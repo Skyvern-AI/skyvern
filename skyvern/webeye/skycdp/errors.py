@@ -9,6 +9,8 @@ catches everything this engine can raise.
 
 from __future__ import annotations
 
+from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
+
 
 class CdpError(Exception):
     """Base identity for every failure raised by the raw-CDP engine."""
@@ -56,40 +58,6 @@ class CdpProtocolError(CdpError):
         if data:
             detail = f"{detail} ({data})"
         super().__init__(detail)
-
-
-# Chrome reports a vanished session/target through these protocol errors rather than by closing the
-# socket, so they must classify as target-closed for retry/recovery branches to behave the same way
-# they do under Playwright.
-_TARGET_CLOSED_MARKERS = (
-    "session with given id not found",
-    "target closed",
-    "session closed",
-    "target with given id not found",
-    "no target with given id",
-    "inspected target navigated or closed",
-    "not attached to an active page",
-)
-
-# A destroyed execution context means a navigation swapped the document out from under a command.
-# The page is alive and the command is worth retrying, so this must NOT classify as target-closed --
-# that identity aborts locator polling and routes recovery down the page-died branch.
-_CONTEXT_LOST_MARKERS = (
-    "cannot find context with specified id",
-    "execution context was destroyed",
-    "execution context is not available",
-    "uniquecontextid not found",
-)
-
-
-def is_target_closed_message(message: str) -> bool:
-    lowered = message.lower()
-    return any(marker in lowered for marker in _TARGET_CLOSED_MARKERS)
-
-
-def is_context_lost_message(message: str) -> bool:
-    lowered = message.lower()
-    return any(marker in lowered for marker in _CONTEXT_LOST_MARKERS)
 
 
 def protocol_error(method: str, error: dict) -> CdpError:

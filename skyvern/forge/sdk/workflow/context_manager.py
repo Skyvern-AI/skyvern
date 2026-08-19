@@ -285,6 +285,8 @@ class WorkflowRunContext:
         self.include_secrets_in_templates: bool = False
         self.credential_totp_identifiers: dict[str, str] = {}
         self.resolved_credential_parameter_ids: dict[str, str] = {}
+        # tested_url per credential parameter key: where each credential's secrets may be released.
+        self.credential_tested_urls: dict[str, str] = {}
         self.runtime_otp_values: set[str] = set()
 
     def set_workflow(self, workflow: "Workflow") -> None:
@@ -313,6 +315,14 @@ class WorkflowRunContext:
 
     def has_parameter(self, key: str) -> bool:
         return key in self.parameters
+
+    def get_value_or_none(self, key: str) -> Any:
+        """Like ``get_value``, but None for a parameter that was never registered.
+
+        A secret whose lookup failed is never registered, so callers that want to report
+        the missing configuration must not raise KeyError reaching for it.
+        """
+        return self.values.get(key)
 
     def has_value(self, key: str) -> bool:
         return key in self.values
@@ -618,6 +628,12 @@ class WorkflowRunContext:
         Recursively replace registered secret values in data with a mask.
         Used to sanitize HttpRequestBlock output before storing.
 
+        Deliberately NOT gated on the workflow Mask Secrets setting: this sanitizer
+        predates the SKY-11822 artifact/LLM redaction stack and backs block-level
+        opt-ins such as HttpRequestBlock secret_response_paths, which must keep
+        masking regardless of the workflow toggle. The gated stack lives behind
+        secret_redaction_enabled_for_run.
+
         Values shorter than _SECRET_SUBSTRING_MIN_LENGTH mask only when they are the entire
         string; a short secret embedded inside a longer scalar is knowingly left unmasked.
         """
@@ -793,6 +809,8 @@ class WorkflowRunContext:
                 raise RuntimeSequentialCredentialUnsupported(self.workflow_run_id)
 
         self.resolved_credential_parameter_ids[parameter.key] = credential_id
+        if db_credential.tested_url:
+            self.credential_tested_urls[parameter.key] = db_credential.tested_url
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
@@ -1871,6 +1889,25 @@ class WorkflowContextManager:
         context = self.workflow_run_contexts.get(workflow_run_id)
         return context is not None and context.mask_secrets
 
+    def secret_redaction_enabled_for_run(self, workflow_run_id: str | None) -> bool:
+        """Whether data redaction (artifacts, HAR/console logs, LLM-bound text) applies to a run.
+
+        Redaction is opt-in per workflow via the Mask Secrets setting, under the global
+        ENABLE_SECRET_ARTIFACT_REDACTION kill switch. Runs without a live workflow run
+        context (standalone tasks) are never redacted.
+        """
+        return settings.ENABLE_SECRET_ARTIFACT_REDACTION and self.mask_secrets_enabled_for_run(workflow_run_id)
+
+    def artifact_redaction_enabled(self, workflow_run_id: str | None) -> bool:
+        """Whether persisted artifacts and browser diagnostics should be redacted.
+
+        Bare tasks have no workflow Mask Secrets setting, so only the global kill switch applies.
+        Workflow runs retain their per-run opt-in.
+        """
+        if workflow_run_id is None:
+            return settings.ENABLE_SECRET_ARTIFACT_REDACTION
+        return self.secret_redaction_enabled_for_run(workflow_run_id)
+
     def get_secret_values_for_run(
         self,
         workflow_run_id: str | None,
@@ -1878,13 +1915,23 @@ class WorkflowContextManager:
         *,
         respect_artifact_redaction_flag: bool = True,
     ) -> set[str]:
-        if respect_artifact_redaction_flag and not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
-            return set()
-        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+        if respect_artifact_redaction_flag and not self.artifact_redaction_enabled(workflow_run_id):
             return set()
 
-        context = self.workflow_run_contexts[workflow_run_id]
         current_context = skyvern_context.current()
+        # Task-scoped secrets (e.g. a v3-resolved verification code) redact even for bare tasks with no
+        # workflow-run context. They are runtime-OTP-like, so honor exclude_runtime_otp; run them through
+        # the same length/sentinel floor as the workflow-secret path so a short value (e.g. a 2-char
+        # inline payload code) can't carpet-bomb unrelated artifact content.
+        task_secret_values: set[str] = (
+            collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+            if current_context and not exclude_runtime_otp
+            else set()
+        )
+        if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
+            return task_secret_values
+
+        context = self.workflow_run_contexts[workflow_run_id]
         totp_values: list[str] = []
         if current_context is not None:
             totp_values = [
@@ -1899,7 +1946,7 @@ class WorkflowContextManager:
         if exclude_runtime_otp:
             secret_values -= runtime_otp_values
             secret_values -= set(totp_values)
-        return secret_values
+        return secret_values | task_secret_values
 
     async def register_block_parameters_for_workflow_run(
         self,

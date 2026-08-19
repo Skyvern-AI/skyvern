@@ -24,6 +24,7 @@ class CopilotPendingTurn(BaseModel):
     pre_turn_workflow: dict[str, Any] | None = None
     pre_turn_proposed_workflow: dict[str, Any] | None = None
     keep_pending_proposal: bool = False
+    idempotency_digest: str | None = None
     user_message_id: str | None = None
     recovering_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
@@ -137,6 +138,11 @@ class WorkflowCopilotChatRequest(BaseModel):
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
         ),
     )
+    idempotency_key: str | None = Field(
+        None,
+        max_length=256,
+        description="Stable key for deduplicating a retried product action within this chat.",
+    )
     target_block_label: str | None = Field(
         None,
         description=(
@@ -238,6 +244,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CONDENSING = "condensing"
     NARRATION = "narration"
     BLOCK_PROGRESS = "block_progress"
+    RUN_STARTED = "run_started"
     RUN_OUTCOME = "run_outcome"
     TURN_START = "turn_start"
     DESIGN_START = "design_start"
@@ -398,6 +405,14 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
     )
     iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotRunStartedUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RUN_STARTED, description="Message type"
+    )
+    workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

@@ -23,6 +23,7 @@ _AGENT_MODULE = "skyvern.forge.agent"
 @pytest.fixture
 def browser_state() -> RealBrowserState:
     state = RealBrowserState.__new__(RealBrowserState)
+    state.engine_selection = None
     return state
 
 

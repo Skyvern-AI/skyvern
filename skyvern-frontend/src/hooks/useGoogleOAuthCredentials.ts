@@ -38,7 +38,7 @@ export function safePostCredentialsInvalidate(
   }
 }
 
-function broadcastCredentialsChanged() {
+export function broadcastGoogleOAuthCredentialsChanged() {
   safePostCredentialsInvalidate(credentialBroadcastChannel);
 }
 
@@ -122,7 +122,12 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
 export function useGoogleOAuthCredentials({
   enabled = true,
   includeEmail = false,
-}: { enabled?: boolean; includeEmail?: boolean } = {}) {
+  refetchOnMount,
+}: {
+  enabled?: boolean;
+  includeEmail?: boolean;
+  refetchOnMount?: boolean | "always";
+} = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -162,6 +167,7 @@ export function useGoogleOAuthCredentials({
     // window focus. The integrations directory and the OAuth callback path
     // explicitly invalidate this query, so user-visible updates remain prompt.
     staleTime: 30_000,
+    refetchOnMount,
     refetchOnWindowFocus: true,
   });
 
@@ -195,7 +201,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Google account connected successfully",
@@ -229,7 +235,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Connection renamed",
@@ -256,7 +262,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Google credential disconnected",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -29,6 +30,10 @@ class PersistentSessionsManager(Protocol):
         """Start the periodic reaper that closes idle/expired sessions."""
         ...
 
+    def get_browser_session_startup_timeout_seconds(self) -> float:
+        """Return the authoritative budget for a browser session to become ready."""
+        ...
+
     def can_probe_registered_browser_state(self) -> bool: ...
 
     def supports_evict_and_reconnect(self) -> bool:
@@ -51,7 +56,7 @@ class PersistentSessionsManager(Protocol):
         runnable_type: str,
         runnable_id: str,
         organization_id: str,
-    ) -> str | None:
+    ) -> str:
         """Begin a browser session for a specific runnable."""
         ...
 
@@ -90,6 +95,16 @@ class PersistentSessionsManager(Protocol):
         download_run_id: str | None = None,
     ) -> BrowserState | None:
         """Get the browser state for a session."""
+        ...
+
+    def get_cached_browser_state_for_release(
+        self,
+        session_id: str,
+        *,
+        expected_runnable_id: str,
+        expected_runnable_generation_id: str,
+    ) -> BrowserState | None:
+        """Snapshot the exact locally cached wrapper for a trusted owner release."""
         ...
 
     async def get_observer_browser_state(
@@ -133,6 +148,8 @@ class PersistentSessionsManager(Protocol):
         browser_profile_id: str | None = None,
         generate_browser_profile: bool = False,
         inherit_profile_proxy: bool = False,
+        bound_workflow_permanent_id: str | None = None,
+        bound_key: str | None = None,
         wait_for_startup: bool = True,
         needs_live_view: bool = False,
     ) -> PersistentBrowserSession:
@@ -168,9 +185,23 @@ class PersistentSessionsManager(Protocol):
         *,
         expected_runnable_id: str | None = None,
         expected_runnable_generation_id: str | None = None,
+        allow_retirement_release: bool = False,
         expected_browser_state: BrowserState | None = None,
     ) -> bool:
         """Release a browser session."""
+        ...
+
+    async def release_stale_browser_session(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        expected_runnable_id: str,
+        expected_runnable_generation_id: str,
+        expected_browser_state: BrowserState,
+        observed_last_activity_at: datetime,
+    ) -> bool:
+        """Release a terminal owner using immutable owner, generation, wrapper, and activity identities."""
         ...
 
     async def evict_cached_browser_state(
@@ -178,15 +209,20 @@ class PersistentSessionsManager(Protocol):
         session_id: str,
         organization_id: str | None = None,
         expected: BrowserState | None = None,
+        *,
+        detach_remote_driver: bool = False,
     ) -> None:
-        """Drop any in-process cache entry for this session and close its BrowserState,
-        so the next get_browser_state call re-establishes a fresh CDP connection.
+        """Drop any in-process cache entry so the next lookup reconnects.
 
         When ``expected`` is provided the eviction is race-safe: callers can pass the
         stale BrowserState they just navigated against, and the manager skips eviction
         if the cached wrapper now holds a different (fresh) BrowserState that another
         coroutine just stored. This guards against closing a fresh wrapper that a
         parallel caller is already holding.
+
+        ``detach_remote_driver`` is for a known local CDP-client loss while the remote
+        persistent browser remains healthy. It stops only the adopted Playwright driver
+        instead of closing the remote context that another proxy client may still use.
         """
         ...
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge.sdk.copilot.tools import list_integrations_tool
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations, _serialize
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
@@ -150,3 +151,12 @@ async def test_lists_a_google_connection_whose_grant_expired(patched_services) -
 
     assert result["data"]["count"] == 1
     assert result["data"]["integrations"][0]["state"] == "error"
+
+
+def test_tool_description_states_facts_without_prescribing_dialogue() -> None:
+    description = list_integrations_tool.description
+
+    assert "state` is `active`" in description
+    assert "state` is `error`" in description
+    assert "ask the user" not in description.lower()
+    assert "reconnect" not in description.lower()

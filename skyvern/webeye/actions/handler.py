@@ -2,9 +2,11 @@ import asyncio
 import contextlib
 import copy
 import json
+import math
 import os
 import re
 import shutil
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -12,7 +14,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
@@ -89,8 +91,8 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     fetch_file_bytes,
     get_download_dir,
+    get_run_temp_dir,
     list_files_in_directory,
-    make_temp_directory,
     resolve_run_download_id,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -166,10 +168,13 @@ from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
+    begin_requested_download_for_context,
     download_filename_from_suffix,
     extract_filename,
+    finish_requested_download_for_context,
     is_download_response,
     normalize_download_filename,
+    publish_download_bytes_for_context,
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
@@ -1511,6 +1516,14 @@ async def _recover_blocked_inline_pdf_download(
         # A URL with no path basename (e.g. ".../?token=...") yields no name; the bytes are a
         # confirmed PDF, so give the persisted file a .pdf extension instead of an extension-less one.
         base_name = "statement.pdf"
+    handled_by_interceptor, intercepted_target = publish_download_bytes_for_context(
+        page.context,
+        data,
+        base_name,
+        "application/pdf",
+    )
+    if handled_by_interceptor:
+        return intercepted_target
     target = _download_target_path(download_dir, base_name)
     try:
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -3801,7 +3814,10 @@ class ActionHandler:
         # admit only frames that appeared in this action's window (see _recover_blocked_inline_pdf_download).
         inline_iframe_srcs_before = await _collect_inline_iframe_src_candidates(page)
 
-        staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
+        # Run-scoped so teardown and the stale sweep reclaim it by run identity (SKY-14159).
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
+        )
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
@@ -3824,6 +3840,7 @@ class ActionHandler:
         # keep their existing single-page download behavior with no popup-download wiring.
         if task.browser_session_id:
             page.on("popup", _register_download_popup)
+        requested_download_token = begin_requested_download_for_context(page.context)
         try:
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
@@ -4328,6 +4345,12 @@ class ActionHandler:
             except Exception:
                 LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
 
+            download_error = finish_requested_download_for_context(page.context, requested_download_token)
+            if download_error is not None and "results" in locals() and results:
+                results[-1] = ActionFailure(
+                    Exception(download_error["reasoning"]),
+                    download_triggered=download_triggered,
+                )
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
@@ -4585,17 +4608,361 @@ async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
     return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
 
 
+class _GridRowSelection(StrEnum):
+    """Row-selection state of a checkbox's grid context. NOT_GRID_ROW: not a grid row-selection
+    control, so native ``checked`` is the whole truth. SELECTED/UNSELECTED: the closest row's
+    app-controlled selection *positively* read (aria-selected true/false, or a known selected class for
+    SELECTED); it can diverge from the input's native ``checked``. UNMARKED: a well-formed grid
+    row-selection row that exposes no positive selected signal (no aria-selected, no known class) --
+    absence, which is NOT a proof of unselected, so it never suppresses a needed click and is never
+    cell-driven (no readable post-state exists to prove), only handled by the ordinary click. UNREADABLE:
+    the snapshot could not be read (malformed
+    or a bad value), so the caller falls open to an ordinary click rather than trusting native state."""
+
+    NOT_GRID_ROW = "not_grid_row"
+    SELECTED = "selected"
+    UNSELECTED = "unselected"
+    UNMARKED = "unmarked"
+    UNREADABLE = "unreadable"
+
+
+# A selectable ARIA grid tracks row selection as app state on the closest row, independent of a
+# selection checkbox's native `checked`. This is a dumb DOM extractor; every decision lives in the pure
+# `_classify_grid_row_selection`, so classification is unit-tested without a browser and a snapshot that
+# is not the exact shape it promises is UNREADABLE (fail open to an ordinary click). Detection is purely
+# structural and framework-token-free: the checkbox's closest cell must be the row's unique selection
+# cell -- an exact role=gridcell that is the ONLY direct role=gridcell cell in the row. An ordinary
+# boolean data-column checkbox sits among several role=gridcell cells (or in a bare td), so it stays a
+# native checkbox rather than a row-selection control.
+_GRID_ROW_SNAPSHOT_JS = """
+(el, selectedTokens) => {
+  const container = el.closest('[role="grid"], [role="treegrid"]');
+  const row = el.closest('[role="row"], tr');
+  const cell = el.closest('[role="gridcell"], td');
+  const inRow = row !== null && row !== container;
+  const inCell = cell !== null && cell !== container && cell !== row;
+  // The row and cell must belong to the same closest grid as the checkbox, so a nested grid cannot
+  // pair an inner selection cell with an outer row.
+  const sameGridChain = container !== null && inRow && inCell && container.contains(row) && row.contains(cell);
+  const candidateExactGridcell = cell !== null && cell.getAttribute('role') === 'gridcell';
+  const candidateDirectRowChild = cell !== null && inRow && cell.parentElement === row;
+  let gridCellCount = 0;
+  if (inRow) {
+    const children = row.children;
+    for (let i = 0; i < children.length; i++) {
+      if (children[i].getAttribute('role') === 'gridcell') { gridCellCount++; }
+    }
+  }
+  // Whether any OTHER row of this same grid holds a POSITIVE selection (aria-selected="true" or a known
+  // selected class token). A cell click can replace/clear the whole selection, so this proves whether a
+  // recovery could destroy another row's selection; the same positive vocabulary as the per-row read.
+  const tokens = Array.isArray(selectedTokens) ? selectedTokens : [];
+  let otherRowSelected = false;
+  if (container !== null && row !== null) {
+    const rows = container.querySelectorAll('[role="row"], tr');
+    for (let i = 0; i < rows.length && !otherRowSelected; i++) {
+      const r = rows[i];
+      if (r === row) { continue; }
+      if (r.closest('[role="grid"], [role="treegrid"]') !== container) { continue; }
+      const asel = r.getAttribute('aria-selected');
+      if (asel !== null && asel.trim().toLowerCase() === 'true') { otherRowSelected = true; break; }
+      const cls = Array.prototype.slice.call(r.classList).map(function (c) { return c.trim().toLowerCase(); });
+      for (let j = 0; j < tokens.length; j++) {
+        if (cls.indexOf(tokens[j]) !== -1) { otherRowSelected = true; break; }
+      }
+    }
+  }
+  return {
+    inHeader: el.closest('thead, [role="columnheader"]') !== null,
+    hasGrid: container !== null,
+    hasRow: inRow,
+    hasCell: inCell,
+    sameGridChain: sameGridChain,
+    isCheckbox: typeof el.matches === 'function' && el.matches('input[type="checkbox"]'),
+    candidateExactGridcell: candidateExactGridcell,
+    candidateDirectRowChild: candidateDirectRowChild,
+    gridCellCount: gridCellCount,
+    rowAriaSelected: inRow ? row.getAttribute('aria-selected') : null,
+    rowClasses: inRow ? Array.prototype.slice.call(row.classList) : null,
+    otherRowSelected: otherRowSelected,
+  };
+}
+"""
+
+# Atomic recovery-targeting read. Finds one locator-relative point on the selection cell whose ACTUAL
+# hit target (`document.elementFromPoint`) is the cell itself -- not the checkbox, a label, any other
+# descendant (interactive or not), an overlay, an iframe, or null. Candidates are inside the cell's
+# padding box clipped to the viewport and to every clipping ancestor, so a partially-scrolled cell is
+# probed only where it is actually visible. Returns a point relative to the cell padding-box top-left
+# (the Playwright `position` origin) or null when no candidate resolves to the cell (fail closed). A
+# selector allow-list of descendant types is necessarily incomplete; hit-testing is the only proof that
+# a point is clear cell space.
+_SAFE_CELL_POINT_JS = """
+(el) => {
+  const cell = el.closest('[role="gridcell"], td');
+  if (cell === null) { return null; }
+  const rect = cell.getBoundingClientRect();
+  const padLeft = rect.left + cell.clientLeft;
+  const padTop = rect.top + cell.clientTop;
+  let left = Math.max(padLeft, 0);
+  let top = Math.max(padTop, 0);
+  let right = Math.min(padLeft + cell.clientWidth, window.innerWidth);
+  let bottom = Math.min(padTop + cell.clientHeight, window.innerHeight);
+  for (let a = cell.parentElement; a !== null; a = a.parentElement) {
+    const style = window.getComputedStyle(a);
+    if (style.overflowX !== 'visible' || style.overflowY !== 'visible') {
+      const ar = a.getBoundingClientRect();
+      left = Math.max(left, ar.left);
+      top = Math.max(top, ar.top);
+      right = Math.min(right, ar.right);
+      bottom = Math.min(bottom, ar.bottom);
+    }
+  }
+  const w = right - left;
+  const h = bottom - top;
+  if (w <= 0 || h <= 0) { return null; }
+  const fractions = [
+    [0.5, 0.5],
+    [0.85, 0.5], [0.15, 0.5], [0.5, 0.15], [0.5, 0.85],
+    [0.85, 0.15], [0.15, 0.15], [0.85, 0.85], [0.15, 0.85],
+    [0.7, 0.5], [0.3, 0.5], [0.5, 0.7], [0.5, 0.3]
+  ];
+  for (let i = 0; i < fractions.length; i++) {
+    const vx = left + w * fractions[i][0];
+    const vy = top + h * fractions[i][1];
+    if (document.elementFromPoint(vx, vy) === cell) {
+      return { x: vx - padLeft, y: vy - padTop };
+    }
+  }
+  return null;
+}
+"""
+
+_ROW_SELECTION_SETTLE_JS = (
+    "() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(r))))"
+)
+
+# Common selected-row class conventions, consulted only when the row exposes no aria-selected. Exact
+# lowercased-token membership only (never a substring/suffix match).
+_SELECTED_ROW_CLASS_TOKENS = frozenset({"selected", "is-selected", "k-selected"})
+_REQUIRED_SNAPSHOT_BOOL_KEYS = (
+    "inHeader",
+    "hasGrid",
+    "hasRow",
+    "hasCell",
+    "sameGridChain",
+    "isCheckbox",
+    "candidateExactGridcell",
+    "candidateDirectRowChild",
+)
+
+
+def _is_str_list_or_none(value: object) -> bool:
+    return value is None or (isinstance(value, list) and all(isinstance(item, str) for item in value))
+
+
+def _classify_grid_row_selection(snapshot: object) -> _GridRowSelection:
+    """Classify the ``_GRID_ROW_SNAPSHOT_JS`` result. A snapshot that is not the exact shape the
+    extractor promises -- a non-dict, a missing required key, or a wrong field type -- is UNREADABLE and
+    never silently treated as an ordinary checkbox. NOT_GRID_ROW is returned only when a well-formed
+    snapshot positively proves a non-grid-row context: a header cell, not a checkbox inside its own
+    grid -> row -> cell chain, or a row without the unique selection-cell signature (the checkbox's
+    closest cell must be an exact role=gridcell and the ONLY direct role=gridcell cell in the row, so an
+    ordinary data-column checkbox among several gridcells stays a native checkbox). Otherwise the closest
+    row's selection: aria-selected is authoritative when present (exact true/false after normalizing; any
+    other token is UNREADABLE), else an exact selected-row class token is SELECTED; absent both, the row
+    is UNMARKED -- absence of a positive selected signal, which the caller must not read as UNSELECTED."""
+    if not isinstance(snapshot, dict):
+        return _GridRowSelection.UNREADABLE
+    for key in _REQUIRED_SNAPSHOT_BOOL_KEYS:
+        if not isinstance(snapshot.get(key), bool):
+            return _GridRowSelection.UNREADABLE
+    grid_cell_count = snapshot.get("gridCellCount")
+    if not isinstance(grid_cell_count, int) or isinstance(grid_cell_count, bool):
+        return _GridRowSelection.UNREADABLE
+    for key in ("rowClasses", "rowAriaSelected"):
+        if key not in snapshot:
+            return _GridRowSelection.UNREADABLE
+    row_classes = snapshot["rowClasses"]
+    aria_selected = snapshot["rowAriaSelected"]
+    if not _is_str_list_or_none(row_classes):
+        return _GridRowSelection.UNREADABLE
+    if not (aria_selected is None or isinstance(aria_selected, str)):
+        return _GridRowSelection.UNREADABLE
+
+    if snapshot["inHeader"]:
+        return _GridRowSelection.NOT_GRID_ROW
+    if not (snapshot["hasGrid"] and snapshot["hasRow"] and snapshot["hasCell"] and snapshot["isCheckbox"]):
+        return _GridRowSelection.NOT_GRID_ROW
+    if not snapshot["sameGridChain"]:
+        return _GridRowSelection.NOT_GRID_ROW
+    # The unique selection-cell signature: the checkbox's closest cell is an exact role=gridcell and the
+    # only direct role=gridcell cell in the row. Absent it -- a bare td, a nested gridcell, or several
+    # data cells with role=gridcell -- the checkbox is an ordinary data control, not a row-selection one.
+    if not (snapshot["candidateExactGridcell"] and snapshot["candidateDirectRowChild"] and grid_cell_count == 1):
+        return _GridRowSelection.NOT_GRID_ROW
+
+    if aria_selected is not None:
+        token = aria_selected.strip().lower()
+        if token == "true":
+            return _GridRowSelection.SELECTED
+        if token == "false":
+            return _GridRowSelection.UNSELECTED
+        return _GridRowSelection.UNREADABLE
+    if row_classes is not None and not _SELECTED_ROW_CLASS_TOKENS.isdisjoint(
+        cls.strip().lower() for cls in row_classes
+    ):
+        return _GridRowSelection.SELECTED
+    # No aria-selected and no known selected class: absence, not a positive UNSELECTED. Return UNMARKED
+    # so the caller never suppresses a needed click from it and never cell-drives it (no readable
+    # post-state exists to prove) -- it is handled by the ordinary click.
+    return _GridRowSelection.UNMARKED
+
+
+def _grid_other_row_selected(snapshot: object) -> bool:
+    """Whether the snapshot proves that another row of the same grid holds a positive selection. Only a
+    literal ``True`` counts, so a missing/malformed field is treated as 'not proven', matching the
+    fail-open direction of the classifier."""
+    return isinstance(snapshot, dict) and snapshot.get("otherRowSelected") is True
+
+
+class _GridRowRead(NamedTuple):
+    """A single snapshot read of a grid row-selection checkbox: its classified ``state`` and whether any
+    OTHER row of the same grid is positively selected (``other_row_selected``), so a cell recovery can be
+    proven not to clear another row's selection without a second, racy read."""
+
+    state: _GridRowSelection
+    other_row_selected: bool
+
+
+async def _read_grid_row_selection(element: SkyvernElement) -> _GridRowRead:
+    """The checkbox's grid row-selection state plus the grid-wide other-row-selected flag from ONE
+    snapshot read, or UNREADABLE when the snapshot cannot be read -- a failed read falls open to an
+    ordinary click, never to a native-only read that could report a checked-but-unselected row as
+    already selected."""
+    try:
+        snapshot = await element.get_locator().evaluate(_GRID_ROW_SNAPSHOT_JS, sorted(_SELECTED_ROW_CLASS_TOKENS))
+    except Exception:
+        LOG.debug("Grid row-selection snapshot read failed; treating as unreadable", element_id=element.get_id())
+        return _GridRowRead(_GridRowSelection.UNREADABLE, False)
+    return _GridRowRead(_classify_grid_row_selection(snapshot), _grid_other_row_selected(snapshot))
+
+
+def _is_finite_number(value: object) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _coerce_click_position(point: object) -> dict[str, float] | None:
+    """Validate the locator-relative point returned by ``_SAFE_CELL_POINT_JS`` -- a finite {x, y}
+    padding-box offset hit-tested to land on the selection cell -- before it is handed to Playwright, or
+    None when no cell-space point was proven (fail closed)."""
+    if not isinstance(point, dict):
+        return None
+    x = point.get("x")
+    y = point.get("y")
+    if not _is_finite_number(x) or not _is_finite_number(y):
+        return None
+    return {"x": float(x), "y": float(y)}
+
+
+async def _grid_row_reached_state(element: SkyvernElement, desired_state: bool) -> bool:
+    """After a bounded settle so the framework can commit selection, whether the closest row reached the
+    desired selection state. Desired-true requires a POSITIVE SELECTED read. Desired-false (only ever
+    driven from a positively-SELECTED row) requires the positive selected signal to be gone -- UNSELECTED
+    (aria-selected="false") or UNMARKED (the signal removed). A read failure or the opposite state is a
+    failure (fail closed)."""
+    try:
+        await element.get_locator().evaluate(_ROW_SELECTION_SETTLE_JS)
+    except Exception:
+        pass
+    reached = (await _read_grid_row_selection(element)).state
+    if desired_state:
+        return reached is _GridRowSelection.SELECTED
+    return reached is _GridRowSelection.UNSELECTED or reached is _GridRowSelection.UNMARKED
+
+
+async def _drive_grid_row_selection(
+    action: actions.ClickAction, element: SkyvernElement, desired_state: bool
+) -> list[ActionResult] | None:
+    """Drive a grid row-selection checkbox to the desired row-selection state by clicking a proven-clear
+    point on the selection cell (hit-tested via ``document.elementFromPoint``), then re-reading the
+    row's selection after a bounded settle. Entered only from a positively-readable start (an UNSELECTED
+    row to select, a SELECTED row to deselect), so the re-read after the drive can actually prove the
+    result; never entered for an UNMARKED row, whose selection is unreadable in both directions. A native
+    check()/uncheck() flips the input's ``checked`` without entering the framework's row selection (the
+    divergence), so it is never used here. Returns
+    [ActionAbort()] when the row reaches the desired selection, or None to fall through to a single
+    ordinary click when the cell nests an interactive control, no proven cell-space point exists, or the
+    click does not achieve the desired selection. Never loops, force-clicks, or mutates the DOM."""
+    cell_locator = element.get_locator().locator('xpath=ancestor-or-self::*[@role="gridcell" or self::td][1]').first
+    try:
+        if await cell_locator.count() == 0:
+            return None
+        if await SkyvernElement._label_click_forwards_to_descendant(cell_locator, fail_closed=True):
+            LOG.warning(
+                "Grid row-selection cell nests a link/button; continuing the normal click",
+                element_id=element.get_id(),
+            )
+            return None
+        point = _coerce_click_position(await cell_locator.evaluate(_SAFE_CELL_POINT_JS))
+        if point is None:
+            LOG.warning(
+                "No proven cell-space point clear of controls for grid row selection, continuing the normal click",
+                element_id=element.get_id(),
+            )
+            return None
+        await cell_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, position=point)
+    except Exception:
+        LOG.warning(
+            "Grid row-selection click failed, continuing the normal click", element_id=element.get_id(), exc_info=True
+        )
+        return None
+    if await _grid_row_reached_state(element, desired_state):
+        LOG.info("Grid row reached the desired selection state", action=action, desired_state=desired_state)
+        return [ActionAbort()]
+    LOG.warning(
+        "Grid row selection did not reach the desired state, continuing the normal click",
+        element_id=element.get_id(),
+    )
+    return None
+
+
+async def _checkbox_live_state(element: SkyvernElement, grid_state: _GridRowSelection) -> bool | None:
+    """A checkbox's live selected state from an already-read grid classification: the closest row's
+    selection when it is a grid row-selection control (native ``checked`` can diverge from app row
+    selection), else the input's native ``checked``. None -- fall open -- when the row state is
+    unreadable, or is UNMARKED (a well-formed row with no positive selected signal: absence is not a
+    proof of unselected), or the native read fails."""
+    if grid_state is _GridRowSelection.SELECTED:
+        return True
+    if grid_state is _GridRowSelection.UNSELECTED:
+        return False
+    if grid_state is _GridRowSelection.UNREADABLE or grid_state is _GridRowSelection.UNMARKED:
+        return None
+    try:
+        return await element.is_checked()
+    except Exception:
+        LOG.debug(
+            "Failed to read native checkbox state; continuing with an ordinary click", element_id=element.get_id()
+        )
+        return None
+
+
 async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
     """Read one generic, live observable of a control's selected/checked state, or None when no
     boolean observable is readable (unknown control, malformed value, or a detached/unreadable
-    element) so the caller falls open to an ordinary click. Native checkbox/radio inputs report
-    through is_checked(); other controls expose an exact aria-checked/aria-pressed/aria-selected
-    boolean read live. Role only chooses which observable to read and whether a bare aria-selected
-    value is trustworthy; it never implies desired intent."""
+    element) so the caller falls open to an ordinary click. Native radio inputs report through
+    is_checked(); a checkbox reports its grid row's selection when it is a grid row-selection control
+    (native `checked` can diverge from app row selection) and otherwise its native is_checked(); other
+    controls expose an exact aria-checked/aria-pressed/aria-selected boolean read live. Role only
+    chooses which observable to read and whether a bare aria-selected value is trustworthy; it never
+    implies desired intent."""
     try:
         if element.get_tag_name() == "input":
             input_type = (await element.get_attr("type") or "").strip().casefold()
-            if input_type in ("checkbox", "radio"):
+            if input_type == "checkbox":
+                return await _checkbox_live_state(element, (await _read_grid_row_selection(element)).state)
+            if input_type == "radio":
                 return await element.is_checked()
             return None
         for aria_attr in ("aria-checked", "aria-pressed", "aria-selected"):
@@ -4762,6 +5129,98 @@ async def _apply_label_desired_click_state(
     return None
 
 
+async def _apply_checkbox_desired_click_state(
+    action: actions.ClickAction, element: SkyvernElement, desired_state: bool
+) -> list[ActionResult] | None:
+    """Drive a checkbox to an explicit terminal state from a SINGLE grid row-selection snapshot read
+    (state + grid-wide other-row-selected). An ordinary checkbox (NOT_GRID_ROW) is set natively. A grid
+    row-selection checkbox drives app row selection through its selection cell -- a native set flips
+    ``checked`` while the row stays unselected, the divergence this guards against -- so it is recovered
+    on the cell and never check()/uncheck(). Returns [ActionAbort()] only from a positively-proven state,
+    or None to fall through to a single ordinary click. Invariants: absence of a positive selected signal
+    (UNMARKED) never suppresses a needed click; the cell is driven ONLY from a positively-readable start
+    (UNSELECTED to select, SELECTED to deselect) whose result the drive can then read, and only when no
+    OTHER row of the grid holds a readable selection, so a recovery can never clear another row's
+    selection; a drive aborts only after a positively-readable post-state; and an UNMARKED row -- no
+    positive selected signal, DOM-indistinguishable from a foreign-vocabulary selected row -- is never
+    cell-driven, only handled by the single ordinary click."""
+    grid = await _read_grid_row_selection(element)
+    state = grid.state
+
+    if state is _GridRowSelection.NOT_GRID_ROW:
+        native = await _checkbox_live_state(element, state)
+        if native is None:
+            LOG.info("No readable selected state, continuing the normal click", action=action)
+            return None
+        if native == desired_state:
+            LOG.info("Control already in the desired state, suppressing the redundant click", action=action)
+            return [ActionAbort()]
+        LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
+        if await _set_native_checkbox_state(element, should_check=desired_state):
+            return [ActionAbort()]
+        LOG.warning("Failed to set the native control to the desired state, continuing the normal click", action=action)
+        return None
+
+    if state is _GridRowSelection.UNREADABLE:
+        LOG.info("Grid row selection unreadable, continuing the normal click", action=action)
+        return None
+
+    # A grid row-selection checkbox with a well-formed snapshot: SELECTED / UNSELECTED / UNMARKED.
+    positively_selected = state is _GridRowSelection.SELECTED
+    positively_unselected = state is _GridRowSelection.UNSELECTED
+    if positively_selected and desired_state:
+        LOG.info("Row already selected, suppressing the redundant click", action=action)
+        return [ActionAbort()]
+    if positively_unselected and not desired_state:
+        LOG.info("Row already unselected, suppressing the redundant click", action=action)
+        return [ActionAbort()]
+
+    if not desired_state:
+        # Deselect intent. Only a positively-SELECTED row is driven off its selection; an UNMARKED row is
+        # never suppressed from absence, and is only treated as already-unselected when native `checked`
+        # positively agrees the box is off. Otherwise fall open without claiming success.
+        if positively_selected:
+            if grid.other_row_selected:
+                LOG.info("Another row is selected; not driving the cell, continuing the normal click", action=action)
+                return None
+            return await _drive_grid_row_selection(action, element, desired_state)
+        try:
+            native_checked = await element.is_checked()
+        except Exception:
+            native_checked = None
+        if native_checked is False:
+            LOG.info("Unmarked row with the box positively off already matches desired unselected", action=action)
+            return [ActionAbort()]
+        LOG.info("Unmarked row can't be proven unselected, continuing the normal click", action=action)
+        return None
+
+    # Select intent from a row not positively selected. Only a positively-UNSELECTED row is driven through
+    # the selection cell: both its start state and the SELECTED post-state the drive must prove are
+    # readable, and only when no OTHER row holds a readable selection so the recovery can never
+    # replace/clear it. An UNMARKED row exposes no positive selected signal, so neither its start nor a
+    # post-drive selection can be read -- a cell drive there would be an unverifiable state-changing probe
+    # on an ambiguous row (and could clear a selection the gate cannot see). Never drive it: fall open to
+    # the single ordinary click, whose real activation enters the framework's own selection.
+    if positively_unselected:
+        if grid.other_row_selected:
+            LOG.info("Another row is selected; not driving the cell, continuing the normal click", action=action)
+            return None
+        return await _drive_grid_row_selection(action, element, desired_state)
+    LOG.info("Unmarked row can't be proven selected by a cell drive, continuing the normal click", action=action)
+    return None
+
+
+async def _input_type_or_none(element: SkyvernElement) -> str | None:
+    """The casefolded ``type`` of an input, or None when the read raises (a detached/unreadable
+    element). Reading it outside a guard would propagate; the merge base falls open to one ordinary
+    click, so a failed read must too."""
+    try:
+        return (await element.get_attr("type") or "").strip().casefold()
+    except Exception:
+        LOG.debug("Failed to read input type; continuing with an ordinary click", element_id=element.get_id())
+        return None
+
+
 async def _apply_desired_click_state(
     action: actions.ClickAction, element: SkyvernElement, desired_state: bool, dom: DomUtil
 ) -> list[ActionResult] | None:
@@ -4772,6 +5231,8 @@ async def _apply_desired_click_state(
     once to change. Never converts an explicit desired_state=False into a check."""
     if element.get_tag_name() == "label":
         return await _apply_label_desired_click_state(action, element, desired_state, dom)
+    if element.get_tag_name() == "input" and await _input_type_or_none(element) == "checkbox":
+        return await _apply_checkbox_desired_click_state(action, element, desired_state)
     live_state = await _resolve_live_selected_state(element)
     if live_state is None:
         LOG.info("No readable selected state, continuing the normal click", action=action)
@@ -4784,10 +5245,10 @@ async def _apply_desired_click_state(
         )
         return [ActionAbort()]
     if element.get_tag_name() == "input":
-        input_type = (await element.get_attr("type") or "").strip().casefold()
-        if input_type == "radio" and not desired_state:
-            # A radio can't be turned off by clicking it -- only selecting another radio in the
-            # group clears it -- so skip the doomed uncheck() and let a single ordinary click run.
+        # Only a native radio reaches here (checkbox is handled above; a non-toggle input has no
+        # readable state and already fell open), and a radio can't be turned off by clicking it -- only
+        # selecting another radio in the group clears it -- so skip the doomed uncheck() on desired=False.
+        if not desired_state:
             LOG.info("A radio can't be unchecked in place, continuing with a single normal click", action=action)
             return None
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
@@ -4973,7 +5434,7 @@ async def handle_click_action(
                     )
                     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
 
-                if sequential_click_result := await handle_sequential_click_for_dropdown(
+                if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,
                     action_history=results,
                     anchor_element=skyvern_element,
@@ -4988,6 +5449,11 @@ async def handle_click_action(
                     results.append(sequential_click_result)
                     return results
 
+            except NoAvailableOptionFoundForCustomSelection as exc:
+                failure = ActionFailure(exc)
+                failure.skip_remaining_actions = True
+                results.append(failure)
+                return results
             except Exception:
                 LOG.warning(
                     "Failed to do sequential logic for the click action, skipping",
@@ -5049,6 +5515,45 @@ async def _build_after_click_verify_prompt(
     )
 
 
+async def handle_sequential_click_with_submit_bypass(
+    action: actions.ClickAction,
+    action_history: list[ActionResult],
+    anchor_element: SkyvernElement,
+    dom: DomUtil,
+    page: Page,
+    skyvern_frame: SkyvernFrame,
+    scraped_page: ScrapedPage,
+    incremental_scraped: IncrementalScrapePage,
+    task: Task,
+    step: Step,
+) -> ActionResult | None:
+    """Skip only the dropdown-specific post-click full rescrape for exact explicit
+    submit controls; every other click still runs ``handle_sequential_click_for_dropdown``.
+
+    ``anchor_element`` is the final click target after any disabled-wrapper
+    retargeting, so the explicit-submit check is evaluated here and never stale.
+    """
+    if await anchor_element.is_explicit_submit():
+        LOG.info(
+            "Explicit submit click; bypassing the dropdown sequential-click rescrape",
+            element_id=anchor_element.get_id(),
+        )
+        return None
+
+    return await handle_sequential_click_for_dropdown(
+        action=action,
+        action_history=action_history,
+        anchor_element=anchor_element,
+        dom=dom,
+        page=page,
+        skyvern_frame=skyvern_frame,
+        scraped_page=scraped_page,
+        incremental_scraped=incremental_scraped,
+        task=task,
+        step=step,
+    )
+
+
 @traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
@@ -5097,6 +5602,20 @@ async def handle_sequential_click_for_dropdown(
         LOG.info("No new interactable elements found, exiting the sequential click logic")
         return None
 
+    # Settle what the click revealed before spending an LLM call on it. This walk is DOM-only, and
+    # a click that opened no menu returns below either way -- so running the goal check first could
+    # not change that outcome, only the bill. The check itself is unchanged for menus that do open:
+    # exiting the sequential click logic on an achieved goal is the reason it exists (#5599).
+    dropdown_menu_element = await locate_dropdown_menu(
+        current_anchor_element=anchor_element,
+        incremental_scraped=incremental_scraped,
+        step=step,
+        task=task,
+    )
+
+    if dropdown_menu_element is None:
+        return None
+
     action_history_str = ""
     if action_history and len(action_history) > 0:
         result = action_history[-1]
@@ -5122,16 +5641,6 @@ async def handle_sequential_click_for_dropdown(
     verify_result = CompleteVerifyResult.model_validate(response)
     if verify_result.user_goal_achieved:
         LOG.info("User goal achieved, exiting the sequential click logic")
-        return None
-
-    dropdown_menu_element = await locate_dropdown_menu(
-        current_anchor_element=anchor_element,
-        incremental_scraped=incremental_scraped,
-        step=step,
-        task=task,
-    )
-
-    if dropdown_menu_element is None:
         return None
 
     dropdown_select_context = await _get_input_or_select_context(

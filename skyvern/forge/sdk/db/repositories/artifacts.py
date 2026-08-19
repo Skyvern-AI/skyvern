@@ -577,9 +577,9 @@ class ArtifactsRepository(BaseRepository):
     ) -> int:
         """Tag session-scoped DOWNLOAD artifacts that landed during this run with ``run_id``.
 
-        Called at run finalization. ``occupy_browser_session`` ensures at
-        most one run is active on a session at a time, so the time-window
-        match is unambiguous.
+        Called at run finalization with the run's own window, and mid-run by a
+        code block registering its downloads, which passes its block row's
+        ``created_at`` so a co-tenant run's earlier rows stay unclaimed.
 
         Returns the number of rows updated. Idempotent: re-running picks up
         only ``run_id IS NULL`` rows, so a retry after success is a no-op.
@@ -608,7 +608,8 @@ class ArtifactsRepository(BaseRepository):
 
         Read-only counterpart of :meth:`claim_session_download_artifacts_for_run`, matched on the
         same filter so a grader reading before the claim sees this run's files and not a reused
-        session's earlier ones."""
+        session's earlier ones. A code block can claim mid-run when artifact content signing is
+        configured, so on those deployments this counts only what no block has claimed yet."""
         async with self.Session() as session:
             result = await session.execute(
                 select(func.count())
@@ -749,6 +750,21 @@ class ArtifactsRepository(BaseRepository):
                 and_(
                     ArtifactModel.organization_id == organization_id,
                     ArtifactModel.task_id == task_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    @db_operation("delete_artifacts_by_ids")
+    async def delete_artifacts_by_ids(self, *, organization_id: str, artifact_ids: list[str]) -> None:
+        if not artifact_ids:
+            return
+
+        async with self.Session() as session:
+            stmt = delete(ArtifactModel).where(
+                and_(
+                    ArtifactModel.organization_id == organization_id,
+                    ArtifactModel.artifact_id.in_(artifact_ids),
                 )
             )
             await session.execute(stmt)

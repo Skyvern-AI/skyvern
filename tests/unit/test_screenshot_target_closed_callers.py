@@ -49,6 +49,7 @@ def _agent_rig(
     # A genuinely closed target fails HTML capture too, so the closed-target cases pass html_error.
     frame.get_content = AsyncMock(side_effect=html_error) if html_error else AsyncMock(return_value="<html></html>")
     monkeypatch.setattr(agent_mod.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
+    monkeypatch.setattr(agent_mod.app.ARTIFACT_MANAGER, "accumulate_action_html_to_archive", MagicMock())
 
     log = MagicMock()
     monkeypatch.setattr(agent_mod, "LOG", log)

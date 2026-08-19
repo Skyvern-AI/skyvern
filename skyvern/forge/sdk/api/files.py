@@ -254,6 +254,29 @@ async def fetch_file_bytes(
     raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
 
 
+def _resolve_legacy_download_path(candidate_path: str) -> str:
+    """Resolve a legacy file:// path and confirm it is inside the repository downloads directory.
+
+    Containment is checked on the realpath with commonpath, so dot segments, percent-decoded dot
+    segments, symlinks, and sibling directories such as ``downloads-evil`` cannot escape.
+    """
+    allowed_dir = os.path.realpath(os.path.join(REPO_ROOT_DIR, "downloads"))
+    resolved_path = os.path.realpath(candidate_path)
+    try:
+        inside_allowed_dir = os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir
+    except ValueError:
+        inside_allowed_dir = False
+    if not inside_allowed_dir:
+        LOG.warning(
+            "Legacy local file path traversal blocked",
+            candidate_path=candidate_path,
+            resolved_path=resolved_path,
+            allowed_dir=allowed_dir,
+        )
+        raise PermissionError("Local file path is outside the downloads directory")
+    return resolved_path
+
+
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
     """Validate if a URL is supported for downloading.
 
@@ -292,12 +315,9 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
 
             # Validate the file path is within allowed directories
             try:
-                file_path = parse_uri_to_path(url)
-                allowed_prefix = f"{REPO_ROOT_DIR}/downloads"
-                if not file_path.startswith(allowed_prefix):
-                    return False
+                _resolve_legacy_download_path(parse_uri_to_path(url))
                 return True
-            except ValueError:
+            except (ValueError, PermissionError):
                 return False
 
         # Reject unsupported schemes
@@ -356,10 +376,9 @@ async def download_file(
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            local_path = parse_uri_to_path(url)
-            if local_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
-                LOG.info("Downloading file from local file system", url=url)
-                return local_path
+            local_path = _resolve_legacy_download_path(parse_uri_to_path(url))
+            LOG.info("Downloading file from local file system", url=url)
+            return local_path
 
         resolver = SSRFGuardedResolver()
         current_url = await validate_and_pin_fetch_url(url, resolver)
@@ -597,6 +616,32 @@ def get_download_dir(run_id: str | None) -> str:
     download_dir = os.path.join(settings.DOWNLOAD_PATH, str(run_id))
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+RUN_TEMP_NAMESPACE = "runs"
+
+
+def _is_single_path_component(value: str) -> bool:
+    return bool(value) and value not in (".", "..") and Path(value).name == value
+
+
+def get_run_temp_dir(organization_id: str, run_id: str) -> str:
+    """The run's own scratch directory (``TEMP_PATH/runs/<org>/<run>``), created on first use.
+
+    The one sanctioned place for per-run temp files: everything under it is deletable by run
+    identity alone — activity teardown removes the finishing run's directory and the stale sweep
+    reaps aged ones — so a tenant staging here needs no cleanup logic of its own. Both components
+    must be single plain path elements because this path is later fed to rmtree by identity.
+    """
+    if not _is_single_path_component(organization_id) or not _is_single_path_component(run_id):
+        raise ValueError("organization_id and run_id must be single path components")
+    run_dir = os.path.join(settings.TEMP_PATH, RUN_TEMP_NAMESPACE, organization_id, run_id)
+    # makedirs follows symlinked ancestors; a planted link under runs/ would materialize run dirs
+    # outside TEMP_PATH and put them beyond the reapers' reach. Resolve-check before creating.
+    if not Path(run_dir).resolve().is_relative_to(Path(settings.TEMP_PATH).resolve()):
+        raise ValueError("run temp dir resolves outside TEMP_PATH")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: str | None = None) -> str | None:

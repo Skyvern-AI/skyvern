@@ -30,6 +30,10 @@ def _fake_context() -> SimpleNamespace:
     )
 
 
+def _fake_run_config() -> SimpleNamespace:
+    return SimpleNamespace(trace_include_sensitive_data=True)
+
+
 def _patch_recovery_common(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -172,7 +176,7 @@ async def test_recovery_uses_browser_only_surface_and_no_native_tools(monkeypatc
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -237,7 +241,7 @@ async def test_recovery_passes_non_empty_output_guardrails(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -287,7 +291,7 @@ async def test_recovery_fails_closed_on_ask_question(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -332,7 +336,7 @@ async def test_recovery_replace_workflow_terminal_has_distinct_failure_note(monk
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -374,7 +378,7 @@ async def test_recovery_unparseable_terminal_has_distinct_failure_note(monkeypat
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -421,7 +425,7 @@ async def test_recovery_marks_terminal_reply_unverified_when_judge_not_satisfied
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -467,7 +471,7 @@ async def test_recovery_navigation_only_counts_as_progress(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
@@ -545,12 +549,16 @@ async def test_recovery_runs_post_loop_verification_from_browser_state_without_e
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.self_heal_recovery.app.AGENT_FUNCTION.get_copilot_config",
         lambda: CopilotConfig(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.self_heal_recovery.app.AGENT_FUNCTION.redact_codeblock_parameter_values",
+        lambda value, _parameters: value,
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools.page_observation._record_composition_page_observation",
@@ -601,7 +609,7 @@ async def test_recovery_fails_closed_on_wall_clock_budget(monkeypatch: pytest.Mo
     )
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
-        lambda *args, **kwargs: ("gpt-test", object(), "llm_key", True),
+        lambda *_args, **_kwargs: ("gpt-test", _fake_run_config(), "llm_key", True),
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.self_heal_recovery.app", SimpleNamespace(AGENT_FUNCTION=MagicMock()))
     monkeypatch.setattr(

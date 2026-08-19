@@ -509,6 +509,10 @@ class LocalStorage(BaseStorage):
             "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
         )
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        Path(parse_uri_to_path(uri)).unlink(missing_ok=True)
+
     def _build_browser_session_path(
         self,
         organization_id: str,
@@ -592,6 +596,7 @@ class LocalStorage(BaseStorage):
             raise PermissionError(f"No permission to access storage URI: {uri}") from e
 
         allowed_dirs = (
+            (Path(self.artifact_path) / organization_id).resolve(),
             (Path(self.artifact_path) / settings.ENV / organization_id).resolve(),
             (Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id).resolve(),
         )

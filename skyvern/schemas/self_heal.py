@@ -22,6 +22,7 @@ class HealSkipReason(StrEnum):
     capped = "capped"
     adoption_failed = "adoption_failed"
     credential_unavailable = "credential_unavailable"
+    credential_off_site = "credential_off_site"
     timeout_class = "timeout_class"
     insecure_code = "insecure_code"
     unclassifiable = "unclassifiable"

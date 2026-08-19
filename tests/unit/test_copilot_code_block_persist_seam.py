@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import textwrap
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 
@@ -30,12 +31,12 @@ def _yaml(body: str) -> str:
     return textwrap.dedent(body).strip() + "\n"
 
 
-def _ctx() -> CopilotContext:
+def _ctx(workflow_yaml: str = "") -> CopilotContext:
     ctx = CopilotContext(
         organization_id="o",
         workflow_id="w",
         workflow_permanent_id="wp",
-        workflow_yaml="",
+        workflow_yaml=workflow_yaml,
         browser_session_id=None,
         stream=None,
     )
@@ -153,6 +154,194 @@ async def test_requested_output_contract_does_not_rewrite_model_code(monkeypatch
     assert _single_code(ctx.workflow_yaml) == (
         'record_id = "{{ business_name }}"\nreturn {"output": {"record_id": record_id}}\n'
     )
+
+
+@pytest.mark.asyncio
+async def test_google_lookup_failure_reuses_collected_bindings_without_retraversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    ctx.google_connection_turn_start_bindings = ()
+    collected = False
+
+    def _collect_once(_workflow: SimpleNamespace) -> tuple[tuple[str, str], ...]:
+        nonlocal collected
+        if collected:
+            raise AssertionError("Google bindings were traversed more than once")
+        collected = True
+        return ()
+
+    async def _lookup_fails(_organization_id: str) -> NoReturn:
+        raise RuntimeError("lookup unavailable")
+
+    monkeypatch.setattr(workflow_update_module, "google_sheet_connection_bindings", _collect_once)
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _lookup_fails,
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": _code_yaml('return {"ok": True}')},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert collected is True
+
+
+@pytest.mark.asyncio
+async def test_google_notice_baseline_is_captured_before_an_update_without_sheets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
+    submitted_yaml = _code_yaml('return {"step": 1}')
+    baseline_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(("existing_sheet", "goac_existing"),),
+    )
+    submitted_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(),
+    )
+
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        if kwargs["workflow_yaml"] == baseline_yaml:
+            return baseline_workflow
+        return submitted_workflow
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda workflow: workflow.google_bindings,
+    )
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        lambda _organization_id: _empty_credentials(),
+    )
+    ctx = _ctx(baseline_yaml)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted_yaml},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.google_connection_turn_start_bindings == (("existing_sheet", "goac_existing"),)
+
+
+@pytest.mark.asyncio
+async def test_google_notice_skips_lookup_when_turn_start_baseline_cannot_be_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
+    submitted_yaml = _code_yaml('return {"step": 1}')
+    submitted_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(("new_sheet", "goac_error"),),
+    )
+
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        if kwargs["workflow_yaml"] == baseline_yaml:
+            raise RuntimeError("baseline unavailable")
+        return submitted_workflow
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    async def _unexpected_lookup(_organization_id: str) -> NoReturn:
+        raise AssertionError("credential lookup must wait for a valid baseline")
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda workflow: workflow.google_bindings,
+    )
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _unexpected_lookup,
+    )
+    ctx = _ctx(baseline_yaml)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted_yaml},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.google_connection_turn_start_bindings is None
+    assert ctx.google_connection_notices == []
+
+
+async def _empty_credentials() -> list[SimpleNamespace]:
+    return []
+
+
+@pytest.mark.asyncio
+async def test_google_notice_capture_waits_for_a_relevant_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    ctx.google_connection_turn_start_bindings = ()
+    current_bindings = iter(((), (("write_sheet", "goac_error"),)))
+    captures: list[dict[str, object]] = []
+
+    monkeypatch.setenv("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS", "/tmp/google-notice-capture")
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda _workflow: next(current_bindings),
+    )
+
+    async def _visible_credentials(_organization_id: str) -> list[SimpleNamespace]:
+        return [SimpleNamespace(id="goac_error", state="error", credential_name="Needs reconnect")]
+
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _visible_credentials,
+    )
+    monkeypatch.setattr(
+        workflow_update_module,
+        "write_google_connection_notice_capture",
+        lambda **kwargs: captures.append(kwargs),
+    )
+
+    first = await _update_workflow(
+        {"workflow_yaml": _code_yaml('return {"step": 1}')},
+        ctx,
+        allow_missing_credentials=True,
+    )
+    assert first["ok"] is True
+    assert captures == []
+    assert ctx.google_connection_notice_capture_written is False
+
+    second = await _update_workflow(
+        {"workflow_yaml": _code_yaml('return {"step": 2}')},
+        ctx,
+        allow_missing_credentials=True,
+    )
+    assert second["ok"] is True
+    assert len(captures) == 1
+    assert ctx.google_connection_notice_capture_written is True
 
 
 @pytest.mark.asyncio

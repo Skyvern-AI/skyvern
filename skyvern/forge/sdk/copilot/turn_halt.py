@@ -12,7 +12,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODES
 
 LOG = structlog.get_logger()
 
@@ -27,7 +27,7 @@ class TurnHaltVerdict(StrEnum):
 
 _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
     {
-        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        *TERMINAL_CHALLENGE_BLOCKER_REASON_CODES,
         "tool_error_run_output_terminal_blocker",
     }
 )

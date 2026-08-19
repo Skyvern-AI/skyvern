@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from enum import StrEnum
 from typing import Any
 
 import structlog
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.output_extraction_plan import unbound_candidate_relations
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -315,6 +317,10 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     for interaction in ctx.scout_trajectory:
         interaction_mapping: Mapping[str, Any] = interaction
         fact = {key: interaction_mapping[key] for key in _MODEL_SCOUT_FACT_KEYS if key in interaction_mapping}
+        for key in ("source_url", "result_url"):
+            value = fact.get(key)
+            if isinstance(value, str):
+                fact[key] = safe_page_origin(value)
         for key in _MODEL_SCOUT_NULLABLE_FACT_KEYS:
             fact.setdefault(key, None)
         facts.append(fact)
@@ -367,6 +373,19 @@ async def _evaluate_pre_hook(
         raw_output_path = params.get("output_path")
         if isinstance(raw_output_path, str) and raw_output_path.strip():
             ctx.pending_scout_read_output_path = raw_output_path.strip()
+    return None
+
+
+async def _screenshot_pre_hook(_params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+    if ctx.codeblock_redaction_parameters:
+        return {"ok": False, "error": "Screenshots are unavailable during runtime self-heal."}
+    return None
+
+
+async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+    intent = params.get("intent")
+    if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
+        return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
     return None
 
 
@@ -521,7 +540,6 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
             "copilot credential live-page admission",
             outcome="resolver_error",
             seam="page_observation",
-            exc_info=True,
         )
         return
 
@@ -648,7 +666,7 @@ async def _click_post_hook(
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
             "selector": selector,
-            "url": url,
+            "url": safe_page_origin(url) or "",
             "title": title,
         }
         await _bind_login_credential_for_observed_url(ctx, url, result)
@@ -704,6 +722,13 @@ async def _click_post_hook(
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+        elif ctx.last_scout_act_observe_outcome == "unchanged":
+            result["data"]["page_observation"] = {
+                "status": "unchanged",
+                "message": (
+                    "The page observation did not change after the click; no post-click page evidence was attached."
+                ),
+            }
     await _capture_post_interaction_screenshot(ctx)
     return result
 
@@ -736,7 +761,7 @@ async def _read_scout_field_value(ctx: AgentContext, selector: str) -> str | Non
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        LOG.debug("scout field-value read failed; leaving the value unread", exc_info=True)
+        LOG.debug("scout field-value read failed; leaving the value unread")
         return None
     if not isinstance(readback, dict) or not readback.get("ok"):
         return None
@@ -775,7 +800,7 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        LOG.debug("scout control-state probe failed; treating editability as unknown", exc_info=True)
+        LOG.debug("scout control-state probe failed; treating editability as unknown")
         return None, None
     if not isinstance(result, dict) or not result.get("ok"):
         return None, None
@@ -787,6 +812,68 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
 
 def _significant_character_count(value: str) -> int:
     return sum(1 for character in value if character.isalnum())
+
+
+class ScoutTypeVerdict(StrEnum):
+    """What a fill did to the field, decided by whoever still holds the value that was typed."""
+
+    LANDED = "landed"
+    EMPTY = "empty"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+def _scout_type_verdict(readback: str | None, typed_length: int) -> ScoutTypeVerdict:
+    """Classify a field readback against the length that was typed into it.
+
+    Only sound for a readback taken from the page itself. A value read back through the tool
+    layer has any registered secret replaced by a placeholder, so its length describes the
+    scrubber, not the field — see `GOTCHAS.md` §28.
+    """
+    if not isinstance(readback, str):
+        return ScoutTypeVerdict.UNKNOWN
+    if readback.strip() == "":
+        return ScoutTypeVerdict.EMPTY
+    # A field holding more than was typed means the text joined a value already there — a re-render
+    # can move a selector onto a neighbouring input, so a second fill appends to the wrong field and
+    # leaves the intended one empty. Count only alphanumerics: a phone/card/date input that inserts
+    # its own separators grows past the typed length without anything having landed in the wrong
+    # field, and rejecting those would fail every auto-formatting form.
+    if _significant_character_count(readback) > typed_length:
+        return ScoutTypeVerdict.MISMATCH
+    return ScoutTypeVerdict.LANDED
+
+
+def _scout_type_landing_failure(
+    verdict: ScoutTypeVerdict,
+    *,
+    tool_name: str,
+    selector: str,
+    typed_length: int,
+    significant_count: int,
+) -> dict[str, Any] | None:
+    if verdict is ScoutTypeVerdict.EMPTY:
+        return {
+            "ok": False,
+            "error": (
+                f"{tool_name} reported success but the field is still empty. "
+                f"Re-inspect the current page and retry {tool_name} on the target field. "
+                "If an overlay (cookie/marketing popup) consumed the focus, the first "
+                "interaction usually dismisses it."
+            ),
+        }
+    if verdict is ScoutTypeVerdict.MISMATCH:
+        return {
+            "ok": False,
+            "error": (
+                f"{tool_name} landed in a field that already held a value: {selector!r} now holds "
+                f"{significant_count} characters after typing {typed_length}. The selector "
+                "likely resolved to a different input than intended, leaving the target field empty. "
+                "Re-inspect the current page, confirm which input each value belongs in, clear the field, "
+                f"and retry {tool_name}."
+            ),
+        }
+    return None
 
 
 async def _verify_scout_type_landed(
@@ -805,6 +892,12 @@ async def _verify_scout_type_landed(
     fires when there is a selector to read and a positive typed length, so it never
     second-guesses intent-only types or masked/formatted values, which keep a
     non-empty value.
+
+    The readback rides the tool layer, which replaces any registered secret it finds — including
+    one the field already held, not only one this call typed. A caller that fills a registered
+    secret must classify its own readback and call `_scout_type_landing_failure` instead; a
+    readback of a field still holding a credential filled earlier in the same browser session is
+    inflated the same way and is not covered here.
     """
     if not isinstance(selector, str) or not selector.strip():
         return None
@@ -819,33 +912,13 @@ async def _verify_scout_type_landed(
         # transiently empty; settle briefly and re-read once before declaring the type lost.
         await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
         value = await _read_scout_field_value(ctx, selector)
-    if isinstance(value, str) and value.strip() == "":
-        return {
-            "ok": False,
-            "error": (
-                "type_text reported success but the field is still empty — an overlay "
-                "(cookie/marketing popup) likely consumed the keystrokes or focus. "
-                "Re-inspect the current page and retry typing into the target field; "
-                "the overlay is usually dismissed by that first interaction."
-            ),
-        }
-    # A field holding more than was typed means the text joined a value already there — a re-render
-    # can move a selector onto a neighbouring input, so a second fill appends to the wrong field and
-    # leaves the intended one empty. Count only alphanumerics: a phone/card/date input that inserts
-    # its own separators grows past the typed length without anything having landed in the wrong
-    # field, and rejecting those would fail every auto-formatting form.
-    if isinstance(value, str) and _significant_character_count(value) > typed_length:
-        return {
-            "ok": False,
-            "error": (
-                f"type_text landed in a field that already held a value: {selector!r} now holds "
-                f"{_significant_character_count(value)} characters after typing {typed_length}. The selector "
-                "likely resolved to a different input than intended, leaving the target field empty. "
-                "Re-inspect the current page, confirm which input each value belongs in, clear the field, "
-                "and retry."
-            ),
-        }
-    return None
+    return _scout_type_landing_failure(
+        _scout_type_verdict(value, typed_length),
+        tool_name="type_text",
+        selector=selector,
+        typed_length=typed_length,
+        significant_count=_significant_character_count(value) if isinstance(value, str) else 0,
+    )
 
 
 async def _type_text_post_hook(
@@ -1053,10 +1126,10 @@ def _record_scouted_read(
         "copilot_scouted_read_attribution",
         declared=bool(declared_output_path),
         attributed_by="declaration" if declared_output_path == output_path else "elimination",
-        bound_output_path=output_path,
-        declaration_only_output_path=declared_output_path or "output.scouted_read",
+        bound_output_path_present=bool(output_path),
+        declaration_only_output_path_present=bool(declared_output_path),
         requested_output_count=len(requested),
-        read_result_shape=type(result).__name__,
+        read_result_present=result is not None,
     )
     interaction: ScoutedInteraction = {
         "tool_name": "read_value",
@@ -1138,8 +1211,8 @@ async def _evaluate_post_hook(
     if recorded is not None:
         LOG.info(
             "copilot_scouted_read_recorded",
-            read_result_shape=recorded.get("read_result_shape"),
-            read_output_path=recorded.get("read_output_path"),
+            read_result_present=bool(recorded.get("read_result_shape")),
+            read_output_path_present=bool(recorded.get("read_output_path")),
             witnessed_value_kept=bool(recorded.get("read_result_value")),
             trajectory_len=len(ctx.scout_trajectory),
         )
@@ -1155,13 +1228,13 @@ async def _evaluate_post_hook(
             }
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
-                read_output_path=claimed_path,
-                read_result_shape=recorded.get("read_result_shape"),
+                read_output_path_present=bool(claimed_path),
+                read_result_present=bool(recorded.get("read_result_shape")),
             )
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested
-        LOG.info("copilot_requested_output_unread_after_read", unread=unread_requested)
+        LOG.info("copilot_requested_output_unread_after_read", unread_count=len(unread_requested))
     if _copilot_block_authoring_policy(
         ctx
     ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
@@ -1447,6 +1520,7 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url", "selector"}),
             forced_args={"inline": True},
             requires_browser=True,
+            pre_hook=_screenshot_pre_hook,
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
@@ -1520,6 +1594,7 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
+            pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
         ),
         "console_messages": SchemaOverlay(

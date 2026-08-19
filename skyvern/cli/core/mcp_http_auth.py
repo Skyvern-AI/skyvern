@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from fastapi import HTTPException
+from fastmcp.server.dependencies import get_http_request
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from starlette.requests import Request
@@ -612,6 +613,19 @@ def _service_unavailable_response(message: str) -> JSONResponse:
         status_code=503,
         headers={"Retry-After": "30"},
     )
+
+
+def request_organization_id() -> str | None:
+    """Return the org id MCPAPIKeyMiddleware pinned on the current HTTP request.
+
+    None outside an HTTP request (stdio) or before authentication ran. The write
+    side is `_forward_authenticated_request` below; keep reader and writer together.
+    """
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return None
+    return getattr(getattr(request, "state", None), "organization_id", None)
 
 
 class MCPAPIKeyMiddleware:

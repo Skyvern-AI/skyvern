@@ -4,9 +4,11 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Literal
+from urllib.parse import urlsplit
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.constants import PERMANENT_NAV_ERRORS, SKIP_INNER_NAV_RETRY_ERRORS
 from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, FailedToNavigateToUrl, InvalidUrl
 from skyvern.utils.url_validators import canonical_navigation_host, is_blocked_host
@@ -109,6 +111,25 @@ def is_permanent_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in PERMANENT_NAV_ERRORS)
 
 
+def redact_url_secrets(url: str) -> str:
+    """Reduce a URL to scheme and host for display.
+
+    A single-use sign-in link carries its bearer token in the path, query, or fragment, and the
+    display value below reaches both the logs and the run's user-visible failure_reason.
+    """
+    split = urlsplit(url)
+    # hostname, not netloc: netloc carries any user:password@ prefix.
+    host = split.hostname
+    if not split.scheme or not host:
+        return "<redacted>"
+    port = f":{split.port}" if split.port else ""
+    return f"{split.scheme}://{host}{port}/<redacted>"
+
+
+async def default_navigation_settle() -> None:
+    await asyncio.sleep(settings.BROWSER_ACTION_TIMEOUT_MS / 1000)
+
+
 async def navigate_with_retry(
     navigate: NavigateFunc,
     url: str,
@@ -116,18 +137,33 @@ async def navigate_with_retry(
     settle: SettleFunc,
     wait_until: Literal["load", "domcontentloaded", "commit"] = "load",
     sleep: SleepFunc | None = None,
+    log_url: str | None = None,
 ) -> None:
     # Late-bound so a test patching ``asyncio.sleep`` reaches the retry backoff.
     if sleep is None:
         sleep = asyncio.sleep
     degradation = _DEGRADATION_MAP.get(wait_until, [wait_until])
+    # Callers navigating to a secret URL pass a redacted display value; validation and the
+    # navigation itself still use the real one.
+    display_url = log_url if log_url is not None else url
+
+    # A redacting caller also loses the exception chain and traceback: both carry the original
+    # message, and a secret URL must not survive in either.
+    redacting = log_url is not None
 
     # Fail closed before any request is dispatched so a blocked target never reaches the browser.
-    await asyncio.to_thread(validate_navigation_destination, url)
+    try:
+        await asyncio.to_thread(validate_navigation_destination, url)
+    except BlockedNavigationDestination as error:
+        # A self-hosted portal's sign-in link can legitimately resolve to a private host, so the
+        # refused URL is as much a secret as an accepted one.
+        if not redacting:
+            raise
+        raise BlockedNavigationDestination(url=display_url, reason=error.reason) from None
 
     for attempt in range(retry_times):
         strategy = degradation[min(attempt, len(degradation) - 1)]
-        LOG.info("Trying to navigate to url", url=url, retry_time=attempt, wait_until=strategy)
+        LOG.info("Trying to navigate to url", url=display_url, retry_time=attempt, wait_until=strategy)
         try:
             start_time = time.monotonic()
             response = await navigate(strategy)
@@ -135,24 +171,33 @@ async def navigate_with_retry(
             # layer, so a public entry point can still land on an internal host (SKY-13112).
             await _revalidate_navigation_response(response)
             elapsed = time.monotonic() - start_time
-            LOG.info("Page loading time", loading_time=elapsed, url=url, wait_until=strategy)
+            LOG.info("Page loading time", loading_time=elapsed, url=display_url, wait_until=strategy)
             await settle()
-            LOG.info("Successfully navigated to url", url=url, retry_time=attempt, wait_until=strategy)
+            LOG.info("Successfully navigated to url", url=display_url, retry_time=attempt, wait_until=strategy)
             return
 
-        except BlockedNavigationDestination:
+        except BlockedNavigationDestination as error:
             # Blocked destinations are permanent; retrying re-issues the same request.
-            raise
+            if not redacting:
+                raise
+            # This one names a refused redirect hop, not the requested url, so redact that hop
+            # rather than substituting the caller's display value for it.
+            raise BlockedNavigationDestination(url=redact_url_secrets(error.url), reason=error.reason) from None
         except Exception as error:
             error_str = str(error)
+            # Playwright names the destination in its own message, so the raw text carries the
+            # secret even though the url field is redacted. Match on the raw text, report the safe one.
+            safe_error_str = error_str.replace(url, display_url) if log_url is not None else error_str
 
             if is_skip_inner_retry_error(error_str):
                 LOG.warning(
                     "Non-retriable navigation error, failing immediately",
-                    url=url,
-                    error=error_str,
+                    url=display_url,
+                    error=safe_error_str,
                 )
-                raise FailedToNavigateToUrl(url=url, error_message=error_str) from error
+                raise FailedToNavigateToUrl(url=display_url, error_message=safe_error_str) from (
+                    None if redacting else error
+                )
 
             if attempt >= retry_times - 1:
                 # Terminal navigation failure is re-raised as FailedToNavigateToUrl and surfaced
@@ -160,19 +205,21 @@ async def navigate_with_retry(
                 # (site-unreachable) outcome. Keep the traceback, drop the error level.
                 LOG.warning(
                     "Failed to navigate after retries",
-                    url=url,
+                    url=display_url,
                     retry_times=retry_times,
-                    error=error_str,
-                    exc_info=True,
+                    error=safe_error_str,
+                    exc_info=not redacting,
                 )
-                raise FailedToNavigateToUrl(url=url, error_message=error_str) from error
+                raise FailedToNavigateToUrl(url=display_url, error_message=safe_error_str) from (
+                    None if redacting else error
+                )
 
             LOG.warning(
                 "Error while navigating to url, retrying",
-                exc_info=True,
-                url=url,
+                exc_info=not redacting,
+                url=display_url,
                 retry_time=attempt,
                 wait_until=strategy,
-                error=error_str,
+                error=safe_error_str,
             )
             await sleep(1)

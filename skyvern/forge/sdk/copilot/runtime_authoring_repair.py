@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import re
 from typing import Any, TypeGuard
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ChallengeKind,
     interactive_challenge_controls,
     is_carrier_backed_category_entry,
+    typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
@@ -108,6 +111,19 @@ def _origin_from_runtime_url(value: Any) -> str | None:
     return url_origin(value)
 
 
+def _safe_runtime_page_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    redacted = redact_raw_secrets_for_prompt(value)
+    try:
+        parsed = urlsplit(redacted)
+    except ValueError:
+        return None
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    safe_url = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return _bounded_runtime_text(safe_url, 160) or None
+
+
 def _runtime_summary_entry(entry: Any, keys: tuple[str, ...]) -> str:
     if not isinstance(entry, dict):
         return _bounded_runtime_text(entry)
@@ -181,6 +197,14 @@ def post_run_inspection_cleanly_matches(evidence: Any, run_id: Any) -> bool:
         and evidence.get("workflow_run_id") == run_id
         and has_bounded_page_schema(evidence)
     )
+
+
+def same_run_typed_challenge_kind(evidence: dict[str, Any] | None, run_id: str | None) -> ChallengeKind | None:
+    """The classifier kind only when the packet was observed after this very run, so a stale or
+    foreign packet cannot name the wall a later run hit."""
+    if not post_run_inspection_cleanly_matches(evidence, run_id):
+        return None
+    return typed_challenge_kind(evidence)
 
 
 def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
@@ -378,21 +402,25 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
         return None
     current_url = evidence.get("current_url") or evidence.get("inspected_url")
     page_title = evidence.get("page_title") or evidence.get("title")
+    page_form_summaries = _runtime_form_summaries(evidence.get("forms"))
+    page_result_summaries = _runtime_result_summaries(evidence.get("result_containers"))
+    page_action_summaries = _runtime_summary_list(evidence.get("navigation_targets"), ("text", "selector", "disabled"))
+    page_challenge_summaries = _runtime_summary_list(
+        evidence.get("challenge_controls"), ("text", "selector", "disabled")
+    )
     finalized = pending.model_copy(
         update={
             "current_origin": _origin_from_runtime_url(current_url),
-            "current_url_present": isinstance(current_url, str) and bool(current_url.strip()),
-            "current_title_present": isinstance(page_title, str) and bool(page_title.strip()),
+            "current_url": _safe_runtime_page_url(current_url),
+            "current_title": _bounded_runtime_text(page_title, 160) or None,
             "page_evidence_source": _bounded_runtime_text(evidence.get("source_tool"), 80) or None,
-            "observed_after_workflow_run": True,
-            "page_form_summaries": _runtime_form_summaries(evidence.get("forms")),
-            "page_result_summaries": _runtime_result_summaries(evidence.get("result_containers")),
-            "page_action_summaries": _runtime_summary_list(
-                evidence.get("navigation_targets"), ("text", "selector", "disabled")
+            "observed_after_workflow_run": bool(
+                page_form_summaries or page_result_summaries or page_action_summaries or page_challenge_summaries
             ),
-            "page_challenge_summaries": _runtime_summary_list(
-                evidence.get("challenge_controls"), ("text", "selector", "disabled")
-            ),
+            "page_form_summaries": page_form_summaries,
+            "page_result_summaries": page_result_summaries,
+            "page_action_summaries": page_action_summaries,
+            "page_challenge_summaries": page_challenge_summaries,
         }
     )
     copilot_ctx.last_code_authoring_repair_context = finalized

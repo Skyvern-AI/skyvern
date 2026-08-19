@@ -31,6 +31,7 @@ interface StartSettings {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
   browserProfileId: string | null;
   browserProfileKey: string | null;
@@ -67,6 +68,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         : ProxyLocation.Residential,
       persistBrowserSession: data.withWorkflowSettings
         ? data.persistBrowserSession
+        : false,
+      reuseBrowserSession: data.withWorkflowSettings
+        ? data.reuseBrowserSession
         : false,
       pinSavedSessionIp: data.withWorkflowSettings
         ? data.pinSavedSessionIp

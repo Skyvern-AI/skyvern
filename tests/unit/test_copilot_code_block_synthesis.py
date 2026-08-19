@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _INDENT,
     _MAX_STEPS,
     _READONLY_DEFERRED_VAR,
+    _REQUIRED_STATE_TIMEOUT_MS,
     CREDENTIAL_FILL_TOOL_NAME,
     INPUT_TEMPLATED_PROVENANCE_SOURCE,
     LOCATOR_WITNESS_PARAM_SOURCE,
@@ -2309,6 +2310,24 @@ class TestCredentialFillSynthesis:
         assert result is not None
         assert 'await page.locator("#totpCode").fill(await authtest_simple.otp())' in result.code
 
+    def test_an_in_call_submit_survives_as_a_click_after_the_one_time_code_fill(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6),
+                _interaction(
+                    "click",
+                    selector="#verifyButton",
+                    source_url="https://authenticationtest.com/simpleFormAuth/",
+                    role="button",
+                    accessible_name="Verify",
+                ),
+            ]
+        )
+        assert result is not None
+        assert 'await page.locator("#totpCode").fill(await authtest_simple.otp())' in result.code
+        assert "#verifyButton" in result.code
+        assert ".click()" in result.code
+
     def test_runtime_otp_fill_is_detected_as_credential_fill_code(self) -> None:
         assert code_contains_credential_fill('await page.locator("#otp").fill(await login_credential.otp())')
 
@@ -3583,39 +3602,39 @@ def _run_synthesized_block(code: str, page: _FakePage, portal: object) -> None:
     asyncio.run(namespace["_block"](page, portal))
 
 
-class TestLoginOnlyPresenceGuardSynthesis:
-    def _login_only_trajectory(self, *, submit: dict[str, Any]) -> list[dict[str, Any]]:
+class TestLoginEntryReadinessSynthesis:
+    def _login_trajectory(self, *, submit: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             _credential_fill(selector="#username", credential_field="username"),
             _credential_fill(selector="#password", credential_field="password"),
             submit,
         ]
 
-    def test_click_submit_wraps_whole_prefix_in_count_guard(self) -> None:
-        traj = self._login_only_trajectory(
+    def test_login_waits_for_entry_target_instead_of_skipping_on_immediate_count(self) -> None:
+        traj = self._login_trajectory(
             submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
-        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
-        guard_line = next(i for i, ln in enumerate(result.code.splitlines()) if ".count() == 1:" in ln)
-        body = result.code.splitlines()[guard_line + 1 : guard_line + 5]
-        assert any(".fill(portal.username)" in ln for ln in body)
-        assert any(".fill(portal.password)" in ln for ln in body)
-        assert any('page.locator("#login-btn").click()' in ln for ln in body)
-        assert all(ln.startswith(_INDENT * 2) for ln in body)
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" not in result.code
+        assert (
+            f'await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})' in result.code
+        )
+        assert f'{_INDENT}await page.locator("#username").fill(portal.username)' in result.code
+        assert f'{_INDENT}await page.locator("#password").fill(portal.password)' in result.code
+        assert f'{_INDENT}await page.locator("#login-btn").click()' in result.code
 
-    def test_enter_submit_is_recognized_and_guarded(self) -> None:
-        traj = self._login_only_trajectory(
+    def test_enter_submit_is_recognized_after_entry_target_wait(self) -> None:
+        traj = self._login_trajectory(
             submit=_interaction("press_key", selector="#password", key="Enter", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
-        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" in result.code
-        assert '        await page.locator("#password").press("Enter")' in result.code
+        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" not in result.code
+        assert f'{_INDENT}await page.locator("#password").press("Enter")' in result.code
 
     def test_present_state_runs_full_login(self) -> None:
-        traj = self._login_only_trajectory(
+        traj = self._login_trajectory(
             submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
@@ -3625,31 +3644,33 @@ class TestLoginOnlyPresenceGuardSynthesis:
         assert page.filled == ["#username", "#password"]
         assert page.clicked == ["#login-btn"]
 
-    def test_absent_state_skips_login_without_timeout(self) -> None:
-        traj = self._login_only_trajectory(
+    def test_absent_state_fails_at_login_target_instead_of_falling_through(self) -> None:
+        traj = self._login_trajectory(
             submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
         page = _FakePage({})
-        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        with pytest.raises(TimeoutError, match="#username not visible"):
+            _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
         assert page.filled == []
         assert page.clicked == []
         assert page.goto_calls == ["https://example.com/login"]
 
-    def test_multiple_match_state_does_not_strict_mode_fail(self) -> None:
-        traj = self._login_only_trajectory(
+    def test_multiple_match_state_fails_at_ambiguous_login_target(self) -> None:
+        traj = self._login_trajectory(
             submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
         page = _FakePage({"#username": 2, "#password": 2, "#login-btn": 2})
-        _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
+        with pytest.raises(AssertionError, match="strict-mode fill on #username with count 2"):
+            _run_synthesized_block(result.code, page, SimpleNamespace(username="u", password="p"))
         assert page.filled == []
         assert page.clicked == []
 
     def test_login_field_rendered_after_goto_is_filled_not_skipped(self) -> None:
-        traj = self._login_only_trajectory(
+        traj = self._login_trajectory(
             submit=_interaction("click", selector="#login-btn", source_url="https://example.com/login")
         )
         result = synthesize_code_block(traj, strict_selectors=True)
@@ -3755,23 +3776,6 @@ def test_login_submit_emits_solve_captcha_after_navigation_commit() -> None:
     assert result.code.count("await solve_captcha(page)") == 1
 
 
-def test_typed_challenge_boundary_emits_solve_captcha() -> None:
-    trajectory = [
-        _interaction(
-            "click",
-            selector="#continue",
-            source_url="https://example.com/challenge",
-            challenge_state={"detected": True, "evidence_source": "challenge_state"},
-        )
-    ]
-
-    result = synthesize_code_block(trajectory, strict_selectors=True)
-
-    assert result is not None
-    assert result.code.count("await solve_captcha(page)") == 1
-    assert result.code.index("await solve_captcha(page)") > result.code.index('await page.locator("#continue").click()')
-
-
 def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
     trajectory = [
         _interaction("click", selector="#download-report", source_url="https://example.com/reports"),
@@ -3783,33 +3787,11 @@ def test_non_login_trajectory_does_not_emit_solve_captcha() -> None:
     assert "solve_captcha" not in result.code
 
 
-def _captcha_click(challenge_state: dict[str, Any] | None = None) -> dict[str, Any]:
-    click: dict[str, Any] = {
-        "tool_name": "click",
-        "selector": "button.btn--login",
-        "source_url": "https://example.com/login",
-        "trajectory_index": 0,
-    }
-    if challenge_state is not None:
-        click["challenge_state"] = challenge_state
-    return click
-
-
-def test_stamped_challenge_carrier_emits_solve_captcha_after_the_click() -> None:
+def test_unstamped_click_emits_no_solve_captcha() -> None:
     result = synthesize_code_block(
-        [_captcha_click({"evidence_source": "challenge_state"})],
+        [_interaction("click", selector="button.btn--login", source_url="https://example.com/login")],
         strict_selectors=True,
     )
-    assert result is not None
-    lines = [line.strip() for line in result.code.splitlines() if line.strip()]
-    click_index = next(i for i, line in enumerate(lines) if ".click()" in line)
-    solve_index = next(i for i, line in enumerate(lines) if line == "await solve_captcha(page)")
-    assert solve_index > click_index
-    assert lines[click_index + 1 : solve_index] == ['await page.wait_for_load_state("domcontentloaded")']
-
-
-def test_unstamped_click_emits_no_solve_captcha() -> None:
-    result = synthesize_code_block([_captcha_click()], strict_selectors=True)
     assert result is not None
     assert "solve_captcha" not in result.code
 

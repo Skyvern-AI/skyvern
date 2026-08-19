@@ -2181,6 +2181,22 @@ def test_secure_runner_classification_treats_browser_disconnected_as_non_healabl
     assert classification.skip_reason == HealSkipReason.unclassifiable
 
 
+def test_secure_runner_does_not_heal_native_playwright_disconnect_when_hint_is_false() -> None:
+    block = _make_code_block()
+    classification = block._classify_secure_runner_failure(
+        CodeBlockEngineFailure(
+            error_code="browser_disconnected",
+            safe_message=None,
+            failure_reason=None,
+            exception_class="playwright._impl._errors.TargetClosedError",
+            failing_line=3,
+            healability_hint=False,
+        )
+    )
+    assert classification.healable is False
+    assert classification.skip_reason == HealSkipReason.unclassifiable
+
+
 @pytest.mark.asyncio
 async def test_self_heal_passes_pre_resolved_browser_state_by_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.config.settings.ENABLE_CODE_BLOCK_SELF_HEALING", True, raising=False)
@@ -2297,13 +2313,14 @@ async def test_heal_output_write_failure_does_not_finalize_completed(monkeypatch
     record_output_mock = AsyncMock(side_effect=write_error)
     monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output_mock)
 
-    with pytest.raises(RuntimeError, match="output parameter write failed"):
+    with pytest.raises(RuntimeError) as exc_info:
         await block.execute(
             workflow_run_id="wr_test",
             workflow_run_block_id="wrb_test",
             organization_id="o_test",
             browser_session_id="pbs_test",
         )
+    assert exc_info.value.args == ()
 
     assert record_output_mock.await_count == 1
     assert len(FakeRecorder.instances) == 1

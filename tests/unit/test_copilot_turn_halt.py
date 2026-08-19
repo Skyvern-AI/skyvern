@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.run_outcome import (
+    DEVICE_APPROVAL_BLOCKER_REASON_CODE,
+    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+)
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHaltKind,
@@ -32,6 +35,21 @@ def test_terminal_challenge_stashes_local_halt() -> None:
     halt = stash_turn_halt_from_blocker_signal(
         ctx,
         _signal(TERMINAL_CHALLENGE_BLOCKER_REASON_CODE),
+        source="test",
+    )
+
+    assert halt is not None
+    assert halt.kind is TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)
+
+
+def test_device_approval_challenge_stashes_local_halt() -> None:
+    ctx = SimpleNamespace(turn_halt=None)
+
+    halt = stash_turn_halt_from_blocker_signal(
+        ctx,
+        _signal(DEVICE_APPROVAL_BLOCKER_REASON_CODE),
         source="test",
     )
 

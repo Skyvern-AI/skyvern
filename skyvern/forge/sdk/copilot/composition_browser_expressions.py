@@ -313,7 +313,7 @@ COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "})()"
 )
 
-# Safety bound; an over-cap payload is treated as a failed extraction and falls back to get_html.
+# Safety bound; an over-cap payload is returned as a typed structured-extraction failure.
 COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS = 120_000
 
 # Injected from composition_evidence so the JS matches the parser's caps/vocabulary (single source of truth).
@@ -338,7 +338,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_MODAL_DISMISS_CONTROLS={int(_MAX_MODAL_DISMISS_CONTROLS)};"
     f"const MAX_PAGE_OBSTRUCTIONS={int(_MAX_PAGE_OBSTRUCTIONS)};"
     f"const MAX_VISIBLE_TEXT_EXCERPT_CHARS={int(_MAX_VISIBLE_TEXT_EXCERPT_CHARS)};"
-    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};"
+    f"const ANTI_BOT_SCAN_BYTES={int(_ANTI_BOT_SCAN_BYTES)};" + _JS_IMPLICIT_ROLE_HELPER
 )
 
 # Mirrors parse_composition_html's structural extraction; Python re-bounds the values to the exact caps.
@@ -370,6 +370,195 @@ const resolvesUniquely = (sel, el) => {
   if (!sel) return false;
   try { const m = document.querySelectorAll(sel); return m.length === 1 && m[0] === el; } catch (e) { return false; }
 };
+const TEXT_ANCHOR_MAX_HOPS = 4;
+const TEXT_ANCHOR_MAX_LABELS = 4;
+const TEXT_ANCHOR_MAX_LABEL_CHARS = 60;
+const TEXT_ANCHOR_MAX_VALUE_ANCHORS = 2;
+const labelLike = (text) => text.length >= 2 && text.indexOf('{') < 0;
+// Page data ("9.42K", "+13.4%", "1,284") renames itself on the next refresh, so it anchors a node only
+// when no wordy leaf in the same ancestor does. A digit alone does not make a name unstable — "Q3
+// revenue" is as durable as any label — so a word carries the text back to the label side.
+const valueLike = (text) => /\d/.test(text) && !/[A-Za-z]{3}/.test(text);
+// Playwright resolves :has-text() itself and document.querySelectorAll throws on it, so the rung that
+// emits a text anchor owns its own uniqueness check and the CSS filter must skip what it emitted.
+// nodeText truncates at FIELD_CAP so one element cannot bloat the payload, but :has-text() reads the
+// element's whole text. Matching on the capped copy would miss a same-shape competitor whose label sits
+// past the cap and certify an anchor Playwright then resolves to two elements — so this compare, which
+// feeds no payload, reads the full text.
+// :has-text() reads rendered text and sees through open shadow roots, while querySelectorAll stops at
+// the shadow boundary and textContent counts script bodies. Matching on the narrower view certifies an
+// anchor Playwright then resolves to two elements, so this walks the same ground the engine will.
+let openRootIndex = null;
+const openRoots = () => {
+  if (!openRootIndex) {
+    openRootIndex = [document];
+    const stack = [document];
+    while (stack.length) {
+      const root = stack.pop();
+      let hosts; try { hosts = Array.from(root.querySelectorAll('*')); } catch (e) { hosts = []; }
+      for (const host of hosts) {
+        if (host.shadowRoot) { openRootIndex.push(host.shadowRoot); stack.push(host.shadowRoot); }
+      }
+    }
+  }
+  return openRootIndex;
+};
+const renderedText = (el) => {
+  if (!el) return '';
+  let parts = el.shadowRoot ? ' ' + String(el.shadowRoot.textContent || '') : '';
+  let kids; try { kids = Array.from(el.querySelectorAll('*')); } catch (e) { kids = []; }
+  for (const kid of kids) if (kid.shadowRoot) parts += ' ' + String(kid.shadowRoot.textContent || '');
+  const own = String(el.textContent || '');
+  let scripts; try { scripts = Array.from(el.querySelectorAll('script,style')); } catch (e) { scripts = []; }
+  let text = own;
+  for (const dead of scripts) text = text.split(String(dead.textContent || '')).join(' ');
+  return (text + parts).split(/\s+/).join(' ').trim();
+};
+const untruncatedText = renderedText;
+const anchorMatches = (base, label) => {
+  const needle = String(label).toLowerCase();
+  const found = [];
+  for (const root of openRoots()) {
+    let nodes; try { nodes = Array.from(root.querySelectorAll(base)); } catch (e) { continue; }
+    for (const node of nodes) if (renderedText(node).toLowerCase().indexOf(needle) >= 0) found.push(node);
+  }
+  return found;
+};
+const shapeSelector = (el) => (el.tagName || '*').toLowerCase() + classSelector(classesFor(el));
+const anchorSelector = (base, label) => base + ':has-text("' + cssAttr(label) + '")';
+// One document pass keyed by ancestor, so a page of candidate nodes costs a single walk rather than
+// a subtree scan per node; only leaves within TEXT_ANCHOR_MAX_HOPS of an ancestor are reachable.
+let anchorLeafIndex = null;
+const anchorLeavesFor = (el) => {
+  if (!anchorLeafIndex) {
+    anchorLeafIndex = new Map();
+    for (const leaf of document.querySelectorAll('*')) {
+      if (leaf.children && leaf.children.length) continue;
+      const leafText = nodeText(leaf);
+      if (!leafText || leafText.length > TEXT_ANCHOR_MAX_LABEL_CHARS || !labelLike(leafText)) continue;
+      let node = leaf.parentElement;
+      for (let hops = 0; node && hops < TEXT_ANCHOR_MAX_HOPS; hops++, node = node.parentElement) {
+        const bucket = anchorLeafIndex.get(node);
+        // Every leaf is kept: dropping by document order would decide which labels are even
+        // considered before any of them is ranked, and the best label is often not the first.
+        if (!bucket) { anchorLeafIndex.set(node, [{ el: leaf, text: leafText }]); continue; }
+        bucket.push({ el: leaf, text: leafText });
+      }
+    }
+  }
+  return anchorLeafIndex.get(el) || [];
+};
+const textAnchorCandidateFor = (base, label, anchor, inner, el) => {
+  const selector = anchorSelector(base, label) + (inner ? ' ' + inner : '');
+  if (selector.length > MAX_SELECTOR_CHARS) return null;
+  const anchors = anchorMatches(base, label);
+  if (anchors.length !== 1 || anchors[0] !== anchor) return null;
+  if (inner) {
+    let within; try { within = Array.from(anchor.querySelectorAll(inner)); } catch (e) { return null; }
+    if (within.length !== 1 || within[0] !== el) return null;
+  }
+  return { selector: selector, source: 'text_anchor' };
+};
+const textAnchorCandidatesFor = (el) => {
+  const out = [];
+  const ownText = nodeText(el);
+  const shape = shapeSelector(el);
+  // A control usually names itself ("Export", "Sign in"); anchoring it on a neighbour's text when its
+  // own text is unique offers a weaker selector than the one a person would write.
+  if (ownText && readsAsOneLeaf(el) && ownText.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && labelLike(ownText)) {
+    const candidate = textAnchorCandidateFor(shape, ownText, el, '', el);
+    if (candidate) out.push(candidate);
+  }
+  let node = el;
+  for (let hops = 0; node && node.tagName !== 'BODY' && node.tagName !== 'HTML' && hops <= TEXT_ANCHOR_MAX_HOPS; hops++, node = node.parentElement) {
+    const base = shapeSelector(node);
+    if (!base) continue;
+    const inner = node === el ? '' : shape;
+    const leaves = anchorLeavesFor(node).filter((leaf) => leaf.el !== el && leaf.text !== ownText);
+    leaves.sort((a, b) => (valueLike(a.text) ? 1 : 0) - (valueLike(b.text) ? 1 : 0) || a.text.length - b.text.length);
+    for (const leaf of leaves.slice(0, TEXT_ANCHOR_MAX_LABELS)) {
+      const candidate = textAnchorCandidateFor(base, leaf.text, node, inner, el);
+      if (!candidate) continue;
+      // A stable label is the anchor worth having, so it ends the climb. Anchors built from page data
+      // never do: a card whose figure and delta sit beside each other would otherwise stop the walk on
+      // two volatile anchors and never reach the label one level up that actually names it.
+      if (!valueLike(leaf.text)) { out.unshift(candidate); return out; }
+      if (out.length < TEXT_ANCHOR_MAX_VALUE_ANCHORS) out.push(candidate);
+    }
+  }
+  return out;
+};
+// A wrong label is worse than none: it is the field a staleness check compares against, so every
+// rung here must name THIS node. Own name first, then the explicit label[for] association, then the
+// label-then-value shape, and only then the nearest labelling ancestor scoped to that ancestor's own
+// children — an ancestor-wide querySelector returns the first label in the whole subtree, which on a
+// flat form is a sibling field's label rather than this one's.
+const NAMING_SELECTOR = 'label,h1,h2,h3,h4,[aria-label]';
+const CONTROL_SELECTOR = 'input,select,textarea,button,[role="textbox"],[role="combobox"]';
+const VALUE_DEPENDENT_SOURCES = new Set(['name_value', 'class_value']);
+const NAMED_BY_OWN_TEXT_ROLES = new Set(['button', 'link', 'menuitem', 'tab', 'option', 'checkbox', 'radio']);
+const namingTextOf = (node) => attr(node, 'aria-label') || nodeText(node);
+const labelContextFor = (el) => {
+  const own = attr(el, 'aria-label');
+  if (own) return own;
+  const id = attr(el, 'id');
+  if (id) {
+    let associated = null;
+    try { associated = document.querySelector('label[for="' + cssAttr(id) + '"]'); } catch (e) { associated = null; }
+    if (associated) return namingTextOf(associated);
+  }
+  const wrapping = el.closest && el.closest('label');
+  if (wrapping) {
+    const text = nodeText(wrapping).split(nodeText(el)).join('').trim();
+    if (text) return text;
+  }
+  if (readsAsOneLeaf(el)) {
+    // A control's own text is its name, digits and all — a button reading "2024" is called 2024. A
+    // passive node whose text is the datum ("9.42K") is not named by it, and echoing the value there
+    // would make every refresh look like the element changed identity.
+    const ownText = nodeText(el);
+    const named = NAMED_BY_OWN_TEXT_ROLES.has(attr(el, 'role') || implicitRole(el));
+    if (ownText && (named || !valueLike(ownText))) return ownText;
+  }
+  const inner = el.querySelector && el.querySelector(NAMING_SELECTOR);
+  if (inner) return namingTextOf(inner);
+  const first = el.firstElementChild;
+  if (first && !(first.children || []).length && (el.children || []).length > 1) {
+    const leading = nodeText(first);
+    if (leading && !valueLike(leading)) return leading;
+  }
+  let node = el.parentElement;
+  for (let hops = 0; node && hops < TEXT_ANCHOR_MAX_HOPS; hops++, node = node.parentElement) {
+    // A label that sits beside a field names the field it precedes, so document order decides which
+    // one is ours. Taking the first match instead would give every field on a flat form the first
+    // field's label — a confident wrong name, which a staleness check trusts as readily as a right one.
+    const kids = Array.from(node.children || []);
+    const mine = kids.indexOf(kids.find((k) => k === el || k.contains(el)));
+    const naming = kids.filter((k) => k !== el && !k.contains(el) && k.matches && k.matches(NAMING_SELECTOR));
+    // A label names the control it sits next to, so another control standing between the two means the
+    // label is that one's, not ours. Without this a lone trailing label is handed to every field above
+    // it, and a leading label to every field below — a confident wrong name, which the check that reads
+    // this field trusts exactly as readily as a right one.
+    const controlBetween = (from, to) => kids
+      .slice(Math.min(from, to) + 1, Math.max(from, to))
+      .some((k) => k.matches && (k.matches(CONTROL_SELECTOR) || k.querySelector(CONTROL_SELECTOR)));
+    const adjacent = naming.filter((k) => !controlBetween(kids.indexOf(k), mine));
+    if (adjacent.length) {
+      const preceding = adjacent.filter((k) => kids.indexOf(k) < mine);
+      // Nothing precedes us and several could apply: no honest pick, so say nothing.
+      if (!preceding.length && adjacent.length > 1) return '';
+      return namingTextOf(preceding.length ? preceding[preceding.length - 1] : adjacent[0]);
+    }
+  }
+  return '';
+};
+// The label is reported whole. It is what a later check compares an element against, and a prefix that
+// reads like a name would make a truncation look like a rename; nodeText's own bound still applies.
+const identityFor = (el) => ({
+  tag: (el.tagName || '').toLowerCase(),
+  role: attr(el, 'role') || implicitRole(el),
+  label_context: labelContextFor(el),
+});
 const structuralPath = (el) => {
   const parts = [];
   let node = el;
@@ -403,29 +592,62 @@ const structuralPath = (el) => {
 const selectorCandidatesFor = (el) => {
   const tag = (el.tagName || '*').toLowerCase();
   const candidates = [];
+  // Same bound the parser applies, enforced before the payload is measured: an over-length selector is
+  // dropped either way, so shipping it only spends the packet's size budget — and an oversized packet
+  // is discarded whole, costing every other carrier on the page.
+  const offer = (selector, source) => {
+    if (selector && selector.length <= MAX_SELECTOR_CHARS) candidates.push({ selector: selector, source: source });
+  };
   const id = attr(el, 'id');
-  if (id) candidates.push(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]');
+  if (id) offer(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]', 'id');
   const name = attr(el, 'name'); const value = attr(el, 'value');
-  if (name && value) candidates.push(tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]');
+  if (name && value) offer(tag + '[name="' + cssAttr(name) + '"][value="' + cssAttr(value) + '"]', 'name_value');
   const classes = classesFor(el); const cs = classSelector(classes);
-  if (cs && value) candidates.push(tag + cs + '[value="' + cssAttr(value) + '"]');
-  if (name) candidates.push(tag + '[name="' + cssAttr(name) + '"]');
+  if (cs && value) offer(tag + cs + '[value="' + cssAttr(value) + '"]', 'class_value');
+  if (name) offer(tag + '[name="' + cssAttr(name) + '"]', 'name');
   const ariaLabel = attr(el, 'aria-label');
-  if (ariaLabel) candidates.push(tag + '[aria-label="' + cssAttr(ariaLabel) + '"]');
+  if (ariaLabel) offer(tag + '[aria-label="' + cssAttr(ariaLabel) + '"]', 'aria_label');
   const href = attr(el, 'href');
-  if (tag === 'a' && href) candidates.push('a[href="' + cssAttr(href) + '"]');
-  if (cs) candidates.push(tag + cs);
+  if (tag === 'a' && href) offer('a[href="' + cssAttr(href) + '"]', 'href');
+  if (cs) offer(tag + cs, 'class');
   const type = attr(el, 'type');
-  if (cs && type) candidates.push(tag + cs + '[type="' + cssAttr(type) + '"]');
-  const path = structuralPath(el);
-  if (path && !candidates.includes(path)) candidates.push(path);
-  return candidates.filter((selector, index) => {
-    if (!selector || candidates.indexOf(selector) !== index) return false;
-    try { return Array.from(document.querySelectorAll(selector)).includes(el); } catch (e) { return false; }
-  }).map((selector) => ({ selector: selector, source: 'browser' }));
+  if (cs && type) offer(tag + cs + '[type="' + cssAttr(type) + '"]', 'class_type');
+  // The text rung costs a document walk, so it is paid for only when no attribute rung already names
+  // this node alone; it is offered above the positional path and below any unique attribute. A rung
+  // that is unique only because of a current value does not count as naming it: the value is what
+  // changes on the next render, which is the failure this rung exists to avoid.
+  if (!candidates.some((candidate) => !VALUE_DEPENDENT_SOURCES.has(candidate.source) && resolvesUniquely(candidate.selector, el))) {
+    for (const candidate of textAnchorCandidatesFor(el)) candidates.push(candidate);
+  }
+  offer(structuralPath(el), 'structural');
+  const seen = new Set();
+  const offered = [];
+  for (const candidate of candidates) {
+    if (seen.has(candidate.selector)) continue;
+    seen.add(candidate.selector);
+    // querySelectorAll throws on :has-text(), so re-verifying a text anchor here would drop every one
+    // it emitted; the rung already proved this selector resolves to this node alone.
+    if (candidate.source === 'text_anchor') { offered.push(candidate); continue; }
+    try { if (!Array.from(document.querySelectorAll(candidate.selector)).includes(el)) continue; } catch (e) { continue; }
+    offered.push(candidate);
+  }
+  return offered;
 };
+// A relation's key is the label the page itself prints beside the value, so it is the anchor the
+// carrier is offered under before any shape the generic ladder happens to pick.
+const relationCandidatesFor = (carrier, keyText) => {
+  const label = String(keyText || '').trim();
+  const base = shapeSelector(carrier);
+  const keyed = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base
+    ? textAnchorCandidateFor(base, label, carrier, '', carrier)
+    : null;
+  const rest = selectorCandidatesFor(carrier).filter((candidate) => !keyed || candidate.selector !== keyed.selector);
+  return keyed ? [keyed].concat(rest) : rest;
+};
+// The primary selector feeds CSS APIs (match counts, position lookups), so it stays CSS-only even
+// when a text anchor is the sturdier offer.
 const selectorFor = (el) => {
-  const candidates = selectorCandidatesFor(el).map((item) => item.selector);
+  const candidates = selectorCandidatesFor(el).filter((item) => item.source !== 'text_anchor').map((item) => item.selector);
   for (let i = 0; i < candidates.length; i++) {
     if (resolvesUniquely(candidates[i], el)) return candidates[i];
   }
@@ -550,7 +772,7 @@ const modalDismissControls = (node) => {
     // a modal it has no way to clear.
     const text = controlLabel(c);
     seen.add(selector);
-    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, selector_candidates: selectorCandidatesFor(c), type: attr(c, 'type') });
+    out.push({ tag: (c.tagName || '').toLowerCase(), text: text, aria_label: attr(c, 'aria-label'), title: attr(c, 'title'), selector: selector, selector_candidates: selectorCandidatesFor(c), identity: identityFor(c), type: attr(c, 'type') });
   }
   return out;
 };
@@ -571,11 +793,11 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node) });
+      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }
@@ -589,7 +811,7 @@ for (const link of document.querySelectorAll('a[href]')) {
   let resolved; try { resolved = new URL(rawHref, location.href).href; } catch (e) { continue; }
   let host; try { host = new URL(resolved).host.toLowerCase(); } catch (e) { continue; }
   if (!host || host !== baseHost) continue;
-  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link), selector_candidates: selectorCandidatesFor(link) };
+  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link), selector_candidates: selectorCandidatesFor(link), identity: identityFor(link) };
   if (link.hasAttribute('download')) entry.has_download_attr = true;
   navTargets.push(entry);
 }
@@ -628,13 +850,15 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   let unique = false;
   if (selector) { try { unique = document.querySelectorAll(selector).length === 1; } catch (e) { unique = false; } }
   if (selector && unique && !usedClickableSelectors.has(selector)) {
-    clickableControls.push({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), tag: tag });
+    clickableControls.push({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), tag: tag });
     usedClickableSelectors.add(selector);
     if (text) seenClickableText.add(text);
     continue;
   }
   if (!text || seenClickableText.has(text)) continue;
-  clickableControls.push({ text: text, tag: tag });
+  // No CSS selector singles this control out, which is the case the text rung exists for: reporting
+  // the control with its text alone leaves the model nothing to address it by.
+  clickableControls.push({ text: text, tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el) });
   seenClickableText.add(text);
 }
 
@@ -647,7 +871,7 @@ const resultRowTextIsContent = (s) => {
 };
 const resultEntry = (node, tag) => {
   const selector = selectorFor(node);
-  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_candidates: selectorCandidatesFor(node), selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
+  const entry = { tag: tag, id: attr(node, 'id'), selector: selector, selector_candidates: selectorCandidatesFor(node), identity: identityFor(node), selector_match_count: selectorMatchCount(selector), visible: elementVisible(node), is_table: tag === 'table' };
 	  if (tag === 'table') {
 	    let rows = Array.from(node.querySelectorAll(':scope > tbody > tr')).filter((r) => r.querySelector(':scope > td'));
 	    if (!rows.length) rows = Array.from(node.querySelectorAll(':scope > tr')).filter((r) => r.querySelector(':scope > td'));
@@ -703,7 +927,6 @@ const keyValueSkipTags = new Set(['body', 'form', 'html', 'table', 'tbody', 'the
 const nonContentChildTags = new Set(['style', 'script', 'noscript', 'svg', 'template']);
 const bareMagnitude = /^-?\$?\d{1,3}(?:[,\s]?\d{3})*(?:\.\d+)?[KMB]?$/i;
 const insidePageChrome = (node) => !!(node.closest && node.closest('nav,aside,header,footer,[role=navigation],[role=menu],[role=menubar],[role=banner],[role=complementary]'));
-const labelLike = (text) => text.length >= 2 && text.indexOf('{') < 0;
 const metricCardNodes = new Set();
 const insideMetricCard = (node) => { let ancestor = node; while (ancestor) { if (metricCardNodes.has(ancestor)) return true; ancestor = ancestor.parentElement; } return false; };
 // Mirror of _append_requested_target_relations: the labels the turn asked for are resolved before
@@ -741,7 +964,7 @@ const valueBesideLabel = (labelEl) => {
       let pos = -1;
       try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
       if (pos < 0) return null;
-      return { owner: ancestor, relation: { key_text: labelText, label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+      return { owner: ancestor, relation: { key_text: labelText, selector_candidates: relationCandidatesFor(carrier, labelText), identity: identityFor(carrier), label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
     }
     branch = ancestor;
     ancestor = ancestor.parentElement;
@@ -808,7 +1031,7 @@ for (const node of all) {
   countFoldedKey(headingLeaves[0].text);
   countWalkedValue(cardValueText);
   if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; continue; }
-  keyValueRelations.push({ key_text: headingLeaves[0].text, value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
+  keyValueRelations.push({ key_text: headingLeaves[0].text, selector_candidates: relationCandidatesFor(cardCarrier, headingLeaves[0].text), identity: identityFor(cardCarrier), value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
   metricCardNodes.add(node);
 }
 for (const node of all) {
@@ -830,7 +1053,7 @@ for (const node of all) {
   let position = -1;
   try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
   if (position < 0) continue;
-  keyValueRelations.push({ key_text: keyText, value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+  keyValueRelations.push({ key_text: keyText, selector_candidates: relationCandidatesFor(node, keyText), identity: identityFor(node), value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
 const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -866,9 +1089,11 @@ for (const node of all) {
   const magnitudeLeaves = valueLeaves.filter((leaf) => bareMagnitude.test(leaf.valueText));
   const designatedIndex = valueLeaves.length === 1 ? valueLeaves[0].index : (magnitudeLeaves.length === 1 ? magnitudeLeaves[0].index : null);
   let capped = false;
+  // A leaf that claims no key text gets no label-keyed anchor: an anchor naming a label this
+  // relation does not itself claim reads as though it identified this leaf's value.
   for (const leaf of valueLeaves) {
     if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
-    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', selector_candidates: relationCandidatesFor(node, leaf.index === designatedIndex ? keyText : ''), identity: identityFor(node), value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
     revealRelationCount++;
   }
   if (capped) break;

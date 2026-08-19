@@ -31,6 +31,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    key_is_org_scoped,
     presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
@@ -954,6 +955,10 @@ class S3Storage(BaseStorage):
             return None
         return presigned_urls[0], uploaded_s3_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri, log_exception=True, raise_on_error=True)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -1125,13 +1130,13 @@ class S3Storage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.key, allowed_prefixes):
                 return
 
         # Artifacts bucket: keys use v1/{env}/{org}/
         if parsed_uri.bucket == settings.AWS_S3_BUCKET_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.key.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.key, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

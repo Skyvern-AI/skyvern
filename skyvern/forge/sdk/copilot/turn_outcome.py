@@ -6,6 +6,7 @@ schemas can embed ``TurnOutcome`` without importing copilot business logic.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -22,6 +23,30 @@ IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
 # ROUTE_OWNED_TERMINAL_REASONS in dev_scripts/replay_turn_outcome_kind.py for the full split.
 CANCEL_TERMINAL_REASON = "cancel"
 CopilotComposerMode = Literal["ask", "build", "code"]
+
+
+def selected_connected_account_id(outcome: TurnOutcome | None, current_user_message: str) -> str | None:
+    """Return the exact account selected from the prior server-owned choice set."""
+    choices = outcome.connected_account_choices if outcome is not None else None
+    if not choices:
+        return None
+    return next(
+        (choice.connection_id for choice in choices if choice.connection_id == current_user_message),
+        None,
+    )
+
+
+def connected_account_choice_context(outcome: TurnOutcome | None, current_user_message: str) -> str:
+    choices = outcome.connected_account_choices if outcome is not None else None
+    if not choices:
+        return ""
+    payload: dict[str, Any] = {
+        "connected_account_choices": [choice.model_dump(mode="json") for choice in choices],
+    }
+    selected_connection_id = selected_connected_account_id(outcome, current_user_message)
+    if selected_connection_id is not None:
+        payload["selected_connection_id"] = selected_connection_id
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def stopped_exit_response_kind(terminal_reason: str | None) -> ResponseKind:

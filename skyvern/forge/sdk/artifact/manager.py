@@ -99,12 +99,12 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
 def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
     if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
         return data
-    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
-        return data
 
     try:
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
+        if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
+            return data
         secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
@@ -521,7 +521,8 @@ class ArtifactManager:
         separate process from the agent and does not know which run is
         currently using the session. Run finalization runs the
         ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
-        whose ``created_at`` falls inside the run's window.
+        whose ``created_at`` falls inside the run's window; a code block
+        runs the same UPDATE mid-run over its own block row's window.
         """
         return await self._create_browser_session_artifact(
             organization_id=organization_id,
@@ -1923,6 +1924,36 @@ class ArtifactManager:
             return
 
         context = skyvern_context.current()
+        resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
+        resolved_workflow_run_block_id = workflow_run_block_id or (
+            context.parent_workflow_run_block_id if context else None
+        )
+        resolved_run_id = run_id or (context.run_id if context else None)
+        if not _bundling_enabled():
+            for _, (artifact_type, data) in entries.items():
+                artifact_id = generate_artifact_id()
+                uri = app.STORAGE.build_uri(
+                    organization_id=step.organization_id,
+                    artifact_id=artifact_id,
+                    step=step,
+                    artifact_type=artifact_type,
+                )
+                await self._create_artifact(
+                    aio_task_primary_key=step.task_id,
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    uri=uri,
+                    step_id=step.step_id,
+                    task_id=step.task_id,
+                    workflow_run_id=resolved_workflow_run_id,
+                    workflow_run_block_id=resolved_workflow_run_block_id,
+                    run_id=resolved_run_id,
+                    organization_id=step.organization_id,
+                    file_size=len(data),
+                    data=data,
+                )
+            return
+
         archive_artifact_id = generate_artifact_id()
         archive_uri = app.STORAGE.build_uri(
             organization_id=step.organization_id,
@@ -1939,9 +1970,9 @@ class ArtifactManager:
             organization_id=step.organization_id,
             step_id=step.step_id,
             task_id=step.task_id,
-            workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
-            workflow_run_block_id=workflow_run_block_id or (context.parent_workflow_run_block_id if context else None),
-            run_id=run_id or (context.run_id if context else None),
+            workflow_run_id=resolved_workflow_run_id,
+            workflow_run_block_id=resolved_workflow_run_block_id,
+            run_id=resolved_run_id,
             created_at=now,
             modified_at=now,
         )

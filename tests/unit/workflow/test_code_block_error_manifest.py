@@ -205,6 +205,20 @@ async def test_ordinary_exception_still_eligible_for_self_heal(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_ordinary_exception_failure_reason_names_the_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-14294: an undeclared raise is the one signal the run has about why it failed."""
+    block = CodeBlock(
+        label="ordinary_reason_block",
+        code="raise Exception('no submit button on the page')",
+        output_parameter=_output_parameter("ordinary_reason_output"),
+    )
+    result = await _run_code_block(monkeypatch, block)
+
+    assert result.success is False
+    assert result.failure_reason == "Failed to execute code block. Reason: Exception: no submit button on the page"
+
+
+@pytest.mark.asyncio
 async def test_multiple_manifest_entries_resolve_independently(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: a manifest with multiple entries lets different branches raise different declared codes."""
     manifest = {

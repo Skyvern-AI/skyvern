@@ -6,7 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 
@@ -58,6 +58,13 @@ import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { parseHeaderJson } from "@/util/secretHeaders";
+import {
+  getRecoveryGuidanceRetryContext,
+  isRecoveryGuidanceTelemetryContext,
+  RecoveryGuidanceTelemetry,
+  type RecoveryGuidanceRetryNavigation,
+  type RecoveryGuidanceTelemetryContext,
+} from "@/util/onboarding/recoveryGuidanceTelemetry";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -144,6 +151,7 @@ type Props = {
   initialSettings: {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
+    reuseBrowserSession: boolean;
     cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
@@ -220,6 +228,7 @@ type RunWorkflowRequestBody = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
+  reuse_browser_session: boolean | null;
   browser_profile_id?: string | null;
   start_fresh_browser?: boolean;
   max_screenshot_scrolls?: number | null;
@@ -256,6 +265,7 @@ export function getRunWorkflowRequestBody(
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
+    reuseBrowserSession,
     browserProfileId,
     startFreshBrowser,
     cdpAddress,
@@ -288,6 +298,7 @@ export function getRunWorkflowRequestBody(
     data,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
+    reuse_browser_session: reuseBrowserSession,
     // Backend ranks an explicit profile override above start_fresh_browser, so a
     // fresh run must drop the (possibly settings-derived) override to take effect.
     browser_profile_id: startFresh || perInputAgent ? null : bpi,
@@ -450,6 +461,7 @@ export type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
+  reuseBrowserSession: boolean | null;
   browserProfileId: string | null;
   startFreshBrowser?: boolean;
   cdpAddress: string | null;
@@ -460,6 +472,42 @@ export type RunWorkflowFormType = Record<string, unknown> & {
   aiFallback: boolean | null;
 };
 
+function recordRecoveryGuidanceRetryCreated(
+  context: RecoveryGuidanceTelemetryContext | null,
+  retryRunId: unknown,
+): RecoveryGuidanceRetryNavigation | null {
+  if (
+    !isRecoveryGuidanceTelemetryContext(context) ||
+    typeof retryRunId !== "string" ||
+    retryRunId.trim().length === 0
+  ) {
+    return null;
+  }
+  RecoveryGuidanceTelemetry.retryCreated(context, retryRunId);
+  return { ...context, retryRunId };
+}
+
+type RunWorkflowSuccessCallbacks = Readonly<{
+  onStarted: () => void;
+  onNavigate: (
+    workflowRunId: unknown,
+    recoveryGuidanceRetry: RecoveryGuidanceRetryNavigation | null,
+  ) => void;
+}>;
+
+function handleRunWorkflowSuccess(
+  workflowRunId: unknown,
+  recoveryGuidanceRetryContext: RecoveryGuidanceTelemetryContext | null,
+  { onStarted, onNavigate }: RunWorkflowSuccessCallbacks,
+): void {
+  const recoveryGuidanceRetry = recordRecoveryGuidanceRetryCreated(
+    recoveryGuidanceRetryContext,
+    workflowRunId,
+  );
+  onStarted();
+  onNavigate(workflowRunId, recoveryGuidanceRetry);
+}
+
 function RunWorkflowForm({
   workflowParameters,
   initialValues,
@@ -468,9 +516,13 @@ function RunWorkflowForm({
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
+  const recoveryGuidanceRetryContext = getRecoveryGuidanceRetryContext(
+    location.state,
+  );
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const loginCredentialInputs = useMemo(
     () => getLoginCredentialInputs({ workflow, workflowParameters }),
@@ -535,6 +587,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      reuseBrowserSession: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
       startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
@@ -558,6 +611,9 @@ function RunWorkflowForm({
     workflow?.browser_profile_key,
     browserMemoryEnabled,
   );
+  const explicitBrowserSessionPicked = Boolean(
+    form.watch("browserSessionId")?.trim(),
+  );
   const hasBlockingParameterError = workflowParameters.some(
     (param) =>
       blockingParameterTypes.has(param.workflow_parameter_type) &&
@@ -579,29 +635,39 @@ function RunWorkflowForm({
       >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
-      toast({
-        variant: "success",
-        title: "Agent run started",
-        description: "The agent run has been started successfully",
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["runs"],
-      });
-      if (studioEnabled) {
-        // A full-run start lands on the bare /runs/{wr} deep link; the learned
-        // run layout (or factory copilot,browser,overview) restores via the
-        // fallback.
-        navigate(`/runs/${response.data.workflow_run_id}`);
-      } else {
-        navigate(
-          env.useNewRunsUrl
-            ? `/runs/${response.data.workflow_run_id}`
-            : `/agents/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
-        );
-      }
+      handleRunWorkflowSuccess(
+        response.data?.workflow_run_id,
+        recoveryGuidanceRetryContext,
+        {
+          onStarted: () => {
+            toast({
+              variant: "success",
+              title: "Agent run started",
+              description: "The agent run has been started successfully",
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRuns"],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["runs"],
+            });
+          },
+          onNavigate: (workflowRunId, recoveryGuidanceRetry) => {
+            const runPath = studioEnabled
+              ? `/runs/${workflowRunId}`
+              : env.useNewRunsUrl
+                ? `/runs/${workflowRunId}`
+                : `/agents/${workflowPermanentId}/${workflowRunId}/overview`;
+            if (recoveryGuidanceRetry) {
+              navigate(runPath, {
+                state: { recoveryGuidanceRetry },
+              });
+            } else {
+              navigate(runPath);
+            }
+          },
+        },
+      );
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -667,6 +733,7 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      reuseBrowserSession: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
       startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
@@ -706,6 +773,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      reuseBrowserSession,
       browserProfileId,
       startFreshBrowser,
       maxScreenshotScrolls,
@@ -726,6 +794,7 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      reuseBrowserSession,
       browserProfileId,
       startFreshBrowser,
       maxScreenshotScrolls,
@@ -742,6 +811,7 @@ function RunWorkflowForm({
       "webhookCallbackUrl",
       "proxyLocation",
       "browserSessionId",
+      "reuseBrowserSession",
       "browserProfileId",
       "startFreshBrowser",
       "maxScreenshotScrolls",
@@ -1429,6 +1499,67 @@ function RunWorkflowForm({
                   />
                   <FormField
                     control={form.control}
+                    name="reuseBrowserSession"
+                    render={({ field }) => (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel>
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                Reuse browser session
+                              </div>
+                              <h2 className="text-sm text-muted-foreground">
+                                Override whether this run continues in the
+                                workflow&apos;s live browser.
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <Select
+                                value={
+                                  field.value == null
+                                    ? "workflow-default"
+                                    : field.value
+                                      ? "on"
+                                      : "off"
+                                }
+                                onValueChange={(value) =>
+                                  field.onChange(
+                                    value === "workflow-default"
+                                      ? null
+                                      : value === "on",
+                                  )
+                                }
+                                disabled={explicitBrowserSessionPicked}
+                              >
+                                <SelectTrigger
+                                  className="w-64"
+                                  aria-label="Reuse browser session override"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="workflow-default">
+                                    Workflow default (currently{" "}
+                                    {initialSettings.reuseBrowserSession
+                                      ? "on"
+                                      : "off"}
+                                    )
+                                  </SelectItem>
+                                  <SelectItem value="on">On</SelectItem>
+                                  <SelectItem value="off">Off</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </FormControl>
+                            <FormMessage />
+                          </div>
+                        </div>
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
                     name="browserProfileId"
                     render={({ field }) => {
                       return (
@@ -1691,4 +1822,10 @@ function RunWorkflowForm({
   );
 }
 
-export { RunWorkflowForm };
+/* eslint-disable react-refresh/only-export-components */
+export {
+  handleRunWorkflowSuccess,
+  recordRecoveryGuidanceRetryCreated,
+  RunWorkflowForm,
+};
+/* eslint-enable react-refresh/only-export-components */

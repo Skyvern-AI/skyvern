@@ -89,7 +89,7 @@ async def test_code_block_schema_carries_the_steps_already_demonstrated() -> Non
     demonstrated = result["data"]["demonstrated_steps"]
     assert demonstrated[0]["tool_name"] == "click"
     assert demonstrated[0]["selector"] == 'button[aria-label="Log in"]'
-    assert demonstrated[0]["source_url"] == "https://example.com/a"
+    assert demonstrated[0]["source_url"] == "https://example.com/"
     assert demonstrated[0]["selector_match_count"] is None
 
 

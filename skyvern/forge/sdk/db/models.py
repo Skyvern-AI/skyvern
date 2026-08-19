@@ -65,6 +65,7 @@ from skyvern.forge.sdk.db.id import (
     generate_task_v2_id,
     generate_thought_id,
     generate_totp_code_id,
+    generate_uploaded_file_id,
     generate_workflow_copilot_chat_id,
     generate_workflow_copilot_chat_message_id,
     generate_workflow_copilot_completion_criteria_set_id,
@@ -596,6 +597,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
+    reuse_browser_session = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     mask_secrets = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     pin_saved_session_ip = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_id = Column(String, nullable=True)
@@ -737,6 +739,8 @@ class WorkflowRunModel(Base):
     browser_seed_source = Column(String, nullable=True)
     browser_sink_profile_id = Column(String, nullable=True)
     start_fresh_browser = Column(Boolean, nullable=True)
+    reuse_browser_session = Column(Boolean, nullable=True)
+    reuse_bound_key = Column(String, nullable=True)
     status = Column(String, nullable=False)
     failure_reason = Column(String)
     proxy_location = Column(String)
@@ -1348,6 +1352,17 @@ class PersistentBrowserSessionModel(Base):
                 "AND completed_at IS NULL AND deleted_at IS NULL"
             ),
         ),
+        Index(
+            "uq_pbs_live_workflow_binding",
+            "organization_id",
+            "bound_workflow_permanent_id",
+            text("COALESCE(bound_key, '')"),
+            unique=True,
+            postgresql_where=text(
+                "bound_workflow_permanent_id IS NOT NULL AND deleted_at IS NULL "
+                "AND status IN ('created', 'running', 'retry')"
+            ),
+        ),
     )
 
     persistent_browser_session_id = Column(String, primary_key=True, default=generate_persistent_browser_session_id)
@@ -1372,6 +1387,8 @@ class PersistentBrowserSessionModel(Base):
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
+    bound_workflow_permanent_id = Column(String, nullable=True)
+    bound_key = Column(String, nullable=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     instance_type = Column(String, nullable=True)
@@ -1384,6 +1401,12 @@ class PersistentBrowserSessionModel(Base):
     # Last client CDP command seen by the proxy; drives activity-based lease renewal so an
     # actively-driven session stays alive past its idle budget (capped by MAX_TIMEOUT).
     last_activity_at = Column(DateTime, nullable=True)
+    # Set when a close is requested, so the session activity can observe it without waiting for the
+    # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
+    close_requested_at = Column(DateTime, nullable=True)
+    # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
+    # and dropping it would rewrite a hot table for no gain. Keep it in sync with `alembic check`.
+    provisioning_deadline_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -1998,6 +2021,48 @@ class MicrosoftOAuthCredentialModel(Base):
     consent_code_verifier = Column(String, nullable=True)
     consent_app_origin = Column(String, nullable=True)
     consent_expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class UploadedFileModel(Base):
+    __tablename__ = "uploaded_files"
+    __table_args__ = (
+        # Defense in depth: one live row per storage object even if a future storage-key
+        # change reintroduces a collision. File ids make normal upload keys unique per row.
+        Index(
+            "ux_uploaded_files_org_storage_uri_live",
+            "organization_id",
+            "storage_uri",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index(
+            "ix_uploaded_files_expires_at_live",
+            "expires_at",
+            postgresql_where=text("deleted_at IS NULL AND expires_at IS NOT NULL"),
+        ),
+        Index("ix_uploaded_files_organization_id", "organization_id"),
+        CheckConstraint("size_bytes >= 0", name="ck_uploaded_files_size_bytes_non_negative"),
+    )
+
+    file_id = Column(String, primary_key=True, default=generate_uploaded_file_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    # Server-generated. Never accept a caller-supplied URI here: it is the only thing the
+    # delete and purge paths dereference.
+    storage_uri = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    size_bytes = Column(BigInteger, nullable=True)
+    # NULL means the file has no caller-specified lifetime and is governed only by the
+    # organization's existing data-retention policy.
+    expires_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

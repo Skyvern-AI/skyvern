@@ -35,7 +35,11 @@ def _har_bytes() -> bytes:
     ).encode()
 
 
-def _fake_app(har_data: bytes = b"", browser_log: bytes = b"") -> SimpleNamespace:
+def _fake_app(
+    har_data: bytes = b"",
+    browser_log: bytes = b"",
+    redaction_enabled: bool = True,
+) -> SimpleNamespace:
     return SimpleNamespace(
         BROWSER_MANAGER=SimpleNamespace(
             get_har_data=AsyncMock(return_value=har_data),
@@ -46,6 +50,7 @@ def _fake_app(har_data: bytes = b"", browser_log: bytes = b"") -> SimpleNamespac
             create_task_archive=AsyncMock(return_value="archive_1"),
         ),
         WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+            secret_redaction_enabled_for_run=Mock(return_value=redaction_enabled),
             get_secret_values_for_run=Mock(return_value={SECRET}),
         ),
     )
@@ -63,13 +68,13 @@ def _workflow_objects() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespa
 async def test_persist_har_data_redacts_secret_and_sensitive_header(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_app = _fake_app(har_data=_har_bytes())
     monkeypatch.setattr(workflow_service_module, "app", fake_app)
-    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
 
     browser_state, last_step, workflow, workflow_run = _workflow_objects()
     service = WorkflowService()
 
     await service.persist_har_data(browser_state, last_step, workflow, workflow_run)
 
+    fake_app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run.assert_called_once_with(WORKFLOW_RUN_ID)
     fake_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.assert_called_once_with(WORKFLOW_RUN_ID)
     fake_app.ARTIFACT_MANAGER.create_artifact.assert_awaited_once()
     artifact_kwargs = fake_app.ARTIFACT_MANAGER.create_artifact.await_args.kwargs
@@ -84,13 +89,12 @@ async def test_persist_har_data_redacts_secret_and_sensitive_header(monkeypatch:
 
 
 @pytest.mark.asyncio
-async def test_persist_har_data_skips_all_redaction_when_flag_disabled(
+async def test_persist_har_data_skips_all_redaction_when_run_not_opted_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_har = _har_bytes()
-    fake_app = _fake_app(har_data=original_har)
+    fake_app = _fake_app(har_data=original_har, redaction_enabled=False)
     monkeypatch.setattr(workflow_service_module, "app", fake_app)
-    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
 
     browser_state, last_step, workflow, workflow_run = _workflow_objects()
     service = WorkflowService()
@@ -110,7 +114,6 @@ async def test_persist_har_data_skips_all_redaction_when_flag_disabled(
 async def test_persist_browser_console_log_redacts_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_app = _fake_app(browser_log=f"console leaked {SECRET}".encode())
     monkeypatch.setattr(workflow_service_module, "app", fake_app)
-    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
 
     browser_state, last_step, workflow, workflow_run = _workflow_objects()
     service = WorkflowService()
@@ -131,7 +134,6 @@ async def test_persist_browser_console_log_redacts_secret(monkeypatch: pytest.Mo
 async def test_bundled_debug_artifacts_redact_har_and_console_log(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_app = _fake_app(har_data=_har_bytes(), browser_log=f"console leaked {SECRET}".encode())
     monkeypatch.setattr(workflow_service_module, "app", fake_app)
-    monkeypatch.setattr(workflow_service_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
 
     browser_state, last_step, workflow, workflow_run = _workflow_objects()
     service = WorkflowService()

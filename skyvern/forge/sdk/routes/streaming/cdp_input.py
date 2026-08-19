@@ -10,6 +10,7 @@ import typing as t
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
+from opentelemetry import metrics
 from playwright.async_api import CDPSession
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
@@ -31,10 +32,29 @@ from skyvern.forge.sdk.streaming.registries import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.webeye.browser_errors import is_target_closed_message
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import revalidate_redirect_chain, validate_navigation_destination
 
 LOG = structlog.get_logger()
+
+_LATENCY_BUCKETS_SECONDS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.045, 0.06, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+_INPUT_KIND_LABELS = frozenset(
+    {"mouseEvent", "keyEvent", "wheelEvent", "navigateEvent", "goBackEvent", "goForwardEvent", "reloadEvent"}
+)
+_meter = metrics.get_meter("skyvern.live_view")
+_input_wait_seconds = _meter.create_histogram(
+    "skyvern.live_view.input_wait_seconds",
+    unit="s",
+    description="Input event: receive_text returned -> dispatch started, including active-page resolution",
+    explicit_bucket_boundaries_advisory=_LATENCY_BUCKETS_SECONDS,
+)
+_input_dispatch_seconds = _meter.create_histogram(
+    "skyvern.live_view.input_dispatch_seconds",
+    unit="s",
+    description="Input event: dispatch handling after an active CDP session is acquired",
+    explicit_bucket_boundaries_advisory=_LATENCY_BUCKETS_SECONDS,
+)
 
 _VALID_MOUSE_TYPES = {"mousePressed", "mouseReleased", "mouseMoved"}
 _VALID_MOUSE_BUTTONS = {"left", "middle", "right", "none"}
@@ -48,6 +68,12 @@ _MAX_VK_CODE = 0xFE
 # Matches the length Skyvern's own InvalidUrl exception documents as its supported max.
 _MAX_URL_LEN = 2083
 ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
+_NAVIGATION_RESET_TIMEOUT_MS = 5_000
+_TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
+
+
+def _input_kind_label(kind: object) -> str:
+    return kind if isinstance(kind, str) and kind in _INPUT_KIND_LABELS else "other"
 
 
 @dataclasses.dataclass
@@ -136,6 +162,26 @@ class ActivePageCdpInputSession:
             await session.detach()
         except Exception:
             pass
+
+
+async def _close_input_session_and_release_browser_state(
+    input_session: ActivePageCdpInputSession | None,
+    browser_state: BrowserState | None,
+    entity_type: str,
+    entity_id: str,
+) -> None:
+    """Detach the child CDP session before closing its adopted browser driver.
+
+    The observer and input sessions share the proxy's upstream connection. Releasing the
+    observer first closes Playwright while leaving the input session's target attachment
+    behind on that shared connection, so a reconnect can receive a live but stalled stream.
+    The ``finally`` keeps browser-state ownership release cancellation-safe.
+    """
+    try:
+        if input_session is not None:
+            await input_session.close()
+    finally:
+        await release_browser_state(browser_state, entity_type, entity_id)
 
 
 def _validated_modifiers(msg: dict) -> int:
@@ -258,6 +304,22 @@ _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
 }
 
 
+async def _reset_page_after_navigation_failure(
+    page: object,
+    log_id_key: str,
+    log_id_value: str,
+) -> None:
+    try:
+        await page.goto("about:blank", timeout=_NAVIGATION_RESET_TIMEOUT_MS)  # type: ignore[attr-defined]
+    except Exception:
+        LOG.exception("CDP input: failed to reset page after navigation failure", **{log_id_key: log_id_value})
+        raise
+
+
+def _is_navigation_target_loss(error: BaseException) -> bool:
+    return type(error).__name__ in _TARGET_CLOSED_ERROR_TYPES or is_target_closed_message(str(error))
+
+
 async def _dispatch_navigate_event(
     page: object,
     msg: dict,
@@ -289,17 +351,29 @@ async def _dispatch_navigate_event(
         await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
         return
 
-    response = await page.goto(url)  # type: ignore[attr-defined]
+    try:
+        response = await page.goto(url)  # type: ignore[attr-defined]
+    except Exception as error:
+        if _is_navigation_target_loss(error):
+            raise
+        LOG.warning(
+            "CDP input: navigation failed",
+            **{log_id_key: log_id_value},
+            error_type=type(error).__name__,
+        )
+        # A timeout does not cancel Chrome's in-flight navigation. Supersede it before preserving
+        # input so a late redirect cannot commit after a one-time page.url validation.
+        await _reset_page_after_navigation_failure(page, log_id_key, log_id_value)
+        await websocket.send_json({"kind": "navigate-error", "reason": "failed"})
+        return
+
     try:
         # page.goto follows redirects at the network layer, so a validated public entry point
         # can still land on an internal host -- re-check the followed chain (SKY-13112 pattern).
         await revalidate_redirect_chain(response, validate_navigation_destination)
     except BlockedNavigationDestination as error:
         LOG.info("CDP input: navigate blocked via redirect", **{log_id_key: log_id_value}, reason=error.reason)
-        try:
-            await page.goto("about:blank")  # type: ignore[attr-defined]
-        except Exception:
-            LOG.exception("CDP input: failed to reset page after redirect refusal", **{log_id_key: log_id_value})
+        await _reset_page_after_navigation_failure(page, log_id_key, log_id_value)
         await websocket.send_json({"kind": "navigate-error", "reason": "blocked"})
 
 
@@ -399,6 +473,7 @@ async def _run_input_loop(
             raw = await websocket.receive_text()
         except WebSocketDisconnect:
             break
+        received_at = time.monotonic()
 
         try:
             msg = json.loads(raw)
@@ -446,6 +521,9 @@ async def _run_input_loop(
                 no_active_page_log_count += 1
             continue
 
+        attributes = {"event_kind": _input_kind_label(kind)}
+        dispatch_started = time.monotonic()
+        _input_wait_seconds.record(dispatch_started - received_at, attributes)
         try:
             await _dispatch_event(cdp_session, input_session.page, kind, msg, log_id_key, log_id_value, websocket)
         except Exception:
@@ -457,6 +535,7 @@ async def _run_input_loop(
             )
             await websocket.close(code=4411, reason="dispatch_failed")
             break
+        _input_dispatch_seconds.record(time.monotonic() - dispatch_started, attributes)
 
 
 @legacy_base_router.websocket("/stream/cdp_input/workflow_run/{workflow_run_id}")
@@ -543,11 +622,13 @@ async def cdp_input_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", workflow_run_id=workflow_run_id, exc_info=True)
     finally:
-        await release_browser_state(browser_state, "workflow_run", workflow_run_id)
-        if stream_registered:
-            await stream_ref_dec(workflow_run_id)
-        if input_session is not None:
-            await input_session.close()
+        try:
+            await _close_input_session_and_release_browser_state(
+                input_session, browser_state, "workflow_run", workflow_run_id
+            )
+        finally:
+            if stream_registered:
+                await stream_ref_dec(workflow_run_id)
         await channel.close()
         LOG.info("CDP input channel closed", workflow_run_id=workflow_run_id, client_id=client_id)
 
@@ -623,8 +704,8 @@ async def cdp_input_browser_session_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", browser_session_id=browser_session_id, exc_info=True)
     finally:
-        await release_browser_state(browser_state, "browser_session", browser_session_id)
-        if input_session is not None:
-            await input_session.close()
+        await _close_input_session_and_release_browser_state(
+            input_session, browser_state, "browser_session", browser_session_id
+        )
         await channel.close()
         LOG.info("CDP input channel closed", browser_session_id=browser_session_id, client_id=client_id)

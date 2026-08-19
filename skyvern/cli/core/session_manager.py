@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import secrets
 import time
 import weakref
@@ -9,11 +10,13 @@ from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
+from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
@@ -87,6 +90,7 @@ class SessionState:
     _observed_refs_generation: int = 0
     # Local fallback when no cloud/CDP/extension browser-session identity is available.
     _observe_v2_state: ObserveV2State = field(default_factory=ObserveV2State)
+    _codeblock_redactor: Callable[[Any], Any] | None = field(default=None, repr=False)
 
     def get_response_body(self, request_id: int) -> str | None:
         """Public accessor for cached response bodies (keyed by request_id)."""
@@ -363,6 +367,11 @@ def register_copilot_session(session_id: str, state: SessionState, *, organizati
         raise ValueError("organization_id is required for a copilot browser session")
     if state.organization_id not in {None, organization_id}:
         raise ValueError("session state belongs to a different organization")
+    if is_self_heal_session_id(session_id):
+        os.environ.pop("DEBUGP", None)
+        redactor = current_codeblock_log_redactor()
+        if redactor is not None:
+            state._codeblock_redactor = redactor
     state.organization_id = organization_id
     _copilot_sessions[(organization_id, session_id)] = state
 
@@ -807,12 +816,22 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
         return
 
     def _on_new_page(page: Page) -> None:
-        event = {
-            "tab_id": str(id(page)),
-            "url": page.url,
-            "timestamp": time.time(),
-            "page": page,
-        }
+        from skyvern.cli.mcp_tools.inspection import _redact_inspection_value
+
+        try:
+            event_data = _redact_inspection_value(
+                state,
+                {
+                    "tab_id": str(id(page)),
+                    "url": page.url,
+                    "timestamp": time.time(),
+                },
+            )
+        except BaseException:
+            return
+        if type(event_data) is not dict:
+            return
+        event = {**event_data, "page": page}
         state._page_events.append(event)
         state._page_event_signal.set()
 
@@ -827,18 +846,21 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
                 page_id = id(page)
                 state._hooked_page_ids.discard(page_id)
                 state._hooked_handlers_map.pop(page_id, None)
-            except Exception:
-                LOG.debug("Failed to clean up closed page state", exc_info=True)
+            except BaseException:
+                pass
 
-        page.on("close", _on_close)
+        try:
+            page.on("close", _on_close)
+        except BaseException:
+            pass
 
         # Register inspection hooks eagerly so early popup events are captured
         try:
             from skyvern.cli.mcp_tools.inspection import _register_hooks_on_page
 
             _register_hooks_on_page(state, page)
-        except Exception:
-            LOG.debug("Failed to register inspection hooks on new page", exc_info=True)
+        except BaseException:
+            pass
 
     try:
         browser._browser_context.on("page", _on_new_page)

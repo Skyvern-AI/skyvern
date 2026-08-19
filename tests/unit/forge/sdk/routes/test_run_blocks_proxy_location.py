@@ -6,6 +6,8 @@ from fastapi import BackgroundTasks
 
 from skyvern.config import settings
 from skyvern.forge.sdk.routes import run_blocks as run_blocks_mod
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.schemas.credential_type import CredentialType
 from skyvern.schemas.run_blocks import DownloadFilesRequest, LoginRequest
 from skyvern.schemas.runs import ProxyLocation
@@ -28,6 +30,15 @@ def _app_mock() -> MagicMock:
     app_mock.DATABASE.credentials.get_credential = AsyncMock(return_value=SimpleNamespace(totp_identifier=None))
     app_mock.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
     return app_mock
+
+
+def _caller() -> org_auth_service.CallerContext:
+    organization = SimpleNamespace(organization_id="org_test")
+    return org_auth_service.CallerContext(
+        organization=organization,
+        caller_id=organization.organization_id,
+        caller_type=CallerType.API_KEY,
+    )
 
 
 @pytest.mark.parametrize(
@@ -64,7 +75,7 @@ async def test_login_generated_workflow_uses_runtime_proxy_default(
                 credential_id="cred_test",
                 proxy_location=input_proxy_location,
             ),
-            organization=SimpleNamespace(organization_id="org_test"),
+            caller=_caller(),
         )
 
     assert result is response
@@ -105,7 +116,7 @@ async def test_download_files_generated_workflow_uses_runtime_proxy_default(
                 navigation_goal="Download the statement.",
                 proxy_location=input_proxy_location,
             ),
-            organization=SimpleNamespace(organization_id="org_test"),
+            caller=_caller(),
         )
 
     assert result is response

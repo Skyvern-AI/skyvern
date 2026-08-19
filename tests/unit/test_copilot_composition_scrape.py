@@ -11,9 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_structured
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
+from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 
 
 class _AsyncioSleepProxy:
@@ -46,6 +48,29 @@ def test_same_inspect_target_is_strict() -> None:
     assert _same_inspect_target("current_page", "https://h/p") is False
 
 
+def test_inspection_regression_guard_uses_safe_query_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
+    page_url = "https://example.com/search?q=first"
+    evidence = parse_composition_structured(
+        {"page_title": "Results", "forms": [{"fields": [{"selector": "#q"}]}]},
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+    assert evidence is not None
+    evidence["current_url_location_fingerprint"] = _page_evidence_location_fingerprint(page_url)
+    ctx = SimpleNamespace(
+        flow_evidence=[{"step": 3, "reached_via": "interaction", "had_bounded_schema": True, "evidence": evidence}]
+    )
+
+    assert tools.composition_capture._non_current_inspection_regression_error(ctx, entry_url=page_url) is None
+    assert (
+        tools.composition_capture._non_current_inspection_regression_error(
+            ctx, entry_url="https://example.com/search?q=second"
+        )
+        is not None
+    )
+
+
 _HOLLOW_HTML = "<div>loading</div>"
 _BOUNDED_HTML = "<form><input name='q'><button type='submit'>Go</button></form>"
 
@@ -64,11 +89,19 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     async def fake_stripped(ctx: object) -> tuple[str, bool]:
         return next(stripped_payloads), False
 
+    async def unavailable_structured(ctx: object, **_kwargs: object) -> tuple[None, None]:
+        # This test isolates the HTML cap-drop recapture path; a real structured failure is now
+        # reported instead of silently selecting that path.
+        return None, None
+
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
     monkeypatch.setattr(tools._shared, "_discovery_get_html", fake_raw)
     monkeypatch.setattr(tools._shared, "_composition_get_stripped_html", fake_stripped)
+    monkeypatch.setattr(
+        tools.composition_capture, "_composition_get_structured_evidence_result", unavailable_structured
+    )
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
     )
@@ -85,6 +118,31 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     # First iteration's raw read is cap-dropped; the settle retry skips it entirely.
     assert raw_calls["n"] == 1
     settle_sleep.assert_awaited_once_with(tools.composition_capture._COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_late_structured_error_retains_valid_hollow_packet(monkeypatch: pytest.MonkeyPatch) -> None:
+    first = parse_composition_structured(
+        {"page_title": "Loading", "forms": []},
+        inspected_url="https://example.com/loading",
+        current_url="https://example.com/loading",
+    )
+    assert first is not None
+    capture = AsyncMock(side_effect=[(first, None), (None, "structured extraction timed out")])
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", capture)
+    monkeypatch.setattr(tools.composition_capture.asyncio, "sleep", AsyncMock())
+
+    evidence, error = await tools._capture_composition_evidence(
+        SimpleNamespace(),
+        inspected_url="https://example.com/loading",
+        current_url="https://example.com/loading",
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert evidence["page_title"] == first["page_title"]
+    assert evidence["current_url"] == first["current_url"]
+    assert capture.await_count == 2
 
 
 def _challenge_signalled_structured_payload(*, with_form: bool = True) -> dict:
@@ -118,15 +176,15 @@ async def test_unrendered_challenge_keeps_structured_packet_when_relooks_run_out
         current_url="https://example.com/login",
     )
 
-    async def fake_structured(ctx: object, **_kwargs: object) -> dict:
-        return dict(packet)
+    async def fake_structured(ctx: object, **_kwargs: object) -> tuple[dict, None]:
+        return dict(packet), None
 
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
     # Body-only read: the anti-bot token lives in <title>, so it is absent here by construction.
     get_html = AsyncMock(return_value=(_BOUNDED_HTML, None, False, False))
-    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence", fake_structured)
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", fake_structured)
     monkeypatch.setattr(tools.composition_capture, "_composition_get_html", get_html)
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
@@ -167,14 +225,14 @@ async def test_settled_structured_packet_pays_no_extra_relook(monkeypatch: pytes
     )
     calls = {"n": 0}
 
-    async def fake_structured(ctx: object, **_kwargs: object) -> dict:
+    async def fake_structured(ctx: object, **_kwargs: object) -> tuple[dict, None]:
         calls["n"] += 1
-        return dict(packet)
+        return dict(packet), None
 
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
-    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence", fake_structured)
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", fake_structured)
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
     )
@@ -202,14 +260,14 @@ async def test_signalled_packet_survives_extractor_blinking_mid_loop(monkeypatch
     )
     payloads = iter([dict(packet), None, None])
 
-    async def fake_structured(ctx: object, **_kwargs: object) -> dict | None:
-        return next(payloads)
+    async def fake_structured(ctx: object, **_kwargs: object) -> tuple[dict | None, None]:
+        return next(payloads), None
 
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
     get_html = AsyncMock(return_value=(_BOUNDED_HTML, None, False, False))
-    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence", fake_structured)
+    monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", fake_structured)
     monkeypatch.setattr(tools.composition_capture, "_composition_get_html", get_html)
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity

@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.narration import (
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 
 _SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
 
@@ -229,6 +230,80 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
 
     assert payload["designActivity"] == []
     assert payload["blocks"][0]["activity"] == []
+
+
+def test_build_narrative_payload_persists_review_projection() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: existing
+      prompt: before
+"""
+    ctx.staged_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: existing
+      prompt: after
+    - block_type: task
+      label: added
+      prompt: new
+"""
+    ctx.staged_workflow = _staged("existing", "added")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+    ctx.executed_block_fingerprints = workflow_block_fingerprints(ctx.staged_workflow_yaml)
+    ctx.executed_block_fingerprints.pop("added")
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert payload["review"] == {
+        "blocks": [
+            {"label": "existing", "blockType": "task", "change": "changed", "neverTested": False},
+            {"label": "added", "blockType": "task", "change": "added", "neverTested": True},
+        ],
+        "duplicateWrites": [],
+    }
+    assert payload["testedBlockFingerprints"] == {"existing": sorted(ctx.executed_block_fingerprints["existing"])}
+
+
+def test_build_narrative_payload_omits_review_when_projection_is_unavailable() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = "::: invalid"
+    ctx.staged_workflow_yaml = "::: invalid"
+    ctx.staged_workflow = _staged("step_1")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert "review" not in payload
+
+
+def test_build_narrative_payload_projects_an_empty_persisted_workflow() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = None
+    ctx.staged_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: first_draft
+      prompt: new
+"""
+    ctx.staged_workflow = _staged("first_draft")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert payload["review"] == {
+        "blocks": [
+            {"label": "first_draft", "blockType": "task", "change": "added", "neverTested": True},
+        ],
+        "duplicateWrites": [],
+    }
 
 
 def test_surgical_edit_tools_label_the_operation_and_target_block() -> None:

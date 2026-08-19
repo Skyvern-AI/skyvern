@@ -248,6 +248,22 @@ def _filter_invalid_array_items(data: list[Any], schema: dict[str, Any]) -> list
     return filtered
 
 
+def extraction_shape_matches(value: Any, schema: dict[str, Any] | list | str | None) -> bool:
+    """Whether ``value`` already matches the root shape ``fill_missing_fields`` would fill for ``schema``.
+
+    Mirrors that function's root branch — object when the (nullable-normalized) type is ``object`` or the
+    schema carries ``properties``; array when the type is ``array``. A caller can gate
+    ``validate_and_fill_extraction_result`` on this so a shape-mismatched value (e.g. a string under an
+    object schema) is left raw instead of laundered into an all-default stub. Keep in sync with
+    ``fill_missing_fields``."""
+    if not isinstance(schema, dict):
+        return False
+    root_type = _resolve_schema_type(schema.get("type"), "root")
+    expects_object = root_type == "object" or "properties" in schema
+    expects_array = root_type == "array"
+    return (expects_object and isinstance(value, dict)) or (expects_array and isinstance(value, list))
+
+
 def validate_and_fill_extraction_result(
     extraction_result: dict[str, Any],
     schema: dict[str, Any] | list | str | None,

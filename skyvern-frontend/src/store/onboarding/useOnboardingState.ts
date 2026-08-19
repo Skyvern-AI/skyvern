@@ -1,5 +1,9 @@
 import { createContext, useContext } from "react";
-import type { OnboardingState, OnboardingStatePatch } from "./types";
+import type {
+  OnboardingState,
+  OnboardingStatePatch,
+  RecoveryGuidanceAssignment,
+} from "./types";
 
 type OnboardingContextValue = {
   state: OnboardingState | null;
@@ -7,6 +11,7 @@ type OnboardingContextValue = {
   updateState: (patch: OnboardingStatePatch) => void;
   isNewUser: boolean;
   abVariant: string | null;
+  recoveryGuidanceAssignment: RecoveryGuidanceAssignment | null;
 };
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);

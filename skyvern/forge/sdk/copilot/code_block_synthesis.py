@@ -31,7 +31,6 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     same_month_file_match_transform_fingerprint,
     same_month_file_match_transform_is_valid,
 )
-from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.output_extraction_plan import output_path_segments
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -222,10 +221,8 @@ def credential_segment_bounds(trajectory: Sequence[Mapping[str, Any]]) -> list[t
 
 
 def _captcha_boundary_indices(trajectory: Sequence[Mapping[str, Any]]) -> set[int]:
-    """Return typed challenge points plus credential-associated submit boundaries."""
-    boundaries = {
-        index for index, interaction in enumerate(trajectory) if composition_challenge_carrier(interaction) is not None
-    }
+    """Return credential-associated submit boundaries."""
+    boundaries: set[int] = set()
     latest_credential_fill_by_source: dict[str, int] = {}
     for index, interaction in enumerate(trajectory):
         if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
@@ -2103,7 +2100,6 @@ def synthesize_code_block(
     entry_replay_condition_active = False
     entry_replay_start_index = 0
     entry_post_auth_resume_index = 0
-    login_only_presence_guard_active = False
     for index, interaction in enumerate(trajectory):
         candidate = str(interaction.get("source_url") or "").strip()
         if candidate:
@@ -2186,29 +2182,6 @@ def synthesize_code_block(
                     entry_recovery_clicks.append((recovery_index, recovery_locator))
             if entry_recovery_clicks:
                 notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
-        login_only_presence_guard_active = bool(
-            entry_target
-            and not entry_replay_condition_active
-            and not entry_post_auth_resume_index
-            and not entry_replay_start_index
-            and not entry_recovery_clicks
-            and any(
-                str(interaction.get("tool_name") or "") == CREDENTIAL_FILL_TOOL_NAME
-                and str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS
-                for interaction in entry_trajectory
-            )
-        )
-        login_guard_last_index: int | None = None
-        if login_only_presence_guard_active:
-            credential_index = last_scout_credential_fill_index(entry_trajectory)
-            login_guard_last_index = (
-                credential_submit_boundary_index(entry_trajectory, credential_index)
-                if credential_index is not None
-                else None
-            )
-            notes.append(
-                "login rung fills only when the credential form is present, so an authenticated replay skips it"
-            )
         line_start = len(lines) + 1
         if entry_target:
             if entry_replay_condition_active:
@@ -2274,7 +2247,7 @@ def synthesize_code_block(
                 lines.append(
                     f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
                 )
-            elif not login_only_presence_guard_active:
+            else:
                 lines.append(
                     f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
                 )
@@ -2291,12 +2264,6 @@ def synthesize_code_block(
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
-        if login_only_presence_guard_active:
-            lines.append(f"{_INDENT}try:")
-            lines.append(f'{_INDENT * 2}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
-            lines.append(f"{_INDENT}except Exception:")
-            lines.append(f"{_INDENT * 2}pass")
-            lines.append(f"{_INDENT}if await {_ENTRY_TARGET_VAR}.count() == 1:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
@@ -2309,12 +2276,6 @@ def synthesize_code_block(
                 return _INDENT * 3
             return _INDENT * 2
         if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
-            return _INDENT * 2
-        # The guard exists so an authenticated replay skips the login. Indenting past its submit
-        # would skip the value read too, and the block then returns a name it never bound.
-        if login_only_presence_guard_active and (
-            login_guard_last_index is None or trajectory_index <= login_guard_last_index
-        ):
             return _INDENT * 2
         return _INDENT
 
@@ -2656,9 +2617,6 @@ def synthesize_code_block(
     ):
         lines.append(f"{_INDENT * 2}pass")
 
-    if login_only_presence_guard_active and (emitted - len(deferred_readonly_assertions)) == 0:
-        lines.append(f"{_INDENT * 2}pass")
-
     if deferred_readonly_assertions:
         deferred_base = _INDENT
         if entry_replay_condition_active:
@@ -2906,29 +2864,3 @@ def trajectory_has_browser_fill_interaction(trajectory: Sequence[Mapping[str, An
         if tool_name == CREDENTIAL_FILL_TOOL_NAME and str(interaction.get("credential_field") or "").strip():
             return True
     return False
-
-
-# The rendered offer's message content must begin with this sentinel; the
-# supersede-collapse and synthetic-turn classification key on the prefix.
-
-
-def credential_otp_authoring_guidance(credential_key: str) -> str:
-    """Render the shared invocation-time OTP guidance for model-facing authoring surfaces."""
-    return (
-        f"Treat `await {credential_key}.otp()` as the only one-time-code source. It resolves at the moment "
-        "it is awaited; it is not pre-materialized. Do not read `email_inbox`, call an email integration, "
-        "or split or parse message bodies. The tightest validity window is to await it in the focused "
-        "authentication Code block immediately before filling and submitting the OTP: a later delivery can "
-        "invalidate an earlier code, while crossing a block boundary adds output binding and latency. Later "
-        "authenticated actions remain separate focused Code blocks when appropriate. After submitting the code, "
-        'return `{"otp_submitted": True}` only after a real authenticated-page anchor is visible. Use a '
-        "scout-grounded unique visible selector for that anchor: prefer an exact role/heading, stable id/test-id, "
-        "or scoped locator. Transient disappearance of the OTP field or an intermediate loading view is not "
-        "authenticated-state proof. "
-        "If scouting has not observed a unique authenticated anchor, do not return "
-        "authentication success; keep scouting, testing, and repairing until run evidence identifies one. Never "
-        "use a broad text locator as the authenticated anchor, including `page.get_by_text(...)` even with "
-        '`exact=True`, `page.locator("text=...")`, or an unscoped `.first`; hidden or duplicate text can turn a '
-        "successful sign-in into a timeout or strict-mode failure. If the page shows an invalid or rejected code, "
-        "raise so the run reports failure."
-    )

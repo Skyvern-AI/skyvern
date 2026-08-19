@@ -767,9 +767,20 @@ def _download_wait_span_attrs(span_exporter: InMemorySpanExporter) -> dict:
 class _FakeMonotonic:
     def __init__(self) -> None:
         self.current = 0.0
+        self._advance_after_next_read: float | None = None
+
+    def advance_after_next_read(self, current: float) -> None:
+        self._advance_after_next_read = current
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
 
     def monotonic(self) -> float:
-        return self.current
+        current = self.current
+        if self._advance_after_next_read is not None:
+            self.current = self._advance_after_next_read
+            self._advance_after_next_read = None
+        return current
 
 
 def _make_download_click_context(
@@ -1306,7 +1317,7 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch.object(interceptor, "_handle_browser_download", side_effect=hanging_handler),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging_dir),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging_dir),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="pbs-1", download_suffix=None),
@@ -1345,6 +1356,8 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
         page_url="https://example.com/download",
     )
     task.download_timeout = None
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(0.05)
 
     with tempfile.TemporaryDirectory() as temp_dir:
 
@@ -1358,25 +1371,24 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
         async def slow_download_completion(**kwargs: object) -> None:
             assert kwargs["timeout"] == 0.2
             during_completion_wait.append(datetime.now(UTC).replace(tzinfo=None))
-            await asyncio.sleep(0.05)
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
         mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
         mock_app.STORAGE = MagicMock()
-        started_at = time.monotonic()
-
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_MAX_WAIT_TIME", 0.02),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_TIMEOUT", 0.2),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
+            patch("skyvern.webeye.actions.handler.get_run_temp_dir", return_value=temp_dir),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(side_effect=slow_download_completion),
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
+            patch("skyvern.webeye.actions.handler.time", clock),
         ):
             results = await asyncio.wait_for(
                 ActionHandler.handle_action(
@@ -1389,10 +1401,6 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
                 timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
             )
 
-        elapsed = time.monotonic() - started_at
-
-    assert elapsed >= 0.05
-    assert elapsed < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == ["report.pdf"]
     # The download-triggered persist path stamps the execution window too, and the
@@ -1403,6 +1411,8 @@ async def test_handle_action_download_completion_may_exceed_signal_budget(
     assert action.started_at <= action.finished_at
     assert during_completion_wait
     assert action.finished_at <= during_completion_wait[0]
+    span_attrs = _download_wait_span_attrs(span_exporter)
+    assert span_attrs["download_signal_elapsed_seconds"] == 0.05
 
 
 @pytest.mark.asyncio
@@ -2219,6 +2229,8 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
         task_id=task.task_id,
         step_id=step.step_id,
     )
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(1.2)
 
     # _handle_action simulates the page navigating to about:blank during the print download
     async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
@@ -2243,6 +2255,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
             patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files_side_effect),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.time", clock),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -2267,7 +2280,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
     assert span_attrs["download_signal_observed"] is True
     assert span_attrs["download_signal_source"] == "download_file_detected"
     assert span_attrs["download_signal_poll_iterations"] == 1
-    assert 0 <= span_attrs["download_signal_elapsed_seconds"] < 1
+    assert span_attrs["download_signal_elapsed_seconds"] == 1.2
 
 
 @pytest.mark.asyncio
@@ -2550,7 +2563,7 @@ async def test_handle_action_download_fails_on_transient_user_defined_error_text
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=str(staging_dir)),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=str(staging_dir)),
             patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
@@ -2701,9 +2714,20 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
     page.evaluate = AsyncMock()
     request = MagicMock(resource_type="xhr")
     late_tasks: list[asyncio.Task[None]] = []
+    first_download_wait_poll = asyncio.Event()
+    list_calls = 0
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(0.01)
+
+    def list_files(_download_dir: object) -> list[str]:
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 2:
+            first_download_wait_poll.set()
+        return []
 
     async def expose_error_after_grace() -> None:
-        await asyncio.sleep(0.04)
+        await first_download_wait_poll.wait()
         callbacks["transient_text"](
             {},
             {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
@@ -2724,9 +2748,11 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.time", clock),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -2744,6 +2770,7 @@ async def test_handle_action_download_admits_request_event_queued_by_action(
 
     assert isinstance(results[-1], ActionFailure)
     assert [error.error_code for error in action.errors or []] == ["download_failed"]
+    assert clock.current == 0.01
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_wait_extended_for_in_flight_request"] is True
     for event in ("response", "request", "requestfinished", "requestfailed"):
@@ -2778,9 +2805,20 @@ async def test_handle_action_download_observes_error_after_grace_while_xhr_is_in
     page.evaluate = AsyncMock()
     request = MagicMock(resource_type="xhr")
     late_event_finished = asyncio.Event()
+    first_download_wait_poll = asyncio.Event()
+    list_calls = 0
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(0.01)
+
+    def list_files(_download_dir: object) -> list[str]:
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 2:
+            first_download_wait_poll.set()
+        return []
 
     async def finish_request_after_grace() -> None:
-        await asyncio.sleep(0.04)
+        await first_download_wait_poll.wait()
         callbacks["transient_text"](
             {},
             {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
@@ -2802,9 +2840,11 @@ async def test_handle_action_download_observes_error_after_grace_while_xhr_is_in
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.time", clock),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -2823,6 +2863,7 @@ async def test_handle_action_download_observes_error_after_grace_while_xhr_is_in
     assert isinstance(results[-1], ActionFailure)
     assert [error.error_code for error in action.errors or []] == ["download_failed"]
     assert action.terminal_user_errors is True
+    assert clock.current == 0.01
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["download_wait_extended_for_in_flight_request"] is True
     assert span_attrs["download_wait_user_error_detected"] is True
@@ -2857,9 +2898,20 @@ async def test_handle_action_download_custom_timeout_observes_error_after_grace_
     page.expose_binding = AsyncMock(side_effect=expose_binding)
     page.evaluate = AsyncMock()
     request = MagicMock(resource_type="xhr")
+    first_download_wait_poll = asyncio.Event()
+    list_calls = 0
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(0.01)
+
+    def list_files(_download_dir: object) -> list[str]:
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 2:
+            first_download_wait_poll.set()
+        return []
 
     async def expose_error_after_grace() -> None:
-        await asyncio.sleep(0.04)
+        await first_download_wait_poll.wait()
         callbacks["transient_text"](
             {},
             {"text": "The generated document could not be prepared for download", "timestamp_ms": 1},
@@ -2880,10 +2932,11 @@ async def test_handle_action_download_custom_timeout_observes_error_after_grace_
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
-            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0.005),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
+            patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
+            patch("skyvern.webeye.actions.handler.time", clock),
             patch(
                 "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
                 new=AsyncMock(),
@@ -2901,6 +2954,7 @@ async def test_handle_action_download_custom_timeout_observes_error_after_grace_
     assert isinstance(results[-1], ActionFailure)
     assert [error.error_code for error in action.errors or []] == ["download_failed"]
     assert action.terminal_user_errors is True
+    assert clock.current == 0.01
     span_attrs = _download_wait_span_attrs(span_exporter)
     assert span_attrs["no_signal_grace_seconds"] == 0.01
     assert span_attrs["timeout_seconds"] == 0.1
@@ -3032,7 +3086,9 @@ async def test_handle_action_download_without_explicit_timeout_has_bounded_in_fl
 
 
 @pytest.mark.asyncio
-async def test_handle_action_download_cancellation_cleans_extended_wait_listeners() -> None:
+async def test_handle_action_download_cancellation_cleans_extended_wait_listeners(
+    span_exporter: InMemorySpanExporter,
+) -> None:
     now = datetime.now(UTC)
     organization = make_organization(now)
     task, step, page, browser_state, scraped_page, action = _make_download_click_context(
@@ -3057,8 +3113,12 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
         },
     )
     body_cancelled = asyncio.Event()
+    body_started = asyncio.Event()
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(0.01)
 
     async def never_resolving_body() -> bytes:
+        body_started.set()
         try:
             await asyncio.Event().wait()
             return b"%PDF-1.4 late"
@@ -3091,12 +3151,14 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS", 1.0),
+            patch("skyvern.webeye.actions.handler.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=temp_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=str(staging_dir)),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=str(staging_dir)),
             patch("skyvern.webeye.actions.handler.list_files_in_directory", return_value=[]),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", side_effect=make_capture),
             patch("skyvern.webeye.actions.handler.skyvern_context.current", return_value=None),
             patch("skyvern.webeye.actions.handler.app", mock_app),
+            patch("skyvern.webeye.actions.handler.time", clock),
         ):
             handle_task = asyncio.create_task(
                 ActionHandler.handle_action(
@@ -3107,7 +3169,7 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
                     action=action,
                 )
             )
-            await asyncio.sleep(0.04)
+            await asyncio.wait_for(body_started.wait(), timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS)
             assert not handle_task.done()
             handle_task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -3118,10 +3180,13 @@ async def test_handle_action_download_cancellation_cleans_extended_wait_listener
         assert captures[0]._drained.is_set()
         assert not staging_dir.exists()
         assert not (staging_dir / "report.pdf").exists()
+        assert clock.current == 0.01
 
     for event in ("response", "request", "requestfinished", "requestfailed"):
         page.remove_listener.assert_any_call(event, callbacks[event])
     page.context.remove_listener.assert_called_once_with("page", page.context.on.call_args.args[1])
+    span_attrs = _download_wait_span_attrs(span_exporter)
+    assert span_attrs["download_wait_extended_for_in_flight_request"] is True
 
 
 @pytest.mark.asyncio
@@ -3186,6 +3251,8 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
     download = MagicMock()
     download.suggested_filename = "report.pdf"
     download.save_as = AsyncMock()
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(1.2)
 
     with tempfile.TemporaryDirectory() as temp_root:
         primary_dir = os.path.join(temp_root, "pbs-1")
@@ -3219,6 +3286,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
                 new=wait_for_downloads,
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
+            patch("skyvern.webeye.actions.handler.time", clock),
         ):
             results = await ActionHandler.handle_action(
                 scraped_page=scraped_page,
@@ -3240,7 +3308,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
     assert span_attrs["download_signal_observed"] is True
     assert span_attrs["download_signal_source"] == "browser_download_event"
     assert span_attrs["download_signal_poll_iterations"] == 1
-    assert 0 <= span_attrs["download_signal_elapsed_seconds"] < 1
+    assert span_attrs["download_signal_elapsed_seconds"] == 1.2
 
 
 @pytest.mark.asyncio
@@ -3293,6 +3361,8 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
             f.write("dummy")
 
     download.save_as = AsyncMock(side_effect=save_download)
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(1.2)
 
     async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         download_callbacks["download"](download)
@@ -3321,6 +3391,7 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
             patch("skyvern.webeye.actions.handler.DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS", 0),
+            patch("skyvern.webeye.actions.handler.time", clock),
             patch(
                 "skyvern.webeye.actions.handler._persist_captured_download", wraps=_persist_captured_download
             ) as persist,
@@ -3348,7 +3419,7 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
     assert span_attrs["download_signal_observed"] is True
     assert span_attrs["download_signal_source"] == "browser_download_event"
     assert span_attrs["download_signal_poll_iterations"] == 1
-    assert 0 <= span_attrs["download_signal_elapsed_seconds"] < 1
+    assert span_attrs["download_signal_elapsed_seconds"] == 1.2
 
 
 @pytest.mark.asyncio
@@ -3395,6 +3466,8 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
 
     download = MagicMock()
     download.suggested_filename = "report.pdf"
+    clock = _FakeMonotonic()
+    clock.advance_after_next_read(1.2)
 
     async def save_empty_download(target_path: str | os.PathLike[str]) -> None:
         open(target_path, "w").close()
@@ -3428,6 +3501,7 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
             patch("skyvern.webeye.actions.handler.DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS", 0),
+            patch("skyvern.webeye.actions.handler.time", clock),
         ):
             results = await ActionHandler.handle_action(
                 scraped_page=scraped_page,
@@ -3451,7 +3525,7 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     assert span_attrs["download_signal_observed"] is True
     assert span_attrs["download_signal_source"] == "browser_download_event"
     assert span_attrs["download_signal_poll_iterations"] == 1
-    assert 0 <= span_attrs["download_signal_elapsed_seconds"] < 1
+    assert span_attrs["download_signal_elapsed_seconds"] == 1.2
 
 
 @pytest.mark.asyncio
@@ -3752,7 +3826,7 @@ async def test_handle_action_discards_xhr_staging_when_native_file_present(
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="pbs-1", download_suffix=None),
@@ -3812,7 +3886,7 @@ async def test_handle_action_uses_xhr_staging_fallback_when_no_native_file(
             # the full no-signal grace before falling back to xhr staging; shorten it.
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="pbs-1", download_suffix=None),
@@ -3875,7 +3949,7 @@ async def test_handle_action_moves_multiple_staged_xhr_files_as_fallback(
             # the full no-signal grace before falling back to xhr staging; shorten it.
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0.01),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="pbs-1", download_suffix=None),
@@ -3930,7 +4004,7 @@ async def test_handle_action_cleans_staging_on_exception(
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
                 return_value=MagicMock(run_id="pbs-1", download_suffix=None),
@@ -3997,7 +4071,7 @@ async def test_handle_action_logs_warning_when_late_native_appears_after_xhr_fal
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
@@ -4639,7 +4713,7 @@ async def test_handle_action_adopted_session_xhr_staging_recovered_when_helper_f
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=staging_dir),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=staging_dir),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr) as capture_cls,
             patch(
                 "skyvern.webeye.actions.handler.skyvern_context.current",
@@ -4734,7 +4808,7 @@ async def test_handle_action_hard_deadline_drain_uses_zero_remaining_budget_and_
         with (
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(download_dir)),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=str(staging_dir)),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=str(staging_dir)),
             patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr),
             patch("skyvern.webeye.actions.handler.time", clock),
@@ -4805,7 +4879,7 @@ async def test_handle_action_xhr_body_finishing_within_remaining_deadline_is_col
             patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
             patch("skyvern.webeye.actions.handler.BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME", 0),
             patch("skyvern.webeye.actions.handler.get_download_dir", return_value=str(download_dir)),
-            patch("skyvern.webeye.actions.handler.make_temp_directory", return_value=str(staging_dir)),
+            patch("skyvern.webeye.actions.handler.tempfile.mkdtemp", return_value=str(staging_dir)),
             patch("skyvern.webeye.actions.handler.list_files_in_directory", side_effect=list_files),
             patch("skyvern.webeye.actions.handler.ScopedXhrDownloadCapture", return_value=mock_xhr),
             patch("skyvern.webeye.actions.handler.time", clock),

@@ -89,6 +89,7 @@ function makeContext(
     updateState: vi.fn(),
     isNewUser: false,
     abVariant: null,
+    recoveryGuidanceAssignment: null,
     ...overrides,
   };
 }

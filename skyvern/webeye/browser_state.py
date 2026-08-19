@@ -6,6 +6,7 @@ from playwright.async_api import BrowserContext, Page, Playwright
 
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+from skyvern.exceptions import BrowserStateDiagnostic
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
@@ -46,6 +47,8 @@ class BrowserState(Protocol):
     ) -> None: ...
 
     def is_connected(self) -> bool: ...
+
+    def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
 
     async def reconnect(
         self,
@@ -131,3 +134,12 @@ class BrowserState(Protocol):
         must_included_tags: list[str] | None = None,
         allow_transient_ui_suppression: bool = False,
     ) -> ScrapedPage: ...
+
+
+def get_browser_state_diagnostic(browser_state: BrowserState | None) -> BrowserStateDiagnostic | None:
+    """Read the latched disconnect snapshot without requiring every test double to implement it."""
+    if browser_state is None:
+        return None
+    getter = getattr(browser_state, "get_browser_state_diagnostic", None)
+    diagnostic = getter() if callable(getter) else None
+    return diagnostic if isinstance(diagnostic, BrowserStateDiagnostic) else None

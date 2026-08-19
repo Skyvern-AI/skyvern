@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,

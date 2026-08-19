@@ -226,7 +226,7 @@ async def block_fn(page, context):
 - `await page.reload_page()` — Reload the current page
 
 ### Interaction
-- `await page.click(selector=, ai=, prompt=)` — Click an element
+- `await page.click(selector=, ai=, prompt=, desired_state=)` — Click an element (desired_state=True/False is a recorded toggle intent; preserve it as-is, never invent it)
 - `await page.fill(selector=, value=, ai=, prompt=)` — Fill a text input
 - `await page.select_option(selector=, value=, ai=, prompt=)` — Select a dropdown option
 

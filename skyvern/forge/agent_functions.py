@@ -65,7 +65,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
-from skyvern.schemas.run_enums import RunEngine
+from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.email_validation import normalize_identifier_if_email
@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+    from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
@@ -1096,6 +1097,24 @@ class AgentFunction:
         """
         return False
 
+    def serialize_codeblock_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Cloud overrides this with the runner's canonical parameter serialization."""
+        return parameters
+
+    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+        """Cloud overrides this with the runner's canonical parameter scrubber."""
+        return value
+
+    def prepare_codeblock_control_flow_exception(self, exception: BaseException) -> bool:
+        if type(exception) not in {asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit}:
+            return False
+        exception.args = ()
+        exception.__traceback__ = exception.__context__ = exception.__cause__ = None
+        exception.__notes__ = []
+        if type(exception) is SystemExit:
+            exception.code = None
+        return True
+
     async def resolve_in_process_script_execution_policy(
         self,
         *,
@@ -1810,7 +1829,12 @@ class AgentFunction:
         if "@" not in totp_identifier:
             return None
 
-        from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import (
+            InsufficientCreditsForOTPParse,
+            looks_like_magic_link,
+            parse_otp_login,
+        )
 
         lookup_context = context or EmailOTPVerificationContext()
         sources = build_email_otp_sources(self)
@@ -1893,11 +1917,17 @@ class AgentFunction:
                             )
                             continue
                         source_context.remember_message(credential_id, candidate.message_id)
+                        if otp_value is None and expected_otp_type is OTPType.TOTP:
+                            # An enforced parse reports "not found" rather than the type it did see,
+                            # so a link arriving for a code-verb call is only visible by its shape.
+                            if looks_like_magic_link(candidate.content):
+                                lookup_context.observed_otp_types.add(OTPType.MAGIC_LINK)
                         if (
                             otp_value
                             and expected_otp_type is not None
                             and otp_value.get_otp_type() != expected_otp_type
                         ):
+                            lookup_context.observed_otp_types.add(otp_value.get_otp_type())
                             continue
                         if otp_value:
                             try:
@@ -2268,7 +2298,7 @@ class AgentFunction:
             return destination.customer_uri
 
         if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
-            if not destination.google_access_token or not destination.google_drive_folder_id:
+            if not destination.google_access_token:
                 raise ValueError("Google Drive destination is missing required fields")
             uploaded_file = await google_drive_service.upload_file(
                 access_token=destination.google_access_token,
@@ -2538,6 +2568,7 @@ class AgentFunction:
         self,
         organization_id: str,
         edited_by: str | None,
+        workflow_permanent_id: str | None = None,
     ) -> None:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
         return None
@@ -2547,8 +2578,31 @@ class AgentFunction:
         organization_id: str,
         workflow_id: str,
         status: WorkflowRunStatus | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run: WorkflowRun | None = None,
     ) -> None:
-        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
+        return None
+
+    async def on_credential_saved(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        credential_type: CredentialType,
+    ) -> None:
+        """Fired after a credential is persisted. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_run_created(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        run_type: RunType,
+        caller_type: CallerType,
+    ) -> None:
+        """Fired after any run type is created; run_type is attribution only. Overrides must be best-effort."""
         return None
 
     async def on_workflow_run_terminal(

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import difflib
 import importlib.util
 import json
 import os
@@ -49,6 +50,8 @@ from skyvern.exceptions import (
     BrowserActionPolicyNotEnforceable,
     BrowserProfileNotApplied,
     BrowserProfileNotFound,
+    BrowserSessionAlreadyOccupiedError,
+    BrowserSessionClosed,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
     BrowserSessionStartupTimeout,
@@ -62,6 +65,7 @@ from skyvern.exceptions import (
     SequentialCredentialLimitExceeded,
     SkyvernException,
     SkyvernHTTPException,
+    UnrecognizedWorkflowParameters,
     WorkflowNotFound,
     WorkflowNotFoundForWorkflowRun,
     WorkflowRunNotFound,
@@ -82,7 +86,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, OrganizationAuthTokenType, WorkflowRunTriggerType
-from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_parameter_id
+from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workflow_id, generate_workflow_parameter_id
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
@@ -94,10 +98,13 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE,
+    SESSION_RETIREMENT_RUNNABLE_TYPE,
     PersistentBrowserSession,
+    is_final_status,
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.streaming.registries import mark_stream_closing
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import bind_policy_to_context, rejection_reasons
@@ -170,6 +177,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     is_adaptive_caching,
+    resolve_reuse_browser_session,
+    should_acquire_reused_session,
 )
 from skyvern.forge.sdk.workflow.runtime_completion import (
     ContractVerdict,
@@ -177,6 +186,13 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
     parse_completion_contract,
 )
 from skyvern.forge.sdk.workflow.secret_encryption import encrypt_workflow_definition_secrets
+from skyvern.forge.sdk.workflow.sequential_key import (
+    REUSE_ADMISSION_OFF_DISABLED,
+    REUSE_ADMISSION_OFF_KILL_SWITCH,
+    REUSE_ADMISSION_OFF_UNRESOLVABLE,
+    is_reuse_admission_off,
+    resolve_reuse_bound_key,
+)
 from skyvern.forge.sdk.workflow.status_mapping import (
     BLOCK_STATUS_MAP,
     NONFINAL_BLOCK_STATUSES,
@@ -256,6 +272,8 @@ TRIGGER_RUN_TAG_KEY = "skyvern.trigger"
 TARGET_DOMAIN_RUN_TAG_KEY = "skyvern.target_domain"
 CREATION_RUN_TAG_CALLER_ID = "system:creation-tagging"
 COMPLETION_RUN_TAG_CALLER_ID = "system:completion-tagging"
+MAX_REPORTED_PARAMETER_KEYS = 20
+MAX_REPORTED_PARAMETER_KEY_LENGTH = 64
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
@@ -264,6 +282,13 @@ POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
 
 # Bound pre-finalization write-back so a stuck profile upload cannot leave the run in a non-terminal state.
 BROWSER_SESSION_WRITE_BACK_TIMEOUT = SAVE_DOWNLOADED_FILES_TIMEOUT
+# Bound cancellation cleanup so an unresponsive release cannot stall worker shutdown indefinitely.
+UNSTAMPED_REUSED_SESSION_RELEASE_TIMEOUT_SECONDS = 30.0
+# The router admits one activity touch per 30-second window, but the async sink is best-effort:
+# it suppresses in-flight writes and swallows failures, so 60 seconds covers only the throttle.
+# Ten windows (300 seconds), plus the timestamp CAS pin, require five full minutes of continuously
+# failed activity writes before a live client can lose its browser.
+REUSED_SESSION_ROUTER_ACTIVITY_STALE_AFTER = timedelta(seconds=300)
 
 # Limit burst concurrency for status-path fetches that are typically hit by client polling.
 WORKFLOW_STATUS_RESPONSE_MAX_IN_FLIGHT = 3
@@ -435,12 +460,23 @@ def _merge_workflow_run_errors(
 
 _T_OP = TypeVar("_T_OP")
 
-# Failure reason stamped when execute_workflow's body is interrupted before it captures a terminal
-# intent (pre_finally_status stays None)
+# Failure reasons stamped when execute_workflow exits before it captures a terminal intent
+# (pre_finally_status stays None).
 WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON = (
-    "Workflow run was interrupted before completion (worker eviction or in-process cancellation); "
-    "finalized as failed by execute_workflow's in-band cleanup."
+    "Workflow run was interrupted before completion; the interruption cause was unavailable. "
+    "Finalized as failed by execute_workflow's in-band cleanup."
 )
+WORKFLOW_RUN_FAILED_FAILURE_REASON_TEMPLATE = (
+    "Workflow run failed: workflow execution raised before completion ({cause_type}); "
+    "finalized by execute_workflow's in-band cleanup."
+)
+_WORKFLOW_RUN_ESCAPED_EXCEPTION_FAILURE_CATEGORY = [
+    {
+        "category": "UNKNOWN",
+        "confidence_float": 0.5,
+        "reasoning": "No keyword match found",
+    }
+]
 
 # Short lifespan for auto-provisioned CodeBlock sessions; the renewal loop extends it while the
 # run is active, so this only bounds how long a leaked session lingers if cleanup never runs.
@@ -1149,6 +1185,25 @@ class WorkflowBrowserCleanupResult:
     child_workflow_run_ids: list[str]
     close_browser_on_completion: bool
     browser_session_write_back_attempted: bool = False
+
+
+@dataclass(frozen=True)
+class ReusedSessionOwnerProof:
+    is_terminal: bool
+    runnable_generation_id: str | None = None
+    browser_state: BrowserState | None = None
+    router_activity_is_stale: bool = False
+    observed_last_activity_at: datetime | None = None
+
+    @property
+    def can_release(self) -> bool:
+        return (
+            self.is_terminal
+            and self.runnable_generation_id is not None
+            and self.browser_state is not None
+            and self.router_activity_is_stale
+            and self.observed_last_activity_at is not None
+        )
 
 
 def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) -> dict[str, Any]:
@@ -2574,26 +2629,8 @@ class WorkflowService:
                 )
             )
 
-            # Check artifact bundling flag at workflow level so it applies to both agent and cached paths.
-            # See also: skyvern/forge/agent.py Agent.agent_step() checks per-task for standalone task runs.
             new_context = skyvern_context.current()
             if new_context:
-                try:
-                    new_context.use_artifact_bundling = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "USE_ARTIFACT_BUNDLING",
-                        workflow_run.workflow_run_id,
-                        properties={"organization_id": organization.organization_id},
-                    )
-                    LOG.debug(
-                        "USE_ARTIFACT_BUNDLING flag resolved for workflow",
-                        use_artifact_bundling=new_context.use_artifact_bundling,
-                        workflow_run_id=workflow_run.workflow_run_id,
-                        organization_id=organization.organization_id,
-                    )
-                except Exception:
-                    LOG.warning("Failed to check USE_ARTIFACT_BUNDLING flag for workflow", exc_info=True)
-                    new_context.use_artifact_bundling = False
-
                 # Resolve flex routing eligibility once per run boot. Site B
                 # (scripts/run_workflow.py) re-resolves in the Temporal worker — both go
                 # through the same AgentFunction hook so the cloud side is the single
@@ -2630,6 +2667,10 @@ class WorkflowService:
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
             try:
                 missing_parameters: list[str] = []
+                unresolved_credential_parameters: list[str] = []
+                # Only the credentials the request never mentioned. A key sent as null or blank is a
+                # caller who knows the key and means "run without a credential".
+                absent_credential_parameters: list[str] = []
                 workflow_parameter_values: list[tuple[WorkflowParameter, Any]] = []
                 for workflow_parameter in all_workflow_parameters:
                     if workflow_request.data and workflow_parameter.key in workflow_request.data:
@@ -2643,6 +2684,7 @@ class WorkflowService:
                             # credential": no run parameter row is written and the run context
                             # backfills it as None.
                             if self._is_optional_credential_parameter(workflow_parameter):
+                                unresolved_credential_parameters.append(workflow_parameter.key)
                                 continue
                             missing_parameters.append(workflow_parameter.key)
                             continue
@@ -2661,6 +2703,44 @@ class WorkflowService:
                         workflow_parameter_values.append((workflow_parameter, workflow_parameter.default_value))
                     elif not self._is_optional_credential_parameter(workflow_parameter):
                         missing_parameters.append(workflow_parameter.key)
+                    else:
+                        unresolved_credential_parameters.append(workflow_parameter.key)
+                        absent_credential_parameters.append(workflow_parameter.key)
+
+                declared_parameter_keys = self._declared_request_parameter_keys(workflow, all_workflow_parameters)
+                unknown_parameter_keys = sorted(set(workflow_request.data or {}) - declared_parameter_keys)
+                if unknown_parameter_keys:
+                    # Keys only, never values: an unknown key is the whole diagnosis and a value may
+                    # be a credential id or customer data.
+                    LOG.warning(
+                        "Workflow run request sent parameter keys the workflow does not declare",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        unknown_parameter_keys=self._bound_parameter_keys(unknown_parameter_keys),
+                        declared_parameter_key_count=len(declared_parameter_keys),
+                    )
+                # Only raise when an unknown key looks like it was meant for one of the credentials
+                # the request omitted -- a caller who legitimately runs without a credential must not
+                # 400 just because their request also carries an unrelated extra key (a stale field,
+                # a client-side sentinel, an internal marker).
+                misdirected_credential_keys = [
+                    unknown_key
+                    for unknown_key in unknown_parameter_keys
+                    if difflib.get_close_matches(unknown_key, absent_credential_parameters, n=1)
+                ]
+                if misdirected_credential_keys:
+                    raise UnrecognizedWorkflowParameters(
+                        unknown_keys=self._bound_parameter_keys(unknown_parameter_keys),
+                        expected_keys=self._bound_parameter_keys(sorted(declared_parameter_keys)),
+                        unresolved_credential_keys=sorted(absent_credential_parameters),
+                    )
+                if unresolved_credential_parameters:
+                    LOG.info(
+                        "Workflow run is starting without an at-will credential",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        credential_parameter_keys=sorted(unresolved_credential_parameters),
+                    )
 
                 if missing_parameters:
                     missing_list = ", ".join(sorted(missing_parameters))
@@ -2969,7 +3049,10 @@ class WorkflowService:
         # No pick + Save ON: the workflow's own auto-profile accumulates (the only place the
         # credential fall-through survives). The sink is always the own profile — the run forks its own
         # and never cross-writes the credential.
-        if workflow.persist_browser_session:
+        if workflow.persist_browser_session or resolve_reuse_browser_session(
+            run_override=workflow_run.reuse_browser_session,
+            workflow_default=workflow.reuse_browser_session,
+        ):
             own_browser_profile_id = await self._ensure_managed_browser_profile(
                 workflow=workflow,
                 workflow_run=workflow_run,
@@ -3210,7 +3293,13 @@ class WorkflowService:
         """Get-or-create the workflow's managed browser profile (own memory), lazily seeding it from
         the legacy Save & Reuse archive on first creation and reconciling its proxy pin. Returns the
         profile id, or None when a freshly created row had to be rolled back (seed failed)."""
-        if not workflow.persist_browser_session:
+        if not (
+            workflow.persist_browser_session
+            or resolve_reuse_browser_session(
+                run_override=workflow_run.reuse_browser_session,
+                workflow_default=workflow.reuse_browser_session,
+            )
+        ):
             return None
         try:
             rendered_key = await self._render_workflow_browser_profile_key(
@@ -3578,6 +3667,29 @@ class WorkflowService:
         return storage_key
 
     @staticmethod
+    def _declared_request_parameter_keys(
+        workflow: Workflow,
+        workflow_parameters: list[WorkflowParameter],
+    ) -> set[str]:
+        """Every request-data key the run path can consume: the workflow's parameter rows plus the
+        definition's other parameter types, whose keys drive the per-run credential overrides."""
+        declared_keys = {workflow_parameter.key for workflow_parameter in workflow_parameters}
+        declared_keys.update(parameter.key for parameter in workflow.workflow_definition.parameters)
+        return declared_keys
+
+    @staticmethod
+    def _bound_parameter_keys(keys: list[str]) -> list[str]:
+        """Unknown keys come straight from the request, so bound them before they reach a log line
+        or an error message: a caller can put an entire value where a parameter name belongs."""
+        bounded = [
+            key if len(key) <= MAX_REPORTED_PARAMETER_KEY_LENGTH else f"{key[:MAX_REPORTED_PARAMETER_KEY_LENGTH]}..."
+            for key in keys[:MAX_REPORTED_PARAMETER_KEYS]
+        ]
+        if len(keys) > MAX_REPORTED_PARAMETER_KEYS:
+            bounded.append(f"(+{len(keys) - MAX_REPORTED_PARAMETER_KEYS} more)")
+        return bounded
+
+    @staticmethod
     def _is_optional_credential_parameter(workflow_parameter: WorkflowParameter) -> bool:
         """A credential_id parameter with no default is an at-will credential: absence is
         allowed and the run proceeds without a credential, mirroring how an input parameter
@@ -3804,6 +3916,690 @@ class WorkflowService:
                     budget_seconds=CODE_BLOCK_SESSION_STARTUP_BUDGET_SECONDS,
                 )
 
+    @staticmethod
+    async def _close_reused_session_best_effort(*, organization_id: str, session_id: str) -> None:
+        try:
+            await app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id)
+        except Exception:
+            LOG.warning(
+                "Failed to close unusable reused browser session",
+                organization_id=organization_id,
+                browser_session_id=session_id,
+                exc_info=True,
+            )
+
+    @staticmethod
+    async def _read_reused_session_owner_proof(
+        *,
+        organization_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> ReusedSessionOwnerProof:
+        runnable_type = browser_session.runnable_type
+        runnable_id = browser_session.runnable_id
+        if runnable_id is None:
+            return ReusedSessionOwnerProof(is_terminal=False)
+        try:
+            if runnable_type in ("workflow_run", SESSION_RETIREMENT_RUNNABLE_TYPE):
+                owner = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id=runnable_id,
+                    organization_id=organization_id,
+                )
+            elif runnable_type == "task":
+                owner = await app.DATABASE.tasks.get_task(
+                    task_id=runnable_id,
+                    organization_id=organization_id,
+                )
+            else:
+                LOG.warning(
+                    "Refusing to reclaim reusable browser session from unknown runnable type",
+                    organization_id=organization_id,
+                    runnable_type=runnable_type,
+                    runnable_id=runnable_id,
+                )
+                return ReusedSessionOwnerProof(is_terminal=False)
+            if owner is not None and not owner.status.is_final():
+                return ReusedSessionOwnerProof(is_terminal=False)
+
+            # Capture the immutable generation and exact cached wrapper synchronously with the
+            # terminal-owner observation. The trusted release must CAS both identities later.
+            runnable_generation_id = browser_session.runnable_generation_id
+            browser_state = (
+                app.PERSISTENT_SESSIONS_MANAGER.get_cached_browser_state_for_release(
+                    browser_session.persistent_browser_session_id,
+                    expected_runnable_id=runnable_id,
+                    expected_runnable_generation_id=runnable_generation_id,
+                )
+                if runnable_generation_id is not None
+                else None
+            )
+            last_activity_at = browser_session.last_activity_at
+            router_activity_is_stale = (
+                last_activity_at is not None
+                and datetime.now(UTC) - _as_utc(last_activity_at) > REUSED_SESSION_ROUTER_ACTIVITY_STALE_AFTER
+            )
+            return ReusedSessionOwnerProof(
+                is_terminal=True,
+                runnable_generation_id=runnable_generation_id,
+                browser_state=browser_state,
+                router_activity_is_stale=router_activity_is_stale,
+                observed_last_activity_at=last_activity_at,
+            )
+        except Exception:
+            LOG.warning(
+                "Unable to read reusable browser session owner; treating it as live",
+                organization_id=organization_id,
+                runnable_type=runnable_type,
+                runnable_id=runnable_id,
+                exc_info=True,
+            )
+            return ReusedSessionOwnerProof(is_terminal=False)
+
+    async def resolve_and_persist_reuse_bound_key(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+        effective_reuse: bool,
+    ) -> tuple[WorkflowRun, bool]:
+        """Resolve and persist the authoritative browser-reuse admission decision."""
+        reuse_bound_key = (
+            workflow_run.reuse_bound_key if workflow_run.reuse_bound_key is not None else REUSE_ADMISSION_OFF_DISABLED
+        )
+        colliding_keys: list[str] = []
+        if workflow_run.browser_address:
+            effective_reuse = False
+            reuse_bound_key = REUSE_ADMISSION_OFF_DISABLED
+            LOG.info(
+                "Disabled reusable browser admission for workflow run with pinned browser address",
+                organization_id=workflow_run.organization_id,
+                workflow_run_id=workflow_run.workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
+        elif workflow_run.reuse_bound_key is not None:
+            # A replay adopts the already-resolved tuple. The CAS below then succeeds only when
+            # that complete tuple is unchanged, or re-reads a concurrently installed winner.
+            effective_reuse = bool(workflow_run.reuse_browser_session)
+        elif effective_reuse:
+            try:
+                parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                )
+                parameter_values = {
+                    workflow_parameter.key: run_parameter.value
+                    for workflow_parameter, run_parameter in parameter_tuples
+                }
+                persisted_selections = await app.DATABASE.workflow_run_credential_selections.get_selections_for_run(
+                    workflow_run.workflow_run_id
+                )
+                reuse_bound_key, colliding_keys = resolve_reuse_bound_key(
+                    workflow,
+                    parameter_values,
+                    persisted_selections,
+                )
+            except Exception:
+                LOG.warning(
+                    "Reusable browser identity is unresolvable; using a fresh browser for this run",
+                    organization_id=workflow_run.organization_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    exc_info=True,
+                )
+                effective_reuse = False
+                reuse_bound_key = REUSE_ADMISSION_OFF_UNRESOLVABLE
+        if colliding_keys:
+            LOG.warning(
+                "Workflow run parameters collide with credential selection keys for reusable browser identity",
+                workflow_run_id=workflow_run.workflow_run_id,
+                parameter_keys=colliding_keys,
+            )
+        workflow_run = await app.DATABASE.workflow_runs.compare_and_set_reuse_admission(
+            workflow_run_id=workflow_run.workflow_run_id,
+            effective_reuse=effective_reuse,
+            reuse_bound_key=reuse_bound_key,
+        )
+        admitted_reuse = bool(workflow_run.reuse_browser_session)
+        LOG.info(
+            "Persisted reusable browser admission before publication",
+            organization_id=workflow_run.organization_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            effective_reuse=admitted_reuse,
+            has_reuse_bound_key=(
+                workflow_run.reuse_bound_key is not None and not is_reuse_admission_off(workflow_run.reuse_bound_key)
+            ),
+        )
+        return workflow_run, admitted_reuse
+
+    async def _claim_reused_session(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        browser_session: PersistentBrowserSession,
+    ) -> str:
+        session_id = browser_session.persistent_browser_session_id
+        if is_final_status(browser_session.status):
+            raise BrowserSessionClosed(session_id)
+        status = getattr(browser_session.status, "value", browser_session.status)
+        readiness_timeout = (
+            app.PERSISTENT_SESSIONS_MANAGER.get_browser_session_startup_timeout_seconds()
+            if status == "created"
+            else 0.0
+        )
+        readiness_started_at = time.monotonic()
+        browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
+            session_id,
+            organization_id,
+            timeout=readiness_timeout,
+        )
+        if browser_address is None:
+            if status == "created" and time.monotonic() - readiness_started_at < readiness_timeout:
+                raise BrowserSessionAlreadyOccupiedError(
+                    session_id,
+                    browser_session.runnable_id or "starting",
+                )
+            raise BrowserSessionClosed(session_id)
+        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            browser_session_id=session_id,
+            runnable_type="workflow_run",
+            runnable_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        current_context = skyvern_context.ensure_context()
+        current_context.browser_session_id = session_id
+        current_context.browser_session_runnable_id = workflow_run_id
+        current_context.browser_session_runnable_generation_id = lease_generation_id
+        return session_id
+
+    async def _adopt_reused_session(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        expected_workflow_permanent_id: str,
+        expected_bound_key: str | None,
+        browser_session: PersistentBrowserSession,
+    ) -> str | None:
+        session_id = browser_session.persistent_browser_session_id
+        workflow_identity_matches = browser_session.bound_workflow_permanent_id == expected_workflow_permanent_id or (
+            browser_session.runnable_type == SESSION_RETIREMENT_RUNNABLE_TYPE
+            and browser_session.bound_workflow_permanent_id is None
+        )
+        if not workflow_identity_matches or browser_session.bound_key != expected_bound_key:
+            LOG.warning(
+                "Refusing reusable browser session with mismatched binding identity",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=session_id,
+                expected_workflow_permanent_id=expected_workflow_permanent_id,
+                expected_bound_key=expected_bound_key,
+                actual_workflow_permanent_id=browser_session.bound_workflow_permanent_id,
+                actual_bound_key=browser_session.bound_key,
+            )
+            return None
+        if is_final_status(browser_session.status):
+            latest = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                session_id=session_id,
+                organization_id=organization_id,
+            )
+            if latest is None or is_final_status(latest.status):
+                return None
+            raise BrowserSessionAlreadyOccupiedError(session_id, latest.runnable_id or "unknown")
+
+        stale_owner_id = browser_session.runnable_id
+        if stale_owner_id and stale_owner_id != workflow_run_id:
+            owner_proof = await self._read_reused_session_owner_proof(
+                organization_id=organization_id,
+                browser_session=browser_session,
+            )
+            if not owner_proof.is_terminal:
+                raise BrowserSessionAlreadyOccupiedError(session_id, stale_owner_id)
+            released = False
+            if owner_proof.can_release:
+                assert owner_proof.runnable_generation_id is not None
+                assert owner_proof.browser_state is not None
+                assert owner_proof.observed_last_activity_at is not None
+                released = await app.PERSISTENT_SESSIONS_MANAGER.release_stale_browser_session(
+                    session_id,
+                    organization_id,
+                    expected_runnable_id=stale_owner_id,
+                    expected_runnable_generation_id=owner_proof.runnable_generation_id,
+                    expected_browser_state=owner_proof.browser_state,
+                    observed_last_activity_at=owner_proof.observed_last_activity_at,
+                )
+            if not released:
+                LOG.info(
+                    "Deferring terminal-owner lease release and respawning on a replacement session",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    stale_runnable_type=browser_session.runnable_type,
+                    stale_runnable_id=stale_owner_id,
+                    browser_session_id=session_id,
+                    router_activity_is_stale=owner_proof.router_activity_is_stale,
+                )
+                return None
+            LOG.info(
+                "Reclaimed reused browser session from stale runnable",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                stale_runnable_type=browser_session.runnable_type,
+                stale_runnable_id=stale_owner_id,
+                browser_session_id=session_id,
+            )
+
+        try:
+            return await self._claim_reused_session(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session=browser_session,
+            )
+        except BrowserSessionAlreadyOccupiedError:
+            raise
+        except BrowserSessionClosed:
+            latest = await app.DATABASE.browser_sessions.get_persistent_browser_session(
+                session_id=session_id,
+                organization_id=organization_id,
+            )
+            if latest is None or is_final_status(latest.status):
+                return None
+            if latest.runnable_id is not None:
+                raise BrowserSessionAlreadyOccupiedError(session_id, latest.runnable_id)
+            # A fresh read proves the failed liveness probe belongs to an ownerless session.
+            return None
+
+    async def _adopt_reused_session_with_occupancy_retry(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        bound_key: str | None,
+        browser_session: PersistentBrowserSession,
+    ) -> tuple[str | None, PersistentBrowserSession]:
+        candidate = browser_session
+        for attempt in range(2):
+            try:
+                return (
+                    await self._adopt_reused_session(
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        expected_workflow_permanent_id=workflow_permanent_id,
+                        expected_bound_key=bound_key,
+                        browser_session=candidate,
+                    ),
+                    candidate,
+                )
+            except BrowserSessionAlreadyOccupiedError:
+                if attempt > 0:
+                    raise
+                latest = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                )
+                if latest is None:
+                    raise
+                candidate = latest
+                LOG.info(
+                    "Retrying reusable browser session adoption after occupancy race",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=candidate.persistent_browser_session_id,
+                )
+        raise RuntimeError("Unreachable reusable browser session adoption state")
+
+    async def _retire_reused_session_for_respawn(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_permanent_id: str,
+        bound_key: str | None,
+        browser_session: PersistentBrowserSession,
+    ) -> str | None:
+        session_id = browser_session.persistent_browser_session_id
+        observed_workflow_permanent_id = browser_session.bound_workflow_permanent_id
+        if observed_workflow_permanent_id is None:
+            await self._close_reused_session_best_effort(
+                organization_id=organization_id,
+                session_id=session_id,
+            )
+            return None
+        occupied_owner_id = browser_session.runnable_id
+        # Binding retirement never clears the immutable lease. Match the owner ID so a same-owner
+        # generation rotation can still move this lane to a replacement session.
+        occupied_generation_id = None
+        cleared = await app.DATABASE.browser_sessions.clear_persistent_browser_session_binding(
+            session_id=session_id,
+            organization_id=organization_id,
+            expected_workflow_permanent_id=observed_workflow_permanent_id,
+            expected_bound_key=browser_session.bound_key,
+            retiring_workflow_run_id=workflow_run_id,
+            expected_runnable_id=occupied_owner_id,
+            expected_runnable_generation_id=occupied_generation_id,
+        )
+        if not cleared:
+            latest = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+            )
+            if latest is None:
+                return None
+            adopted_session_id, latest = await self._adopt_reused_session_with_occupancy_retry(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session=latest,
+            )
+            if adopted_session_id is not None:
+                return adopted_session_id
+            latest_workflow_permanent_id = latest.bound_workflow_permanent_id
+            if latest_workflow_permanent_id is None:
+                return None
+            latest_owner_id = latest.runnable_id
+            # Lease columns are monotonic and never cleared. This retry runs only after adoption proves
+            # the latest owner terminal, so omitting the generation pin is intentional.
+            cleared = await app.DATABASE.browser_sessions.clear_persistent_browser_session_binding(
+                session_id=latest.persistent_browser_session_id,
+                organization_id=organization_id,
+                expected_workflow_permanent_id=latest_workflow_permanent_id,
+                expected_bound_key=latest.bound_key,
+                retiring_workflow_run_id=workflow_run_id,
+                expected_runnable_id=latest_owner_id,
+                expected_runnable_generation_id=None,
+            )
+            if not cleared:
+                return None
+            if latest_owner_id is None:
+                await self._close_reused_session_best_effort(
+                    organization_id=organization_id,
+                    session_id=latest.persistent_browser_session_id,
+                )
+            return None
+        if occupied_owner_id is not None:
+            LOG.info(
+                "Unbound terminal-owner browser session without clearing its active lease",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                stale_runnable_id=occupied_owner_id,
+                browser_session_id=session_id,
+            )
+            return None
+        await self._close_reused_session_best_effort(
+            organization_id=organization_id,
+            session_id=session_id,
+        )
+        return None
+
+    @staticmethod
+    async def _reuse_browser_session_disabled_by_kill_switch(
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        workflow_run_id: str | None = None,
+    ) -> bool:
+        try:
+            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "REUSE_BROWSER_SESSION_KILL_SWITCH",
+                workflow_permanent_id,
+                properties={
+                    "organization_id": organization_id,
+                    "workflow_permanent_id": workflow_permanent_id,
+                },
+            )
+        except Exception:
+            LOG.warning(
+                "Could not evaluate reusable browser kill switch; leaving reuse enabled",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                exc_info=True,
+            )
+            return False
+
+    async def acquire_reused_session(
+        self,
+        organization: Organization,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> str | None:
+        """Find or create and claim the browser session bound to this workflow identity."""
+        organization_id = organization.organization_id
+        workflow_run_id = workflow_run.workflow_run_id
+        workflow_permanent_id = workflow.workflow_permanent_id
+        bound_key = workflow_run.reuse_bound_key
+        if bound_key is None or is_reuse_admission_off(bound_key):
+            return None
+        browser_session = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            bound_key=bound_key,
+        )
+        if browser_session is not None:
+            adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session=browser_session,
+            )
+            if adopted_session_id is not None:
+                return adopted_session_id
+            LOG.info(
+                "Respawning unusable workflow-bound browser session",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                browser_session_status=browser_session.status,
+            )
+            adopted_after_unbind_race = await self._retire_reused_session_for_respawn(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session=browser_session,
+            )
+            if adopted_after_unbind_race is not None:
+                return adopted_after_unbind_race
+
+        last_unusable_session_id: str | None = None
+        for _ in range(2):
+            try:
+                browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=organization_id,
+                    timeout_minutes=30,
+                    proxy_location=workflow.proxy_location,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                    inherit_profile_proxy=True,
+                    bound_workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                )
+            except IntegrityError:
+                browser_session = await app.DATABASE.browser_sessions.get_live_bound_persistent_browser_session(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    bound_key=bound_key,
+                )
+                if browser_session is None:
+                    raise
+                LOG.info(
+                    "Adopting browser session created by concurrent reuse acquisition",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session.persistent_browser_session_id,
+                )
+
+            adopted_session_id, browser_session = await self._adopt_reused_session_with_occupancy_retry(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session=browser_session,
+            )
+            if adopted_session_id is not None:
+                return adopted_session_id
+            last_unusable_session_id = browser_session.persistent_browser_session_id
+            adopted_after_unbind_race = await self._retire_reused_session_for_respawn(
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                bound_key=bound_key,
+                browser_session=browser_session,
+            )
+            if adopted_after_unbind_race is not None:
+                return adopted_after_unbind_race
+
+        raise BrowserSessionClosed(last_unusable_session_id or "unknown")
+
+    @staticmethod
+    async def _release_unstamped_reused_session_lease(
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        browser_session_id: str,
+        lease_generation_id: str,
+    ) -> None:
+        release_task = asyncio.create_task(
+            asyncio.wait_for(
+                app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+                    browser_session_id,
+                    organization_id,
+                    expected_runnable_id=workflow_run_id,
+                    expected_runnable_generation_id=lease_generation_id,
+                ),
+                timeout=UNSTAMPED_REUSED_SESSION_RELEASE_TIMEOUT_SECONDS,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        released: bool | None = None
+        while True:
+            try:
+                released = await asyncio.shield(release_task)
+                break
+            except asyncio.CancelledError as error:
+                if release_task.cancelled():
+                    LOG.warning(
+                        "Unstamped reusable browser session lease release was cancelled",
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+                    break
+                if cancellation is None:
+                    cancellation = error
+            except TimeoutError:
+                LOG.warning(
+                    "Timed out releasing unstamped reusable browser session lease",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    timeout_seconds=UNSTAMPED_REUSED_SESSION_RELEASE_TIMEOUT_SECONDS,
+                )
+                break
+            except Exception:
+                LOG.warning(
+                    "Failed to release unstamped reusable browser session lease",
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                    exc_info=True,
+                )
+                break
+        if released is False:
+            LOG.warning(
+                "Unstamped reusable browser session lease no longer matched its owner and generation",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                browser_session_id=browser_session_id,
+                lease_generation_id=lease_generation_id,
+            )
+        if cancellation is not None:
+            raise cancellation
+
+    async def _acquire_and_stamp_reused_session(
+        self,
+        *,
+        organization: Organization,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> tuple[WorkflowRun, str | None]:
+        browser_session_id = await self.acquire_reused_session(organization, workflow, workflow_run)
+        if browser_session_id is None:
+            return workflow_run, None
+        current_context = skyvern_context.ensure_context()
+        lease_generation_id = current_context.browser_session_runnable_generation_id
+        stamp_succeeded = False
+        original_cancellation: asyncio.CancelledError | None = None
+        try:
+            if (
+                current_context.browser_session_id != browser_session_id
+                or current_context.browser_session_runnable_id != workflow_run.workflow_run_id
+                or lease_generation_id is None
+            ):
+                raise RuntimeError("Reusable browser session acquisition did not produce a complete lease identity")
+            workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
+                workflow_run_id=workflow_run.workflow_run_id,
+                browser_session_id=browser_session_id,
+            )
+            stamp_succeeded = True
+            return workflow_run, browser_session_id
+        except asyncio.CancelledError as error:
+            original_cancellation = error
+            raise
+        finally:
+            if not stamp_succeeded and lease_generation_id is not None:
+                cleanup_cancellation: asyncio.CancelledError | None = None
+                try:
+                    await self._release_unstamped_reused_session_lease(
+                        organization_id=organization.organization_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        browser_session_id=browser_session_id,
+                        lease_generation_id=lease_generation_id,
+                    )
+                except asyncio.CancelledError as error:
+                    cleanup_cancellation = error
+                if (
+                    current_context.browser_session_id == browser_session_id
+                    and current_context.browser_session_runnable_id == workflow_run.workflow_run_id
+                    and current_context.browser_session_runnable_generation_id == lease_generation_id
+                ):
+                    current_context.browser_session_id = None
+                    current_context.browser_session_runnable_id = None
+                    current_context.browser_session_runnable_generation_id = None
+                if original_cancellation is not None:
+                    raise original_cancellation
+                if cleanup_cancellation is not None:
+                    raise cleanup_cancellation
+
+    @staticmethod
+    async def _ensure_browser_session_lease(
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        browser_session_id: str,
+    ) -> str | None:
+        current_context = skyvern_context.ensure_context()
+        if (
+            current_context.browser_session_id == browser_session_id
+            and current_context.browser_session_runnable_id == workflow_run_id
+            and current_context.browser_session_runnable_generation_id is not None
+        ):
+            return current_context.browser_session_runnable_generation_id
+        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            browser_session_id=browser_session_id,
+            runnable_type="workflow_run",
+            runnable_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        current_context.browser_session_id = browser_session_id
+        current_context.browser_session_runnable_id = workflow_run_id
+        current_context.browser_session_runnable_generation_id = lease_generation_id
+        return lease_generation_id
+
     async def _collect_inherited_workflow_system_prompt(
         self,
         parent_workflow_run_id: str | None,
@@ -4008,6 +4804,7 @@ class WorkflowService:
         workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
+        browser_session_id = browser_session_id or workflow_run.browser_session_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
@@ -4158,6 +4955,45 @@ class WorkflowService:
             )
             return workflow_run
 
+        if should_acquire_reused_session(
+            browser_session_id=browser_session_id,
+            start_fresh_browser=workflow_run.start_fresh_browser,
+            run_override=workflow_run.reuse_browser_session,
+            workflow_default=workflow.reuse_browser_session,
+        ):
+            try:
+                workflow_run, browser_session_id = await self._acquire_and_stamp_reused_session(
+                    organization=organization,
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                )
+                if browser_session_id is not None:
+                    close_browser_on_completion = False
+            except Exception as e:
+                LOG.exception(
+                    "Failed to acquire reusable browser session for workflow run",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                )
+                failure_reason = (
+                    f"Failed to acquire reusable browser session for workflow run: "
+                    f"{get_user_facing_exception_message(e)}"
+                )
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=failure_reason,
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=False,
+                    need_call_webhook=need_call_webhook,
+                )
+                return workflow_run
+
         browser_session = None
         code_block_browser_session_id: str | None = None
         using_managed_browser_profile = await self._browser_profile_is_managed(
@@ -4234,15 +5070,11 @@ class WorkflowService:
         renewal_task: asyncio.Task[None] | None = None
         if browser_session_id:
             try:
-                lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                    browser_session_id=browser_session_id,
-                    runnable_type="workflow_run",
-                    runnable_id=workflow_run_id,
+                await self._ensure_browser_session_lease(
                     organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
                 )
-                current_context = skyvern_context.ensure_context()
-                current_context.browser_session_runnable_id = workflow_run_id
-                current_context.browser_session_runnable_generation_id = lease_generation_id
             except Exception as e:
                 LOG.exception(
                     "Failed to begin browser session for workflow run",
@@ -4571,6 +5403,9 @@ class WorkflowService:
             browser_cleanup_result: WorkflowBrowserCleanupResult | None = None
             browser_persistence_status: WorkflowRunStatus | None = None
             browser_write_back_exhausted = False
+            # Install the no-await tombstone before any final status becomes observable. Trusted
+            # stale-owner release must defer from this point until browser teardown releases it.
+            mark_stream_closing(workflow_run_id)
             if pre_finally_status is not None:
                 browser_persistence_status = pre_finally_browser_persistence_status
                 if browser_persistence_status is not None and not browser_persistence_status.is_final():
@@ -4682,10 +5517,30 @@ class WorkflowService:
                 )
             else:
                 try:
+                    escaped_error = sys.exc_info()[1]
+                    cause_type = type(escaped_error).__name__ if isinstance(escaped_error, Exception) else None
+                    if cause_type:
+                        LOG.warning(
+                            "Workflow execution raised before completion; finalizing escaped exception",
+                            workflow_run_id=workflow_run_id,
+                            error_type=cause_type,
+                            exc_info=True,
+                        )
+                    # Keep cause_type in failure_reason so escaped app errors retain full
+                    # diagnostic context.
+                    failure_reason = (
+                        WORKFLOW_RUN_FAILED_FAILURE_REASON_TEMPLATE.format(cause_type=cause_type)
+                        if cause_type
+                        else WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON
+                    )
+                    # Exception types such as TimeoutError must not be mistaken for a page-load
+                    # timeout when the reason classifier scans failure_reason.
+                    failure_category = _WORKFLOW_RUN_ESCAPED_EXCEPTION_FAILURE_CATEGORY if cause_type else None
                     finalize_task = asyncio.ensure_future(
                         self.mark_workflow_run_as_failed_if_not_final(
                             workflow_run_id=workflow_run_id,
-                            failure_reason=WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON,
+                            failure_reason=failure_reason,
+                            failure_category=failure_category,
                             cascade_children=True,
                         )
                     )
@@ -5249,14 +6104,6 @@ class WorkflowService:
         if not any(
             block.block_type in BLOCK_TYPES_THAT_SHOULD_BE_CACHED for block in workflow.workflow_definition.blocks
         ):
-            return
-
-        disable_script_generation = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            "DISABLE_GENERATE_SCRIPT_AFTER_BLOCK",
-            workflow_run.workflow_run_id,
-            properties={"organization_id": workflow_run.organization_id},
-        )
-        if disable_script_generation:
             return
 
         asyncio.create_task(
@@ -6448,6 +7295,14 @@ class WorkflowService:
                                     "networkidle timeout after browser profile navigation (non-fatal)",
                                     workflow_run_id=workflow_run_id,
                                 )
+                    except BrowserProfileNotApplied:
+                        LOG.info(
+                            "Saved browser profile was not applied; falling back to normal login",
+                            workflow_run_id=workflow_run_id,
+                            block_label=block.label,
+                            browser_profile_id=resolved_browser_profile_id,
+                        )
+                        profile_loaded = False
                     except Exception:
                         LOG.warning(
                             "Saved browser profile failed to load, falling back to normal login",
@@ -6457,6 +7312,8 @@ class WorkflowService:
                             exc_info=True,
                         )
                         profile_loaded = False
+
+                    if not profile_loaded:
                         # Clear the profile so the normal login path doesn't reuse it, and record the
                         # degraded state (a resolved profile failed to load; the run continues fresh)
                         # so the run detail can surface it instead of the old silent fallback.
@@ -6881,7 +7738,7 @@ class WorkflowService:
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
                 block_idx=block_idx,
-                block_result=block_result,
+                block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
@@ -6900,7 +7757,7 @@ class WorkflowService:
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
                 block_idx=block_idx,
-                block_result=block_result,
+                block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
@@ -6910,7 +7767,7 @@ class WorkflowService:
                     block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
                     block_idx=block_idx,
-                    block_result=block_result,
+                    block_status=block_result.status,
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
@@ -6923,7 +7780,7 @@ class WorkflowService:
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
                 block_idx=block_idx,
-                block_result=block_result,
+                block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
@@ -6934,7 +7791,7 @@ class WorkflowService:
                     block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
                     block_idx=block_idx,
-                    block_result=block_result,
+                    block_status=block_result.status,
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
@@ -6947,7 +7804,7 @@ class WorkflowService:
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
                 block_idx=block_idx,
-                block_result=block_result,
+                block_status=block_result.status,
                 block_type_var=block.block_type,
                 block_label=block.label,
             )
@@ -6958,7 +7815,7 @@ class WorkflowService:
                     block_type=block.block_type,
                     workflow_run_id=workflow_run_id,
                     block_idx=block_idx,
-                    block_result=block_result,
+                    block_status=block_result.status,
                     continue_on_failure=block.continue_on_failure,
                     block_type_var=block.block_type,
                     block_label=block.label,
@@ -7303,6 +8160,7 @@ class WorkflowService:
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        reuse_browser_session: bool = False,
         mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
@@ -7326,9 +8184,12 @@ class WorkflowService:
         generate_script_on_terminal: bool = False,
         created_by: str | None = None,
         edited_by: str | None = None,
+        workflow_id: str | None = None,
+        encrypt_secrets: bool = True,
     ) -> Workflow:
         try:
-            await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
+            if encrypt_secrets:
+                await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             return await app.DATABASE.workflows.create_workflow(
                 title=title,
                 workflow_definition=workflow_definition.model_dump(mode="json"),
@@ -7341,6 +8202,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                reuse_browser_session=reuse_browser_session,
                 mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
@@ -7364,6 +8226,7 @@ class WorkflowService:
                 generate_script_on_terminal=generate_script_on_terminal,
                 created_by=created_by,
                 edited_by=edited_by,
+                workflow_id=workflow_id,
             )
         except IntegrityError as e:
             if "uc_org_permanent_id_version" in str(e) and workflow_permanent_id:
@@ -7728,11 +8591,18 @@ class WorkflowService:
             workflow_tags=workflow_tags,
         )
 
-    def schedule_workflow_saved_hook(self, *, organization_id: str, edited_by: str | None) -> None:
+    def schedule_workflow_saved_hook(
+        self,
+        *,
+        organization_id: str,
+        edited_by: str | None,
+        workflow_permanent_id: str,
+    ) -> None:
         task = asyncio.create_task(
             app.AGENT_FUNCTION.on_workflow_saved(
                 organization_id=organization_id,
                 edited_by=edited_by,
+                workflow_permanent_id=workflow_permanent_id,
             ),
         )
         self._background_tasks.add(task)
@@ -7750,6 +8620,7 @@ class WorkflowService:
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        reuse_browser_session: bool | None = None,
         mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
@@ -7792,6 +8663,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                reuse_browser_session=reuse_browser_session,
                 mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
@@ -7825,6 +8697,7 @@ class WorkflowService:
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
+                reuse_browser_session=reuse_browser_session,
                 mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
@@ -7850,6 +8723,7 @@ class WorkflowService:
             self.schedule_workflow_saved_hook(
                 organization_id=updated_workflow.organization_id,
                 edited_by=cast("str | None", edited_by) if edited_by is not _UNSET else None,
+                workflow_permanent_id=updated_workflow.workflow_permanent_id,
             )
 
         return updated_workflow
@@ -8161,9 +9035,36 @@ class WorkflowService:
                         organization_id=organization_id,
                     )
 
-        # Check if this workflow/org should use browser sessions (anti-bot detection mitigation)
+        # Sample the kill switch exactly once, before request-time precedence. This persisted
+        # admission decision is authoritative: later flag changes stop new runs but never revoke an
+        # in-flight run or strip the forced-session fallback that was selected at admission.
         browser_session_id = workflow_request.browser_session_id
+        workflow: Workflow | None = None
+        will_acquire_reused_session = False
+        persisted_reuse_bound_key: str | None = None
+        persisted_reuse_browser_session = workflow_request.reuse_browser_session
         if not browser_session_id:
+            workflow = await self.get_workflow(workflow_id=workflow_id)
+            configured_reuse = should_acquire_reused_session(
+                browser_session_id=None,
+                start_fresh_browser=workflow_request.start_fresh_browser,
+                run_override=workflow_request.reuse_browser_session,
+                workflow_default=workflow.reuse_browser_session,
+            )
+            if configured_reuse and await self._reuse_browser_session_disabled_by_kill_switch(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+            ):
+                persisted_reuse_browser_session = False
+                persisted_reuse_bound_key = REUSE_ADMISSION_OFF_KILL_SWITCH
+                LOG.warning(
+                    "Reusable browser session disabled before workflow run creation",
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                )
+            else:
+                will_acquire_reused_session = configured_reuse
+        if not browser_session_id and not will_acquire_reused_session:
             force_browser_session = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
                 "FORCE_BROWSER_SESSION",
                 workflow_permanent_id,
@@ -8173,7 +9074,7 @@ class WorkflowService:
                 },
             )
             if force_browser_session:
-                workflow = await self.get_workflow(workflow_id=workflow_id)
+                assert workflow is not None
                 # Forced session creation happens before setup_workflow_run persists
                 # run-level credential selections. This validates override inputs
                 # before best-effort profile-key rendering, then setup_workflow_run
@@ -8189,6 +9090,8 @@ class WorkflowService:
                     browser_session_id=workflow_request.browser_session_id,
                     browser_profile_id=browser_profile_id,
                     start_fresh_browser=workflow_request.start_fresh_browser,
+                    reuse_browser_session=persisted_reuse_browser_session,
+                    reuse_bound_key=persisted_reuse_bound_key,
                     proxy_location=workflow_request.proxy_location,
                     webhook_callback_url=workflow_request.webhook_callback_url,
                     totp_verification_url=workflow_request.totp_verification_url,
@@ -8312,6 +9215,8 @@ class WorkflowService:
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
             start_fresh_browser=workflow_request.start_fresh_browser,
+            reuse_browser_session=persisted_reuse_browser_session,
+            reuse_bound_key=persisted_reuse_bound_key,
             proxy_location=workflow_request.proxy_location,
             webhook_callback_url=workflow_request.webhook_callback_url,
             totp_verification_url=workflow_request.totp_verification_url,
@@ -8388,12 +9293,15 @@ class WorkflowService:
         workflow_id: str,
         organization_id: str,
         status: WorkflowRunStatus,
+        workflow_run: WorkflowRun,
     ) -> None:
         hook_coroutines = (
             app.AGENT_FUNCTION.on_workflow_run_completed(
                 organization_id=organization_id,
                 workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
                 status=status,
+                workflow_run=workflow_run,
             ),
         )
         for hook_coroutine in hook_coroutines:
@@ -8520,6 +9428,7 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
                 workflow_id=workflow_run.workflow_id,
                 status=status,
+                workflow_run=workflow_run,
             )
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
@@ -8645,8 +9554,9 @@ class WorkflowService:
 
     async def _session_download_count(self, workflow_run: WorkflowRun, context: object) -> int:
         """This run's downloads still scoped to the browser session, which cleanup tags with the run
-        id after this grade runs. Failure-tolerant: an unavailable count must not manufacture a
-        shortfall."""
+        id after this grade runs — except on deployments with artifact content signing, where a code
+        block already claimed them and ``get_downloaded_files`` counts them instead. Failure-tolerant:
+        an unavailable count must not manufacture a shortfall."""
         browser_session_id = getattr(context, "browser_session_id", None)
         if not browser_session_id:
             return 0
@@ -9019,6 +9929,7 @@ class WorkflowService:
             organization_id=updated.organization_id,
             workflow_id=updated.workflow_id,
             status=WorkflowRunStatus.canceled,
+            workflow_run=updated,
         )
 
         bg = asyncio.create_task(
@@ -10158,6 +11069,11 @@ class WorkflowService:
         schedule_credential_fallback_retry: bool = True,
         code_block_browser_session_id: str | None = None,
     ) -> None:
+        # Direct cleanup callers can enter with a terminal row. When browser cleanup is still
+        # pending, install the tombstone before the first awaited terminal hook. A pre-finalization
+        # cleanup result has already reached complete_stream_teardown and must not be tombstoned again.
+        if browser_cleanup_result is None:
+            mark_stream_closing(workflow_run.workflow_run_id)
         analytics.capture("skyvern-oss-agent-workflow-status", {"status": workflow_run.status})
         # Tear down passkey material in the worker, after the finally block, while the context is still alive.
         await app.AGENT_FUNCTION.on_workflow_run_terminal(
@@ -10391,6 +11307,7 @@ class WorkflowService:
                 totp_url=workflow_run.totp_verification_url or None,
                 totp_identifier=workflow_run.totp_identifier,
                 start_fresh_browser=bool(workflow_run.start_fresh_browser),
+                reuse_browser_session=workflow_run.reuse_browser_session,
             ),
             errors=workflow_run_status_response.errors,
             step_count=workflow_run_status_response.total_steps,
@@ -10630,7 +11547,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
@@ -10660,7 +11577,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+        if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log", browser_log_size=len(browser_log))
@@ -10693,13 +11610,7 @@ class WorkflowService:
         if not last_step:
             return
 
-        context = skyvern_context.current()
-        if context and context.use_artifact_bundling:
-            await self._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
-        else:
-            await self.persist_browser_console_log(browser_state, last_step, workflow, workflow_run)
-            await self.persist_har_data(browser_state, last_step, workflow, workflow_run)
-            await self.persist_tracing_data(browser_state, last_step, workflow_run)
+        await self._persist_debug_artifacts_bundled(browser_state, last_step, workflow, workflow_run)
 
     async def _persist_debug_artifacts_bundled(
         self,
@@ -10716,7 +11627,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        redaction_enabled = settings.ENABLE_SECRET_ARTIFACT_REDACTION
+        redaction_enabled = app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id)
         secret_values = (
             app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             if redaction_enabled
@@ -10824,6 +11735,7 @@ class WorkflowService:
             totp_verification_url=runtime_workflow.totp_verification_url,
             totp_identifier=runtime_workflow.totp_identifier,
             persist_browser_session=runtime_workflow.persist_browser_session,
+            reuse_browser_session=runtime_workflow.reuse_browser_session,
             mask_secrets=runtime_workflow.mask_secrets,
             pin_saved_session_ip=runtime_workflow.pin_saved_session_ip,
             browser_profile_id=runtime_workflow.browser_profile_id,
@@ -10902,6 +11814,125 @@ class WorkflowService:
                 )
         return title
 
+    async def _create_initial_workflow_from_request(
+        self,
+        *,
+        organization_id: str,
+        request: WorkflowCreateYAMLRequest,
+        title: str,
+        workflow_definition: WorkflowDefinition,
+        cdp_connect_headers: dict[str, str] | None,
+        created_by: str | None,
+        edited_by: str | None,
+        workflow_permanent_id: str | None = None,
+        workflow_id: str | None = None,
+        encrypt_secrets: bool = True,
+    ) -> Workflow:
+        return await self.create_workflow(
+            title=title,
+            workflow_definition=workflow_definition,
+            description=request.description,
+            organization_id=organization_id,
+            proxy_location=request.proxy_location,
+            webhook_callback_url=request.webhook_callback_url,
+            totp_verification_url=request.totp_verification_url,
+            totp_identifier=request.totp_identifier,
+            persist_browser_session=request.persist_browser_session,
+            reuse_browser_session=request.reuse_browser_session,
+            mask_secrets=request.mask_secrets if request.mask_secrets is not None else False,
+            pin_saved_session_ip=request.pin_saved_session_ip,
+            browser_profile_id=request.browser_profile_id,
+            browser_profile_key=request.browser_profile_key,
+            model=request.model,
+            max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+            max_elapsed_time_minutes=request.max_elapsed_time_minutes,
+            extra_http_headers=request.extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
+            workflow_permanent_id=workflow_permanent_id,
+            version=1,
+            is_saved_task=request.is_saved_task,
+            status=request.status,
+            run_with=request.run_with,
+            cache_key=request.cache_key,
+            ai_fallback=request.ai_fallback,
+            run_sequentially=request.run_sequentially,
+            sequential_key=request.sequential_key,
+            folder_id=request.folder_id,
+            adaptive_caching=request.adaptive_caching,
+            enable_self_healing=request.enable_self_healing if request.enable_self_healing is not None else False,
+            code_version=request.code_version,
+            generate_script_on_terminal=request.generate_script_on_terminal,
+            created_by=created_by,
+            edited_by=edited_by,
+            workflow_id=workflow_id,
+            encrypt_secrets=encrypt_secrets,
+        )
+
+    async def _create_idempotent_workflow_from_request(
+        self,
+        *,
+        organization: Organization,
+        request: WorkflowCreateYAMLRequest,
+        workflow_permanent_id: str,
+        title: str,
+        delete_script: bool,
+        created_by: str | None,
+        edited_by: str | None,
+    ) -> Workflow:
+        organization_id = organization.organization_id
+        await self._validate_and_normalize_credential_rotation_parameters(
+            request.workflow_definition.parameters,
+            organization,
+        )
+        workflow_id = generate_workflow_id()
+        workflow_definition = convert_workflow_definition(
+            workflow_definition_yaml=request.workflow_definition,
+            workflow_id=workflow_id,
+        )
+        workflow_definition.validate()
+        self.validate_workflow_block_graph(workflow_definition)
+        self._validate_payload_templates(workflow_definition)
+        await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
+        cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
+
+        async with app.DATABASE.workflows.acquire_workflow_creation_lock(workflow_permanent_id):
+            try:
+                return await self.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=organization_id,
+                    version=1,
+                    filter_deleted=False,
+                )
+            except WorkflowNotFound:
+                pass
+
+            created_workflow = await self._create_initial_workflow_from_request(
+                organization_id=organization_id,
+                request=request,
+                title=title,
+                workflow_definition=workflow_definition,
+                cdp_connect_headers=cdp_connect_headers,
+                workflow_permanent_id=workflow_permanent_id,
+                created_by=created_by,
+                edited_by=edited_by,
+                workflow_id=workflow_id,
+                encrypt_secrets=False,
+            )
+            await app.DATABASE.workflow_params.save_workflow_definition_parameters(workflow_definition.parameters)
+
+        self.schedule_workflow_saved_hook(
+            organization_id=organization_id,
+            edited_by=edited_by,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        await self.maybe_delete_cached_code(
+            created_workflow,
+            workflow_definition=workflow_definition,
+            organization_id=organization_id,
+            delete_script=delete_script,
+        )
+        return created_workflow
+
     async def create_workflow_from_request(
         self,
         organization: Organization,
@@ -10911,7 +11942,6 @@ class WorkflowService:
         created_by: str | None = None,
         edited_by: str | None = None,
         new_workflow_permanent_id: str | None = None,
-        notify_workflow_saved: bool = True,
         resolved_title: str | None = None,
     ) -> Workflow:
         organization_id = organization.organization_id
@@ -10924,6 +11954,16 @@ class WorkflowService:
             organization_id=organization_id,
             title=title,
         )
+        if new_workflow_permanent_id:
+            return await self._create_idempotent_workflow_from_request(
+                organization=organization,
+                request=request,
+                workflow_permanent_id=new_workflow_permanent_id,
+                title=title,
+                delete_script=delete_script,
+                created_by=created_by,
+                edited_by=edited_by,
+            )
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
             organization,
@@ -10982,6 +12022,7 @@ class WorkflowService:
                     totp_verification_url=request.totp_verification_url,
                     totp_identifier=request.totp_identifier,
                     persist_browser_session=request.persist_browser_session,
+                    reuse_browser_session=request.reuse_browser_session,
                     mask_secrets=request.mask_secrets
                     if request.mask_secrets is not None
                     else getattr(existing_latest_workflow, "mask_secrets", False),
@@ -11015,7 +12056,7 @@ class WorkflowService:
                     if request.code_version is not None
                     else existing_latest_workflow.code_version,
                     generate_script_on_terminal=request.generate_script_on_terminal,
-                    created_by=created_by,
+                    created_by=created_by if created_by is not None else existing_latest_workflow.created_by,
                     edited_by=edited_by,
                 )
             else:
@@ -11024,41 +12065,12 @@ class WorkflowService:
                 # literal "***" placeholder from a misbehaving client.
                 new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 # NOTE: it's only potential, as it may be immediately deleted!
-                potential_workflow = await self.create_workflow(
+                potential_workflow = await self._create_initial_workflow_from_request(
+                    organization_id=organization_id,
+                    request=request,
                     title=title,
                     workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
-                    description=request.description,
-                    organization_id=organization_id,
-                    proxy_location=request.proxy_location,
-                    webhook_callback_url=request.webhook_callback_url,
-                    totp_verification_url=request.totp_verification_url,
-                    totp_identifier=request.totp_identifier,
-                    persist_browser_session=request.persist_browser_session,
-                    mask_secrets=request.mask_secrets if request.mask_secrets is not None else False,
-                    pin_saved_session_ip=request.pin_saved_session_ip,
-                    browser_profile_id=request.browser_profile_id,
-                    browser_profile_key=request.browser_profile_key,
-                    model=request.model,
-                    max_screenshot_scrolling_times=request.max_screenshot_scrolls,
-                    max_elapsed_time_minutes=request.max_elapsed_time_minutes,
-                    extra_http_headers=request.extra_http_headers,
                     cdp_connect_headers=new_cdp_connect_headers,
-                    workflow_permanent_id=new_workflow_permanent_id,
-                    version=1 if new_workflow_permanent_id else None,
-                    is_saved_task=request.is_saved_task,
-                    status=request.status,
-                    run_with=request.run_with,
-                    cache_key=request.cache_key,
-                    ai_fallback=request.ai_fallback,
-                    run_sequentially=request.run_sequentially,
-                    sequential_key=request.sequential_key,
-                    folder_id=request.folder_id,
-                    adaptive_caching=request.adaptive_caching,
-                    enable_self_healing=request.enable_self_healing
-                    if request.enable_self_healing is not None
-                    else False,
-                    code_version=request.code_version,
-                    generate_script_on_terminal=request.generate_script_on_terminal,
                     created_by=created_by,
                     edited_by=edited_by,
                 )
@@ -11083,7 +12095,6 @@ class WorkflowService:
                 description=request.description,
                 workflow_definition=workflow_definition,
                 edited_by=edited_by,
-                notify_workflow_saved=notify_workflow_saved,
             )
 
             await self.maybe_delete_cached_code(

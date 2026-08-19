@@ -29,8 +29,10 @@ from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _record_executed_block_labels,
     _record_run_blocks_result,
     _recorded_run_outcome,
+    _recorded_watchdog_block_receipts,
     _stash_recorded_run_outcome,
     _verify_and_record_run_blocks_result,
 )
@@ -60,6 +62,76 @@ def _run_result(blocks: list[dict[str, Any]], *, ok: bool = True) -> dict[str, A
             "blocks": blocks,
         },
     }
+
+
+def test_recorded_execution_labels_accumulate_across_runs_and_ignore_unexecuted_statuses() -> None:
+    ctx = _ctx()
+
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "completed_step", "status": "completed"},
+                {"label": "failed_step", "status": "failed"},
+                {"label": "skipped_step", "status": "skipped"},
+                {"label": "queued_step", "status": "queued"},
+            ],
+            ok=False,
+        ),
+    )
+    ctx.block_state_map.clear()
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "timed_out_step", "status": "timed_out"},
+                {"label": "skipped_step", "status": "skipped"},
+            ],
+            ok=False,
+        ),
+    )
+
+    assert ctx.executed_block_labels == {"completed_step", "failed_step", "timed_out_step"}
+
+
+def test_recorded_execution_fingerprint_changes_with_the_workflow_shape() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: step
+      prompt: Before
+"""
+
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+    before = set(ctx.executed_block_fingerprints["step"])
+    ctx.workflow_yaml = ctx.workflow_yaml.replace("Before", "After")
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+
+    assert before < ctx.executed_block_fingerprints["step"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_receipts_preserve_terminal_block_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    observer = SimpleNamespace(
+        get_workflow_run_blocks=lambda **_kwargs: None,
+    )
+
+    async def get_workflow_run_blocks(**_kwargs: Any) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(label="ran", status=SimpleNamespace(value="failed")),
+            SimpleNamespace(label="waiting", status=SimpleNamespace(value="queued")),
+        ]
+
+    observer.get_workflow_run_blocks = get_workflow_run_blocks
+    monkeypatch.setattr(run_execution.app.DATABASE, "observer", observer)
+
+    assert await _recorded_watchdog_block_receipts("wr_test", "org") == [
+        {"label": "ran", "status": "failed"},
+        {"label": "waiting", "status": "queued"},
+    ]
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:

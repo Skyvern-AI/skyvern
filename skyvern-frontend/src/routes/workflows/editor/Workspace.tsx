@@ -1650,6 +1650,7 @@ function Workspace({
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
+      reuseBrowserSession: workflowData.reuse_browser_session ?? false,
       pinSavedSessionIp: workflowData.pin_saved_session_ip ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
       browserProfileKey: workflowData.browser_profile_key ?? null,
@@ -1753,13 +1754,15 @@ function Workspace({
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
-  // Expose Code-mode entry to the studio's Editor pane header via the store.
-  // A stable wrapper over a ref keeps the registration from churning while
-  // still calling the latest closure.
+  // Expose Code-mode entry via the store so header chrome outside this
+  // closure (studio's Editor pane header, the legacy overflow menu's "View
+  // schema" item) can enter Code mode without owning serialization. A stable
+  // wrapper over a ref keeps the registration from churning while still
+  // calling the latest closure.
   const enterYamlModeRef = useRef(enterYamlMode);
   enterYamlModeRef.current = enterYamlMode;
   useEffect(() => {
-    if (!embedded || isGlobalWorkflow) {
+    if (isGlobalWorkflow) {
       return;
     }
     const store = useWorkflowYamlEditorStore.getState();
@@ -1974,6 +1977,7 @@ function Workspace({
         selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
+      reuseBrowserSession: selectedVersion.reuse_browser_session ?? false,
       pinSavedSessionIp: selectedVersion.pin_saved_session_ip ?? false,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
       browserProfileKey: selectedVersion.browser_profile_key ?? null,
@@ -2974,6 +2978,7 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              reuse_browser_session: saveData.settings.reuseBrowserSession,
               pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
               browser_profile_id: saveData.settings.browserProfileId,
               browser_profile_key: saveData.settings.browserProfileKey,

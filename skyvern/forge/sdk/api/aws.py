@@ -395,6 +395,7 @@ class AsyncAWSClient:
 
         Args:
             uri: The S3 URI of the file
+            client: Optional S3 client to use
             log_exception: Whether to log exceptions
 
         Returns:

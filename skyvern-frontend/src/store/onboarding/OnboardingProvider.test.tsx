@@ -56,6 +56,7 @@ function freshResponse(): OnboardingStateResponse {
       seen_save_run: null,
     },
     launch_date_at_signup: "2025-01-01T00:00:00Z",
+    recovery_guidance_assignment: null,
   };
 }
 

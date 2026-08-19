@@ -92,6 +92,16 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
+const { switchStudioRun, releaseStudioRun } = vi.hoisted(() => ({
+  switchStudioRun: vi.fn(),
+  releaseStudioRun: vi.fn(),
+}));
+
+vi.mock("@/routes/workflows/studio/runSwitchNavigation", () => ({
+  useSwitchStudioRun: () => switchStudioRun,
+  useReleaseStudioRun: () => releaseStudioRun,
+}));
+
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -100,6 +110,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
@@ -152,18 +170,27 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
   CODE_BLOCK_ACCESS: false,
 };
 
-function chatUi() {
+type ChatProps = { docked?: boolean; portalTarget?: HTMLElement | null };
+
+function chatUi(props: ChatProps = {}) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
       <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
+        <WorkflowCopilotChat {...props} />
       </FeatureFlagValueContext.Provider>
     </FeatureFlagContext.Provider>
   );
 }
 
-async function renderChat() {
-  const view = render(chatUi());
+// A docked chat portals its content, rendering null without a body-attached target.
+function makeDockedProps(): ChatProps {
+  const portalTarget = document.createElement("div");
+  document.body.appendChild(portalTarget);
+  return { docked: true, portalTarget };
+}
+
+async function renderChat(props: ChatProps = {}) {
+  const view = render(chatUi(props));
   await waitFor(() =>
     expect(
       screen.getByPlaceholderText(
@@ -204,7 +231,16 @@ const blockProgressFrame = (
   ...overrides,
 });
 
+const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
+  type: "run_started",
+  workflow_run_id: "wr_1",
+  timestamp: "2026-06-10T00:00:00Z",
+  ...overrides,
+});
+
 beforeEach(() => {
+  switchStudioRun.mockClear();
+  releaseStudioRun.mockClear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   mockCopilotUxV1Enabled.mockReset();
@@ -517,5 +553,20 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
+  });
+});
+
+describe("WorkflowCopilotChat — studio run focus", () => {
+  it("focuses the dispatched run from run_started and does not re-navigate on block_progress", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(runStartedFrame());
+    await waitFor(() => expect(switchStudioRun).toHaveBeenCalledTimes(1));
+    expect(switchStudioRun).toHaveBeenCalledWith("wr_1");
+
+    streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
+    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+    expect(switchStudioRun).toHaveBeenCalledTimes(1);
   });
 });

@@ -11,13 +11,12 @@ import threading
 import weakref
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
-from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
@@ -759,6 +758,7 @@ class TestCDPDownloadInterceptorProxyAuth:
     def _make_cdp_session(self) -> MagicMock:
         session = MagicMock()
         session.send = AsyncMock()
+        session.detach = AsyncMock()
         return session
 
     @pytest.mark.asyncio
@@ -1107,6 +1107,154 @@ class TestCDPDownloadInterceptorProxyAuth:
 
         assert ordering == ["unregister", "unregister", "Fetch.disable", "Fetch.disable"]
 
+    @pytest.mark.parametrize("first_detach_fails", [False, True], ids=["success", "detach-failure"])
+    @pytest.mark.asyncio
+    async def test_disable_detaches_page_sessions_before_clearing_references(self, first_detach_fails: bool) -> None:
+        interceptor = self._make_interceptor()
+        first_session = self._make_cdp_session()
+        second_session = self._make_cdp_session()
+        first_page = MagicMock(url="about:blank")
+        second_page = MagicMock(url="about:blank")
+        first_page.context.new_cdp_session = AsyncMock(return_value=first_session)
+        second_page.context.new_cdp_session = AsyncMock(return_value=second_session)
+        await interceptor.enable_for_page(first_page)
+        await interceptor.enable_for_page(second_page)
+
+        async def detach_first() -> None:
+            assert first_session in interceptor._cdp_sessions
+            if first_detach_fails:
+                raise RuntimeError("detach failed")
+
+        async def detach_second() -> None:
+            assert second_session in interceptor._cdp_sessions
+
+        first_session.detach.side_effect = detach_first
+        second_session.detach.side_effect = detach_second
+
+        await interceptor.disable()
+
+        first_session.detach.assert_awaited_once_with()
+        second_session.detach.assert_awaited_once_with()
+        assert interceptor._cdp_sessions == []
+        assert interceptor._enabled is False
+
+    @pytest.mark.asyncio
+    async def test_disable_cancellation_attempts_all_page_detaches_before_clearing_references(self) -> None:
+        interceptor = self._make_interceptor()
+        first_session = self._make_cdp_session()
+        second_session = self._make_cdp_session()
+        browser_session = self._make_cdp_session()
+        browser_context = MagicMock()
+        page_listener = MagicMock()
+        browser_listener = MagicMock()
+        first_page = MagicMock(url="about:blank")
+        second_page = MagicMock(url="about:blank")
+        first_page.context.new_cdp_session = AsyncMock(return_value=first_session)
+        second_page.context.new_cdp_session = AsyncMock(return_value=second_session)
+        await interceptor.enable_for_page(first_page)
+        await interceptor.enable_for_page(second_page)
+        browser_context._skyvern_cdp_download_interceptor = interceptor
+        interceptor._page_context = browser_context
+        interceptor._page_listener = page_listener
+        interceptor._browser_context = browser_context
+        interceptor._browser_session = browser_session
+        interceptor._browser_download_listener = browser_listener
+        interceptor._accepting_browser_downloads = True
+        first_detach_started = asyncio.Event()
+
+        async def block_first_detach() -> None:
+            first_detach_started.set()
+            await asyncio.Event().wait()
+
+        first_session.detach.side_effect = block_first_detach
+        disabling = asyncio.create_task(interceptor.disable())
+        await asyncio.wait_for(first_detach_started.wait(), timeout=1)
+
+        disabling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await disabling
+
+        first_session.detach.assert_awaited_once_with()
+        second_session.detach.assert_awaited_once_with()
+        assert interceptor._cdp_sessions == []
+        browser_session.remove_listener.assert_called_once_with("Browser.downloadWillBegin", browser_listener)
+        browser_session.detach.assert_awaited_once_with()
+        browser_context.remove_listener.assert_called_once_with("page", page_listener)
+        assert browser_context._skyvern_cdp_download_interceptor is None
+        assert interceptor._page_context is None
+        assert interceptor._page_listener is None
+        assert interceptor._browser_context is None
+        assert interceptor._browser_session is None
+        assert interceptor._browser_download_listener is None
+        assert interceptor._enabled is False
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_waits_for_each_bounded_session_detach(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.5)
+        monkeypatch.setattr(mod, "CDP_SESSION_DETACH_TIMEOUT_SECONDS", 0.01, raising=False)
+        old_interceptor = self._make_interceptor()
+        replacement = self._make_interceptor()
+        first_session = self._make_cdp_session()
+        stalled_session = self._make_cdp_session()
+        third_session = self._make_cdp_session()
+        pages = [MagicMock(url="about:blank") for _ in range(3)]
+        for page, session in zip(pages, [first_session, stalled_session, third_session], strict=True):
+            page.context.new_cdp_session = AsyncMock(return_value=session)
+            await old_interceptor.enable_for_page(page)
+
+        browser_context = MagicMock()
+        browser_session = self._make_cdp_session()
+        page_listener = MagicMock()
+        browser_listener = MagicMock()
+        browser_context._skyvern_cdp_download_interceptor = old_interceptor
+        old_interceptor._page_context = browser_context
+        old_interceptor._page_listener = page_listener
+        old_interceptor._browser_context = browser_context
+        old_interceptor._browser_session = browser_session
+        old_interceptor._browser_download_listener = browser_listener
+        old_interceptor._accepting_browser_downloads = True
+
+        detach_started = asyncio.Event()
+        detach_cancelled = asyncio.Event()
+        release_detach = asyncio.Event()
+
+        async def stalled_detach() -> None:
+            detach_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                detach_cancelled.set()
+                await release_detach.wait()
+
+        stalled_session.detach.side_effect = stalled_detach
+        binding = asyncio.create_task(replacement.bind_to_context(browser_context))
+        try:
+            await asyncio.wait_for(detach_started.wait(), timeout=0.1)
+            await asyncio.wait_for(binding, timeout=0.7)
+            await asyncio.wait_for(detach_cancelled.wait(), timeout=0.1)
+
+            first_session.detach.assert_awaited_once_with()
+            stalled_session.detach.assert_awaited_once_with()
+            third_session.detach.assert_awaited_once_with()
+            browser_session.remove_listener.assert_called_once_with("Browser.downloadWillBegin", browser_listener)
+            browser_session.detach.assert_awaited_once_with()
+            assert old_interceptor._cdp_sessions == []
+            assert old_interceptor._browser_session is None
+            assert old_interceptor._browser_context is None
+            assert old_interceptor._page_context is None
+            assert old_interceptor._page_listener is None
+            assert old_interceptor._browser_download_listener is None
+            assert not old_interceptor._accepting_pages
+            assert not old_interceptor._accepting_browser_downloads
+            assert old_interceptor._enabled is False
+            assert browser_context._skyvern_cdp_download_interceptor is replacement
+        finally:
+            release_detach.set()
+            await asyncio.wait_for(asyncio.gather(binding, return_exceptions=True), timeout=0.2)
+            detached = tuple(mod._DETACHED_DISABLE_TASKS)
+            if detached:
+                await asyncio.wait_for(asyncio.gather(*detached, return_exceptions=True), timeout=0.2)
+
     @pytest.mark.asyncio
     async def test_unregister_failure_invalidates_before_fetch_disable(self) -> None:
         interceptor = self._make_interceptor()
@@ -1430,85 +1578,6 @@ class TestCDPDownloadInterceptorProxyAuth:
         await interceptor._handle_auth_required(event, cdp_session)
         second_call = cdp_session.send.call_args
         assert second_call.args[1]["authChallengeResponse"]["response"] == "CancelAuth"
-
-
-class TestDownloadsOnlyInterception:
-    """An explicitly unenrolled egress monitor marks a flow that does no request mediation (the
-    vendor-attach browsers). Download interception must still come up for those pages instead of
-    aborting setup, while every ambiguous monitor state keeps failing closed (SKY-14066)."""
-
-    def _page_with_session(self) -> tuple[MagicMock, MagicMock]:
-        cdp_session = MagicMock()
-        cdp_session.send = AsyncMock()
-        page = MagicMock(url="about:blank")
-        page.is_closed.return_value = False
-        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
-        return page, cdp_session
-
-    @pytest.mark.asyncio
-    async def test_unenrolled_monitor_enables_downloads_only(self) -> None:
-        monitor = BrowserNetworkEgressMonitor.unenrolled()
-        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
-        page, cdp_session = self._page_with_session()
-
-        await interceptor.enable_for_page(page)
-
-        cdp_session.send.assert_called_once_with(
-            "Fetch.enable",
-            {"patterns": [{"requestStage": "Response"}], "handleAuthRequests": False},
-        )
-        assert interceptor._cdp_sessions == [cdp_session]
-
-    @pytest.mark.asyncio
-    async def test_unenrolled_monitor_with_proxy_auth_keeps_request_stage(self) -> None:
-        monitor = BrowserNetworkEgressMonitor.unenrolled()
-        interceptor = _make_interceptor(
-            output_dir="/tmp/test_downloads",
-            proxy_username="user",
-            proxy_password="pass",
-            network_egress_monitor=monitor,
-        )
-        page, cdp_session = self._page_with_session()
-
-        await interceptor.enable_for_page(page)
-
-        cdp_session.send.assert_called_once_with(
-            "Fetch.enable",
-            {
-                "patterns": [{"requestStage": "Response"}, {"urlPattern": "*", "requestStage": "Request"}],
-                "handleAuthRequests": True,
-            },
-        )
-
-    @pytest.mark.asyncio
-    async def test_request_stage_passes_through_without_mediation(self) -> None:
-        monitor = BrowserNetworkEgressMonitor.unenrolled()
-        interceptor = _make_interceptor(
-            output_dir="/tmp/test_downloads",
-            proxy_username="user",
-            proxy_password="pass",
-            network_egress_monitor=monitor,
-        )
-        page, cdp_session = self._page_with_session()
-        await interceptor.enable_for_page(page)
-        cdp_session.send.reset_mock()
-
-        event = {"requestId": "req-1", "request": {"method": "GET", "url": "https://example.com/"}}
-        await interceptor._handle_request_paused(event, cdp_session, interceptor._artifact_scope_generation)
-
-        cdp_session.send.assert_awaited_once_with("Fetch.continueRequest", {"requestId": "req-1"})
-
-    @pytest.mark.asyncio
-    async def test_enforcing_uninstalled_monitor_still_fails_closed(self) -> None:
-        # Not invalidated, not installed: an enforcing monitor mid-setup is ambiguous, and
-        # silently downgrading it to downloads-only would drop mediation. It must stay loud.
-        monitor = BrowserNetworkEgressMonitor()
-        interceptor = _make_interceptor(output_dir="/tmp/test_downloads", network_egress_monitor=monitor)
-        page, cdp_session = self._page_with_session()
-
-        with pytest.raises(RuntimeError):
-            await interceptor.enable_for_page(page)
-        cdp_session.send.assert_awaited_with("Fetch.disable")
 
 
 class TestStaleInterceptionRace:
@@ -2484,9 +2553,7 @@ class TestDataUrlDownloadCapture:
         assert context._skyvern_cdp_download_interceptor is None
 
     @pytest.mark.asyncio
-    async def test_context_rebind_detaches_cancellation_resistant_disable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_context_rebind_rejects_cancellation_resistant_disable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.01)
         old_interceptor = _make_interceptor()
         new_interceptor = _make_interceptor()
@@ -2512,11 +2579,12 @@ class TestDataUrlDownloadCapture:
         loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
         with capture_logs() as logs:
             try:
-                await asyncio.wait_for(new_interceptor.bind_to_context(context), timeout=0.5)
+                with pytest.raises(TimeoutError, match="teardown did not complete"):
+                    await asyncio.wait_for(new_interceptor.bind_to_context(context), timeout=0.5)
                 await asyncio.wait_for(entered_cancel.wait(), timeout=0.5)
 
-                assert context._skyvern_cdp_download_interceptor is new_interceptor
-                assert context.on.call_count == 1
+                assert context._skyvern_cdp_download_interceptor is old_interceptor
+                context.on.assert_not_called()
                 assert len(mod._DETACHED_DISABLE_TASKS) == 1
 
                 release.set()
@@ -2526,7 +2594,7 @@ class TestDataUrlDownloadCapture:
                 await asyncio.sleep(0)
 
                 assert mod._DETACHED_DISABLE_TASKS == set()
-                assert context._skyvern_cdp_download_interceptor is new_interceptor
+                assert context._skyvern_cdp_download_interceptor is None
             finally:
                 loop.set_exception_handler(previous_handler)
 
@@ -2541,6 +2609,66 @@ class TestDataUrlDownloadCapture:
                 "log_level": "warning",
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_context_rebind_timeout_disables_preenabled_replacement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.1)
+        monkeypatch.setattr(mod, "CDP_SESSION_DETACH_TIMEOUT_SECONDS", 0.01)
+        old_interceptor = _make_interceptor()
+        replacement = _make_interceptor()
+        context = MagicMock()
+        context._skyvern_cdp_download_interceptor = old_interceptor
+        old_cancelled = asyncio.Event()
+        release_old_disable = asyncio.Event()
+        replacement_detach_cancelled = asyncio.Event()
+        release_replacement_detach = asyncio.Event()
+
+        async def stuck_old_disable() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                old_cancelled.set()
+                await release_old_disable.wait()
+
+        async def stuck_replacement_detach() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                replacement_detach_cancelled.set()
+                await release_replacement_detach.wait()
+
+        old_interceptor.disable = stuck_old_disable  # type: ignore[method-assign]
+        replacement_session = MagicMock(send=AsyncMock(), detach=AsyncMock(side_effect=stuck_replacement_detach))
+        replacement_page = MagicMock(url="about:blank", context=context)
+        context.new_cdp_session = AsyncMock(return_value=replacement_session)
+        await replacement.enable_for_page(replacement_page)
+
+        binding = asyncio.create_task(replacement.bind_to_context(context))
+        try:
+            with pytest.raises(TimeoutError, match="teardown did not complete"):
+                await asyncio.wait_for(binding, timeout=0.3)
+            await asyncio.wait_for(old_cancelled.wait(), timeout=0.1)
+            await asyncio.wait_for(replacement_detach_cancelled.wait(), timeout=0.1)
+
+            replacement_session.send.assert_has_awaits([call("Fetch.enable", ANY), call("Fetch.disable")])
+            replacement_session.detach.assert_awaited_once_with()
+            replacement_page.remove_listener.assert_any_call("close", ANY)
+            replacement._network_egress_monitor.unregister_active_request_interceptor.assert_called_once_with(
+                page=replacement_page, owner=replacement
+            )
+            assert replacement._cdp_sessions == []
+            assert replacement._active_request_interceptors == {}
+            assert replacement._enabled is False
+            assert context._skyvern_cdp_download_interceptor is old_interceptor
+        finally:
+            release_old_disable.set()
+            release_replacement_detach.set()
+            await asyncio.wait_for(asyncio.gather(binding, return_exceptions=True), timeout=0.2)
+            detached = tuple(mod._DETACHED_DISABLE_TASKS)
+            if detached:
+                await asyncio.wait_for(asyncio.gather(*detached, return_exceptions=True), timeout=0.2)
 
     @pytest.mark.asyncio
     async def test_context_rebind_awaits_fast_disable_before_binding(self) -> None:

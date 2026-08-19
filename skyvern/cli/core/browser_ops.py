@@ -11,6 +11,8 @@ import json
 import os
 import re
 import time
+from contextlib import suppress
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,10 +35,35 @@ TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credential
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
 OBSERVE_V2_ENV = "SKYVERN_MCP_OBSERVE_V2"
 
+# Per-request rollout decision (set by the cloud MCP middleware from the org-keyed
+# PostHog flag). None means "no decision here" - fall back to the process env var,
+# which stays the sole control for stdio and self-hosted servers.
+_OBSERVE_V2_OVERRIDE: ContextVar[bool | None] = ContextVar("skyvern_mcp_observe_v2_override", default=None)
+
+
+def observe_v2_env_enabled() -> bool:
+    """Return the raw process-env observe-v2 setting, ignoring any per-request override."""
+    return os.getenv(OBSERVE_V2_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_observe_v2_override(value: bool | None) -> Token[bool | None]:
+    """Pin the observe-v2 decision for the current context; returns the reset token."""
+    return _OBSERVE_V2_OVERRIDE.set(value)
+
+
+def reset_observe_v2_override(token: Token[bool | None]) -> None:
+    _OBSERVE_V2_OVERRIDE.reset(token)
+
 
 def observe_v2_enabled() -> bool:
-    """Return whether the default-off observe v2 experiment is enabled."""
-    return os.getenv(OBSERVE_V2_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Return whether the default-off observe v2 experiment is enabled.
+
+    An org-keyed per-request override (cloud rollout flag) wins over the env var.
+    """
+    override = _OBSERVE_V2_OVERRIDE.get()
+    if override is not None:
+        return override
+    return observe_v2_env_enabled()
 
 
 _COORDINATE_PASSWORD_TARGET_JS = """
@@ -1204,12 +1231,15 @@ async def get_observe_document_id(page: Any) -> str | None:
                 frame_tree = await cdp.send("Page.getFrameTree")
                 loader_id = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
         except Exception:
-            if getattr(session_target, "_skyvern_observe_cdp_session", None) is cdp:
-                try:
-                    delattr(session_target, "_skyvern_observe_cdp_session")
-                except Exception:
-                    pass
-            cdp = None
+            if cdp is not None:
+                if getattr(session_target, "_skyvern_observe_cdp_session", None) is cdp:
+                    try:
+                        delattr(session_target, "_skyvern_observe_cdp_session")
+                    except Exception:
+                        pass
+                with suppress(Exception):
+                    await cdp.detach()
+            cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
             continue
         if isinstance(loader_id, str):
             return f"cdp:{loader_id}"

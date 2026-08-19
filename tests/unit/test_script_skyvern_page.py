@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     SkyvernActionFailed,
     SkyvernHTTPException,
 )
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
@@ -1277,6 +1278,79 @@ async def test_fallback_episode_redacts_sensitive_metadata(sentinel_secret: str)
     assert persisted["agent_actions"]["reasoning"] == "Resolved [REDACTED_SECRET]"
 
 
+def _episode_recorder_context() -> SimpleNamespace:
+    return SimpleNamespace(
+        code_version=2,
+        organization_id="org_1",
+        workflow_permanent_id="wpid_1",
+        workflow_run_id="wr_1",
+        script_revision_id="rev_1",
+    )
+
+
+def _episode_recorder_action() -> SimpleNamespace:
+    return SimpleNamespace(
+        element_id="el_1",
+        reasoning="the agreement box needed checking",
+        get_xpath=lambda: "//input[@id='agree']",
+        skyvern_element_data={
+            "tagName": "input",
+            "text": "I agree",
+            "attributes": {"id": "agree", "type": "checkbox", "name": "agree"},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_performed_episode_omits_selector_suggestions() -> None:
+    # SKY-14052: the cached script's selector path is a raw Playwright click that never runs the
+    # click setup. Handing the reviewer a selector for an action the setup performed would let it
+    # bake a raw click that drops the setup semantics and re-toggles the control.
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url="https://example.com/form")
+    page_ai.current_label = "Agreements"
+
+    with patch("skyvern.core.script_generations.real_skyvern_page_ai.app.DATABASE.scripts") as scripts:
+        scripts.create_fallback_episode = AsyncMock()
+        await page_ai._record_element_fallback_episode(
+            context=_episode_recorder_context(),
+            action_type="click",
+            failed_selector="#stale-agree",
+            intention="check the agreement box",
+            action=_episode_recorder_action(),
+            setup_performed=True,
+        )
+
+    persisted = scripts.create_fallback_episode.await_args.kwargs["agent_actions"]
+    assert persisted["setup_performed"] is True
+    assert "css_suggestion" not in persisted
+    assert "selector_options" not in persisted
+    # The element identity still reaches the reviewer so it can tell a wrong target from a stale one.
+    assert persisted["element_tag"] == "input"
+    assert persisted["all_attributes"]["id"] == "agree"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_episode_still_carries_selector_suggestions() -> None:
+    page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.page = SimpleNamespace(url="https://example.com/form")
+    page_ai.current_label = "Agreements"
+
+    with patch("skyvern.core.script_generations.real_skyvern_page_ai.app.DATABASE.scripts") as scripts:
+        scripts.create_fallback_episode = AsyncMock()
+        await page_ai._record_element_fallback_episode(
+            context=_episode_recorder_context(),
+            action_type="click",
+            failed_selector="#stale-agree",
+            intention="check the agreement box",
+            action=_episode_recorder_action(),
+        )
+
+    persisted = scripts.create_fallback_episode.await_args.kwargs["agent_actions"]
+    assert "setup_performed" not in persisted
+    assert persisted["css_suggestion"]
+
+
 @pytest.mark.asyncio
 async def test_input_text_regenerates_totp_after_selector_preparation(mock_scraped_page, mock_ai):
     mock_page = create_mock_page()
@@ -2390,13 +2464,19 @@ class _RecordingLocator:
         dispatch_error: Exception | None = None,
         gate_on_change: bool = False,
         element_handle: _RecordingElementHandle | None = None,
+        selected_states: list[bool | None] | None = None,
+        evaluate_error: Exception | None = None,
     ) -> None:
         self.calls: list[tuple[str, str | None]] = []
+        self.click_kwargs: list[dict[str, object]] = []
+        self.evaluate_kwargs: list[dict[str, object]] = []
         self.first = self
         self._click_error = click_error
         self._dispatch_error = dispatch_error
         self._gate_on_change = gate_on_change
         self._element_handle = element_handle
+        self._selected_states = list(selected_states or [])
+        self._evaluate_error = evaluate_error
         self.enabled = False
 
     async def element_handle(self, **kwargs: object) -> _RecordingElementHandle | None:
@@ -2409,8 +2489,16 @@ class _RecordingLocator:
     async def scroll_into_view_if_needed(self, **kwargs: object) -> None:
         self.calls.append(("scroll_into_view_if_needed", None))
 
+    async def evaluate(self, _expression: str, **kwargs: object) -> object:
+        self.calls.append(("evaluate", None))
+        self.evaluate_kwargs.append(dict(kwargs))
+        if self._evaluate_error is not None:
+            raise self._evaluate_error
+        return self._selected_states.pop(0) if self._selected_states else None
+
     async def click(self, **kwargs: object) -> None:
         self.calls.append(("click", None))
+        self.click_kwargs.append(dict(kwargs))
         if self._click_error is not None:
             raise self._click_error
 
@@ -2954,6 +3042,125 @@ async def test_get_or_create_browser_state_does_not_record_session_on_acquire_fa
     assert ctx.browser_session_id is None  # requested session not recorded because the attach failed
 
 
+class TestScriptSkyvernPageMagicLink:
+    """SKY-14056: the generated-script sign-in-link verb."""
+
+    @staticmethod
+    def _install(monkeypatch, polled):
+        """Wire a ScriptSkyvernPage whose page records navigations and fills."""
+        from skyvern.core.script_generations import script_skyvern_page as module
+
+        state: dict = {"navigations": [], "fills": [], "rendered": [], "polled_with": {}}
+
+        async def fake_goto(url, **kwargs):
+            state["navigations"].append(url)
+            return None
+
+        async def fake_fill(*args, **kwargs):
+            state["fills"].append(args)
+
+        async def fake_poll(**kwargs):
+            state["polled_with"].update(kwargs)
+            return polled
+
+        def fake_render(value):
+            state["rendered"].append(value)
+            return value
+
+        monkeypatch.setattr(module, "poll_otp_value", fake_poll)
+        monkeypatch.setattr(module, "render_template", fake_render)
+        monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
+
+        page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
+        script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+        script_page.page = page
+        return script_page, state
+
+    @staticmethod
+    def _with_context():
+        from skyvern.forge.sdk.core import skyvern_context
+
+        skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", workflow_run_id="wr_1"))
+        return skyvern_context
+
+    @pytest.mark.asyncio
+    async def test_navigates_to_the_polled_link_without_filling_it(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token=" + "s" * 400
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+
+        ctx = self._with_context()
+        try:
+            await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["navigations"] == [link]
+        assert state["fills"] == []
+        # The anchor sits one grace interval behind now (naive UTC), so an email that landed
+        # while the triggering click was still settling stays visible to the poll.
+        from datetime import datetime, timezone
+
+        from skyvern.services.otp_service import MAGIC_LINK_ANCHOR_GRACE
+
+        anchor = state["polled_with"]["created_after"]
+        assert anchor.tzinfo is None
+        expected_anchor = datetime.now(timezone.utc).replace(tzinfo=None) - MAGIC_LINK_ANCHOR_GRACE
+        assert abs((anchor - expected_anchor).total_seconds()) < 30
+
+    @pytest.mark.asyncio
+    async def test_a_returned_one_time_code_is_reported_not_navigated_to(self, monkeypatch) -> None:
+        """A configured webhook answers without honouring expected_otp_type."""
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        script_page, state = self._install(monkeypatch, OTPValue(value="123456", type=OTPType.TOTP))
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(RuntimeError, match="totp"):
+                await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_link_never_goes_through_render_template(self, monkeypatch) -> None:
+        """The polled URL is opaque; rendering it would corrupt or expand its token."""
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token={{ not_a_template }}"
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+
+        ctx = self._with_context()
+        try:
+            await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == [link]
+        assert link not in state["rendered"]
+        assert "inbox@example.com" in state["rendered"]
+
+    @pytest.mark.asyncio
+    async def test_no_identifier_fails_closed_before_polling(self, monkeypatch) -> None:
+        script_page, state = self._install(monkeypatch, None)
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(RuntimeError, match="identifier"):
+                await script_page.magic_link()
+        finally:
+            ctx.reset()
+
+        assert state["polled_with"] == {}
+
+
 class TestAiClickRunsRegisteredClickSetup:
     """SKY-13916: the cached-script AI click path must run the registered
     ActionHandler setup for the click action before dispatching the physical
@@ -2963,10 +3170,12 @@ class TestAiClickRunsRegisteredClickSetup:
     Any nonempty setup result is terminal, mirroring _handle_action (which
     returns early whenever setup yields results): a failure surfaces as
     SkyvernActionFailed and falls back to the raw selector when one exists; any
-    other nonempty result -- an ActionAbort, or an ActionSuccess from a setup
-    that already performed the click -- suppresses the physical click, records
-    the episode, and returns the resolved selector. Only an empty setup result
-    proceeds to the physical click.
+    other nonempty result suppresses the physical click and returns the resolved
+    selector. Only an empty setup result proceeds to the physical click.
+
+    SKY-14052: episode recording then splits on ``setup_performed``. A setup that
+    physically performed the action records a setup-aware episode; a true
+    desired-state no-op records nothing and discards any v3 parent row.
     """
 
     _MODULE = "skyvern.core.script_generations.real_skyvern_page_ai"
@@ -2989,8 +3198,11 @@ class TestAiClickRunsRegisteredClickSetup:
         return page_ai, locator
 
     @staticmethod
-    def _context():
-        return SimpleNamespace(
+    def _context() -> SkyvernContext:
+        # The real dataclass, not a SimpleNamespace: _patched replaces the shared
+        # skyvern_context.current, so the structlog processor reads this object too and a
+        # partial stand-in raises AttributeError on whatever field it happens to lack.
+        return SkyvernContext(
             organization_id="org_1",
             task_id="task_1",
             step_id="step_1",
@@ -2998,10 +3210,7 @@ class TestAiClickRunsRegisteredClickSetup:
             workflow_permanent_id="wpid_1",
             script_revision_id="rev_1",
             code_version=2,
-            tz_info=None,
             prompt="goal",
-            script_run_parameters=None,
-            log=[],
         )
 
     @contextlib.contextmanager
@@ -3085,6 +3294,97 @@ class TestAiClickRunsRegisteredClickSetup:
         spies.handle_spy.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_performed_abort_from_setup_records_a_setup_aware_episode(self):
+        # SKY-14052: a setup branch that physically performed the click (a site-specific click
+        # transport, a checkbox/toggle state set) is a real selector miss, so the reviewer must
+        # get the episode -- flagged so it cannot repair the call into a raw selector click.
+        page_ai, _locator = self._build_page_ai()
+        with self._patched(setup_result=[ActionAbort(setup_performed=True)], handle_result=[ActionSuccess()]) as spies:
+            result = await page_ai.ai_click(selector="#btn", intention="check the agreement box")
+
+        spies.handle_spy.assert_not_awaited()
+        page_ai._record_element_fallback_episode.assert_awaited_once()
+        assert page_ai._record_element_fallback_episode.await_args.kwargs["setup_performed"] is True
+        assert result == "xpath=//button[@id='x']"
+
+    @pytest.mark.asyncio
+    async def test_performed_success_from_setup_records_a_setup_aware_episode(self):
+        # The hCaptcha login setup performs the click and returns ActionSuccess.
+        page_ai, _locator = self._build_page_ai()
+        with self._patched(
+            setup_result=[ActionSuccess(setup_performed=True)], handle_result=[ActionSuccess()]
+        ) as spies:
+            await page_ai.ai_click(selector="#btn", intention="sign in")
+
+        spies.handle_spy.assert_not_awaited()
+        page_ai._record_element_fallback_episode.assert_awaited_once()
+        assert page_ai._record_element_fallback_episode.await_args.kwargs["setup_performed"] is True
+
+    @pytest.mark.asyncio
+    async def test_ordinary_click_records_an_episode_without_setup_semantics(self):
+        page_ai, _locator = self._build_page_ai()
+        with self._patched(setup_result=[], handle_result=[ActionSuccess()]):
+            await page_ai.ai_click(selector="#btn", intention="submit")
+
+        page_ai._record_element_fallback_episode.assert_awaited_once()
+        assert page_ai._record_element_fallback_episode.await_args.kwargs["setup_performed"] is False
+
+    @pytest.mark.asyncio
+    async def test_noop_setup_discards_the_v3_parent_episode(self):
+        # Class-B parent-row hygiene: v3 created the episode row before falling through. A true
+        # desired-state no-op records nothing, so that row would linger with no agent data.
+        page_ai, _locator = self._build_page_ai()
+        page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
+        delete_spy = AsyncMock()
+        with self._patched(setup_result=[ActionAbort()], handle_result=[ActionSuccess()]):
+            with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
+                await page_ai.ai_click(selector="#btn", intention="toggle owner")
+
+        page_ai._record_element_fallback_episode.assert_not_awaited()
+        delete_spy.assert_awaited_once_with(episode_id="ep_1", organization_id="org_1")
+
+    @pytest.mark.asyncio
+    async def test_noop_setup_without_a_v3_parent_episode_deletes_nothing(self):
+        page_ai, _locator = self._build_page_ai()
+        delete_spy = AsyncMock()
+        with self._patched(setup_result=[ActionAbort()], handle_result=[ActionSuccess()]):
+            with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
+                await page_ai.ai_click(selector="#btn", intention="toggle owner")
+
+        delete_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_performed_setup_keeps_the_v3_parent_episode(self):
+        # The recorder updates the existing row instead; deleting it would drop the repair signal.
+        page_ai, _locator = self._build_page_ai()
+        page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
+        delete_spy = AsyncMock()
+        with self._patched(setup_result=[ActionAbort(setup_performed=True)], handle_result=[ActionSuccess()]):
+            with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
+                await page_ai.ai_click(selector="#btn", intention="check the agreement box")
+
+        delete_spy.assert_not_awaited()
+        assert page_ai._record_element_fallback_episode.await_args.kwargs["v3_parent_episode_id"] == "ep_1"
+
+    @pytest.mark.asyncio
+    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self):
+        # SKY-14052: handle_click_action's own ClickContext.desired_state guard can suppress the
+        # click with an ActionAbort the same way a registered per-site setup does, but it arrives
+        # via `handle_result`, not `setup_result` (no per-site setup is registered here). It must
+        # get the same no-op treatment: no corrective episode, and any v3 parent row discarded.
+        page_ai, _locator = self._build_page_ai()
+        page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
+        delete_spy = AsyncMock()
+        with self._patched(setup_result=None, handle_result=[ActionAbort()]) as spies:
+            with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
+                result = await page_ai.ai_click(selector="#btn", intention="toggle owner")
+
+        spies.handle_spy.assert_awaited_once()
+        page_ai._record_element_fallback_episode.assert_not_awaited()
+        delete_spy.assert_awaited_once_with(episode_id="ep_1", organization_id="org_1")
+        assert result == "xpath=//button[@id='x']"
+
+    @pytest.mark.asyncio
     async def test_setup_failure_falls_back_to_selector(self):
         page_ai, locator = self._build_page_ai()
         with self._patched(setup_result=[ActionFailure(Exception("boom"))], handle_result=[ActionSuccess()]) as spies:
@@ -3102,6 +3402,23 @@ class TestAiClickRunsRegisteredClickSetup:
                 await page_ai.ai_click(selector=None, intention="submit")
 
         spies.handle_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_setup_performed_failure_raises_instead_of_retrying_raw_click(self):
+        # SKY-14052: a setup that already performed the interaction (e.g. a login click before
+        # its hCaptcha wait failed) must not have that failure silently swallowed and retried as
+        # a raw selector click -- that would repeat the side effect (resubmit a form, re-trigger
+        # a download) instead of recovering from it.
+        page_ai, locator = self._build_page_ai()
+        with self._patched(
+            setup_result=[ActionFailure(Exception("boom"), setup_performed=True)],
+            handle_result=[ActionSuccess()],
+        ) as spies:
+            with pytest.raises(SkyvernActionFailed):
+                await page_ai.ai_click(selector="#btn", intention="sign in")
+
+        spies.handle_spy.assert_not_awaited()
+        locator.click.assert_not_awaited()
 
 
 class TestAiActAppliesDesiredStateGuard:
@@ -3189,3 +3506,203 @@ class TestAiActAppliesDesiredStateGuard:
         # The control already reads selected, so handle_click_action must suppress the
         # physical click; ai_act neither dispatches a click nor raises.
         chain.assert_not_awaited()
+
+
+class TestCachedClickDesiredState:
+    """SKY-14051: a generated cached click carries the recording's level-triggered toggle intent.
+
+    Every selector-first path — the primary click, the escape-dismiss retry, and the tail click —
+    reads the control's live state first and suppresses a click that would toggle an
+    already-satisfied control back off. An unreadable state falls open to exactly one ordinary
+    click, and ``mode="direct"`` stays a raw Playwright click.
+    """
+
+    @staticmethod
+    def _clicks(locator: _RecordingLocator) -> list[tuple[str, str | None]]:
+        return [recorded for recorded in locator.calls if recorded[0] == "click"]
+
+    @pytest.fixture(autouse=True)
+    def _ai_click(self, mock_ai):
+        mock_ai.ai_click = AsyncMock(return_value="#ai-picked")
+        return mock_ai.ai_click
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("desired_state", [True, False])
+    async def test_matching_state_suppresses_the_primary_click(self, mock_ai, desired_state: bool):
+        locator = _RecordingLocator(selected_states=[desired_state])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=desired_state)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == []
+        mock_ai.ai_click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("desired_state", [True, False])
+    async def test_mismatched_state_clicks_exactly_once(self, mock_ai, desired_state: bool):
+        locator = _RecordingLocator(selected_states=[not desired_state])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=desired_state)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_state_clicks_exactly_once(self, mock_ai):
+        locator = _RecordingLocator(selected_states=[None])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_state_read_falls_open_to_one_click(self, mock_ai):
+        locator = _RecordingLocator(evaluate_error=RuntimeError("element is not attached"))
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+
+    @pytest.mark.asyncio
+    async def test_legacy_call_without_desired_state_never_reads_state(self, mock_ai):
+        # Existing cached scripts carry no desired_state; they must keep their edge-triggered click
+        # without paying for a live read.
+        locator = _RecordingLocator(selected_states=[True])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it")
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+        assert ("evaluate", None) not in locator.calls
+
+    @pytest.mark.asyncio
+    async def test_desired_state_never_reaches_playwright(self, mock_ai):
+        locator = _RecordingLocator(selected_states=[False])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True, force=True)
+
+        assert locator.click_kwargs == [{"timeout": settings.BROWSER_ACTION_TIMEOUT_MS, "force": True}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_element_prep", [True, False])
+    async def test_state_read_shares_the_clicks_timeout_budget(self, mock_ai, skip_element_prep: bool):
+        # On the prep opt-out path the locator was never waited on, so an unbounded read would stall
+        # a missing selector well past the caller's budget before falling open.
+        locator = _RecordingLocator(selected_states=[False])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        await skyvern_page.click(
+            "#toggle",
+            prompt="toggle it",
+            desired_state=True,
+            timeout=1234,
+            _skip_element_prep=skip_element_prep,
+        )
+
+        assert locator.evaluate_kwargs == [{"timeout": 1234}]
+
+    @pytest.mark.asyncio
+    async def test_escape_retry_suppresses_when_the_first_click_already_reached_the_state(self, mock_ai):
+        # The primary click dispatched and toggled the control before raising, so the retry after
+        # dismissing the overlay would toggle it straight back off.
+        locator = _RecordingLocator(
+            click_error=PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events"),
+            selected_states=[False, True],
+        )
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+            result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+        mock_ai.ai_click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_escape_retry_still_clicks_once_when_the_state_is_unchanged(self, mock_ai):
+        locator = _RecordingLocator(
+            click_error=PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events"),
+            selected_states=[False, False],
+        )
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+            await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True)
+
+        assert self._clicks(locator) == [("click", None), ("click", None)]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_selector_still_falls_back_to_ai(self, mock_ai):
+        locator = _RecordingLocator(
+            click_error=PlaywrightTimeoutError("Timeout 5000ms exceeded."),
+            selected_states=[False, False],
+        )
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        with patch("skyvern.core.script_generations.skyvern_page.asyncio.sleep", new_callable=AsyncMock):
+            result = await skyvern_page.click("#toggle", prompt="toggle it", desired_state=True)
+
+        assert result == "#ai-picked"
+        mock_ai.ai_click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("desired_state", [True, False, None])
+    async def test_proactive_path_always_invokes_ai_regardless_of_desired_state(
+        self, mock_ai, desired_state: bool | None
+    ):
+        # ai='proactive' must ALWAYS invoke the LLM when a selector is present (the documented
+        # contract in validate_proactive_misuse) even when the caller passes desired_state and the
+        # resolved selector already matches it locally. A local short-circuit here would trust a
+        # recorded, purely positional xpath (skyvern/webeye/scraper/domUtils.js) to decide whether
+        # the *intended* control is already satisfied -- but a stale/positional xpath can resolve
+        # to a *different* element that happens to already hold the same state, silently no-op'ing
+        # on the real target while reporting success. ai_click resolves the element fresh instead.
+        locator = _RecordingLocator(selected_states=[True, True])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", prompt="toggle it", ai="proactive", desired_state=desired_state)
+
+        assert result == "#ai-picked"
+        assert self._clicks(locator) == []
+        assert ("evaluate", None) not in locator.calls
+        mock_ai.ai_click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("desired_state", [True, False])
+    async def test_tail_click_path_honors_desired_state(self, mock_ai, desired_state: bool):
+        locator = _RecordingLocator(selected_states=[desired_state])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", ai=None, desired_state=desired_state)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == []
+
+    @pytest.mark.asyncio
+    async def test_tail_click_path_clicks_once_on_a_mismatch(self, mock_ai):
+        locator = _RecordingLocator(selected_states=[False])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        await skyvern_page.click("#toggle", ai=None, desired_state=True)
+
+        assert self._clicks(locator) == [("click", None)]
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_stays_a_raw_click(self, mock_ai):
+        locator = _RecordingLocator(selected_states=[True])
+        skyvern_page = _skyvern_page_with_locator(mock_ai, locator)
+
+        result = await skyvern_page.click("#toggle", mode="direct", desired_state=True)
+
+        assert result == "#toggle"
+        assert self._clicks(locator) == [("click", None)]
+        assert ("evaluate", None) not in locator.calls
+        assert locator.click_kwargs == [{"timeout": settings.BROWSER_ACTION_TIMEOUT_MS}]

@@ -7,6 +7,7 @@ This service is responsible for:
 """
 
 import asyncio
+import os
 import shutil
 import time
 from datetime import datetime, timedelta
@@ -17,6 +18,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.api.files import RUN_TEMP_NAMESPACE
 from skyvern.forge.sdk.artifact.storage.factory import StorageFactory
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 
@@ -120,15 +122,17 @@ def cleanup_temp_directory() -> int:
 
 def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
     """
-    Remove stale per-run disk artifacts left behind on crash paths: per-day browser
-    console-log dirs under LOG_PATH and per-run download dirs under DOWNLOAD_PATH.
+    Remove stale per-run disk artifacts left behind on crash paths: per-day dirs under
+    LOG_PATH, VIDEO_PATH and HAR_PATH, and per-run download dirs under DOWNLOAD_PATH.
 
-    TEMP_PATH is intentionally excluded. Its dominant leak (the CDP-connect profile copy)
-    is fixed at the source, and mtime is not a safe liveness signal for what remains there:
-    reused generated-script caches (TEMP_PATH/<script_id>) are overwritten in place without
-    bumping the dir mtime, and browser-session profile dirs are written only at open/close —
-    both read as stale while actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and
-    keyed per run, so an aged top-level entry there is genuinely finished.
+    TEMP_PATH is intentionally excluded, with one exception: the run-scoped namespace
+    (TEMP_PATH/runs/<org>/<run>) IS swept, because it is single-tenant and keyed by run
+    identity — an aged run dir is a crash-path orphan. The rest of TEMP_PATH stays out:
+    mtime is not a safe liveness signal there — reused generated-script caches
+    (TEMP_PATH/<script_id>) are overwritten in place without bumping the dir mtime, and
+    browser-session profile dirs are written only at open/close — both read as stale while
+    actively in use. LOG_PATH/DOWNLOAD_PATH are single-tenant and keyed per run, so an aged
+    top-level entry there is genuinely finished.
 
     DOWNLOAD_PATH is swept only when the active storage backend uploads run downloads
     elsewhere (S3/Azure/GCS), leaving the local copy as scratch. On the local backend
@@ -146,7 +150,10 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
 
     cutoff = time.time() - max_age_hours * 3600
     removed_count = 0
-    bases = [settings.LOG_PATH]
+    # VIDEO_PATH and HAR_PATH are per-day dirs like LOG_PATH; multi-activity workers no longer wipe
+    # them at teardown (SKY-14139), so the sweep is their only reaper. An unset path is skipped —
+    # Path("") is the working directory.
+    bases = [base for base in (settings.LOG_PATH, settings.VIDEO_PATH, settings.HAR_PATH) if base]
     if not isinstance(StorageFactory.get_storage(), LocalStorage):
         bases.append(settings.DOWNLOAD_PATH)
     for base in bases:
@@ -175,9 +182,74 @@ def sweep_stale_temp_artifacts(max_age_hours: float | None = None) -> int:
             except Exception:
                 LOG.warning("Failed to sweep stale temp entry", entry=str(entry), exc_info=True)
 
+    removed_count += _sweep_run_scoped_temp(cutoff)
+
     if removed_count:
         LOG.info("Swept stale temp artifacts", removed_count=removed_count, max_age_hours=max_age_hours)
     return removed_count
+
+
+def _sweep_run_scoped_temp(cutoff: float) -> int:
+    """Reap aged ``TEMP_PATH/runs/<org>/<run>`` dirs — the one swept part of TEMP_PATH.
+
+    Two guards beyond the generic loop's (#15381 review): ancestors are never followed through
+    symlinks and every candidate must RESOLVE inside the real TEMP_PATH, or a planted link would
+    let the sweep delete foreign directories; and staleness is judged on the whole subtree, not
+    the run root's mtime — writes into an existing staging child never refresh the root, and
+    download timeouts are unbounded, so an old root can still be mid-download.
+    """
+    if not settings.TEMP_PATH:
+        return 0
+    temp_root = Path(settings.TEMP_PATH).resolve()
+    runs_root = Path(settings.TEMP_PATH) / RUN_TEMP_NAMESPACE
+    if runs_root.is_symlink() or not runs_root.is_dir():
+        return 0
+    removed = 0
+    try:
+        org_dirs = list(runs_root.iterdir())
+    except OSError:
+        LOG.warning("Failed to list run-scoped temp namespace for sweep", base=str(runs_root), exc_info=True)
+        return 0
+    for org_dir in org_dirs:
+        if org_dir.is_symlink() or not org_dir.is_dir():
+            continue
+        try:
+            run_dirs = list(org_dir.iterdir())
+        except OSError:
+            continue
+        for run_dir in run_dirs:
+            try:
+                if run_dir.is_symlink() or not run_dir.is_dir():
+                    if run_dir.lstat().st_mtime < cutoff:
+                        run_dir.unlink(missing_ok=True)
+                        removed += 1
+                    continue
+                if not run_dir.resolve().is_relative_to(temp_root):
+                    LOG.warning("Run temp dir resolves outside TEMP_PATH; skipping", entry=str(run_dir))
+                    continue
+                if not _subtree_is_stale(run_dir, cutoff):
+                    continue
+                shutil.rmtree(run_dir, ignore_errors=True)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception:
+                LOG.warning("Failed to sweep run-scoped temp entry", entry=str(run_dir), exc_info=True)
+    return removed
+
+
+def _subtree_is_stale(root: Path, cutoff: float) -> bool:
+    try:
+        if root.lstat().st_mtime >= cutoff:
+            return False
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for name in dirnames + filenames:
+                if (Path(dirpath) / name).lstat().st_mtime >= cutoff:
+                    return False
+    except OSError:
+        # Cannot prove the subtree is dead; keeping it is the safe wrong answer.
+        return False
+    return True
 
 
 async def _temp_artifact_sweep_loop() -> None:

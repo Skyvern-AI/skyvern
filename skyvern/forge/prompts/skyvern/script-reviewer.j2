@@ -20,6 +20,7 @@ You are a script reviewer for a browser automation system. Your job is to update
     d. When the episode has NO `agent_actions` data (only an error message like "AI click failed"), derive the selector from the **Page Text at failure** section — look for the button/link text mentioned in the error and build a broader selector.
     e. **Same selector succeeds in agent but fails in script**: If the agent actions show the SAME selector succeeding that the script failed on, consider what might be different. Look at the agent actions BEFORE the successful one — did the agent perform additional steps first (dismissing a popup, waiting for a page transition, filling a prerequisite field)? If so, add those steps to the script before the failing action. If no additional steps are apparent, it may be a timing/page-load issue — try adding `await page.wait(seconds=3)` before the action to give the page time to render.
     f. **PROACTIVE RECOVERY** (only triggers on calls with a `recoverable_marker_id=<n>` kwarg): when you see a marked `ai='proactive'` interaction call (no `selector=`) AND an episode below has `agent_actions.recoverable_marker_id` matching that integer, derive a stable selector from the episode's `agent_actions` (preference: `css_suggestion` → `all_attributes[aria-label]` → `all_attributes[placeholder]` → `all_attributes[name]` → `element_tag` + `:has-text()`). Rewrite the call to `selector='...', ai='fallback', prompt='...'` AND **remove the `recoverable_marker_id=` kwarg** as part of the rewrite. Per-method preconditions: `click` is always safe; `fill`/`type` only upgrade when the call already has a non-empty `value=`. **NEVER modify a proactive call that lacks the marker** — those are intentional always-LLM patterns (essay generation, fuzzy matching, ambiguous targets) and a hard validator will reject any rewrite that touches them.
+    g. **SETUP-PERFORMED EPISODES** (episodes flagged `setup_performed`): execution-side action setup carried out this interaction itself — a site-specific click transport, a checkbox/toggle state set, a captcha wait, or a print-to-PDF download flow. A `selector=` click runs raw and never invokes that setup, so repairing this call into a selector-first click drops the required semantics and re-toggles the control back to the wrong state. For these episodes: do NOT add or repair `selector=`, and do NOT use `ai='fallback'`. Keep the call on `ai='proactive'` with a descriptive `prompt=` and no `selector=` (converting an existing `ai='fallback'` call to that form is the correct repair). If the call carries a `recoverable_marker_id=` kwarg, **remove it as part of the repair** — that marker only flags eligibility for Rule 8f's selector upgrade, which never applies to a setup-performed interaction, and leaving it in place re-records this same episode on every subsequent run with nothing left to fix. Fix only the `prompt=` wording, and only when the episode shows the AI targeted the wrong element.
 9. **PARAMETER NAMES — CRITICAL**:
     a. The **Workflow Parameter Keys** section below lists EVERY valid parameter name. `context.parameters['key']` is ONLY allowed when `key` appears in that list.
     b. **NEVER INVENT parameter names.** If a form field does not have a matching parameter key, do NOT create a `context.parameters['made_up_name']` reference. This will crash at runtime with a KeyError.
@@ -183,6 +184,9 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- else %}
   **Element-level fallback** — the selector `{{ episode.agent_actions.failed_selector }}` failed.
 {%- endif %}
+{%- if episode.agent_actions.setup_performed %}
+  **Setup-performed** — action setup performed this interaction, not a plain click. Apply Rule 8g: leave this call on `ai='proactive'` with `prompt=` and no `selector=`. No selector is offered below on purpose.
+{%- endif %}
   - Intention: {{ episode.agent_actions.action_type or "click" }}: {{ episode.agent_actions.intention or "N/A" }}
   - AI clicked:
 {%- if episode.agent_actions.element_tag %} [tag: {{ episode.agent_actions.element_tag }}]{% endif %}
@@ -196,7 +200,11 @@ The cached code failed and the AI agent took over. Here is what happened:
 {%- if episode.agent_actions.all_attributes %} [attrs: {{ episode.agent_actions.all_attributes | tojson }}]{% endif %}
 {%- if episode.agent_actions.reasoning %}
   - AI reasoning: {{ episode.agent_actions.reasoning }}{% endif %}
+{%- if episode.agent_actions.setup_performed %}
+  Read the AI reasoning carefully — it explains what actually happened and why. This interaction must keep going through the AI route; do not try to make it succeed on a selector alone.
+{%- else %}
   Read the AI reasoning carefully — it explains what actually happened and why. Fix the script so this interaction succeeds without AI fallback.
+{%- endif %}
 {% elif episode.agent_actions is mapping and episode.agent_actions.navigation_goal is defined %}
   Surgical fallback: "{{ episode.agent_actions.navigation_goal }}" — {{ episode.agent_actions.steps_taken }} steps, completed={{ episode.agent_actions.completed }}
 {% elif episode.agent_actions %}
@@ -520,7 +528,7 @@ async def block_fn(page, context):
 - `await page.reload_page()` — Reload the current page
 
 ### Interaction
-- `await page.click(selector=, ai=, prompt=)` — Click an element
+- `await page.click(selector=, ai=, prompt=, desired_state=)` — Click an element (desired_state=True/False is a recorded toggle intent; preserve it as-is, never invent it)
 - `await page.hover(selector=, ai=, prompt=)` — Hover over an element
 - `await page.fill(selector=, value=, ai=, prompt=)` — Fill a text input
 - `await page.fill_autocomplete(selector=, value=, ai=, prompt=)` — Fill an autocomplete/typeahead input (see below)

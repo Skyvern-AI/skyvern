@@ -1382,6 +1382,25 @@ async def test_google_drive_unwraps_credential_id_and_requests_drive_scopes(tmp_
 
 
 @pytest.mark.asyncio
+async def test_google_drive_without_folder_id_uploads_to_my_drive_root(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        google_credential_id="google-credential",
+        google_drive_folder_id=None,
+    )
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("statement.pdf",)),
+        tmp_path / "downloads",
+        downloads_during_execute=("statement.pdf",),
+    )
+
+    assert execution.result.success is True
+    destination = execution.upload.await_args.kwargs["destination"]
+    assert destination.google_drive_folder_id is None
+
+
+@pytest.mark.asyncio
 async def test_sftp_unwraps_secrets_and_defaults_port_to_22(tmp_path: Path) -> None:
     download_dir = tmp_path / "downloads"
     block = _file_download_block(
@@ -1531,8 +1550,8 @@ async def test_missing_sftp_host_fails_without_dispatch(tmp_path: Path) -> None:
         ),
         (
             FileDownloadTarget.GOOGLE_DRIVE,
-            {"google_credential_id": "credential"},
-            "google_drive_folder_id",
+            {"google_drive_folder_id": "folder-id"},
+            "google_credential_id",
         ),
         (FileDownloadTarget.SFTP, {"sftp_host": "host", "sftp_username": "user"}, "sftp_password"),
     ],

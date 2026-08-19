@@ -4,6 +4,12 @@ import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
 import {
+  markCommit,
+  markLoad,
+  markMessage,
+  startDebugReport,
+} from "@/routes/streaming/streamStats";
+import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
@@ -70,6 +76,8 @@ interface Props {
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   onUrlChange?: (url: string) => void;
   onActivity?: () => void;
+  // Bypasses a stale RFB selection after the authenticated RFB socket has failed.
+  forceCdp?: boolean;
   // Opt-in: turns the read-only URL bar into a navigable input. Only the
   // hosted-browser-session live view passes this today (SKY-13683) -- the
   // workflow studio/editor callers of this component leave it unset and keep
@@ -87,10 +95,12 @@ function BrowserSessionStream({
   onReadyChange,
   onUrlChange,
   onActivity,
+  forceCdp = false,
   enableUrlInput = false,
   onFrameWidthChange,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
+  const [streamImgToken, setStreamImgToken] = useState<number>(0);
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
@@ -103,6 +113,13 @@ function BrowserSessionStream({
   const socketRef = useRef<WebSocket | null>(null);
   const onActivityRef = useRef(onActivity);
   const hasFrameRef = useRef(false);
+  const pendingFrameRef = useRef<{
+    token: number;
+    screenshot: string;
+    message: StreamMessage;
+  } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastCommittedTokenRef = useRef<number>(0);
   const reconnectAttemptsRef = useRef(0);
   const terminalStatusSeenRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -135,6 +152,8 @@ function BrowserSessionStream({
     onActivityRef.current = onActivity;
   }, [onActivity]);
 
+  useEffect(() => startDebugReport(), []);
+
   // Once control can't be offered (input socket torn down), forget any prior
   // grab so re-enabling doesn't silently restore control without a new click.
   useEffect(() => {
@@ -162,6 +181,14 @@ function BrowserSessionStream({
       }
     };
 
+    const clearPendingFrame = () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      pendingFrameRef.current = null;
+    };
+
     async function connect() {
       const credentialParam = await getCredentialParam(credentialGetter);
       if (cancelled) {
@@ -170,7 +197,7 @@ function BrowserSessionStream({
 
       socketRef.current?.close();
       const socket = new WebSocket(
-        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}`,
+        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}${forceCdp ? "&force_cdp=true" : ""}`,
       );
       socketRef.current = socket;
 
@@ -201,22 +228,49 @@ function BrowserSessionStream({
           }
           const hasActivity =
             Boolean(message.screenshot) || message.url !== undefined;
+          // Presentation metadata is committed only with its pixels. Applying it
+          // on receipt would pair the new viewport (which maps click coordinates)
+          // with the previous screenshot.
+          const applyMetadata = (m: StreamMessage) => {
+            if (m.format) {
+              setStreamFormat((prev) => (prev === m.format ? prev : m.format!));
+            }
+            if (m.viewport_width) {
+              setViewportWidth((prev) =>
+                prev === m.viewport_width ? prev : m.viewport_width!,
+              );
+            }
+            if (m.viewport_height) {
+              setViewportHeight((prev) =>
+                prev === m.viewport_height ? prev : m.viewport_height!,
+              );
+            }
+            if (m.url !== undefined) {
+              setCurrentUrl((prev) => (prev === m.url ? prev : m.url!));
+            }
+          };
           if (message.screenshot) {
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
-            setStreamImgSrc(message.screenshot);
-          }
-          if (message.format) {
-            setStreamFormat(message.format);
-          }
-          if (message.viewport_width) {
-            setViewportWidth(message.viewport_width);
-          }
-          if (message.viewport_height) {
-            setViewportHeight(message.viewport_height);
-          }
-          if (message.url !== undefined) {
-            setCurrentUrl(message.url);
+            const token = markMessage();
+            pendingFrameRef.current = {
+              token,
+              screenshot: message.screenshot,
+              message,
+            };
+            if (rafRef.current === null) {
+              rafRef.current = requestAnimationFrame(() => {
+                rafRef.current = null;
+                const pending = pendingFrameRef.current;
+                if (!pending || !isCurrentSocket()) return;
+                pendingFrameRef.current = null;
+                lastCommittedTokenRef.current = pending.token;
+                setStreamImgSrc(pending.screenshot);
+                setStreamImgToken(pending.token);
+                applyMetadata(pending.message);
+                markCommit(pending.token);
+              });
+            }
           }
           if (hasActivity) {
             onActivityRef.current?.();
@@ -229,6 +283,7 @@ function BrowserSessionStream({
             terminalStatusSeenRef.current = true;
             // Drop the last frame: keeping it leaves a dead, still-interactive
             // screenshot covering the terminal status panel.
+            clearPendingFrame();
             setStreamImgSrc("");
             socket.close();
           }
@@ -255,6 +310,7 @@ function BrowserSessionStream({
         if (socketRef.current !== socket) {
           return;
         }
+        clearPendingFrame();
         socketRef.current = null;
 
         if (
@@ -303,13 +359,14 @@ function BrowserSessionStream({
     return () => {
       cancelled = true;
       clearReconnectTimer();
+      clearPendingFrame();
       const socket = socketRef.current;
       if (socket) {
         socketRef.current = null;
         socket.close();
       }
     };
-  }, [credentialGetter, browserSessionId]);
+  }, [credentialGetter, browserSessionId, forceCdp]);
 
   const isReady = streamImgSrc.length > 0;
 
@@ -356,6 +413,8 @@ function BrowserSessionStream({
         navigateError={enableUrlInput ? navigateError : undefined}
         onHistoryNavigate={enableUrlInput ? historyNavigate : undefined}
         onFrameWidthChange={onFrameWidthChange}
+        frameToken={streamImgToken}
+        onFrameLoad={markLoad}
       />
     );
   }

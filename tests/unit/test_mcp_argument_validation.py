@@ -7,7 +7,8 @@ names that don't match the tool's contract.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -15,6 +16,7 @@ from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.cli.mcp_tools.argument_validation import _repair_argument_types, _split_comma_separated_list
 from tests.unit._mcp_browser_fakes import make_mock_page, make_skyvern_page
@@ -93,6 +95,21 @@ async def test_valid_argument_shape_is_not_blocked() -> None:
     error = payload.get("error")
     if error is not None:
         assert "unsupported_arguments" not in error.get("details", {})
+
+
+@pytest.mark.asyncio
+async def test_session_create_null_profile_flag_uses_published_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_skyvern = MagicMock()
+    fake_skyvern.create_browser_session = AsyncMock(
+        return_value=SimpleNamespace(browser_session_id="pbs_test", app_url=None)
+    )
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: fake_skyvern)
+    monkeypatch.setattr(mcp_session, "is_stateless_http_mode", lambda: True)
+
+    payload = await _call("skyvern_browser_session_create", {"generate_browser_profile": None})
+
+    assert payload["ok"] is True
+    fake_skyvern.create_browser_session.assert_awaited_once_with(timeout=60, proxy_location=None)
 
 
 @pytest.mark.asyncio

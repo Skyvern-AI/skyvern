@@ -9,17 +9,7 @@ from typing import Any
 
 import pytest
 
-
-def _mk_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
-    """Build a fake CallModelData payload with a model_data.input list.
-
-    ``CallModelData.context`` is the run context itself (``TContext | None``), not a wrapper around
-    one; a fake that nests it hides an attribute error behind a passing test.
-    """
-    return SimpleNamespace(
-        model_data=SimpleNamespace(input=list(items), instructions=instructions),
-        context=context,
-    )
+from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
 
 
 class TestFirstTurnCompaction:

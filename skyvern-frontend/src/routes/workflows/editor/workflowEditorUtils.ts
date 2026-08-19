@@ -981,6 +981,14 @@ function convertToNode(
           smtpPortSecretParameterKey: block.smtp_port?.key,
           smtpUsernameSecretParameterKey: block.smtp_username?.key,
           smtpPasswordSecretParameterKey: block.smtp_password?.key,
+          customSmtpHost: block.custom_smtp_host ?? null,
+          customSmtpPort:
+            block.custom_smtp_port !== null &&
+            block.custom_smtp_port !== undefined
+              ? String(block.custom_smtp_port)
+              : null,
+          customSmtpUsername: block.custom_smtp_username ?? null,
+          customSmtpPassword: block.custom_smtp_password ?? null,
         },
       };
     }
@@ -2140,6 +2148,7 @@ function getElements(
     startNode(startNodeId, {
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
+      reuseBrowserSession: settings.reuseBrowserSession,
       pinSavedSessionIp: settings.pinSavedSessionIp,
       browserProfileId: settings.browserProfileId,
       browserProfileKey: settings.browserProfileKey,
@@ -3242,6 +3251,13 @@ function getWorkflowBlock(
           node.data.smtpUsernameSecretParameterKey,
         smtp_password_secret_parameter_key:
           node.data.smtpPasswordSecretParameterKey,
+        custom_smtp_host: node.data.customSmtpHost ?? null,
+        custom_smtp_port:
+          node.data.customSmtpPort && node.data.customSmtpPort !== ""
+            ? parseInt(node.data.customSmtpPort, 10)
+            : null,
+        custom_smtp_username: node.data.customSmtpUsername ?? null,
+        custom_smtp_password: node.data.customSmtpPassword ?? null,
       };
     }
     case "codeBlock": {
@@ -3689,6 +3705,7 @@ function getWorkflowBlocks(
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
+    reuseBrowserSession: false,
     pinSavedSessionIp: false,
     browserProfileId: null,
     browserProfileKey: null,
@@ -3722,6 +3739,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   if (isWorkflowStartNodeData(data)) {
     return {
       persistBrowserSession: data.persistBrowserSession,
+      reuseBrowserSession: data.reuseBrowserSession,
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
@@ -4752,6 +4770,10 @@ function convertBlocksToBlockYAML(
           smtp_port_secret_parameter_key: block.smtp_port?.key,
           smtp_username_secret_parameter_key: block.smtp_username?.key,
           smtp_password_secret_parameter_key: block.smtp_password?.key,
+          custom_smtp_host: block.custom_smtp_host,
+          custom_smtp_port: block.custom_smtp_port,
+          custom_smtp_username: block.custom_smtp_username,
+          custom_smtp_password: block.custom_smtp_password,
           sender: block.sender,
           recipients: block.recipients,
           subject: block.subject,
@@ -4897,6 +4919,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
+    reuse_browser_session: workflow.reuse_browser_session,
     pin_saved_session_ip: workflow.pin_saved_session_ip,
     browser_profile_id: workflow.browser_profile_id ?? null,
     browser_profile_key: workflow.browser_profile_key ?? null,

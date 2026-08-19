@@ -189,8 +189,8 @@ async def test_treatment_zero_scroll_records_screenshot_action_via_legacy_nestin
         with contextlib.ExitStack() as stack:
             skyvern_frame_cls = stack.enter_context(patch("skyvern.forge.agent.SkyvernFrame"))
             skyvern_frame_cls.create_instance = AsyncMock(return_value=frame_mock)
-            prepare = AsyncMock(return_value=None)
-            stack.enter_context(patch.object(app.ARTIFACT_MANAGER, "prepare_llm_artifact", prepare))
+            archive = MagicMock(return_value=["artifact-id"])
+            stack.enter_context(patch.object(app.ARTIFACT_MANAGER, "accumulate_screenshot_to_step_archive", archive))
 
             agent = MagicMock(spec=ForgeAgent)
             await ForgeAgent.record_artifacts_after_action(
@@ -199,7 +199,7 @@ async def test_treatment_zero_scroll_records_screenshot_action_via_legacy_nestin
             assert browser_state.take_post_action_screenshot.await_args.kwargs["scrolling_number"] == 0
             frame_mock.get_scroll_x_y.assert_awaited()  # legacy always-attempt read
             frame_mock.safe_scroll_to_x_y.assert_awaited()  # legacy restore (no-op to same position)
-            prepare.assert_awaited()  # artifact recorded via legacy nesting (x/y known)
+            archive.assert_called_once()  # artifact recorded via legacy nesting (x/y known)
     finally:
         skyvern_context.reset()
 

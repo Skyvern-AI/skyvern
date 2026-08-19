@@ -337,8 +337,8 @@ function FileDownloadEditorBody({
 
         {downloadTarget === "google_drive" && (
           <DestinationField
-            label="Google Drive Folder ID (Required)"
-            help="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID."
+            label="Google Drive Folder ID (Optional)"
+            help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
           >
             <WorkflowBlockInputTextarea
               nodeId={blockId}

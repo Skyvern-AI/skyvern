@@ -62,6 +62,8 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    MCP_RESULT_PROVENANCE_KEY,
+    MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
     parse_final_response,
 )
@@ -80,15 +82,15 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     scout_observation_bound_paths,
 )
 from skyvern.forge.sdk.copilot.run_outcome import (
-    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-    TERMINAL_CHALLENGE_USER_FACING_REASON,
+    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODES,
     RecordedRunOutcome,
     run_outcome_display_reason,
+    terminal_challenge_disposition,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import same_run_typed_challenge_kind
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
@@ -191,7 +193,7 @@ def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
     outcome = getattr(ctx, "last_run_outcome", None)
     if not isinstance(outcome, RecordedRunOutcome):
         return None
-    if outcome.reason_code != TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE:
+    if outcome.reason_code not in TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODES:
         return None
     return outcome
 
@@ -219,16 +221,20 @@ def _structured_page_challenge_reason(ctx: Any, evidence: dict[str, Any] | None 
 
 
 def _terminal_challenge_halt_signal(
-    ctx: Any,
+    ctx: AgentContext,
     *,
     evidence_source: str,
     evidence_reason: str,
     blocked_tool: str = "update_and_run_blocks",
     challenge_evidence_source: str | None = None,
 ) -> CopilotToolBlockerSignal:
-    workflow_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    workflow_run_id = ctx.last_run_blocks_workflow_run_id
     safe_evidence_reason = (
         run_outcome_display_reason(evidence_reason) or "Structured challenge evidence reported a terminal blocker."
+    )
+    disposition = terminal_challenge_disposition(
+        challenge_kind=same_run_typed_challenge_kind(ctx.composition_page_evidence, workflow_run_id),
+        runs_this_turn=ctx.block_run_calls_this_turn,
     )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
@@ -237,19 +243,20 @@ def _terminal_challenge_halt_signal(
             f"{safe_evidence_reason}. Do NOT retry block-running tools, do NOT try a proxy/location switch "
             "in this turn, and do NOT claim the workflow is verified end-to-end. Reply with the blocker."
         ),
-        user_facing_reason=TERMINAL_CHALLENGE_USER_FACING_REASON,
+        user_facing_reason=disposition.user_facing_reason,
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,
         renders_final_reply=True,
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        internal_reason_code=disposition.internal_reason_code,
         blocked_tool=blocked_tool,
         extra={
-            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+            "run_outcome_reason_code": disposition.run_outcome_reason_code,
+            "challenge_kind": disposition.challenge_kind.value if disposition.challenge_kind else None,
             "evidence_source": evidence_source,
             "challenge_evidence_source": challenge_evidence_source,
             "evidence_reason": safe_evidence_reason,
-            "workflow_run_id": workflow_run_id if isinstance(workflow_run_id, str) else None,
+            "workflow_run_id": workflow_run_id,
         },
     )
 
@@ -777,6 +784,10 @@ def _summarize_tool_output(output: str) -> str:
         return _truncated_output_fallback(output)
 
     synopsis: dict[str, Any] = {}
+    # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
+    # re-stamped rather than copied, so this is not where an attacker-chosen provenance survives.
+    if MCP_RESULT_PROVENANCE_KEY in parsed:
+        synopsis[MCP_RESULT_PROVENANCE_KEY] = MCP_RESULT_PROVENANCE_VALUE
     if "ok" in parsed:
         synopsis["ok"] = parsed["ok"]
     if parsed.get("error"):
@@ -834,12 +845,10 @@ def _replace_item_field(item: Any, name: str, new_value: Any) -> Any:
         dup = copy.copy(item)
         setattr(dup, name, new_value)
         return dup
-    except (AttributeError, TypeError) as exc:
+    except (AttributeError, TypeError):
         LOG.debug(
             "Could not rewrite input-list item field; leaving untouched",
             field=name,
-            item_type=type(item).__name__,
-            error=str(exc),
         )
         return item
 
@@ -1763,14 +1772,12 @@ async def run_with_enforcement(
                     # would double-emit frames to the client.
                     LOG.error(
                         "Context window exceeded after partial emission; not retrying",
-                        error=str(e),
                         iteration=iteration,
                         has_session=session is not None,
                     )
                     raise
                 LOG.error(
                     "Context window exceeded, retrying with aggressive prune",
-                    error=str(e),
                     iteration=iteration,
                     has_session=session is not None,
                 )
@@ -1798,13 +1805,11 @@ async def run_with_enforcement(
                 except asyncio.CancelledError:
                     _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
                     raise
-                except Exception as retry_err:
+                except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
                     LOG.error(
                         "Context window recovery retry failed",
-                        original_error=str(e),
-                        retry_error=str(retry_err),
                         iteration=iteration,
                         has_session=session is not None,
                     )

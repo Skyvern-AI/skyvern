@@ -120,6 +120,7 @@ from .frontier import _SKYVERN_TEMPLATE_CONTEXT_ROOTS as _SKYVERN_TEMPLATE_CONTE
 from .frontier import _TEMPLATE_BUILTIN_ROOTS as _TEMPLATE_BUILTIN_ROOTS
 from .frontier import _detect_stale_block_metadata as _detect_stale_block_metadata
 from .frontier import _find_invalidated_labels as _find_invalidated_labels
+from .frontier import _frontier_runtime_page_url as _frontier_runtime_page_url
 from .frontier import _get_prior_workflow as _get_prior_workflow
 from .frontier import _get_prior_workflow_definition as _get_prior_workflow_definition
 from .frontier import _invalidate_verified_state_on_edit as _invalidate_verified_state_on_edit
@@ -163,6 +164,7 @@ from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_ST
 from .run_execution import WatchdogExitReason as WatchdogExitReason
 from .run_execution import _any_quiet_block_requested as _any_quiet_block_requested
 from .run_execution import _attach_action_traces as _attach_action_traces
+from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
@@ -586,14 +588,17 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     These are OAuth connections made on the Integrations page, NOT the stored
     login credentials returned by `list_credentials` — the two lists are disjoint,
     so check this one before concluding the user has no Google or Microsoft access.
-    Blocks such as `google_sheets_write` take a `connection_id` from here directly
-    as their credential field. Not paginated; one call returns every connection.
+    Prefer a purpose-built native integration block over automating that connected
+    service through its browser UI. For Google Sheets, call `get_block_schema` for
+    `google_sheets_read` or `google_sheets_write`, then pass an active compatible
+    connection's `connection_id` as the block's `credential_id`. Not paginated; one
+    call returns every connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
-    fails at run time. Only a connection whose `state` is `active` can be used — an
-    expired grant stays listed so you can ask the user to reconnect that account
-    rather than tell them nothing is connected.
+    fails at run time. A connection whose `state` is `active` can mint an access token.
+    A connection whose `state` is `error` remains listed but cannot mint one until it
+    is authorized again.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -655,6 +660,8 @@ async def run_blocks_tool(
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    # No definition change on this path, so the frontier never reaches the edit-in-place branch
+    # and a live page read would be spent on nothing.
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, prior_definition
     )
@@ -865,7 +872,11 @@ async def update_and_run_blocks_tool(
         new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
 
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
-        copilot_ctx, block_labels, prior_definition, new_definition
+        copilot_ctx,
+        block_labels,
+        prior_definition,
+        new_definition,
+        await _frontier_runtime_page_url(copilot_ctx),
     )
     with copilot_span(
         "run_blocks",
@@ -987,6 +998,7 @@ async def fill_credential_field_tool(
     selector: str,
     credential_id: str,
     field: str,
+    submit_selector: str | None = None,
 ) -> str:
     """Fill ONE field of a SAVED credential into the live debug browser during code-only scouting.
 
@@ -1005,8 +1017,22 @@ async def fill_credential_field_tool(
     `candidate_login_credentials`, ask the user which one to use and pass the
     `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
 
-    This tool only fills; it never clicks or submits. Each successful fill is
-    recorded as a scouted interaction with the credential identity and field.
+    `submit_selector` is optional and submits in the SAME call: pass the CSS
+    selector of the form's submit control and this tool clicks it once the fill
+    has been typed, whether or not reading the field back could confirm it. The
+    result's `submitted` says outright whether the control was clicked; when it is
+    false, `submit_skipped` or `submit_error` says why, and the code is still
+    waiting to be submitted. A selector matching more than one control is not
+    clicked at all rather than guessed between. A one-time code expires in
+    seconds, so for `field="totp"` always
+    inspect the page for the submit control FIRST and pass its selector here —
+    submitting on a later turn can send an already-expired code. Take that
+    selector from `inspect_page_for_composition`, which you have already run on
+    the sign-in page; this tool's own `form_submit_controls` is reported only when
+    nothing was submitted, so it cannot supply the selector for the same call. Omit `submit_selector` and the
+    tool fills only; it never clicks on its own. Each successful fill is recorded
+    as a scouted interaction with the credential identity and field, and an
+    in-call submit is recorded as the click that followed it.
 
     In model-authored code blocks, one-time codes resolve via two paths:
     **credential-bound:** `await <parameter_key>.otp()` for a saved credential whose
@@ -1020,7 +1046,7 @@ async def fill_credential_field_tool(
     address string to `otp()` and ensure an active Gmail or Outlook connection exists
     for that mailbox.
     """
-    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
+    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field, submit_selector)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 

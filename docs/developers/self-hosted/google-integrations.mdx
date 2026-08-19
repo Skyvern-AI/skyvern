@@ -65,6 +65,8 @@ ENABLE_ENCRYPTION=true
 ENCRYPTOR_AES_SECRET_KEY=<32-byte base64 key>
 ```
 
+Generate the key with `openssl rand -base64 32`. Skyvern refuses to start if `ENABLE_ENCRYPTION=true` and the key is empty or still the `fillmein` placeholder. `ENCRYPTOR_AES_SALT` and `ENCRYPTOR_AES_IV` are optional; when unset they are derived from `ENCRYPTOR_AES_SECRET_KEY`. Set them only if you want to pin them explicitly, and never change them afterwards — rotating any of the three values makes previously stored credentials undecryptable.
+
 Then configure the client for your organization:
 
 1. Open **Settings → Google OAuth**, or use the **Google OAuth** form at the top of **Integrations**.
@@ -82,6 +84,7 @@ Operators who prefer environment configuration can set these values on the **bac
 
 ```bash .env
 # Enable encryption — OAuth refresh tokens are never stored in plaintext.
+# Generate the key with `openssl rand -base64 32`.
 ENABLE_ENCRYPTION=true
 ENCRYPTOR_AES_SECRET_KEY=<32-byte base64 key>
 
@@ -105,6 +108,8 @@ GOOGLE_OAUTH_APP_ORIGINS=https://skyvern.your-company.com
 | `GOOGLE_OAUTH_REDIRECT_HOSTS` | Yes | Comma-separated hostnames permitted as the `redirect_uri`. Non-loopback hosts must use HTTPS. |
 | `GOOGLE_OAUTH_APP_ORIGINS` | Yes | Comma-separated origins (`scheme://host[:port]`) permitted to finish the flow. Empty rejects every connect attempt. |
 | `ENABLE_ENCRYPTION` | Yes | Must be `true`; credentials are refused if encryption is off. |
+| `ENCRYPTOR_AES_SECRET_KEY` | Yes | AES key used to encrypt stored credentials. Empty or `fillmein` stops the backend from starting. |
+| `ENCRYPTOR_AES_SALT` / `ENCRYPTOR_AES_IV` | No | Derived from `ENCRYPTOR_AES_SECRET_KEY` when unset. Changing them after credentials are stored makes those credentials undecryptable. |
 
 For local development, `localhost` is treated as a loopback host, so `http://localhost:8080` works for both `GOOGLE_OAUTH_REDIRECT_HOSTS` (`localhost`) and `GOOGLE_OAUTH_APP_ORIGINS` (`http://localhost:8080`).
 

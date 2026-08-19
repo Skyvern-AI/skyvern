@@ -3,6 +3,11 @@ import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Status } from "@/api/types";
+import {
+  iconForStatus,
+  variantForStatus,
+  type StatusVariant,
+} from "@/components/statusVisuals";
 import { copyText } from "@/util/copyText";
 import {
   Popover,
@@ -30,22 +35,22 @@ import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunSignals } from "./useStudioRunSignals";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
-// Terminal-only (finalizedRunStatus never returns a live status); mirrors the
-// StatusBadge variant buckets so the dot reads the same as the run chip.
+// Terminal-only by design: finalizedRunStatus (below) only resolves once a run
+// is done, so running/queued/created/paused runs render no dot at all — the
+// studio surfaces "in progress" elsewhere (the run pane itself), and a dot
+// with no fixed color yet would be misleading. Colors key off the same
+// variantForStatus buckets StatusBadge uses, so the dot always agrees with
+// the run chip.
+const dotClassByVariant: Record<StatusVariant, string> = {
+  success: "bg-badge-success",
+  warning: "bg-badge-warning",
+  destructive: "bg-badge-destructive",
+  terminated: "bg-badge-terminated",
+  secondary: "bg-badge-neutral",
+};
+
 function runStatusDotClass(status: Status): string {
-  switch (status) {
-    case Status.Completed:
-      return "bg-badge-success";
-    case Status.Terminated:
-      return "bg-badge-terminated";
-    case Status.Failed:
-    case Status.Canceled:
-    case Status.TimedOut:
-      return "bg-badge-destructive";
-    default:
-      // Fallback for terminal statuses added after this mapping.
-      return "bg-badge-warning";
-  }
+  return dotClassByVariant[variantForStatus(status)];
 }
 
 function runStatusLabel(status: Status): string {
@@ -54,7 +59,9 @@ function runStatusLabel(status: Status): string {
 
 // Mirrors the labels' `hidden xl:inline`: below Tailwind's xl the toggles are
 // icon-only and the tooltip carries the label; with labels visible, enabled
-// toggles have no tooltip (only icon-only controls tooltip).
+// toggles have no tooltip (only icon-only controls tooltip) — except the run
+// control's status dot, which always tooltips since its color/icon has no
+// visible label anywhere in the header.
 function useLabelsCollapsed(): boolean {
   const [collapsed, setCollapsed] = useState(false);
   useEffect(() => {
@@ -201,10 +208,12 @@ export function StudioPaneToggles() {
               <span
                 aria-hidden
                 className={cn(
-                  "absolute -right-0.5 -top-0.5 size-2 rounded-full",
+                  "absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full text-foreground",
                   runStatusDotClass(runStatus),
                 )}
-              />
+              >
+                {iconForStatus(runStatus, "size-2.5")}
+              </span>
             ) : null}
           </>
         );
@@ -314,7 +323,7 @@ export function StudioPaneToggles() {
             >
               <span className="inline-flex items-center">
                 {runId ? (
-                  labelsCollapsed ? (
+                  labelsCollapsed || showRunStatusDot ? (
                     <Tooltip>
                       <TooltipTrigger asChild>{runButton}</TooltipTrigger>
                       <TooltipContent side="bottom">{tip}</TooltipContent>

@@ -165,6 +165,15 @@
       }
     };
 
+    // Buffer every event in-page for the backend to drain via Runtime.evaluate, for builds that drop consoleAPICalled/bindingCalled delivery.
+    const EXFIL_QUEUE_LIMIT = 1000;
+    const exfilQueue = (window.__skyvern_exfil_queue =
+      window.__skyvern_exfil_queue || []);
+    const exfilDocId = (window.__skyvern_exfil_doc_id =
+      window.__skyvern_exfil_doc_id ||
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10));
+    let exfilSeq = 0;
+
     [
       "click",
       "mousedown",
@@ -445,14 +454,18 @@
             },
           };
 
+          eventData.exfilDocId = exfilDocId;
+          eventData.exfilSeq = exfilSeq++;
+          exfilQueue.push(eventData);
+          if (exfilQueue.length > EXFIL_QUEUE_LIMIT) {
+            exfilQueue.splice(0, exfilQueue.length - EXFIL_QUEUE_LIMIT);
+          }
+
           const bindingName = window.__skyvern_exfiltration_binding_name;
           const binding =
             typeof bindingName === "string" ? window[bindingName] : null;
 
-          // Single transport: prefer the CDP binding; console.log is only the
-          // fallback when the binding is absent. Sending through both delivered
-          // every event 2-3x (the console paths also cost json_value CDP
-          // round-trips per event, queueing seconds of latency under load).
+          // Prefer the CDP binding; console.log is the fallback when it is absent. The queue above is the third leg, deduped by (exfilDocId, exfilSeq).
           if (typeof binding === "function") {
             Promise.resolve(binding(eventData)).catch((err) => {
               console.log("[SYS] exfiltration: binding transport failed.", err);

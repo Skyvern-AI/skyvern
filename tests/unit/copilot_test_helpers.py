@@ -257,3 +257,15 @@ def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
     The record is plain interaction dicts, so this only spares tests the brace noise.
     """
     return dict(fields)
+
+
+def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
+    """Build a fake CallModelData payload with a model_data.input list.
+
+    ``CallModelData.context`` is the run context itself (``TContext | None``), not a wrapper around
+    one; a fake that nests it hides an attribute error behind a passing test.
+    """
+    return SimpleNamespace(
+        model_data=SimpleNamespace(input=list(items), instructions=instructions),
+        context=context,
+    )

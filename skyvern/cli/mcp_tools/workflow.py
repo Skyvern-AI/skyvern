@@ -508,6 +508,7 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "totp_verification_url",
     "totp_identifier",
     "persist_browser_session",
+    "reuse_browser_session",
     "mask_secrets",
     "pin_saved_session_ip",
     "browser_profile_id",

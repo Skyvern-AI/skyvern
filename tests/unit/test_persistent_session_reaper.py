@@ -336,7 +336,7 @@ async def test_protects_expired_session_while_a_runnable_is_still_acquiring_it(
     ]
     manager = _make_manager(sessions)
     manager.close_session = AsyncMock()
-    browser_manager._acquiring_session_runnables.add("s_attaching")
+    browser_manager._acquiring_session_runnables["s_attaching"] = 1
 
     await manager.reap_expired_sessions()
 
@@ -1034,12 +1034,15 @@ async def test_reaper_loop_runs_reconcile_after_reap_even_when_reap_fails() -> N
     # Wiring: each reaper pass runs reconcile after reap, and a reap failure must not skip reconcile.
     manager = _make_manager([], owned_ids=[])
     manager.reap_expired_sessions = AsyncMock(side_effect=RuntimeError("reap boom"))
-    manager.reconcile_local_sessions = AsyncMock()
 
-    sleep_mock = AsyncMock(side_effect=[None, asyncio.CancelledError()])
-    with patch(f"{MODULE}.asyncio.sleep", sleep_mock):
-        with pytest.raises(asyncio.CancelledError):
-            await manager._reap_expired_sessions_loop(1)
+    async def reconcile_then_cancel() -> None:
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        current_task.cancel()
+
+    manager.reconcile_local_sessions = AsyncMock(side_effect=reconcile_then_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await manager._reap_expired_sessions_loop(0)
 
     manager.reap_expired_sessions.assert_awaited_once()
     manager.reconcile_local_sessions.assert_awaited_once()

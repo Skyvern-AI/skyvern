@@ -5,7 +5,6 @@ from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.code_block_synthesis import credential_otp_authoring_guidance
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -250,70 +249,24 @@ def _code_only_browser_schema_guidance(settled_block_types: frozenset[str] | Non
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
-        "Deciding which of two page states you are in costs no wait: wait once on `a.or_(b).first`, then branch with `is_visible()` or `count()`. Build each side to match only visible elements — `page.locator('#x >> visible=true')` — because `.first` is the first match in DOM order, not the first to become visible, so a hidden sign-in form that precedes the signed-in view captures the wait and spends the whole ceiling. Give that combined entry wait `timeout=90000`, because a cold first load can hydrate for a minute and the wait returns the instant either state appears, so a fast page pays nothing for the generous window.",
+        "The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
     ]
     if not _login_is_settled(settled_block_types):
-        guidance.extend(
-            [
-                "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
-                credential_otp_authoring_guidance("<key>"),
-            ]
+        guidance.append(
+            "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, use await <key>.otp() for authenticator, email, or SMS one-time codes, and use await <key>.magic_link(page) when the scouted page offers an emailed sign-in link; that broker navigates the page without exposing the sign-in link to authored code. Never put literal secret values in code; scout credential fields with fill_credential_field."
         )
     return guidance
 
 
 def _code_only_browser_credential_login_rules(settled_block_types: frozenset[str] | None = None) -> str:
-    """Credential bullets for the runtime-facts section, in their original order.
-
-    Two kinds of text live here. The accessor contract and `solve_captcha` are facts about the
-    code runtime — both exist in every code block's namespace, and this is the only place either
-    is described, so they render unconditionally. The step-by-step login procedure is authoring
-    steering and is withheld once a login block is settled, which is what stopped the model
-    rewriting a block the user asked to keep.
-    """
-    otp_guidance = credential_otp_authoring_guidance("<credential_key>")
-    login_procedure_withheld = _login_is_settled(settled_block_types)
-
-    accessor_fact = """- A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
-  `fill_credential_field`, never embed literal secrets."""
-
-    login_procedure = """- Credentialed login code must be idempotent. After `goto`, wait once on the two
-  states together, then branch without waiting again. Build each side to match only
-  visible elements, since `.first` takes the first match in DOM order rather than the
-  first to become visible, and a sign-in form that is present but hidden on an
-  already-authenticated page would otherwise capture the wait and hold it to the ceiling:
-  `login_form = page.locator("#login-form >> visible=true")`,
-  `authenticated_anchor = page.locator("#account-menu >> visible=true")`, then
-  `await login_form.or_(authenticated_anchor).first.wait_for(state="visible", timeout=90000)`,
-  then `if await login_form.is_visible():` to fill username/password. The generous window
-  covers a cold first load whose hydration lands well after Playwright's default, and the
-  combined wait still returns the instant either state appears. Waiting on the
-  login form by itself spends the entire timeout proving it is absent whenever the
-  session is already authenticated. After submit, use the scouting trajectory to reach and
-  observe a logged-in page anchor instead of relying only on `networkidle`."""
-
-    captcha_fact = """- After a credentialed login submit or navigation commit, call
-  `await solve_captcha(page)` before waiting for post-login anchors. This helper
-  owns any platform-managed verification challenge; do not locate or interact
-  with challenge controls directly."""
-
-    otp_procedure = (
-        """- After challenge handling, wait for either the observed one-time-code field or
-  a real authenticated-page anchor. If an OTP field appears, fill it with
-  `await <credential_key>.otp()`, submit it with the exact control the scout
-  demonstrated (its recorded selector and label, never a guessed one). """
-        + otp_guidance
-        + """
-  Do not treat disappearance of the login fields as proof of authentication."""
-    )
-
-    bullets = (
-        [accessor_fact, captcha_fact]
-        if login_procedure_withheld
-        else [accessor_fact, login_procedure, captcha_fact, otp_procedure]
-    )
-    return "\n".join(bullets) + "\n"
+    """Expose credential accessors without prescribing login control flow."""
+    return """- A `credential_id` workflow parameter resolves to a credential object with
+  `<key>.username`, `<key>.password`, `await <key>.otp()` for one-time codes, and
+  `await <key>.magic_link(page)` for an emailed sign-in link without exposing the sign-in link to authored code;
+  scout fields with
+  `fill_credential_field`, never embed literal secrets.
+- The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while
+  scouting; this is an available capability, not a required login step.\n"""
 
 
 def _code_only_browser_block_status_section(settled_block_types: frozenset[str] | None = None) -> str:

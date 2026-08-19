@@ -315,7 +315,7 @@ Do NOT use fixups as a first resort — prefer letting fill_form handle fields. 
 - `await page.extract_form_fields()` — Scan for form fields (called internally by fill_form)
 
 ### Interaction
-- `await page.click(selector=, ai=, prompt=)` — Click an element
+- `await page.click(selector=, ai=, prompt=, desired_state=)` — Click an element (desired_state=True/False is a recorded toggle intent; preserve it as-is, never invent it)
 - `await page.fill(selector=, value=, ai=, prompt=)` — Fill a text input
 - `await page.fill_autocomplete(selector=, value=, ai=, prompt=)` — Fill autocomplete/typeahead input
 - `await page.select_option(selector=, value=, ai=, prompt=)` — Select a dropdown option

@@ -1,9 +1,16 @@
 import { useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { useGoogleOAuthCredentials } from "@/hooks/useGoogleOAuthCredentials";
+import {
+  broadcastGoogleOAuthCredentialsChanged,
+  useGoogleOAuthCredentials,
+} from "@/hooks/useGoogleOAuthCredentials";
 import { useToast } from "@/components/ui/use-toast";
-import { clearStoredGoogleOAuthIntegrationIdForState } from "./googleOAuth";
+import {
+  clearStoredGoogleOAuthIntegrationIdForState,
+  getStoredGoogleOAuthIntegrationIdForState,
+} from "./googleOAuth";
+import { closeGoogleOAuthPopupIfMarked } from "./googleOAuthPopup";
 
 function GoogleOAuthCallback() {
   const [searchParams] = useSearchParams();
@@ -17,10 +24,35 @@ function GoogleOAuthCallback() {
     if (ranRef.current) return;
     ranRef.current = true;
 
+    const state = searchParams.get("state");
+    const bouncedCredentialId = searchParams.get("credential_id");
+    const bouncedSuccess = searchParams.get("success") === "1";
+    const storedIntegrationId = state
+      ? getStoredGoogleOAuthIntegrationIdForState(state)
+      : null;
+
+    // A hosted callback exchanges the code, then returns the popup to its
+    // original app origin. Back on that origin, sessionStorage and
+    // BroadcastChannel address the studio tab that opened the popup.
+    if (bouncedCredentialId && bouncedSuccess && storedIntegrationId) {
+      if (state) {
+        clearStoredGoogleOAuthIntegrationIdForState(state);
+      }
+      queryClient.invalidateQueries({ queryKey: ["googleOAuthCredentials"] });
+      broadcastGoogleOAuthCredentialsChanged();
+      toast({
+        title: "Success",
+        description: "Google account connected successfully",
+      });
+      if (!closeGoogleOAuthPopupIfMarked()) {
+        navigate("/integrations", { replace: true });
+      }
+      return;
+    }
+
     const finish = async () => {
       const error = searchParams.get("error");
       const code = searchParams.get("code");
-      const state = searchParams.get("state");
 
       if (error) {
         toast({
@@ -41,12 +73,16 @@ function GoogleOAuthCallback() {
         return;
       }
 
+      let connected = false;
       try {
         await submitOAuthCallbackAsync({ code, state });
         queryClient.invalidateQueries({ queryKey: ["googleOAuthCredentials"] });
+        connected = true;
       } finally {
         clearStoredGoogleOAuthIntegrationIdForState(state);
-        navigate("/integrations", { replace: true });
+        if (!connected || !closeGoogleOAuthPopupIfMarked()) {
+          navigate("/integrations", { replace: true });
+        }
       }
     };
 

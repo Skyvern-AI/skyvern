@@ -16,6 +16,7 @@ from agents.run_context import RunContextWrapper
 from pydantic import BaseModel
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.agents.context import (
     compact_agent_messages_for_llm,
     get_agent_message_field,
@@ -198,10 +199,18 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,
         }
+        parameters = getattr(ctx, "codeblock_redaction_parameters", {})
+        if parameters:
+            payload = app.AGENT_FUNCTION.redact_codeblock_parameter_values(payload, parameters)
+        if not isinstance(payload, dict):
+            payload = {}
         path = target / f"call-{next(_MODEL_CALL_SEQ):04d}.json"
-        path.write_text(json.dumps(payload, indent=2, default=str))
+        serialized = json.dumps(payload, indent=2, default=str)
+        if parameters:
+            serialized = app.AGENT_FUNCTION.redact_codeblock_parameter_values(serialized, parameters)
+        path.write_text(serialized if isinstance(serialized, str) else "")
     except Exception:
-        LOG.warning("Failed to dump copilot model input", exc_info=True)
+        LOG.warning("Failed to dump copilot model input")
 
 
 def _filter_to_budget(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:

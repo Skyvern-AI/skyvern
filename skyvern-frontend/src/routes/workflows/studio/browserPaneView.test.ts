@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { resolveBrowserPaneView } from "./browserPaneView";
+import { resolveBrowserPaneView, resolveLiveSurface } from "./browserPaneView";
 
 const base = {
   intent: "auto" as const,
@@ -143,5 +143,48 @@ describe("resolveBrowserPaneView", () => {
 
   it("falls back to live (warming up) with nothing to show", () => {
     expect(resolveBrowserPaneView(base)).toBe("live");
+  });
+});
+
+const liveBase = {
+  recording: false,
+  running: false,
+  runInDebugSession: false,
+  hasRunId: false,
+};
+
+describe("resolveLiveSurface", () => {
+  it("follows a run that is running outside the debug session", () => {
+    expect(
+      resolveLiveSurface({ ...liveBase, running: true, hasRunId: true }),
+    ).toBe("run");
+  });
+
+  it("returns to the debug session once that run is terminal", () => {
+    expect(
+      resolveLiveSurface({ ...liveBase, running: false, hasRunId: true }),
+    ).toBe("debug");
+  });
+
+  it("stays on the debug session for a run executing in it", () => {
+    expect(
+      resolveLiveSurface({
+        ...liveBase,
+        running: true,
+        runInDebugSession: true,
+        hasRunId: true,
+      }),
+    ).toBe("debug");
+  });
+
+  it("stays on the debug session while recording", () => {
+    expect(
+      resolveLiveSurface({
+        ...liveBase,
+        recording: true,
+        running: true,
+        hasRunId: true,
+      }),
+    ).toBe("debug");
   });
 });
