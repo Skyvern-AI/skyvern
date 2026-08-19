@@ -9,6 +9,11 @@ import {
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { getSseClient } from "@/api/sse";
+import {
+  FeatureFlagContext,
+  FeatureFlagValueContext,
+} from "@/hooks/useFeatureFlag";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
@@ -21,50 +26,57 @@ type StreamCall = {
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const { streamCalls, postStreaming, cancelPost, historyResponse, speechState } =
-  vi.hoisted(() => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: { message: string },
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as {
-          sender: "user" | "ai";
-          content: string;
-          created_at: string;
-          narrative_payload?: Record<string, unknown> | null;
-        }[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    const speech = {
-      isSupported: false,
-      isListening: false,
-      isHearingSpeech: false,
-      start: vi.fn(),
-      stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
-      toggle: vi.fn(),
-      takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-      speechState: speech,
-    };
-  });
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyResponse,
+  speechState,
+  copilotUxV1Enabled,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const post = vi.fn().mockResolvedValue({});
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: { message: string },
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as {
+        sender: "user" | "ai";
+        content: string;
+        created_at: string;
+        narrative_payload?: Record<string, unknown> | null;
+      }[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  const speech = {
+    isSupported: false,
+    isListening: false,
+    isHearingSpeech: false,
+    start: vi.fn(),
+    stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
+    toggle: vi.fn(),
+    takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    historyResponse: history,
+    speechState: speech,
+    copilotUxV1Enabled: { value: false },
+  };
+});
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -96,13 +108,24 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
 vi.mock("posthog-js/react", () => ({
-  // "copilot_ux_v1" stays off — this file's fixtures pin today's headline
-  // strings, not the disposition-first reorder behind that flag.
-  useFeatureFlagEnabled: (flag: string) => flag !== "copilot_ux_v1",
+  // "copilot_ux_v1" stays off by default — this file's fixtures pin today's
+  // headline strings, not the disposition-first reorder behind that flag. The
+  // mode pill it introduces is the only ask/build control a user can reach
+  // mid-turn, so the test that needs one opts in.
+  useFeatureFlagEnabled: (flag: string) =>
+    flag !== "copilot_ux_v1" || copilotUxV1Enabled.value,
 }));
 
 const saveData = {
@@ -188,6 +211,52 @@ async function renderChat(
   return view;
 }
 
+async function renderChatWithFlags(
+  booleanFlags: Record<string, boolean>,
+  defaultMode: string,
+) {
+  const view = render(
+    <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
+      <FeatureFlagValueContext.Provider value={() => defaultMode}>
+        <WorkflowCopilotChat />
+      </FeatureFlagValueContext.Provider>
+    </FeatureFlagContext.Provider>,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByPlaceholderText(/Message Skyvern Copilot|Ask Copilot/),
+    ).toBeTruthy(),
+  );
+  return view;
+}
+
+// Code-block mode is off in the bare harness (no flag provider), so the turns
+// it drives all carry code_block=null; this one opts into the code composer.
+function renderChatWithCodeMode() {
+  return renderChatWithFlags(
+    {
+      ENABLE_WORKFLOW_COPILOT_V2: true,
+      WORKFLOW_COPILOT_CODE_BLOCK_MODE: true,
+      CODE_BLOCK_ACCESS: true,
+    },
+    "build",
+  );
+}
+
+// The mode pill is the one ask/build control that stays mounted through an
+// in-flight turn. Code-block mode is off so switching mode moves only the mode.
+function renderChatWithModePill() {
+  copilotUxV1Enabled.value = true;
+  return renderChatWithFlags(
+    {
+      ENABLE_WORKFLOW_COPILOT_V2: true,
+      WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
+      CODE_BLOCK_ACCESS: false,
+    },
+    "build",
+  );
+}
+
 function textarea(): HTMLTextAreaElement {
   return screen.getByRole("textbox") as HTMLTextAreaElement;
 }
@@ -236,6 +305,7 @@ beforeEach(() => {
     generatingBlockLabel: null,
     cancelNonce: 0,
   });
+  copilotUxV1Enabled.value = false;
 });
 
 afterEach(() => {
@@ -953,6 +1023,378 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(screen.getAllByText("queued message")).toHaveLength(1);
     expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowCopilotChat — a repeat of the turn's own message is not re-run", () => {
+  it("drops a queued prompt identical to the one that opened the finished turn", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("build me a workflow");
+    expect(screen.getAllByText("build me a workflow")).toHaveLength(2);
+
+    await completeOldestStream("first done");
+    await act(async () => {});
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByText("build me a workflow")).toHaveLength(1);
+    expect(
+      screen.queryByText("Queued — sends when this turn finishes."),
+    ).toBeNull();
+  });
+
+  it("drains an identical queued prompt when the turn ends in a response-framed error", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse("Copilot hit an internal error."),
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "build",
+          designStarted: false,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "error",
+          terminalMessage: "Copilot hit an internal error.",
+          narrativeSummary: "Copilot hit an internal error.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      });
+      call.resolve();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("build me a workflow");
+  });
+
+  it("drains an identical queued prompt when the turn's tested run failed", async () => {
+    await renderChat();
+    await submit("run the workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("run the workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse("The run failed — here's a fix."),
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "build",
+          designStarted: false,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "response",
+          terminalMessage: "The run failed — here's a fix.",
+          narrativeSummary: "The run failed.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: null,
+          endedAt: null,
+          terminalEnvelope: {
+            run_verdict: "not_demonstrated",
+            run_display_reason: "The run did not reach the goal.",
+          },
+        },
+      });
+      call.resolve();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("run the workflow");
+  });
+
+  it("drains an identical queued prompt when a live browser session attached mid-turn", async () => {
+    const view = await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    view.rerender(<WorkflowCopilotChat liveBrowserSessionId="pbs_live_1" />);
+    await completeOldestStream("first done");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("build me a workflow");
+  });
+
+  it("drains an identical queued prompt when the turn comes back cancelled", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    await act(async () => {
+      call.onMessage({ ...terminalResponse("Stopped."), cancelled: true });
+      call.resolve();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("build me a workflow");
+  });
+
+  it("drains an identical queued prompt that carries dictation audio", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    speechState.takeAudioBlob.mockReturnValueOnce(new Blob(["dictation"]));
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("first done");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("build me a workflow");
+  });
+
+  it("drains an identical queued prompt when the turn itself opened on dictation audio", async () => {
+    await renderChat();
+    speechState.takeAudioBlob.mockReturnValueOnce(new Blob(["dictation"]));
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("first done");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]?.body.message).toBe("build me a workflow");
+  });
+
+  it("drains a queued repeat of the message a targeted block build opened on", async () => {
+    await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const blockBuildMessage = streamCalls[0]!.body.message;
+    expect(
+      (streamCalls[0]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBe("open_page");
+
+    await submit(blockBuildMessage);
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("block rebuilt");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toBe(blockBuildMessage);
+    expect(
+      (streamCalls[1]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+  });
+
+  it("drains an identical queued prompt when the composer left the code mode the turn opened in", async () => {
+    await renderChatWithCodeMode();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(
+      (streamCalls[0]!.body as unknown as { code_block: boolean | null })
+        .code_block,
+    ).toBe(false);
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // A block-level Generate behind a queued prompt disarms its own target but
+    // still flips the composer into code, so the queued send is a new shape.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("first done");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
+    expect(
+      (streamCalls[1]!.body as unknown as { code_block: boolean | null })
+        .code_block,
+    ).toBe(true);
+  });
+
+  it("drains an identical queued prompt when the composer left the mode the turn opened in", async () => {
+    await renderChatWithModePill();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(
+      (streamCalls[0]!.body as unknown as { mode: string | null }).mode,
+    ).toBe("build");
+
+    await submit("build me a workflow");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // Switch the composer to Ask while the turn runs: the queued repeat is now
+    // a question about the same words, not a re-run of the same request.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Ask"));
+    });
+
+    await completeOldestStream("first done");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toBe("build me a workflow");
+    expect(
+      (streamCalls[1]!.body as unknown as { mode: string | null }).mode,
+    ).toBe("ask");
+  });
+
+  it("drains an identical queued prompt when the turn opened as a fix", async () => {
+    await renderChat({
+      initialMessage: "fix the failing step",
+      initialMessageFixOrigin: true,
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(
+      (streamCalls[0]!.body as unknown as { fix_origin: boolean }).fix_origin,
+    ).toBe(true);
+
+    // The user retypes the same text; this one is a plain send, not a fix, so
+    // it is a different request even though the words match.
+    await submit("fix the failing step");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    await completeOldestStream("fix applied");
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toBe("fix the failing step");
+    expect(
+      (streamCalls[1]!.body as unknown as { fix_origin: boolean }).fix_origin,
+    ).toBe(false);
+  });
+
+  it("drains a queued block build that repeats the message of the turn in flight", async () => {
+    await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const blockBuildMessage = streamCalls[0]!.body.message;
+    await completeOldestStream("block rebuilt");
+
+    // The user re-sends the block build's own text by hand, so this turn is
+    // scoped to no block.
+    await submit(blockBuildMessage);
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(
+      (streamCalls[1]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+
+    // Generate on the same block again: nothing is queued yet, so the target
+    // stays armed while its message queues behind the in-flight turn.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      streamCalls[1]!.onMessage(terminalResponse("hand-typed done"));
+      streamCalls[1]!.resolve();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
+    expect(streamCalls[2]!.body.message).toBe(blockBuildMessage);
+    expect(
+      (streamCalls[2]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBe("open_page");
+  });
+
+  it("drains an identical queued prompt when a block build armed mid-send", async () => {
+    await renderChat();
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const blockBuildMessage = streamCalls[0]!.body.message;
+    await completeOldestStream("block rebuilt");
+
+    // Generate lands while the send is still awaiting its client, i.e. after
+    // the turn was stamped but before the request is built: this turn carries
+    // the block target, and its queued repeat does not.
+    vi.mocked(getSseClient).mockImplementationOnce(async () => {
+      await act(async () => {
+        useCopilotActionStore
+          .getState()
+          .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+      });
+      return { postStreaming } as unknown as Awaited<
+        ReturnType<typeof getSseClient>
+      >;
+    });
+    await submit(blockBuildMessage);
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(
+      (streamCalls[1]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBe("open_page");
+
+    await act(async () => {
+      streamCalls[1]!.onMessage(terminalResponse("block rebuilt again"));
+      streamCalls[1]!.resolve();
+    });
+
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
+    expect(streamCalls[2]!.body.message).toBe(blockBuildMessage);
+  });
+
+  it("drops a queued prompt that a replacement send rewrote into a repeat", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    await submit("something else entirely");
+    await submit("build me a workflow");
+
+    await completeOldestStream("first done");
+    await act(async () => {});
+
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("something else entirely")).toBeNull();
+    expect(screen.getAllByText("build me a workflow")).toHaveLength(1);
   });
 });
 

@@ -357,7 +357,12 @@ def run_server() -> None:
         access_log=False,
         log_config={"version": 1, "disable_existing_loggers": False},
         factory=True,
+        # uvloop can double-close a recycled fd after create_connection cancellation (MagicStack/uvloop#740).
+        loop="asyncio",
         ws="websockets-sansio",
+        # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=120.0,
     )
 
 
@@ -583,6 +588,8 @@ def run_dev() -> None:
             "--port",
             str(skyvern_settings.PORT),
             "--factory",
+            "--loop",
+            "asyncio",
             "--ws",
             "websockets-sansio",
         ],
@@ -658,8 +665,16 @@ def run_mcp(
         typer.Option("--scope", help="MCP tool scope: all (default), operate, build, browser, or lean."),
     ] = "all",
     host: Annotated[
-        str, typer.Option("--host", help="Host for HTTP transports.")
-    ] = _default_host(),  # sys.platform is constant; safe at import time
+        str,
+        typer.Option(
+            "--host",
+            help=(
+                "Host for HTTP transports. Defaults to loopback; pass 0.0.0.0 explicitly to listen on all "
+                "interfaces. Binding wider does not widen the browser Origin allowlist: requests from a browser "
+                "are limited to loopback and Claude origins, so a browser UI on another host is answered with 403."
+            ),
+        ),
+    ] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="Port for HTTP transports.")] = 8000,
     path: Annotated[str, typer.Option("--path", help="HTTP endpoint path for MCP transport.")] = "/mcp",
     stateless_http: Annotated[
@@ -684,7 +699,11 @@ def run_mcp(
         ),
     ] = False,
 ) -> None:
-    """Run the MCP server with configurable transport for local or remote hosting."""
+    """Run the MCP server with configurable transport for local or remote hosting.
+
+    Remote hosting serves non-browser clients. Browser callers stay restricted to the loopback and Claude
+    origins enforced by OriginValidationMiddleware, which takes no configuration on this path.
+    """
     global _mcp_eof_shutdown_requested, _mcp_shutdown_exit_code
     _mcp_eof_shutdown_requested = False
     _mcp_shutdown_exit_code = None
@@ -711,6 +730,7 @@ def run_mcp(
     )
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
     from skyvern.cli.mcp_tools.instructions import instructions_for_scope  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.origin_middleware import OriginValidationMiddleware  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
 
     mcp.instructions = instructions_for_scope(scope)
@@ -767,8 +787,12 @@ def run_mcp(
                 raise SystemExit(_mcp_shutdown_exit_code) from None
             return
 
+        # Origin validation must precede MCPAPIKeyMiddleware: a hostile page riding a
+        # valid API key is already past the gate if auth resolves first. The server card
+        # stays outermost so discovery remains public.
         middleware = [
             Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
+            Middleware(OriginValidationMiddleware),
             Middleware(MCPAPIKeyMiddleware),
         ]
         asyncio.run(

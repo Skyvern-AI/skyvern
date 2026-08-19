@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -212,3 +213,129 @@ async def test_a_run_state_is_not_the_viewers_to_release(monkeypatch: pytest.Mon
     await screencast.release_browser_state(SimpleNamespace(), "workflow_run", "wr_1")
 
     release.assert_not_awaited()
+
+
+class _FakeCdpSession:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+        self.sent: list[tuple[str, dict]] = []
+
+    def on(self, event: str, handler: object) -> None:
+        self.handlers[event] = handler
+
+    async def send(self, method: str, params: dict | None = None) -> dict:
+        self.sent.append((method, params or {}))
+        if method == "Page.captureScreenshot":
+            return {"data": "primed"}
+        return {}
+
+    async def detach(self) -> None:
+        return None
+
+
+class _FakePage:
+    def __init__(self, session: _FakeCdpSession) -> None:
+        self.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=session))
+        self.url = "https://example.test/"
+        self.viewport_size = {"width": 800, "height": 600}
+
+
+@pytest.mark.asyncio
+async def test_forwarded_frame_is_acked_and_records_forward_latency(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeCdpSession()
+    page = _FakePage(session)
+    monkeypatch.setattr(screencast, "_resolve_working_page", AsyncMock(return_value=page))
+    forward_hist, queue_hist, send_hist = Mock(), Mock(), Mock()
+    monkeypatch.setattr(screencast, "_frame_forward_seconds", forward_hist)
+    monkeypatch.setattr(screencast, "_frame_queue_seconds", queue_hist)
+    monkeypatch.setattr(screencast, "_frame_send_seconds", send_hist)
+
+    sent: list[dict] = []
+
+    async def _send_json(payload: dict) -> None:
+        sent.append(payload)
+        if len(sent) == 2:
+            raise RuntimeError("client gone")
+
+    websocket = SimpleNamespace(send_json=_send_json)
+
+    async def _never_finalized() -> bool:
+        return False
+
+    loop_task = asyncio.create_task(
+        screencast.start_screencast_loop(websocket, object(), "pbs_1", "browser_session", _never_finalized)
+    )
+    for _ in range(100):
+        if "Page.screencastFrame" in session.handlers:
+            break
+        await asyncio.sleep(0.01)
+    session.handlers["Page.screencastFrame"](
+        {"data": "AAAA", "sessionId": 7, "metadata": {"deviceWidth": 640, "deviceHeight": 480}}
+    )
+    await asyncio.wait_for(loop_task, timeout=5)
+
+    assert [m["screenshot"] for m in sent] == ["primed", "AAAA"]
+    assert sent[1]["viewport_width"] == 640 and sent[1]["viewport_height"] == 480
+    assert ("Page.screencastFrameAck", {"sessionId": 7}) in session.sent
+    assert queue_hist.record.call_count == 2
+    assert forward_hist.record.call_count == 1 and send_hist.record.call_count == 1
+    value, attributes = forward_hist.record.call_args.args
+    assert value >= 0 and attributes == {"entity_type": "browser_session"}
+
+
+@pytest.mark.asyncio
+async def test_evicted_frame_records_queue_dwell(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FakeCdpSession()
+    page = _FakePage(session)
+    monkeypatch.setattr(screencast, "_resolve_working_page", AsyncMock(return_value=page))
+    queue_hist, evicted = Mock(), Mock()
+    monkeypatch.setattr(screencast, "_frame_queue_seconds", queue_hist)
+    monkeypatch.setattr(screencast, "_frames_evicted", evicted)
+
+    first_send_started = asyncio.Event()
+    release_first_send = asyncio.Event()
+    sent: list[dict] = []
+
+    async def _send_json(payload: dict) -> None:
+        sent.append(payload)
+        if payload["screenshot"] == "primed":
+            first_send_started.set()
+            await release_first_send.wait()
+        elif payload["screenshot"] == "frame-3":
+            raise RuntimeError("client gone")
+
+    websocket = SimpleNamespace(send_json=_send_json)
+
+    async def _never_finalized() -> bool:
+        return False
+
+    loop_task = asyncio.create_task(
+        screencast.start_screencast_loop(websocket, object(), "pbs_1", "browser_session", _never_finalized)
+    )
+    for _ in range(100):
+        if "Page.screencastFrame" in session.handlers:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.wait_for(first_send_started.wait(), timeout=5)
+
+    try:
+        for data in ("frame-1", "frame-2", "frame-3"):
+            session.handlers["Page.screencastFrame"]({"data": data, "sessionId": 7, "metadata": {}})
+            await asyncio.sleep(0)
+
+        for _ in range(100):
+            if evicted.add.called:
+                break
+            await asyncio.sleep(0.01)
+
+        assert evicted.add.call_count == 1
+        # The forwarding loop has dequeued only the primed frame, so the second sample
+        # can only come from the oldest queued frame that was evicted.
+        assert queue_hist.record.call_count == 2
+        value, attributes = queue_hist.record.call_args.args
+        assert value >= 0 and attributes == {"entity_type": "browser_session"}
+    finally:
+        release_first_send.set()
+        await asyncio.wait_for(loop_task, timeout=5)
+
+    assert [payload["screenshot"] for payload in sent] == ["primed", "frame-2", "frame-3"]

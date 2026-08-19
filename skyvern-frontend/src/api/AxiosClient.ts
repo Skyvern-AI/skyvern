@@ -18,6 +18,8 @@ const pathname = url.pathname.replace("/api", "");
 const apiSansApiV1BaseUrl = `${url.origin}${pathname}`;
 
 const initialApiKey = getRuntimeApiKey();
+
+export const POSTHOG_ATTRIBUTION_HEADER = "X-PostHog-Attribution";
 const apiKeyHeader = initialApiKey ? { "X-API-Key": initialApiKey } : {};
 
 const client = axios.create({
@@ -264,6 +266,14 @@ function removeHeaderForAllClients(header: string) {
     delete instance.defaults.headers.common[header];
     delete (instance.defaults.headers as Record<string, unknown>)[header];
   });
+}
+
+export function setPostHogAttributionHeader(value: string | undefined) {
+  if (value) {
+    setHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER, value);
+  } else {
+    removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
+  }
 }
 
 export function setAuthorizationHeader(token: string) {

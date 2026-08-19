@@ -16,6 +16,7 @@ import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
+import type { WorkflowStartNodeData } from "../StartNode/types";
 
 const mocks = vi.hoisted(() => ({
   credentialDetail: {
@@ -27,11 +28,17 @@ const mocks = vi.hoisted(() => ({
   credentialDetailsById: new Map<string, CredentialApiResponse>(),
   searchValues: [] as Array<string | undefined>,
   useCredentialsQuery: vi.fn(),
+  nodes: [] as Array<{
+    id: string;
+    type: "start";
+    data: WorkflowStartNodeData;
+  }>,
+  updateNodeData: vi.fn(),
 }));
 
 vi.mock("@xyflow/react", () => ({
-  useNodes: () => [],
-  useReactFlow: () => ({ updateNodeData: vi.fn() }),
+  useNodes: () => mocks.nodes,
+  useReactFlow: () => ({ updateNodeData: mocks.updateNodeData }),
 }));
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: mocks.useCredentialsQuery,
@@ -87,6 +94,16 @@ beforeEach(() => {
   mocks.credentialDetail.isPending = false;
   mocks.credentialDetailsById.clear();
   mocks.searchValues.length = 0;
+  mocks.nodes = [];
+  mocks.updateNodeData.mockImplementation(
+    (nodeId: string, updates: Partial<WorkflowStartNodeData>) => {
+      mocks.nodes = mocks.nodes.map((node) =>
+        node.id === nodeId
+          ? { ...node, data: { ...node.data, ...updates } }
+          : node,
+      );
+    },
+  );
   useWorkflowParametersStore.setState({ parameters: [] });
 });
 
@@ -104,8 +121,47 @@ function credential(
   } as CredentialApiResponse;
 }
 
-function renderInCloud(children: ReactNode, fallbackRetryEnabled = true) {
-  return render(
+function startNode(
+  overrides: Partial<WorkflowStartNodeData>,
+): (typeof mocks.nodes)[number] {
+  return {
+    id: "start",
+    type: "start",
+    data: {
+      withWorkflowSettings: true,
+      webhookCallbackUrl: "",
+      proxyLocation: "RESIDENTIAL",
+      persistBrowserSession: false,
+      reuseBrowserSession: false,
+      pinSavedSessionIp: false,
+      browserProfileId: null,
+      browserProfileKey: null,
+      model: null,
+      maxScreenshotScrolls: null,
+      maxElapsedTimeMinutes: null,
+      extraHttpHeaders: null,
+      cdpConnectHeaders: null,
+      editable: true,
+      runWith: "agent",
+      codeVersion: null,
+      scriptCacheKey: null,
+      aiFallback: true,
+      enableSelfHealing: false,
+      maskSecrets: false,
+      runSequentially: true,
+      sequentialKey: null,
+      finallyBlockLabel: null,
+      workflowSystemPrompt: null,
+      errorCodeMapping: null,
+      label: "__start_block__",
+      showCode: false,
+      ...overrides,
+    },
+  };
+}
+
+function cloudTree(children: ReactNode, fallbackRetryEnabled = true) {
+  return (
     <CloudContext.Provider value={true}>
       <FeatureFlagContext.Provider
         value={(flag) =>
@@ -116,8 +172,12 @@ function renderInCloud(children: ReactNode, fallbackRetryEnabled = true) {
       >
         {children}
       </FeatureFlagContext.Provider>
-    </CloudContext.Provider>,
+    </CloudContext.Provider>
   );
+}
+
+function renderInCloud(children: ReactNode, fallbackRetryEnabled = true) {
+  return render(cloudTree(children, fallbackRetryEnabled));
 }
 
 describe("LoginBlockCredentialSelector", () => {
@@ -404,5 +464,77 @@ describe("LoginBlockCredentialSelector fallback picker", () => {
     await waitFor(() => {
       expect(document.body.style.pointerEvents).toBe("none");
     });
+  });
+});
+
+describe("LoginBlockCredentialSelector browser session reuse", () => {
+  beforeEach(() => {
+    mocks.useCredentialsQuery.mockReturnValue({
+      data: [
+        credential("cred_primary", "primary_credential"),
+        credential("cred_secondary", "secondary_credential"),
+      ],
+      isFetching: false,
+      isLoading: false,
+    });
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "credentials",
+          parameterType: "credential",
+          credentialId: "cred_primary",
+          credentialIds: ["cred_primary", "cred_secondary"],
+          selectionStrategy: "round_robin",
+        },
+      ],
+    });
+  });
+
+  it("applies enable state before disabling and keeps persistence sticky", () => {
+    mocks.nodes = [
+      startNode({
+        persistBrowserSession: false,
+        reuseBrowserSession: false,
+      }),
+    ];
+    const selector = (
+      <LoginBlockCredentialSelector nodeId="login-node" value="credentials" />
+    );
+    const view = renderInCloud(selector);
+    const getToggle = () => {
+      const label = screen.getByText("Reuse browser sessions");
+      const toggle = label.parentElement?.parentElement?.querySelector(
+        'button[role="switch"]',
+      );
+      expect(toggle).not.toBeNull();
+      return toggle!;
+    };
+
+    fireEvent.click(getToggle());
+
+    expect(mocks.updateNodeData).toHaveBeenLastCalledWith("start", {
+      reuseBrowserSession: true,
+      persistBrowserSession: true,
+    });
+    expect(mocks.nodes[0]?.data).toMatchObject({
+      reuseBrowserSession: true,
+      persistBrowserSession: true,
+    });
+
+    view.rerender(cloudTree(selector));
+    expect(getToggle().getAttribute("data-state")).toBe("checked");
+    fireEvent.click(getToggle());
+
+    expect(mocks.updateNodeData).toHaveBeenLastCalledWith("start", {
+      reuseBrowserSession: false,
+      persistBrowserSession: true,
+    });
+    expect(mocks.nodes[0]?.data).toMatchObject({
+      reuseBrowserSession: false,
+      persistBrowserSession: true,
+    });
+
+    view.rerender(cloudTree(selector));
+    expect(getToggle().getAttribute("data-state")).toBe("unchecked");
   });
 });

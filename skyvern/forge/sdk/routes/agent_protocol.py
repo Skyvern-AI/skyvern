@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 import time
 import unicodedata
@@ -15,6 +16,7 @@ from fastapi import (
     BackgroundTasks,
     Body,
     Depends,
+    Form,
     Header,
     HTTPException,
     Path,
@@ -135,7 +137,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
-from skyvern.forge.sdk.workflow.models.tags import TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
@@ -202,7 +204,14 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
     sanitize_workflow_yaml_with_references,
 )
-from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services import (
+    block_service,
+    run_service,
+    task_v1_service,
+    task_v2_service,
+    uploaded_file_service,
+    workflow_service,
+)
 from skyvern.services.pdf_import_service import pdf_import_service
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
@@ -237,6 +246,23 @@ async def _validate_enterprise_gated_task_run_features(
         ) from e
 
 
+def _schedule_task_run_created(
+    background_tasks: BackgroundTasks,
+    *,
+    organization_id: str,
+    run_id: str,
+    run_type: RunType,
+    caller_type: CallerType,
+) -> None:
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=organization_id,
+        run_id=run_id,
+        run_type=run_type,
+        caller_type=caller_type,
+    )
+
+
 class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
@@ -269,10 +295,11 @@ async def run_task(
     request: Request,
     background_tasks: BackgroundTasks,
     run_request: TaskRunRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    current_org = caller.organization
     if run_request.webhook_url:
         run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
@@ -405,6 +432,13 @@ async def run_task(
             run_type = RunType.yutori_navigator
         elif resolved_engine == RunEngine.skyvern_v3:
             run_type = RunType.task_v3
+        _schedule_task_run_created(
+            background_tasks,
+            organization_id=current_org.organization_id,
+            run_id=task_v1_response.task_id,
+            run_type=run_type,
+            caller_type=caller.caller_type,
+        )
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
@@ -486,6 +520,13 @@ async def run_task(
             task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
         )
         task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
+        _schedule_task_run_created(
+            background_tasks,
+            organization_id=current_org.organization_id,
+            run_id=task_v2.observer_cruise_id,
+            run_type=RunType.task_v2,
+            caller_type=caller.caller_type,
+        )
         return TaskRunResponse(
             run_id=task_v2.observer_cruise_id,
             run_type=RunType.task_v2,
@@ -527,6 +568,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         browser_session_id=workflow_run_request.browser_session_id,
         browser_profile_id=workflow_run_request.browser_profile_id,
         start_fresh_browser=workflow_run_request.start_fresh_browser,
+        reuse_browser_session=workflow_run_request.reuse_browser_session,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=workflow_run_request.max_elapsed_time_minutes,
         extra_http_headers=workflow_run_request.extra_http_headers,
@@ -613,6 +655,13 @@ async def run_workflow(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     if settings.OTEL_ENABLED:
         span = trace.get_current_span()
@@ -815,6 +864,30 @@ async def create_workflow_legacy(
         raise FailedToCreateWorkflow(str(e))
 
 
+IDEMPOTENCY_KEY_MAX_BYTES = 255
+IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+
+
+def validate_idempotency_key(
+    value: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", description=IDEMPOTENCY_KEY_CONTRACT),
+    ] = None,
+) -> str | None:
+    # Visible ASCII encodes one byte per character, so the character count is the byte count.
+    if value is None:
+        return None
+    if not 1 <= len(value) <= IDEMPOTENCY_KEY_MAX_BYTES or not all("\x21" <= char <= "\x7e" for char in value):
+        raise HTTPException(status_code=422, detail=IDEMPOTENCY_KEY_CONTRACT)
+    return value
+
+
+# The only way to read the header: a route cannot take the key without the bound check.
+# Depends() resolves only inside the request cycle — calling create_workflow directly in-process
+# bypasses this entirely. No such caller exists outside tests/; keep it that way.
+IdempotencyKey = Annotated[str | None, Depends(validate_idempotency_key)]
+
+
 @base_router.post(
     "/agents",
     response_model=Workflow,
@@ -848,7 +921,7 @@ async def create_workflow(
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: IdempotencyKey = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
     try:
@@ -867,7 +940,7 @@ async def create_workflow(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_definition.folder_id = folder_id
-        if idempotency_key is not None and idempotency_key.strip():
+        if idempotency_key is not None:
             digest = calculate_sha256(f"create_workflow\0{current_org.organization_id}\0{idempotency_key}")
             workflow_permanent_id = f"wpid_{digest}"
             try:
@@ -883,31 +956,14 @@ async def create_workflow(
                 current_org.organization_id,
                 workflow_definition,
             )
-            created_workflow: Workflow
-            async with app.DATABASE.workflows.acquire_workflow_creation_lock(workflow_permanent_id):
-                try:
-                    return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
-                        workflow_permanent_id=workflow_permanent_id,
-                        organization_id=current_org.organization_id,
-                        version=1,
-                        filter_deleted=False,
-                    )
-                except WorkflowNotFound:
-                    pass
-                created_workflow = await app.WORKFLOW_SERVICE.create_workflow_from_request(
-                    organization=current_org,
-                    request=workflow_definition,
-                    new_workflow_permanent_id=workflow_permanent_id,
-                    created_by=user_id,
-                    edited_by=user_id,
-                    notify_workflow_saved=False,
-                    resolved_title=resolved_title,
-                )
-            app.WORKFLOW_SERVICE.schedule_workflow_saved_hook(
-                organization_id=created_workflow.organization_id,
+            return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=current_org,
+                request=workflow_definition,
+                new_workflow_permanent_id=workflow_permanent_id,
+                created_by=user_id,
                 edited_by=user_id,
+                resolved_title=resolved_title,
             )
-            return created_workflow
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -3389,9 +3445,10 @@ async def run_block(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
-    """
-    Kick off the execution of one or more blocks in a workflow. Returns the
-    workflow_run_id.
+    """Run workflow-editor debugger blocks and return the workflow run ID.
+
+    This is intentionally UI-only: ``get_current_user_id`` preserves per-user
+    output continuity and maps the self-hosted UI's API key to its organization user.
     """
 
     # NOTE(jdo): if you're running debugger locally, and you want to see the
@@ -3416,7 +3473,7 @@ async def run_block(
             trigger_type=block_trigger_type,
         )
 
-        browser_session_id = block_run_request.browser_session_id
+        browser_session_id = workflow_run.browser_session_id
 
         await block_service.execute_blocks(
             request=request,
@@ -3453,6 +3510,7 @@ async def run_block(
         run_request=block_run_request,
         downloaded_files=None,
         recording_url=None,
+        browser_session_id=workflow_run.browser_session_id,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
     )
 
@@ -3576,11 +3634,12 @@ async def run_task_v1(
     request: Request,
     background_tasks: BackgroundTasks,
     task: TaskRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
+    current_org = caller.organization
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
@@ -3601,6 +3660,13 @@ async def run_task_v1(
         )
     except task_v1_service.InvalidTaskV1ModelError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    _schedule_task_run_created(
+        background_tasks,
+        organization_id=current_org.organization_id,
+        run_id=created_task.task_id,
+        run_type=RunType.task_v1,
+        caller_type=caller.caller_type,
+    )
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
@@ -3867,6 +3933,13 @@ async def retry_workflow_run(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     if settings.OTEL_ENABLED:
         span = trace.get_current_span()
@@ -4424,6 +4497,13 @@ async def run_workflow_legacy(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -5515,15 +5595,75 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
+    retention_days: Annotated[
+        int | None,
+        Form(
+            description=(
+                "Number of days to keep the file before it is deleted automatically. "
+                "Omit to keep the file until the organization's data retention policy removes it."
+            ),
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> UploadFileResponse:
+    # Validated before the upload so a rejected retention period never leaves bytes behind.
+    try:
+        uploaded_file_service.resolve_expires_at(retention_days)
+    except uploaded_file_service.InvalidRetentionPeriod as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    file_id = uploaded_file_service.generate_upload_id()
+    # The id is embedded in the stored filename (not the record) so two uploads of the same
+    # original filename on the same day get distinct storage keys instead of overwriting
+    # each other's object; record_upload still stores the caller's original filename.
+    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
     uris = await app.STORAGE.save_legacy_file(
-        organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
+        organization_id=current_org.organization_id, filename=storage_filename, fileObj=file.file
     )
     if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
     presigned_url, uploaded_s3_uri = uris
-    return UploadFileResponse(s3_uri=uploaded_s3_uri, presigned_url=presigned_url)
+    uploaded_file = await uploaded_file_service.record_upload(
+        file_id=file_id,
+        organization_id=current_org.organization_id,
+        storage_uri=uploaded_s3_uri,
+        filename=file.filename or "",
+        size_bytes=file.size,
+        retention_days=retention_days,
+    )
+    return UploadFileResponse(
+        s3_uri=uploaded_s3_uri,
+        presigned_url=presigned_url,
+        file_id=uploaded_file.file_id,
+        expires_at=uploaded_file.expires_at,
+    )
+
+
+@base_router.delete(
+    "/files/{file_id}",
+    tags=["Files"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "delete_file",
+    },
+    status_code=204,
+)
+@base_router.delete("/files/{file_id}/", include_in_schema=False)
+async def delete_file(
+    file_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    """Delete a previously uploaded file.
+
+    A file that does not exist, was already deleted, or belongs to another organization all
+    answer 404 alike — the endpoint must not tell a caller whether someone else's file id
+    exists.
+    """
+    deleted = await uploaded_file_service.delete_uploaded_file(
+        file_id=file_id, organization_id=current_org.organization_id
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+    return Response(status_code=204)
 
 
 @legacy_v2_router.post(
@@ -5541,11 +5681,13 @@ async def run_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
     data: TaskV2Request,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
+    organization = caller.organization
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
             "Overriding max steps for task v2",
@@ -5597,6 +5739,13 @@ async def run_task_v2(
         max_steps_override=x_max_steps_override,
         max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
+    )
+    _schedule_task_run_created(
+        background_tasks,
+        organization_id=organization.organization_id,
+        run_id=task_v2.observer_cruise_id,
+        run_type=RunType.task_v2,
+        caller_type=caller.caller_type,
     )
     return task_v2.model_dump(by_alias=True)
 

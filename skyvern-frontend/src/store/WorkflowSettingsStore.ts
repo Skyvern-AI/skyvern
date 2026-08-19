@@ -9,6 +9,7 @@ export interface WorkflowSettingsState {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
   browserProfileKey: string | null;
   model: WorkflowModel | null;
@@ -26,6 +27,22 @@ export interface WorkflowSettingsState {
   resetWorkflowSettings: () => void;
 }
 
+export type WorkflowBrowserSessionReuseUpdate = Pick<
+  WorkflowSettingsState,
+  "persistBrowserSession" | "reuseBrowserSession"
+>;
+
+export function updateWorkflowBrowserSessionReuse(
+  enabled: boolean,
+  persistBrowserSession: boolean,
+  updateSettings: (settings: WorkflowBrowserSessionReuseUpdate) => void,
+): void {
+  updateSettings({
+    reuseBrowserSession: enabled,
+    persistBrowserSession: enabled || persistBrowserSession,
+  });
+}
+
 const defaultState: Omit<
   WorkflowSettingsState,
   "setWorkflowSettings" | "resetWorkflowSettings"
@@ -33,6 +50,7 @@ const defaultState: Omit<
   webhookCallbackUrl: "",
   proxyLocation: ProxyLocation.Residential,
   persistBrowserSession: false,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileKey: null,
   model: null,

@@ -2,6 +2,7 @@ import datetime
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
@@ -65,3 +66,32 @@ async def test_update_artifact_uri_returns_none_for_other_organization(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_artifacts_by_ids_scopes_to_organization(
+    repo: ArtifactsRepository,
+    recording_artifact: str,
+    sqlite_engine: AsyncEngine,
+) -> None:
+    created_at = datetime.datetime(2026, 8, 1, 12, 0, 0)
+    async with sqlite_engine.begin() as conn:
+        await conn.execute(
+            ArtifactModel.__table__.insert().values(
+                artifact_id="a_other_org",
+                organization_id="o_other",
+                artifact_type="recording",
+                uri="s3://bucket/other.webm",
+                created_at=created_at,
+                modified_at=created_at,
+            )
+        )
+
+    await repo.delete_artifacts_by_ids(
+        organization_id="o_test",
+        artifact_ids=[recording_artifact, "a_other_org"],
+    )
+
+    async with sqlite_engine.connect() as conn:
+        remaining_ids = set((await conn.scalars(select(ArtifactModel.artifact_id))).all())
+    assert remaining_ids == {"a_other_org"}

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from dataclasses import field as dataclass_field
+from typing import TYPE_CHECKING, Any
 
 import structlog
-import tldextract
 
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
@@ -15,6 +16,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, url_parts
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     admit_credential_for_live_page,
@@ -31,6 +33,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
+from skyvern.forge.sdk.credential_site_policy import same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialType,
@@ -39,13 +42,21 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
 )
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from .banned_blocks import _copilot_block_authoring_policy
 from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
-from .mcp_hooks import _verify_scout_type_landed
+from .mcp_hooks import (
+    _TYPE_READBACK_SETTLE_SECONDS,
+    ScoutTypeVerdict,
+    _scout_type_landing_failure,
+    _scout_type_verdict,
+    _significant_character_count,
+)
 from .scouting import (
     _attach_scout_observation_step,
+    _attach_scout_page_summary,
     _capture_element_fingerprint,
     _capture_enclosing_form_submits,
     _capture_post_interaction_screenshot,
@@ -62,10 +73,15 @@ from .scouting import (
     _selector_live_match_count,
 )
 
+if TYPE_CHECKING:
+    from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+
 LOG = structlog.get_logger()
 
 _CREDENTIAL_FILL_FIELDS = CREDENTIAL_FILL_FIELDS
 _CREDENTIAL_FILL_TIMEOUT_MS = 15000
+_CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS = 3.0
+_CREDENTIAL_SUBMIT_TIMEOUT_MS = 5000
 
 
 @dataclass(frozen=True)
@@ -127,34 +143,8 @@ def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
     return bool(current_origin and admitted_origin and current_origin == admitted_origin)
 
 
-# Private PSL entries are included so hosts that hand strangers a subdomain each -- github.io,
-# vercel.app, s3.amazonaws.com -- stay separate sites rather than collapsing into one.
-_SITE_EXTRACT = tldextract.TLDExtract(include_psl_private_domains=True)
-
-
-def _site_of(url: str | None) -> tuple[str, int | None, str] | None:
-    """A URL's site: scheme and port alongside its domain under the public suffix.
-
-    Scheme and port ride along so a site-wide grant moves between a site's hosts without also
-    reaching it over plaintext or on another port, which the origin comparison would refuse.
-    """
-    parts = url_parts(url or "")
-    origin = canonicalize_origin(parts[2]) if parts else None
-    if origin is None:
-        return None
-    extracted = _SITE_EXTRACT(origin.host)
-    # tldextract renamed this property; read the new name where the installed version has it.
-    site = (
-        extracted.top_domain_under_public_suffix
-        if hasattr(extracted, "top_domain_under_public_suffix")
-        else extracted.registered_domain
-    )
-    return (origin.scheme, origin.port, site) if site else None
-
-
-def _same_site(current_url: str | None, granted_url: str) -> bool:
-    current, granted = _site_of(current_url), _site_of(granted_url)
-    return bool(current and granted and current == granted)
+# One site policy, shared with code-block credential release.
+_same_site = same_site
 
 
 def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) -> bool:
@@ -171,6 +161,56 @@ def _credential_fill_origin_mismatch_error() -> str:
     return (
         "The browser left this credential's intended login origin before it could be filled. "
         "Re-inspect the current page and fill again if the sign-in is still in progress there."
+    )
+
+
+def _credential_submit_origin_mismatch_notice() -> str:
+    return (
+        "The field was filled, but the browser left this credential's login origin before the submit "
+        "control could be clicked, so it was not clicked. The form may already have been submitted — "
+        "inspect the current page before filling this field again."
+    )
+
+
+def _credential_submit_target_gone_notice() -> str:
+    return (
+        "The field was filled, but the submit control was no longer on the page, so it was not clicked. "
+        "A form that submits itself once the code is complete may already have been submitted, though a "
+        "re-render or an error state can also remove the control — inspect the current page before "
+        "filling this field again."
+    )
+
+
+def _credential_submit_already_committed_notice() -> str:
+    return (
+        "The field was filled and the page moved on before the submit control could be clicked, so it "
+        "was not clicked: the form submitted itself. Inspect the current page to see where the sign-in "
+        "got to rather than filling this field again."
+    )
+
+
+def _credential_submit_ambiguous_notice(selector: str, match_count: int) -> str:
+    return (
+        f"The field was filled, but the submit selector {selector} matches {match_count} controls, so "
+        "nothing was clicked rather than guessing between them — on a one-time-code form the wrong one "
+        "can resend the code and void the one just typed. Fill again with a selector that matches only "
+        "the submit control."
+    )
+
+
+def _credential_submit_selector_never_matched_notice(selector: str) -> str:
+    return (
+        f"The field was filled, but the submit selector {selector} matched nothing on this page either "
+        "before or after the fill, so nothing was clicked and the form was not submitted. Inspect the "
+        "page for the real submit control; a one-time code is still waiting to be submitted."
+    )
+
+
+def _credential_submit_page_unreadable_notice() -> str:
+    return (
+        "The field was filled, but the page could not be read to confirm the browser was still on this "
+        "credential's login origin, so the submit control was not clicked. Inspect the current page; a "
+        "one-time code is still waiting to be submitted."
     )
 
 
@@ -453,18 +493,182 @@ async def _resolve_credential_fill_value(
     return value, credential_item.name, None
 
 
+async def _read_filled_field_value(page: SkyvernBrowserPage, selector: str) -> str | None:
+    """Read a field back on the same page handle that filled it.
+
+    The tool-layer read path replaces registered secrets with a placeholder, so a credential
+    readback taken through it describes the scrubber rather than the field.
+    """
+
+    async def read() -> str | None:
+        try:
+            # `.first` mirrors how the direct fill narrowed the selector. Reading the un-narrowed
+            # locator would raise Playwright strict mode whenever the selector matches more than
+            # one input — disabling the check in the very case the mismatch verdict exists to catch.
+            # The fill just resolved this locator, so a read that does not return promptly means
+            # the page moved on — an auto-submitting 2FA form does exactly that, and waiting out a
+            # navigation here would only age the code.
+            value = await asyncio.wait_for(
+                page.locator(selector).first.input_value(), timeout=_CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS
+            )
+        except Exception:
+            LOG.debug("credential fill readback failed; leaving the value unread")
+            return None
+        return value if isinstance(value, str) else None
+
+    value = await read()
+    if value is not None and value.strip() == "":
+        # A controlled/React input can mirror its value asynchronously, so a first read may be
+        # transiently empty; settle briefly and re-read once before declaring the fill lost.
+        await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
+        value = await read()
+    return value
+
+
+@dataclass(frozen=True)
+class _ScoutTargetProbe:
+    """A target's factual identity, read before the secret-bearing action reaches the page."""
+
+    selector: str
+    selector_candidates: list[ScoutedSelectorCandidate]
+    selector_match_count: int | None = None
+    role: str = ""
+    accessible_name: str = ""
+    role_name_match_count: int | None = None
+    fingerprint: dict[str, str] = dataclass_field(default_factory=dict)
+
+
+async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, fingerprint: bool) -> _ScoutTargetProbe:
+    await _capture_scout_selector_candidates(copilot_ctx, selector)
+    captured_selector_candidates = copilot_ctx.pending_scout_selector_candidates
+    copilot_ctx.pending_scout_selector_candidates = None
+    selector_candidates: list[ScoutedSelectorCandidate] = [{"selector": selector, "source": "requested"}]
+    for candidate in captured_selector_candidates or []:
+        if candidate not in selector_candidates:
+            selector_candidates.append(candidate)
+    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
+    return _ScoutTargetProbe(
+        selector=selector,
+        selector_candidates=selector_candidates,
+        selector_match_count=await _selector_live_match_count(copilot_ctx, selector),
+        role=role,
+        accessible_name=accessible_name,
+        role_name_match_count=(
+            await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
+        ),
+        fingerprint=await _capture_element_fingerprint(copilot_ctx, selector) if fingerprint else {},
+    )
+
+
+@dataclass(frozen=True)
+class _CredentialSubmitOutcome:
+    clicked: bool
+    result_url: str = ""
+    mint_to_submit_ms: int | None = None
+    skipped: str | None = None
+    error: str | None = None
+    live_match_count: int | None = None
+
+
+async def _submit_after_credential_fill(
+    copilot_ctx: AgentContext,
+    *,
+    probe: _ScoutTargetProbe,
+    grant: _CredentialFillOriginGrant,
+    source_url: str,
+    mint_started: float,
+    secret_value: str,
+) -> _CredentialSubmitOutcome:
+    """Click the submit control the fill was aimed at, without ever costing the fill itself."""
+    if not _within_grant(source_url, grant):
+        # An unreadable page is not a page that moved; both fail closed, but only one of them knows
+        # where the browser went, and the model acts on what this says.
+        notice = (
+            _credential_submit_origin_mismatch_notice() if source_url else _credential_submit_page_unreadable_notice()
+        )
+        return _CredentialSubmitOutcome(clicked=False, skipped=notice)
+    # A form that submits itself on the last digit takes its own submit control off the page. Clicking
+    # anyway spends the full click timeout and reports a failure for a login that already succeeded.
+    # None is an unreadable page, not an absent control: skipping on it would strand a fresh code.
+    live_match_count = await _selector_live_match_count(copilot_ctx, probe.selector)
+    # Whichever read actually saw the page decides. An unreadable count at dispatch does not unsee
+    # what the probe counted before the fill, and neither read being able to see is not a verdict.
+    known_match_count = live_match_count if live_match_count is not None else probe.selector_match_count
+    if known_match_count == 0:
+        # A control that was never there is a wrong selector, not a form that submitted itself. Both
+        # skip the click, but telling the model the login went through when it did not strands the code.
+        gone = (
+            _credential_submit_selector_never_matched_notice(probe.selector)
+            if probe.selector_match_count == 0
+            else _credential_submit_target_gone_notice()
+        )
+        return _CredentialSubmitOutcome(clicked=False, skipped=gone, live_match_count=live_match_count)
+    # A direct click resolves to `.first`, so an ambiguous selector picks by document order. On a
+    # one-time-code form the neighbour is often "Resend code", which would void the code just typed.
+    if known_match_count is not None and known_match_count > 1:
+        return _CredentialSubmitOutcome(
+            clicked=False,
+            skipped=_credential_submit_ambiguous_notice(probe.selector, known_match_count),
+            live_match_count=live_match_count,
+        )
+    engine_selection = None
+    error_text: str | None = None
+    clicked = False
+    try:
+        async with mcp_browser_context(copilot_ctx):
+            page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
+            engine_selection = page.engine_selection
+            try:
+                await page.click(probe.selector, mode="direct", timeout=_CREDENTIAL_SUBMIT_TIMEOUT_MS)
+                clicked = True
+            except Exception as exc:
+                # A submit that navigates away leaves the post-click auto-wait timing out after the
+                # click was already dispatched; the form was submitted, so this is not a failure.
+                if is_post_dispatch_click_timeout(exc, engine_selection):
+                    clicked = True
+                else:
+                    error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), secret_value))
+    except Exception as exc:
+        # Raised entering or leaving the browser context rather than by the click. Reporting a failure
+        # for a click that already went out invites the model to submit the form a second time.
+        if not clicked:
+            error_text = scrub_secrets_from_text(copilot_ctx, _scrub_secret_from_text(str(exc), secret_value))
+    if not clicked:
+        LOG.info(
+            "copilot fill_credential_field submit click failed",
+            selector=probe.selector,
+        )
+        return _CredentialSubmitOutcome(
+            clicked=False,
+            error=(
+                f"{error_text or 'The submit control could not be clicked.'} Whether the click reached "
+                "the page before this failed is not known, so the form may already have been submitted. "
+                "Inspect the current page before submitting again — a second attempt spends another code."
+            ),
+            live_match_count=live_match_count,
+        )
+    mint_to_submit_ms = int((time.monotonic() - mint_started) * 1000)
+    return _CredentialSubmitOutcome(
+        clicked=True,
+        result_url=await _live_working_page_url(copilot_ctx) or "",
+        mint_to_submit_ms=mint_to_submit_ms,
+        live_match_count=live_match_count,
+    )
+
+
 async def _fill_credential_field_impl(
     copilot_ctx: AgentContext,
     selector: str,
     credential_id: str,
     field: str,
+    submit_selector: str | None = None,
 ) -> dict[str, Any]:
     lock = getattr(copilot_ctx, "credential_fill_lock", None)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         copilot_ctx.credential_fill_lock = lock
     async with lock:
-        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field)
+        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field, submit_selector)
 
 
 async def _fill_credential_field_impl_serial(
@@ -472,8 +676,11 @@ async def _fill_credential_field_impl_serial(
     selector: str,
     credential_id: str,
     field: str,
+    submit_selector: str | None = None,
 ) -> dict[str, Any]:
-    arguments = {"selector": selector, "credential_id": credential_id, "field": field}
+    arguments: dict[str, Any] = {"selector": selector, "credential_id": credential_id, "field": field}
+    if submit_selector:
+        arguments["submit_selector"] = submit_selector
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
         record_tool_step_result_for_ctx(copilot_ctx, "fill_credential_field", arguments, result)
@@ -484,6 +691,7 @@ async def _fill_credential_field_impl_serial(
         return finish({"ok": False, "error": authority_error})
 
     selector = (selector or "").strip()
+    submit_selector = (submit_selector or "").strip()
     field = (field or "").strip().lower()
     credential_id = (credential_id or "").strip()
     if not selector:
@@ -500,7 +708,25 @@ async def _fill_credential_field_impl_serial(
         )
         return finish({"ok": False, "error": policy_error or _missing_credential_origin_error(credential_id, None)})
 
+    session_error = await ensure_browser_session(copilot_ctx)
+    if session_error:
+        return finish(session_error)
+    await _capture_scout_source_url(copilot_ctx)
+    # Capture each target's factual identity before the secret-bearing action; a fill can change
+    # attributes, trigger framework replacement, or navigate, so a later read describes a different
+    # element. These facts never include the credential value.
+    fill_probe = await _probe_scout_target(copilot_ctx, selector, fingerprint=True)
+    submit_probe = (
+        await _probe_scout_target(copilot_ctx, submit_selector, fingerprint=False) if submit_selector else None
+    )
+    fingerprint = fill_probe.fingerprint
+
     value, credential_name, resolve_error = await _resolve_credential_fill_value(copilot_ctx, credential_id, field)
+    # Started here rather than before the resolver, whose credential read and enterprise-secret
+    # normalization precede the generation and would be counted as code age they are not. Nothing
+    # between the generation and this line touches the network. From here only the fill's own readback
+    # and the reads the submit needs to re-check its origin and target may sit before the click.
+    mint_started = time.monotonic()
     if resolve_error or value is None:
         error_result: dict[str, Any] = {
             "ok": False,
@@ -513,27 +739,6 @@ async def _fill_credential_field_impl_serial(
                 "credential_field": field,
             }
         return finish(error_result)
-
-    session_error = await ensure_browser_session(copilot_ctx)
-    if session_error:
-        return finish(session_error)
-    await _capture_scout_source_url(copilot_ctx)
-    # Capture the target's factual identity before the secret-bearing action. A fill can change
-    # attributes, trigger framework replacement, or navigate; post-fill inspection would then
-    # describe a different element. These facts never include the credential value.
-    await _capture_scout_selector_candidates(copilot_ctx, selector)
-    captured_selector_candidates = getattr(copilot_ctx, "pending_scout_selector_candidates", None)
-    copilot_ctx.pending_scout_selector_candidates = None
-    selector_candidates: list[ScoutedSelectorCandidate] = [{"selector": selector, "source": "requested"}]
-    for candidate in captured_selector_candidates or []:
-        if candidate not in selector_candidates:
-            selector_candidates.append(candidate)
-    role, accessible_name = await _resolve_scout_role_name(copilot_ctx, selector)
-    selector_match_count = await _selector_live_match_count(copilot_ctx, selector)
-    role_name_match_count = (
-        await _role_name_match_count(copilot_ctx, role, accessible_name) if role and accessible_name else None
-    )
-    fingerprint = await _capture_element_fingerprint(copilot_ctx, selector)
     try:
         async with mcp_browser_context(copilot_ctx):
             page, _ = await get_page(session_id=copilot_ctx.browser_session_id)
@@ -544,6 +749,9 @@ async def _fill_credential_field_impl_serial(
                 timeout=_CREDENTIAL_FILL_TIMEOUT_MS,
                 _direct_fill_release_guard=_credential_fill_release_guard(origin_grant),
             )
+            readback = await _read_filled_field_value(page, selector)
+            fill_verdict = _scout_type_verdict(readback, len(value))
+            readback_significant_count = _significant_character_count(readback) if readback is not None else 0
     except _CredentialFillOriginMismatchError:
         return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
     except Exception as exc:
@@ -568,30 +776,74 @@ async def _fill_credential_field_impl_serial(
 
     _clear_pending_browser_interaction_observation(copilot_ctx)
     source_url = _consume_scout_source_url(copilot_ctx)
-    landing_failure = await _verify_scout_type_landed(copilot_ctx, selector=selector, typed_length=len(value))
+    landing_failure = _scout_type_landing_failure(
+        fill_verdict,
+        tool_name="fill_credential_field",
+        selector=selector,
+        typed_length=len(value),
+        significant_count=readback_significant_count,
+    )
+    landing_inferred_from_navigation = False
+    if landing_failure is not None and fill_verdict is ScoutTypeVerdict.EMPTY:
+        # A form that commits on the last character clears its own field and moves on, so the field
+        # reads empty because the fill worked, not because it was lost. Only the page having left the
+        # one the fill acted on distinguishes the two, and it is read here rather than up front
+        # because every other path reaches this point having already landed.
+        landed_url = await _live_working_page_url(copilot_ctx) or ""
+        # Compared at origin+path, not as raw strings: a rejected code re-renders the same page at
+        # ?error=..., and reading that as a navigation would report a fill nobody saw land.
+        landed_parts = url_parts(landed_url) if landed_url else None
+        source_parts = url_parts(source_url) if source_url else None
+        landed_page = landed_parts[1] if landed_parts else None
+        source_page = source_parts[1] if source_parts else None
+        if landed_page and source_page and landed_page != source_page:
+            LOG.info(
+                "copilot fill_credential_field field cleared by a navigation, treating the fill as landed",
+                selector=selector,
+                credential_id=credential_id,
+                field=field,
+            )
+            landing_failure = None
+            fill_verdict = ScoutTypeVerdict.UNKNOWN
+            landing_inferred_from_navigation = True
     if landing_failure is not None:
         LOG.info(
             "copilot fill_credential_field did not land",
             selector=selector,
             credential_id=credential_id,
             field=field,
+            verdict=fill_verdict.value,
         )
         return finish(landing_failure)
+    if fill_verdict is ScoutTypeVerdict.UNKNOWN:
+        # The fill is recorded as landed either way; without this the unread case is
+        # indistinguishable in the logs from a readback that confirmed the value.
+        LOG.info(
+            "copilot fill_credential_field landing unverified",
+            selector=selector,
+            credential_id=credential_id,
+            field=field,
+        )
     url = await _live_working_page_url(copilot_ctx) or ""
-    _mark_pending_browser_interaction_observation(copilot_ctx, tool_name="fill_credential_field", url=url)
     _record_scouted_interaction(
         copilot_ctx,
         tool_name="fill_credential_field",
         selector=selector,
-        selector_candidates=selector_candidates,
-        selector_match_count=selector_match_count,
+        selector_candidates=fill_probe.selector_candidates,
+        selector_match_count=fill_probe.selector_match_count,
         source_url=source_url,
         result_url=url,
-        observed_effects={"value_landed": True},
+        observed_effects=(
+            # The field read back empty and only the page having moved says the fill landed, so the
+            # landing is carried as the inference it is rather than as something read off the field.
+            {"value_landed": True, "landing_inferred_from_navigation": True}
+            if landing_inferred_from_navigation
+            else {"value_landed": True}
+        ),
         typed_length=len(value),
-        role=role,
-        accessible_name=accessible_name,
-        role_name_match_count=role_name_match_count,
+        role=fill_probe.role,
+        accessible_name=fill_probe.accessible_name,
+        role_name_match_count=fill_probe.role_name_match_count,
         credential_id=credential_id,
         credential_field=field,
         credential_name=credential_name,
@@ -610,15 +862,6 @@ async def _fill_credential_field_impl_serial(
             selector=selector,
             fingerprint_keys=list(fingerprint.keys()),
         )
-    observation_step, _ = await _register_scout_interaction_observation(
-        copilot_ctx, tool_name="fill_credential_field", selector=selector, source_url=source_url, url=url
-    )
-    _attach_scout_observation_step(
-        copilot_ctx,
-        tool_name="fill_credential_field",
-        selector=selector,
-        observation_step=observation_step,
-    )
     data: dict[str, Any] = {
         "selector": selector,
         "credential_id": credential_id,
@@ -626,17 +869,102 @@ async def _fill_credential_field_impl_serial(
         "typed_length": len(value),
         "url": url,
         "credential_name": credential_name,
+        # Stated rather than left to be read off which other keys are present: whether the form went
+        # in is the one thing here the model must not have to infer.
+        "submitted": False,
     }
-    if observation_step is not None:
-        data["observation_step"] = observation_step
-    form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
-    if form_submits:
-        data["form_submit_controls"] = form_submits
-    await _capture_post_interaction_screenshot(copilot_ctx)
+    submit: _CredentialSubmitOutcome | None = None
+    if submit_probe is not None and landing_inferred_from_navigation:
+        # The page moved on under the fill, which is the form having committed itself. The probed
+        # control belongs to the page that is gone, so clicking now would act on a different one.
+        data["submit_skipped"] = _credential_submit_already_committed_notice()
+    elif submit_probe is not None:
+        submit = await _submit_after_credential_fill(
+            copilot_ctx,
+            probe=submit_probe,
+            grant=origin_grant,
+            source_url=url,
+            mint_started=mint_started,
+            secret_value=value,
+        )
+        if submit.clicked:
+            data["submitted"] = True
+            data["submit_selector"] = submit_probe.selector
+            # The fill can render a second matching control, so the count at dispatch is what the
+            # click actually faced; the pre-fill count is only a fallback when that read failed. No
+            # `ambiguous` flag rides along because a click only happens once both reads agree the
+            # selector is singular — an ambiguous one is declined rather than clicked and re-anchored.
+            _record_scouted_interaction(
+                copilot_ctx,
+                tool_name="click",
+                selector=submit_probe.selector,
+                selector_candidates=submit_probe.selector_candidates,
+                selector_match_count=(
+                    submit.live_match_count
+                    if submit.live_match_count is not None
+                    else submit_probe.selector_match_count
+                ),
+                source_url=url,
+                result_url=submit.result_url,
+                role=submit_probe.role,
+                accessible_name=submit_probe.accessible_name,
+                role_name_match_count=submit_probe.role_name_match_count,
+            )
+        elif submit.skipped is not None:
+            data["submit_skipped"] = submit.skipped
+        elif submit.error is not None:
+            data["submit_error"] = submit.error
+            # `submitted: false` on its own reads as "nothing went out, retry freely". A click that
+            # raised may still have reached the page, and a blind retry spends a second code.
+            data["submit_uncertain"] = True
+
+    submitted = submit is not None and submit.clicked
+    observed_tool = "click" if submitted else "fill_credential_field"
+    observed_selector = submit_probe.selector if submitted and submit_probe is not None else selector
+    observed_source_url = url if submitted else source_url
+    observed_url = submit.result_url if submitted and submit is not None else url
+    if submitted:
+        # Enforcement lets a filled one-time code supersede an earlier challenge only on a packet
+        # naming this tool. Submitting on a later turn left one behind; submitting here must too, or
+        # the challenge this fill just answered still halts the turn. It mints no page evidence.
+        await _register_scout_interaction_observation(
+            copilot_ctx,
+            tool_name="fill_credential_field",
+            selector=selector,
+            source_url=source_url,
+            url=url,
+        )
+    _mark_pending_browser_interaction_observation(copilot_ctx, tool_name=observed_tool, url=observed_url)
+    # An act-observe that cannot reach the discovery server leaves the previous click's outcome in
+    # place, which would be stamped onto this submit's evidence as though it described this page.
+    copilot_ctx.last_scout_act_observe_outcome = None
+    copilot_ctx.last_scout_act_observe_packet = None
+    observation_step, page_evidence = await _register_scout_interaction_observation(
+        copilot_ctx,
+        tool_name=observed_tool,
+        selector=observed_selector,
+        source_url=observed_source_url,
+        url=observed_url,
+    )
+    _attach_scout_observation_step(
+        copilot_ctx,
+        tool_name=observed_tool,
+        selector=observed_selector,
+        observation_step=observation_step,
+    )
     result: dict[str, Any] = {"ok": True, "data": data}
     if observation_step is not None:
         result["observation_step"] = observation_step
         data["observation_step"] = observation_step
+    if submitted:
+        data["submit_url"] = safe_page_origin(observed_url) or ""
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
+    else:
+        form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
+        if form_submits:
+            data["form_submit_controls"] = form_submits
+    await _capture_post_interaction_screenshot(copilot_ctx)
     LOG.info(
         "copilot fill_credential_field filled a saved credential field",
         selector=selector,
@@ -644,5 +972,7 @@ async def _fill_credential_field_impl_serial(
         field=field,
         typed_length=len(value),
         url=url or None,
+        submit_selector=submit_probe.selector if submit_probe is not None else None,
+        totp_mint_to_submit_ms=submit.mint_to_submit_ms if submit is not None else None,
     )
     return finish(result)

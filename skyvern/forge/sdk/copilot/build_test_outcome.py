@@ -22,7 +22,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     only_degraded_blocking,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import workflow_target_url
+from skyvern.forge.sdk.copilot.composition_evidence import page_evidence_source_matches_run, workflow_target_url
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identities_in_text, selector_identity_from_failure
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
@@ -50,6 +50,7 @@ BuildTestOutcomeReasonCode = Literal[
     "outcome_not_demonstrated",
     "no_meaningful_output",
     "terminal_challenge_blocker",
+    "device_approval_challenge_blocker",
     "blocker_reported",
     "failed_run",
     "run_completed_unevaluated",
@@ -64,6 +65,9 @@ BuildTestOutcomeReasonCode = Literal[
     "definition_contract_unsatisfied",
     "fallback_floor_turn_unsatisfiable",
 ]
+_TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset(
+    {"terminal_challenge_blocker", "device_approval_challenge_blocker"}
+)
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 
@@ -650,14 +654,23 @@ def recorded_outcome_from_run_blocks_result(
         unbound_required_parameter_keys or [],
         block_parameter_keys or {},
     )
-    page_refs = _page_evidence_refs(page_evidence)
+    graded_page_evidence = (
+        page_evidence
+        if page_evidence is not None
+        and page_evidence_source_matches_run(
+            _safe_str(page_evidence.get("source_browser_session_id")),
+            _safe_str(data.get("browser_session_id")),
+        )
+        else None
+    )
+    page_refs = _page_evidence_refs(graded_page_evidence)
     output_refs = _output_evidence_refs(blocks)
     verification_identity = _completion_verification_identity(completion_verification)
     missing_output_facts = _missing_requested_output_facts(completion_verification, blocks)
     authoritative_workflow_run_id = (
         recorded_run_outcome.workflow_run_id if recorded_run_outcome is not None else None
     ) or workflow_run_id
-    page_path_failure = _post_run_page_path_failure(page_evidence, authoritative_workflow_run_id or None)
+    page_path_failure = _post_run_page_path_failure(graded_page_evidence, authoritative_workflow_run_id or None)
     runtime_output_facts = _runtime_output_repair_facts(
         completion_verification,
         blocks,
@@ -666,11 +679,11 @@ def recorded_outcome_from_run_blocks_result(
     )
     if recorded_run_outcome is not None and (
         failed_block is None
-        or _run_outcome_reason_code(recorded_run_outcome) == "terminal_challenge_blocker"
+        or _run_outcome_reason_code(recorded_run_outcome) in _TERMINAL_CHALLENGE_REASON_CODES
         or recorded_run_outcome.verdict == "not_evaluated"
     ):
         reason_code = _run_outcome_reason_code(recorded_run_outcome)
-        if reason_code == "terminal_challenge_blocker":
+        if reason_code in _TERMINAL_CHALLENGE_REASON_CODES:
             return RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1396,8 +1409,8 @@ def _run_outcome_reason_code(recorded_run_outcome: RecordedRunOutcome) -> BuildT
     if reason_code in {
         "outcome_not_demonstrated",
         "no_meaningful_output",
-        "terminal_challenge_blocker",
         "blocker_reported",
+        *_TERMINAL_CHALLENGE_REASON_CODES,
     }:
         return reason_code
     if recorded_run_outcome.verdict == "demonstrated":

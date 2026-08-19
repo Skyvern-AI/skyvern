@@ -61,6 +61,7 @@ class Extensions(StrEnum):
 
 
 FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE = "forced_workflow_run"
+SESSION_RETIREMENT_RUNNABLE_TYPE = "session_retirement"
 
 
 class PersistentBrowserSession(BaseModel):
@@ -94,6 +95,7 @@ class PersistentBrowserSession(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     last_activity_at: datetime | None = None
+    close_requested_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -101,6 +103,8 @@ class PersistentBrowserSession(BaseModel):
     browser_type: PersistentBrowserType | None = None
     browser_profile_id: str | None = None
     generate_browser_profile: bool = False
+    bound_workflow_permanent_id: str | None = None
+    bound_key: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True

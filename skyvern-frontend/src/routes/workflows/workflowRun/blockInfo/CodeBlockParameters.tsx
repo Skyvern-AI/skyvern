@@ -5,6 +5,7 @@ import { ActionsApiResponse, Status } from "@/api/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
+import { actionCodeLine } from "@/routes/workflows/workflowRun/codeBlockFailure";
 import type {
   CodeBlockStep,
   WorkflowParameter,
@@ -19,15 +20,6 @@ type Props = {
   failureReason?: string | null;
   actions?: Array<ActionsApiResponse> | null;
 };
-
-function getActionCodeLine(action: ActionsApiResponse): number | null {
-  const output = action.output;
-  if (!output || typeof output !== "object" || Array.isArray(output)) {
-    return null;
-  }
-  const codeLine = (output as Record<string, unknown>).code_line;
-  return typeof codeLine === "number" ? codeLine : null;
-}
 
 function formatStepLines(step: CodeBlockStep): string {
   if (step.line_start == null) {
@@ -54,11 +46,10 @@ function CodeBlockParameters({
     blockStatus === Status.Failed
       ? (actions ?? []).find(
           (action) =>
-            action.status === Status.Failed &&
-            getActionCodeLine(action) !== null,
+            action.status === Status.Failed && actionCodeLine(action) !== null,
         )
       : undefined;
-  const failingLine = failingAction ? getActionCodeLine(failingAction) : null;
+  const failingLine = failingAction ? actionCodeLine(failingAction) : null;
   const failingReason = failureReason ?? failingAction?.response ?? null;
   const codeExtensions = useMemo<Array<Extension>>(() => {
     if (failingLine == null) {

@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,10 @@ if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
+
+# ponytail: lifecycle I/O is rare; use per-key locks only if start/stop contention becomes measurable.
+_ARTIFACT_OWNERS_LOCK = threading.Lock()
+_ARTIFACT_OWNERS: dict[tuple[str, str], object] = {}
 
 
 DEFAULT_CAPTURE_INTERVAL_SECONDS: float = 1.0
@@ -49,8 +54,14 @@ def _is_cdp_session_teardown_error(exc: BaseException) -> bool:
     return any(needle in message for needle in _TEARDOWN_ERROR_MESSAGES)
 
 
-def _write_frame_atomically(temp_dir: Path, stream_key: str, data: bytes) -> None:
-    """Atomic tempfile+``os.replace`` write; intended to run on a worker thread."""
+def _write_frame_atomically(
+    temp_dir: Path,
+    stream_key: str,
+    data: bytes,
+    organization_id: str,
+    owner: object,
+) -> bool:
+    """Atomically commit a frame only while this publisher still owns the stream key."""
     temp_dir.mkdir(parents=True, exist_ok=True)
     target = temp_dir / stream_key
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(temp_dir), prefix=f".{stream_key}.", suffix=".tmp")
@@ -59,8 +70,12 @@ def _write_frame_atomically(temp_dir: Path, stream_key: str, data: bytes) -> Non
         with os.fdopen(tmp_fd, "wb") as fp:
             fp_taken = True
             fp.write(data)
-        os.replace(tmp_path, target)
+        with _ARTIFACT_OWNERS_LOCK:
+            if _ARTIFACT_OWNERS.get((organization_id, stream_key)) is not owner:
+                return False
+            os.replace(tmp_path, target)
         tmp_path = None  # type: ignore[assignment]
+        return True
     finally:
         if not fp_taken:
             try:
@@ -96,6 +111,7 @@ class CDPFramePublisher:
         self._stream_key = stream_key
         self._organization_id = organization_id
         self._capture_interval_seconds = max(capture_interval_seconds, 0.1)
+        self._artifact_owner = object()
 
         self._task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
@@ -125,10 +141,15 @@ class CDPFramePublisher:
         """Spawn the background publish loop. Idempotent."""
         if self.is_running:
             return
-        # Written once (never removed) so display capture stays off this key even if this publisher
-        # dies mid-run; a capture tick racing this first write may still publish one stray black frame.
+        # Written before publishing so display capture stays off this key until stop removes it.
+        # A capture tick racing this first write may still publish one stray black frame.
         try:
-            await asyncio.to_thread(_touch_remote_browser_sentinel, self._organization_id, self._stream_key)
+            await asyncio.to_thread(
+                _claim_remote_browser_artifacts,
+                self._organization_id,
+                self._stream_key,
+                self._artifact_owner,
+            )
         except OSError:
             LOG.warning(
                 "Could not write the remote-browser sentinel; display capture may overwrite frames",
@@ -146,7 +167,7 @@ class CDPFramePublisher:
         )
 
     async def stop(self) -> None:
-        """Cancel the loop, detach CDP session, and reset state. Idempotent."""
+        """Cancel the loop, detach CDP session, remove its artifacts, and reset state. Idempotent."""
         self._stopped.set()
         task = self._task
         self._task = None
@@ -158,6 +179,12 @@ class CDPFramePublisher:
                 pass
         await self._detach_cdp_session()
         self._last_published_digest = None
+        await asyncio.to_thread(
+            _remove_owned_artifacts,
+            self._organization_id,
+            self._stream_key,
+            self._artifact_owner,
+        )
         LOG.info(
             "CDP frame publisher stopped",
             stream_key=self._stream_key,
@@ -332,7 +359,22 @@ class CDPFramePublisher:
         try:
             # Blocking I/O runs on a worker thread so a large flush does not
             # stall the event loop shared with other publishers / agent work.
-            await asyncio.to_thread(_write_frame_atomically, temp_dir, self._stream_key, data)
+            write_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _write_frame_atomically,
+                    temp_dir,
+                    self._stream_key,
+                    data,
+                    self._organization_id,
+                    self._artifact_owner,
+                )
+            )
+            try:
+                write_committed = await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                # Cancellation does not stop a worker thread; finish the write before stop() removes it.
+                await asyncio.gather(write_task, return_exceptions=True)
+                raise
         except OSError:
             LOG.warning(
                 "Failed to write streaming frame to disk",
@@ -340,6 +382,8 @@ class CDPFramePublisher:
                 organization_id=self._organization_id,
                 exc_info=True,
             )
+            return False
+        if not write_committed:
             return False
 
         # Local-disk storage reads the temp file directly; remote object-storage
@@ -384,6 +428,36 @@ def _touch_remote_browser_sentinel(organization_id: str, stream_key: str) -> Non
     path = remote_browser_sentinel_path(organization_id, stream_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
+
+
+def _claim_remote_browser_artifacts(organization_id: str, stream_key: str, owner: object) -> None:
+    with _ARTIFACT_OWNERS_LOCK:
+        _ARTIFACT_OWNERS[(organization_id, stream_key)] = owner
+        _touch_remote_browser_sentinel(organization_id, stream_key)
+
+
+def _remove_owned_artifacts(organization_id: str, stream_key: str, owner: object) -> None:
+    with _ARTIFACT_OWNERS_LOCK:
+        owner_key = (organization_id, stream_key)
+        if _ARTIFACT_OWNERS.get(owner_key) is not owner:
+            return
+        _ARTIFACT_OWNERS.pop(owner_key)
+        artifact_dir = Path(get_skyvern_temp_dir()) / organization_id
+        owned_artifact_paths = (
+            artifact_dir / stream_key,
+            remote_browser_sentinel_path(organization_id, stream_key),
+        )
+        for artifact_path in owned_artifact_paths:
+            try:
+                artifact_path.unlink(missing_ok=True)
+            except OSError:
+                LOG.warning(
+                    "Could not remove CDP frame publisher artifact",
+                    artifact_path=str(artifact_path),
+                    stream_key=stream_key,
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
 
 
 def stream_key_for_workflow_run(workflow_run_id: str) -> str:

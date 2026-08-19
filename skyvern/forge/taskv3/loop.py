@@ -73,6 +73,7 @@ class LoopOutcome:
     extracted_output: Any = None
     turns: int = 0
     tool_calls: int = 0
+    action_steps: int = 0
     billable_actions: list[str] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
 
@@ -186,10 +187,12 @@ async def run_agent_tool_loop(
     tools: list[ToolSpec],
     max_turns: int,
     max_tool_calls: int,
+    max_action_steps: int | None = None,
     prompt_name: str = "taskv3-agent-loop",
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
+    on_action_round: Callable[[list[tuple[str, dict[str, Any]]]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     deadline_seconds: float | None = None,
     retryable_call_exceptions: tuple[type[BaseException], ...] = (),
@@ -212,6 +215,7 @@ async def run_agent_tool_loop(
     total_tool_calls = 0
     total_tokens = 0
     billable_actions: list[str] = []
+    action_steps = 0
     started_at = time.monotonic()
 
     while outcome is None:
@@ -289,6 +293,8 @@ async def run_agent_tool_loop(
             messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
             continue
 
+        turn_did_action = False
+        round_actions: list[tuple[str, dict[str, Any]]] = []
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -301,11 +307,22 @@ async def run_agent_tool_loop(
                 outcome = LoopOutcome("canceled", "run canceled")
                 _append_skipped_tool_results(messages, tool_calls[idx:], "run canceled")
                 break
-            total_tool_calls += 1
             spec = tool_by_name.get(tool_name)
+            # Once the action-step budget is spent, refuse a further page action — terminate, mirroring
+            # the step engine's max-steps stop — but let perception/finish through, since the cap bounds
+            # new action rounds, not the separate re-observe/finish turn the system prompt asks for.
+            if spec is not None and spec.billable and max_action_steps is not None and action_steps >= max_action_steps:
+                outcome = LoopOutcome("budget_exhausted", f"Reached the maximum steps ({max_action_steps})")
+                _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
+                break
+            total_tool_calls += 1
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             else:
+                if spec.billable:
+                    # A dispatched page action consumes a step even if it errors (it may mutate before
+                    # failing); billing below counts successes only.
+                    turn_did_action = True
                 try:
                     result = await spec.handler(args)
                 except Exception as exc:
@@ -317,6 +334,7 @@ async def run_agent_tool_loop(
             )
             if spec is not None and spec.billable and result.status == "ok":
                 billable_actions.append(tool_name)
+                round_actions.append((tool_name, args))
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
@@ -334,11 +352,27 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "earlier tool call in this batch failed")
                 break
 
+        # A "step" is one action round: a turn that ran >=1 page-mutating action. Perception-only
+        # turns (observe/get_html) don't consume the caller's step budget — the step engine bundles
+        # perception into each step, so counting v3's perception rounds against the same budget
+        # under-counts equivalent work.
+        if turn_did_action:
+            action_steps += 1
+        # Hand the round's executed actions to the caller so it can persist per-action artifacts
+        # (screenshot, DB rows) — kept out of this transport-agnostic core, like should_cancel. A
+        # persistence hiccup must not abort an otherwise-good run, so failures are contained here.
+        if round_actions and on_action_round is not None:
+            try:
+                await on_action_round(round_actions)
+            except Exception:
+                LOG.warning("taskv3 on_action_round callback failed", turn=turns, exc_info=True)
+
     if outcome is None:
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
 
     outcome.turns = turns
     outcome.tool_calls = total_tool_calls
+    outcome.action_steps = action_steps
     outcome.billable_actions = billable_actions
     outcome.messages = messages
     return outcome

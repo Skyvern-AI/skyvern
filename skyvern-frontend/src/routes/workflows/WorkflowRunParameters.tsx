@@ -89,6 +89,7 @@ function WorkflowRunParameters() {
           proxyLocation ?? workflow.proxy_location ?? ProxyLocation.Residential,
         webhookCallbackUrl:
           webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
+        reuseBrowserSession: workflow.reuse_browser_session ?? false,
         maxScreenshotScrolls:
           maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
         extraHttpHeaders:

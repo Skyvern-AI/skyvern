@@ -1106,10 +1106,17 @@ class SendEmailBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
 
-    smtp_host_secret_parameter_key: str
-    smtp_port_secret_parameter_key: str
-    smtp_username_secret_parameter_key: str
-    smtp_password_secret_parameter_key: str
+    # On the platform path an omitted key is provisioned and a key that is set must name a
+    # declared AWS secret. With custom_smtp_host these are never read, so any key resolves to
+    # an inert placeholder.
+    smtp_host_secret_parameter_key: str | None = None
+    smtp_port_secret_parameter_key: str | None = None
+    smtp_username_secret_parameter_key: str | None = None
+    smtp_password_secret_parameter_key: str | None = None
+    custom_smtp_host: str | None = None
+    custom_smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    custom_smtp_username: str | None = None
+    custom_smtp_password: str | None = None
     sender: str
     recipients: list[str]
     subject: str
@@ -1235,12 +1242,12 @@ class HumanInteractionBlockYAML(BlockYAML):
     instructions: str = "Please review and approve or reject to continue the workflow."
     positive_descriptor: str = "Approve"
     negative_descriptor: str = "Reject"
-    timeout_seconds: int
+    timeout_seconds: int = 60 * 60 * 2
 
-    sender: str
+    sender: str = "hello@skyvern.com"
     recipients: list[str]
-    subject: str
-    body: str
+    subject: str = "Human interaction required for workflow run"
+    body: str = "Your interaction is required for a workflow run!"
 
 
 class FileDownloadBlockYAML(BlockYAML):
@@ -1536,10 +1543,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    reuse_browser_session: bool = False
     mask_secrets: bool | None = Field(
         default=None,
         title="Mask Secrets",
-        description="Visually mask secrets as they are typed in the browser, hiding them from screenshots, recordings, and the live view.",
+        description="Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text.",
     )
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None

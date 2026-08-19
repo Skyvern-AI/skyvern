@@ -147,6 +147,30 @@ describe("useCdpInput reconnects", () => {
     expect(MockWebSocket.instances).toHaveLength(2);
   });
 
+  it("requires and sends a fresh take-control after reconnect", async () => {
+    const result = await renderControllingInputHook();
+    const firstSocket = MockWebSocket.instances[0]!;
+    expect(firstSocket.send).toHaveBeenCalledWith(
+      JSON.stringify({ kind: "take-control" }),
+    );
+
+    closeLatestSocket(4411);
+    await advanceReconnectDelay();
+    const reconnectedSocket = MockWebSocket.instances[1]!;
+    act(() => {
+      reconnectedSocket.emitMessage(JSON.stringify({ kind: "ready" }));
+    });
+    expect(result.current.userIsControlling).toBe(false);
+
+    reconnectedSocket.send.mockClear();
+    act(() => {
+      result.current.setUserIsControlling(true);
+    });
+    expect(reconnectedSocket.send).toHaveBeenCalledWith(
+      JSON.stringify({ kind: "take-control" }),
+    );
+  });
+
   it("does not reconnect after a normal close", async () => {
     await renderInputHook();
     expect(MockWebSocket.instances).toHaveLength(1);
@@ -172,6 +196,31 @@ describe("useCdpInput reconnects", () => {
     await advanceReconnectDelay();
 
     expect(MockWebSocket.instances).toHaveLength(6);
+  });
+
+  it("resets its five-attempt budget only after the fresh socket is ready", async () => {
+    await renderInputHook();
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      closeLatestSocket(4410);
+      await advanceReconnectDelay();
+    }
+    expect(MockWebSocket.instances).toHaveLength(5);
+
+    act(() => {
+      MockWebSocket.instances[MockWebSocket.instances.length - 1]!.emitMessage(
+        JSON.stringify({ kind: "ready" }),
+      );
+    });
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      closeLatestSocket(4410);
+      await advanceReconnectDelay();
+    }
+    expect(MockWebSocket.instances).toHaveLength(10);
+
+    closeLatestSocket(4410);
+    await advanceReconnectDelay();
+    expect(MockWebSocket.instances).toHaveLength(10);
   });
 });
 

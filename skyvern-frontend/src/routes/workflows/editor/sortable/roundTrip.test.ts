@@ -47,6 +47,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
@@ -622,6 +623,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     const settings: WorkflowSettings = {
       ...DEFAULT_SETTINGS,
       errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+      reuseBrowserSession: true,
       finallyBlockLabel: "B5",
       maskSecrets: true,
       workflowSystemPrompt: "always double-check totals",
@@ -631,6 +633,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(recovered.errorCodeMapping).toEqual({
       OUT_OF_STOCK: "item unavailable",
     });
+    expect(recovered.reuseBrowserSession).toBe(true);
     expect(recovered.finallyBlockLabel).toBe("B5");
     expect(recovered.maskSecrets).toBe(true);
     expect(recovered.workflowSystemPrompt).toBe("always double-check totals");

@@ -43,6 +43,21 @@ class UnresolvedRuntimeFailure(BaseModel):
         return _UNSAFE_IDENTIFIER_RE.sub("", value)[:80].strip()
 
 
+class ConnectedAccountChoice(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    connection_id: str
+    name: str
+    state: str
+    email_address: str | None = None
+
+
+class ConnectedAccountChoiceReference(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    connection_id: str
+
+
 class TurnOutcome(BaseModel):
     # extra="ignore" so a rolling deploy that adds a new TurnOutcome field
     # does not make older readers silently treat freshly-written rows as None.
@@ -60,4 +75,6 @@ class TurnOutcome(BaseModel):
     copilot_last_code_build_failed: bool = False
     copilot_pending_capability: str | None = None
     copilot_turn_id: str | None = None
+    idempotency_digest: str | None = None
     unresolved_runtime_failure: UnresolvedRuntimeFailure | None = None
+    connected_account_choices: list[ConnectedAccountChoice] | None = None

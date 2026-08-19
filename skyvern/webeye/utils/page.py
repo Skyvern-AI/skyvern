@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import json
 import re
 import time
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
+from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
@@ -246,14 +248,14 @@ def _is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelectio
     return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
 
 
-def _is_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
+def is_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
     return (
         engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
     )
 
 
 def _is_readiness_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or _is_engine_timeout(
+    return isinstance(exc, (asyncio.TimeoutError, SkyvernPageAnalysisTimeout)) or is_engine_timeout(
         exc, engine_selection
     )
 
@@ -389,7 +391,7 @@ async def _page_screenshot_helper(
             animations="disabled",
         )
     except Exception as timeout_error:
-        if not _is_engine_timeout(timeout_error, engine_selection):
+        if not is_engine_timeout(timeout_error, engine_selection):
             raise
         LOG.info(
             f"Timeout error while taking screenshot: {str(timeout_error)}. Going to take a screenshot again with animation allowed."
@@ -462,11 +464,13 @@ async def _current_viewpoint_screenshot_helper(
             screenshot_time=end_time - start_time,
             file_path=file_path,
         )
+        skyvern_context.record_browser_success()
         return screenshot
     except Exception as e:
         if engine_selection is not None and not _is_engine_error(e, engine_selection):
             raise
-        if _is_engine_timeout(e, engine_selection):
+        if is_engine_timeout(e, engine_selection):
+            skyvern_context.record_browser_timeout(BrowserOperation.SCREENSHOT)
             LOG.warning(
                 "Screenshot timeout",
                 timeout_ms=timeout,
@@ -514,7 +518,7 @@ async def take_element_screenshot(
     except Exception as error:
         if not _is_engine_error(error, engine_selection):
             raise
-        if not _is_engine_timeout(error, engine_selection):
+        if not is_engine_timeout(error, engine_selection):
             raise FailedToTakeScreenshot(error_message=str(error)) from error
         try:
             return await locator.screenshot(timeout=timeout, animations="allow")
@@ -628,23 +632,61 @@ def _merge_images_by_position(images: list[Image.Image], positions: list[int]) -
         merged_height += positions[i] - positions[i - 1]
 
     merged_img = Image.new("RGB", (max_width, merged_height), color=(255, 255, 255))
+    merged_complete = False
+    try:
+        current_y = 0
+        merged_img.paste(images[0], (0, current_y))
+        current_y += images[0].height
 
-    current_y = 0
-    merged_img.paste(images[0], (0, current_y))
-    current_y += images[0].height
+        for i in range(1, len(images)):
+            step = positions[i] - positions[i - 1]
+            overlap = images[i].height - step
+            if overlap > 0:
+                cropped = images[i].crop((0, overlap, images[i].width, images[i].height))
+            else:
+                cropped = images[i]
 
-    for i in range(1, len(images)):
-        step = positions[i] - positions[i - 1]
-        overlap = images[i].height - step
-        if overlap > 0:
-            cropped = images[i].crop((0, overlap, images[i].width, images[i].height))
-        else:
-            cropped = images[i]
-
-        merged_img.paste(cropped, (0, current_y))
-        current_y += cropped.height
+            try:
+                merged_img.paste(cropped, (0, current_y))
+                current_y += cropped.height
+            finally:
+                # paste copies the pixels, so a freshly cropped temporary is dead here; close it to
+                # release the decode eagerly, even if the paste raised. Aliases of ``images[i]`` (no
+                # overlap) are left for the caller to close, since it still owns every input image.
+                if cropped is not images[i]:
+                    cropped.close()
+        merged_complete = True
+    finally:
+        # On failure the caller never receives ``merged_img`` and cannot hand it to
+        # ``_close_screenshot_stitch_resources``, so release the stitched canvas here before the
+        # exception unwinds through the fallback/OOM path.
+        if not merged_complete:
+            merged_img.close()
 
     return merged_img
+
+
+def _close_screenshot_stitch_resources(
+    images: list[Image.Image],
+    merged_image: Image.Image | None,
+    buffer: BytesIO | None,
+) -> None:
+    """Deterministically release the decoded viewport images, the stitched image, and the PNG buffer.
+
+    ``_merge_images_by_position`` returns the sole input image for single-viewport input, so the
+    merged image can alias ``images[0]``; dedupe by identity to avoid an invalid double-close.
+    """
+    seen_ids: set[int] = set()
+    closeables: list[Image.Image] = list(images)
+    if merged_image is not None:
+        closeables.append(merged_image)
+    for image in closeables:
+        if id(image) in seen_ids:
+            continue
+        seen_ids.add(id(image))
+        image.close()
+    if buffer is not None:
+        buffer.close()
 
 
 # FileReader keeps the payload binary-safe without arrayBuffer/Uint8Array
@@ -1096,8 +1138,9 @@ class SkyvernFrame:
     ) -> Any:
         try:
             async with asyncio.timeout(timeout_ms / 1000):
-                return await evaluate_expression()
+                result = await evaluate_expression()
         except asyncio.TimeoutError as error:
+            skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
             # Re-raised and handled by the caller (scrape retries / failure classification),
             # so this is not the failure boundary; log without a traceback at warning.
             LOG.warning("Skyvern timed out trying to analyze the page", expression=expression)
@@ -1133,6 +1176,8 @@ class SkyvernFrame:
                 initial_error=error_msg,
                 engine_selection=engine_selection,
             )
+        skyvern_context.record_browser_success()
+        return result
 
     @staticmethod
     async def _evaluate_with_navigation_recovery(
@@ -1219,7 +1264,10 @@ class SkyvernFrame:
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page")
             try:
                 async with asyncio.timeout(retry_budget):
-                    return await evaluate_expression()
+                    result = await evaluate_expression()
+                # The final evaluate answered, so this run-wide health tally is no longer stale.
+                skyvern_context.record_browser_success()
+                return result
             except asyncio.TimeoutError as error:
                 LOG.exception("Skyvern timed out on retry after JS context re-injection", expression=expression)
                 raise SkyvernPageAnalysisTimeout("Skyvern timed out trying to analyze the page") from error
@@ -1465,31 +1513,40 @@ class SkyvernFrame:
                     max_number=scrolling_number,
                     engine_selection=engine_selection,
                 )
-                images = []
+                images: list[Image.Image] = []
+                merged_img: Image.Image | None = None
+                buffer: BytesIO | None = None
+                try:
+                    for screenshot in screenshots:
+                        with Image.open(BytesIO(screenshot)) as img:
+                            img.load()
+                            images.append(img)
 
-                for screenshot in screenshots:
-                    with Image.open(BytesIO(screenshot)) as img:
-                        img.load()
-                        images.append(img)
+                    merged_img = _merge_images_by_position(images, positions)
 
-                merged_img = _merge_images_by_position(images, positions)
+                    buffer = BytesIO()
+                    merged_img.save(buffer, format="PNG")
+                    buffer.seek(0)
 
-                buffer = BytesIO()
-                merged_img.save(buffer, format="PNG")
-                buffer.seek(0)
+                    img_data = buffer.read()
+                    if file_path is not None:
+                        with open(file_path, "wb") as f:
+                            f.write(img_data)
 
-                img_data = buffer.read()
-                if file_path is not None:
-                    with open(file_path, "wb") as f:
-                        f.write(img_data)
-
-                end_time = time.time()
-                LOG.debug(
-                    "Full page screenshot taking time",
-                    screenshot_time=end_time - start_time,
-                    file_path=file_path,
-                )
-                return img_data
+                    end_time = time.time()
+                    LOG.debug(
+                        "Full page screenshot taking time",
+                        screenshot_time=end_time - start_time,
+                        file_path=file_path,
+                    )
+                    return img_data
+                finally:
+                    # The decoded images, stitched image, and PNG buffer land in reference cycles that
+                    # gen-0 GC defers, leaving ~100 MB/event resident until a full collection; release
+                    # them explicitly then force one, scoped to the multi-viewport stitch that accumulates them.
+                    _close_screenshot_stitch_resources(images, merged_img, buffer)
+                    if len(images) > 1:
+                        gc.collect()
         except Exception:
             LOG.warning(
                 "Failed to take full page screenshot, fallback to use playwright full page screenshot",

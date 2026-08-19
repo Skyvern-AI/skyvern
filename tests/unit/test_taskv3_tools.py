@@ -6,12 +6,31 @@ operations (no task-ecosystem) with the right args, without a live browser.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from skyvern.forge.taskv3.tools import build_browser_tools
+
+
+def _has_playwright_browser() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_skip_no_browser = pytest.mark.skipif(
+    not _has_playwright_browser(),
+    reason="Requires Playwright browsers installed (run: playwright install chromium)",
+)
 
 
 class _FakeElement:
@@ -82,7 +101,7 @@ class _FakePage:
     async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
         self.calls.append(("fill", {"selector": selector, "text": text}))
 
-    async def type(self, selector: str, text: str, timeout: int | None = None) -> None:
+    async def type(self, selector: str, text: str, delay: int | None = None, timeout: int | None = None) -> None:
         self.calls.append(("type", {"selector": selector, "text": text}))
 
     async def select_option(
@@ -176,16 +195,19 @@ async def test_observe_renders_group_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_click_type_select_dispatch_raw_ops() -> None:
+async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)  # the typeahead probe polls; skip real waiting in tests
     page = _FakePage()
     tools = build_browser_tools(page)
     await _tool(tools, "click").handler({"selector": "#submit"})
     await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
     await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
-    kinds = {c[0]: c[1] for c in page.calls}
-    assert kinds["click"]["selector"] == "#submit"
-    assert kinds["fill"] == {"selector": "#first", "text": "John"}
-    assert kinds["select_option"]["label"] == "United States"
+    assert ("click", {"selector": "#submit"}) in page.calls
+    # `type` keystroke-types the value (typeahead-safe path) — the value is entered via page.type
+    assert ("type", {"selector": "#first", "text": "John"}) in page.calls
+    assert ("select_option", {"selector": "#country", "value": None, "label": "United States"}) in page.calls
 
 
 @pytest.mark.asyncio
@@ -324,10 +346,19 @@ def test_preflight_tool_set_matches_builder() -> None:
     # origin the policy can act on) fails a test rather than silently shrinking coverage.
     from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, _build_action
 
-    assert PREFLIGHT_TOOL_NAMES == {"click", "type", "select_option", "press_key", "file_upload", "navigate"}
+    assert PREFLIGHT_TOOL_NAMES == {
+        "click",
+        "type",
+        "select_combobox",
+        "select_option",
+        "press_key",
+        "file_upload",
+        "navigate",
+    }
     rep = {
         "click": {"selector": "#x"},
         "type": {"selector": "#x", "text": "y"},
+        "select_combobox": {"selector": "#x", "value": "v"},
         "select_option": {"selector": "#x", "value": "v"},
         "press_key": {"key": "Enter"},
         "file_upload": {"selector": "#x", "file": "/tmp/f"},
@@ -359,3 +390,285 @@ async def test_navigate_runs_preflight_when_observation_enabled(monkeypatch: pyt
     action, site = seen[0]
     assert site == "taskv3-navigate"
     assert action.url == "https://jobs.example.test/acme/1"  # PAGE target the origin check can act on
+
+
+class _TypeaheadFakePage:
+    """Fake page for the BEHAVIORAL typeahead path. `evaluate` stands in for the JS suggestion-finder
+    (_FIND_SUGGESTION_JS, identified by the data-tv3-sugg tag it sets) and the commit-verifier
+    (_VERIFY_COMMIT_JS, identified by its `closest` call), so type()/select_combobox control flow can be
+    driven without a real DOM. `field_type` feeds the pre-probe input-type check; `suggestion` is what the
+    finder returns (None => the page rendered nothing that overlaps the value); `committed` is the value
+    the verifier reads back after the suggestion is clicked."""
+
+    def __init__(
+        self, *, field_type: str = "text", suggestion: dict[str, Any] | None = None, committed: str = ""
+    ) -> None:
+        self._field_type = field_type
+        self._suggestion = suggestion
+        self._committed = committed
+        self.calls: list[tuple[str, Any]] = []
+        self.clicked_suggestion = False
+
+    async def eval_on_selector(self, selector: str, js: str) -> str:
+        return self._field_type
+
+    async def evaluate(self, js: str, arg: Any = None) -> Any:
+        # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), so match
+        # the verifier (identified by its `closest` call) first, then the finder.
+        if "closest" in js:
+            return self._committed
+        if "data-tv3-sugg" in js:
+            return self._suggestion
+        return None
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        self.calls.append(("click", selector))
+        if selector == '[data-tv3-sugg="1"]':
+            self.clicked_suggestion = True
+
+    async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
+        self.calls.append(("fill", (selector, text)))
+
+    async def type(self, selector: str, text: str, delay: int | None = None, timeout: int | None = None) -> None:
+        self.calls.append(("type", (selector, text)))
+
+    async def press(self, selector: str, key: str) -> None:
+        self.calls.append(("press", (selector, key)))
+
+
+async def _instant_sleep(*_a: Any, **_k: Any) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_type_auto_commits_reacting_typeahead(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A plain `type` into a text field that REACTS with a suggestion list must commit the match itself
+    # (the model does not reliably reach for select_combobox) and report the committed value.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text",
+        suggestion={"text": "San Francisco, CA, USA", "score": 2},
+        committed="San Francisco, CA, USA",
+    )
+    tools = build_browser_tools(page)
+    r = await _tool(tools, "type").handler({"selector": "#location-input", "text": "San Francisco, California"})
+    assert r.status == "ok"
+    assert "San Francisco, CA, USA" in r.content  # the value the widget committed (normalized), not raw text
+    assert page.clicked_suggestion  # it clicked the tagged suggestion rather than leaving typed text
+
+
+@pytest.mark.asyncio
+async def test_type_leaves_raw_text_when_no_suggestion_reacts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Text field that does NOT react with a suggestion list is an ordinary field: keep the typed text,
+    # do not click anything, do not error.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(field_type="text", suggestion=None)
+    tools = build_browser_tools(page)
+    r = await _tool(tools, "type").handler({"selector": "#notes", "text": "Springfield"})
+    assert r.status == "ok"
+    assert ("type", ("#notes", "Springfield")) in page.calls  # keystroke-typed; raw text left in place
+    assert not page.clicked_suggestion
+
+
+@pytest.mark.asyncio
+async def test_type_non_text_input_skips_probe_fast_path() -> None:
+    # A non-text input (email/tel/…) is never a typeahead: fast fill, no suggestion probe, no click —
+    # even if a suggestion would have been offered.
+    page = _TypeaheadFakePage(field_type="email", suggestion={"text": "x@y.com", "score": 9})
+    tools = build_browser_tools(page)
+    r = await _tool(tools, "type").handler({"selector": "#email", "text": "john.smith@example.com"})
+    assert r.status == "ok"
+    assert ("fill", ("#email", "john.smith@example.com")) in page.calls
+    assert not page.clicked_suggestion
+
+
+@pytest.mark.asyncio
+async def test_select_combobox_commits_reacting_suggestion(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(
+        field_type="text", suggestion={"text": "San Francisco, CA, USA", "score": 2}, committed="San Francisco, CA, USA"
+    )
+    tools = build_browser_tools(page)
+    r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
+    assert r.status == "ok" and "San Francisco, CA, USA" in r.content
+    assert page.clicked_suggestion
+
+
+@pytest.mark.asyncio
+async def test_select_combobox_fails_loud_when_no_suggestion_reacts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No suggestion overlaps the value => no false "filled": select_combobox must error, never claim success.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _TypeaheadFakePage(field_type="text", suggestion=None)
+    tools = build_browser_tools(page)
+    r = await _tool(tools, "select_combobox").handler({"selector": "#loc", "value": "San Francisco, California"})
+    assert r.status == "error" and "NOT filled" in r.content
+
+
+# --- DOM-level tests: exercise the REAL finder/pre-snapshot JS against a live page, so the safeguards
+# (reaction-gate, container-vs-row, nav-exclusion) are actually executed, not mocked by a fake page. ---
+
+_FINDER_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <label for="location-input">Current location</label>
+  <input id="location-input" type="text" style="position:absolute;top:100px;left:40px;width:300px;height:28px">
+  <!-- Static page text present BEFORE typing. It shares — and OUTSCORES on — the typed value, so if the
+       pre-snapshot reaction-gate weren't working it would win. It must be ignored. -->
+  <div id="static-distractor" style="position:absolute;top:150px;left:40px;width:300px;height:30px">San Francisco California office openings</div>
+</body></html>
+"""
+
+
+@contextlib.asynccontextmanager
+async def _finder_page() -> AsyncIterator[Any]:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+            await page.set_content(_FINDER_FIXTURE_HTML)
+            yield page
+        finally:
+            await browser.close()
+
+
+async def _snapshot_react_find(page: Any, inject_js: str) -> Any:
+    # Mirror _type_and_commit's order: snapshot the pre-typing DOM, let the widget "react" (inject its
+    # dropdown), then run the finder — so only reacting DOM is eligible.
+    from skyvern.forge.taskv3.tools import _FIND_SUGGESTION_JS, _PRESNAPSHOT_JS  # noqa: PLC0415
+
+    await page.evaluate(_PRESNAPSHOT_JS)
+    await page.evaluate(inject_js)
+    return await page.evaluate(_FIND_SUGGESTION_JS, {"value": "San Francisco, California", "field": "#location-input"})
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_finder_picks_row_over_container_and_ignores_static_text() -> None:
+    # A dropdown container holding two rows appears under the field IN REACTION to typing. The finder must
+    # (a) ignore the pre-existing static text that outscores the rows, and (b) tag the matching ROW — not
+    # the container (whose center-click would land on the wrong row: "San Francisco" -> "San Jose").
+    inject = """() => {
+      const c = document.createElement('div');
+      c.id = 'dd'; c.setAttribute('style', 'position:absolute;top:132px;left:40px;width:300px');
+      for (const t of ['San Francisco, CA, USA', 'San Jose, CA, USA']) {
+        const row = document.createElement('div');
+        row.className = 'opt'; row.textContent = t; row.setAttribute('style', 'height:28px');
+        c.appendChild(row);
+      }
+      document.body.appendChild(c);
+    }"""
+    async with _finder_page() as page:
+        found = await _snapshot_react_find(page, inject)
+        assert found is not None and found["text"] == "San Francisco, CA, USA"
+        tagged = await page.eval_on_selector_all("[data-tv3-sugg]", "els => els.map(e => e.textContent.trim())")
+        assert tagged == ["San Francisco, CA, USA"]  # exactly one tag, on the row (not the container)
+        static_tagged = await page.eval_on_selector("#static-distractor", "e => e.hasAttribute('data-tv3-sugg')")
+        assert static_tagged is False  # pre-existing text excluded despite its higher token score
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_finder_excludes_navigational_anchor() -> None:
+    # A matching <a href> appearing after typing is navigational (clicking would leave the form), so the
+    # finder must never select it; with no non-nav candidate it returns null and tags nothing.
+    inject = """() => {
+      const a = document.createElement('a');
+      a.href = '/somewhere'; a.textContent = 'San Francisco, CA, USA';
+      a.setAttribute('style', 'position:absolute;top:132px;left:40px;width:300px;height:28px;display:block');
+      document.body.appendChild(a);
+    }"""
+    async with _finder_page() as page:
+        found = await _snapshot_react_find(page, inject)
+        assert found is None
+        anchor_tagged = await page.eval_on_selector("a", "e => e.hasAttribute('data-tv3-sugg')")
+        assert anchor_tagged is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_finder_refuses_multirow_container() -> None:
+    # A reacting element whose match comes from its own text but that stacks multiple visible child rows
+    # is a list container, not a single suggestion — clicking its center would hit an arbitrary row, so
+    # the finder must refuse it (return null) rather than commit a wrong value.
+    inject = """() => {
+      const c = document.createElement('div');
+      c.id = 'ddc';
+      c.setAttribute('style', 'position:absolute;top:132px;left:40px;width:300px');
+      c.appendChild(document.createTextNode('San Francisco California'));
+      for (const t of ['Result one', 'Result two']) {
+        const row = document.createElement('div');
+        row.textContent = t; row.setAttribute('style', 'height:28px');
+        c.appendChild(row);
+      }
+      document.body.appendChild(c);
+    }"""
+    async with _finder_page() as page:
+        found = await _snapshot_react_find(page, inject)
+        assert found is None
+        any_tagged = await page.eval_on_selector_all("[data-tv3-sugg]", "els => els.length")
+        assert any_tagged == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_verify_accepts_short_normalized_committed_value() -> None:
+    # A selection that normalizes to a short value ("New York" -> "NY") has no >=3-char token to overlap;
+    # verify must still accept it on causality (value changed, suggestion list gone), not report failure.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import _VERIFY_COMMIT_JS  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            page = await (await browser.new_context()).new_page()
+            await page.set_content(
+                '<input id="loc" value="NY">'
+            )  # widget committed the short normalized value; no open list
+            committed = await page.evaluate(
+                _VERIFY_COMMIT_JS, {"field": "#loc", "typed": "New York", "chosen": "New York, NY, USA"}
+            )
+            assert committed == "NY"
+            # negative: field still holds the raw typed text and the list is open (tagged present) => not committed
+            await page.set_content('<input id="loc2" value="New York"><div data-tv3-sugg="1">New York, NY, USA</div>')
+            not_committed = await page.evaluate(
+                _VERIFY_COMMIT_JS, {"field": "#loc2", "typed": "New York", "chosen": "New York, NY, USA"}
+            )
+            assert not_committed == ""
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_autocomplete_flag_requires_real_combobox_semantics() -> None:
+    # The observe hint must fire on real combobox semantics, not on a bare aria-controls (which a
+    # search/filter input pointing at a results table also carries).
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    from skyvern.forge.taskv3.tools import _IS_AUTOCOMPLETE_JS  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            page = await (await browser.new_context()).new_page()
+            await page.set_content(
+                '<input id="search" aria-controls="results">'
+                '<input id="combo" role="combobox" aria-autocomplete="list">'
+                '<input id="haspopup" aria-haspopup="listbox">'
+            )
+            assert await page.eval_on_selector("#search", _IS_AUTOCOMPLETE_JS) is False
+            assert await page.eval_on_selector("#combo", _IS_AUTOCOMPLETE_JS) is True
+            assert await page.eval_on_selector("#haspopup", _IS_AUTOCOMPLETE_JS) is True
+        finally:
+            await browser.close()

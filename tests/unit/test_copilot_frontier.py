@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jinja2.sandbox import SandboxedEnvironment
@@ -52,18 +52,35 @@ class _FakeBlock:
 
 
 class _FakeParameter:
-    def __init__(self, key: str, default_value: object = None) -> None:
+    def __init__(self, key: str, default_value: object = None, **fields: object) -> None:
         self.key = key
         self.default_value = default_value
+        self._fields = fields
 
     def model_dump(self, mode: str = "json") -> dict[str, Any]:
-        return {"key": self.key, "default_value": self.default_value}
+        return {"key": self.key, "default_value": self.default_value, **self._fields}
 
 
 class _FakeDefinition:
-    def __init__(self, blocks: list[_FakeBlock], parameters: list[_FakeParameter] | None = None) -> None:
+    def __init__(
+        self,
+        blocks: list[_FakeBlock],
+        parameters: list[_FakeParameter] | None = None,
+        workflow_system_prompt: str | None = None,
+    ) -> None:
         self.blocks = blocks
         self.parameters = parameters or []
+        self.workflow_system_prompt = workflow_system_prompt
+
+    def model_dump(self, mode: str = "json", exclude: set[str] | None = None) -> dict[str, Any]:
+        dump: dict[str, Any] = {
+            "blocks": [block.model_dump() for block in self.blocks],
+            "parameters": [parameter.model_dump() for parameter in self.parameters],
+            "workflow_system_prompt": self.workflow_system_prompt,
+        }
+        for key in exclude or set():
+            dump.pop(key, None)
+        return dump
 
 
 class _FakeWorkflow:
@@ -587,6 +604,371 @@ def test_plan_frontier_edit_read_only_block_still_walks_back_to_anchor() -> None
     labels, _seed, frontier = _plan_frontier(ctx, ["nav", "extract"], old, new)
     assert labels == ["nav", "extract"]
     assert frontier == "nav"
+
+
+def _login_then_inspect_edit() -> tuple[Any, Any]:
+    # Only code blocks record the page they ended on, so the block that holds the anchor is one.
+    def _definition(inspect_code: str) -> Any:
+        return _FakeDefinition(
+            [
+                _FakeBlock("open_site", "navigation"),
+                _FakeBlock("login_to_site", "code", {"code": "await page.locator('#pw').fill(creds.password)"}),
+                _FakeBlock("inspect_summary", "code", {"code": inspect_code}),
+            ]
+        )
+
+    return _definition("old"), _definition("new")
+
+
+_LOGIN_THEN_INSPECT_LABELS = ["open_site", "login_to_site", "inspect_summary"]
+
+
+def test_plan_frontier_edit_resumes_at_edited_block_when_live_page_matches_recorded_anchor() -> None:
+    # The run rows recorded where login ended, and the session is still on that page, so the
+    # verified login is not replayed just to reach the edited block.
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {
+        "login_to_site": "https://app.example.com/dashboard",
+        "inspect_summary": "https://app.example.com/dashboard/logs",
+    }
+    ctx.verified_prefix_terminal_label = "inspect_summary"
+
+    labels, _seed, frontier = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+    assert frontier == "inspect_summary"
+    assert labels == ["inspect_summary"]
+
+
+def test_plan_frontier_edit_walks_back_when_a_loop_hides_a_credential_fill() -> None:
+    # The fill sits inside a loop rather than at the top level, and still sends the run to a
+    # freshly minted browser — so the anchored one cannot be named for it.
+    fill = _FakeBlock("do_login", "code", {"code": "await page.locator('#pw').fill(creds.password)"})
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("retry_login", "for_loop", {"loop_blocks": [fill]}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("retry_login", "for_loop", {"loop_blocks": [fill], "loop_over": "changed"}),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_site", "retry_login"]
+    ctx.verified_block_outputs = {"open_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"open_site": "https://app.example.com/signin"}
+    ctx.verified_prefix_terminal_label = "retry_login"
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        ["open_site", "retry_login"],
+        old,
+        new,
+        "https://app.example.com/signin",
+    )
+
+    assert frontier == "open_site"
+
+
+def test_plan_frontier_resume_names_the_browser_that_must_run_it() -> None:
+    # The page was proven in the browser holding the verified state, so the run has to go there
+    # rather than to whichever browser the chat is pointing at.
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_terminal_label = "inspect_summary"
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+
+    assert frontier == "inspect_summary"
+    assert ctx.frontier_resume_session_id == "pbs_login_run"
+
+
+def test_plan_frontier_append_names_the_browser_that_ran_the_prefix() -> None:
+    # The prefix now survives an append, so the appended block starts straight away — it has to
+    # start in the browser that ran the prefix, not whichever one the chat is holding.
+    code = "await page.locator('#pw').fill(creds.password)"
+    old = _FakeDefinition([_FakeBlock("open_site", "navigation"), _FakeBlock("login_to_site", "code", {"code": code})])
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("login_to_site", "code", {"code": code}),
+            _FakeBlock("read_total", "code", {"code": "result = {}"}),
+        ]
+    )
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = ["open_site", "login_to_site"]
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+    ctx.verified_prefix_terminal_label = "login_to_site"
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        ["open_site", "login_to_site", "read_total"],
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+
+    assert frontier == "read_total"
+    assert ctx.frontier_resume_session_id == "pbs_login_run"
+
+
+def test_plan_frontier_does_not_name_a_browser_when_the_seeder_vetoes_the_frontier() -> None:
+    # An unresolvable template makes the seeder hand back a full re-run, which puts the login block
+    # back into the executed list. Borrowing the already-signed-in browser for that would replay the
+    # sign-in into a page that is past it.
+    def _definition(read_code: str) -> Any:
+        return _FakeDefinition(
+            [
+                _FakeBlock("open_site", "navigation"),
+                _FakeBlock("login_to_site", "code", {"code": "await page.locator('#pw').fill(creds.password)"}),
+                _FakeBlock("read_total", "code", {"code": read_code}),
+            ]
+        )
+
+    labels_in_order = ["open_site", "login_to_site", "read_total"]
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.verified_prefix_labels = list(labels_in_order)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_login_run"
+    ctx.verified_prefix_terminal_label = "read_total"
+
+    labels, _seed, frontier = _plan_frontier(
+        ctx,
+        labels_in_order,
+        _definition("result = 1"),
+        _definition("result = '{{ mystery_root.value }}'"),
+        "https://app.example.com/dashboard",
+    )
+
+    assert frontier == "open_site"
+    assert labels == labels_in_order
+    assert ctx.frontier_resume_session_id is None
+
+
+def test_plan_frontier_edit_walks_back_when_live_page_left_the_recorded_anchor() -> None:
+    # Same recorded anchor, but the session has moved elsewhere — resuming there would run the
+    # edited block against a page we cannot show it started from, so walk back to the login.
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+
+    labels, _seed, frontier = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/settings",
+    )
+    assert frontier == "open_site"
+    assert labels == _LOGIN_THEN_INSPECT_LABELS
+
+
+def test_plan_frontier_edit_walks_back_when_no_anchor_was_recorded() -> None:
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/dashboard",
+    )
+    assert frontier == "open_site"
+
+
+def test_editing_a_block_drops_its_recorded_end_url_but_keeps_its_predecessor() -> None:
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_prefix_block_end_urls = {
+        "login_to_site": "https://app.example.com/dashboard",
+        "inspect_summary": "https://app.example.com/dashboard/logs",
+    }
+
+    _invalidate_verified_state_on_edit(ctx, old, new)
+
+    assert ctx.verified_prefix_block_end_urls == {"login_to_site": "https://app.example.com/dashboard"}
+
+
+def test_plan_frontier_edit_walks_back_when_only_the_spa_route_fragment_matches() -> None:
+    # A hash-routed app carries its whole route in the fragment, so two routes share a path.
+    old, new = _login_then_inspect_edit()
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
+    ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/#/dashboard"}
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        _LOGIN_THEN_INSPECT_LABELS,
+        old,
+        new,
+        "https://app.example.com/#/settings",
+    )
+    assert frontier == "open_site"
+
+
+def test_plan_frontier_edit_walks_back_when_the_browser_ran_past_the_edited_block() -> None:
+    # A URL-stable app leaves every block ending on the same page, so the predecessor's anchor
+    # matches from anywhere in the chain. The browser is really sitting after the last block, so
+    # resuming mid-chain would run the edited block against the wrong state.
+    def _definition(add_code: str) -> Any:
+        return _FakeDefinition(
+            [
+                _FakeBlock("open_dashboard", "code", {"code": "await page.goto('/')"}),
+                _FakeBlock("add_item", "code", {"code": add_code}),
+                _FakeBlock("checkout", "code", {"code": "await page.click('#buy')"}),
+            ]
+        )
+
+    labels_in_order = ["open_dashboard", "add_item", "checkout"]
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = list(labels_in_order)
+    ctx.verified_block_outputs = {"open_dashboard": "ok", "add_item": "ok"}
+    ctx.verified_prefix_block_end_urls = dict.fromkeys(labels_in_order, "https://app.example.com/")
+    ctx.verified_prefix_terminal_label = "checkout"
+
+    labels, _seed, frontier = _plan_frontier(
+        ctx,
+        labels_in_order,
+        _definition("await page.click('#add')"),
+        _definition("await page.click('#add-to-cart')"),
+        "https://app.example.com/",
+    )
+    assert frontier == "open_dashboard"
+    assert labels == labels_in_order
+
+
+def test_plan_frontier_edit_walks_back_when_the_frontier_would_refill_credentials() -> None:
+    # A frontier that refills credentials is replayed into a freshly minted browser, so the page
+    # we anchored against is not the page it will run in.
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("login_code", "code", {"code": "await page.locator('#pw').fill(creds.password)"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "navigation"),
+            _FakeBlock("login_code", "code", {"code": "await page.locator('#password').fill(creds.password)"}),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open_site", "login_code"]
+    ctx.verified_block_outputs = {"open_site": "ok"}
+    ctx.verified_prefix_block_end_urls = {"open_site": "https://app.example.com/signin"}
+
+    _labels, _seed, frontier = _plan_frontier(
+        ctx,
+        ["open_site", "login_code"],
+        old,
+        new,
+        "https://app.example.com/signin",
+    )
+    assert frontier == "open_site"
+
+
+@pytest.mark.asyncio
+async def test_runtime_page_url_is_read_from_the_browser_that_holds_the_verified_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A login-first replay runs in a browser the chat does not keep. That browser, not the chat's,
+    # is the one whose page can speak for where a resumed frontier would start.
+    ctx = _make_ctx(browser_session_id="pbs_scout")
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_fresh_run"
+    read_from: list[str | None] = []
+
+    async def fake_page_info(_ctx: object, session_id_override: str | None = None, **_kw: object) -> tuple[str, str]:
+        read_from.append(session_id_override)
+        return "https://app.example.com/dashboard", ""
+
+    monkeypatch.setattr(frontier_module, "_fallback_page_info", fake_page_info)
+    url = await frontier_module._frontier_runtime_page_url(ctx)
+
+    assert read_from == ["pbs_fresh_run"]
+    assert url == "https://app.example.com/dashboard"
+
+
+@pytest.mark.asyncio
+async def test_no_runtime_page_url_when_the_verified_browser_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx(browser_session_id="pbs_scout")
+    ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
+    ctx.verified_prefix_block_end_session_id = "pbs_gone"
+
+    async def unreadable(_ctx: object, session_id_override: str | None = None, **_kw: object) -> tuple[str, str]:
+        return "", ""
+
+    monkeypatch.setattr(frontier_module, "_fallback_page_info", unreadable)
+    assert await frontier_module._frontier_runtime_page_url(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_bails_does_not_leave_a_session_choice_for_the_next_one() -> None:
+    # The planner's choice is proven against one frontier only. A run that exits before using it
+    # must not leave it behind for a later run that was never checked against that browser.
+    from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
+
+    ctx = _make_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_login_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": [], "parameters": {}}, ctx)
+
+    assert result["ok"] is False
+    assert ctx.frontier_resume_session_id is None
+
+
+class _FakeRunBlockRow:
+    def __init__(self, label: str | None, final_url: str | None) -> None:
+        self.label = label
+        self.final_url = final_url
+
+
+def test_block_end_urls_keep_only_rows_that_can_anchor_a_resumed_frontier() -> None:
+    # A blank or unlabelled row would otherwise become an anchor the planner trusts.
+    rows = [
+        _FakeRunBlockRow("login_to_site", "https://app.example.com/dashboard"),
+        _FakeRunBlockRow("open_blank", "about:blank"),
+        _FakeRunBlockRow(None, "https://app.example.com/orphan"),
+        _FakeRunBlockRow("no_url_recorded", None),
+        _FakeRunBlockRow("inspect_summary", "https://app.example.com/dashboard/logs"),
+    ]
+
+    assert tools._block_end_urls_by_label(rows) == {
+        "login_to_site": "https://app.example.com/dashboard",
+        "inspect_summary": "https://app.example.com/dashboard/logs",
+    }
 
 
 def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() -> None:
@@ -1514,10 +1896,15 @@ async def test_recorded_failed_prefix_seeds_fresh_runtime_anchor_without_verifie
 # --------------------------------------------------------------------------- #
 
 
-def _wf_def(*specs: tuple[str, str, dict[str, Any]], params: list[_FakeParameter] | None = None) -> _FakeDefinition:
+def _wf_def(
+    *specs: tuple[str, str, dict[str, Any]],
+    params: list[_FakeParameter] | None = None,
+    workflow_system_prompt: str | None = None,
+) -> _FakeDefinition:
     return _FakeDefinition(
         [_FakeBlock(label, block_type, config) for label, block_type, config in specs],
         parameters=params,
+        workflow_system_prompt=workflow_system_prompt,
     )
 
 
@@ -1868,17 +2255,17 @@ def test_fused_and_split_leave_identical_verified_state() -> None:
 def test_parameter_definition_change_resets_verified_trust(
     prior_params: list[_FakeParameter], new_params: list[_FakeParameter]
 ) -> None:
-    # A block can reference a parameter by template without a config edit, so an
-    # added key may alter behavior the block-diff alone won't catch — fail closed.
-    # The shared fixture references {{ term }} but never `limit`, so the addition
-    # and removal cases exercise the unreferenced-key fail-closed path.
+    # A block can reference a parameter by template without a config edit, so a
+    # removed key — or an added key the verified blocks already name — may alter
+    # behavior the block-diff alone won't catch. The shared fixture references
+    # both {{ term }} and {{ limit }} so every case is a real behavior change.
     prior = _wf_def(
-        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("search", "navigation", {"prompt": "search {{ term }} {{ limit }}"}),
         ("extract", "extraction", {"prompt": "grab"}),
         params=prior_params,
     )
     new = _wf_def(
-        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        ("search", "navigation", {"prompt": "search {{ term }} {{ limit }}"}),
         ("extract", "extraction", {"prompt": "grab"}),
         params=new_params,
     )
@@ -1912,6 +2299,202 @@ def test_parameter_reorder_keeps_verified_trust() -> None:
     assert ctx.verified_prefix_labels == ["search"]
     assert ctx.workflow_verification_evidence.full_workflow_verified is True
     assert ctx.last_full_workflow_test_ok is True
+
+
+def test_appended_block_output_parameter_keeps_upstream_verified_prefix() -> None:
+    # Every block auto-declares a ``<label>_output`` parameter, so appending a
+    # block always adds a key. The verified upstream block cannot have referenced
+    # a key that did not exist when it was verified, so its trust must survive.
+    prior = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        params=[_FakeParameter("app_credentials"), _FakeParameter("sign_in_output")],
+    )
+    new = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        ("read_summary", "code", {"code": "print(1)"}),
+        params=[
+            _FakeParameter("app_credentials"),
+            _FakeParameter("sign_in_output"),
+            _FakeParameter("read_summary_output"),
+        ],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == ["sign_in"]
+    assert ctx.workflow_verification_evidence.block_verified == ["sign_in"]
+    # The appended block has never run, so the end-to-end claim must still drop.
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.last_full_workflow_test_ok is False
+
+    labels, _seed, frontier = _plan_frontier(ctx, ["sign_in", "read_summary"], prior, new)
+    assert labels == ["read_summary"]
+    assert frontier == "read_summary"
+
+
+def test_parameter_named_only_by_workflow_system_prompt_resets_verified_trust() -> None:
+    # A definition-level prompt is inherited by every block, trusted ones included,
+    # so a key named there changes what an already-verified block renders even
+    # though no block config mentions it.
+    prior = _wf_def(("sign_in", "login", {"url": "https://example.com/login"}))
+    new = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        params=[_FakeParameter("locale", "en-US")],
+        workflow_system_prompt="Answer in {{ locale }}",
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.workflow_verification_evidence.block_verified == []
+
+
+def test_appended_block_output_parameter_survives_unrelated_workflow_system_prompt() -> None:
+    # The definition-level scan must not read the parameter declarations themselves,
+    # or every added key would self-match and wipe the prefix on any append.
+    prior = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        params=[_FakeParameter("locale", "en-US"), _FakeParameter("sign_in_output")],
+        workflow_system_prompt="Answer in {{ locale }}",
+    )
+    new = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        ("read_summary", "code", {"code": "print(1)"}),
+        params=[
+            _FakeParameter("locale", "en-US"),
+            _FakeParameter("sign_in_output"),
+            _FakeParameter("read_summary_output"),
+        ],
+        workflow_system_prompt="Answer in {{ locale }}",
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == ["sign_in"]
+    assert ctx.workflow_verification_evidence.block_verified == ["sign_in"]
+
+
+def test_parameter_removed_while_another_parameter_names_it_resets_verified_trust() -> None:
+    # A credential parameter holds the *key* of another parameter (url_parameter_key,
+    # totp_secret_key), resolved at runtime. Removing that key changes what the
+    # verified login block resolves, and it appears in no block config.
+    prior = _wf_def(
+        ("sign_in", "login", {"parameter_keys": ["app_creds"]}),
+        params=[
+            _FakeParameter("login_url", "https://example.com/login"),
+            _FakeParameter("app_creds", url_parameter_key="login_url"),
+        ],
+    )
+    new = _wf_def(
+        ("sign_in", "login", {"parameter_keys": ["app_creds"]}),
+        params=[_FakeParameter("app_creds", url_parameter_key="login_url")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.workflow_verification_evidence.block_verified == []
+
+
+def test_parameter_check_fails_closed_when_definition_dump_raises() -> None:
+    class _ExplodingDefinition(_FakeDefinition):
+        def model_dump(self, mode: str = "json", exclude: set[str] | None = None) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+    prior = _wf_def(("sign_in", "login", {"url": "https://example.com/login"}))
+    new = _ExplodingDefinition(
+        [_FakeBlock("sign_in", "login", {"url": "https://example.com/login"})],
+        parameters=[_FakeParameter("locale", "en-US")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+    assert ctx.workflow_verification_evidence.block_verified == []
+
+
+def test_non_string_parameter_key_resets_verified_trust() -> None:
+    prior = _wf_def(("sign_in", "login", {"url": "https://example.com/login"}))
+    new = _wf_def(
+        ("sign_in", "login", {"url": "https://example.com/login"}),
+        params=[_FakeParameter(cast(str, None))],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["sign_in"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+
+
+def test_added_parameter_named_by_untrusted_upstream_block_resets_verified_trust() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "{{ login_url }}"}),
+        ("submit", "navigation", {"prompt": "submit"}),
+    )
+    new = _wf_def(
+        ("open", "goto_url", {"url": "{{ login_url }}"}),
+        ("submit", "navigation", {"prompt": "submit"}),
+        params=[_FakeParameter("login_url", "https://example.com/login")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, [], current_url=None, full=False)
+    ctx.workflow_verification_evidence.block_verified = ["submit"]
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.workflow_verification_evidence.block_verified == []
+
+
+def test_non_ascii_parameter_key_reference_resets_verified_trust() -> None:
+    # json.dumps escapes non-ASCII, so a naive substring test would miss the reference.
+    prior = _wf_def(("login", "navigation", {"prompt": "log in with {{ contraseña }}"}))
+    new = _wf_def(
+        ("login", "navigation", {"prompt": "log in with {{ contraseña }}"}),
+        params=[_FakeParameter("contraseña", "hunter2")],
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["login"], current_url="https://example.com/home", full=True)
+
+    _invalidate_verified_state_on_edit(ctx, prior, new)
+
+    assert ctx.verified_prefix_labels == []
+
+
+def test_removed_parameter_resets_verified_trust_only_when_a_verified_block_named_it() -> None:
+    prior = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        params=[_FakeParameter("term", "cats"), _FakeParameter("stale_output")],
+    )
+    unreferenced_removed = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        params=[_FakeParameter("term", "cats")],
+    )
+    referenced_removed = _wf_def(
+        ("search", "navigation", {"prompt": "search {{ term }}"}),
+        params=[_FakeParameter("stale_output")],
+    )
+
+    kept_ctx = _make_ctx()
+    _seed_verified(kept_ctx, ["search"], current_url="https://example.com/s", full=True)
+    _invalidate_verified_state_on_edit(kept_ctx, prior, unreferenced_removed)
+    assert kept_ctx.verified_prefix_labels == ["search"]
+
+    reset_ctx = _make_ctx()
+    _seed_verified(reset_ctx, ["search"], current_url="https://example.com/s", full=True)
+    _invalidate_verified_state_on_edit(reset_ctx, prior, referenced_removed)
+    assert reset_ctx.verified_prefix_labels == []
+    assert reset_ctx.workflow_verification_evidence.block_verified == []
 
 
 def test_reorder_resets_verified_trust() -> None:

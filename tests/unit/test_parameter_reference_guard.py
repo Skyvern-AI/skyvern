@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 
 from skyvern.core.script_generations.generate_script import (
+    ScriptBlockSource,
     _collect_declared_param_keys,
     _collect_upstream_schema_keys,
+    generate_workflow_script_python_code,
 )
 from skyvern.core.script_generations.parameter_reference_guard import (
     HallucinatedParameterError,
@@ -227,6 +229,78 @@ def test_collect_upstream_schema_keys_parses_json_string_schema() -> None:
 def test_collect_upstream_schema_keys_ignores_invalid_json_string_schema() -> None:
     blocks = [{"data_schema": "this is not json"}]
     assert _collect_upstream_schema_keys(blocks) == frozenset()
+
+
+CARRIED_FORWARD_FIELD = "what_is_the_full_name_of_the_person_to_search_for"
+
+CACHED_BLOCK_CODE = f'''@skyvern.cached(cache_key="search_person")
+async def search_person(page, context):
+    await page.fill(
+        selector="xpath=//input[@id='q']",
+        value=context.parameters["{CARRIED_FORWARD_FIELD}"],
+        prompt="What is the full name of the person to search for?",
+    )
+'''
+
+
+@pytest.mark.asyncio
+async def test_carried_forward_cached_block_does_not_fail_codegen() -> None:
+    """SKY-13946: a cached block reused verbatim must not trip the guard.
+
+    The block's actions did not run this time, so the schema this run synthesizes
+    cannot declare the field its cached code references — enforcing against it
+    failed codegen on every replay and permanently blocked caching.
+    """
+    workflow = {
+        "workflow_permanent_id": "wpid_test",
+        "title": "people search",
+        "workflow_definition": {
+            "parameters": [
+                {"key": key, "parameter_type": "workflow", "workflow_parameter_type": "string"}
+                for key in ("firstName", "lastName")
+            ]
+        },
+    }
+    cached_blocks = {
+        "search_person": ScriptBlockSource(
+            label="search_person",
+            code=CACHED_BLOCK_CODE,
+            run_signature="await search_person(page, context)",
+            workflow_run_id="wr_previous",
+            workflow_run_block_id="wrb_1",
+            input_fields=[CARRIED_FORWARD_FIELD],
+        )
+    }
+
+    result = await generate_workflow_script_python_code(
+        file_name="main.py",
+        workflow_run_request={"parameters": {}},
+        workflow=workflow,
+        blocks=[
+            {
+                "block_type": "task",
+                "label": "review_results",
+                "task_id": "tsk_review",
+                "workflow_run_block_id": "wrb_2",
+                "navigation_goal": "Open the first result",
+                "url": "https://example.com/results",
+            }
+        ],
+        actions_by_task={
+            "tsk_review": [
+                {
+                    "action_type": "click",
+                    "action_id": "act_1",
+                    "xpath": "//a[1]",
+                    "intention": "Open the first result",
+                }
+            ]
+        },
+        cached_blocks=cached_blocks,
+        updated_block_labels={"review_results"},
+    )
+
+    assert CARRIED_FORWARD_FIELD in result.source_code
 
 
 def test_collect_upstream_schema_keys_recurses_into_loop_blocks() -> None:

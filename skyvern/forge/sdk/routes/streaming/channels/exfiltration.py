@@ -17,10 +17,11 @@ import enum
 import json
 import time
 import typing as t
+import uuid
 import weakref
 
 import structlog
-from playwright.async_api import CDPSession, ConsoleMessage, Page
+from playwright.async_api import CDPSession, ConsoleMessage, Frame, Page
 
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
@@ -43,13 +44,13 @@ class ExfiltratedEvent:
     params: dict = dataclasses.field(default_factory=dict)
     source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
     timestamp: float = dataclasses.field(default_factory=lambda: time.time())  # seconds since epoch
-    # Monotonic order assigned at the earliest synchronous capture point so the
-    # interpreter can restore chronological order after async materialization
-    # (e.g. console json_value round-trips) reorders events under load.
+    # Monotonic order assigned near the capture point so the interpreter can restore chronological order; queue-drained events are stamped at drain time.
     capture_seq: int = -1
 
 
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
+
+_NAV_COMMIT_EVENTS = ("nav:frame_navigated", "nav:navigated_within_document")
 
 
 @dataclasses.dataclass
@@ -66,7 +67,29 @@ class ExfiltrationChannel(CdpChannel):
     BINDING_NAME: t.ClassVar[str] = "__skyvern_exfiltrate_event"
     CONSOLE_DEDUP_TTL_SECONDS: t.ClassVar[float] = 5.0
     REFRESH_INTERVAL_SECONDS: t.ClassVar[float] = 1.0
+    # Tighter than the re-injection refresh so a navigation destroys few queued events.
+    QUEUE_DRAIN_INTERVAL_SECONDS: t.ClassVar[float] = 0.25
+    QUEUE_DRAIN_TIMEOUT_SECONDS: t.ClassVar[float] = 3.0
+    # Mirrors EXFIL_QUEUE_LIMIT in exfiltrate.js; the drained list is page-controlled input.
+    QUEUE_DRAIN_MAX_ITEMS: t.ClassVar[int] = 1000
+    SEEN_EVENT_DEDUP_KEY_LIMIT: t.ClassVar[int] = 4096
     NETWORK_ACTIVITY_THROTTLE_SECONDS: t.ClassVar[float] = 1.0
+    # Ownership token check: only the channel whose token the page carries may drain. The cap holds at the source so at
+    # most `limit` items ever cross CDP even if a page grows the queue past the in-page bound; the overflow is dropped.
+    _DRAIN_QUEUE_JS: t.ClassVar[str] = (
+        "([token, limit]) => {"
+        " if (window.__skyvern_exfil_owner !== token) return null;"
+        " const q = window.__skyvern_exfil_queue;"
+        " if (!Array.isArray(q) || q.length === 0) return [];"
+        " const out = q.splice(0, limit);"
+        " q.length = 0;"
+        " return out;"
+        " }"
+    )
+    # The queue outlives recordings, so an adopting channel discards the backlog instead of replaying it as phantom steps.
+    _DISCARD_QUEUE_JS: t.ClassVar[str] = (
+        "() => { const q = window.__skyvern_exfil_queue; if (Array.isArray(q)) q.length = 0; }"
+    )
     _active_binding_channels: t.ClassVar[weakref.WeakKeyDictionary[Page, "ExfiltrationChannel"]] = (
         weakref.WeakKeyDictionary()
     )
@@ -80,13 +103,17 @@ class ExfiltrationChannel(CdpChannel):
         self.on_event = on_event
         self._page_console_captures: weakref.WeakKeyDictionary[Page, PageConsoleCapture] = weakref.WeakKeyDictionary()
         self._recent_console_event_fingerprints: dict[str, float] = {}
+        self._seen_event_dedup_keys: dict[tuple[str, int], None] = {}
         self._pending_event_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task | None = None
+        self._drain_task: asyncio.Task | None = None
+        self._pending_nav_tasks: weakref.WeakKeyDictionary[Page, asyncio.Task] = weakref.WeakKeyDictionary()
         self._network_activity_count = 0
         self._last_network_activity_emit = 0.0
         self._network_activity_flush_task: asyncio.Task[None] | None = None
         self._capture_paused = False
         self._capture_seq = 0
+        self._drain_token = uuid.uuid4().hex
 
         super().__init__(vnc_channel=vnc_channel)
 
@@ -106,10 +133,11 @@ class ExfiltrationChannel(CdpChannel):
             return
         self.on_event(messages)
 
-    def _track_event_task(self, coro: t.Coroutine[t.Any, t.Any, None]) -> None:
+    def _track_event_task(self, coro: t.Coroutine[t.Any, t.Any, None]) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
         self._pending_event_tasks.add(task)
         task.add_done_callback(self._on_event_task_done)
+        return task
 
     def _on_event_task_done(self, task: asyncio.Task[None]) -> None:
         self._pending_event_tasks.discard(task)
@@ -208,7 +236,25 @@ class ExfiltrationChannel(CdpChannel):
             return [cls._strip_none(item) for item in value]
         return value
 
+    def _event_dedup_key(self, event_data: dict[str, t.Any]) -> tuple[str, int] | None:
+        doc_id = event_data.get("exfilDocId")
+        seq = event_data.get("exfilSeq")
+        # bool is excluded: a forged {"exfilSeq": true} would hash-collide with the genuine seq == 1.
+        if isinstance(doc_id, str) and isinstance(seq, int) and not isinstance(seq, bool):
+            return (doc_id, seq)
+        return None
+
     def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        # Stamped events dedup exactly across transports; the fingerprint heuristic below is only for unstamped (older in-flight) events.
+        dedup_key = self._event_dedup_key(event_data)
+        if dedup_key is not None:
+            if dedup_key in self._seen_event_dedup_keys:
+                return False
+            self._seen_event_dedup_keys[dedup_key] = None
+            while len(self._seen_event_dedup_keys) > self.SEEN_EVENT_DEDUP_KEY_LIMIT:
+                self._seen_event_dedup_keys.pop(next(iter(self._seen_event_dedup_keys)))
+            return True
+
         fingerprint = self._console_fingerprint(event_data)
 
         now = time.monotonic()
@@ -304,7 +350,11 @@ class ExfiltrationChannel(CdpChannel):
             LOG.debug(f"{self.class_name} failed to expose exfiltration binding", page_url=page.url, exc_info=True)
 
     async def _install_exfiltration_script(self, page: Page, *, add_init_script: bool) -> None:
-        binding_script = f"window.__skyvern_exfiltration_binding_name = {json.dumps(self.BINDING_NAME)};"
+        # The owner token rides along so every document this page loads is claimed for this channel when its init scripts run.
+        binding_script = (
+            f"window.__skyvern_exfiltration_binding_name = {json.dumps(self.BINDING_NAME)};"
+            f" window.__skyvern_exfil_owner = {json.dumps(self._drain_token)};"
+        )
 
         if add_init_script:
             await page.add_init_script(binding_script)
@@ -333,6 +383,58 @@ class ExfiltrationChannel(CdpChannel):
                         exc_info=True,
                     )
 
+    async def _drain_page_queue(self, page: Page) -> None:
+        if page.url.startswith("devtools:"):
+            return
+
+        # Skip unadopted pages to avoid an evaluate round-trip; the owner token check inside _DRAIN_QUEUE_JS is the correctness guard.
+        if page not in self._page_console_captures:
+            return
+
+        # The queue is per-document, so every frame (exfiltrate.js is injected into all of them) has its own; iframe
+        # interactions are exactly where the push transports tend to be the failing leg this drain backstops.
+        await asyncio.gather(*(self._drain_frame_queue(frame) for frame in page.frames), return_exceptions=True)
+
+    async def _drain_frame_queue(self, frame: Frame) -> None:
+        try:
+            items = await asyncio.wait_for(
+                frame.evaluate(self._DRAIN_QUEUE_JS, [self._drain_token, self.QUEUE_DRAIN_MAX_ITEMS]),
+                timeout=self.QUEUE_DRAIN_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            # Expected on a detached frame or during navigation teardown; the drain loop retries.
+            LOG.debug(f"{self.class_name} failed to drain exfiltration queue", exc_info=True, **self.identity)
+            return
+
+        if not isinstance(items, list):
+            return
+
+        if len(items) > self.QUEUE_DRAIN_MAX_ITEMS:
+            items = items[: self.QUEUE_DRAIN_MAX_ITEMS]
+
+        for item in items:
+            event_data = self._parse_exfil_payload(item)
+            if event_data is None:
+                continue
+            self._emit_console_event(event_data, self._next_capture_seq())
+
+    async def _drain_all_pages(self) -> None:
+        browser_context = self.browser_context
+        if not browser_context:
+            return
+        await asyncio.gather(
+            *(self._drain_page_queue(page) for page in list(browser_context.pages)), return_exceptions=True
+        )
+
+    async def _drain_queue_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.QUEUE_DRAIN_INTERVAL_SECONDS)
+            try:
+                await self._drain_all_pages()
+            except Exception:
+                # A dead loop silently disables the only working transport on suppressing builds, so never let it die.
+                LOG.debug(f"{self.class_name} exfiltration drain loop iteration failed", exc_info=True, **self.identity)
+
     def _handle_network_activity(self) -> None:
         self._network_activity_count += 1
 
@@ -359,30 +461,51 @@ class ExfiltrationChannel(CdpChannel):
         self._network_activity_count = 0
         self._handle_cdp_event("net:activity", {"count": count})
 
+    def _emit_cdp_event(self, event_name: str, params: dict) -> None:
+        self._emit_events(
+            [
+                ExfiltratedEvent(
+                    kind="exfiltrated-event",
+                    event_name=event_name,
+                    params=params,
+                    source=ExfiltratedEventSource.CDP,
+                    timestamp=time.time(),
+                    capture_seq=self._next_capture_seq(),
+                ),
+            ]
+        )
+
+    async def _drain_then_emit_nav_start(self, page: Page, event_name: str, params: dict) -> None:
+        # Drain before emitting the nav-start so the click that triggered it takes a lower capture_seq (click before nav).
+        await self._drain_page_queue(page)
+        self._emit_cdp_event(event_name, params)
+
+    async def _emit_cdp_event_after(self, pending: asyncio.Task, event_name: str, params: dict) -> None:
+        # The commit event must land after the nav-start it pairs with, or the interpreter (which sorts by capture_seq)
+        # sees the commit set last_url first and drops the URL-change step the nav-start would have produced.
+        with contextlib.suppress(Exception):
+            await pending
+        self._emit_cdp_event(event_name, params)
+
     def _handle_cdp_event(self, event_name: str, params: dict) -> None:
         LOG.debug(f"{self.class_name} cdp event captured: {event_name}", params=params)
 
-        messages = [
-            ExfiltratedEvent(
-                kind="exfiltrated-event",
-                event_name=event_name,
-                params=params,
-                source=ExfiltratedEventSource.CDP,
-                timestamp=time.time(),
-                capture_seq=self._next_capture_seq(),
-            ),
-        ]
+        page = self.page
+        on_page = page is not None and not page.url.startswith("devtools:")
 
-        self._emit_events(messages)
+        if event_name == "nav:frame_started_navigating" and on_page:
+            task = self._track_event_task(self._drain_then_emit_nav_start(page, event_name, params))
+            self._pending_nav_tasks[page] = task
+            return
 
-        if event_name in ("nav:frame_navigated", "nav:navigated_within_document"):
-            page = self.page
-            if page and not page.url.startswith("devtools:"):
-                self._schedule_page_rearm(
-                    page,
-                    event_name=event_name,
-                    wait_for_load=event_name == "nav:frame_navigated",
-                )
+        pending_nav = self._pending_nav_tasks.get(page) if page else None
+        if event_name in _NAV_COMMIT_EVENTS and pending_nav is not None and not pending_nav.done():
+            self._track_event_task(self._emit_cdp_event_after(pending_nav, event_name, params))
+        else:
+            self._emit_cdp_event(event_name, params)
+
+        if event_name in _NAV_COMMIT_EVENTS and on_page:
+            self._schedule_page_rearm(page, event_name=event_name, wait_for_load=event_name == "nav:frame_navigated")
 
     def _schedule_page_rearm(self, page: Page, *, event_name: str, wait_for_load: bool) -> None:
         if page.url.startswith("devtools:"):
@@ -428,6 +551,7 @@ class ExfiltrationChannel(CdpChannel):
                 class_name=self.class_name,
                 event_name=event_name,
                 url=page.url,
+                **self.identity,
             )
 
             if wait_for_load:
@@ -440,6 +564,7 @@ class ExfiltrationChannel(CdpChannel):
                         event_name=event_name,
                         url=page.url,
                         exc_info=True,
+                        **self.identity,
                     )
 
             try:
@@ -453,6 +578,7 @@ class ExfiltrationChannel(CdpChannel):
                     event_name=event_name,
                     url=page.url,
                     exc_info=True,
+                    **self.identity,
                 )
         finally:
             self._rearm_in_flight_pages.pop(page, None)
@@ -465,14 +591,14 @@ class ExfiltrationChannel(CdpChannel):
         if page.url.startswith("devtools:"):
             return self
 
-        LOG.info(f"{self.class_name} adorning page.", url=page.url)
+        LOG.info(f"{self.class_name} adorning page.", url=page.url, **self.identity)
 
         await page.evaluate(self.js("adorn"))
         if page not in self._adorn_init_script_pages:
             await page.add_init_script(self.js("adorn"))
             self._adorn_init_script_pages.add(page)
 
-        LOG.info(f"{self.class_name} adornment complete on page.", url=page.url)
+        LOG.info(f"{self.class_name} adornment complete on page.", url=page.url, **self.identity)
 
         return self
 
@@ -514,7 +640,7 @@ class ExfiltrationChannel(CdpChannel):
             await self._install_exfiltration_script(page, add_init_script=False)
             return self
 
-        LOG.info(f"{self.class_name} setting up exfiltration on new page.", url=page.url)
+        LOG.info(f"{self.class_name} setting up exfiltration on new page.", url=page.url, **self.identity)
 
         await self._ensure_binding(page)
 
@@ -522,6 +648,17 @@ class ExfiltrationChannel(CdpChannel):
             self._handle_console_event(msg)
 
         page.on("console", console_listener)
+
+        # Discard events buffered between recordings before claiming the page, so they don't replay as phantom steps.
+        try:
+            await page.evaluate(self._DISCARD_QUEUE_JS)
+        except Exception:
+            LOG.debug(
+                f"{self.class_name} failed to discard stale exfiltration queue",
+                url=page.url,
+                exc_info=True,
+                **self.identity,
+            )
 
         await self._install_exfiltration_script(page, add_init_script=True)
 
@@ -532,7 +669,7 @@ class ExfiltrationChannel(CdpChannel):
         except Exception:
             LOG.debug(f"{self.class_name} failed to attach page CDP EXFIL listener", page_url=page.url, exc_info=True)
 
-        LOG.info(f"{self.class_name} setup complete on page.", url=page.url)
+        LOG.info(f"{self.class_name} setup complete on page.", url=page.url, **self.identity)
 
         return self
 
@@ -541,12 +678,12 @@ class ExfiltrationChannel(CdpChannel):
         if page.url.startswith("devtools:"):
             return self
 
-        LOG.info(f"{self.class_name} adding decoration to page.", url=page.url)
+        LOG.info(f"{self.class_name} adding decoration to page.", url=page.url, **self.identity)
 
         await page.add_init_script(self.js("decorate"))
         await page.evaluate(self.js("decorate"))
 
-        LOG.info(f"{self.class_name} decoration setup complete on page.", url=page.url)
+        LOG.info(f"{self.class_name} decoration setup complete on page.", url=page.url, **self.identity)
 
         return self
 
@@ -555,7 +692,7 @@ class ExfiltrationChannel(CdpChannel):
         if page.url.startswith("devtools:"):
             return self
 
-        LOG.info(f"{self.class_name} removing decoration from page.", url=page.url)
+        LOG.info(f"{self.class_name} removing decoration from page.", url=page.url, **self.identity)
 
         # Best-effort cleanup: the page's target can close mid-recording (take-control
         # swaps, navigations, bot-detection pages), and Playwright then raises
@@ -568,7 +705,7 @@ class ExfiltrationChannel(CdpChannel):
             LOG.debug(f"{self.class_name} failed to remove decoration from page", url=page.url, exc_info=True)
             return self
 
-        LOG.info(f"{self.class_name} decoration removed from page.", url=page.url)
+        LOG.info(f"{self.class_name} decoration removed from page.", url=page.url, **self.identity)
 
         return self
 
@@ -616,7 +753,7 @@ class ExfiltrationChannel(CdpChannel):
         browser_context = self.browser_context
 
         if not browser_context:
-            LOG.error(f"{self.class_name} no browser context to enable adornment.")
+            LOG.error(f"{self.class_name} no browser context to enable adornment.", **self.identity)
             return self
 
         tasks: list[asyncio.Task] = []
@@ -633,7 +770,7 @@ class ExfiltrationChannel(CdpChannel):
         browser_context = self.browser_context
 
         if not browser_context:
-            LOG.error(f"{self.class_name} no browser context to enable console events.")
+            LOG.error(f"{self.class_name} no browser context to enable console events.", **self.identity)
             return self
 
         for page in browser_context.pages:
@@ -647,7 +784,7 @@ class ExfiltrationChannel(CdpChannel):
         browser_context = self.browser_context
 
         if not browser_context:
-            LOG.error(f"{self.class_name} no browser context to enable decoration.")
+            LOG.error(f"{self.class_name} no browser context to enable decoration.", **self.identity)
             return self
 
         for page in browser_context.pages:
@@ -658,7 +795,7 @@ class ExfiltrationChannel(CdpChannel):
         return self
 
     async def start(self) -> t.Self:
-        LOG.info(f"{self.class_name} starting.")
+        LOG.info(f"{self.class_name} starting.", **self.identity)
 
         await self.enable_cdp_events()
 
@@ -671,10 +808,13 @@ class ExfiltrationChannel(CdpChannel):
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = asyncio.create_task(self._refresh_exfiltration_loop())
 
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = asyncio.create_task(self._drain_queue_loop())
+
         return self
 
     async def stop(self) -> t.Self:
-        LOG.info(f"{self.class_name} stopping.")
+        LOG.info(f"{self.class_name} stopping.", **self.identity)
 
         try:
             if self._refresh_task:
@@ -682,6 +822,15 @@ class ExfiltrationChannel(CdpChannel):
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._refresh_task
                 self._refresh_task = None
+
+            if self._drain_task:
+                self._drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._drain_task
+                self._drain_task = None
+
+            # Final flush so events since the last drain tick reach the recording before teardown.
+            await self._drain_all_pages()
 
             if self._network_activity_flush_task and not self._network_activity_flush_task.done():
                 self._network_activity_flush_task.cancel()
@@ -747,6 +896,6 @@ class ExfiltrationChannel(CdpChannel):
             self._closing = True
             await self.close()
 
-        LOG.info(f"{self.class_name} stopped.")
+        LOG.info(f"{self.class_name} stopped.", **self.identity)
 
         return self

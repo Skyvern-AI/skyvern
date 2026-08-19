@@ -331,7 +331,6 @@ function BrowserStream({
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
-  const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
   const [terminalDiagnostic, setTerminalDiagnostic] =
@@ -437,15 +436,6 @@ function BrowserStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
 
-  // effect for vnc disconnects only
-  useEffect(() => {
-    if (prevVncConnectedRef.current && !isVncConnected) {
-      setVncDisconnectedTrigger((x) => x + 1);
-      onClose?.();
-    }
-    prevVncConnectedRef.current = isVncConnected;
-  }, [isVncConnected, onClose]);
-
   // message channel reconnect policy
   useEffect(() => {
     const messageJustClosed =
@@ -513,6 +503,7 @@ function BrowserStream({
       }
 
       let cancelled = false;
+      let didDisconnect = false;
 
       async function setupVnc() {
         if (rfbRef.current && isVncConnected) {
@@ -601,9 +592,12 @@ function BrowserStream({
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
+          if (cancelled || didDisconnect) return;
+          didDisconnect = true;
           setIsVncConnected(false);
           setIsCanvasReady(false);
-          if (cancelled) return;
+          setVncDisconnectedTrigger((x) => x + 1);
+          onClose?.();
           const clean = Boolean(e.detail?.clean);
           setTerminalDiagnostic(
             (prev) =>

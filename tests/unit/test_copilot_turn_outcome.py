@@ -5,7 +5,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     build_turn_outcome,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 
 
 def test_build_minimal_turn_outcome_sets_signature_and_inherited() -> None:
@@ -44,3 +44,12 @@ def test_turn_outcome_json_round_trip() -> None:
     payload = outcome.model_dump(mode="json")
     restored = TurnOutcome.model_validate(payload)
     assert restored == outcome
+
+
+def test_turn_outcome_round_trips_connected_account_choices() -> None:
+    outcome = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=[ConnectedAccountChoice(connection_id="goac_1", name="Sheets", state="active")],
+    )
+
+    assert TurnOutcome.model_validate(outcome.model_dump(mode="json")) == outcome

@@ -470,7 +470,7 @@ class DragAction(Action):
     action_type: ActionType = ActionType.DRAG
     start_x: int | None = None
     start_y: int | None = None
-    path: list[tuple[int, int]] = []
+    path: list[tuple[int, int]] = Field(default_factory=list, max_length=1_000)
 
 
 class VerificationCodeAction(Action):

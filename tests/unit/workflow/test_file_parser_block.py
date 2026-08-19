@@ -21,6 +21,7 @@ import docx
 import pandas as pd
 import pytest
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -65,6 +66,26 @@ def _mock_workflow_run_context() -> MagicMock:
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
     return ctx
+
+
+async def _execute_with_downloaded_file(
+    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> BlockResult:
+    workflow_run_context = _mock_workflow_run_context()
+    monkeypatch.setattr(
+        FileParserBlock,
+        "get_workflow_run_context",
+        lambda _self, _workflow_run_id: workflow_run_context,
+    )
+    monkeypatch.setattr(
+        block_module,
+        "resolve_local_or_download_file",
+        AsyncMock(return_value=str(file_path)),
+    )
+    return await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+    )
 
 
 def _create_docx(
@@ -158,6 +179,60 @@ class TestValidateFileType:
         block = _make_file_parser_block("https://example.com/empty.docx", FileType.DOCX)
         with pytest.raises(InvalidFileType):
             block.validate_file_type("https://example.com/empty.docx", str(path))
+
+
+@pytest.mark.asyncio
+class TestFileParserBlockAutoDetectExecution:
+    async def test_docx_downloaded_from_extensionless_url_is_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == {"value": "Hello\nWorld"}
+
+    async def test_legacy_doc_reports_conversion_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "document.doc"
+        path.write_bytes(b"not a real legacy document")
+        block = _make_file_parser_block("https://example.com/document.doc", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "Legacy .doc format" in result.failure_reason
+        assert "convert the file to .docx" in result.failure_reason
+
+    async def test_unknown_binary_reports_auto_detect_not_csv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
+        assert "File contains binary data" in result.failure_reason
+
+    async def test_legacy_csv_default_unknown_binary_reports_auto_detect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.CSV)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
 
 
 @pytest.mark.asyncio

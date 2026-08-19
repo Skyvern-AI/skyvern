@@ -28,6 +28,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    key_is_org_scoped,
     presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
@@ -752,6 +753,10 @@ class GcsStorage(BaseStorage):
             return None
         return signed_urls[0], uploaded_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -914,13 +919,13 @@ class GcsStorage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.object_path.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.object_path, allowed_prefixes):
                 return
 
         # Artifacts bucket: object paths use v1/{env}/{org}/
         if parsed_uri.bucket == settings.GCS_BUCKET_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.object_path.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.object_path, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

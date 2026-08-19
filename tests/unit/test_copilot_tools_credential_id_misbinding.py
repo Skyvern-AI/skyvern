@@ -434,10 +434,6 @@ async def test_update_workflow_persists_credential_id_misbinding_without_authori
                 ),
             ),
         ),
-        patch(
-            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
-            new=AsyncMock(return_value="copilot"),
-        ),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
@@ -496,10 +492,6 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
                     sequential_key=None,
                 ),
             ),
-        ),
-        patch(
-            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
-            new=AsyncMock(return_value="copilot"),
         ),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,

@@ -114,6 +114,11 @@ def test_google_drive_extract_folder_id(value: str, expected: str) -> None:
     assert google_drive_service.extract_folder_id(value) == expected
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_google_drive_extract_folder_id_treats_blank_as_my_drive_root(value: str | None) -> None:
+    assert google_drive_service.extract_folder_id(value) is None
+
+
 def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
     with pytest.raises(ValueError, match="folder URL"):
         google_drive_service.extract_folder_id("https://drive.google.com/file/d/file_123/view")
@@ -122,6 +127,21 @@ def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
 def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
     with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
         google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+
+
+@pytest.mark.parametrize("builder_name", ["build_multipart_upload_request", "build_resumable_initiate_request"])
+def test_google_drive_upload_omits_parents_without_folder_id(builder_name: str, tmp_path) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+
+    request = getattr(google_drive_service, builder_name)(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id=None,
+    )
+
+    assert b'"parents"' not in request.content
+    assert b'"report.txt"' in request.content
 
 
 @pytest.mark.parametrize(

@@ -729,6 +729,101 @@ describe("RunView failure banner", () => {
     expect(scope.queryByText("canceled by user")).toBeNull();
   });
 
+  test("a code block failure leads with its error state, line and guidance", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "code block failed. failure reason: CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_code",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: ["user_code_error"],
+          failure_reason:
+            "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+        }),
+      ),
+    ];
+    const { container } = renderRunView({ onFix: vi.fn(), onRetry: vi.fn() });
+    const banner = within(within(container).getByRole("alert"));
+
+    expect(
+      banner.getByText("The block's code raised NameError"),
+    ).not.toBeNull();
+    expect(banner.getByText("Line 6")).not.toBeNull();
+    expect(banner.getByText("Error code user_code_error")).not.toBeNull();
+    expect(
+      banner.getByText(/Open the block and fix the line that raised/),
+    ).not.toBeNull();
+    expect(banner.getByText("Technical details")).not.toBeNull();
+    // A code defect is still the author's to fix, so both CTAs stay.
+    expect(
+      banner.getByRole("button", { name: "Fix with Copilot" }),
+    ).not.toBeNull();
+  });
+
+  test("a sandbox fault offers a retry instead of a copilot fix", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason:
+        "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry.",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_code",
+          block_type: "code",
+          status: Status.Failed,
+          error_codes: ["runner_unavailable"],
+          failure_reason:
+            "Secure CodeBlock runner is unavailable. Please retry.",
+        }),
+      ),
+    ];
+    const onFix = vi.fn();
+    const onRetry = vi.fn();
+    const { container } = renderRunView({ onFix, onRetry });
+    const banner = within(within(container).getByRole("alert"));
+
+    expect(banner.getByText("The code sandbox was unreachable")).not.toBeNull();
+    expect(
+      banner.queryByRole("button", { name: "Fix with Copilot" }),
+    ).toBeNull();
+
+    const retry = banner.getByRole("button", { name: "Retry" });
+    expect(retry.className).toContain("bg-cta");
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  test("a code block that continued on failure does not retitle the banner", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "task block failed. failure reason: Login rejected",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_code",
+          block_type: "code",
+          status: Status.Failed,
+          continue_on_failure: true,
+          error_codes: ["runner_unavailable"],
+          failure_reason:
+            "Secure CodeBlock runner is unavailable. Please retry.",
+        }),
+      ),
+    ];
+    const { container } = renderRunView();
+    const banner = within(within(container).getByRole("alert"));
+
+    expect(banner.getByText("task block failed")).not.toBeNull();
+    expect(banner.queryByText("The code sandbox was unreachable")).toBeNull();
+  });
+
   test("hides the run failure banner outside the Timeline view", () => {
     seedCompletedRun({
       status: Status.Failed,

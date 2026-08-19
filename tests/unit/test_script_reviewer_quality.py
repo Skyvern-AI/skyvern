@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from skyvern.core.script_generations.script_validators import validate_missing_selectors
+from skyvern.forge.prompts import prompt_engine
 from skyvern.services.script_reviewer import ScriptReviewer
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "skyvern" / "forge" / "prompts" / "skyvern" / "script-reviewer.j2"
@@ -19,6 +20,57 @@ class TestSelectorReplacementGuidance:
         assert "full_block" in text
         assert "REMOVE" in text
         assert "label:has-text" in text
+
+
+class TestSetupPerformedGuidance:
+    """SKY-14052: an episode whose action was performed by execution-side click setup must not be
+    repaired into a selector-first click — the cached selector path is a raw Playwright click that
+    never runs the setup, so it would drop the setup's semantics and re-toggle the control."""
+
+    @staticmethod
+    def _render(agent_actions: dict) -> str:
+        return prompt_engine.load_prompt(
+            template="script-reviewer",
+            episodes=[
+                {
+                    "block_label": "Agreements",
+                    "fallback_type": "element",
+                    "error_message": "AI fallback succeeded",
+                    "agent_actions": agent_actions,
+                }
+            ],
+            existing_code="",
+            navigation_goal="accept the agreement",
+        )
+
+    _BASE_ACTIONS = {
+        "action_type": "click",
+        "intention": "check the agreement box",
+        "failed_selector": "#stale-agree",
+        "element_tag": "input",
+    }
+
+    def test_rule_8g_routes_setup_performed_episodes_to_proactive(self) -> None:
+        text = _PROMPT_PATH.read_text(encoding="utf-8")
+        rule = next(line for line in text.splitlines() if line.strip().startswith("g. **SETUP-PERFORMED"))
+        assert "ai='proactive'" in rule
+        assert "do NOT use `ai='fallback'`" in rule
+        assert "do NOT add or repair `selector=`" in rule
+
+    def test_setup_performed_episode_renders_the_no_raw_click_instruction(self) -> None:
+        rendered = self._render({**self._BASE_ACTIONS, "setup_performed": True, "css_suggestion": "#agree"})
+
+        assert "**Setup-performed**" in rendered
+        assert "Rule 8g" in rendered
+        # The generic "make it work without AI" instruction would contradict Rule 8g here.
+        assert "succeeds without AI fallback" not in rendered
+
+    def test_ordinary_episode_keeps_the_selector_repair_instruction(self) -> None:
+        rendered = self._render({**self._BASE_ACTIONS, "css_suggestion": "#agree"})
+
+        assert "**Setup-performed**" not in rendered
+        assert "succeeds without AI fallback" in rendered
+        assert "[css: `#agree`]" in rendered
 
 
 class TestValidateProactiveMisuse:

@@ -282,9 +282,9 @@ function FileUploadEditorBody({
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <Label className="text-sm text-muted-foreground">
-                Google Drive Folder ID (Required)
+                Google Drive Folder ID (Optional)
               </Label>
-              <HelpTooltip content="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID." />
+              <HelpTooltip content="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root." />
             </div>
             <WorkflowBlockInputTextarea
               nodeId={blockId}

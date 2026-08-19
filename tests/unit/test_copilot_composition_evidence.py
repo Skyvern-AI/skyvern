@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,14 +16,18 @@ import yaml
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_KIND_KEY,
     ChallengeEvidenceSource,
+    ChallengeKind,
     artifact_challenge_flag_key,
     carrier_backed_anti_bot_categories,
     challenge_evidence_source_from_entry,
     composition_challenge_carrier,
     is_carrier_backed_category_entry,
+    typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    _STRUCTURED_EVIDENCE_BODY,
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
@@ -30,6 +35,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _BARE_MAGNITUDE_RE,
     _MAX_CLICKABLE_CONTROLS,
     _MAX_SELECTOR_CHARS,
+    _SELECTOR_CANDIDATE_SOURCES,
+    _UNKNOWN_SELECTOR_SOURCE,
     _structural_path,
     composition_page_evidence_error,
     has_actionable_steer_content,
@@ -41,7 +48,8 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     parse_composition_structured,
 )
-from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index
+from skyvern.forge.sdk.copilot.output_extraction_plan import _relation_label_child_index, candidate_page_context
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.blockers import _artifact_challenge_flag_from_result
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -2035,6 +2043,44 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
     assert composition_page_evidence_error(exact, workflow_yaml) is None
 
 
+def test_composition_gate_credits_safe_cross_turn_location_fingerprint() -> None:
+    target = "https://example.com/admin?view=users"
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_admin", "url": target},
+        {"block_type": "validation", "label": "confirm_admin", "complete_criterion": "Admin panel is shown."},
+    )
+    ctx = _Ctx(
+        prior_observed_acted_pages=[
+            {
+                "url": "https://example.com/",
+                "location_fingerprint": page_location_fingerprint(target),
+                "had_bounded_schema": True,
+                "reached_via": "interaction",
+            }
+        ]
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_candidate_page_context_exposes_origin_not_path_or_query() -> None:
+    context = candidate_page_context(
+        [
+            {
+                "reached_via": "interaction",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "current_url": "https://example.com/magic/29f4ed70-8c9a-4db6-b68d-f53a87bd2147?code=secret",
+                    "page_title": "Signed in",
+                    "forms": [{"fields": [{"selector": "#q"}]}],
+                },
+            }
+        ]
+    )
+
+    assert context == "url: https://example.com/\ntitle: Signed in"
+
+
 def test_composition_gate_matches_url_blocks_against_target_when_observation_ref_is_present() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -3214,7 +3260,13 @@ async def test_structured_extractor_emits_reveal_shape_relation_on_live_dom() ->
         ("", "Billing period: Mar 1 - Mar 31, 2026", 2),
     ]
     assert all(relation["value_text"] != "Amount due: $9,999.99" for relation in structured["key_value_relations"])
-    assert structured["key_value_relations"] == html_parsed["key_value_relations"]
+    # Uniqueness of a text anchor and a node's role are live-DOM observations, so the static parse
+    # reports the relation without them rather than guessing.
+    live_only = {"selector_candidates", "identity"}
+    assert [
+        {key: value for key, value in relation.items() if key not in live_only}
+        for relation in structured["key_value_relations"]
+    ] == html_parsed["key_value_relations"]
     assert has_witnessed_value_content(structured) is True
 
 
@@ -3305,11 +3357,18 @@ async def test_structured_extractor_emits_reveal_truncation_signal_on_live_dom()
 class _RecordingCompositionServer:
     """Records call_internal_tool tool names and evaluate expressions for invariant assertions."""
 
-    def __init__(self, *, structured_json: str | None, html: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        structured_json: str | dict[str, Any] | None,
+        html: str = "",
+        structured_exception: Exception | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self.evaluate_expressions: list[str] = []
         self._structured_json = structured_json
         self._html = html
+        self._structured_exception = structured_exception
 
     async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(tool_name)
@@ -3317,6 +3376,8 @@ class _RecordingCompositionServer:
             expression = arguments.get("expression", "")
             self.evaluate_expressions.append(expression)
             if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                if self._structured_exception is not None:
+                    raise self._structured_exception
                 if self._structured_json is None:
                     return {"ok": False, "error": "structured extract failed"}
                 return {"ok": True, "data": {"result": self._structured_json}}
@@ -3354,8 +3415,119 @@ async def test_capture_uses_structured_extractor_and_skips_get_html() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capture_falls_back_to_get_html_when_structured_unusable() -> None:
+async def test_capture_reports_structured_failure_without_calling_get_html() -> None:
     server = _RecordingCompositionServer(structured_json=None, html=_HTML_FORM_PAGE)
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert evidence is None
+    assert error == "structured page evidence failed: evaluate returned an error"
+    assert server.calls.count("skyvern_get_html") == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_does_not_reflect_structured_exception_text_to_copilot() -> None:
+    server = _RecordingCompositionServer(
+        structured_json=None,
+        structured_exception=RuntimeError("https://example.com/callback?token=raw-secret"),
+    )
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert evidence is None
+    assert error == "skyvern_evaluate failed while capturing structured page evidence"
+    assert "raw-secret" not in error
+
+
+@pytest.mark.asyncio
+async def test_capture_reports_oversize_structured_dict_without_calling_get_html() -> None:
+    server = _RecordingCompositionServer(
+        structured_json={"page_title": "T", "forms": [], "oversize": "x" * 300_000},
+        html=_HTML_FORM_PAGE,
+    )
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert evidence is None
+    assert error == "structured page evidence exceeded the bounded payload size"
+    assert server.calls.count("skyvern_get_html") == 0
+
+
+@pytest.mark.asyncio
+async def test_capture_reports_structured_timeout_without_calling_get_html() -> None:
+    server = _RecordingCompositionServer(
+        structured_json=None,
+        html=_HTML_FORM_PAGE,
+        structured_exception=TimeoutError(),
+    )
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert evidence is None
+    assert error == "skyvern_evaluate timed out after 20s while capturing structured page evidence"
+    assert server.calls.count("skyvern_get_html") == 0
+
+
+@pytest.mark.asyncio
+async def test_inspect_tool_returns_the_structured_observation_timeout_to_copilot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def current_page(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://example.com/analytics", "Analytics"
+
+    async def failed_capture(_ctx: object, **_kwargs: object) -> tuple[None, str]:
+        return None, "skyvern_evaluate timed out after 20s while capturing structured page evidence"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", current_page)
+    monkeypatch.setattr(tools_module.composition_capture, "_capture_composition_evidence", failed_capture)
+
+    result = await tools_module.composition_capture._inspect_page_for_composition_impl(
+        SimpleNamespace(), "current_page"
+    )
+
+    assert result == {
+        "ok": False,
+        "data": None,
+        "error": (
+            "inspect_page_for_composition could not capture page evidence: "
+            "skyvern_evaluate timed out after 20s while capturing structured page evidence"
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_capture_retains_html_fallback_for_a_valid_hollow_structured_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools_module.composition_capture, "_COMPOSITION_HOLLOW_RECAPTURE_RETRIES", 0)
+    hollow = json.dumps(
+        {
+            "page_title": "",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "modal_overlays": [],
+            "visual_obstruction_candidates": [],
+            "visible_text_excerpt": "",
+            "body_has_markup": False,
+            "anti_bot_indicators": [],
+        }
+    )
+    server = _RecordingCompositionServer(structured_json=hollow, html=_HTML_FORM_PAGE)
     ctx = SimpleNamespace(discovery_mcp_server=server)
 
     evidence, error = await tools_module._capture_composition_evidence(
@@ -3365,7 +3537,7 @@ async def test_capture_falls_back_to_get_html_when_structured_unusable() -> None
     assert error is None
     assert evidence is not None
     assert evidence["forms"]
-    assert server.calls.count("skyvern_get_html") >= 1
+    assert server.calls.count("skyvern_get_html") == 1
 
 
 @pytest.mark.asyncio
@@ -3381,6 +3553,35 @@ async def test_navigation_failure_uses_structured_evidence_when_bounded() -> Non
     assert evidence["forms"]
     assert server.calls.count("skyvern_get_html") == 0
     assert any("navigation_error_before_html_capture" in warning for warning in evidence["inspection_warnings"])
+
+
+@pytest.mark.asyncio
+async def test_navigation_failure_uses_visual_fallback_after_structured_failure_without_get_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _RecordingCompositionServer(structured_json=None, html=_HTML_FORM_PAGE)
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
+
+    async def attach_visual(_ctx: Any, evidence: dict[str, Any]) -> dict[str, Any]:
+        return {**evidence, "screenshot_used": True, "visual_evidence_summary": "A login form is visible."}
+
+    monkeypatch.setattr(
+        tools_module.composition_capture,
+        "_augment_composition_evidence_with_visual_fallback",
+        attach_visual,
+    )
+
+    evidence = await tools_module._composition_evidence_after_navigation_failure(
+        ctx,
+        inspected_url="https://example.com/login",
+        navigation_error="https://example.com/callback?token=raw-secret",
+    )
+
+    assert evidence is not None
+    assert evidence["screenshot_used"] is True
+    assert evidence["visual_evidence_summary"] == "A login form is visible."
+    assert "raw-secret" not in json.dumps(evidence)
+    assert server.calls.count("skyvern_get_html") == 0
 
 
 @pytest.mark.asyncio
@@ -4133,3 +4334,186 @@ def test_the_page_side_capture_keeps_a_label_that_sits_outside_the_value_row() -
     relation = packet["key_value_relations"][0]
     assert relation["label_child_index"] == -1
     assert _relation_label_child_index(relation) == -1
+
+
+@pytest.mark.parametrize(
+    ("classifier_kind", "expected"),
+    [
+        ("device_approval", "device_approval"),
+        ("Device_Approval", "device_approval"),
+        ("captcha", "captcha"),
+        ("a shape nobody enumerated", None),
+        ("", None),
+    ],
+)
+def test_merge_visual_composition_evidence_stamps_only_closed_enum_challenge_kinds(
+    classifier_kind: str, expected: str | None
+) -> None:
+    parsed = parse_composition_html(
+        "<html><head><title>2-Step Verification</title></head><body>challenge</body></html>",
+        inspected_url="https://sso.example.com/challenge",
+        current_url="https://sso.example.com/challenge",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "The sign-in is waiting for approval on another device.",
+            "challenge_detected": True,
+            "challenge_kind": classifier_kind,
+            "challenge_location": "Centered on the page.",
+        },
+    )
+
+    assert merged["challenge_state"].get(CHALLENGE_KIND_KEY) == expected
+    assert typed_challenge_kind(merged) == (ChallengeKind(expected) if expected else None)
+
+
+def _typed_candidate_payload() -> dict[str, Any]:
+    tile_candidates = [
+        {"selector": 'div.tile:has-text("Visitors")', "source": "text_anchor"},
+        {"selector": "div.tile", "source": "class"},
+        {"selector": "div > div:nth-of-type(1) > div:nth-of-type(1)", "source": "structural"},
+    ]
+    tile_identity = {"tag": "div", "role": "", "label_context": "Visitors"}
+    return {
+        "page_title": "Analytics",
+        "forms": [
+            {
+                "id": "search",
+                "fields": [
+                    {
+                        "name": "q",
+                        "type": "text",
+                        "selector": "input#q",
+                        "selector_candidates": [{"selector": "input#q", "source": "id"}],
+                        "identity": {"tag": "input", "role": "textbox", "label_context": "Query"},
+                    }
+                ],
+                "submit_controls": [
+                    {
+                        "text": "Search",
+                        "selector": "button.go",
+                        "selector_candidates": [{"selector": "button.go", "source": "class"}],
+                        "identity": {"tag": "button", "role": "button", "label_context": "Search"},
+                    }
+                ],
+            }
+        ],
+        "navigation_targets": [
+            {
+                "text": "Web analytics",
+                "href": "https://example.com/web",
+                "selector": "a.nav",
+                "selector_candidates": [{"selector": 'a.nav:has-text("Web analytics")', "source": "text_anchor"}],
+                "identity": {"tag": "a", "role": "link", "label_context": "Analytics"},
+            }
+        ],
+        "result_containers": [
+            {
+                "tag": "table",
+                "selector": "table.grid",
+                "selector_match_count": 1,
+                "visible": True,
+                "selector_candidates": [{"selector": "table.grid", "source": "class"}],
+                "identity": {"tag": "table", "role": "", "label_context": "Paths"},
+            }
+        ],
+        "key_value_relations": [
+            {
+                "key_text": "Visitors",
+                "value_text": "9.42K",
+                "container_selector": "div.tile",
+                "container_match_count": 5,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+                "selector_candidates": tile_candidates,
+                "identity": tile_identity,
+            }
+        ],
+        "clickable_controls": [
+            {
+                "text": "Export",
+                "selector": "button.export",
+                "selector_candidates": [{"selector": 'button:has-text("Export")', "source": "text_anchor"}],
+                "identity": {"tag": "button", "role": "button", "label_context": "Export"},
+            }
+        ],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Visitors 9.42K",
+        "anti_bot_indicators": [],
+    }
+
+
+def test_structured_preserves_typed_selector_candidates_and_identity_on_every_carrier() -> None:
+    parsed = parse_composition_structured(
+        _typed_candidate_payload(),
+        inspected_url="https://example.com/web",
+        current_url="https://example.com/web",
+    )
+
+    assert parsed is not None
+    carriers = [
+        parsed["forms"][0]["fields"][0],
+        parsed["forms"][0]["submit_controls"][0],
+        parsed["navigation_targets"][0],
+        parsed["result_containers"][0],
+        parsed["key_value_relations"][0],
+        parsed["clickable_controls"][0],
+    ]
+    for carrier in carriers:
+        assert carrier["selector_candidates"], carrier
+        assert set(carrier["identity"]) == {"tag", "role", "label_context"}
+        for candidate in carrier["selector_candidates"]:
+            assert candidate["source"] in _SELECTOR_CANDIDATE_SOURCES
+    relation = parsed["key_value_relations"][0]
+    sources = [candidate["source"] for candidate in relation["selector_candidates"]]
+    assert sources.index("text_anchor") < sources.index("structural")
+    assert relation["identity"]["label_context"] == "Visitors"
+
+
+def test_structured_keeps_unknown_sources_and_drops_overlong_selector_candidates() -> None:
+    """An unfamiliar rung name loses its ranking, never its selector; only unusable data is dropped."""
+    payload = _typed_candidate_payload()
+    payload["key_value_relations"][0]["selector_candidates"] = [
+        {"selector": "div.card", "source": "a_rung_added_after_this_parser"},
+        {"selector": 'div.tile:has-text("' + "x" * _MAX_SELECTOR_CHARS + '")', "source": "text_anchor"},
+        {"selector": "div.tile", "source": "class"},
+        {"selector": "div.panel", "source": "not a source!"},
+    ]
+    payload["clickable_controls"][0]["identity"] = {"role": "button"}
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url="https://example.com/web",
+        current_url="https://example.com/web",
+    )
+
+    assert parsed is not None
+    assert parsed["key_value_relations"][0]["selector_candidates"] == [
+        {"selector": "div.card", "source": "a_rung_added_after_this_parser"},
+        {"selector": "div.tile", "source": "class"},
+        {"selector": "div.panel", "source": _UNKNOWN_SELECTOR_SOURCE},
+    ]
+    assert "identity" not in parsed["clickable_controls"][0]
+
+
+def test_selector_candidate_source_vocabulary_matches_the_page_side_ladder() -> None:
+    ladder = _STRUCTURED_EVIDENCE_BODY[
+        _STRUCTURED_EVIDENCE_BODY.index("const selectorCandidatesFor") : _STRUCTURED_EVIDENCE_BODY.index(
+            "const relationCandidatesFor"
+        )
+    ]
+    text_rung = _STRUCTURED_EVIDENCE_BODY[: _STRUCTURED_EVIDENCE_BODY.index("const structuralPath")]
+    emitted = set(re.findall(r"offer\(.+, '([a-z_]+)'\);\s*$", ladder, re.M)) | set(
+        re.findall(r"source: '([a-z_]+)'", text_rung)
+    )
+
+    # Drift detection, not enforcement: an emitted rung the parser cannot rank still reaches the model,
+    # but the two lists diverging means someone added a rung and left it unrankable.
+    assert emitted == set(_SELECTOR_CANDIDATE_SOURCES) - {_UNKNOWN_SELECTOR_SOURCE}

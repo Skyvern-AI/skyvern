@@ -916,3 +916,58 @@ def test_credential_bearing_routes_use_the_deployment_aware_gate() -> None:
         if parameter.default is not inspect.Parameter.empty
     }
     assert org_auth_service.get_current_org_for_credential_routes not in api_key_resolver_dependencies
+
+
+@pytest.mark.asyncio
+async def test_get_current_org_forwards_optional_attribution_header_to_authentication_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-attribution")
+    calls: list[tuple[str, str | None]] = []
+
+    async def authentication_callback(
+        token: str,
+        attribution_header: str | None = None,
+    ) -> Organization:
+        calls.append((token, attribution_header))
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    resolved = await org_auth_service.get_current_org(
+        authorization="Bearer clerk-token",
+        x_posthog_attribution="encoded-attribution",
+    )
+
+    assert resolved == organization
+    assert calls == [("clerk-token", "encoded-attribution")]
+
+
+@pytest.mark.asyncio
+async def test_authenticate_helper_requires_attribution_aware_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-legacy")
+    tokens: list[str] = []
+
+    async def authentication_callback(token: str) -> Organization:
+        tokens.append(token)
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    with pytest.raises(TypeError, match="positional argument"):
+        await org_auth_service.authenticate_helper(
+            "Bearer clerk-token",
+            attribution_header="encoded-attribution",
+        )
+
+    assert tokens == []

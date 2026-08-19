@@ -4,6 +4,7 @@ import io
 import json
 import logging
 from collections.abc import Iterator
+from decimal import Decimal
 
 import pytest
 import structlog
@@ -232,3 +233,47 @@ def test_native_structlog_exception_not_double_processed(json_stream: io.StringI
     assert "Traceback (most recent call last)" in record["exception"]
     assert record["exception"].count("Traceback (most recent call last)") == 1
     assert record["error_type"] == "builtins.ValueError"
+
+
+def test_decimal_log_values_render_as_json_numbers() -> None:
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "Recorded run costs", "compute_cost": Decimal("0.00098117"), "proxy_cost": Decimal("0.00400000")},
+    )
+    record = json.loads(rendered)
+
+    assert record["compute_cost"] == pytest.approx(0.00098117)
+    assert record["proxy_cost"] == pytest.approx(0.004)
+    assert isinstance(record["compute_cost"], float)
+    assert "Decimal(" not in rendered
+
+
+def test_structlog_serialization_hook_survives_the_decimal_default() -> None:
+    """Passing `default=` to JSONRenderer disables its built-in __structlog__ support."""
+
+    class _Custom:
+        def __structlog__(self) -> str:
+            return "custom-repr"
+
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "hook", "obj": _Custom()},
+    )
+
+    assert json.loads(rendered)["obj"] == "custom-repr"
+
+
+def test_unserializable_value_falls_back_to_repr_instead_of_raising() -> None:
+    class _Opaque:
+        def __repr__(self) -> str:
+            return "<opaque>"
+
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "opaque", "obj": _Opaque()},
+    )
+
+    assert json.loads(rendered)["obj"] == "<opaque>"

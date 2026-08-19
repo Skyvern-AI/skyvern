@@ -10778,7 +10778,7 @@ async def _dispatched_chain_snapshot(
         {"art_terminal": html.encode()},
     )
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_requested_output", organization_id="o", current_url=""
+        ctx, run_id="wr_requested_output", run_session_id="pbs_run", organization_id="o", current_url=""
     )
     return _build_run_evidence_snapshot(ctx, _requested_output_result({"login_gate_blocks_target": True}))
 

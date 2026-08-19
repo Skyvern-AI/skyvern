@@ -1,6 +1,7 @@
 import {
   CounterClockwiseClockIcon,
   DotsHorizontalIcon,
+  FileTextIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
@@ -29,6 +30,7 @@ import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuer
 import { useProductTourStore } from "@/store/ProductTourStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
@@ -59,6 +61,11 @@ export function EditorOverflowMenu({
   const queryClient = useQueryClient();
 
   const toggleHistoryPanel = useToggleHistoryPanel();
+  // Entry point into the same YAML/schema editor Studio's Editor pane header
+  // opens. Null for a global/template workflow (Workspace never registers one
+  // there); the "View schema" item below is also gated `!embedded` since
+  // Studio already surfaces its own toggle.
+  const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
 
   const workflowRunIsRunningOrQueued = Boolean(
     workflowRun && statusIsRunningOrQueued(workflowRun),
@@ -131,6 +138,15 @@ export function EditorOverflowMenu({
     <DropdownMenu modal={false}>
       {embedded ? trigger : <TooltipProvider>{trigger}</TooltipProvider>}
       <DropdownMenuContent align="end" className="min-w-[12rem]">
+        {!embedded && enterYamlMode && (
+          <DropdownMenuItem
+            disabled={isRecording}
+            onSelect={() => enterYamlMode()}
+          >
+            <FileTextIcon className="mr-2 size-4" />
+            View schema
+          </DropdownMenuItem>
+        )}
         <CodeSubmenu />
         {!workflowRunIsRunningOrQueued && (
           <DropdownMenuItem

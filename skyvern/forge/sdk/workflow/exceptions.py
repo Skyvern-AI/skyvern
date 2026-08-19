@@ -105,6 +105,24 @@ class InvalidEmailClientConfiguration(BaseWorkflowException):
         super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")
 
 
+class CustomSMTPConnectionFailed(BaseWorkflowException):
+    def __init__(self, host: str, port: int, reason: str | None = None) -> None:
+        detail = f" ({reason})" if reason else ""
+        super().__init__(
+            f"Could not connect to SMTP server {host}:{port}{detail}. "
+            "Check the SMTP host and port in the Send Email block's Advanced settings."
+        )
+
+
+class CustomSMTPAuthenticationFailed(BaseWorkflowException):
+    def __init__(self, username: str) -> None:
+        super().__init__(
+            f"SMTP authentication failed for '{username}'. "
+            "Check the SMTP username and password in the Send Email block's Advanced settings. "
+            "For Gmail, use an App Password instead of your regular password."
+        )
+
+
 class NoValidEmailRecipient(BaseWorkflowException):
     def __init__(self, recipients: list[str]) -> None:
         super().__init__(f"No valid email recipient found. Recipients: {recipients}")

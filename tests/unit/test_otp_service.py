@@ -1140,14 +1140,12 @@ class TestPollOtpValueRetry:
         )
 
         assert result == otp
-        mock_fetch.assert_awaited_once_with(
-            "o_test",
-            "https://example.com/mfa",
-            "fake-token",
-            task_id="tsk_test",
-            workflow_run_id="wr_test",
-            workflow_permanent_id="wpid_test",
-        )
+        assert mock_fetch.await_count == 1
+        args, kwargs = mock_fetch.await_args
+        assert args == ("o_test", "https://example.com/mfa", "fake-token")
+        assert kwargs["task_id"] == "tsk_test"
+        assert kwargs["workflow_run_id"] == "wr_test"
+        assert kwargs["workflow_permanent_id"] == "wpid_test"
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -1448,6 +1446,52 @@ class TestPollOtpValueRetry:
                 )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "webhook_response, expected_diagnostics",
+        [
+            # Every poll answered, never with the documented body: the customer's endpoint
+            # is broken, and the timeout has to say so rather than read as "no code yet".
+            ((204, {}, "", False), "webhook_responses=2 http_status=204x2"),
+            # Documented shape, code simply had not arrived: a plain timeout, no diagnostics.
+            ((200, {"Content-Type": "application/json"}, {"verification_code": ""}, True), None),
+        ],
+    )
+    async def test_timeout_reports_webhook_status_only_when_endpoint_never_conformed(
+        self,
+        webhook_response: tuple[int, dict[str, str], object, bool],
+        expected_diagnostics: str | None,
+    ) -> None:
+        """A totp_verification_url that answers but never honors the contract must be named at timeout."""
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        utcnow_returns = [
+            base,
+            base + timedelta(seconds=30),
+            base + timedelta(seconds=60),
+            base + timedelta(minutes=16),
+        ]
+
+        with (
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._post_totp_verification_url", new_callable=AsyncMock) as mock_post,
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service.settings") as mock_settings,
+            patch("skyvern.services.otp_service.datetime") as mock_datetime,
+        ):
+            mock_datetime.utcnow.side_effect = utcnow_returns
+            mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+            mock_post.return_value = webhook_response
+
+            with pytest.raises(NoTOTPVerificationCodeFound) as exc_info:
+                await poll_otp_value(
+                    organization_id="o_test",
+                    task_id="tsk_test",
+                    totp_verification_url="https://example.com/mfa",
+                )
+
+        assert exc_info.value.webhook_diagnostics == expected_diagnostics
+
+    @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
@@ -1539,7 +1583,10 @@ class TestTryGenerateTotpFromCredential:
         from skyvern.services import otp_service
 
         fake_app = SimpleNamespace(
-            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(get_workflow_run_context=lambda _wr_id: fake),
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
         )
         monkeypatch.setattr(otp_service, "app", fake_app)
 
@@ -1637,7 +1684,10 @@ class TestTryGenerateTotpFromCredential:
         from skyvern.services import otp_service
 
         fake_app = SimpleNamespace(
-            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(get_workflow_run_context=lambda _wr_id: None),
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: None,
+                has_workflow_run_context=lambda _wr_id: False,
+            ),
         )
         monkeypatch.setattr(otp_service, "app", fake_app)
 

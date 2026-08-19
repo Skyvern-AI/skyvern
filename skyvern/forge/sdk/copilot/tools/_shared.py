@@ -450,7 +450,9 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
     return url
 
 
-async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None = None) -> tuple[str, str]:
+async def _fallback_page_info(
+    ctx: AgentContext, session_id_override: str | None = None, *, read_title: bool = True
+) -> tuple[str, str]:
     session_id = session_id_override or ctx.browser_session_id
     if not session_id:
         return "", ""
@@ -468,7 +470,7 @@ async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None
         if not page:
             return ""
         url = page.url
-        return await page.title()
+        return await page.title() if read_title else ""
 
     # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
     # raising — and every caller reaches this path, since a tool result's browser_context carries
@@ -735,17 +737,17 @@ def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
     return tuple(targets)
 
 
-async def _composition_get_structured_evidence(
+async def _composition_get_structured_evidence_result(
     copilot_ctx: Any,
     *,
     inspected_url: str,
     current_url: str,
     timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
-) -> dict[str, Any] | None:
-    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Capture composition evidence and preserve why the observation failed."""
     server = getattr(copilot_ctx, "discovery_mcp_server", None)
     if server is None:
-        return None
+        return None, "structured page evidence failed: discovery MCP server not attached to context"
     with copilot_span("composition_structured_extract"):
         try:
             result = await asyncio.wait_for(
@@ -755,20 +757,61 @@ async def _composition_get_structured_evidence(
                 ),
                 timeout=timeout_seconds,
             )
-        except Exception:
-            return None
+        except asyncio.TimeoutError:
+            return (
+                None,
+                f"skyvern_evaluate timed out after {timeout_seconds:g}s while capturing structured page evidence",
+            )
+        except Exception as exc:
+            LOG.warning(
+                "copilot_composition_structured_extract_failed",
+                error_type=type(exc).__name__,
+                detail_present=bool(str(exc).strip()),
+            )
+            return None, "skyvern_evaluate failed while capturing structured page evidence"
     if not isinstance(result, dict) or not result.get("ok"):
-        return None
+        LOG.warning(
+            "copilot_composition_structured_extract_rejected",
+            result_is_mapping=isinstance(result, dict),
+            error_present=bool(result.get("error")) if isinstance(result, dict) else False,
+        )
+        return None, "structured page evidence failed: evaluate returned an error"
     raw = (result.get("data") or {}).get("result")
     if isinstance(raw, str):
         if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
-            return None
+            return None, "structured page evidence exceeded the bounded payload size"
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError):
-            return None
+            return None, "structured page evidence returned invalid JSON"
     elif isinstance(raw, dict):
+        try:
+            serialized = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None, "structured page evidence returned an unsupported result type"
+        if len(serialized) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None, "structured page evidence exceeded the bounded payload size"
         payload = raw
     else:
-        return None
-    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+        return None, "structured page evidence returned an unsupported result type"
+    evidence = parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+    if evidence is None:
+        return None, "structured page evidence did not match the bounded schema"
+    return evidence, None
+
+
+async def _composition_get_structured_evidence(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    """Compatibility wrapper for best-effort scout observers that intentionally ignore failures."""
+    evidence, _ = await _composition_get_structured_evidence_result(
+        copilot_ctx,
+        inspected_url=inspected_url,
+        current_url=current_url,
+        timeout_seconds=timeout_seconds,
+    )
+    return evidence

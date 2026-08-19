@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 
 from skyvern.forge.sdk.copilot.agent import (
     _CANCEL_REPLY_DEFAULT,
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     VerificationResult,
 )
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 
 
@@ -593,6 +595,45 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         assert result.proposal_disposition == "review_tested"
         assert result.user_response == tested_reply
         assert result.cancelled is expected_cancelled
+
+    def test_overwrite_review_describes_the_same_last_good_yaml_accept_will_apply(self) -> None:
+        tested_yaml = """
+title: Fixture
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: tested
+      code: |-
+        await page.goto("https://example.com/Tested")
+"""
+        failed_yaml = tested_yaml.replace("tested", "failed").replace("Tested", "Failed")
+        ctx = _ctx(
+            last_workflow=MagicMock(name="failed_workflow"),
+            last_workflow_yaml=failed_yaml,
+            last_test_ok=False,
+            last_good_workflow=MagicMock(name="tested_workflow"),
+            last_good_workflow_yaml=tested_yaml,
+        )
+        ctx.staged_workflow = ctx.last_workflow
+        ctx.staged_workflow_yaml = failed_yaml
+        ctx.has_staged_proposal = True
+        ctx.persisted_workflow_yaml = """
+title: Fixture
+workflow_definition:
+  parameters: []
+  blocks: []
+"""
+        ctx.executed_block_fingerprints = workflow_block_fingerprints(tested_yaml)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.workflow_yaml is not None
+        accepted_block = yaml.safe_load(result.workflow_yaml)["workflow_definition"]["blocks"][0]
+        assert accepted_block["label"] == "tested"
+        assert accepted_block["steps"]
+        assert result.narrative_payload is not None
+        assert [block["label"] for block in result.narrative_payload["review"]["blocks"]] == ["tested"]
 
     def test_unexpected_error_with_overwrite_and_blocker_describes_latest_attempt_separately(self) -> None:
         ctx = _overwrite_ctx(last_test_ok=None)

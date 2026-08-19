@@ -95,12 +95,6 @@ class TestCacheableMissingLabels:
 
 class TestPendingMintSkipsNonCacheableWorkflows:
     async def _run_hook(self, workflow: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> list:
-        monkeypatch.setattr(
-            app,
-            "EXPERIMENTATION_PROVIDER",
-            SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False)),
-            raising=False,
-        )
         calls: list = []
 
         async def record(wf: object, run: object) -> None:

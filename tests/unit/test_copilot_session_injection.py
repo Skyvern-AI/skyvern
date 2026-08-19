@@ -410,7 +410,12 @@ class TestClickAdapter:
         from skyvern.forge.sdk.copilot.tools import _click_post_hook
 
         ctx = _make_ctx()
-        raw = {"browser_context": {"url": "https://ex.com", "title": "Page"}}
+        raw = {
+            "browser_context": {
+                "url": "https://ex.com/magic/29f4ed70-8c9a-4db6-b68d-f53a87bd2147?code=secret",
+                "title": "Page",
+            }
+        }
         result = {
             "ok": True,
             "data": {"selector": "#btn", "intent": None, "sdk_equivalent": "..."},
@@ -419,7 +424,7 @@ class TestClickAdapter:
         adapted = await _click_post_hook(result, raw, ctx)
 
         assert adapted["data"]["selector"] == "#btn"
-        assert adapted["data"]["url"] == "https://ex.com"
+        assert adapted["data"]["url"] == "https://ex.com/"
         assert adapted["data"]["title"] == "Page"
         assert "sdk_equivalent" not in adapted["data"]
 

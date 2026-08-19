@@ -19,7 +19,6 @@ cross-layer sync-guard test at the end asserts neither symbol is ripped out.
 from __future__ import annotations
 
 import json
-import re
 import textwrap
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -256,64 +255,35 @@ def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -
     assert "MCP/scout evidence" in prompt
 
 
-def test_code_only_authoring_prompt_requires_idempotent_credential_login() -> None:
+def test_code_only_authoring_prompt_exposes_credential_capability_without_prescribing_login_control_flow() -> None:
     prompt = _code_only_browser_authoring_prompt()
 
-    assert "Credentialed login code must be idempotent" in prompt
-    # One wait on the two states together, then a no-wait branch — waiting on the login form alone
-    # spends the whole timeout proving it is absent on an already-authenticated session.
-    assert ".or_(" in prompt
-    assert re.search(r"\.or_\([^)]*\)\.first\.wait_for\([^)]*timeout=90000(?!\d)", prompt)
-    # `.first` is the first match in DOM order, not the first to become visible, so an unconstrained
-    # union binds to a hidden sign-in form and holds the wait to the ceiling.
-    assert "visible=true" in prompt
-    assert "is_visible()" in prompt
-    assert "await solve_captcha(page)" in prompt
-    assert "platform-managed verification challenge" in prompt
-    assert "await <credential_key>.otp()" in prompt
-    assert "Do not read `email_inbox`" in prompt
-    assert "split or parse message bodies" in prompt
-    assert '`{"otp_submitted": True}`' in prompt
-    assert "invalid or rejected code" in prompt
-    assert "unique visible selector" in prompt
-    assert "Never use a broad text locator" in prompt
-    assert "scoped locator" in prompt
-    assert "including `page.get_by_text(...)`" in prompt
-    assert "resolves at the moment it is awaited" in prompt
-    assert "not pre-materialized" in prompt
-    assert "tightest validity window" in prompt
-    assert "crossing a block boundary" in prompt
-    assert "output binding and latency" in prompt
-    assert "Later authenticated actions remain separate" in prompt
-    assert "focused Code blocks" in prompt
-    assert "await that anchor with a bounded timeout" not in prompt
-    assert "Transient disappearance of the OTP field" in prompt
-    assert "If scouting has not observed a unique authenticated anchor, do not return authentication success" in prompt
-    assert "Do not treat disappearance of the" in prompt
-    assert "login fields as proof of authentication" in prompt
+    assert "<key>.username" in prompt
+    assert "<key>.password" in prompt
+    assert "await <key>.otp()" in prompt
+    assert "await <key>.magic_link(page)" in prompt
+    assert "without exposing the sign-in link to authored code" in prompt
+    assert "solve_captcha(page)" in prompt
+    assert "Credentialed login code must be idempotent" not in prompt
+    assert ".or_(" not in prompt
+    assert "timeout=90000" not in prompt
+    assert "await solve_captcha(page)" not in prompt
+    assert "After challenge handling" not in prompt
+    assert "resolves at the moment it is awaited" not in prompt
+    assert "Transient disappearance of the OTP field" not in prompt
 
 
-def test_code_only_schema_guidance_uses_the_runtime_otp_contract() -> None:
+def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_procedure() -> None:
     guidance = "\n".join(_code_only_browser_schema_guidance())
 
+    assert "<key>.username" in guidance
+    assert "<key>.password" in guidance
     assert "await <key>.otp()" in guidance
-    assert "Do not read `email_inbox`" in guidance
-    assert "split or parse message bodies" in guidance
-    assert '`{"otp_submitted": True}`' in guidance
-    assert "authenticated-page anchor" in guidance
-    assert "unique visible selector" in guidance
-    assert "Never use a broad text locator" in guidance
-    assert "including `page.get_by_text(...)`" in guidance
-    assert "resolves at the moment it is awaited" in guidance
-    assert "not pre-materialized" in guidance
-    assert "tightest validity window" in guidance
-    assert "crossing a block boundary adds output binding and latency" in guidance
-    assert "Later authenticated actions remain separate focused Code blocks" in guidance
-    assert "await that anchor with a bounded timeout" not in guidance
-    assert "Transient disappearance of the OTP field" in guidance
-    assert (
-        "If scouting has not observed a unique authenticated anchor, do not return authentication success" in guidance
-    )
+    assert "await <key>.magic_link(page)" in guidance
+    assert "solve_captcha(page)" in guidance
+    assert "Do not read `email_inbox`" not in guidance
+    assert "authenticated-page anchor" not in guidance
+    assert "Transient disappearance of the OTP field" not in guidance
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2"])
@@ -820,13 +790,16 @@ def test_settled_gating_is_a_no_op_for_a_new_workflow() -> None:
 
     assert absent == empty
     assert "Already saved in this workflow" not in absent
-    for withheld_only_when_settled in (
+    for capability in ("<key>.username", "<key>.password", "await <key>.otp()", "await <key>.magic_link(page)"):
+        assert capability in absent
+        assert capability in unrelated
+    for removed_procedure in (
         "Credentialed login code must be idempotent",
         "wait for either the observed one-time-code field",
+        "timeout=90000",
     ):
-        assert withheld_only_when_settled in absent
-    # A settled type this prompt does not gate leaves the login guidance intact.
-    assert "Credentialed login code must be idempotent" in unrelated
+        assert removed_procedure not in absent
+        assert removed_procedure not in unrelated
 
 
 def test_code_only_authoring_prompt_for_new_workflow_keeps_every_pending_type() -> None:
@@ -966,23 +939,17 @@ def test_pre_hook_and_post_emission_reject_share_constant() -> None:
     assert hasattr(tools_module, "_banned_block_reject_message")
 
 
-def test_schema_guidance_keeps_post_login_wait_ceiling_model_owned() -> None:
-    # The entry wait compares two mutually exclusive states, so it can carry a concrete cold-load
-    # ceiling. Once the model has observed the site's actual post-login transition, the server must
-    # not replace that evidence with a fixed shorter timeout in either authoring surface.
+def test_schema_guidance_does_not_prescribe_login_waits_or_branches() -> None:
     from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_schema_guidance
 
     guidance = " ".join(_code_only_browser_schema_guidance())
     authoring_prompt = _code_only_browser_authoring_prompt()
 
-    assert ".or_(" in guidance
-    assert "visible=true" in guidance
-    assert "is_visible()" in guidance or "count()" in guidance
-    assert "timeout=90000" in guidance
-    assert "timeout=30000" not in guidance
-    assert 'authenticated_anchor.wait_for(state="visible", timeout=' not in authoring_prompt
-    assert "After the submit action, await that anchor" not in guidance
-    assert "and then\n  wait for the authenticated anchor" not in authoring_prompt
+    for text in (guidance, authoring_prompt):
+        assert ".or_(" not in text
+        assert "timeout=90000" not in text
+        assert "login_form" not in text
+        assert "authenticated_anchor" not in text
 
 
 def test_schema_guidance_drops_credential_binding_when_login_is_settled() -> None:
@@ -1010,17 +977,20 @@ def test_authoring_prompt_drops_login_procedure_when_login_is_settled() -> None:
 def test_authoring_prompt_keeps_runtime_facts_when_login_is_settled() -> None:
     settled = _code_only_browser_authoring_prompt(frozenset({"login"}))
 
-    # These describe the code runtime, not how to author a login, and this prompt is the only
-    # place either is described. Withholding them strands a helper that exists in the namespace.
-    assert "await solve_captcha(page)" in settled
+    # The credential object is a runtime capability. A mandatory challenge/login sequence is not.
     assert "`credential_id` workflow parameter resolves to a credential object" in settled
+    assert "await solve_captcha(page)" not in settled
 
 
-def test_authoring_prompt_keeps_credentialed_login_rules_for_a_new_login() -> None:
+def test_authoring_prompt_exposes_credential_capabilities_without_a_login_procedure() -> None:
     for settled_types in (frozenset(), frozenset({"file_download"})):
         rendered = _code_only_browser_authoring_prompt(settled_types)
-        assert "Credentialed login code must be idempotent" in rendered
-        assert "await solve_captcha(page)" in rendered
+        assert "<key>.username" in rendered
+        assert "<key>.password" in rendered
+        assert "await <key>.otp()" in rendered
+        assert "await <key>.magic_link(page)" in rendered
+        assert "Credentialed login code must be idempotent" not in rendered
+        assert "await solve_captcha(page)" not in rendered
 
 
 def test_settled_login_does_not_change_new_workflow_rendering() -> None:

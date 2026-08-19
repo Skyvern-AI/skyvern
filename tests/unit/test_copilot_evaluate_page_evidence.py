@@ -197,7 +197,7 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
         },
     )
 
-    async def fallback_page_info(_ctx: CopilotContext) -> tuple[str, str]:
+    async def fallback_page_info(_ctx: CopilotContext, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://example.test/search?case=secret", "Search"
 
     async def capture_evidence(
@@ -611,7 +611,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
     login_url = "https://analytics.example.test/login?next=%2Fweb"
     ctx = _ctx()
 
-    async def fallback_page_info(_ctx: CopilotContext) -> tuple[str, str]:
+    async def fallback_page_info(_ctx: CopilotContext, _session_id_override: str | None = None) -> tuple[str, str]:
         return login_url, "Sign in"
 
     async def capture_evidence(

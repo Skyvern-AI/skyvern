@@ -75,6 +75,33 @@ async def test_failed_address_write_never_renders_the_upstream_in_the_error() ->
 
 
 @pytest.mark.asyncio
+async def test_failed_vendor_insert_never_renders_the_upstream_in_the_error() -> None:
+    """Same leak as the address write, on the INSERT path: this upstream is a bearer credential and
+    the routing caller logs the failure with exc_info."""
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    mock_session.commit = AsyncMock(
+        side_effect=IntegrityError(
+            "INSERT INTO persistent_browser_sessions (upstream_cdp_url) VALUES (%(upstream_cdp_url)s)",
+            {"upstream_cdp_url": VENDOR_UPSTREAM},
+            Exception("duplicate key value violates unique constraint"),
+        )
+    )
+    repo = BrowserSessionsRepository(session_factory=lambda: MockAsyncSessionCtx(mock_session))
+
+    with pytest.raises(IntegrityError) as excinfo:
+        await repo.create_vendor_cdp_browser_session(
+            organization_id=ORG_ID,
+            upstream_cdp_url=VENDOR_UPSTREAM,
+            browser_vendor="websocket",
+            browser_id="vendor-sess-1",
+            timeout_minutes=240,
+        )
+
+    assert VENDOR_UPSTREAM not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
 async def test_create_vendor_cdp_browser_session_insert_shape() -> None:
     """The vendor-held row is a single INSERT: running, timed, upstream-addressed, and left with
     no client-facing address or runnable binding."""

@@ -3,8 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   RecoveryGuidanceTelemetry,
-  type Surface,
+  type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
+import type { RecoveryGuidanceAssignment } from "@/store/onboarding/types";
 import {
   getRecoveryPaths,
   type RecoveryPath,
@@ -17,21 +18,35 @@ const DOCS_URL = "https://docs.skyvern.com";
 const SUPPORT_URL = "mailto:support@skyvern.com";
 
 type Props = Readonly<{
-  surface: Surface;
-  failureCategory: string | null;
+  telemetryContext: RecoveryGuidanceTelemetryContext;
   workflowPermanentId?: string | null;
-  onRetry?: () => Promise<void> | void;
+  onRetry?: () => void;
 }>;
 
+function shouldShowRecoveryGuidance({
+  assignment,
+  workflowRunId,
+  treatmentSurfaceEnabled,
+}: {
+  assignment: RecoveryGuidanceAssignment | null;
+  workflowRunId: string | undefined;
+  treatmentSurfaceEnabled: boolean;
+}): boolean {
+  return (
+    treatmentSurfaceEnabled &&
+    assignment?.arm === "treatment" &&
+    assignment.eligible_run_id === workflowRunId
+  );
+}
+
 function FirstRunRecoveryGuidance({
-  surface,
-  failureCategory,
+  telemetryContext,
   workflowPermanentId,
   onRetry,
 }: Props) {
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
-  const paths = getRecoveryPaths(failureCategory);
+  const paths = getRecoveryPaths(telemetryContext.failureCategory);
   const shownRef = useRef(false);
 
   useEffect(() => {
@@ -39,16 +54,8 @@ function FirstRunRecoveryGuidance({
       return;
     }
     shownRef.current = true;
-    RecoveryGuidanceTelemetry.recoveryGuidanceShown(
-      surface,
-      failureCategory,
-      paths.length,
-    );
-  }, [surface, failureCategory, paths.length]);
-
-  function externalUrlFor(id: RecoveryPathId): string {
-    return id === "contact_support" ? SUPPORT_URL : DOCS_URL;
-  }
+    RecoveryGuidanceTelemetry.recoveryGuidanceShown(telemetryContext);
+  }, [telemetryContext]);
 
   function routeFor(id: RecoveryPathId): string {
     if (id === "edit_workflow") {
@@ -59,78 +66,45 @@ function FirstRunRecoveryGuidance({
     return "/credentials";
   }
 
-  async function handlePathClick(path: RecoveryPath): Promise<void> {
-    RecoveryGuidanceTelemetry.recoveryPathChosen(
-      surface,
-      failureCategory,
+  function handlePathClick(path: RecoveryPath): void {
+    RecoveryGuidanceTelemetry.recoveryGuidanceClicked(
+      telemetryContext,
       path.id,
     );
 
     if (path.kind === "retry") {
-      try {
-        await onRetry?.();
-        RecoveryGuidanceTelemetry.recoveryOutcome(
-          surface,
-          failureCategory,
-          path.id,
-          "retry_started",
-        );
-      } catch {
-        RecoveryGuidanceTelemetry.recoveryOutcome(
-          surface,
-          failureCategory,
-          path.id,
-          "retry_failed_to_start",
-        );
-      }
+      onRetry?.();
       return;
     }
 
     if (path.kind === "external") {
-      const url = externalUrlFor(path.id);
-      // Capture before navigating: a mailto hand-off can pause JS and drop a
-      // post-navigation capture.
-      RecoveryGuidanceTelemetry.recoveryOutcome(
-        surface,
-        failureCategory,
-        path.id,
-        "opened",
+      window.open(
+        path.id === "contact_support" ? SUPPORT_URL : DOCS_URL,
+        "_blank",
+        "noopener,noreferrer",
       );
-      if (url.startsWith("mailto:")) {
-        window.location.href = url;
-      } else {
-        window.open(url, "_blank", "noopener,noreferrer");
-      }
       return;
     }
 
     navigate(routeFor(path.id));
-    RecoveryGuidanceTelemetry.recoveryOutcome(
-      surface,
-      failureCategory,
-      path.id,
-      "navigated",
-    );
   }
 
   return (
     <div
       data-testid="first-run-recovery-guidance"
-      className="space-y-2 border-t border-red-600/40 pt-3"
+      className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/30"
     >
-      <div className="text-sm font-medium">
-        Not sure what to do next? Try one of these:
+      <div className="text-sm font-medium text-amber-900 dark:text-amber-100">
+        Need help recovering from this run?
       </div>
-      <div className="flex flex-wrap gap-2">
+      <div className="mt-2 flex flex-wrap gap-2">
         {paths.map((path) => (
           <Button
             key={path.id}
-            size="sm"
-            variant="secondary"
             data-testid={`recovery-path-${path.id}`}
-            onClick={() => {
-              void handlePathClick(path);
-            }}
+            variant="outline"
+            size="sm"
+            onClick={() => handlePathClick(path)}
           >
             {path.label}
           </Button>
@@ -140,4 +114,5 @@ function FirstRunRecoveryGuidance({
   );
 }
 
-export { FirstRunRecoveryGuidance };
+// eslint-disable-next-line react-refresh/only-export-components
+export { FirstRunRecoveryGuidance, shouldShowRecoveryGuidance };

@@ -110,6 +110,10 @@ const baseSendEmailData = {
   continueOnFailure: false,
   model: null,
   debuggable: true,
+  customSmtpHost: null,
+  customSmtpPort: null,
+  customSmtpUsername: null,
+  customSmtpPassword: null,
 };
 
 beforeEach(() => {
@@ -303,5 +307,67 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     render(<SendEmailBlockForm blockId="b1" />);
 
     expect(screen.queryByText(/Use the \+ button to add inputs/i)).toBeNull();
+  });
+
+  test("Advanced section is collapsed by default and reveals SMTP fields on expand (SKY-14062)", () => {
+    mockNodeFixtures.set("b1", {
+      id: "b1",
+      type: "sendEmail",
+      data: baseSendEmailData,
+    });
+
+    render(<SendEmailBlockForm blockId="b1" />);
+
+    expect(screen.queryByPlaceholderText("smtp.example.com")).toBeNull();
+
+    fireEvent.click(screen.getByText("Advanced Settings"));
+
+    expect(screen.getByPlaceholderText("smtp.example.com")).toBeDefined();
+    expect(screen.getByText("SMTP Host")).toBeDefined();
+    expect(screen.getByText("SMTP Port")).toBeDefined();
+    expect(screen.getByText("SMTP Username")).toBeDefined();
+    expect(screen.getByText("SMTP Password")).toBeDefined();
+    expect(screen.getByText("Sender (From)")).toBeDefined();
+  });
+
+  test("SMTP host onChange dispatches updateNodeData with customSmtpHost (SKY-14062)", () => {
+    mockNodeFixtures.set("b1", {
+      id: "b1",
+      type: "sendEmail",
+      data: baseSendEmailData,
+    });
+
+    render(<SendEmailBlockForm blockId="b1" />);
+    fireEvent.click(screen.getByText("Advanced Settings"));
+
+    const input = screen.getByPlaceholderText(
+      "smtp.example.com",
+    ) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "smtp.gmail.com" } });
+
+    const lastCall =
+      updateNodeDataMock.mock.calls[updateNodeDataMock.mock.calls.length - 1];
+    expect(lastCall).toBeDefined();
+    expect(lastCall![0]).toBe("b1");
+    expect(lastCall![1]).toEqual({ customSmtpHost: "smtp.gmail.com" });
+  });
+
+  test("SMTP port input strips non-numeric characters (SKY-14062)", () => {
+    mockNodeFixtures.set("b1", {
+      id: "b1",
+      type: "sendEmail",
+      data: baseSendEmailData,
+    });
+
+    render(<SendEmailBlockForm blockId="b1" />);
+    fireEvent.click(screen.getByText("Advanced Settings"));
+
+    const input = screen.getByPlaceholderText("587") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "58a7" } });
+
+    const lastCall =
+      updateNodeDataMock.mock.calls[updateNodeDataMock.mock.calls.length - 1];
+    expect(lastCall).toBeDefined();
+    expect(lastCall![1]).toEqual({ customSmtpPort: "587" });
   });
 });

@@ -63,6 +63,35 @@ interface ReviewGateCardProps {
   flash?: boolean;
 }
 
+const REVIEW_SECTIONS = [
+  { change: "added", title: "Added", prefix: "+", titleClass: "text-success" },
+  {
+    change: "changed",
+    title: "Changed",
+    prefix: "~",
+    titleClass: "text-amber-700 dark:text-amber-300",
+  },
+  {
+    change: "unchanged",
+    title: "Unchanged",
+    prefix: "",
+    titleClass: "text-muted-foreground",
+  },
+  {
+    change: "removed",
+    title: "Removed",
+    prefix: "-",
+    titleClass: "text-destructive",
+  },
+] as const;
+
+function humanizedList(labels: string[]): string {
+  const names = labels.map(humanizeBlockLabel);
+  if (names.length < 2) return names[0] ?? "";
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
 export function ReviewGateCard({
   turn,
   pending,
@@ -82,14 +111,7 @@ export function ReviewGateCard({
   const itemClassName = rejected
     ? "ml-2 text-xs text-muted-foreground dark:text-slate-500 line-through opacity-60"
     : "ml-2 text-xs text-foreground";
-  const priorLabels = new Set(
-    (turn?.blocks ?? [])
-      .filter((block) => block.state === "drafted")
-      .map((block) => block.label),
-  );
-  const removed = draft
-    ? [...priorLabels].filter((label) => !draft.blockLabels.includes(label))
-    : [];
+  const review = turn?.review ?? null;
   const title = turn
     ? getDiffCardTitle(turn, { pendingProposal: pending, rejected, accepted })
     : "Proposed changes";
@@ -112,28 +134,59 @@ export function ReviewGateCard({
           </span>
         ) : null}
       </div>
-      {draft ? (
+      {review ? (
+        <div className="px-3 pb-3">
+          {REVIEW_SECTIONS.map((section) => {
+            const rows = review.blocks.filter(
+              (block) => block.change === section.change,
+            );
+            if (rows.length === 0) return null;
+            return (
+              <div className="mt-2" key={section.change}>
+                <div
+                  className={`text-[10px] font-bold uppercase tracking-wide ${section.titleClass}`}
+                >
+                  {section.title}
+                </div>
+                {rows.map((block) => (
+                  <div
+                    key={`${block.change}-${block.label}`}
+                    className={`${itemClassName} flex items-center gap-2`}
+                    title={block.label}
+                  >
+                    <span>
+                      {section.prefix ? `${section.prefix} ` : ""}
+                      {humanizeBlockLabel(block.label)}
+                    </span>
+                    {block.neverTested ? (
+                      <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
+                        Never tested
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {review.duplicateWrites.map((group) => (
+            <div
+              key={`${group.blockType}-${group.blockLabels.join("-")}`}
+              className="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-2 text-xs text-foreground"
+            >
+              {humanizedList(group.blockLabels)} write to the same destination.
+            </div>
+          ))}
+        </div>
+      ) : draft ? (
         <div className="px-3 pb-3">
           {draft.blockLabels.length > 0 ? (
             <div className="mt-2">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-success">
-                Added
+              <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                Proposed blocks
               </div>
               {draft.blockLabels.map((label) => (
                 <div key={label} className={itemClassName} title={label}>
-                  + {humanizeBlockLabel(label)}
-                </div>
-              ))}
-            </div>
-          ) : null}
-          {removed.length > 0 ? (
-            <div className="mt-2">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-destructive">
-                Removed
-              </div>
-              {removed.map((label) => (
-                <div key={label} className={itemClassName} title={label}>
-                  - {humanizeBlockLabel(label)}
+                  {humanizeBlockLabel(label)}
                 </div>
               ))}
             </div>

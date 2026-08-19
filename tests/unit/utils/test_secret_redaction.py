@@ -101,6 +101,19 @@ def test_redact_secrets_from_text_replaces_long_secret_inside_alphanumeric_run()
     assert result == f"prefix{REDACTED_SECRET_PLACEHOLDER}suffix"
 
 
+def test_redact_secrets_from_text_boundary_all_lengths_toggles_long_secret_matching() -> None:
+    text = "prefixlongword9suffix"
+
+    assert redact_secrets_from_text(text, {"longword9"}) == f"prefix{REDACTED_SECRET_PLACEHOLDER}suffix"
+    assert redact_secrets_from_text(text, {"longword9"}, boundary_all_lengths=False) == (
+        f"prefix{REDACTED_SECRET_PLACEHOLDER}suffix"
+    )
+    assert redact_secrets_from_text(text, {"longword9"}, boundary_all_lengths=True) == text
+    assert redact_secrets_from_text("code: longword9 ok", {"longword9"}, boundary_all_lengths=True) == (
+        f"code: {REDACTED_SECRET_PLACEHOLDER} ok"
+    )
+
+
 def test_redact_secrets_from_bytes_replaces_invalid_utf8_and_redacts() -> None:
     data = b"\xffhunter2"
 
@@ -281,7 +294,54 @@ def test_mask_secrets_enabled_for_run_truth_table(
     assert manager.mask_secrets_enabled_for_run(None) is False
 
 
-def test_get_secret_values_for_run_ignores_workflow_opt_out_when_flag_enabled(
+def test_secret_redaction_enabled_for_run_requires_env_flag_and_workflow_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    manager = workflow_context_manager_factory(workflow_run_id="wr_enabled", mask_secrets=True)
+    manager.workflow_run_contexts["wr_disabled"] = workflow_context_manager_factory(
+        workflow_run_id="wr_disabled", mask_secrets=False
+    ).workflow_run_contexts["wr_disabled"]
+
+    monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    assert manager.secret_redaction_enabled_for_run("wr_enabled") is True
+    assert manager.secret_redaction_enabled_for_run("wr_disabled") is False
+    assert manager.secret_redaction_enabled_for_run("missing") is False
+    assert manager.secret_redaction_enabled_for_run(None) is False
+
+    monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
+    assert manager.secret_redaction_enabled_for_run("wr_enabled") is False
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, True), (False, False)])
+def test_artifact_redaction_enabled_for_bare_task_uses_global_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_SECRET_ARTIFACT_REDACTION", enabled)
+    manager = WorkflowContextManager()
+
+    assert manager.artifact_redaction_enabled(None) is expected
+
+
+def test_artifact_redaction_enabled_for_workflow_run_delegates_to_per_run_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WorkflowContextManager()
+    delegated_run_ids: list[str | None] = []
+
+    def per_run_gate(workflow_run_id: str | None) -> bool:
+        delegated_run_ids.append(workflow_run_id)
+        return True
+
+    monkeypatch.setattr(manager, "secret_redaction_enabled_for_run", per_run_gate)
+
+    assert manager.artifact_redaction_enabled("wr_1") is True
+    assert delegated_run_ids == ["wr_1"]
+
+
+def test_get_secret_values_for_run_respects_workflow_opt_out(
     monkeypatch: pytest.MonkeyPatch,
     workflow_context_manager_factory: Callable[..., WorkflowContextManager],
 ) -> None:
@@ -292,7 +352,7 @@ def test_get_secret_values_for_run_ignores_workflow_opt_out_when_flag_enabled(
         secrets={"password": "super-secret"},
     )
 
-    assert manager.get_secret_values_for_run("wr_1") == {"super-secret"}
+    assert manager.get_secret_values_for_run("wr_1") == set()
     assert manager.get_secret_values_for_run("wr_1", respect_artifact_redaction_flag=False) == {"super-secret"}
 
 

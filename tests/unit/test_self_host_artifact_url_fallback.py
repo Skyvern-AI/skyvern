@@ -10,13 +10,18 @@ When it is set: today's cloud behavior (bundling on, Skyvern signed URLs).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from skyvern.config import settings
+from skyvern.forge.sdk.artifact import manager as artifact_manager_module
 from skyvern.forge.sdk.artifact.manager import ArtifactManager, _bundling_enabled
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.workflow import service as workflow_service_module
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.forge.sdk.artifact.storage.test_helpers import create_fake_step
 
 _DUMMY_KEYRING_JSON = '{"current_kid":"k1","keys":{"k1":{"secret":"deadbeef"}}}'
@@ -260,6 +265,65 @@ class TestFileInfosFromArtifactsRespectsKeyring:
 
 
 class TestFlushStepArchiveUnbundled:
+    @pytest.mark.asyncio
+    async def test_workflow_debug_artifact_is_individually_retrievable_without_keyring(self, tmp_path) -> None:
+        """Self-hosted cleanup artifacts must not point an individual row at a ZIP."""
+        step = create_fake_step("step_self_hosted_cleanup")
+        artifacts: list[Artifact] = []
+
+        async def create_artifact(
+            artifact_id: str, artifact_type: ArtifactType, uri: str, **kwargs: object
+        ) -> Artifact:
+            now = datetime.now(timezone.utc)
+            artifact = Artifact(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                uri=uri,
+                created_at=now,
+                modified_at=now,
+                **kwargs,
+            )
+            artifacts.append(artifact)
+            return artifact
+
+        storage = LocalStorage(str(tmp_path))
+        manager = ArtifactManager()
+        database = SimpleNamespace(
+            tasks=SimpleNamespace(get_latest_step=AsyncMock(return_value=step)),
+            artifacts=SimpleNamespace(
+                create_artifact=AsyncMock(side_effect=create_artifact),
+                bulk_create_artifacts=AsyncMock(return_value=[]),
+            ),
+        )
+        app = SimpleNamespace(
+            DATABASE=database,
+            STORAGE=storage,
+            ARTIFACT_MANAGER=manager,
+            BROWSER_MANAGER=SimpleNamespace(
+                get_har_data=AsyncMock(return_value=b'{"log":{}}'),
+                get_browser_console_log=AsyncMock(return_value=b"console"),
+            ),
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                artifact_redaction_enabled=MagicMock(return_value=False),
+                secret_redaction_enabled_for_run=MagicMock(return_value=False),
+            ),
+        )
+        task = SimpleNamespace(task_id=step.task_id, organization_id=step.organization_id)
+        workflow = SimpleNamespace(workflow_id="wf_self_hosted")
+        workflow_run = SimpleNamespace(workflow_run_id="wr_self_hosted")
+        browser_state = SimpleNamespace(browser_context=None, browser_artifacts=SimpleNamespace(traces_dir=None))
+
+        with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", None),
+            patch.object(workflow_service_module, "app", app),
+            patch.object(artifact_manager_module, "app", app),
+        ):
+            await WorkflowService().persist_debug_artifacts(browser_state, task, workflow, workflow_run)
+            await manager.wait_for_upload_aiotasks([step.task_id])
+            har_artifact = next(artifact for artifact in artifacts if artifact.artifact_type == ArtifactType.HAR)
+            assert har_artifact.bundle_key is None
+            assert await manager.retrieve_artifact(har_artifact) == b'{"log":{}}'
+
     @pytest.mark.asyncio
     async def test_unbundled_flush_writes_one_artifact_per_member(self) -> None:
         """Keyring unset → no ZIP, no STEP_ARCHIVE parent, no bundle_key on members."""

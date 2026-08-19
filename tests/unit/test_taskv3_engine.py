@@ -6,9 +6,19 @@ from the tools test, so the engine's wiring is exercised without a real LLM or b
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from skyvern.forge.taskv3.engine import run_task_v3_agent_loop
+from skyvern.forge.taskv3.engine import (
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MAX_TURNS,
+    MAX_TOOL_CALLS_PER_ACTION_STEP,
+    MAX_TURNS_PER_ACTION_STEP,
+    coerce_v3_parameters,
+    run_task_v3_agent_loop,
+    taskv3_runaway_backstops,
+)
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage
 
@@ -98,3 +108,42 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
     assert captured["deadline_seconds"] == engine_mod.DEFAULT_DEADLINE_SECONDS
     assert captured["max_call_retries"] == engine_mod.DEFAULT_MAX_CALL_RETRIES
     assert captured["retryable_call_exceptions"] == (LLMProviderErrorRetryableTask,)
+
+
+def test_runaway_backstops_scale_with_action_step_budget() -> None:
+    # No action-step budget -> the guards are the engine's fixed defaults.
+    assert taskv3_runaway_backstops(None) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
+    assert taskv3_runaway_backstops(0) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
+    # Small cap: the fixed floors dominate, so a productive run keeps its historical headroom.
+    assert taskv3_runaway_backstops(10) == (DEFAULT_MAX_TURNS, DEFAULT_MAX_TOOL_CALLS)
+    # Large cap: both guards scale up so the action-step budget -- not the guards -- bounds the run.
+    big = 100
+    assert taskv3_runaway_backstops(big) == (
+        big * MAX_TURNS_PER_ACTION_STEP,
+        big * MAX_TOOL_CALLS_PER_ACTION_STEP,
+    )
+    # Monotonic: a larger cap never yields smaller guards.
+    t_small, c_small = taskv3_runaway_backstops(20)
+    t_big, c_big = taskv3_runaway_backstops(80)
+    assert t_big >= t_small and c_big >= c_small
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        ({"full_name": "Ada", "email": "a@x.test"}, {"full_name": "Ada", "email": "a@x.test"}),
+        # JSON object stored as a string (single-encoded): parsed so the profile reaches the model
+        # instead of being dropped to None by an isinstance(dict) check (the org-at-0% regression).
+        ('{"full_name": "Ada", "email": "a@x.test"}', {"full_name": "Ada", "email": "a@x.test"}),
+        # Double-encoded (json.dumps of the single-encoded string): both layers unwrapped.
+        (json.dumps('{"full_name": "Ada", "email": "a@x.test"}'), {"full_name": "Ada", "email": "a@x.test"}),
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("null", None),  # JSON null is genuinely no payload, not {"task_data": None}
+        ("just a plain string", {"task_data": "just a plain string"}),
+        (["a", "b"], {"task_data": ["a", "b"]}),
+    ],
+)
+def test_coerce_v3_parameters_surfaces_payload_regardless_of_type(payload: object, expected: object) -> None:
+    assert coerce_v3_parameters(payload) == expected

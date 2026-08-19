@@ -1012,6 +1012,7 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
     db_credential = SimpleNamespace(
         credential_id="cred_runtime",
         run_sequentially=run_sequentially,
+        tested_url=None,
         vault_type=None,
         totp_identifier=None,
     )

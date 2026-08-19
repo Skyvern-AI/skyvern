@@ -751,6 +751,13 @@ async def create_credential(
             auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
         )
 
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_credential_saved,
+        organization_id=current_org.organization_id,
+        credential_id=credential.credential_id,
+        credential_type=data.credential_type,
+    )
+
     return _convert_to_response(credential)
 
 

@@ -22,13 +22,147 @@ from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_
 
 LOG = structlog.get_logger()
 
+# ARIA combobox signals — used by observe() only to add a hint that a field is a typeahead. This is a
+# nudge for the model, not load-bearing: type() handles typeaheads behaviorally (see _FIND_SUGGESTION_JS),
+# so a field with no ARIA (a plain <input> backed by a custom dropdown) is still handled correctly.
+_IS_AUTOCOMPLETE_JS = r"""(el) => {
+  if (!el || el.tagName !== 'INPUT') return false;
+  const ac = el.getAttribute('aria-autocomplete');
+  // Only definitive combobox semantics — NOT bare aria-controls, which a search/filter input pointing
+  // at a results table also carries and would over-flag.
+  return el.getAttribute('role') === 'combobox' || (ac && ac !== 'none') || el.getAttribute('aria-haspopup') === 'listbox';
+}"""
+
+# Function words to ignore when matching the typed value against a candidate's text — otherwise a stray
+# "the"/"for"/"and" shared with some page chrome could score a hit. Only content words count. NOTE: not
+# "new" — it is load-bearing in proper names ("New York" vs "York"), so it stays a matchable token.
+_STOPWORDS_JS = (
+    "new Set(['the','and','for','you','our','are','was','add','all','not','but','can','will',"
+    "'one','get','job','your','this','that','with','from','has','have','may','use','any','per','via',"
+    "'inc','llc','ltd','corp'])"
+)
+
+# Snapshot of everything visible BEFORE typing. The finder ignores anything marked here, so only DOM
+# that appeared (or became visible) IN REACTION to typing can be treated as a suggestion — static page
+# text that merely happens to share a word with the value (a nearby card, nav item, prior answer) is
+# never eligible. This is what makes "detect by the page's reaction" rigorous rather than a claim.
+_PRESNAPSHOT_JS = r"""() => {
+  document.querySelectorAll('[data-tv3-pre]').forEach((e) => e.removeAttribute('data-tv3-pre'));
+  for (const el of document.querySelectorAll('body *')) {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) el.setAttribute('data-tv3-pre', '1');
+  }
+}"""
+
+# Behavioral, site-agnostic suggestion finder. After the caller types a value (with a pre-snapshot taken
+# first), this looks for the suggestion list the typeahead rendered IN REACTION: a small, visible,
+# leaf-ish row that did NOT exist/show before typing (not `data-tv3-pre`), sits in the dropdown region
+# near the field, and shares a CONTENT word with the typed value. It keys off reaction + geometry + token
+# overlap — NOT any site's CSS classes, ARIA, or field vocabulary — so a bespoke widget (plain <input> +
+# custom dropdown) is handled like an ARIA combobox and it stays durable as sites restyle. Navigational
+# controls (links/buttons) are excluded unless explicitly role=option. Among matches it picks the
+# INNERMOST row — a candidate that contains another match is a container (its text is the union of all
+# rows, so it ties/outranks any single row; clicking it would land on the wrong row), so it's dropped.
+# Tags the winner with data-tv3-sugg and returns {text, score}, or null if nothing reacted.
+_FIND_SUGGESTION_JS = (
+    r"""(args) => {
+  const STOP = """
+    + _STOPWORDS_JS
+    + r""";
+  const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w)));
+  const want = toks(args.value || '');
+  document.querySelectorAll('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
+  if (!want.size) return null;
+  const field = document.querySelector(args.field);
+  const fr = field ? field.getBoundingClientRect() : null;
+  const cands = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.hasAttribute('data-tv3-pre')) continue;                    // existed/was visible before typing → not a reaction
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
+    const role = el.getAttribute('role');
+    // never click something navigational (would leave the form) unless it's explicitly an option
+    const nav = (tag === 'A' && el.hasAttribute('href')) || tag === 'BUTTON' || role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab';
+    if (nav && role !== 'option') continue;
+    if (el.children.length > 8) continue;                             // a suggestion row, not a big container
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0 || r.height > 120) continue;  // visible, row-sized (allows a 2-line row)
+    if (fr) {                                                          // in the dropdown region: below, or above if it flipped up
+      if (r.top < fr.top - 400 || r.top > fr.bottom + 500) continue;
+      if (r.right < fr.left || r.left > fr.right) continue;
+    }
+    const txt = (el.innerText || '').trim();
+    if (!txt || txt.length > 80) continue;
+    const have = toks(txt);
+    let score = 0;
+    for (const w of want) if (have.has(w)) score++;
+    if (score > 0) cands.push({ el, score, h: r.height });
+  }
+  if (!cands.length) return null;
+  // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows), then
+  // take the highest score, breaking ties toward the smallest (innermost) row.
+  const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && c.el.contains(o.el)));
+  const pool = leaves.length ? leaves : cands;
+  pool.sort((a, b) => b.score - a.score || a.h - b.h);
+  const best = pool[0];
+  // Refuse to tag a multi-row CONTAINER even when it is the only match (its score came from different
+  // rows' text combined, and clicking it would land on an arbitrary middle row). A real suggestion is a
+  // single row: its visible child elements, if any, sit on one line (inline sub-parts), not stacked rows.
+  const childRows = new Set();
+  for (const ch of best.el.children) {
+    const cr = ch.getBoundingClientRect();
+    if (cr.width > 0 && cr.height > 0 && (ch.innerText || '').trim()) childRows.add(Math.round(cr.top));
+  }
+  if (childRows.size >= 2) return null;
+  best.el.setAttribute('data-tv3-sugg', '1');
+  return { text: (best.el.innerText || '').trim(), score: best.score };
+}"""
+)
+
+# Read back whether the field committed a real selection CAUSED BY the suggestion click — not just that
+# the field holds text (the caller typed into it before clicking, so a bare value check would call any
+# no-op click a success). Committed iff the visible value (a) reflects the row we clicked (shares a word
+# with the chosen suggestion, or the typed value) and (b) shows the click took effect — it changed from
+# the raw typed text OR the suggestion list closed. Failing that, a hidden input in the nearest
+# div/li/fieldset (never the whole <form>) whose value overlaps. Otherwise "" — nothing committed.
+_VERIFY_COMMIT_JS = r"""(args) => {
+  const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3));
+  const overlaps = (a, b) => { const B = toks(b); for (const w of toks(a)) if (B.has(w)) return true; return false; };
+  const el = document.querySelector(args.field);
+  const typed = String(args.typed || '').trim();
+  const chosen = String(args.chosen || '').trim() || typed;
+  const cur = el ? (el.value || '').trim() : '';
+  const tagged = document.querySelector('[data-tv3-sugg]');
+  const listClosed = !tagged || tagged.getBoundingClientRect().height === 0;
+  // A short normalized value ("New York" -> "NY", "United States" -> "US") has no >=3-char token to
+  // overlap, so accept it on causality alone (it changed / the list closed). Longer values must still
+  // relate to the chosen suggestion so an unrelated change can't read as a successful commit.
+  if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) return cur;
+  const cont = el ? el.closest('div,li,fieldset') : null;
+  if (cont) {
+    for (const h of cont.querySelectorAll('input[type=hidden]')) {
+      const v = (h.value || '').trim();
+      if (v && (overlaps(v, chosen) || overlaps(v, typed))) return v;
+    }
+  }
+  return '';
+}"""
+
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
-_OBSERVE_JS = r"""
+_OBSERVE_JS = (
+    r"""
 () => {
+  const _isAutocomplete = """
+    + _IS_AUTOCOMPLETE_JS
+    + r""";
   const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[contenteditable=true]';
   const els = document.querySelectorAll(q);
   const out = [];
+  // Monotonic across observe() calls (persisted on window), and never reassigned on an element that
+  // already has one, so a data-tv3 marker always denotes the same element. Resetting the counter per
+  // call let a selector remembered from an earlier observe silently resolve to a different node.
+  if (typeof window.__tv3_next !== 'number') window.__tv3_next = 0;
   let i = 0;
   let lastGroup = '';
   for (const el of els) {
@@ -39,7 +173,14 @@ _OBSERVE_JS = r"""
     if (el.id) { const s = '#' + CSS.escape(el.id); if (uniq(s)) selector = s; }
     if (!selector && el.getAttribute('data-testid')) { const s = '[data-testid="' + el.getAttribute('data-testid') + '"]'; if (uniq(s)) selector = s; }
     if (!selector && el.name) { const s = el.tagName.toLowerCase() + '[name="' + el.name + '"]'; if (uniq(s)) selector = s; }
-    if (!selector) { el.setAttribute('data-tv3', 't' + i); selector = '[data-tv3="t' + i + '"]'; }
+    if (!selector) {
+      let m = el.getAttribute('data-tv3');
+      // Reuse a marker only if it still uniquely resolves; otherwise mint a fresh monotonic one.
+      // Keeps a marker stable across observe() calls without trusting a foreign, duplicated, or
+      // syntactically-broken data-tv3 value that a remembered selector could resolve to the wrong node.
+      if (!m || !uniq('[data-tv3="' + m + '"]')) { m = 't' + (window.__tv3_next++); el.setAttribute('data-tv3', m); }
+      selector = '[data-tv3="' + m + '"]';
+    }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
     if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
     if (!label) label = (el.innerText || (el.type === 'password' ? '' : el.value) || '').trim();
@@ -49,6 +190,9 @@ _OBSERVE_JS = r"""
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
     else if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio') rec.checked = el.getAttribute('aria-checked') === 'true';
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
+    // Flag typeahead/autocomplete inputs so the model treats them as combobox fills instead of typing
+    // raw text that never registers as a valid selection (type() also auto-commits them). See _IS_AUTOCOMPLETE_JS.
+    if (_isAutocomplete(el)) rec.autocomplete = true;
     // Attach the surrounding question/group text for controls whose meaning lives in nearby
     // non-interactive text (radio/checkbox groups, weakly-labeled fields) so the agent can answer
     // without fetching raw HTML. Deduped against the previous element to keep grouped options compact.
@@ -66,6 +210,7 @@ _OBSERVE_JS = r"""
   return JSON.stringify({ url: location.href, title: document.title, elements: out });
 }
 """
+)
 
 
 def _spec(
@@ -109,6 +254,8 @@ def build_browser_tools(
                 extra += f" checked={e['checked']}"
             if e.get("required"):
                 extra += " *required"
+            if e.get("autocomplete"):
+                extra += " [autocomplete→use select_combobox]"
             if e.get("group"):
                 extra += f" group={e['group']!r}"
             lines.append(
@@ -132,14 +279,138 @@ def build_browser_tools(
         await page.click(selector, timeout=15000)
         return ToolResult.ok(f"clicked {selector} — now at {await _url()}")
 
+    async def _commit_typeahead(selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+        # Poll for the suggestion list rendered IN REACTION to the value already typed into `selector`,
+        # click the best match, and verify the field committed. Site-agnostic (see _FIND_SUGGESTION_JS).
+        # Returns (committed_value, suggestion_text): suggestion_text is None when no suggestion ever
+        # surfaced (an ordinary field, or nothing matched); committed is None when a suggestion was
+        # clicked but no value landed.
+        best_txt: str | None = None
+        for _ in range(rounds):
+            await asyncio.sleep(0.4)
+            try:
+                found = await page.evaluate(_FIND_SUGGESTION_JS, {"value": value, "field": selector})
+            except Exception as e:
+                LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
+                found = None
+            if isinstance(found, dict) and found.get("text"):
+                best_txt = str(found["text"])
+                break
+        if not best_txt:
+            return None, None
+        # Click the tagged best row. If the list re-rendered and dropped the tag, re-find (re-tag the
+        # current best) and click once more — never blind-press ArrowDown/Enter, which would commit
+        # whichever row the widget happens to highlight rather than the one we actually scored.
+        clicked = False
+        try:
+            await page.click('[data-tv3-sugg="1"]', timeout=3000)
+            clicked = True
+        except Exception:
+            try:
+                refound = await page.evaluate(_FIND_SUGGESTION_JS, {"value": value, "field": selector})
+                if isinstance(refound, dict) and refound.get("text"):
+                    best_txt = str(refound["text"])
+                    await page.click('[data-tv3-sugg="1"]', timeout=3000)
+                    clicked = True
+            except Exception:
+                clicked = False
+        if not clicked:
+            # a suggestion surfaced but we couldn't click it — report un-committed, don't guess
+            LOG.debug("taskv3 typeahead could not click suggestion", selector=selector, suggestion=best_txt)
+            return None, best_txt
+        await asyncio.sleep(0.3)
+        try:
+            committed = (
+                (await page.evaluate(_VERIFY_COMMIT_JS, {"field": selector, "typed": value, "chosen": best_txt})) or ""
+            ).strip()
+        except Exception as e:
+            LOG.debug("taskv3 typeahead commit-verify failed", selector=selector, error=str(e))
+            committed = ""
+        return (committed or None), best_txt
+
+    async def _type_and_commit(selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+        # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
+        # visible DOM just before typing so the finder treats only NEW/reacting nodes as suggestions —
+        # static page text that merely shares a word with the value can't be mistaken for one.
+        await page.click(selector, timeout=15000)
+        await page.fill(selector, "", timeout=15000)
+        presnapshot_ok = True
+        try:
+            await page.evaluate(_PRESNAPSHOT_JS)
+        except Exception:
+            presnapshot_ok = False
+            LOG.info("taskv3 typeahead pre-snapshot failed; skipping suggestion probe", selector=selector)
+        await page.type(selector, value, delay=15, timeout=15000)
+        if not presnapshot_ok:
+            # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
+            # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
+            # value and let the caller re-observe.
+            return None, None
+        return await _commit_typeahead(selector, value, rounds)
+
+    # Input kinds that are never typeaheads — skip the suggestion probe (and its latency) for these.
+    # `textarea` is included: free-text boxes never render a typeahead and would just pay the probe tax.
+    _NON_TYPEAHEAD_TYPES = frozenset(
+        {
+            "textarea",
+            "email",
+            "tel",
+            "number",
+            "url",
+            "password",
+            "date",
+            "datetime-local",
+            "month",
+            "time",
+            "week",
+            "color",
+            "range",
+        }
+    )
+
+    async def _field_type(selector: str) -> str:
+        try:
+            return (
+                await page.eval_on_selector(
+                    selector,
+                    "el => el.tagName === 'TEXTAREA' ? 'textarea' : (el.getAttribute('type') || 'text').toLowerCase()",
+                )
+            ) or "text"
+        except Exception:
+            return "text"
+
     async def type_text(args: dict[str, Any]) -> ToolResult:
         selector = args["selector"]
         text = args.get("text", "")
-        if args.get("clear", True):
+        press_enter = args.get("press_enter")
+        clear = args.get("clear", True)
+        # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
+        # model does not reliably reach for select_combobox on its own. So after typing into a plain text
+        # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
+        # here. Detection is behavioral (no per-site rules), so this holds across ATSes; non-text inputs
+        # and append/enter typing skip it and fill normally (fast path, no polling).
+        if text and clear and not press_enter and await _field_type(selector) not in _NON_TYPEAHEAD_TYPES:
+            # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
+            # not just on a single `input` from fill — still surfaces them, then commit the best match.
+            committed, opt_txt = await _type_and_commit(selector, text, rounds=3)
+            if opt_txt and committed:
+                return ToolResult.ok(
+                    f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
+                )
+            if opt_txt and not committed:
+                # A suggestion surfaced but the field did not accept it — the field is NOT filled. Return
+                # an error so a batched turn halts here (the loop stops the rest of the batch on error)
+                # instead of proceeding — e.g. to a queued submit — on an uncommitted field.
+                return ToolResult.error(
+                    f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is NOT "
+                    "filled; re-observe and retry, do not proceed"
+                )
+            return ToolResult.ok(f"typed into {selector}")
+        if clear:
             await page.fill(selector, text, timeout=15000)
         else:
             await page.type(selector, text, timeout=15000)
-        if args.get("press_enter"):
+        if press_enter:
             await page.press(selector, "Enter")
         return ToolResult.ok(f"typed into {selector}")
 
@@ -205,6 +476,23 @@ def build_browser_tools(
         await el.set_input_files(paths)
         return ToolResult.ok(f"uploaded {paths} to {selector}")
 
+    async def select_combobox(args: dict[str, Any]) -> ToolResult:
+        # Explicit typeahead fill (type() also drives this automatically): type the value, WAIT for the
+        # async suggestion list, pick the best-matching suggestion, and VERIFY the field committed. Fails
+        # loudly if nothing matches rather than leaving raw typed text the widget won't accept as a valid
+        # selection (a false "filled" — the failure mode this exists to prevent).
+        selector = args["selector"]
+        value = args["value"]
+        committed, opt_txt = await _type_and_commit(selector, value, rounds=8)
+        if opt_txt is None:
+            return ToolResult.error(
+                f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
+                "— do not assume success or move on as if it were"
+            )
+        if not committed:
+            return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
+        return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
+
     tools = [
         _spec(
             "observe",
@@ -242,6 +530,15 @@ def build_browser_tools(
                 {"selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}}, ["selector"]
             ),
             select_option,
+        ),
+        _spec(
+            "select_combobox",
+            "Fill an autocomplete/typeahead/combobox field (location, school, employer lookups): types the "
+            "value, waits for the suggestion list to render, selects the best-matching suggestion, and "
+            "verifies the field committed. Use this INSTEAD of `type` for such fields — it errors if no "
+            "suggestion matches so you never leave uncommitted raw text.",
+            _obj({"selector": {"type": "string"}, "value": {"type": "string"}}, ["selector", "value"]),
+            select_combobox,
         ),
         _spec(
             "press_key",
@@ -283,7 +580,7 @@ def build_browser_tools(
         ),
     ]
     for _tool_spec in tools:
-        if _tool_spec.name in ("click", "type", "select_option", "press_key", "file_upload"):
+        if _tool_spec.name in ("click", "type", "select_option", "select_combobox", "press_key", "file_upload"):
             _tool_spec.billable = True
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page)

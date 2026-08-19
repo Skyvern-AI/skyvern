@@ -4,11 +4,14 @@ import hashlib
 import json
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
+from skyvern.forge.sdk.copilot.challenge_evidence import CHALLENGE_KIND_KEY, ChallengeKind
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
@@ -17,11 +20,16 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
+from skyvern.forge.sdk.copilot.enforcement import (
+    latest_diagnosis_contract_satisfies_goal,
+    terminal_challenge_blocker_signal_from_page_evidence,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
+    DEVICE_APPROVAL_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
+    TERMINAL_CHALLENGE_USER_FACING_REASON,
     RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -30,8 +38,10 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
 )
+from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
+from skyvern.forge.sdk.copilot.tools.scouting import _mark_post_run_page_observed
 
 
 def _ctx() -> CopilotContext:
@@ -355,8 +365,8 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
         failed_block_status="failed",
         workflow_run_id="wr_failed",
         current_origin="https://example.test",
-        current_url_present=True,
-        current_title_present=True,
+        current_url="https://example.test/search",
+        current_title="Search results",
         page_evidence_source="inspect_page_for_composition",
         observed_after_workflow_run=True,
         page_form_summaries=["text input labeled Search"],
@@ -364,6 +374,9 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
         page_action_summaries=["button Search is disabled"],
     )
     changed_page = base.model_copy(update={"page_result_summaries": ["results table is visible"]})
+    changed_location = base.model_copy(
+        update={"current_url": "https://example.test/other", "current_title": "Other page"}
+    )
 
     base_contract = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
@@ -375,11 +388,20 @@ def test_runtime_authoring_repair_context_identity_includes_bounded_page_state()
         result=_authoring_repair_result(changed_page),
         ctx=_ctx(),
     )
+    changed_location_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result=_authoring_repair_result(changed_location),
+        ctx=_ctx(),
+    )
 
     assert base_contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert (
         base_contract.to_trace_data()["root_cause_signature"]
         != changed_page_contract.to_trace_data()["root_cause_signature"]
+    )
+    assert (
+        base_contract.to_trace_data()["root_cause_signature"]
+        == changed_location_contract.to_trace_data()["root_cause_signature"]
     )
     assert base_contract.diagnosis_result.root_cause_identity.error_class == (
         "code_authoring_runtime_block_failure_timeout_waiting_for_selector"
@@ -416,7 +438,7 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
         "workflow_run_id": "wr_failed",
         "observed_after_workflow_run": True,
         "source_tool": "inspect_page_for_composition",
-        "current_url": "https://example.test/search?case=secret",
+        "current_url": "https://example.test/search?case=secret#result",
         "page_title": "Search results",
         "forms": [
             {
@@ -441,14 +463,52 @@ def test_failed_run_finalizes_runtime_authoring_repair_context_after_matching_pa
     assert repair_context.block_label == "search_registry"
     assert repair_context.runtime_failure_class is None
     assert repair_context.current_origin == "https://example.test"
-    assert repair_context.current_url_present is True
-    assert repair_context.current_title_present is True
+    assert repair_context.current_url == "https://example.test/search"
+    assert repair_context.current_title == "Search results"
+    assert "current_url_present" not in CodeAuthoringRepairContext.model_fields
+    assert "current_title_present" not in CodeAuthoringRepairContext.model_fields
     assert repair_context.page_evidence_source == "inspect_page_for_composition"
     assert repair_context.observed_after_workflow_run is True
     assert repair_context.page_form_summaries == ["Search #search", "Go button.search disabled"]
     assert repair_context.page_result_summaries == ["#results No matching records"]
     assert repair_context.page_action_summaries == ["Next page a.next"]
     assert "case=secret" not in repair_context.model_dump_json()
+
+
+def test_post_run_observation_is_false_when_all_four_summary_collections_are_empty() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = _failed_run_result()
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    ctx.composition_page_evidence = {
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/search?layout=cards",
+        "page_title": "Search results",
+        "forms": [],
+        "result_containers": [],
+        "navigation_targets": [],
+        "challenge_controls": [],
+        "observed_empty_page": True,
+    }
+    result = {
+        "ok": False,
+        "error": "Run failed.",
+        "data": {"workflow_run_id": "wr_failed", "overall_status": "failed"},
+    }
+
+    inject_runtime_authoring_repair_context(ctx, result)
+
+    repair_context = ctx.last_code_authoring_repair_context
+    assert isinstance(repair_context, CodeAuthoringRepairContext)
+    assert repair_context.current_url == "https://example.test/search"
+    assert repair_context.current_title == "Search results"
+    assert repair_context.page_form_summaries == []
+    assert repair_context.page_result_summaries == []
+    assert repair_context.page_action_summaries == []
+    assert repair_context.page_challenge_summaries == []
+    assert repair_context.observed_after_workflow_run is False
 
 
 def test_failed_run_injects_pending_runtime_authoring_context_before_page_observation() -> None:
@@ -989,8 +1049,8 @@ def test_runtime_authoring_repair_context_sanitizes_failure_and_page_summaries()
         "workflow_run_id": "wr_secret",
         "observed_after_workflow_run": True,
         "source_tool": "inspect_page_for_composition",
-        "current_url": "https://user:secret@example.test/search?password=hunter2",
-        "page_title": "Search",
+        "current_url": "https://user:secret@example.test/search/" + "p" * 200 + "?password=hunter2#token",
+        "page_title": "Search\n" + "x" * 200,
         "forms": [
             {
                 "fields": [{"label": "Password password=hunter2", "selector": "#password"}],
@@ -1011,6 +1071,12 @@ def test_runtime_authoring_repair_context_sanitizes_failure_and_page_summaries()
     assert "user:secret" not in dumped
     assert "password=hunter2" not in dumped
     assert repair_context.current_origin == "https://example.test"
+    assert repair_context.current_url is not None
+    assert repair_context.current_url.startswith("https://example.test/search/")
+    assert len(repair_context.current_url) == 160
+    assert repair_context.current_title is not None
+    assert "\n" not in repair_context.current_title
+    assert len(repair_context.current_title) == 160
 
 
 @pytest.mark.parametrize(
@@ -2038,12 +2104,171 @@ def _bounded_failure_page_evidence() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "failure_reason",
+    [
+        "Failed to execute code block.",
+        "CodeBlock failed because a browser operation failed at line 12: Locator.wait_for timed out.",
+    ],
+    ids=["inline", "secure_runner"],
+)
+def test_codeblock_failure_result_carries_same_run_page_facts_for_both_execution_engines(
+    failure_reason: str,
+) -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    run_result = _failed_run_result()
+    data = run_result["data"]
+    assert isinstance(data, dict)
+    blocks = data["blocks"]
+    assert isinstance(blocks, list)
+    block = blocks[0]
+    assert isinstance(block, dict)
+    block["failure_reason"] = failure_reason
+    evidence = _bounded_failure_page_evidence()
+    evidence["workflow_run_id"] = "wr_failed"
+    evidence["observed_after_workflow_run"] = True
+    ctx.composition_page_evidence = evidence
+
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+    inject_runtime_authoring_repair_context(ctx, run_result)
+
+    assert block["failure_reason"] == failure_reason
+    repair_context = CodeAuthoringRepairContext.model_validate(data["authoring_repair_context"])
+    assert repair_context.current_url == "https://example.test/app/results"
+    assert repair_context.current_title == "Results"
+    assert repair_context.page_result_summaries == [
+        "#results #results tbody tr",
+        "#results tbody tr button",
+        "First result row",
+    ]
+    assert repair_context.observed_after_workflow_run is True
+
+
+_SOURCE_MISMATCH_EVENT = "copilot_post_run_evidence_source_mismatch_refused"
+
+
+def _stale_login_page_evidence() -> dict[str, object]:
+    return {**_bounded_failure_page_evidence(), "current_url": "https://example.test/account/login"}
+
+
+def _cross_session_run_result() -> dict[str, object]:
+    result = _failed_run_result()
+    data = result["data"]
+    assert isinstance(data, dict)
+    data["browser_session_id"] = "pbs_run"
+    return result
+
+
+def test_store_post_run_page_evidence_refuses_a_packet_read_from_another_browser_session() -> None:
+    ctx = _ctx()
+    with capture_logs() as logs:
+        stored, _ = store_post_run_page_evidence(
+            ctx,
+            _stale_login_page_evidence(),
+            run_id="wr_failed",
+            current_url="https://example.test/account/login",
+            source_browser_session_id="pbs_scout",
+            run_browser_session_id="pbs_run",
+        )
+
+    assert stored["source_browser_session_id"] == "pbs_scout"
+    assert stored["observed_after_workflow_run"] is False
+    assert "workflow_run_id" not in stored
+    assert any(entry["event"] == _SOURCE_MISMATCH_EVENT for entry in logs)
+
+    same_session_twin = recorded_outcome_from_run_blocks_result(
+        _cross_session_run_result(), page_evidence={**stored, "source_browser_session_id": "pbs_run"}
+    )
+    assert same_session_twin is not None
+    assert any("example.test" in ref for ref in same_session_twin.page_evidence_refs)
+
+
+def test_unknown_run_session_grants_a_foreign_packet_so_producers_must_stamp_the_run_session() -> None:
+    """An envelope that omits browser_session_id reads as 'unknown' and grants, which is why every
+    result path — watchdog cancels included — stamps the run session rather than leaving it out."""
+    ctx = _ctx()
+    with capture_logs() as logs:
+        stored, _ = store_post_run_page_evidence(
+            ctx,
+            _stale_login_page_evidence(),
+            run_id="wr_failed",
+            current_url="https://example.test/account/login",
+            source_browser_session_id="pbs_scout",
+            run_browser_session_id=None,
+        )
+
+    assert stored["source_browser_session_id"] == "pbs_scout"
+    assert stored["observed_after_workflow_run"] is True
+    assert stored["workflow_run_id"] == "wr_failed"
+    assert not any(entry["event"] == _SOURCE_MISMATCH_EVENT for entry in logs)
+
+    refused = recorded_outcome_from_run_blocks_result(_cross_session_run_result(), page_evidence=stored)
+    assert refused is None
+
+
+def test_mark_post_run_page_observed_refuses_a_packet_read_from_another_browser_session() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_test_ok = False
+
+    with capture_logs() as logs:
+        _mark_post_run_page_observed(
+            ctx,
+            source_tool="inspect_page_for_composition",
+            url="https://example.test/account/login",
+            page_evidence=_stale_login_page_evidence(),
+            source_browser_session_id="pbs_scout",
+        )
+
+    assert ctx.post_run_page_observation_tool is None
+    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert any(entry["event"] == _SOURCE_MISMATCH_EVENT for entry in logs)
+
+
+@pytest.mark.parametrize("run_browser_session_id", ["pbs_run", None])
+def test_post_run_page_evidence_keeps_run_identity_without_a_foreign_source(
+    run_browser_session_id: str | None,
+) -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_run_blocks_browser_session_id = run_browser_session_id
+    ctx.last_test_ok = False
+
+    stored, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id="pbs_run",
+        run_browser_session_id=run_browser_session_id,
+    )
+    _mark_post_run_page_observed(
+        ctx,
+        source_tool="inspect_page_for_composition",
+        url="https://example.test/app/results",
+        page_evidence=stored,
+        source_browser_session_id="pbs_run",
+    )
+
+    assert stored["source_browser_session_id"] == "pbs_run"
+    assert stored["observed_after_workflow_run"] is True
+    assert stored["workflow_run_id"] == "wr_failed"
+    assert ctx.post_run_page_observation_workflow_run_id == "wr_failed"
+
+
 def test_post_run_failure_page_store_mark_inject_grounds_repair_without_finalizing_early() -> None:
     ctx = _ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
 
-    stored = store_post_run_page_evidence(
-        ctx, _bounded_failure_page_evidence(), run_id="wr_failed", current_url="https://example.test/app/results"
+    stored, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id="pbs_run",
+        run_browser_session_id="pbs_run",
     )
     assert ctx.composition_page_evidence is stored
     assert stored["observed_after_workflow_run"] is True
@@ -2155,6 +2380,37 @@ def test_post_run_inspection_cleanly_matches_predicate(evidence: object, run_id:
     assert post_run_inspection_cleanly_matches(evidence, run_id) is expected
 
 
+def test_same_run_post_run_page_evidence_is_redacted_and_copied_for_the_run_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    evidence = _bounded_failure_page_evidence()
+    evidence["observed_after_workflow_run"] = True
+    evidence["workflow_run_id"] = "wr_current"
+    evidence["result_containers"] = [{"rows": [{"cells": ["private-value"]}]}]
+    ctx.composition_page_evidence = evidence
+    ctx.codeblock_redaction_parameters = {"account": "private-value"}
+    safe_evidence = {**evidence, "result_containers": [{"rows": [{"cells": ["[REDACTED]"]}]}]}
+    scrubber = MagicMock(return_value=safe_evidence)
+    monkeypatch.setattr(run_execution_module.app.AGENT_FUNCTION, "redact_codeblock_parameter_values", scrubber)
+
+    result_evidence = run_execution_module._same_run_page_evidence_for_result(ctx, "wr_current")
+
+    assert result_evidence == safe_evidence
+    assert result_evidence is not evidence
+    scrubber.assert_called_once_with(evidence, ctx.codeblock_redaction_parameters)
+
+
+def test_foreign_post_run_page_evidence_is_excluded_from_the_run_result() -> None:
+    ctx = _ctx()
+    evidence = _bounded_failure_page_evidence()
+    evidence["observed_after_workflow_run"] = True
+    evidence["workflow_run_id"] = "wr_other"
+    ctx.composition_page_evidence = evidence
+
+    assert run_execution_module._same_run_page_evidence_for_result(ctx, "wr_current") is None
+
+
 @pytest.mark.asyncio
 async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
     monkeypatch: pytest.MonkeyPatch,
@@ -2165,11 +2421,11 @@ async def test_bounded_seam_capture_is_stored_stamped_without_touching_budget(
     captured.pop("workflow_run_id", None)
 
     async def fake_capture(
-        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
+        _ctx: CopilotContext, *, inspected_url: str, current_url: str
     ) -> tuple[dict[str, object], None]:
         return dict(captured), None
 
-    monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
 
     await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app/results"
@@ -2215,12 +2471,10 @@ async def test_failed_seam_capture_neutralizes_non_matching_evidence(
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.composition_page_evidence = stale
 
-    async def fake_capture(
-        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
-    ) -> tuple[None, None]:
+    async def fake_capture(_ctx: CopilotContext, *, inspected_url: str, current_url: str) -> tuple[None, None]:
         return None, None
 
-    monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
 
     await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
@@ -2239,16 +2493,274 @@ async def test_failed_seam_capture_preserves_clean_matching_evidence(
     clean["workflow_run_id"] = "wr_failed"
     ctx.composition_page_evidence = clean
 
-    async def fake_capture(
-        _ctx: CopilotContext, *, inspected_url: str, current_url: str, solve_challenges: bool = True
-    ) -> tuple[None, None]:
+    async def fake_capture(_ctx: CopilotContext, *, inspected_url: str, current_url: str) -> tuple[None, None]:
         return None, None
 
-    monkeypatch.setattr(run_execution_module, "_capture_composition_evidence", fake_capture)
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
 
     await run_execution_module._capture_and_store_post_run_page(
         ctx, run_session_id="run_session", run_id="wr_failed", current_url="https://example.test/app"
     )
+    assert ctx.composition_page_evidence is clean
+
+
+def _post_run_inspect_ctx() -> CopilotContext:
+    ctx = _ctx()
+    ctx.browser_session_id = "scout_session"
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_run_blocks_browser_session_id = "run_session"
+    ctx.last_test_ok = False
+    ctx.org_credentials_for_turn = []
+    return ctx
+
+
+async def _drive_inspect_page(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: CopilotContext,
+    *,
+    captured: dict[str, object] | None,
+    target_url: str = "current_page",
+    capture_lands_on_session: str | None = None,
+    capture_clears_session: bool = False,
+    capture_raises: bool = False,
+) -> dict[str, object]:
+    async def fake_capture(
+        inner_ctx: CopilotContext, *, inspected_url: str, current_url: str
+    ) -> tuple[dict[str, object] | None, None]:
+        if capture_clears_session:
+            inner_ctx.browser_session_id = None
+        elif capture_lands_on_session is not None:
+            inner_ctx.browser_session_id = capture_lands_on_session
+        if capture_raises:
+            raise TimeoutError("capture timed out after the session was substituted")
+        return (dict(captured) if captured is not None else None), None
+
+    async def fake_page_info(inner_ctx: CopilotContext, session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://example.test/app/results", "Results"
+
+    monkeypatch.setattr(composition_capture_module, "_capture_composition_evidence", fake_capture)
+    monkeypatch.setattr(composition_capture_module, "_fallback_page_info", fake_page_info)
+    return await composition_capture_module._inspect_page_for_composition_impl(ctx, target_url)
+
+
+@pytest.mark.asyncio
+async def test_post_run_current_page_inspect_is_sourced_from_the_run_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+
+    with capture_logs() as logs:
+        result = await _drive_inspect_page(monkeypatch, ctx, captured=_bounded_failure_page_evidence())
+
+    assert result["ok"] is True
+    stored = ctx.composition_page_evidence
+    assert isinstance(stored, dict)
+    assert stored["source_browser_session_id"] == "run_session"
+    assert stored["observed_after_workflow_run"] is True
+    assert stored["workflow_run_id"] == "wr_failed"
+    assert ctx.post_run_page_observation_workflow_run_id == "wr_failed"
+    assert result["reached_via"] == "post_run"
+    assert ctx.browser_session_id == "scout_session"
+    assert not any(entry.get("event") == "copilot_post_run_evidence_source_mismatch_refused" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_post_run_inspect_drops_a_packet_whose_source_session_is_unprovable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed mid-capture session create clears the id, and an unknown source id grants post-run
+    identity, so the packet has to be dropped rather than laundered into the run's own evidence."""
+    ctx = _post_run_inspect_ctx()
+
+    result = await _drive_inspect_page(
+        monkeypatch,
+        ctx,
+        captured=_bounded_failure_page_evidence(),
+        capture_clears_session=True,
+    )
+
+    assert result["ok"] is False
+    assert ctx.composition_page_evidence is None
+    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert ctx.browser_session_id == "scout_session"
+
+
+@pytest.mark.asyncio
+async def test_failed_post_run_capture_on_a_substituted_session_is_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Substitution racing a capture failure is the trickiest path here: it must neither grant post-run
+    identity nor disturb the packet already stored for the run."""
+    ctx = _post_run_inspect_ctx()
+    clean = _clean_same_run_page_evidence()
+    ctx.composition_page_evidence = clean
+
+    result = await _drive_inspect_page(
+        monkeypatch,
+        ctx,
+        captured=_bounded_failure_page_evidence(),
+        capture_lands_on_session="replacement_session",
+        capture_raises=True,
+    )
+
+    assert result["ok"] is False
+    assert ctx.composition_page_evidence is clean
+    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert ctx.browser_session_id == "scout_session"
+
+
+@pytest.mark.asyncio
+async def test_post_run_inspect_does_not_close_the_session_it_landed_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tool calls in one batch run concurrently, so a session read back off the shared context may be
+    a sibling's rather than this capture's substitute; closing it would kill a live browser."""
+    ctx = _post_run_inspect_ctx()
+    closed: list[str] = []
+
+    class _Sessions:
+        async def close_session(self, *, organization_id: str, browser_session_id: str) -> None:
+            closed.append(browser_session_id)
+
+    monkeypatch.setattr("skyvern.forge.app.PERSISTENT_SESSIONS_MANAGER", _Sessions(), raising=False)
+
+    await _drive_inspect_page(
+        monkeypatch,
+        ctx,
+        captured=_bounded_failure_page_evidence(),
+        capture_lands_on_session="replacement_session",
+    )
+
+    assert closed == []
+    assert ctx.browser_session_id == "scout_session"
+
+
+@pytest.mark.asyncio
+async def test_post_run_inspect_stamps_the_session_the_capture_landed_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+
+    result = await _drive_inspect_page(
+        monkeypatch,
+        ctx,
+        captured=_bounded_failure_page_evidence(),
+        capture_lands_on_session="replacement_session",
+    )
+
+    evidence = result["data"]
+    assert isinstance(evidence, dict)
+    assert evidence["source_browser_session_id"] == "replacement_session"
+    assert evidence["observed_after_workflow_run"] is False
+    assert "workflow_run_id" not in evidence
+    assert ctx.post_run_page_observation_workflow_run_id is None
+    assert result["reached_via"] == "current_page"
+
+
+def _clean_same_run_page_evidence() -> dict[str, object]:
+    clean = _bounded_failure_page_evidence()
+    clean["observed_after_workflow_run"] = True
+    clean["workflow_run_id"] = "wr_failed"
+    clean["source_browser_session_id"] = "run_session"
+    return clean
+
+
+@pytest.mark.asyncio
+async def test_preserved_post_run_capture_does_not_move_the_observation_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capture too hollow to store must not move the marker either, or the marker and the stored
+    packet describe different pages."""
+    ctx = _post_run_inspect_ctx()
+    ctx.composition_page_evidence = _clean_same_run_page_evidence()
+    ctx.post_run_page_observation_generation = 3
+    hollow: dict[str, object] = {
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/login",
+        "page_title": "Sign in",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+    }
+
+    await _drive_inspect_page(monkeypatch, ctx, captured=hollow)
+
+    assert ctx.post_run_page_observation_generation == 3
+    stored = ctx.composition_page_evidence
+    assert isinstance(stored, dict)
+    assert stored["page_title"] != "Sign in"
+
+
+@pytest.mark.asyncio
+async def test_refused_post_run_capture_preserves_stored_evidence_but_returns_the_fresh_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    clean = _clean_same_run_page_evidence()
+    ctx.composition_page_evidence = clean
+    replacement_page = _bounded_failure_page_evidence()
+    replacement_page["page_title"] = "Replacement session page"
+
+    result = await _drive_inspect_page(
+        monkeypatch, ctx, captured=replacement_page, capture_lands_on_session="replacement_session"
+    )
+
+    assert ctx.composition_page_evidence is clean
+    evidence = result["data"]
+    assert isinstance(evidence, dict)
+    assert evidence["page_title"] == "Replacement session page"
+    assert evidence["observed_after_workflow_run"] is False
+
+
+@pytest.mark.asyncio
+async def test_hollow_post_run_capture_preserves_stored_evidence_but_returns_the_fresh_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    clean = _clean_same_run_page_evidence()
+    ctx.composition_page_evidence = clean
+    hollow: dict[str, object] = {
+        "source_tool": "inspect_page_for_composition",
+        "current_url": "https://example.test/app/login",
+        "page_title": "Sign in",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+    }
+
+    result = await _drive_inspect_page(monkeypatch, ctx, captured=hollow)
+
+    assert ctx.composition_page_evidence is clean
+    evidence = result["data"]
+    assert isinstance(evidence, dict)
+    assert evidence["page_title"] == "Sign in"
+    assert evidence["observed_after_workflow_run"] is True
+    assert evidence["source_browser_session_id"] == "run_session"
+
+
+@pytest.mark.asyncio
+async def test_post_run_url_target_inspect_returns_the_page_it_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _post_run_inspect_ctx()
+    clean = _bounded_failure_page_evidence()
+    clean["observed_after_workflow_run"] = True
+    clean["workflow_run_id"] = "wr_failed"
+    ctx.composition_page_evidence = clean
+    inspected = _bounded_failure_page_evidence()
+    inspected["page_title"] = "Other page"
+
+    result = await _drive_inspect_page(
+        monkeypatch, ctx, captured=inspected, target_url="https://example.test/app/results"
+    )
+
+    evidence = result["data"]
+    assert isinstance(evidence, dict)
+    assert evidence["page_title"] == "Other page"
+    assert evidence["source_browser_session_id"] == "scout_session"
+    assert evidence["observed_after_workflow_run"] is False
     assert ctx.composition_page_evidence is clean
 
 
@@ -2351,3 +2863,259 @@ def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> Non
     assert contract.repair_decision.next_action == RepairNextAction.REPAIR
     assert contract.repair_decision.target_blocks == ["append_visitors_to_sheet"]
     assert contract.diagnosis_input.failed_block_labels == ["append_visitors_to_sheet"]
+
+
+def _device_wall_page_evidence(challenge_kind: str | None, *, run_id: str = "wr_device_wall") -> dict[str, object]:
+    challenge_state: dict[str, object] = {
+        "detected": True,
+        "kind": "2-step verification",
+        "requires_human_verification": True,
+    }
+    if challenge_kind is not None:
+        challenge_state[CHALLENGE_KIND_KEY] = challenge_kind
+    return {
+        "current_url": "https://sso.example.test/challenge",
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": run_id,
+        "challenge_state": challenge_state,
+    }
+
+
+def _fresh_session_run_result(
+    page_evidence: dict[str, object] | None,
+    used_fresh_run_session: bool | None = True,
+    stalled_pre_auth: bool | None = None,
+) -> dict[str, object]:
+    data: dict[str, object] = {
+        "workflow_run_id": "wr_device_wall",
+        "overall_status": "failed",
+        "failure_reason": "Failed to execute code block.",
+        "failure_categories": [{"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state"}],
+        "blocks": [{"label": "authenticate", "status": "failed"}],
+    }
+    if page_evidence is not None:
+        data["post_run_page_evidence"] = page_evidence
+    if used_fresh_run_session is not None:
+        data["used_fresh_run_session"] = used_fresh_run_session
+    if stalled_pre_auth is not None:
+        data["challenge_stalled_fresh_session"] = stalled_pre_auth
+    return {"ok": False, "error": "Run failed.", "data": data}
+
+
+def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
+    data: dict[str, object] = {}
+
+    run_execution_module._attach_run_session_facts(
+        data,
+        used_fresh_run_session=True,
+        run_ok=False,
+        page_evidence=_device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value),
+    )
+
+    assert data["used_fresh_run_session"] is True
+    assert data["challenge_stalled_fresh_session"] is True
+
+
+def test_run_envelope_omits_the_challenge_stall_fact_without_a_structured_packet() -> None:
+    data: dict[str, object] = {}
+
+    run_execution_module._attach_run_session_facts(
+        data,
+        used_fresh_run_session=True,
+        run_ok=False,
+        page_evidence=None,
+    )
+
+    assert data["used_fresh_run_session"] is True
+    assert "challenge_stalled_fresh_session" not in data
+
+
+def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
+    data: dict[str, object] = {}
+
+    run_execution_module._attach_run_session_facts(
+        data,
+        used_fresh_run_session=True,
+        run_ok=True,
+        page_evidence=_device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value),
+    )
+
+    assert data["challenge_stalled_fresh_session"] is False
+
+
+def test_device_approval_wall_is_not_labelled_a_site_verification_challenge() -> None:
+    ctx = _ctx()
+    page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    ctx.composition_page_evidence = page_evidence
+    run_result = _fresh_session_run_result(page_evidence)
+
+    run_execution_module._record_run_blocks_result(ctx, run_result)
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
+    assert signal.extra["run_outcome_reason_code"] == "device_approval_challenge_blocker"
+    assert signal.extra["challenge_kind"] == ChallengeKind.DEVICE_APPROVAL.value
+    assert signal.user_facing_reason != TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert "device-approval" in signal.user_facing_reason
+    assert "fresh browser session" in signal.user_facing_reason
+    assert "re-use an already-approved browser session" in signal.user_facing_reason
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "device_approval_challenge_blocker"
+    assert ctx.latest_recorded_build_test_outcome is not None
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "device_approval_challenge_blocker"
+    assert ctx.latest_recorded_build_test_outcome.verdict == "not_authoritative"
+
+
+@pytest.mark.parametrize("used_fresh_run_session", [False, None])
+def test_device_approval_reply_names_a_fresh_session_only_when_the_run_reported_one(
+    used_fresh_run_session: bool | None,
+) -> None:
+    ctx = _ctx()
+    page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    ctx.composition_page_evidence = page_evidence
+
+    run_execution_module._record_run_blocks_result(
+        ctx, _fresh_session_run_result(page_evidence, used_fresh_run_session)
+    )
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
+    assert "device-approval" in signal.user_facing_reason
+    assert "fresh browser session" not in signal.user_facing_reason
+    assert "re-use an already-approved browser session" in signal.user_facing_reason
+
+
+@pytest.mark.parametrize(
+    ("challenge_kind", "used_fresh_run_session"),
+    [(ChallengeKind.CAPTCHA.value, True), (ChallengeKind.HUMAN_VERIFICATION.value, True), (None, None)],
+)
+def test_a_wall_the_classifier_did_not_name_keeps_the_site_verification_label(
+    challenge_kind: str | None,
+    used_fresh_run_session: bool | None,
+) -> None:
+    """A run that stopped at a wall reports the recorded facts on its payload, but the reply only
+    names a device-approval step when the classifier typed one; anything else keeps today's wording."""
+    ctx = _ctx()
+    page_evidence = _device_wall_page_evidence(challenge_kind)
+    ctx.composition_page_evidence = page_evidence
+
+    run_execution_module._record_run_blocks_result(
+        ctx, _fresh_session_run_result(page_evidence, used_fresh_run_session, stalled_pre_auth=True)
+    )
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+
+
+@pytest.mark.parametrize("challenge_kind", [ChallengeKind.CAPTCHA.value, "moon_phase", None])
+def test_unclassified_and_captcha_walls_keep_the_site_verification_label(challenge_kind: str | None) -> None:
+    ctx = _ctx()
+    page_evidence = _device_wall_page_evidence(challenge_kind)
+    ctx.composition_page_evidence = page_evidence
+
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(page_evidence))
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE
+
+
+def test_a_device_wall_seen_on_another_run_cannot_name_this_one() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _device_wall_page_evidence(
+        ChallengeKind.DEVICE_APPROVAL.value, run_id="wr_earlier_run"
+    )
+
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(None))
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+
+
+def test_a_run_that_never_started_does_not_count_as_a_run_of_this_turn() -> None:
+    ctx = _ctx()
+    preflight_failure: dict[str, object] = {
+        "ok": False,
+        "error": "Unable to prepare the Copilot test-run snapshot; execution was not started.",
+        "data": {"workflow_run_id": None, "overall_status": "failed", "blocks": []},
+    }
+
+    run_execution_module._record_run_blocks_result(ctx, preflight_failure)
+    assert ctx.block_run_calls_this_turn == 0
+
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_device_wall_page_evidence(None)))
+
+    signal = ctx.blocker_signal
+    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert ctx.block_run_calls_this_turn == 1
+    assert "stopped instead of retrying the same path" in signal.user_facing_reason
+
+
+def test_stopped_claim_is_dropped_once_the_turn_has_run_more_than_once() -> None:
+    ctx = _ctx()
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_device_wall_page_evidence(None)))
+    first_signal = ctx.blocker_signal
+    assert isinstance(first_signal, CopilotToolBlockerSignal)
+    assert ctx.block_run_calls_this_turn == 1
+    assert "stopped instead of retrying the same path" in first_signal.user_facing_reason
+
+    second_signal = run_execution_module._terminal_challenge_blocker_signal(
+        run_execution_module.TerminalChallengeEvidence(
+            source="failure_category",
+            reason="Run reported ANTI_BOT_DETECTION",
+            challenge_evidence_source="challenge_state",
+        ),
+        tool_name="update_and_run_blocks",
+        runs_this_turn=2,
+    )
+
+    assert "stopped instead of retrying the same path" not in second_signal.user_facing_reason
+    assert "not verified end-to-end" in second_signal.user_facing_reason
+
+
+def test_enforcement_page_evidence_signal_uses_the_same_discriminant() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
+
+    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
+    assert signal.user_facing_reason != TERMINAL_CHALLENGE_USER_FACING_REASON
+
+
+def test_enforcement_page_evidence_signal_never_asserts_a_fresh_session() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
+
+    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
+    assert "fresh browser session" not in signal.user_facing_reason
+
+
+def test_enforcement_signal_will_not_name_a_device_wall_from_another_run() -> None:
+    ctx = _ctx()
+    ctx.composition_page_evidence = _device_wall_page_evidence(
+        ChallengeKind.DEVICE_APPROVAL.value, run_id="wr_earlier_run"
+    )
+    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
+
+    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON

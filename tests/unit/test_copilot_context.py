@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import structlog.testing
 
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
@@ -16,10 +17,13 @@ from skyvern.forge.sdk.copilot.context import (
     _merge_carried_trajectory,
     _merge_observed_acted_pages,
     adopt_model_authored_context,
+    build_model_safe_global_llm_context,
     finalize_observation_context,
     record_approved_credentials_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 
 
 @pytest.mark.parametrize(
@@ -111,9 +115,11 @@ def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
         ],
     )
 
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://example.com/cart"].had_bounded_schema is True
-    assert by_url["https://example.com/cart"].reached_via == "interaction"
+    cart_fingerprint = page_location_fingerprint("https://example.com/cart")
+    cart = next(page for page in pages if page.location_fingerprint == cart_fingerprint)
+    assert cart.url == "https://example.com/"
+    assert cart.had_bounded_schema is True
+    assert cart.reached_via == "interaction"
 
 
 def test_finalize_returns_none_without_context_or_observations() -> None:
@@ -256,6 +262,10 @@ class TestCopilotContext:
             "verified_block_outputs",
             "verified_prefix_labels",
             "verified_prefix_current_url",
+            "verified_prefix_block_end_urls",
+            "verified_prefix_block_end_session_id",
+            "verified_prefix_terminal_label",
+            "frontier_resume_session_id",
             "last_run_blocks_workflow_run_id",
             "last_requested_block_labels",
             "last_executed_block_labels",
@@ -281,6 +291,10 @@ class TestCopilotContext:
         assert ctx.verified_block_outputs == {}
         assert ctx.verified_prefix_labels == []
         assert ctx.verified_prefix_current_url is None
+        assert ctx.verified_prefix_block_end_urls == {}
+        assert ctx.verified_prefix_block_end_session_id is None
+        assert ctx.verified_prefix_terminal_label is None
+        assert ctx.frontier_resume_session_id is None
         assert ctx.last_run_blocks_workflow_run_id is None
         assert ctx.last_requested_block_labels == []
         assert ctx.last_executed_block_labels == []
@@ -341,6 +355,67 @@ def test_record_approved_credentials_survive_prompt_sanitization() -> None:
 
     ids = [record.credential_id for record in StructuredContext.from_json_str(sanitized).approved_credentials]
     assert ids == ["cred_portal"]
+
+
+def test_approved_credentials_survive_redaction_with_carried_password_label() -> None:
+    raw = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id="cred_portal")],
+        carried_trajectory=[{"tool_name": "fill", "selector": "#Password", "label": "Password:", "carried": True}],
+    ).to_json_str()
+
+    safe = build_model_safe_global_llm_context(raw)
+
+    json.loads(safe)
+    parsed = StructuredContext.from_json_str(safe)
+    assert [record.credential_id for record in parsed.approved_credentials] == ["cred_portal"]
+    assert parsed.carried_trajectory[0]["label"] == "Password:"
+
+
+def test_structured_redaction_removes_secret_values_and_preserves_structure() -> None:
+    secret_assignment = "password: hunter2-portal-secret"
+    api_key = "sk-" + "a" * 20
+    raw = StructuredContext(
+        user_goal=f"log in with {secret_assignment}",
+        approved_credentials=[ApprovedCredential(credential_id="cred_portal")],
+        carried_trajectory=[{"label": "Password:", "note": f"api_key={api_key}"}],
+    ).to_json_str()
+
+    safe = redact_raw_secrets_for_structured_prompt(raw)
+
+    assert "hunter2-portal-secret" not in safe
+    assert api_key not in safe
+    assert "[REDACTED_SECRET]" in safe
+    parsed = StructuredContext.from_json_str(safe)
+    assert [record.credential_id for record in parsed.approved_credentials] == ["cred_portal"]
+
+
+def test_structured_redaction_falls_back_to_lexical_for_non_json() -> None:
+    assert redact_raw_secrets_for_structured_prompt("password: hunter2") == "[REDACTED_SECRET]"
+    assert redact_raw_secrets_for_structured_prompt("") == ""
+
+
+def test_ordinary_field_labels_survive_structured_redaction() -> None:
+    raw = StructuredContext(
+        carried_trajectory=[{"label": "Password:"}, {"label": "Username:"}, {"label": "Email:"}]
+    ).to_json_str()
+
+    parsed = StructuredContext.from_json_str(redact_raw_secrets_for_structured_prompt(raw))
+
+    assert [entry["label"] for entry in parsed.carried_trajectory] == ["Password:", "Username:", "Email:"]
+
+
+def test_malformed_structured_context_fallback_logs_a_fingerprint() -> None:
+    broken = '{"user_goal": "x", "approved_credentials": ['
+
+    with structlog.testing.capture_logs() as logs:
+        parsed = StructuredContext.from_json_str(broken)
+
+    assert parsed.approved_credentials == []
+    assert parsed.user_goal == broken
+    events = [entry for entry in logs if entry.get("event") == "structured_context_parse_failed"]
+    assert len(events) == 1
+    assert events[0]["raw_length"] == len(broken)
+    assert broken not in str(events[0].values())
 
 
 def test_a_live_page_grant_does_not_carry_into_a_later_turn() -> None:

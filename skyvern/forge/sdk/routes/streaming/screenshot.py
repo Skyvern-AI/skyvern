@@ -316,6 +316,7 @@ async def browser_session_streaming(
     browser_session_id: str,
     apikey: str | None = None,
     token: str | None = None,
+    force_cdp: bool = False,
 ) -> None:
     try:
         await websocket.accept()
@@ -344,7 +345,10 @@ async def browser_session_streaming(
         organization_id=organization_id,
     )
 
-    if await stream_transport(browser_session_id, organization_id) == "cdp":
+    # The browser-session page sets this only after its authorized RFB connection closes. The
+    # proxy and API can observe a transient lookup failure independently, so re-resolving the
+    # transport here must not strand that viewer on the failed RFB choice.
+    if force_cdp or await stream_transport(browser_session_id, organization_id) == "cdp":
         await _local_screencast_for_browser_session(websocket, browser_session_id, organization_id)
         return
 

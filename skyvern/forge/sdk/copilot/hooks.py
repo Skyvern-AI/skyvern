@@ -89,7 +89,6 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
 
     async def on_agent_start(self, context: AgentHookContext, agent: AgentBase) -> None:
@@ -99,7 +98,6 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_agent_start counting failed",
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
 
     async def on_tool_end(
@@ -165,7 +163,6 @@ class CopilotRunHooks(RunHooksBase):
                 "CopilotRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
             return
 

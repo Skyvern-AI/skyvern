@@ -1,5 +1,5 @@
 import { AxiosError } from "axios";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
@@ -39,14 +39,11 @@ import {
   Link,
   Navigate,
   Outlet,
+  useLocation,
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
-import {
-  statusIsAFailureType,
-  statusIsCancellable,
-  statusIsFinalized,
-} from "../tasks/types";
+import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
 import { useRefreshOnboardingOnRunCompletion } from "./hooks/useRefreshOnboardingOnRunCompletion";
 import { ResizableTimelineSplit } from "./workflowRun/ResizableTimelineSplit";
@@ -59,6 +56,8 @@ import {
 } from "./workflowRun/workflowTimelineUtils";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { pickDownloadedFileFilename } from "./workflowRun/blockDownloadedFiles";
+import { findRunCodeBlockFailure } from "./workflowRun/codeBlockFailure";
+import { matchFailureTips } from "./studio/runview/failureTips";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -75,15 +74,24 @@ import { WorkflowRunStatusAlert } from "@/routes/workflows/workflowRun/WorkflowR
 import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/WorkflowRunVerificationCodeForm";
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
-import { useRunsQuery } from "@/hooks/useRunsQuery";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
-import { FirstRunRecoveryGuidance } from "@/components/onboarding/FirstRunRecoveryGuidance";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
-import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
-import { isFirstFailedRunRecoveryEligible } from "@/util/onboarding/rolloutGating";
+import {
+  FirstRunRecoveryGuidance,
+  shouldShowRecoveryGuidance,
+} from "@/components/onboarding/FirstRunRecoveryGuidance";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import {
+  getRecoveryGuidanceRetryNavigation,
+  RecoveryGuidanceTelemetry,
+  retryRunHasStarted,
+  type RecoveryGuidanceTelemetryContext,
+} from "@/util/onboarding/recoveryGuidanceTelemetry";
 import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
+
+const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
+  "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
 
 function WorkflowRunRightColumn({
   activeItem,
@@ -161,6 +169,7 @@ function WorkflowRun() {
   const apiCredential = useApiCredential();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const onboarding = useOnboardingStateOptional();
 
@@ -172,6 +181,35 @@ function WorkflowRun() {
   } = useWorkflowRunWithWorkflowQuery();
 
   useRefreshOnboardingOnRunCompletion(workflowRun);
+  const recoveryGuidanceRetry = getRecoveryGuidanceRetryNavigation(
+    location.state,
+  );
+  const reportedRecoveryRetryStartRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (
+      !recoveryGuidanceRetry ||
+      !retryRunHasStarted({
+        retryRunId: recoveryGuidanceRetry.retryRunId,
+        observedRunId: workflowRun?.workflow_run_id,
+        status: workflowRun?.status,
+        startedAt: workflowRun?.started_at,
+      }) ||
+      reportedRecoveryRetryStartRef.current === recoveryGuidanceRetry.retryRunId
+    ) {
+      return;
+    }
+    reportedRecoveryRetryStartRef.current = recoveryGuidanceRetry.retryRunId;
+    RecoveryGuidanceTelemetry.retryStarted(
+      recoveryGuidanceRetry,
+      recoveryGuidanceRetry.retryRunId,
+    );
+  }, [
+    recoveryGuidanceRetry,
+    workflowRun?.started_at,
+    workflowRun?.status,
+    workflowRun?.workflow_run_id,
+  ]);
 
   const status = (error as AxiosError | undefined)?.response?.status;
   const workflow = workflowRun?.workflow;
@@ -289,25 +327,19 @@ function WorkflowRun() {
     </h1>
   );
 
-  const failureTips: { match: (reason: string) => boolean; tip: string }[] = [
-    {
-      match: (reason) => reason.includes("Invalid master password"),
-      tip: "Tip: If inputting the master password via Docker Compose or in any container environment, make sure to double any dollar signs and do not surround it with quotes.",
-    },
-    // Add more tips as needed
-  ];
-
   const failureReason = workflowRun?.failure_reason;
 
-  const matchedTips = failureReason
-    ? failureTips
-        .filter(({ match }) => match(failureReason))
-        .map(({ tip }, index) => (
-          <div key={index} className="text-sm italic text-red-700">
-            {tip}
-          </div>
-        ))
-    : null;
+  const matchedTips = matchFailureTips(failureReason ?? null).map((tip) => (
+    <div key={tip} className="text-sm italic text-red-700">
+      {tip}
+    </div>
+  ));
+
+  const codeFailure = findRunCodeBlockFailure(
+    failureReason,
+    workflowRunTimeline,
+    finallyBlockLabel,
+  );
 
   const failureReasonTitle =
     workflowRun?.status === Status.Terminated
@@ -333,29 +365,30 @@ function WorkflowRun() {
     finallyBlockLabel &&
     finallyBlockInTimeline;
 
-  // Gate the first-failed-run guidance. first_run_at is stamped on any first
-  // terminal run, so derive "first run" from the runs list and assert this run
-  // is that single run.
-  const isFailureRun = workflowRun
-    ? statusIsAFailureType({ status: workflowRun.status })
-    : false;
-  const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
-  // Gate on the rollout arm so a 0% rollout / rollback hides the recovery surface.
-  const firstFailedRunGateEnabled = isFirstFailedRunRecoveryEligible({
-    flagVariant: onboardingFlagVariant,
-    isNewUser: onboarding?.isNewUser === true,
-    isFailureRun,
-    hasFailureReason: Boolean(workflowRun?.failure_reason),
+  const recoveryGuidanceAssignment =
+    onboarding?.recoveryGuidanceAssignment ?? null;
+  const recoveryGuidanceTreatmentSurfaceEnabled =
+    useFeatureFlag(RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG) === true;
+  const recoveryGuidanceTelemetryContext =
+    useMemo<RecoveryGuidanceTelemetryContext | null>(() => {
+      if (!recoveryGuidanceAssignment || !workflowRun) {
+        return null;
+      }
+      return {
+        organizationId: recoveryGuidanceAssignment.organization_id,
+        experimentVersion: recoveryGuidanceAssignment.experiment_version,
+        arm: recoveryGuidanceAssignment.arm,
+        eligibleRunId: recoveryGuidanceAssignment.eligible_run_id,
+        failureCategory: workflowRun.failure_category?.[0]?.category ?? null,
+      };
+    }, [recoveryGuidanceAssignment, workflowRun]);
+  // This is a new, intentionally unconfigured flag. Its unknown/default value
+  // is false, so neither arm gains a visible surface during instrumentation.
+  const showFirstFailedRunRecovery = shouldShowRecoveryGuidance({
+    assignment: recoveryGuidanceAssignment,
+    workflowRunId: workflowRun?.workflow_run_id,
+    treatmentSurfaceEnabled: recoveryGuidanceTreatmentSurfaceEnabled,
   });
-  const { data: recentRuns } = useRunsQuery({
-    page: 1,
-    pageSize: 2,
-    enabled: firstFailedRunGateEnabled,
-  });
-  const showFirstFailedRunRecovery =
-    firstFailedRunGateEnabled &&
-    recentRuns?.length === 1 &&
-    recentRuns[0]?.run_id === workflowRun?.workflow_run_id;
 
   const handleFirstFailedRunRetry = useCallback(() => {
     navigate(`/agents/${workflowPermanentId}/run`, {
@@ -366,6 +399,9 @@ function WorkflowRun() {
         maxScreenshotScrolls,
         runWith: workflowRun?.run_with ?? "agent",
         browserProfileId: workflowRun?.browser_profile_id ?? null,
+        ...(recoveryGuidanceTelemetryContext
+          ? { recoveryGuidanceRetry: recoveryGuidanceTelemetryContext }
+          : {}),
       },
     });
   }, [
@@ -373,6 +409,7 @@ function WorkflowRun() {
     workflowPermanentId,
     proxyLocation,
     maxScreenshotScrolls,
+    recoveryGuidanceTelemetryContext,
     workflowRun?.parameters,
     workflowRun?.webhook_callback_url,
     workflowRun?.run_with,
@@ -385,12 +422,29 @@ function WorkflowRun() {
         <div className="font-bold">{failureReasonTitle}</div>
         <FailureCategoryBadge failureCategory={workflowRun.failure_category} />
       </div>
+      {codeFailure ? (
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
+            <span>{codeFailure.title}</span>
+            {codeFailure.line !== null ? (
+              <span className="shrink-0 rounded border border-red-600/40 px-1.5 py-0.5 text-[10px] tabular-nums">
+                line {codeFailure.line}
+              </span>
+            ) : null}
+            {codeFailure.code ? (
+              <span className="shrink-0 rounded border border-red-600/40 px-1.5 py-0.5 font-mono text-[10px]">
+                {codeFailure.code}
+              </span>
+            ) : null}
+          </div>
+          <div className="text-sm">{codeFailure.guidance}</div>
+        </div>
+      ) : null}
       <div className="text-sm">{workflowRun.failure_reason}</div>
       {matchedTips}
-      {showFirstFailedRunRecovery && (
+      {showFirstFailedRunRecovery && recoveryGuidanceTelemetryContext && (
         <FirstRunRecoveryGuidance
-          surface="runs"
-          failureCategory={workflowRun.failure_category?.[0]?.category ?? null}
+          telemetryContext={recoveryGuidanceTelemetryContext}
           workflowPermanentId={workflowPermanentId}
           onRetry={handleFirstFailedRunRetry}
         />

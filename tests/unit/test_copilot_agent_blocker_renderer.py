@@ -34,7 +34,7 @@ from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, R
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
@@ -111,6 +111,30 @@ def test_render_picks_response_type_from_hint(recovery_hint: RecoveryHint) -> No
     expected_resp_type = "ASK_QUESTION" if recovery_hint == "ask_user_clarifying" else "REPLY"
     assert resp_type == expected_resp_type
     assert user_response == signal.user_facing_reason
+
+
+def test_google_run_gate_blocker_attaches_fresh_server_verified_choices() -> None:
+    ctx = _ctx()
+    ctx.connected_account_recovery_choices = [
+        ConnectedAccountChoice(connection_id="goac_first", name="First account", state="active")
+    ]
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Ask the user to choose a connected Google account.",
+        user_facing_reason="Choose one of the connected Google accounts below so I can run the workflow.",
+        recovery_hint="ask_user_clarifying",
+        internal_reason_code="unapproved_google_connection_reference",
+        blocked_tool="update_and_run_blocks",
+        preserves_workflow_draft=True,
+    )
+
+    result = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert result.user_response == "Choose one of the connected Google accounts below so I can run the workflow."
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices == ctx.connected_account_recovery_choices
+    assert "goac_" not in result.user_response
+    assert "unapproved_credential_reference" not in result.user_response
 
 
 def test_render_falls_back_when_template_leaks() -> None:
@@ -550,6 +574,48 @@ def test_unapproved_credential_reference_points_at_credentials_ui_when_nothing_m
     # Candidates ride on the record whatever the verdict; only an ambiguous one may name them.
     assert "cred_unmatched" not in result.user_response
     assert "More than one saved credential" not in result.user_response
+
+
+def test_unapproved_google_connection_preserves_verified_clickable_choices() -> None:
+    choices = [
+        ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active"),
+        ConnectedAccountChoice(connection_id="goac_inactive", name="Sheets", state="error"),
+    ]
+    ctx = _ctx()
+    ctx.prior_turn_outcome = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=choices,
+    )
+    ctx.request_policy = RequestPolicy(existing_workflow_credential_ids=["goac_active"])
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "connected Google account" in result.user_response
+    assert "Credentials UI" not in result.user_response
+    assert "unapproved_credential_reference" not in result.user_response
+    assert "goac_" not in result.user_response
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices == choices
+
+
+def test_password_blocker_does_not_reuse_prior_google_choices() -> None:
+    choices = [ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active")]
+    ctx = _ctx()
+    ctx.prior_turn_outcome = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=choices,
+    )
+    ctx.request_policy = RequestPolicy(
+        existing_workflow_credential_ids=["goac_active", "cred_password"],
+        run_approved_google_connection_ids=["goac_active"],
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "Credentials UI" in result.user_response
+    assert "connected Google account" not in result.user_response
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices is None
 
 
 def test_shim_over_a_cancelled_turn_keeps_the_stop_label() -> None:

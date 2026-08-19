@@ -16507,11 +16507,13 @@
           },
           "timeout_seconds": {
             "type": "integer",
-            "title": "Timeout Seconds"
+            "title": "Timeout Seconds",
+            "default": 7200
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "default": "hello@skyvern.com"
           },
           "recipients": {
             "items": {
@@ -16522,21 +16524,19 @@
           },
           "subject": {
             "type": "string",
-            "title": "Subject"
+            "title": "Subject",
+            "default": "Human interaction required for workflow run"
           },
           "body": {
             "type": "string",
-            "title": "Body"
+            "title": "Body",
+            "default": "Your interaction is required for a workflow run!"
           }
         },
         "type": "object",
         "required": [
           "label",
-          "timeout_seconds",
-          "sender",
-          "recipients",
-          "subject",
-          "body"
+          "recipients"
         ],
         "title": "HumanInteractionBlockYAML"
       },
@@ -20312,19 +20312,47 @@
             "default": false
           },
           "smtp_host_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Host Secret Parameter Key"
           },
           "smtp_port_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Port Secret Parameter Key"
           },
           "smtp_username_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Username Secret Parameter Key"
           },
           "smtp_password_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Password Secret Parameter Key"
           },
           "sender": {
@@ -20364,10 +20392,6 @@
         "type": "object",
         "required": [
           "label",
-          "smtp_host_secret_parameter_key",
-          "smtp_port_secret_parameter_key",
-          "smtp_username_secret_parameter_key",
-          "smtp_password_secret_parameter_key",
           "sender",
           "recipients",
           "subject",

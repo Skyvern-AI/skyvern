@@ -118,11 +118,14 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         </TableCell>
         <TableCell>
           <div className="flex justify-end gap-0.5">
-            <Button size="icon" variant="ghost" disabled>
-              <PlayIcon className="h-4 w-4" />
+            <Button size="icon" variant="default" disabled>
+              <Pencil2Icon className="h-4 w-4" />
             </Button>
             <Button size="icon" variant="ghost" disabled>
-              <Pencil2Icon className="h-4 w-4" />
+              <MixerHorizontalIcon className="h-4 w-4" />
+            </Button>
+            <Button size="icon" variant="ghost" disabled>
+              <PlayIcon className="h-4 w-4" />
             </Button>
             <Button
               size="icon"
@@ -262,6 +265,28 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
+                      <Button
+                        size="icon"
+                        variant="default"
+                        onClick={(event) => {
+                          handleIconClick(
+                            event,
+                            workflowEditorPath(
+                              workflow.workflow_permanent_id,
+                              studioEnabled,
+                            ),
+                          );
+                        }}
+                      >
+                        <Pencil2Icon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Open in Editor</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
                       <span className="inline-flex">
                         <Button
                           size="icon"
@@ -308,29 +333,6 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>Create New Run</TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        className="text-muted-foreground hover:text-foreground"
-                        onClick={(event) => {
-                          handleIconClick(
-                            event,
-                            workflowEditorPath(
-                              workflow.workflow_permanent_id,
-                              studioEnabled,
-                            ),
-                          );
-                        }}
-                      >
-                        <Pencil2Icon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Open in Editor</TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
                 {kebab}

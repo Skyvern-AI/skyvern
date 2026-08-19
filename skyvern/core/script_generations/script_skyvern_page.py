@@ -664,21 +664,14 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        data=screenshot,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=[screenshot],
+                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             ctx = skyvern_context.current()
@@ -733,20 +726,13 @@ class ScriptSkyvernPage(SkyvernPage):
                     return
 
                 html_bytes = html.encode("utf-8")
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
-                        step=step,
-                        html_action=html_bytes,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.HTML_ACTION,
-                        data=html_bytes,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
+                    step=step,
+                    html_action=html_bytes,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             LOG.warning("Failed to create HTML artifact after action", exc_info=True)
@@ -780,21 +766,14 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                        data=screenshot,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=[screenshot],
+                    artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             LOG.warning("Failed to create final screenshot", exc_info=True)

@@ -226,98 +226,6 @@ GEMINI_SAFETY_SETTINGS: list[dict[str, str]] = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
 
-CONTENT_FILTER_RESCUE_LLM_NAME_FLAG = "CONTENT_FILTER_RESCUE_LLM_NAME"
-# PostHog encodes a disabled multivariate flag as `False`; JS-style booleans
-# can also surface as strings.
-_CONTENT_FILTER_RESCUE_CONTROL_VARIANTS = {None, False, "False", "false", "", "control"}
-_content_filter_rescue_handler_cache: dict[str, LLMAPIHandler] = {}
-_content_filter_rescue_logged: set[str] = set()
-
-
-def _content_filter_rescue_log_once(dedup_key: str) -> bool:
-    """True only the first time `dedup_key` is seen; dedups per-misconfiguration warnings."""
-    if dedup_key in _content_filter_rescue_logged:
-        return False
-    _content_filter_rescue_logged.add(dedup_key)
-    return True
-
-
-async def _get_content_filter_rescue_handler(
-    current_llm_key: str, organization_id: str | None
-) -> tuple[str, LLMAPIHandler] | None:
-    """Resolve the CONTENT_FILTER_RESCUE_LLM_NAME multivariate flag to (llm_key, handler).
-
-    Returns None when the flag is unset/control or resolution fails, so the caller
-    keeps the default content-filter fallback behavior (SKY-11766).
-    """
-    ctx = skyvern_context.current()
-    distinct_id = ((ctx.workflow_run_id or ctx.task_id) if ctx else None) or organization_id
-    if not distinct_id:
-        return None
-    try:
-        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-            CONTENT_FILTER_RESCUE_LLM_NAME_FLAG,
-            distinct_id,
-            properties={
-                "organization_id": organization_id or (ctx.organization_id if ctx else None),
-                "workflow_permanent_id": ctx.workflow_permanent_id if ctx else None,
-            },
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to read CONTENT_FILTER_RESCUE_LLM_NAME; keeping default content-filter fallback",
-            llm_key=current_llm_key,
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return None
-
-    if variant in _CONTENT_FILTER_RESCUE_CONTROL_VARIANTS or not isinstance(variant, str):
-        return None
-    # The rescue call resolves this flag again; skipping the blocked key here is
-    # what terminates that recursion.
-    if variant == current_llm_key:
-        if _content_filter_rescue_log_once(f"self:{variant}"):
-            LOG.warning(
-                "CONTENT_FILTER_RESCUE_LLM_NAME matches the blocked llm_key; ignoring",
-                variant=variant,
-            )
-        return None
-
-    # Custom LLMs are org-owned BYO endpoints: this path never validates ownership and
-    # the handler cache outlives registry updates, so they are not valid rescue targets.
-    if is_custom_llm_key(variant):
-        if _content_filter_rescue_log_once(f"custom:{variant}"):
-            LOG.warning(
-                "CONTENT_FILTER_RESCUE_LLM_NAME variant points at a custom LLM; ignoring",
-                variant=variant,
-            )
-        return None
-
-    handler = _content_filter_rescue_handler_cache.get(variant)
-    if handler is None:
-        # get_config synthesizes a config for unknown keys (a typo'd variant would reach
-        # litellm as a model name), so require an explicitly registered llm_key.
-        if not LLMConfigRegistry.is_registered(variant):
-            if _content_filter_rescue_log_once(f"unregistered:{variant}"):
-                LOG.warning(
-                    "CONTENT_FILTER_RESCUE_LLM_NAME variant is not a registered llm_key; ignoring",
-                    variant=variant,
-                )
-            return None
-        try:
-            handler = LLMAPIHandlerFactory.get_llm_api_handler(variant)
-        except Exception:
-            if _content_filter_rescue_log_once(f"init_failed:{variant}"):
-                LOG.warning(
-                    "Failed to initialize handler for CONTENT_FILTER_RESCUE_LLM_NAME variant",
-                    variant=variant,
-                    exc_info=True,
-                )
-            return None
-        _content_filter_rescue_handler_cache[variant] = handler
-    return variant, handler
-
 
 def _set_llm_context_attrs(
     span: otel_trace.Span,
@@ -1662,9 +1570,7 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
-            _should_bundle = (
-                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-            )
+            _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
             _bundle_hashed_href_map: bytes | None = None
@@ -1994,73 +1900,9 @@ class LLMAPIHandlerFactory:
                     # recovers it. Gemini's non-configurable safety filters block PII-heavy
                     # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
                     # another Gemini tier hits the same block — jump straight to the first
-                    # non-Gemini fallback group, unless CONTENT_FILTER_RESCUE_LLM_NAME names
-                    # a specific rescue llm_key. Fires for any Gemini model that produced the
+                    # non-Gemini fallback group. Fires for any Gemini model that produced the
                     # block, including a standard tier litellm already fell back to (SKY-11766).
                     if is_content_filtered_response(response) and "gemini" in (model_used or "").lower():
-                        rescue_organization_id = organization_id or (
-                            step.organization_id if step else (thought.organization_id if thought else None)
-                        )
-                        rescue = await _get_content_filter_rescue_handler(llm_key, rescue_organization_id)
-                        if rescue is not None:
-                            rescue_llm_key, rescue_handler = rescue
-                            LOG.warning(
-                                "LLM response blocked by content filter on Gemini, retrying with configured rescue LLM",
-                                llm_key=llm_key,
-                                prompt_name=prompt_name,
-                                filtered_model=model_used,
-                                rescue_llm_key=rescue_llm_key,
-                            )
-                            try:
-                                # No parameters= forwarded: the rescue handler derives them from
-                                # its own llm_config (token limits and temperature rules differ).
-                                rescue_result = await rescue_handler(
-                                    prompt=prompt,
-                                    prompt_name=prompt_name,
-                                    step=step,
-                                    task_v2=task_v2,
-                                    thought=thought,
-                                    ai_suggestion=ai_suggestion,
-                                    workflow_run_block_id=workflow_run_block_id,
-                                    screenshots=screenshots,
-                                    organization_id=rescue_organization_id,
-                                    tools=tools,
-                                    use_message_history=use_message_history,
-                                    raw_response=raw_response,
-                                    window_dimension=window_dimension,
-                                    force_dict=force_dict,
-                                    system_prompt=system_prompt,
-                                )
-                            except CancelledError:
-                                raise
-                            except Exception:
-                                # Warn per event so failure rate stays visible, but only
-                                # attach the traceback once per rescue key to avoid spam.
-                                LOG.warning(
-                                    "Content-filter rescue LLM failed; retrying with non-Gemini fallback",
-                                    llm_key=llm_key,
-                                    prompt_name=prompt_name,
-                                    rescue_llm_key=rescue_llm_key,
-                                    exc_info=_content_filter_rescue_log_once(f"rescue_failed:{rescue_llm_key}"),
-                                )
-                            else:
-                                # Pair the blocked response with the already-recorded request so the
-                                # early return doesn't orphan it; the rescue handler persists its own set.
-                                if should_persist_llm_artifacts:
-                                    blocked_response_bytes = _safe_model_dump_json(response).encode("utf-8")
-                                    if _should_bundle:
-                                        _bundle_request = llm_request_json.encode("utf-8")
-                                        _bundle_response = blocked_response_bytes
-                                    else:
-                                        artifacts.append(
-                                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                                data=blocked_response_bytes,
-                                                artifact_type=ArtifactType.LLM_RESPONSE,
-                                                **artifact_targets,
-                                            )
-                                        )
-                                _llm_span.set_attribute("status", "content_filter_rescued")
-                                return rescue_result
                         non_gemini_fallback = next(
                             (group for group in fallback_groups if "gemini" not in group.lower()), None
                         )
@@ -2523,9 +2365,7 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
-            _should_bundle = (
-                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-            )
+            _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
             _bundle_hashed_href_map: bytes | None = None
@@ -3273,9 +3113,7 @@ class LLMCaller:
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
         )
-        _should_bundle = (
-            step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-        )
+        _should_bundle = step is not None and not is_speculative_step and context is not None
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
         _bundle_hashed_href_map: bytes | None = None

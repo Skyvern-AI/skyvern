@@ -86,7 +86,9 @@ describe("getBrowserSessionRefetchIntervalMs", () => {
         completed_at: "2026-07-16T11:59:00.000Z",
         recordings: [
           {
+            artifact_id: null,
             checksum: "recording-checksum",
+            file_size: null,
             filename: "session.webm",
             modified_at: "2026-07-16T12:00:00.000Z",
             url: "https://example.test/session.webm",

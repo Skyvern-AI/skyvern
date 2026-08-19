@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import keyword
+import os
 import re
 import textwrap
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -21,7 +22,6 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
-from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.author_time_block import (
     BANNED_BLOCKS_BLOCK_ID,
     CODE_SAFETY_BLOCK_ID,
@@ -52,6 +52,12 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
+from skyvern.forge.sdk.copilot.google_connection_notice import (
+    collect_google_connection_notices,
+    google_sheet_connection_bindings,
+    retain_notices_after_lookup_failure,
+    write_google_connection_notice_capture,
+)
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
     declared_string_workflow_parameter_keys,
@@ -99,6 +105,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
 )
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -4004,7 +4011,6 @@ async def _update_workflow(
         # values; terminal handlers roll back on non-auto-accept.
         requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
         if requires_canonical_persist:
-            created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
             await app.WORKFLOW_SERVICE.update_workflow_definition(
                 workflow_id=ctx.workflow_id,
                 organization_id=ctx.organization_id,
@@ -4016,6 +4022,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                reuse_browser_session=workflow.reuse_browser_session,
                 mask_secrets=getattr(workflow, "mask_secrets", False),
                 pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
@@ -4032,7 +4039,6 @@ async def _update_workflow(
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,
-                created_by=created_by_stamp,
                 edited_by="copilot",
                 preserve_completion_contract=not getattr(ctx, "clear_persisted_completion_contract", False),
             )
@@ -4045,6 +4051,65 @@ async def _update_workflow(
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
+        if isinstance(ctx, CopilotContext):
+            current_google_connection_bindings = google_sheet_connection_bindings(workflow)
+            turn_start_workflow = prior_workflow
+            if ctx.google_connection_turn_start_bindings is None:
+                baseline_ready = True
+                turn_start_workflow_yaml = ctx.google_connection_turn_start_workflow_yaml
+                if turn_start_workflow_yaml:
+                    try:
+                        turn_start_workflow = await _process_workflow_yaml(
+                            workflow_id=ctx.workflow_id,
+                            workflow_permanent_id=ctx.workflow_permanent_id,
+                            organization_id=ctx.organization_id,
+                            workflow_yaml=turn_start_workflow_yaml,
+                        )
+                    except Exception as baseline_err:
+                        baseline_ready = False
+                        LOG.warning("copilot_google_connection_notice_baseline_failed", error=str(baseline_err))
+                if baseline_ready:
+                    ctx.google_connection_turn_start_bindings = google_sheet_connection_bindings(turn_start_workflow)
+            current_google_connection_ids = tuple(
+                dict.fromkeys(connection_id for _, connection_id in current_google_connection_bindings)
+            )
+            if ctx.google_connection_turn_start_bindings is not None:
+                try:
+                    visible_google_credentials = await google_oauth_service.get_visible_credentials_for_org(
+                        ctx.organization_id
+                    )
+                    next_google_connection_notices = collect_google_connection_notices(
+                        turn_start_bindings=ctx.google_connection_turn_start_bindings,
+                        current_bindings=current_google_connection_bindings,
+                        visible_credentials=visible_google_credentials,
+                    )
+                    capture_root = os.environ.get("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS")
+                    if (
+                        capture_root
+                        and next_google_connection_notices
+                        and not ctx.google_connection_notice_capture_written
+                    ):
+                        try:
+                            write_google_connection_notice_capture(
+                                output_root=capture_root,
+                                turn_start_workflow=turn_start_workflow,
+                                final_workflow=workflow,
+                                accepted_workflow_yaml=workflow_yaml,
+                                visible_credentials=visible_google_credentials,
+                                observed_notices=ctx.google_connection_notices,
+                            )
+                            ctx.google_connection_notice_capture_written = True
+                        except FileExistsError:
+                            ctx.google_connection_notice_capture_written = True
+                        except Exception as capture_err:
+                            LOG.warning("copilot_google_connection_notice_capture_failed", error=str(capture_err))
+                    ctx.google_connection_notices = next_google_connection_notices
+                except Exception as lookup_err:
+                    ctx.google_connection_notices = retain_notices_after_lookup_failure(
+                        current_connection_ids=current_google_connection_ids,
+                        notices=ctx.google_connection_notices,
+                    )
+                    LOG.warning("copilot_google_connection_notice_lookup_failed", error=str(lookup_err))
         _clear_code_authoring_repair_context(ctx)
         accepted_metadata = ctx.code_artifact_metadata
         if isinstance(accepted_metadata, dict) and accepted_metadata:

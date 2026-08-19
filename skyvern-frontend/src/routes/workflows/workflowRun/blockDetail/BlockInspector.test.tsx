@@ -214,4 +214,76 @@ describe("BlockInspector failure scoping", () => {
 
     expect(screen.getByText("Login rejected")).toBeDefined();
   });
+
+  it("leads a code block failure with its error state, line and code", () => {
+    const block = buildBlock({
+      block_type: "code",
+      error_codes: ["user_code_error"],
+      failure_reason:
+        "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(screen.getByText("The block's code raised NameError")).toBeDefined();
+    expect(screen.getByText("Line 6")).toBeDefined();
+    expect(screen.getByText("Error code user_code_error")).toBeDefined();
+    const technicalDetails = screen
+      .getByText("Technical details")
+      .closest("details");
+    expect(technicalDetails?.open).toBe(false);
+    fireEvent.click(screen.getByText("Technical details"));
+    expect(technicalDetails?.open).toBe(true);
+    // The raw reason stays: it carries the message the exception name cannot.
+    expect(
+      screen.getByText(
+        "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
+      ),
+    ).toBeDefined();
+  });
+
+  it("tells the user a sandbox fault is not theirs to fix", () => {
+    const block = buildBlock({
+      block_type: "code",
+      error_codes: ["runner_unavailable"],
+      failure_reason: "Secure CodeBlock runner is unavailable. Please retry.",
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(screen.getByText("The code sandbox was unreachable")).toBeDefined();
+    expect(screen.getByText(/not a problem with your code/i)).toBeDefined();
+  });
+
+  it("labels a workflow-declared error code as metadata", () => {
+    const block = buildBlock({
+      block_type: "code",
+      error_codes: ["inventory_unavailable"],
+      failure_reason: "No inventory was available.",
+      output: {
+        errors: [
+          {
+            error_code: "inventory_unavailable",
+            error_type: "USER_DEFINED_ERROR",
+          },
+        ],
+      },
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(
+      screen.getByText('The workflow reported "inventory_unavailable"'),
+    ).toBeDefined();
+    expect(screen.getByText("Error code inventory_unavailable")).toBeDefined();
+  });
+
+  it("omits technical details when a classified failure has no raw reason", () => {
+    const block = buildBlock({
+      block_type: "code",
+      error_codes: ["runner_unavailable"],
+      failure_reason: null,
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(screen.getByText("The code sandbox was unreachable")).toBeDefined();
+    expect(screen.queryByText("Technical details")).toBeNull();
+  });
 });

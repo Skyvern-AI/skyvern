@@ -23,6 +23,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         vault_type=CredentialVaultType.BITWARDEN,
         totp_identifier="user@example.com",
         run_sequentially=False,
+        tested_url="https://login.example.com/account",
     )
 
     class FakeCredential:
@@ -77,6 +78,9 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
 
     assert context.get_credential_totp_identifier("credential_param") == "user@example.com"
     assert context.get_resolved_credential_parameter_id("credential_param") == "cred-1"
+    # The credential's tested login site is what the code-block release check is armed from;
+    # without it here the guard is silently inert for every block bound to this credential.
+    assert context.credential_tested_urls["credential_param"] == "https://login.example.com/account"
 
 
 async def _register_with_credential(
@@ -89,6 +93,7 @@ async def _register_with_credential(
         vault_type=CredentialVaultType.BITWARDEN,
         totp_identifier=None,
         run_sequentially=False,
+        tested_url=None,
     )
 
     class FakeCredentialItem:

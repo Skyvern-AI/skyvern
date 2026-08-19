@@ -130,10 +130,13 @@ class BrowserContext:
     async def new_cdp_session(self, page: Page) -> CdpSessionFacade:
         """Raw CDP access scoped to one page, matching `context.new_cdp_session(page)`.
 
-        Unlike Playwright this opens no second connection: the page already owns a flat-mode session
-        on the one websocket, and this hands back a view onto it.
+        A dedicated session on the page's target, exactly as Playwright attaches one. Handing back
+        the page's own session instead would put the caller and this engine's route machinery on one
+        Fetch domain, where each continues requests the other still has paused (SKY-14066: the
+        route dispatcher continued download responses before the interceptor could take the body).
         """
-        return CdpSessionFacade(self.browser.connection, session=page.session)
+        session = await self.browser.connection.attach_supplementary(page.session.target.target_id)
+        return CdpSessionFacade(self.browser.connection, session=session)
 
     async def cookies(self, urls: str | list[str] | None = None) -> list[dict]:
         params: dict[str, Any] = {}
@@ -407,7 +410,12 @@ class CdpSessionFacade:
     remove_listener = off
 
     async def detach(self) -> None:
-        return None
+        if self._session is None or self._session.detached:
+            return
+        try:
+            await self._connection.transport.send("Target.detachFromTarget", {"sessionId": self._session.session_id})
+        except CdpError:
+            LOG.debug("skycdp could not detach a supplementary session", exc_info=True)
 
 
 class BrowserType:
