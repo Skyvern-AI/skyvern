@@ -37,7 +37,7 @@ await browser.close();
 
 | Parameter (Python) | Parameter (TS) | Type | Required | Default | Description |
 |-------------------|----------------|------|----------|---------|-------------|
-| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (min 5, capped at 240). |
+| `timeout` | `timeout` | `int` / `number` | No | `60` | Session timeout in minutes (min 5, max 240; higher values are rejected). |
 | `proxy_location` | `proxyLocation` | `ProxyLocation` | No | `None` / `undefined` | Geographic proxy location for browser traffic. |
 
 ## Returns `SkyvernBrowser`

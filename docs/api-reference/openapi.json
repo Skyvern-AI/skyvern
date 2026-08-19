@@ -3912,6 +3912,9 @@
               }
             }
           },
+          "400": {
+            "description": "Requested timeout exceeds the 240-minute maximum"
+          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
           },
@@ -8622,6 +8625,17 @@
             "title": "Max Retries",
             "default": 0
           },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -11321,7 +11335,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -26328,6 +26342,10 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -26363,6 +26381,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
           },
           "parameter_keys": {
             "anyOf": [
