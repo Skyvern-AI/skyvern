@@ -3766,7 +3766,7 @@ async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_co
         auto_accept=False,
     )
     original_workflow = SimpleNamespace(workflow_id="wf-canonical")
-    timeout_copy = "I ran out of time processing your request. Here's what I have so far."
+    timeout_copy = agent_module._TIMEOUT_REPLY_DEFAULT
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
         verified=False,

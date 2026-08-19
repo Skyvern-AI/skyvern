@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,8 +12,17 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
-from skyvern.forge.sdk.copilot.challenge_evidence import CHALLENGE_KIND_KEY, ChallengeKind
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    CHALLENGE_KIND_KEY,
+    ChallengeEvidenceSource,
+    ChallengeKind,
+    composition_challenge_carrier,
+)
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    merge_visual_composition_evidence,
+    parse_composition_html,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -223,6 +233,77 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
         missing.repair_decision.next_action,
         missing.repair_decision.required_authority,
     ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK, [])
+
+
+def test_paused_run_is_not_a_failure_and_is_not_claimed_as_success() -> None:
+    paused = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "error": "The run is paused at a human_interaction block, waiting for a person.",
+            "data": {
+                "workflow_run_id": "wr_paused",
+                "overall_status": "paused",
+                "failure_reason": "The run is paused, waiting for a person to approve or reject it.",
+                "control_signal": {"kind": "watchdog_paused"},
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert (
+        paused.diagnosis_result.suspected_failure_type,
+        paused.repair_decision.next_action,
+        paused.verification_result.user_goal_satisfied,
+    ) == (DiagnosisFailureType.NO_FAILURE, RepairNextAction.NO_CHANGE, False)
+
+
+def test_pause_outranks_trusted_challenge_evidence() -> None:
+    """A pause on a challenge-flagged page stays NO_FAILURE. Classifying it as a challenge blocker
+    maps to STOP, which would have the copilot call the site unfixable about a run that has emailed
+    a person to solve that exact challenge. ``_next_action`` already excludes NO_FAILURE from its
+    anti-bot latch; this keeps ``_failure_type`` agreeing with it."""
+    paused_on_challenge = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "error": "The run is paused at a human_interaction block, waiting for a person.",
+            "data": {
+                "workflow_run_id": "wr_paused_challenge",
+                "overall_status": "paused",
+                "control_signal": {"kind": "watchdog_paused"},
+                "failure_categories": [
+                    {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0}
+                ],
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert (
+        paused_on_challenge.diagnosis_result.suspected_failure_type,
+        paused_on_challenge.repair_decision.next_action,
+    ) == (DiagnosisFailureType.NO_FAILURE, RepairNextAction.NO_CHANGE)
+
+
+def test_non_paused_watchdog_exit_still_classifies_as_a_failed_run() -> None:
+    ceiling = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "error": "The run exceeded the 600s absolute ceiling while still showing progress.",
+            "data": {
+                "workflow_run_id": "wr_ceiling",
+                "overall_status": "running",
+                "failure_reason": "ceiling",
+                "control_signal": {"kind": "watchdog_ceiling"},
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert ceiling.diagnosis_result.suspected_failure_type == DiagnosisFailureType.FAILED_RUN
+    assert ceiling.repair_decision.next_action == RepairNextAction.REPAIR
 
 
 def test_authoring_repair_contexts_have_distinct_structural_root_cause_signatures() -> None:
@@ -3119,3 +3200,115 @@ def test_enforcement_signal_will_not_name_a_device_wall_from_another_run() -> No
     assert signal is not None
     assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
     assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+
+
+_SATISFIABLE_TOTP_PAGE_HTML = (
+    "<html><head><title>Two-Factor Authentication</title></head><body>"
+    "<p>Complete the challenge to continue.</p>"
+    "<form><label for='token'>Authenticator token</label>"
+    "<input id='token' name='token' type='text' placeholder='123456' />"
+    "<button type='submit' class='btn--login'>Login</button></form></body></html>"
+)
+_TOTP_VISION_CHALLENGE_SUMMARY = {
+    "summary": "A centered Two-Factor Authentication card requests an authenticator token; a Login button is shown.",
+    "challenge_detected": True,
+    "challenge_kind": "other",
+    "challenge_location": "Centered page card",
+    "submit_blocked": True,
+    "blocked_submit_controls": ["Login button requires successful two-factor authentication"],
+}
+
+
+_TOTP_VISION_OCCLUSION_ONLY_SUMMARY = {
+    "summary": "A centered Two-Factor Authentication card is covered by a site verification interstitial.",
+    "challenge_detected": True,
+    "challenge_kind": "other",
+    "challenge_location": "Full-page interstitial",
+}
+_FAILED_BLOCK_ACTION_TRACE = [
+    {
+        "action": "null_action",
+        "status": "failed",
+        "reasoning": None,
+        "element": None,
+        "description": "page.wait_for_selector(\"button[name='Continue']\", timeout=15000)",
+        "code_line": 27,
+    },
+    {
+        "action": "null_action",
+        "status": "completed",
+        "reasoning": None,
+        "element": None,
+        "description": "token = credential.otp()",
+    },
+]
+
+
+def _failed_run_blocks_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_failed",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "login_and_read_visitors",
+                    "status": "failed",
+                    "failure_reason": "Timed out waiting for button[name='Continue']",
+                }
+            ],
+            "action_trace_summary": run_execution_module._summarize_action_trace(_FAILED_BLOCK_ACTION_TRACE),
+        },
+    }
+
+
+def _post_run_totp_page_evidence(visual_summary: dict[str, Any]) -> dict[str, Any]:
+    merged = merge_visual_composition_evidence(
+        parse_composition_html(
+            _SATISFIABLE_TOTP_PAGE_HTML,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=dict(visual_summary),
+    )
+    return {
+        **merged,
+        "workflow_run_id": "wr_failed",
+        "observed_after_workflow_run": True,
+        "source_tool": "inspect_page_for_composition",
+    }
+
+
+def test_runtime_authoring_repair_survives_a_vision_only_challenge_over_a_satisfiable_form() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.composition_page_evidence = _post_run_totp_page_evidence(_TOTP_VISION_CHALLENGE_SUMMARY)
+    result = _failed_run_blocks_result()
+
+    run_execution_module._record_run_blocks_result(ctx, result)
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert composition_challenge_carrier(ctx.composition_page_evidence) is None
+    assert terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks") is None
+    assert repair_context is not None
+    assert repair_context.block_label == "login_and_read_visitors"
+    assert ctx.last_code_authoring_repair_context is not None
+    assert any("Authenticator token" in summary for summary in repair_context.page_form_summaries)
+    statement_lines = result["data"]["action_trace_summary"]
+    assert any("code_line=27" in line and "wait_for_selector" in line for line in statement_lines)
+    assert any("credential.otp()" in line for line in statement_lines)
+
+
+def test_vision_challenge_without_a_blocked_submit_claim_still_terminalizes_over_a_form() -> None:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.composition_page_evidence = _post_run_totp_page_evidence(_TOTP_VISION_OCCLUSION_ONLY_SUMMARY)
+
+    run_execution_module._record_run_blocks_result(ctx, _failed_run_blocks_result())
+
+    carrier = composition_challenge_carrier(ctx.composition_page_evidence)
+    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
+
+    assert carrier is ChallengeEvidenceSource.VISION
+    assert signal is not None
+    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE

@@ -2414,34 +2414,40 @@ def test_llmcaller_router_is_cached_across_instances(monkeypatch: pytest.MonkeyP
     assert len(build_calls) == 1
 
 
-def _luna_xhigh_flex_fallback_router(*, fallback_deployment_model: str = "gpt-5.6-luna") -> LLMRouterConfig:
+# Deployments have to be models litellm's *bundled* cost map knows: CI forces
+# LITELLM_LOCAL_MODEL_COST_MAP to match production, and a model that only the fetched map
+# carries would make the probe answer differently depending on which suite ran first.
+_TOOL_CHOICE_CAPABLE_MODEL = "gpt-4o"
+
+
+def _flex_fallback_router(*, fallback_deployment_model: str = _TOOL_CHOICE_CAPABLE_MODEL) -> LLMRouterConfig:
     return LLMRouterConfig(
-        model_name="openai-gpt-5-6-luna-xhigh-flex-fallback-router",
+        model_name="openai-flex-fallback-router",
         required_env_vars=[],
         supports_vision=True,
         add_assistant_prefix=False,
         model_list=[
             LLMRouterModelConfig(
-                model_name="openai-gpt-5-6-luna-xhigh-flex",
-                litellm_params={"model": "gpt-5.6-luna"},
+                model_name="openai-flex",
+                litellm_params={"model": _TOOL_CHOICE_CAPABLE_MODEL},
             ),
             LLMRouterModelConfig(
-                model_name="openai-gpt-5-6-luna-xhigh-fallback",
+                model_name="openai-flex-fallback",
                 litellm_params={"model": fallback_deployment_model},
             ),
         ],
-        main_model_group="openai-gpt-5-6-luna-xhigh-flex",
-        fallback_model_group="openai-gpt-5-6-luna-xhigh-fallback",
+        main_model_group="openai-flex",
+        fallback_model_group="openai-flex-fallback",
     )
 
 
 def test_supports_tool_choice_resolves_router_through_its_deployments(monkeypatch: pytest.MonkeyPatch) -> None:
     """The probe must resolve a router's tool_choice support through its deployments' underlying
     litellm models, not the router's own group name -- litellm knows nothing about the latter."""
-    router_config = _luna_xhigh_flex_fallback_router()
+    router_config = _flex_fallback_router()
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
 
-    caller = LLMCaller("LUNA_XHIGH_FLEX_FALLBACK_ROUTER")
+    caller = LLMCaller("FLEX_FALLBACK_ROUTER")
 
     assert caller.supports_tool_choice() is True
     # Pins why the probe must go through model_list: asking litellm about the router's own group
@@ -2455,10 +2461,10 @@ def test_supports_tool_choice_denies_router_when_any_deployment_is_unsupported(
     # litellm.Router validates every deployment's model string at construction time, so the
     # "unsupported" deployment must be a real, recognized model (just one litellm knows doesn't
     # take tool_choice) rather than a made-up string, which would blow up LLMCaller.__init__.
-    router_config = _luna_xhigh_flex_fallback_router(fallback_deployment_model="openai/gpt-3.5-turbo-instruct")
+    router_config = _flex_fallback_router(fallback_deployment_model="openai/gpt-3.5-turbo-instruct")
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
 
-    caller = LLMCaller("LUNA_XHIGH_FLEX_FALLBACK_ROUTER_PARTIAL")
+    caller = LLMCaller("FLEX_FALLBACK_ROUTER_PARTIAL")
 
     assert caller.supports_tool_choice() is False
 
@@ -2466,7 +2472,7 @@ def test_supports_tool_choice_denies_router_when_any_deployment_is_unsupported(
 def test_supports_tool_choice_follows_dispatch_order_for_anthropic_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     # A router-backed key dispatches through litellm.Router, which forwards tool_choice, even when
     # its name contains ANTHROPIC. Denying on the substring alone would silently disable the lever.
-    router_config = _luna_xhigh_flex_fallback_router()
+    router_config = _flex_fallback_router()
     monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
     monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
     monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: MagicMock())

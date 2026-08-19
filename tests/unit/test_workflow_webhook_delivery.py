@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.service import WorkflowService
 
 
 class _StatusResponse:
-    def __init__(self) -> None:
+    def __init__(self, extra_payload: dict | None = None) -> None:
         now = datetime.now(timezone.utc)
         self.status = "completed"
         self.outputs: dict = {}
@@ -25,6 +30,7 @@ class _StatusResponse:
         self.parameters: dict = {}
         self.errors: list = []
         self.total_steps = 1
+        self.extra_payload = extra_payload or {}
         self.created_at = now
         self.modified_at = now
         self.queued_at = now
@@ -32,7 +38,7 @@ class _StatusResponse:
         self.finished_at = now
 
     def model_dump_json(self) -> str:
-        return '{"workflow_run_id":"wr_abc","status":"completed"}'
+        return json.dumps({"workflow_run_id": "wr_abc", "status": "completed", **self.extra_payload})
 
 
 class _WebhookRunResponse:
@@ -72,7 +78,6 @@ def webhook_service(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowService, A
         service_module,
         "generate_skyvern_webhook_signature",
         lambda payload, api_key: SimpleNamespace(
-            payload_for_log='{"safe":true}',
             headers={"x-skyvern-signature": "sig"},
             signed_payload='{"signed":true}',
         ),
@@ -105,6 +110,65 @@ async def test_prepare_workflow_webhook_builds_request_without_delivery(
     assert webhook.webhook_callback_url == "https://example.com/hook"
     assert webhook.signed_payload == '{"signed":true}'
     deliver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_webhook_logs_named_fields_without_the_payload_object(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, build_response, _update_run = webhook_service
+    synthetic_credential = "synthetic-webhook-credential"
+    build_response.return_value = _StatusResponse({"output": {"destinations": [{"signing_key": synthetic_credential}]}})
+    monkeypatch.setattr(service_module, "generate_skyvern_webhook_signature", generate_skyvern_webhook_signature)
+    deliver = AsyncMock(return_value=_response(200, "ok"))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run())
+
+    webhook_events = [
+        event
+        for event in logs
+        if event["event"]
+        in {
+            "Prepared webhook run status for webhook callback url",
+            "Sending webhook run status to webhook callback url",
+        }
+    ]
+    assert len(webhook_events) == 2
+    assert all("payload" not in event for event in webhook_events)
+    assert all(event["workflow_run_id"] == "wr_abc" for event in webhook_events)
+    assert all(event["webhook_callback_url"] == "https://example.com/hook" for event in webhook_events)
+    assert synthetic_credential not in json.dumps(logs)
+    dispatched_payload = deliver.await_args.kwargs["payload"]
+    assert synthetic_credential in dispatched_payload
+    expected_signature = hmac.new(b"api-key", dispatched_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    assert deliver.await_args.kwargs["headers"]["x-skyvern-signature"] == expected_signature
+
+
+@pytest.mark.asyncio
+async def test_failed_webhook_logs_no_payload_copy(
+    webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc, build_response, _update_run = webhook_service
+    synthetic_credential = "synthetic-webhook-credential"
+    build_response.return_value = _StatusResponse({"output": {"destinations": [{"signing_key": synthetic_credential}]}})
+    monkeypatch.setattr(service_module, "generate_skyvern_webhook_signature", generate_skyvern_webhook_signature)
+    deliver = AsyncMock(return_value=_response(400, "bad request"))
+    monkeypatch.setattr(service_module, "deliver_webhook_with_retries", deliver)
+
+    with capture_logs() as logs:
+        await svc.execute_workflow_webhook(_workflow_run())
+
+    failures = [event for event in logs if event["event"] == "Webhook failed"]
+    assert len(failures) == 1
+    assert failures[0]["resp_code"] == 400
+    assert "webhook_data" not in failures[0]
+    # No default=str: serializability doubles as the guard against logging raw response objects.
+    assert synthetic_credential not in json.dumps(logs)
+    assert synthetic_credential in deliver.await_args.kwargs["payload"]
 
 
 @pytest.mark.asyncio

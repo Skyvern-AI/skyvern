@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairDecision,
     VerificationResult,
 )
+from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
 
@@ -98,11 +99,11 @@ def _overwrite_ctx(*, last_test_ok: bool | None) -> MagicMock:
 
 
 _STATE_EXPECTATIONS = {
-    "no_workflow": ("auto_applicable", "default", False),
+    "no_workflow": ("no_proposal", "default", False),
     "untested": ("review_untested", "unvalidated", True),
-    "failed_test": ("auto_applicable", "default", False),
+    "failed_test": ("review_untested", "unvalidated", True),
     "passing_test": ("review_tested", "tested", True),
-    "suspicious_success": ("auto_applicable", "default", False),
+    "suspicious_success": ("review_untested", "unvalidated", True),
 }
 
 
@@ -295,7 +296,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "no_proposal"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_missing_yaml_drops_tested_proposal(self) -> None:
@@ -306,7 +307,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "no_proposal"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_interactive_completion_verdict_cannot_preserve_tested_proposal_on_timeout(self) -> None:
@@ -326,13 +327,13 @@ class TestBuildTimeoutExitResult:
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
-        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "review_untested"
+        assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
         assert result.clear_proposed_workflow is False
 
-    def test_stale_latch_without_judge_verdict_does_not_preserve_proposal(self) -> None:
+    def test_stale_latch_without_judge_verdict_does_not_credit_proposal_as_tested(self) -> None:
         wf = MagicMock(name="wf")
         ctx = _ctx(
             last_workflow=wf,
@@ -346,11 +347,12 @@ class TestBuildTimeoutExitResult:
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "review_untested"
+        assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
 
-    def test_suspicious_current_run_drops_last_good_workflow_without_verified_terminal_state(self) -> None:
+    def test_suspicious_current_run_surfaces_current_draft_not_last_good_workflow(self) -> None:
         wf = MagicMock(name="wf")
         last_good = MagicMock(name="last_good")
         ctx = _ctx(
@@ -364,10 +366,12 @@ class TestBuildTimeoutExitResult:
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
-        assert result.user_response == _TIMEOUT_REPLY_DEFAULT
+        # The last-good branch stays guarded on a suspicious run -- crediting that
+        # shape as tested would be the false-success this terminal must not make.
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: 'broken'"
+        assert result.proposal_disposition == "review_untested"
+        assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
 
 
 class TestBuildCancelledExitResult:
@@ -405,7 +409,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "no_proposal"
         assert "An unexpected error occurred. Please try again." not in result.user_response
         assert "Copilot hit an internal error before it could finish this turn" in result.user_response
         assert "The workflow was not modified" in result.user_response
@@ -433,18 +437,16 @@ class TestBuildUnexpectedErrorExitResult:
         assert result.proposal_disposition == "review_tested"
         assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
 
-    def test_failed_test_drops_proposal(self) -> None:
+    def test_failed_test_surfaces_proposal_as_unvalidated(self) -> None:
         wf = MagicMock(name="wf")
         ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
 
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
-        assert "Copilot hit an internal error before it could finish this turn" in result.user_response
-        assert "The workflow was preserved" in result.user_response
-        assert "reference cpe_" in result.user_response
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "review_untested"
+        assert result.user_response == _UNEXPECTED_ERROR_REPLY_UNVALIDATED
 
     def test_failed_test_uses_recorded_blocker_reply(self) -> None:
         wf = MagicMock(name="wf")
@@ -542,7 +544,7 @@ class TestBuildUnexpectedErrorExitResult:
         assert "tested it" not in result.user_response
         assert "I couldn't start a test run" in result.user_response
 
-    def test_suspicious_success_drops_proposal(self) -> None:
+    def test_suspicious_success_surfaces_proposal_without_crediting_it_as_tested(self) -> None:
         wf = MagicMock(name="wf")
         ctx = _ctx(
             last_workflow=wf,
@@ -553,12 +555,10 @@ class TestBuildUnexpectedErrorExitResult:
 
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
-        assert result.updated_workflow is None
-        assert result.workflow_yaml is None
-        assert result.proposal_disposition == "auto_applicable"
-        assert "Copilot hit an internal error before it could finish this turn" in result.user_response
-        assert "The workflow was preserved" in result.user_response
-        assert "reference cpe_" in result.user_response
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "review_untested"
+        assert result.user_response == _UNEXPECTED_ERROR_REPLY_UNVALIDATED
 
 
 class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
@@ -690,7 +690,7 @@ class TestTimeoutExitNamesTimeAndDraftState:
 
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
-        assert result.proposal_disposition == "auto_applicable"
+        assert result.proposal_disposition == "no_proposal"
         assert "ran out of time" in result.user_response
 
     def test_untested_draft_with_recorded_failure_still_names_time(self) -> None:
@@ -823,3 +823,69 @@ class TestCancelExitIsRecordedAsAStopNotAQuestion:
         assert result.turn_outcome is not None
         assert result.turn_outcome.terminal_reason == terminal_reason
         assert result.turn_outcome.response_kind is ResponseKind.CLARIFY
+
+
+class TestDeadlineTerminalHandsOverRecordedDraft:
+    """Existence is the condition for surfacing; the test verdict is a label on what is surfaced."""
+
+    def test_failed_test_draft_survives_the_deadline(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_failure_category_top = None
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is wf
+        assert result.workflow_yaml == "version: '1.0'"
+        assert result.proposal_disposition == "review_untested"
+
+    def test_failed_test_reply_names_the_failure(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_failure_category_top = None
+        ctx.last_update_block_count = 2
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "The login block never reached the dashboard.",
+            run_status="failed",
+            workflow_run_id="wr_sky14395",
+        )
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is wf
+        assert "The last test did not verify" in result.user_response
+        assert "The login block never reached the dashboard" in result.user_response
+
+    @pytest.mark.parametrize(
+        "builder",
+        [
+            pytest.param(_build_timeout_exit_result, id="timeout"),
+            pytest.param(_build_max_turns_exit_result, id="max_turns"),
+        ],
+    )
+    def test_empty_terminal_claims_no_deliverable(self, builder) -> None:
+        ctx, _ = _state_ctx("no_workflow")
+        ctx.copilot_total_timeout_exceeded = True
+
+        result = builder(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+        assert "draft workflow" in result.user_response
+        assert "what I have so far" not in result.user_response
+        assert "I have a draft" not in result.user_response
+        assert "draft workflow you can keep" not in result.user_response
+
+    def test_budget_halted_run_is_not_told_its_test_failed(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.copilot_total_timeout_exceeded = True
+        ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is wf
+        assert "did not pass" not in result.user_response
+        assert "did not verify" not in result.user_response

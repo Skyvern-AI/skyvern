@@ -995,3 +995,18 @@ def test_authoring_prompt_exposes_credential_capabilities_without_a_login_proced
 
 def test_settled_login_does_not_change_new_workflow_rendering() -> None:
     assert _code_only_browser_authoring_prompt(frozenset()) == _code_only_browser_authoring_prompt(None)
+
+
+@pytest.mark.asyncio
+async def test_recipient_less_human_interaction_is_not_refused_at_author_time(
+    ctx: MagicMock, code_only_ctx: MagicMock
+) -> None:
+    """Author-time refusal is a closed set of three hard blocks (workflow-copilot decision 0022);
+    ``human_interaction`` is not in it under either authoring policy, even with no recipient."""
+    block_json = json.dumps({"block_type": "human_interaction", "label": "approve_step", "recipients": []})
+
+    for policy_ctx in (ctx, code_only_ctx):
+        assert await _validate_block_pre_hook({"block_json": block_json}, policy_ctx) is None
+
+    assert "human_interaction" not in _COPILOT_BANNED_BLOCK_TYPES
+    assert "human_interaction" not in _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES

@@ -143,6 +143,18 @@ def _unverified_no_repair_contract() -> DiagnosisRepairContract:
 
 
 class TestFailedTestResponseNormalization:
+    def test_paused_run_reply_is_not_rewritten_into_a_failed_test(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_update_block_count=2,
+            last_test_ok=None,
+            last_test_failure_reason="The run is paused, waiting for a person to approve or reject it.",
+        )
+        pause_reply = "The run is paused at the approval step, waiting for someone to approve or reject it."
+
+        assert _rewrite_failed_test_response(pause_reply, ctx) == pause_reply
+
     def test_rewrite_failed_test_response_avoids_success_language(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
 
