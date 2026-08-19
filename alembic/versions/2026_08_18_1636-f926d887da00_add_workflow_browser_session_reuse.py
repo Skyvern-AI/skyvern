@@ -1,7 +1,7 @@
 """add workflow browser session reuse
 
 Revision ID: f926d887da00
-Revises: 3836bc93841d
+Revises: 22705e03c606
 Create Date: 2026-08-18T16:36:02.888566+00:00
 
 """
@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "f926d887da00"
-down_revision: Union[str, None] = "3836bc93841d"
+down_revision: Union[str, None] = "22705e03c606"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
