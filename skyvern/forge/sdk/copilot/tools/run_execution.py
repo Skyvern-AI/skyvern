@@ -123,6 +123,8 @@ from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -407,15 +409,26 @@ async def _attach_action_traces(
         if block_result.get("status") not in _FAILED_BLOCK_STATUSES or not block.task_id:
             continue
         task_actions = actions_by_task.get(block.task_id, [])
-        block_result["action_trace"] = [
-            {
-                "action": a.action_type,
-                "status": a.status,
-                "reasoning": a.reasoning[:150] if a.reasoning else None,
-                "element": a.element_id,
+        action_trace = []
+        for action in task_actions:
+            entry = {
+                "action": action.action_type,
+                "status": action.status,
+                "reasoning": action.reasoning[:150] if action.reasoning else None,
+                "element": action.element_id,
             }
-            for a in task_actions
-        ]
+            output = action.output
+            code_line = output.get("code_line") if isinstance(output, dict) else None
+            if (
+                action.action_type == ActionType.NULL_ACTION
+                and action.status == ActionStatus.failed
+                and type(code_line) is int
+                and action.description
+            ):
+                entry["description"] = action.description[:150]
+                entry["code_line"] = code_line
+            action_trace.append(entry)
+        block_result["action_trace"] = action_trace
 
 
 async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str | None:
@@ -565,21 +578,27 @@ def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str
 
 
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
-    """Compact, stringified summary of action entries for the compact packet."""
+    """Render the six newest action entries chronologically for the compact packet."""
     if not action_trace:
         return []
     summary: list[str] = []
-    for entry in action_trace[-6:]:
+    for entry in reversed(action_trace[:6]):
         if not isinstance(entry, dict):
             continue
         action = entry.get("action") or "?"
         status = entry.get("status") or ""
         element = entry.get("element")
+        description = entry.get("description")
+        code_line = entry.get("code_line")
         bits = [str(action)]
         if element:
             bits.append(str(element))
         if status:
             bits.append(str(status))
+        if isinstance(description, str) and description:
+            bits.append(f"description={description}")
+        if type(code_line) is int:
+            bits.append(f"code_line={code_line}")
         summary.append(" ".join(bits).strip())
     return summary
 

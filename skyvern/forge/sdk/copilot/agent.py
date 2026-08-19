@@ -288,7 +288,6 @@ class RequestPolicyGuardrailInputs:
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
-    fix_origin: bool = False
     persisted_workflow_yaml: str | None = None
     selected_connected_account_id: str | None = None
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
@@ -4144,7 +4143,6 @@ async def _run_copilot_turn_impl(
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
-        fix_origin=getattr(chat_request, "fix_origin", False),
         persisted_workflow_yaml=persisted_workflow_yaml,
         selected_connected_account_id=selected_connected_account_id(prior_turn_outcome, chat_request.message),
         stored_completion_criteria=stored_completion_criteria,

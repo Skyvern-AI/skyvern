@@ -757,13 +757,14 @@ def block_yaml_to_block(
         return ValidationBlock(
             **base_kwargs,
             task_type=TaskType.validation,
+            engine=block_yaml.engine,
             parameters=validation_block_parameters,
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
             without_page_information=block_yaml.without_page_information,
-            # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
-            max_steps_per_run=2,
+            # Default is 2 (1 attempt + 1 retry); an explicit yaml value overrides it.
+            max_steps_per_run=block_yaml.max_steps_per_run if block_yaml.max_steps_per_run is not None else 2,
         )
 
     elif block_yaml.block_type == BlockType.ACTION:
@@ -791,7 +792,8 @@ def block_yaml_to_block(
             disable_cache=block_yaml.disable_cache,
             # DO NOT run complete verification for action block
             complete_verification=False,
-            max_steps_per_run=1,
+            # Default is 1 (a single atomic action); an explicit yaml value overrides it.
+            max_steps_per_run=block_yaml.max_steps_per_run if block_yaml.max_steps_per_run is not None else 1,
         )
 
     elif block_yaml.block_type == BlockType.NAVIGATION:

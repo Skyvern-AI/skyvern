@@ -104,8 +104,15 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
-            return data
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
+            # Runtime-resolved secrets (e.g. verification codes) still redact from browser
+            # diagnostics under the global switch alone, matching the workflow-finalization floor.
+            if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
+                return data
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if not secret_values:
+                return data
+        else:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
     if artifact_type == ArtifactType.HAR:
@@ -1931,6 +1938,9 @@ class ArtifactManager:
         resolved_run_id = run_id or (context.run_id if context else None)
         if not _bundling_enabled():
             for _, (artifact_type, data) in entries.items():
+                # Callers redact before archiving, but route through the gate anyway (idempotent) so
+                # no archive path can persist an unredacted browser diagnostic.
+                data = _maybe_redact_artifact_data(artifact_type, data, resolved_workflow_run_id)
                 artifact_id = generate_artifact_id()
                 uri = app.STORAGE.build_uri(
                     organization_id=step.organization_id,

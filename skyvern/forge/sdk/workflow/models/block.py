@@ -3969,6 +3969,18 @@ CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
 
 
+def _code_block_failure_action(*, failing_line: int | None, action_order: int, response: str = "") -> Action:
+    return Action(
+        action_id=generate_action_id(),
+        action_type=ActionType.NULL_ACTION,
+        status=ActionStatus.failed,
+        action_order=action_order,
+        description=f"code error at line {failing_line}" if failing_line else "code error",
+        response=response[:500],
+        output={"code_line": failing_line},
+    )
+
+
 def _page_open_error_label(error: BaseException) -> str:
     # Playwright maps only TimeoutError/TargetClosedError to their own Python classes; every
     # other driver failure is the base Error whose .name carries the real class (e.g. TypeError).
@@ -7009,9 +7021,21 @@ async def wrapper({default_args}):
                     block_label=self.label,
                 )
                 if secure_code_block_result is not None:
-                    await recorder.persist(recorder.recorded_actions())
-                    if secure_code_block_result.failure is not None:
-                        secure_failure = secure_code_block_result.failure
+                    recorded = recorder.recorded_actions()
+                    secure_failure = secure_code_block_result.failure
+                    if (
+                        secure_failure is not None
+                        and type(secure_failure.failing_line) is int
+                        and secure_failure.failing_line > 0
+                    ):
+                        recorded.append(
+                            _code_block_failure_action(
+                                failing_line=secure_failure.failing_line,
+                                action_order=len(recorded),
+                            )
+                        )
+                    await recorder.persist(recorded)
+                    if secure_failure is not None:
                         secure_classification = (
                             HealClassification(
                                 healable=False,
@@ -7385,15 +7409,10 @@ async def wrapper({default_args}):
             if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
-                    Action(
-                        # Synthesized outside the recorder, so it needs its own stable id for the upsert path.
-                        action_id=generate_action_id(),
-                        action_type=ActionType.NULL_ACTION,
-                        status=ActionStatus.failed,
+                    _code_block_failure_action(
                         action_order=len(recorded),
-                        description=f"code error at line {failing_line}" if failing_line else "code error",
                         response=(failure_reason or "")[:500],
-                        output={"code_line": failing_line},
+                        failing_line=failing_line,
                     )
                 )
             await recorder.persist(recorded)

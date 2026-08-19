@@ -246,6 +246,10 @@ class SkyvernContext:
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
     speculative_plans: dict[str, Any] = field(default_factory=dict)
+    # Writes that persist the cost of an already-billed speculative LLM call. They are
+    # started as background tasks so the completion path doesn't wait on the LLM call,
+    # and drained at task clean-up so the write can't be dropped when the run tears down.
+    pending_speculative_persist_tasks: list[asyncio.Task] = field(default_factory=list)
 
     """
     Example output value:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
@@ -10,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 
 if TYPE_CHECKING:
@@ -374,11 +374,11 @@ class ObserverRepository(BaseRepository):
                 if status:
                     task_v2.status = status
                     if status == TaskV2Status.queued and task_v2.queued_at is None:
-                        task_v2.queued_at = datetime.now(timezone.utc)
+                        task_v2.queued_at = naive_utc_now()
                     if status == TaskV2Status.running and task_v2.started_at is None:
-                        task_v2.started_at = datetime.now(timezone.utc)
+                        task_v2.started_at = naive_utc_now()
                     if status.is_final() and task_v2.finished_at is None:
-                        task_v2.finished_at = datetime.now(timezone.utc)
+                        task_v2.finished_at = naive_utc_now()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:
