@@ -14,7 +14,7 @@ from skyvern.forge.sdk.workflow.sequential_key import resolve_reuse_bound_key
 
 _MIGRATION_PATH = (
     Path(__file__).resolve().parents[2]
-    / "alembic/versions/2026_08_18_1636-3739fba3dc3d_add_persistent_session_workflow_binding.py"
+    / "alembic/versions/2026_08_15_1201-b7e5d9f3a201_add_persistent_session_workflow_binding.py"
 )
 
 
