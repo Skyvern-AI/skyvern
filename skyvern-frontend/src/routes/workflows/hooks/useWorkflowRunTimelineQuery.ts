@@ -55,10 +55,16 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
     // The header counted off this data used to refetch only when the 5s run query landed,
     // so it trailed the copilot chat's own 2.5s timeline poll and could report no actions
     // while rows were visibly executing. Polling directly replaces that chained refetch.
-    refetchInterval:
-      workflowRun && statusIsNotFinalized(workflowRun)
+    // The gate reads the run query's cached data, which is retained after failed
+    // refetches, so this query's own error state has to stop the poll.
+    refetchInterval: (query) => {
+      if (query.state.status === "error") {
+        return false;
+      }
+      return workflowRun && statusIsNotFinalized(workflowRun)
         ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS
-        : false,
+        : false;
+    },
     placeholderData: keepPreviousData,
     refetchOnMount:
       workflowRun && statusIsNotFinalized(workflowRun) ? "always" : false,
