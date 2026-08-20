@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,7 +14,13 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.copilot.enforcement import (
     TOTAL_TIMEOUT_SECONDS,
     CopilotTotalTimeoutError,
+    _mark_copilot_total_timeout,
     run_with_enforcement,
+)
+from skyvern.forge.sdk.copilot.pending_operation import (
+    _turn_operations,
+    pending_operation,
+    pending_operation_fields,
 )
 
 
@@ -284,3 +291,182 @@ async def test_a_broken_recorder_neither_masks_nor_delays_the_cancellation(
 
     assert _cancellation_events(logs) == []
     assert any(entry.get("event") == "Failed to record a copilot turn cancellation" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_deadline_event_names_the_operation_still_open_when_the_budget_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed",
+        lambda *a, **kw: _fake_result(),
+    )
+
+    async def hanging_stream(result: Any, s: Any, c: Any) -> None:
+        with pending_operation("mcp.call_tool:run_block"):
+            await asyncio.sleep(5.0)
+
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
+
+    ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
+    with capture_logs() as logs:
+        with pytest.raises(CopilotTotalTimeoutError):
+            await run_with_enforcement(agent=MagicMock(), initial_input="hello", ctx=ctx, stream=stream)
+
+    events = _deadline_events(logs)
+    assert len(events) == 1
+    assert events[0]["pending_operation"] == "mcp.call_tool:run_block"
+    assert isinstance(events[0]["pending_operation_started_monotonic"], float)
+    assert events[0]["pending_operation_state"] == "unwound_by_cancellation"
+    assert events[0]["iteration"] == 0
+    assert events[0]["elapsed_seconds"] >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_a_broken_fingerprint_reader_neither_masks_nor_delays_the_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def exploding_fields() -> dict[str, str | float | int]:
+        raise RuntimeError("fingerprint reader is broken")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.pending_operation_fields",
+        exploding_fields,
+    )
+    ctx = _cancellation_ctx()
+
+    logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=588.0, ctx=ctx)
+
+    assert _cancellation_events(logs) == []
+    assert any(entry.get("event") == "Failed to record a copilot turn cancellation" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_names_the_inner_operation_that_returned_over_the_outer_one_still_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed",
+        lambda *a, **kw: _fake_result(),
+    )
+
+    async def stream_stalling_after_a_tool_returned(result: Any, s: Any, c: Any) -> None:
+        with pending_operation("mcp.call_tool:run_block"):
+            await asyncio.sleep(0)
+        await asyncio.sleep(5.0)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse",
+        stream_stalling_after_a_tool_returned,
+    )
+
+    ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
+    with capture_logs() as logs:
+        with pytest.raises(CopilotTotalTimeoutError):
+            await run_with_enforcement(agent=MagicMock(), initial_input="hello", ctx=ctx, stream=stream)
+
+    events = _deadline_events(logs)
+    assert len(events) == 1
+    assert events[0]["pending_operation"] == "mcp.call_tool:run_block"
+    assert events[0]["pending_operation_state"] == "returned"
+    assert events[0]["pending_operation_open_count"] == 1, "the outer turn.stream scope is still open"
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_names_an_operation_that_exited_by_exception_and_never_calls_it_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed",
+        lambda *a, **kw: _fake_result(),
+    )
+
+    async def stream_stalling_after_a_tool_failed(result: Any, s: Any, c: Any) -> None:
+        with contextlib.suppress(RuntimeError):
+            with pending_operation("mcp.call_tool:run_block"):
+                raise RuntimeError("tool blew up")
+        await asyncio.sleep(5.0)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse",
+        stream_stalling_after_a_tool_failed,
+    )
+
+    ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
+    with capture_logs() as logs:
+        with pytest.raises(CopilotTotalTimeoutError):
+            await run_with_enforcement(agent=MagicMock(), initial_input="hello", ctx=ctx, stream=stream)
+
+    events = _deadline_events(logs)
+    assert len(events) == 1
+    assert events[0]["pending_operation"] == "mcp.call_tool:run_block"
+    assert events[0]["pending_operation_state"] == "unwound_by_error"
+    assert events[0]["pending_operation_open_count"] == 1, "the outer turn.stream scope is still open"
+
+
+def test_the_fingerprint_reader_reports_nothing_rather_than_raising_on_an_unreadable_slot() -> None:
+    token = _turn_operations.set(cast(Any, object()))
+    try:
+        assert pending_operation_fields() == {}
+    finally:
+        _turn_operations.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_no_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.pending_operation_fields", dict)
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed",
+        lambda *a, **kw: _fake_result(),
+    )
+
+    async def hanging_stream(result: Any, s: Any, c: Any) -> None:
+        await asyncio.sleep(5.0)
+
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
+
+    ctx = MagicMock()
+    ctx.copilot_total_timeout_exceeded = False
+    with capture_logs() as logs:
+        with pytest.raises(CopilotTotalTimeoutError):
+            await run_with_enforcement(agent=MagicMock(), initial_input="hello", ctx=ctx, stream=stream)
+
+    events = _deadline_events(logs)
+    assert len(events) == 1
+    assert "pending_operation" not in events[0]
+    assert events[0]["iteration"] == 0
+    assert events[0]["elapsed_seconds"] >= 0.05
+    assert ctx.copilot_total_timeout_exceeded is True
+
+    with capture_logs() as already_marked:
+        _mark_copilot_total_timeout(ctx, elapsed_seconds=99.0, iteration=1)
+    assert _deadline_events(already_marked) == []

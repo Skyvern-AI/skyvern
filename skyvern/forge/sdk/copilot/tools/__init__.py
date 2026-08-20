@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
+from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -779,13 +780,14 @@ async def run_blocks_tool(
             copilot_ctx,
         ),
     ):
-        result = await _run_blocks_and_collect_debug(
-            arguments,
-            copilot_ctx,
-            labels_to_execute=labels_to_execute,
-            block_outputs_to_seed=block_outputs_to_seed,
-            frontier_start_label=frontier_start_label,
-        )
+        with pending_operation("tool.run_blocks_and_collect_debug"):
+            result = await _run_blocks_and_collect_debug(
+                arguments,
+                copilot_ctx,
+                labels_to_execute=labels_to_execute,
+                block_outputs_to_seed=block_outputs_to_seed,
+                frontier_start_label=frontier_start_label,
+            )
         await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         _record_diagnosis_repair_contract(
@@ -1031,13 +1033,14 @@ async def _run_updated_workflow_blocks(
             copilot_ctx,
         ),
     ):
-        run_result = await _run_blocks_and_collect_debug(
-            {"block_labels": block_labels, "parameters": parameters},
-            copilot_ctx,
-            labels_to_execute=labels_to_execute,
-            block_outputs_to_seed=block_outputs_to_seed,
-            frontier_start_label=frontier_start_label,
-        )
+        with pending_operation("tool.update_and_run_blocks"):
+            run_result = await _run_blocks_and_collect_debug(
+                {"block_labels": block_labels, "parameters": parameters},
+                copilot_ctx,
+                labels_to_execute=labels_to_execute,
+                block_outputs_to_seed=block_outputs_to_seed,
+                frontier_start_label=frontier_start_label,
+            )
         await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)

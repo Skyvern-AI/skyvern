@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_der
 from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import mark_mcp_result_untrusted_for_llm, sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -912,7 +913,8 @@ class SkyvernOverlayMCPServer(MCPServer):
     ) -> CallToolResult:
         propagated_error: BaseException
         try:
-            return await self._call_tool(tool_name, arguments, meta)
+            with pending_operation(f"mcp.call_tool:{tool_name}"):
+                return await self._call_tool(tool_name, arguments, meta)
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 LOG.warning("MCP tool dispatch failed")
