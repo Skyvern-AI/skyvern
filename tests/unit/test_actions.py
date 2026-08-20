@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -7,6 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.exceptions import UnsupportedActionType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.models import ActionModel
@@ -603,6 +605,27 @@ def test_parse_select_option_download_field(download_value: bool | None) -> None
     assert isinstance(action, SelectOptionAction)
     expected = download_value if download_value is not None else False
     assert action.download is expected
+
+
+def test_parse_unknown_action_type_raises_unsupported_action_type() -> None:
+    with pytest.raises(UnsupportedActionType):
+        parse_action(
+            action={"action_type": "INPUT", "id": "1", "reasoning": "test"},
+            scraped_page=_mock_scraped_page(),
+        )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"action_type": "SELECT_OPTION", "id": "1", "reasoning": "test"},
+        {"action_type": "SELECT_OPTION", "id": "1", "reasoning": "test", "option": "Yes"},
+    ],
+    ids=["option_missing", "option_is_a_string"],
+)
+def test_parse_select_option_malformed_option_raises_value_error(action: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        parse_action(action=action, scraped_page=_mock_scraped_page())
 
 
 def test_parse_select_option_download_missing() -> None:

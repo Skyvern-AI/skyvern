@@ -84,7 +84,7 @@ async def test_task_endpoint_refuses_credit_exhausted_org(
         check=AsyncMock(
             side_effect=HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail="Credits exhausted. Enable overage or upgrade your plan.",
+                detail="Credits exhausted. Upgrade your plan in Billing.",
             )
         )
     )
