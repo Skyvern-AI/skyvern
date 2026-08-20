@@ -17,16 +17,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import MissingBrowserStatePage
 from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.models.block import (
+    ActionBlock,
+    BaseTaskBlock,
+    ExtractionBlock,
+    HumanInteractionBlock,
+    LoginBlock,
+    NavigationBlock,
+    TaskBlock,
+    ValidationBlock,
+)
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
-from skyvern.webeye.actions.actions import ActionType
+from skyvern.webeye.actions.actions import ActionStatus, ActionType
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 
 
@@ -36,6 +51,15 @@ async def _run_execute_task_v3(
     post_step_side_effect: BaseException | None = None,
     action_rounds: list[list[tuple[str, dict[str, Any]]]] | None = None,
     screenshot_raises: bool = False,
+    task_block: BaseTaskBlock | None = None,
+    validation_without_page_information: bool = False,
+    provider_probe_calls: int = 0,
+    get_working_page_side_effect: list[Any] | None = None,
+    must_get_working_page_side_effect: BaseException | list[Any] | None = None,
+    loop_raises: BaseException | None = None,
+    update_task_side_effect: BaseException | None = None,
+    completion_gate_vetoes: bool = False,
+    initial_active_credential_parameter_key: str | None = None,
     context_overrides: dict[str, Any] | None = None,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
@@ -46,20 +70,34 @@ async def _run_execute_task_v3(
     step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
 
     browser_state, _, page = make_browser_state()
-    browser_state.must_get_working_page = AsyncMock(return_value=page)
+    browser_state.must_get_working_page = AsyncMock(return_value=page, side_effect=must_get_working_page_side_effect)
+    if get_working_page_side_effect is not None:
+        browser_state.get_working_page = AsyncMock(side_effect=get_working_page_side_effect)
+    else:
+        browser_state.get_working_page = AsyncMock(return_value=page)
     browser_state.take_post_action_screenshot = AsyncMock(
         return_value=b"png-bytes",
         side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
     )
 
     async def _loop(**kwargs: Any) -> LoopOutcome:
+        # Exposed so tests can probe context state as seen from inside the loop (and, since this
+        # runs before any loop_raises, even when the loop goes on to raise).
+        loop_mock.context = context
+        loop_mock.active_credential_parameter_key_during_loop = context.active_credential_parameter_key
         cb = kwargs.get("on_action_round")
         if cb is not None and action_rounds:
             for round_actions in action_rounds:
                 await cb(round_actions)
+        if provider_probe_calls:
+            provider = kwargs["page_provider"]
+            loop_mock.resolved_pages = [await provider() for _ in range(provider_probe_calls)]
+        if loop_raises is not None:
+            raise loop_raises
         return outcome
 
     loop_mock = AsyncMock(side_effect=_loop)
+    loop_mock.browser_state = browser_state
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
     monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
     monkeypatch.setattr("skyvern.forge.sdk.api.files.resolve_run_download_id", lambda *_a, **_k: "download-1")
@@ -89,20 +127,27 @@ async def _run_execute_task_v3(
             task.status = status
         if "extracted_information" in _kwargs:
             task.extracted_information = _kwargs["extracted_information"]
+        if "failure_reason" in _kwargs:
+            task.failure_reason = _kwargs["failure_reason"]
         return task
 
     agent.update_step = AsyncMock(side_effect=fake_update_step)
-    agent.update_task = AsyncMock(side_effect=fake_update_task)
+    agent.update_task = AsyncMock(side_effect=update_task_side_effect or fake_update_task)
     agent.clean_up_task = AsyncMock()
 
     post_step_mock = AsyncMock(side_effect=post_step_side_effect)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", post_step_mock)
+    completion_gate = AsyncMock(return_value=not completion_gate_vetoes)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.gate_step_completion", completion_gate)
+    loop_mock.completion_gate = completion_gate
 
     context = SkyvernContext(
         task_id=task.task_id,
         step_id=step.step_id,
         organization_id=task.organization_id,
         workflow_run_id=task.workflow_run_id,
+        validation_without_page_information=validation_without_page_information,
+        active_credential_parameter_key=initial_active_credential_parameter_key,
     )
     for name, value in (context_overrides or {}).items():
         setattr(context, name, value)
@@ -116,10 +161,13 @@ async def _run_execute_task_v3(
             api_key=None,
             close_browser_on_completion=True,
             browser_session_id=None,
+            task_block=task_block,
         )
     finally:
         skyvern_context.reset()
 
+    loop_mock.clean_up_kwargs = agent.clean_up_task.await_args.kwargs if agent.clean_up_task.await_args else {}
+    loop_mock.update_task_kwargs = agent.update_task.await_args.kwargs if agent.update_task.await_args else {}
     return out_step, out_task, loop_mock, post_step_mock
 
 
@@ -168,12 +216,31 @@ async def test_execute_task_v3_no_actions_bills_nothing(monkeypatch: pytest.Monk
 
 @pytest.mark.asyncio
 async def test_execute_task_v3_failure_maps_to_failed(monkeypatch: pytest.MonkeyPatch) -> None:
-    outcome = LoopOutcome(status="budget_exhausted", reason="max_turns reached", billable_actions=["click"])
+    outcome = LoopOutcome(status="budget_exhausted", reason="max_turns reached", billable_actions=[])
     step, task, _loop, post_step_mock = await _run_execute_task_v3(monkeypatch, outcome)
 
     assert step.status == StepStatus.failed
     # The hook is still called; it self-guards on completed status, so a failed step bills nothing.
     post_step_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_failed_run_with_real_actions_completes_step_for_billing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This one step is the run's billing unit and post-step billing meters only completed steps:
+    # a budget-exhausted run that performed real page actions must still bill them, while the
+    # task-level status keeps reporting the failure. A canceled run stays unbilled.
+    outcome = LoopOutcome(status="budget_exhausted", reason="cap", billable_actions=["click", "type"])
+    step, task, _loop, post_step_mock = await _run_execute_task_v3(monkeypatch, outcome)
+    assert task.status == TaskStatus.failed
+    assert step.status == StepStatus.completed
+    billed_step = post_step_mock.await_args.args[1]
+    assert billed_step.status == StepStatus.completed
+
+    canceled = LoopOutcome(status="canceled", reason="canceled", billable_actions=["click"])
+    step, task, _loop, _post = await _run_execute_task_v3(monkeypatch, canceled)
+    assert step.status == StepStatus.canceled
 
 
 @pytest.mark.asyncio
@@ -187,7 +254,9 @@ async def test_execute_task_v3_completed_without_extraction_fails(monkeypatch: p
         data_extraction_goal="Extract the confirmation number",
         extracted_information_schema=None,
     )
-    assert step.status == StepStatus.failed
+    # The task-level result is the failure; the step (billing unit) completes because a real
+    # billable action ran.
+    assert step.status == StepStatus.completed
     assert task.status == TaskStatus.failed
 
 
@@ -580,8 +649,8 @@ async def test_execute_task_v3_persists_per_action_screenshots_and_rows(monkeypa
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
     rounds = [
-        [("click", {"selector": "#a"}), ("type", {"selector": "#b", "text": "x"})],
-        [("click", {"selector": "#submit"})],
+        [("click", {"selector": "#a"}, True), ("type", {"selector": "#b", "text": "x"}, True)],
+        [("click", {"selector": "#submit"}, True)],
     ]
     step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -614,7 +683,7 @@ async def test_execute_task_v3_persists_action_row_when_screenshot_fails(monkeyp
     step, task, _loop, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
-        action_rounds=[[("click", {"selector": "#a"})]],
+        action_rounds=[[("click", {"selector": "#a"}, True)]],
         screenshot_raises=True,
         data_extraction_goal=None,
         extracted_information_schema=None,
@@ -671,11 +740,13 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
         with (
             patch("skyvern.forge.agent.app") as mock_app,
             patch("skyvern.forge.sdk.artifact.manager.app", mock_app),
+            patch("skyvern.forge.sdk.experimentation.workflow_block_engine.app") as mock_wbe_app,
         ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.ARTIFACT_MANAGER = manager
             mock_app.STORAGE = storage
             mock_app.DATABASE.artifacts = database.artifacts
@@ -711,6 +782,827 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
     assert step.step_id not in manager._step_archives
 
 
+# ---------------------------------------------------------------------------
+# P2: the v3 dispatch gate for workflow task blocks (_task_block_supports_v3
+# and its wiring into ForgeAgent.execute_step)
+# ---------------------------------------------------------------------------
+
+
+def _make_output_parameter(key: str) -> OutputParameter:
+    now = datetime.now(UTC)
+    return OutputParameter(
+        parameter_type=ParameterType.OUTPUT,
+        key=key,
+        description="test output",
+        output_parameter_id=f"op_{key}",
+        workflow_id="w_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_block(block_cls: type[BaseTaskBlock], label: str = "blk", **overrides: Any) -> BaseTaskBlock:
+    return block_cls(label=label, output_parameter=_make_output_parameter(label), **overrides)
+
+
+def _make_credential_parameter(key: str) -> CredentialParameter:
+    now = datetime.now(UTC)
+    return CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="w_test",
+        credential_id=f"cred_{key}",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+_ALLOWED_BLOCK_CASES: list[tuple[type[BaseTaskBlock], dict[str, Any]]] = [
+    (TaskBlock, {}),
+    (NavigationBlock, {"navigation_goal": "Apply to the job"}),
+    (LoginBlock, {}),
+    (ActionBlock, {}),
+    (ValidationBlock, {}),
+    (ExtractionBlock, {"data_extraction_goal": "Extract the price"}),
+]
+_ALLOWED_BLOCK_IDS = ["task", "navigation", "login", "action", "validation", "extraction"]
+
+
+@pytest.mark.parametrize("block_cls,overrides", _ALLOWED_BLOCK_CASES, ids=_ALLOWED_BLOCK_IDS)
+def test_task_block_supports_v3_allows_supported_block_types(
+    block_cls: type[BaseTaskBlock], overrides: dict[str, Any]
+) -> None:
+    assert agent_module._task_block_supports_v3(_make_block(block_cls, **overrides)) is True
+
+
+def test_task_block_supports_v3_denies_unsupported_block_type() -> None:
+    # HUMAN_INTERACTION is a BaseTaskBlock subclass but not in the v3 allow-list.
+    assert agent_module._task_block_supports_v3(_make_block(HumanInteractionBlock)) is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"complete_on_download": True},
+        {"download_suffix": "invoice"},
+        {"download_timeout": 5.0},
+    ],
+    ids=["complete_on_download", "download_suffix", "download_timeout"],
+)
+def test_task_block_supports_v3_denies_download_semantics(overrides: dict[str, Any]) -> None:
+    assert agent_module._task_block_supports_v3(_make_block(ActionBlock, **overrides)) is False
+
+
+class _StepEngineDispatched(BaseException):
+    """Raised by the mocked agent_step to prove the gate fell through to the step engine.
+
+    Subclasses BaseException (not Exception) so execute_step's internal `except Exception`
+    handlers can't swallow it; it must propagate straight out to the test.
+    """
+
+
+async def _run_execute_step_gate(
+    *,
+    engine: agent_module.RunEngine,
+    task_block: BaseTaskBlock | None,
+    experimentation_provider: BaseExperimentationProvider | None = None,
+    **task_overrides: Any,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Drive ForgeAgent.execute_step through the v3 dispatch gate.
+
+    Returns (mocked _execute_task_v3, mocked agent_step). agent_step is a terminal probe that
+    raises a sentinel on call, so a fallthrough is detected without simulating its full body.
+    """
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization, data_extraction_goal=None, extracted_information_schema=None, **task_overrides)
+    step = make_step(now, task, step_id="step-gate", status=StepStatus.created, order=0, output=None)
+    browser_state, _, _ = make_browser_state()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    v3_mock = AsyncMock(return_value=(step, task))
+    step_engine_mock = AsyncMock(side_effect=_StepEngineDispatched)
+    agent._execute_task_v3 = v3_mock  # type: ignore[method-assign]
+    agent.agent_step = step_engine_mock  # type: ignore[method-assign]
+    agent.initialize_execution_state = AsyncMock(return_value=(step, browser_state, None))  # type: ignore[method-assign]
+
+    context = SkyvernContext(task_id=task.task_id, step_id=step.step_id, organization_id=task.organization_id)
+    skyvern_context.set(context)
+    try:
+        with (
+            patch("skyvern.forge.agent.app") as mock_app,
+            patch("skyvern.forge.sdk.experimentation.workflow_block_engine.app") as mock_wbe_app,
+        ):
+            mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
+            mock_app.DATABASE.tasks.update_task = AsyncMock()
+            mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+            mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+            if experimentation_provider is not None:
+                mock_app.EXPERIMENTATION_PROVIDER = experimentation_provider
+                mock_wbe_app.EXPERIMENTATION_PROVIDER = experimentation_provider
+            else:
+                mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+                mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+            mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+            try:
+                await agent.execute_step(
+                    organization=organization,
+                    task=task,
+                    step=step,
+                    engine=engine,
+                    task_block=task_block,
+                    download_baseline_files=[],
+                )
+            except _StepEngineDispatched:
+                pass
+    finally:
+        skyvern_context.reset()
+    return v3_mock, step_engine_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_cls,overrides", _ALLOWED_BLOCK_CASES, ids=_ALLOWED_BLOCK_IDS)
+async def test_execute_step_dispatches_supported_block_types_to_v3(
+    block_cls: type[BaseTaskBlock], overrides: dict[str, Any]
+) -> None:
+    block = _make_block(block_cls, **overrides)
+    v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=block)
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["task_block"] is block
+    step_engine_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"complete_on_download": True},
+        {"download_suffix": "invoice"},
+        {"download_timeout": 5.0},
+    ],
+    ids=["complete_on_download", "download_suffix", "download_timeout"],
+)
+async def test_execute_step_falls_through_to_step_engine_on_download_semantics(overrides: dict[str, Any]) -> None:
+    block = _make_block(ActionBlock, **overrides)
+    v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=block)
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_step_falls_through_to_step_engine_on_unsupported_block_type() -> None:
+    block = _make_block(HumanInteractionBlock)
+    v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=block)
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_step_v1_engine_block_unaffected() -> None:
+    # A v1-engine run always falls to the step engine, regardless of whether the block type
+    # would otherwise be v3-eligible.
+    block = _make_block(TaskBlock)
+    v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v1, task_block=block)
+    v3_mock.assert_not_awaited()
+    step_engine_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_step_bare_task_dispatch_unchanged() -> None:
+    v3_mock, step_engine_mock = await _run_execute_step_gate(engine=agent_module.RunEngine.skyvern_v3, task_block=None)
+    v3_mock.assert_awaited_once()
+    assert v3_mock.await_args.kwargs["task_block"] is None
+    step_engine_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# P3: block-true budgets, task_type-aware goal framing, workflow-cancel detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_action_block_step_cap_not_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An action block's budget is its contract — one action round — not a step-engine-sized number
+    # to translate, so the floor leaves it alone. (A round is not a single tool call: the cap bounds
+    # rounds, and one round can dispatch a batch.)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(ActionBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.action,
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_action_block_not_floored_when_task_type_left_at_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task_type is a defaulted field, so a block that reaches execution without it set would look
+    # general. The block class settles it: an action block keeps its budget either way, because
+    # over-flooring multiplies what one block may spend and under-flooring only costs rounds.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(ActionBlock)
+    assert block.task_type == TaskType.general
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_validation_block_step_cap_not_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same for a validation block's deliberate 1-attempt-plus-retry budget.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ValidationBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
+        max_steps_per_run=2,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_null_task_type_still_floors_a_general_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task_type is nullable on the task row, and `None != TaskType.general` is true — so a naive
+    # comparison would read NULL as "owns its budget" and skip the floor for every block class.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=None,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_non_general_task_type_alone_skips_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The task_type signal stands on its own, so a block class that isn't Action/Validation but
+    # declares an atomic task_type keeps its budget. Nothing produces this pairing today; it is
+    # here so the semantic signal keeps working if a future block type adopts one.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.action,
+        max_steps_per_run=3,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_general_block_step_cap_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The regression this floor exists for: a navigation block carrying a step-engine-sized cap ran
+    # out of action rounds mid-form. A general-purpose block now gets the same translation a bare
+    # task gets, because the same unit mismatch applies to it.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+def test_min_action_steps_is_pinned() -> None:
+    # The constant is this change's headline risk, and every other assertion here is written against
+    # the symbol — so without this line it could be retuned to anything and the suite would stay green.
+    # Moving it is fine; moving it without a deliberate edit here is not.
+    assert MIN_ACTION_STEPS == 24
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_cls", "block_kwargs"),
+    [
+        (TaskBlock, {}),
+        (NavigationBlock, {"navigation_goal": "Apply to the job"}),
+        (LoginBlock, {}),
+        (ExtractionBlock, {"data_extraction_goal": "Grab the confirmation number"}),
+    ],
+)
+async def test_execute_task_v3_every_general_block_type_is_floored(
+    monkeypatch: pytest.MonkeyPatch, block_cls: type[BaseTaskBlock], block_kwargs: dict[str, Any]
+) -> None:
+    # All four carry a general-purpose budget sized in step-engine steps, so all four get translated.
+    # Extraction is included deliberately: it reads rather than acts, but it holds the full browser
+    # tool set, so its cap can bind like any other.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(block_cls, **block_kwargs)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_general_block_generous_cap_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The floor only ever raises: a block budgeted above it keeps exactly what its author wrote.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=40,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 40
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_run_ceiling_still_beats_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The org's workflow-run-wide ceiling is a cost control, not a step-engine artifact, so it is
+    # applied after the floor and wins. The remaining budget is chosen to sit strictly between the
+    # authored cap and the floor: 10 can only be the answer if the floor ran first and the ceiling
+    # then cut it back. Clamping before flooring would return the floor instead.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(41, 50)))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_ceiling",
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert 7 < 10 < MIN_ACTION_STEPS
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 10
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_step_cap_still_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, max_steps_per_run=2, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_validation_block_goal_has_assessment_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ValidationBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
+        complete_criterion="the confirmation banner is shown",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "assessment task" in goal
+    assert "do not modify page state" in goal
+    assert "no further page perception" not in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_validation_without_page_information_adds_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ValidationBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
+        validation_without_page_information=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "page-free assessment" in goal
+    assert "Do not call observe or get_html" in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_action_block_goal_has_single_action_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.action,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "single, focused action" in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_general_block_task_goal_has_no_framing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # task_type=general (the default) gets no task-type framing, even for a block task.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "assessment task" not in goal
+    assert "single, focused action" not in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_true_when_workflow_run_canceled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A workflow task must also stop when its parent run is canceled, not just the task row
+    # itself (mirrors the legacy step-engine check).
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.running)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.canceled)),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_cancel_test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    should_cancel = loop_mock.await_args.kwargs["should_cancel"]
+    assert await should_cancel() is True
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_fails_open_on_workflow_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transient DB error on the parent-run poll must not raise out of the loop (which the
+    # execute_step catch-all would convert into a failed task) — it means "don't cancel yet".
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.running)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(side_effect=ConnectionError("db blip")),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        workflow_run_id="wr_cancel_test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    should_cancel = loop_mock.await_args.kwargs["should_cancel"]
+    assert await should_cancel() is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_skips_workflow_read_for_bare_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No workflow_run_id -> the extra workflow-run read never happens, even if it would say
+    # canceled -- the extra read is only paid for workflow tasks.
+    workflow_run_mock = AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.canceled))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run", workflow_run_mock)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.running)),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, workflow_run_id=None, data_extraction_goal=None, extracted_information_schema=None
+    )
+    should_cancel = loop_mock.await_args.kwargs["should_cancel"]
+    assert await should_cancel() is False
+    workflow_run_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# P4: the page provider (live re-resolution for workflow blocks, once for bare tasks)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_provider_resolves_page_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A bare task must preserve today's exact semantics: must_get_working_page grabs the page once
+    # up front, and every later provider call returns that same object, not a re-resolved one.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        provider_probe_calls=3,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.resolved_pages == [loop_mock.resolved_pages[0]] * 3
+    loop_mock.browser_state.must_get_working_page.assert_awaited_once()
+    # The completion gate reads the page once on a completed outcome; the PROVIDER itself never
+    # consults get_working_page for a bare task.
+    assert loop_mock.browser_state.get_working_page.await_count <= 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_provider_resolves_live_working_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A workflow block's provider must re-acquire the working page on every call through the
+    # recovering accessor (must_get_working_page), so a popup/new tab is followed and a crashed
+    # page gets a reopen attempt, matching the step engine's per-action re-acquisition.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    probe, page_a, page_b, page_c = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    block = _make_block(ActionBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        provider_probe_calls=3,
+        must_get_working_page_side_effect=[probe, page_a, page_b, page_c],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.resolved_pages == [page_a, page_b, page_c]
+    # 1 fail-fast start probe + 3 per-call resolutions, all through the recovering accessor.
+    assert loop_mock.browser_state.must_get_working_page.await_count == 4
+    # One get_working_page read comes from the completion gate, none from the provider.
+    assert loop_mock.browser_state.get_working_page.await_count <= 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_block_fails_fast_when_page_gone_at_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the page is already lost at block start, the task must fail before any LLM turn is spent
+    # (parity with the pre-provider must_get_working_page raise), not grind to budget exhaustion.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock)
+    with pytest.raises(MissingBrowserStatePage):
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            task_block=block,
+            must_get_working_page_side_effect=MissingBrowserStatePage(),
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# P5: block-scoped credential TOTP disambiguation -- a block with exactly one
+# login-credential parameter pins active_credential_parameter_key for the loop's
+# duration (mirrors v1's handler.py get_actual_value_of_parameter_if_secret).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_single_credential_sets_active_key_during_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock, parameters=[_make_credential_parameter("cred_1")])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "cred_1"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_two_credential_params_leaves_active_key_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(
+        ActionBlock,
+        parameters=[_make_credential_parameter("cred_1"), _make_credential_parameter("cred_2")],
+    )
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "pre_existing_key"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_zero_credential_params_leaves_active_key_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        initial_active_credential_parameter_key="pre_existing_key",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.active_credential_parameter_key_during_loop == "pre_existing_key"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_active_credential_key_restored_when_loop_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock, parameters=[_make_credential_parameter("cred_1")])
+    with pytest.raises(RuntimeError, match="loop boom"):
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            task_block=block,
+            initial_active_credential_parameter_key="pre_existing_key",
+            loop_raises=RuntimeError("loop boom"),
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+    from skyvern.forge.taskv3 import engine as engine_module
+
+    loop_mock = engine_module.run_task_v3_agent_loop
+    assert loop_mock.active_credential_parameter_key_during_loop == "cred_1"
+    assert loop_mock.context.active_credential_parameter_key == "pre_existing_key"
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_threads_secret_resolver_for_block_tasks_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Block tasks get fill-time placeholder resolution via the step engine's own helper; bare
+    # tasks keep typing the literal text (no workflow context to resolve against).
+    resolver_mock = MagicMock(return_value="real-value")
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+        resolver_mock,
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ActionBlock)
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    resolve_typed_text = loop_mock.await_args.kwargs["resolve_typed_text"]
+    assert resolve_typed_text is not None
+    assert resolve_typed_text("placeholder_x") == "real-value"
+    resolver_mock.assert_called_once_with(task, "placeholder_x")
+
+    _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert bare_loop_mock.await_args.kwargs["resolve_typed_text"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_block_tasks_get_verify_first_preamble(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Blocks resume mid-workflow: the goal must instruct verifying the criterion against full page
+    # text before acting, and forbid leaving the flow. Bare tasks get none of that.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Open the summary page")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "ALREADY" in goal and "never sign out" in goal
+
+    _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert "never sign out" not in bare_loop_mock.await_args.kwargs["goal"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_should_cancel_detects_timed_out_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The stuck-run reaper sets timed_out (not canceled) on both the run and its child tasks;
+    # the poll must stop the loop for either status on either axis.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.timed_out)),
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, workflow_run_id="wr_reaped", data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert await loop_mock.await_args.kwargs["should_cancel"]() is True
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=SimpleNamespace(status=TaskStatus.running)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.timed_out)),
+    )
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, workflow_run_id="wr_reaped", data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert await loop_mock.await_args.kwargs["should_cancel"]() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flavor", ["timed_out", "canceled"])
+async def test_execute_task_v3_keeps_externally_finalized_terminal_status(
+    monkeypatch: pytest.MonkeyPatch, flavor: str
+) -> None:
+    # An external finalizer (reaper -> timed_out, cancel API -> canceled) can win the race while
+    # the loop is stopping; the v3 finalization must keep that status instead of raising into the
+    # failure path. Webhook asymmetry matches v1: the cancel API already webhooks synchronously
+    # (suppress the duplicate), the reaper path does not (send).
+    from skyvern.exceptions import TaskAlreadyCanceled, TaskAlreadyTimeout
+
+    if flavor == "timed_out":
+        side_effect: BaseException = TaskAlreadyTimeout("tsk_reaped")
+        final_row = SimpleNamespace(status=TaskStatus.timed_out)
+        expect_webhook = True
+    else:
+        side_effect = TaskAlreadyCanceled("canceled", "tsk_reaped")
+        final_row = SimpleNamespace(status=TaskStatus.canceled)
+        expect_webhook = False
+    outcome = LoopOutcome(status="canceled", reason="run canceled", billable_actions=[])
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.get_task",
+        AsyncMock(return_value=final_row),
+    )
+    step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        update_task_side_effect=side_effect,
+        workflow_run_id="wr_reaped",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task is final_row
+    assert loop_mock.clean_up_kwargs["need_call_webhook"] is expect_webhook
+
+
 def test_redact_extracted_information_disambiguates_colliding_secret_keys() -> None:
     result = agent_module._redact_extracted_information(
         {"482913": "codeA", "735264": "codeB", "other": "safe"},
@@ -721,3 +1613,372 @@ def test_redact_extracted_information_disambiguates_colliding_secret_keys() -> N
         "[REDACTED_SECRET]#2": "codeB",
         "other": "safe",
     }
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_completion_gate_veto_fails_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The deployment completion gate (e.g. a submit block requiring a deterministic confirmation)
+    # must be able to veto a v3 finish(completed); the veto fails safe instead of falsely completing.
+    outcome = LoopOutcome(status="completed", reason="looks done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Submit the application")
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        completion_gate_vetoes=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.failed
+    loop_mock.completion_gate.assert_awaited_once()
+
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.completed
+    kwargs = loop_mock.completion_gate.await_args.kwargs
+    assert kwargs["task_block"] is block
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_threads_workflow_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A workflow-level system prompt carries customer behavioral/compliance instructions; the
+    # step engine passes it on every LLM call, so v3 must surface it in its system guidance.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Open the page")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_system_prompt="Always use formal salutations.",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "Always use formal salutations." in loop_mock.await_args.kwargs["extra_system_guidance"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_page_free_validation_prompt_has_no_perception_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # without_page_information validations judge only durable inputs; the goal must not
+    # simultaneously instruct reading the page (the contradiction codex flagged).
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    block = _make_block(ValidationBlock, complete_criterion="The data is consistent")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "page-free assessment" in goal
+    # No perception INSTRUCTIONS: neither the verify-first preamble nor the grounding clause
+    # (the page-free text itself may name the tools only to forbid them).
+    assert "First read" not in goal
+    assert "read the full page text (get_html) before concluding" not in goal
+    assert "Do not call observe or get_html" in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each action row carries its ROUND index in step_order, so the workflow-run step budget
+    # counts v3 rounds exactly (distinct (task, order) pairs across steps and actions).
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type", "type", "click"])
+    rounds = [
+        [("type", {"selector": "#a"}, True), ("type", {"selector": "#b"}, True)],
+        [("click", {"selector": "#go"}, True)],
+    ]
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
+    )
+    create_action = agent_module.app.DATABASE.workflow_params.create_action
+    stamped = [(c.kwargs["action"].step_order, c.kwargs["action"].action_order) for c in create_action.await_args_list]
+    assert stamped == [(0, 0), (0, 1), (1, 2)]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_run_step_budget_caps_and_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The org-wide workflow-run step ceiling binds v3 blocks: remaining budget caps the action
+    # rounds, and an exhausted budget fails the block before any LLM turn is spent.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Go", max_steps_per_run=10)
+    monkeypatch.setattr(
+        ForgeAgent,
+        "_check_workflow_run_step_budget",
+        AsyncMock(return_value=(47, 50)),
+    )
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_budget",
+        max_steps_per_run=10,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    # 47 counted includes this block's own fresh placeholder step; credited back -> 50-46=4.
+    # 47 counted includes this block's own fresh placeholder step; credited back -> 50-46=4.
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 4
+
+    monkeypatch.setattr(
+        ForgeAgent,
+        "_check_workflow_run_step_budget",
+        AsyncMock(return_value=(51, 50)),
+    )
+    step, task, exhausted_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_budget",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    exhausted_loop_mock.assert_not_awaited()
+    assert task.status == TaskStatus.failed
+    assert "maximum steps" in (task.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_detects_user_defined_errors_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # error_code_mapping workflows consume configured codes on failure; v3 must run the same
+    # detection the step engine does before finalizing failed/terminated outcomes.
+    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "payment_failed"}, error_code="payment_failed")]
+    detect_mock = AsyncMock(return_value=detected)
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="blocked by portal", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping={"payment_failed": "declined"})
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        error_code_mapping={"payment_failed": "declined"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_awaited_once()
+    assert errors_update.await_args.kwargs["errors"] == [{"error_code": "payment_failed"}]
+
+    detect_mock.reset_mock()
+    completed = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    await _run_execute_task_v3(
+        monkeypatch,
+        completed,
+        task_block=block,
+        error_code_mapping={"payment_failed": "declined"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    detect_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_router_selected_data_only_validation_goes_page_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The validation evidence router can select data-only mode even when the block does not set
+    # without_page_information; v3 must honor it like v1 does (and stay page-aware on router error).
+    router_result = SimpleNamespace(effective_without_page_information=True)
+    monkeypatch.setattr("skyvern.forge.agent.resolve_validation_evidence_route", AsyncMock(return_value=router_result))
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    block = _make_block(ValidationBlock, complete_criterion="The totals match")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert "page-free assessment" in loop_mock.await_args.kwargs["goal"]
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.resolve_validation_evidence_route", AsyncMock(side_effect=RuntimeError("router down"))
+    )
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    goal = loop_mock.await_args.kwargs["goal"]
+    assert "page-free assessment" not in goal
+    assert "read the full page text (get_html) before concluding" in goal
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_pins_credential_before_building_auth_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tool-offer gate consults credential candidates; built before the pin, a multi-credential
+    # context looks ambiguous and get_verification_code is never offered. The pin must be active
+    # when build_auth_tools runs.
+    seen_keys: list[str | None] = []
+
+    def capturing_build(task: Any) -> tuple[list[Any], str]:
+        ctx = skyvern_context.current()
+        seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
+        return [], ""
+
+    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
+    monkeypatch.setattr("skyvern.forge.agent.build_auth_tools", capturing_build, raising=False)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(LoginBlock, parameters=[_make_credential_parameter("MyCreds")])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert seen_keys == ["MyCreds"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_failed_round_persists_failed_action_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A dispatched round that errored still consumed budget: its row persists with status=failed
+    # and its round index, so later blocks count it against the workflow-run ceiling.
+    outcome = LoopOutcome(status="budget_exhausted", reason="cap", billable_actions=[])
+    rounds = [[("click", {"selector": "#x"}, False)]]
+    await _run_execute_task_v3(
+        monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
+    )
+    create_action = agent_module.app.DATABASE.workflow_params.create_action
+    action = create_action.await_args.kwargs["action"]
+    assert action.status == ActionStatus.failed
+    assert action.step_order == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_page_free_validation_threads_page_free_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    block = _make_block(ValidationBlock, complete_criterion="The data is consistent")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["page_free"] is True
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["page_free"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_recordable_round_persists_without_budget_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # navigate/scroll/wait persist as action rows with screenshots (artifact parity) but never
+    # consume a workflow-run budget unit: their rows keep the current round index.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    rounds = [
+        [("navigate", {"url": "https://a.test"}, True)],
+        [("click", {"selector": "#go"}, True)],
+        [("scroll", {"amount": 500}, True)],
+    ]
+    await _run_execute_task_v3(
+        monkeypatch, outcome, action_rounds=rounds, data_extraction_goal=None, extracted_information_schema=None
+    )
+    create_action = agent_module.app.DATABASE.workflow_params.create_action
+    stamped = [(c.kwargs["action"].action_type, c.kwargs["action"].step_order) for c in create_action.await_args_list]
+    assert stamped == [
+        (ActionType.GOTO_URL, 0),
+        (ActionType.CLICK, 0),
+        (ActionType.SCROLL, 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_failed_run_carries_failure_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # fail_task records a code-level failure classification; v3's direct finalization must too.
+    outcome = LoopOutcome(status="budget_exhausted", reason="Reached the maximum steps (2)", billable_actions=[])
+    _step, task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert task.status == TaskStatus.failed
+    update_kwargs = loop_mock.update_task_kwargs
+    assert update_kwargs.get("failure_category")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Open the panel")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, task_block=block, data_extraction_goal=None, extracted_information_schema=None
+    )
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    assert fingerprint is not None
+
+    _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_page_fingerprint_peeks_without_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sampler peeks with the NON-recovering accessor: a lost page yields None (accept the
+    # verdict) rather than triggering recovery navigation at finish time. A sampling error
+    # propagates — the finish gate fails closed on it instead of reading it as settled.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(NavigationBlock, navigation_goal="Open the panel")
+
+    page = MagicMock()
+    page.evaluate = AsyncMock(side_effect=["hash-a:100:10", "hash-b:100:10"])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        get_working_page_side_effect=[page, page, page, page],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    assert await fingerprint() == "hash-a:100:10"
+    assert await fingerprint() == "hash-b:100:10"
+    loop_mock.browser_state.get_working_page.assert_awaited()
+
+    page.evaluate = AsyncMock(side_effect=RuntimeError("execution context was destroyed"))
+    loop_mock.browser_state.get_working_page = AsyncMock(return_value=page)
+    with pytest.raises(RuntimeError):
+        await fingerprint()
+
+    lost_page_peek = AsyncMock(return_value=None)
+    loop_mock.browser_state.get_working_page = lost_page_peek
+    assert await fingerprint() is None
+    lost_page_peek.assert_awaited_once()

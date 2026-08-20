@@ -39,6 +39,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_author_time_reject,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    advisory_code_block_diagnostics,
+    scanner_advisory_diagnostics,
+)
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
@@ -715,13 +719,7 @@ def _withheld_labels_within(labels: list[str], budget: int) -> list[str]:
     return exhausted if len(json.dumps(exhausted)) <= budget else []
 
 
-def _accepted_code_delta(
-    prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str
-) -> tuple[dict[str, str], list[str]]:
-    """Code blocks the accepted submission changed, as stored after server-side rewrites, paired
-    with the labels that did not fit the budget so an omission is named rather than silent. A block
-    the server did not rewrite is returned too, because the anchor has to survive context
-    compaction and a payload that carried only rewrites would make its own absence ambiguous."""
+def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str) -> dict[str, str]:
     prior = _workflow_yaml_code_blocks_by_label(prior_yaml)
     submitted = _workflow_yaml_code_blocks_by_label(submitted_yaml)
     accepted = _workflow_yaml_code_blocks_by_label(accepted_yaml)
@@ -737,6 +735,40 @@ def _accepted_code_delta(
         if unchanged_since_prior and matches_submission:
             continue
         changed[label] = code
+    return changed
+
+
+def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[str, list[str]]:
+    """Labels per advisory message, computed from every changed block rather than the
+    budget-truncated ``stored_code`` so an oversized block still gets its note."""
+    labels_by_message: dict[str, list[str]] = {}
+    for label, code in sorted(changed_code_blocks.items()):
+        for diagnostic in advisory_code_block_diagnostics(code):
+            labels = labels_by_message.setdefault(diagnostic.message, [])
+            if label not in labels:
+                labels.append(label)
+    return labels_by_message
+
+
+async def _scanner_advisory_labels_by_message(
+    changed_code_blocks: Mapping[str, str], organization_id: str | None
+) -> dict[str, list[str]]:
+    """Labels per scanner-advisory message; each scan is bounded and fail-open inside
+    ``scanner_advisory_diagnostics``, so this never delays or fails the update."""
+    labels_by_message: dict[str, list[str]] = {}
+    for label, code in sorted(changed_code_blocks.items()):
+        for diagnostic in await scanner_advisory_diagnostics(code, organization_id=organization_id):
+            labels = labels_by_message.setdefault(diagnostic.message, [])
+            if label not in labels:
+                labels.append(label)
+    return labels_by_message
+
+
+def _accepted_code_delta(changed: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Code blocks the accepted submission changed, as stored after server-side rewrites, paired
+    with the labels that did not fit the budget so an omission is named rather than silent. A block
+    the server did not rewrite is returned too, because the anchor has to survive context
+    compaction and a payload that carried only rewrites would make its own absence ambiguous."""
     if not changed:
         return {}, []
 
@@ -3751,6 +3783,8 @@ def _author_time_findings(
     *,
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
+    code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
     test-run would not surface it; anything a run reveals belongs in the run, not here."""
@@ -3772,6 +3806,30 @@ def _author_time_findings(
             {
                 "reason_code": "code_artifact_metadata_incomplete",
                 "summary": "\n".join(str(violation) for violation in metadata_violations),
+            }
+        )
+    # A contentless readiness wait is intermittent by construction: it passes on every run where the
+    # page happens to settle, so a green test-run cannot tell the author the wait encodes nothing.
+    if code_block_diagnostics:
+        findings.append(
+            {
+                "reason_code": "code_block_readiness_wait_advisory",
+                "summary": "\n".join(
+                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
+                    for message, labels in code_block_diagnostics.items()
+                ),
+            }
+        )
+    # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
+    # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
+    if scanner_diagnostics:
+        findings.append(
+            {
+                "reason_code": "code_block_scanner_advisory",
+                "summary": "\n".join(
+                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
+                    for message, labels in scanner_diagnostics.items()
+                ),
             }
         )
     return findings
@@ -4132,9 +4190,8 @@ async def _update_workflow(
             "message": "Workflow updated successfully.",
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
-        stored_code, stored_code_withheld = _accepted_code_delta(
-            prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
-        )
+        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
         if stored_code:
             data["stored_code"] = stored_code
         if stored_code_withheld:
@@ -4145,9 +4202,23 @@ async def _update_workflow(
                 returned_chars={label: len(code) for label, code in stored_code.items()},
                 withheld_labels=stored_code_withheld,
             )
+        # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
+        # crafted block code must never turn a successful update into a failed turn.
+        try:
+            advisory_labels = _advisory_labels_by_message(changed_code_blocks)
+        except Exception as advisory_err:
+            LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
+            advisory_labels = {}
+        try:
+            scanner_labels = await _scanner_advisory_labels_by_message(changed_code_blocks, ctx.organization_id)
+        except Exception as scanner_err:
+            LOG.warning("copilot_scanner_advisory_diagnostics_failed", error=str(scanner_err))
+            scanner_labels = {}
         findings = _author_time_findings(
             schema_incompatibility=schema_incompatibility_finding,
             metadata_violations=normalization.violations,
+            code_block_diagnostics=advisory_labels,
+            scanner_diagnostics=scanner_labels,
         )
         if findings:
             data["findings"] = findings

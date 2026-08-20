@@ -3212,7 +3212,7 @@ class RawSkyvern:
             Optional URL to open when the standalone browser session starts.
 
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -8817,7 +8817,7 @@ class AsyncRawSkyvern:
             Optional URL to open when the standalone browser session starts.
 
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 

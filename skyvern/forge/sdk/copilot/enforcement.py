@@ -561,6 +561,26 @@ def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteratio
         _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
 
 
+def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
+    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+
+    Synchronous and never raising, so the caller's ``raise`` re-raises the original
+    cancellation neither masked nor delayed.
+    """
+    try:
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+        ctx.copilot_turn_cancelled_iteration = iteration
+        LOG.warning(
+            "copilot_turn_cancelled",
+            elapsed_seconds=round(elapsed, 3),
+            iteration=iteration,
+            deadline_exceeded=ctx.copilot_total_timeout_exceeded is True,
+        )
+    except Exception:
+        LOG.exception("Failed to record a copilot turn cancellation", iteration=iteration)
+
+
 class CopilotNonRetriableNavError(Exception):
     """Raised from run_with_enforcement when the copilot's most recent run
     hit a permanent navigation error (DNS / cert / SSL / invalid URL) and
@@ -661,23 +681,26 @@ def _same_page(left: str | None, right: str | None) -> bool:
     return left_path == right_path
 
 
-def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
-    """Drain pending_screenshots into a synthetic user message with images.
+def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
+    """Build the synthetic user message for the staged frame without draining it.
 
     Tool results stay text-only because OpenAI rejects images in tool
     messages, so screenshots are delivered as a follow-up user message.
     """
+    # Re-checked here rather than only at enqueue: a retriable failure can swap in a
+    # non-vision fallback model after the frame was staged, so every delivery path needs it.
+    if not getattr(ctx, "supports_vision", False):
+        return None
     pending = getattr(ctx, "pending_screenshots", None)
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
-    pending.clear()
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
             "text": (
-                SCREENSHOT_SENTINEL + "Here is the screenshot from the tool result. "
-                "Analyze it to understand the current browser state."
+                SCREENSHOT_SENTINEL + "Here is the most recent screenshot captured this turn. "
+                "It shows the page as of that capture and may predate later actions."
             ),
         },
     ]
@@ -690,6 +713,15 @@ def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
             }
         )
     return {"role": "user", "content": content}
+
+
+def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
+    """Build the screenshot message and clear the queue — the end-of-turn drain."""
+    message = pending_screenshot_message(ctx)
+    pending = getattr(ctx, "pending_screenshots", None)
+    if isinstance(pending, list):
+        pending.clear()
+    return message
 
 
 def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
@@ -996,6 +1028,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     if not items:
         return items
 
+    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
     tail: list[Any] = []
     for item in reversed(items[1:]):
         if is_screenshot_message(item):
@@ -1028,7 +1061,12 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         retained_tail=[_item_field(item, "type") for item in retained_tail],
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    return [opening, *retained_tail]
+    retained_items = [opening, *retained_tail]
+    screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
+    signal_content = _item_field(screenshot_dropped_signal[0], "content")
+    if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):
+        screenshot_dropped_signal = []
+    return [*retained_items, *screenshot_dropped_signal]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
@@ -1762,7 +1800,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -1784,9 +1822,12 @@ async def run_with_enforcement(
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
-                if images_stripped:
+                # Unconditional: the staged frame never reaches current_input, so images_stripped
+                # cannot see it, and the filter would re-append it to the retry we just shrank.
+                frame_dropped = _consume_pending_screenshots(ctx) is not None
+                if images_stripped or frame_dropped:
                     # The agent could otherwise reason about the page from
                     # memory on the next turn; warn it explicitly.
                     pending_recovery_nudge = _nudge(copilot_config, "screenshot_dropped")
@@ -1803,7 +1844,7 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a

@@ -1,6 +1,8 @@
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
+import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { shouldPollForGeneratedCode } from "@/routes/workflows/utils";
 
 type Params = {
   cacheKey: string;
@@ -24,6 +26,7 @@ export function useIsGeneratingCode({
     workflowPermanentId,
     status: "published",
   });
+  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
 
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
   const publishedLabelCount = Object.keys(
@@ -32,5 +35,8 @@ export function useIsGeneratingCode({
   const hasPublishedScript =
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
-  return !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+  return (
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript)
+  );
 }

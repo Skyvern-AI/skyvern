@@ -14,6 +14,9 @@ from typing import NoReturn
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -22,7 +25,14 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
-from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompletionCriterion, _update_workflow
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    CodeArtifactCompletionCriterion,
+    _accepted_code_delta,
+    _advisory_labels_by_message,
+    _author_time_findings,
+    _changed_code_blocks,
+    _update_workflow,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
 
@@ -102,6 +112,7 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     ctx = _ctx()
     submitted = _code_yaml(
         """
+        await page.locator("body").wait_for(state="visible", timeout=45000)
         await page.get_by_role("button", name="Search", exact=True).click()
         result = (await page.get_by_role("status").inner_text()).strip()
         return {"output": {"result": result}}
@@ -118,6 +129,9 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     assert persisted == [submitted]
     assert ctx.workflow_yaml == submitted
     assert _single_code(ctx.workflow_yaml) == _single_code(submitted)
+    assert result["data"]["stored_code"]["submit_search"] == _single_code(submitted)
+    assert 'page.locator("body").wait_for(state="visible", timeout=45000)' in _single_code(ctx.workflow_yaml)
+    assert [finding["reason_code"] for finding in result["data"]["findings"]] == ["code_block_readiness_wait_advisory"]
     assert "imposed_substitutions" not in result["data"]
 
 
@@ -591,3 +605,108 @@ def test_no_output_contract_actuation_meta_plane_exports_remain() -> None:
     assert "consume_output_contract_advisory_grant_for_run" not in names
     assert "consume_output_contract_advisory_grant_for_run_result" not in names
     assert "record_output_contract_run_output_evidence" not in names
+
+
+class TestBodyReadinessAdvisoryDelivery:
+    _BODY_WAIT = 'body = page.locator("body")\nawait body.wait_for(state="visible", timeout=30000)\n'
+
+    def _oversized_block(self) -> str:
+        padding = "\n".join(f'value_{index} = "{index}"' for index in range(6000))
+        return f'{self._BODY_WAIT}{padding}\nreturn {{"ok": True}}\n'
+
+    def _findings(self, prior: str | None, accepted: str) -> list[dict[str, object]]:
+        return _author_time_findings(
+            schema_incompatibility=None,
+            metadata_violations=[],
+            code_block_diagnostics=_advisory_labels_by_message(_changed_code_blocks(prior, accepted, accepted)),
+        )
+
+    def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
+        accepted = _code_yaml(self._oversized_block(), label="read_summary")
+
+        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted))
+        findings = self._findings(None, accepted)
+
+        assert stored_code == {}
+        assert withheld
+        assert [finding["reason_code"] for finding in findings] == ["code_block_readiness_wait_advisory"]
+        assert "`read_summary`" in str(findings[0]["summary"])
+
+    def test_unchanged_block_carries_no_advisory(self) -> None:
+        prior = _code_yaml(self._BODY_WAIT, label="read_summary")
+
+        assert self._findings(prior, prior) == []
+
+
+@pytest.mark.asyncio
+async def test_scanner_advisory_findings_never_block_a_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    finding = CodeBlockScanFinding(rule_id="exfiltrate-sensitive-data", line=1, message="Sends data off-page.")
+
+    async def _scan(
+        code: str, *, organization_id: str | None = None, timeout_seconds: float = 3.0
+    ) -> list[CodeBlockScanFinding]:
+        return [finding]
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", _scan)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    scanner_findings = [f for f in result["data"]["findings"] if f["reason_code"] == "code_block_scanner_advisory"]
+    assert len(scanner_findings) == 1
+    assert "`submit_search`" in scanner_findings[0]["summary"]
+    assert (
+        "Flagged by scanner rule `exfiltrate-sensitive-data` at line 1. Sends data off-page."
+        in scanner_findings[0]["summary"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_scanner_failure_never_blocks_a_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+
+    async def _scan(code: str, *, organization_id: str | None = None, timeout_seconds: float = 3.0) -> NoReturn:
+        raise RuntimeError("scanner unavailable")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", _scan)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))
+
+
+@pytest.mark.asyncio
+async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", AgentFunction().scan_code_block_source)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))

@@ -4,8 +4,9 @@ import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -19,6 +20,37 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
 LOG = structlog.get_logger()
+
+
+def _session_download_scope_filters(
+    browser_session_id: str,
+    organization_id: str,
+    run_started_at: datetime.datetime,
+) -> list[ColumnElement[bool]]:
+    """Session-scoped DOWNLOAD rows written inside the run's window. The lower bound applies to
+    stamped rows too: a canonical download key can name a parent workflow, whose pre-start downloads
+    are not this run's."""
+    return [
+        ArtifactModel.browser_session_id == browser_session_id,
+        ArtifactModel.organization_id == organization_id,
+        ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+        ArtifactModel.created_at >= run_started_at,
+    ]
+
+
+def _session_download_filters(
+    run_id: str,
+    browser_session_id: str,
+    organization_id: str,
+    run_started_at: datetime.datetime,
+) -> list[ColumnElement[bool]]:
+    """In-window rows attributable to ``run_id``: the watcher stamped this run as producer, or the
+    row is still unbound. The unbound arm is the legacy shape, kept for rows written before
+    stamping."""
+    return [
+        *_session_download_scope_filters(browser_session_id, organization_id, run_started_at),
+        or_(ArtifactModel.run_id == run_id, ArtifactModel.run_id.is_(None)),
+    ]
 
 
 class ArtifactsRepository(BaseRepository):
@@ -575,52 +607,58 @@ class ArtifactsRepository(BaseRepository):
         organization_id: str,
         run_started_at: datetime.datetime,
     ) -> int:
-        """Tag session-scoped DOWNLOAD artifacts that landed during this run with ``run_id``.
-
-        Called at run finalization with the run's own window, and mid-run by a
-        code block registering its downloads, which passes its block row's
-        ``created_at`` so a co-tenant run's earlier rows stay unclaimed.
-
-        Returns the number of rows updated. Idempotent: re-running picks up
-        only ``run_id IS NULL`` rows, so a retry after success is a no-op.
-        """
+        """Reconcile in-window session-scoped DOWNLOAD rows the watcher left unbound onto ``run_id``,
+        returning the number updated. Idempotent: an already-stamped row is never re-stamped, so a
+        retry after success is a no-op."""
         async with self.Session() as session:
             result = await session.execute(
                 update(ArtifactModel)
-                .where(ArtifactModel.browser_session_id == browser_session_id)
-                .where(ArtifactModel.organization_id == organization_id)
-                .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                .where(*_session_download_scope_filters(browser_session_id, organization_id, run_started_at))
                 .where(ArtifactModel.run_id.is_(None))
-                .where(ArtifactModel.created_at >= run_started_at)
                 .values(run_id=run_id)
             )
             await session.commit()
             return result.rowcount or 0
 
-    @db_operation("count_unclaimed_session_download_artifacts")
-    async def count_unclaimed_session_download_artifacts(
+    @db_operation("bind_session_download_artifact_producer")
+    async def bind_session_download_artifact_producer(
         self,
-        browser_session_id: str,
+        artifact_id: str,
         organization_id: str,
-        run_started_at: datetime.datetime,
-    ) -> int:
-        """Session-scoped DOWNLOAD artifacts this run produced but finalization has not claimed yet.
-
-        Read-only counterpart of :meth:`claim_session_download_artifacts_for_run`, matched on the
-        same filter so a grader reading before the claim sees this run's files and not a reused
-        session's earlier ones. A code block can claim mid-run when artifact content signing is
-        configured, so on those deployments this counts only what no block has claimed yet."""
+        run_id: str,
+    ) -> bool:
+        """Fill an unbound row's producing run. Never re-stamps: the watcher re-uploads a download as
+        it grows, and a later observation can fall after the session changed hands."""
         async with self.Session() as session:
             result = await session.execute(
-                select(func.count())
-                .select_from(ArtifactModel)
-                .where(ArtifactModel.browser_session_id == browser_session_id)
+                update(ArtifactModel)
+                .where(ArtifactModel.artifact_id == artifact_id)
                 .where(ArtifactModel.organization_id == organization_id)
                 .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
                 .where(ArtifactModel.run_id.is_(None))
-                .where(ArtifactModel.created_at >= run_started_at)
+                .values(run_id=run_id)
             )
-            return int(result.scalar() or 0)
+            await session.commit()
+            return bool(result.rowcount)
+
+    @db_operation("list_session_download_artifact_ids_for_run")
+    async def list_session_download_artifact_ids_for_run(
+        self,
+        run_id: str,
+        browser_session_id: str,
+        organization_id: str,
+        run_started_at: datetime.datetime,
+    ) -> set[str]:
+        """Ids of the session-scoped DOWNLOAD artifacts attributable to this run, both stamped and
+        still-unbound in-window rows, so a grader reading before the claim is not short. Ids rather
+        than a count because a caller combining this with a run-scoped read would double-count."""
+        async with self.Session() as session:
+            result = await session.scalars(
+                select(ArtifactModel.artifact_id).where(
+                    *_session_download_filters(run_id, browser_session_id, organization_id, run_started_at)
+                )
+            )
+            return set(result.all())
 
     @db_operation("delete_artifact_for_browser_session")
     async def delete_artifact_for_browser_session(

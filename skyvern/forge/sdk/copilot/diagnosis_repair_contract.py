@@ -425,6 +425,10 @@ def _failure_type(
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
 ) -> DiagnosisFailureType:
+    # A paused run is waiting on a person, not failing: classifying it as a failure would tell the
+    # model to repair a workflow whose only problem is that nobody has approved it yet.
+    if (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return DiagnosisFailureType.NO_FAILURE
     skip_reason = _safe_str(data.get("skip_reason"))
     if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT

@@ -543,6 +543,7 @@ class LocalStorage(BaseStorage):
         remote_path: str,
         date: str | None = None,
         recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to local storage."""
         target_path = self._build_browser_session_path(

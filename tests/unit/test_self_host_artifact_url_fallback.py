@@ -306,6 +306,7 @@ class TestFlushStepArchiveUnbundled:
             WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
                 artifact_redaction_enabled=MagicMock(return_value=False),
                 secret_redaction_enabled_for_run=MagicMock(return_value=False),
+                runtime_secret_values_for_artifacts=MagicMock(return_value=set()),
             ),
         )
         task = SimpleNamespace(task_id=step.task_id, organization_id=step.organization_id)

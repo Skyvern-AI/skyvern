@@ -5,8 +5,9 @@ the task/prompt ecosystem (no LLM-backed observe/act/extract). That is the whole
 the agent perceives via a raw DOM snapshot and acts by selector, so the only LLM in the
 loop is the agent's own persistent conversation.
 
-`build_browser_tools(page, ...)` returns `ToolSpec`s bound to one Playwright page, ready
-to hand to `run_agent_tool_loop` alongside `make_finish_tool()`.
+`build_browser_tools(page_provider, ...)` returns `ToolSpec`s that resolve their page via
+`page_provider` on every call (not a page bound once), ready to hand to `run_agent_tool_loop`
+alongside `make_finish_tool()`.
 """
 
 from __future__ import annotations
@@ -21,6 +22,12 @@ from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 
 LOG = structlog.get_logger()
+
+# Resolved fresh per tool call rather than a page bound once, so a click that opens a new
+# tab/popup is followed on the next call instead of leaving the loop stuck on a stale page.
+PageProvider = Callable[[], Awaitable[Any]]
+
+PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
 # ARIA combobox signals — used by observe() only to add a hint that a field is a typeahead. This is a
 # nudge for the model, not load-bearing: type() handles typeaheads behaviorally (see _FIND_SUGGESTION_JS),
@@ -204,10 +211,72 @@ _OBSERVE_JS = (
         if (gt && gt.length > label.length && gt !== lastGroup) { rec.group = gt; lastGroup = gt; }
       }
     }
+    const pressed = el.getAttribute('aria-pressed');
+    if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     out.push(rec);
     if (++i > 250) break;
   }
-  return JSON.stringify({ url: location.href, title: document.title, elements: out });
+  // Page-text digest: outcome states (submission confirmations, rejection banners, validation
+  // summaries) live in non-interactive nodes the element list can never carry. Sources are
+  // structural only — ARIA status channels first, then headings — never a body-text dump, so the
+  // digest stays bounded and can't regrow the context that transcript compaction bounds.
+  const texts = [];
+  let textTotal = 0;
+  let textFull = false;
+  const pushText = (t) => {
+    t = (t || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!t) return;
+    // Containment dedupe, richer message wins: an alert's text re-surfaces inside its heading's
+    // parent text, and a terse early entry ("Saved") must not suppress a later superset
+    // ("Saved — confirmation #A1B2") — supersets REPLACE their contained entries.
+    if (texts.some((s) => s.includes(t))) return;
+    const kept = texts.filter((s) => !t.includes(s));
+    const keptTotal = kept.reduce((total, s) => total + s.length, 0);
+    if (keptTotal + t.length > 900) { textFull = true; return; }
+    texts.length = 0; texts.push(...kept, t); textTotal = keptTotal + t.length;
+  };
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // Isolated: a hostile page's throwing accessor (fingerprinting scripts poison innerText and
+  // friends) must degrade to "no digest", never take element perception down with it.
+  try {
+    // ~= matches ARIA fallback role lists like role="alert status"; = would silently skip them.
+    for (const el of document.querySelectorAll('[role~=alert],[role~=status],[aria-live=polite],[aria-live=assertive],output')) {
+      if (textFull) break;
+      if (visible(el)) pushText(el.innerText);
+    }
+    for (const h of document.querySelectorAll('h1,h2,h3')) {
+      if (textFull) break;
+      if (!visible(h)) continue;
+      // A short parent is a banner/panel whose body text carries the message; a large parent would
+      // drag in unrelated content, so the heading stands alone.
+      const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
+      pushText(pt && pt.length <= 300 ? pt : h.innerText);
+    }
+  } catch (e) { texts.length = 0; }
+  // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
+  // perception can never list its contents — record host + signature so the model can see the gate
+  // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
+  // and rejected: presence is the contract here, not cross-frame reach). Same visibility rule as
+  // elements, so hidden tracking pixels stay out. Isolated like the digest above.
+  const iframeInfo = { total: 0, entries: [] };
+  try {
+    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    for (const f of document.querySelectorAll('iframe')) {
+      const r = f.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
+      if (f.hasAttribute('srcdoc')) continue;
+      const src = f.getAttribute('src') || '';
+      let u;
+      try { u = new URL(src, location.href); } catch (e) { continue; }
+      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
+      iframeInfo.total++;
+      if (iframeInfo.entries.length >= 8) continue;
+      const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
+    }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, elements: out });
 }
 """
 )
@@ -224,26 +293,73 @@ def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[
 
 
 def build_browser_tools(
-    page: Any,
+    page_provider: PageProvider,
     *,
     downloads_dir: str | None = None,
     organization_id: str | None = None,
+    resolve_typed_text: Callable[[str], Any] | None = None,
 ) -> list[ToolSpec]:
-    """Raw-browser tools bound to `page` (a Playwright Page)."""
+    """Raw-browser tools that resolve their page from `page_provider` on every call."""
 
-    async def _url() -> str:
+    def _resolve_text(text: str) -> str:
+        # Workflow credential values reach the model only as secret placeholders; resolve them to the
+        # real value at fill time (the same boundary the step engine uses). Fail open to the literal.
+        if resolve_typed_text is None:
+            return text
+        try:
+            resolved = resolve_typed_text(text)
+        except Exception:
+            LOG.warning("taskv3 typed-text resolution failed; typing the literal text", exc_info=True)
+            return text
+        return resolved if isinstance(resolved, str) else text
+
+    # INVARIANT: holds at most one page, written only by the preflight wrapper immediately before
+    # its handler runs and consumed by that handler's single _resolve_page call; the wrapper clears
+    # it in a finally. Relies on the loop dispatching tool calls sequentially — a concurrent
+    # dispatcher or a twice-resolving handler must replace this handoff, not reuse it.
+    _prefetched_page: list[Any] = []
+
+    async def _resolve_page() -> tuple[Any, ToolResult | None]:
+        # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
+        # once, not twice (each resolution is a must_get_working_page with its recovery path).
+        page = _prefetched_page.pop() if _prefetched_page else await page_provider()
+        if page is None:
+            return None, ToolResult.error(PAGE_UNAVAILABLE_ERROR)
+        return page, None
+
+    async def _url(page: Any) -> str:
         try:
             return page.url
         except Exception:
             return ""
 
     async def observe(_args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         # Bound the one perception call so a wedged page can't hang the turn indefinitely.
         raw = await asyncio.wait_for(page.evaluate(_OBSERVE_JS), timeout=30)
         data = json.loads(raw) if isinstance(raw, str) else raw
         elements = data.get("elements", [])
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         lines = [f"url={data.get('url')} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        for t in data.get("text") or []:
+            lines.append(f"text: {t!r}")
+        iframe_info = data.get("iframes") or {}
+        iframe_entries = iframe_info.get("entries") or []
+        if iframe_entries:
+            total = iframe_info.get("total", len(iframe_entries))
+            parts = []
+            for f in iframe_entries:
+                flag = "[captcha] " if f.get("captcha") else ""
+                title = f" {f['title']!r}" if f.get("title") else ""
+                parts.append(f"{flag}{f.get('host', '?')}{title}")
+            overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
+            lines.append(
+                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector): "
+                + "; ".join(parts)
+                + overflow
+            )
         for e in elements:
             extra = ""
             if e.get("value"):
@@ -252,6 +368,8 @@ def build_browser_tools(
                 extra += f" options={e['options']}"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
+            if e.get("pressed") is not None:
+                extra += f" pressed={e['pressed']}"
             if e.get("required"):
                 extra += " *required"
             if e.get("autocomplete"):
@@ -264,22 +382,46 @@ def build_browser_tools(
         return ToolResult.ok("\n".join(lines), data={"count": len(elements)})
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args.get("selector")
         if selector:
             el = await page.query_selector(selector)
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}")
             html = await el.inner_html()
+            if not html:
+                # Void/leaf elements have no inner HTML; their own tag+attributes are the answer,
+                # not an empty string the model can't distinguish from a missing element. Best
+                # effort: a navigation between the two reads must not turn "" into a tool error.
+                try:
+                    html = await el.evaluate("el => el.outerHTML")
+                except Exception:
+                    html = ""
         else:
             html = await page.content()
-        return ToolResult.ok(html[:20000])
+        if len(html) > 20000:
+            return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
+        return ToolResult.ok(html)
 
     async def click(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args["selector"]
         await page.click(selector, timeout=15000)
-        return ToolResult.ok(f"clicked {selector} — now at {await _url()}")
+        return ToolResult.ok(f"clicked {selector} — now at {await _url(page)}")
 
-    async def _commit_typeahead(selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+    async def hover(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = args["selector"]
+        await page.hover(selector, timeout=15000)
+        return ToolResult.ok(f"hovered {selector}")
+
+    async def _commit_typeahead(page: Any, selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
         # Poll for the suggestion list rendered IN REACTION to the value already typed into `selector`,
         # click the best match, and verify the field committed. Site-agnostic (see _FIND_SUGGESTION_JS).
         # Returns (committed_value, suggestion_text): suggestion_text is None when no suggestion ever
@@ -328,7 +470,7 @@ def build_browser_tools(
             committed = ""
         return (committed or None), best_txt
 
-    async def _type_and_commit(selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+    async def _type_and_commit(page: Any, selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM just before typing so the finder treats only NEW/reacting nodes as suggestions —
         # static page text that merely shares a word with the value can't be mistaken for one.
@@ -346,7 +488,7 @@ def build_browser_tools(
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe.
             return None, None
-        return await _commit_typeahead(selector, value, rounds)
+        return await _commit_typeahead(page, selector, value, rounds)
 
     # Input kinds that are never typeaheads — skip the suggestion probe (and its latency) for these.
     # `textarea` is included: free-text boxes never render a typeahead and would just pay the probe tax.
@@ -368,7 +510,7 @@ def build_browser_tools(
         }
     )
 
-    async def _field_type(selector: str) -> str:
+    async def _field_type(page: Any, selector: str) -> str:
         try:
             return (
                 await page.eval_on_selector(
@@ -380,8 +522,11 @@ def build_browser_tools(
             return "text"
 
     async def type_text(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args["selector"]
-        text = args.get("text", "")
+        text = _resolve_text(args.get("text", ""))
         press_enter = args.get("press_enter")
         clear = args.get("clear", True)
         # A typeahead silently rejects raw typed text — it only accepts a picked suggestion — and the
@@ -389,10 +534,10 @@ def build_browser_tools(
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
         # here. Detection is behavioral (no per-site rules), so this holds across ATSes; non-text inputs
         # and append/enter typing skip it and fill normally (fast path, no polling).
-        if text and clear and not press_enter and await _field_type(selector) not in _NON_TYPEAHEAD_TYPES:
+        if text and clear and not press_enter and await _field_type(page, selector) not in _NON_TYPEAHEAD_TYPES:
             # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
             # not just on a single `input` from fill — still surfaces them, then commit the best match.
-            committed, opt_txt = await _type_and_commit(selector, text, rounds=3)
+            committed, opt_txt = await _type_and_commit(page, selector, text, rounds=3)
             if opt_txt and committed:
                 return ToolResult.ok(
                     f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
@@ -415,6 +560,9 @@ def build_browser_tools(
         return ToolResult.ok(f"typed into {selector}")
 
     async def select_option(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args["selector"]
         if args.get("label") is not None:
             await page.select_option(selector, label=args["label"], timeout=15000)
@@ -423,6 +571,9 @@ def build_browser_tools(
         return ToolResult.ok(f"selected on {selector}")
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         key = args["key"]
         selector = args.get("selector")
         if selector:
@@ -432,6 +583,9 @@ def build_browser_tools(
         return ToolResult.ok(f"pressed {key}")
 
     async def scroll(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args.get("selector")
         if selector:
             el = await page.query_selector(selector)
@@ -445,6 +599,9 @@ def build_browser_tools(
         return ToolResult.ok(f"scrolled {amount}px")
 
     async def wait(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args.get("selector")
         if selector:
             state = args.get("state", "visible")
@@ -458,32 +615,44 @@ def build_browser_tools(
     async def navigate(args: dict[str, Any]) -> ToolResult:
         from skyvern.utils.url_validators import validate_fetch_url
 
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         url = await asyncio.to_thread(validate_fetch_url, args["url"])
-        await page.goto(url, timeout=60000, wait_until="load")
-        return ToolResult.ok(f"navigated to {await _url()}")
+        response = await page.goto(url, timeout=60000, wait_until="load")
+        # Surface the HTTP status: an error page otherwise reads as a successful navigation, hiding
+        # dead URLs and blank shells from the model.
+        status = f" (HTTP {response.status})" if response is not None else ""
+        return ToolResult.ok(f"navigated to {await _url(page)}{status}")
 
     async def file_upload(args: dict[str, Any]) -> ToolResult:
         # Lazy import: keeps this module importable for unit tests without the full forge/storage graph.
         from skyvern.forge.sdk.api.files import download_file
 
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args["selector"]
-        source = args["file"]
+        source = _resolve_text(args["file"])
         local_path = await download_file(source, output_dir=downloads_dir, organization_id=organization_id)
         paths = [local_path]
         el = await page.query_selector(selector)
         if el is None:
             return ToolResult.error(f"no file input for selector {selector!r}")
         await el.set_input_files(paths)
-        return ToolResult.ok(f"uploaded {paths} to {selector}")
+        return ToolResult.ok(f"uploaded 1 file to {selector}")
 
     async def select_combobox(args: dict[str, Any]) -> ToolResult:
         # Explicit typeahead fill (type() also drives this automatically): type the value, WAIT for the
         # async suggestion list, pick the best-matching suggestion, and VERIFY the field committed. Fails
         # loudly if nothing matches rather than leaving raw typed text the widget won't accept as a valid
         # selection (a false "filled" — the failure mode this exists to prevent).
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
         selector = args["selector"]
-        value = args["value"]
-        committed, opt_txt = await _type_and_commit(selector, value, rounds=8)
+        value = _resolve_text(args["value"])
+        committed, opt_txt = await _type_and_commit(page, selector, value, rounds=8)
         if opt_txt is None:
             return ToolResult.error(
                 f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
@@ -496,7 +665,7 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Call once per page, then act by selector.",
+            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached by selector. Call once per page, then act by selector.",
             _obj({}),
             observe,
         ),
@@ -508,6 +677,12 @@ def build_browser_tools(
         ),
         _spec(
             "click", "Click an element by CSS selector.", _obj({"selector": {"type": "string"}}, ["selector"]), click
+        ),
+        _spec(
+            "hover",
+            "Hover over an element by CSS selector (e.g. to open a hover menu).",
+            _obj({"selector": {"type": "string"}}, ["selector"]),
+            hover,
         ),
         _spec(
             "type",
@@ -580,18 +755,41 @@ def build_browser_tools(
         ),
     ]
     for _tool_spec in tools:
-        if _tool_spec.name in ("click", "type", "select_option", "select_combobox", "press_key", "file_upload"):
+        if _tool_spec.name in (
+            "click",
+            "hover",
+            "type",
+            "select_option",
+            "select_combobox",
+            "press_key",
+            "file_upload",
+        ):
             _tool_spec.billable = True
+        if _tool_spec.name in ("observe", "get_html"):
+            # Large perception dumps: only the latest snapshot is relevant, so let the loop elide older
+            # ones from the re-sent transcript (bounds context on perception-heavy pages).
+            _tool_spec.compactable = True
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
-            _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page)
+            _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
     return tools
 
 
 def _with_preflight(
-    name: str, handler: Callable[[dict[str, Any]], Awaitable[ToolResult]], page: Any
+    name: str,
+    handler: Callable[[dict[str, Any]], Awaitable[ToolResult]],
+    page_provider: PageProvider,
+    prefetched_page: list[Any] | None = None,
 ) -> Callable[[dict[str, Any]], Awaitable[ToolResult]]:
     async def wrapped(args: dict[str, Any]) -> ToolResult:
-        preflight_tool_action(name, args, page)
-        return await handler(args)
+        page = await page_provider()
+        if page is not None:
+            preflight_tool_action(name, args, page)
+            if prefetched_page is not None:
+                prefetched_page.append(page)
+        try:
+            return await handler(args)
+        finally:
+            if prefetched_page is not None:
+                prefetched_page.clear()
 
     return wrapped

@@ -90,6 +90,7 @@ from skyvern.forge.sdk.db.id import generate_output_parameter_id, generate_workf
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.transient_ui_capture import resolve_transient_ui_capture_arm
+from skyvern.forge.sdk.experimentation.workflow_block_engine import resolve_workflow_block_engine_arm
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
@@ -151,6 +152,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     compute_conditional_scopes,
     get_all_blocks,
     resolve_conditional_merge_edges,
+    run_is_eligible_for_v3_ab,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
@@ -1331,6 +1333,10 @@ async def _load_user_script_module(
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body.
     """
+    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+    if loaded_script_module is not None:
+        return loaded_script_module
+
     await script_service.ensure_in_process_script_execution_allowed(
         seam="workflow.cached_script_module_load",
         organization_id=organization_id,
@@ -1341,9 +1347,6 @@ async def _load_user_script_module(
         script_revision_id=script_revision_id,
     )
 
-    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
-    if loaded_script_module is not None:
-        return loaded_script_module
     if _script_has_static_module_marker(script_path):
         LOG.warning(
             "Static pin's live module import failed; refusing to exec the stale stored body",
@@ -4802,11 +4805,34 @@ class WorkflowService:
         # latest published version, so a publish between run creation and execution does not change
         # what executes.
         workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
-        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         browser_session_id = browser_session_id or workflow_run.browser_session_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
+        if not workflow.workflow_definition.blocks:
+            failure_reason = "Workflow has no executable blocks."
+            LOG.warning(
+                "Workflow has no executable blocks",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+            )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
+            )
+            return workflow_run
+
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
             try:
@@ -5647,8 +5673,27 @@ class WorkflowService:
         script_blocks_by_label: dict[str, Any] = {}
         loaded_script_module = None
         blocks_to_update: set[str] = set()
+        in_process_script_execution_denied = False
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
+
+        # Resolve the workflow-block engine A/B once, before any block runs: eligibility is a
+        # property of the whole run (see run_is_eligible_for_v3_ab), and every block of a run must
+        # share an arm. Covers the DAG executor too, which this method delegates to.
+        current_context = skyvern_context.current()
+        if current_context:
+            await resolve_workflow_block_engine_arm(
+                current_context,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                run_is_eligible=run_is_eligible_for_v3_ab(all_blocks, is_script_run=is_script_run),
+            )
+        else:
+            LOG.warning(
+                "No context to pin the workflow-block engine arm on; the run stays on control",
+                workflow_run_id=workflow_run_id,
+            )
 
         # A cached script can be superseded (e.g. a stale pin replaced by a platform static
         # script) — drop it here so the ensure_static_script path below re-creates the pin.
@@ -5787,6 +5832,7 @@ class WorkflowService:
                 # full run identity, and one line per denial is what the denial monitor counts.
                 script_blocks_by_label = {}
                 loaded_script_module = None
+                in_process_script_execution_denied = True
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
@@ -5839,6 +5885,12 @@ class WorkflowService:
                     LOG.info("No static script available for this workflow")
             except Exception:
                 LOG.error("Failed to load static script", exc_info=True)
+
+        # A degradable tenant-module denial with no trusted static module recovered above must
+        # not fall through to code_generation mode below (SKY-14323): that would regenerate a
+        # cached revision the next run would deny again. Route the whole run to the agent instead.
+        if in_process_script_execution_denied and (not script_blocks_by_label or loaded_script_module is None):
+            is_script_run = False
 
         # Mark workflow as running, preserving the user's original run_with intent.
         # The run_with field records what the user requested (e.g. "code"),
@@ -5902,6 +5954,14 @@ class WorkflowService:
             script_block_count=len(script_blocks_by_label),
             empty_blocks_detected=script is not None and is_script_run and not script_blocks_by_label,
         )
+
+        if in_process_script_execution_denied and not script_mode_active:
+            await self._mark_script_fallback_triggered(
+                workflow_run_id=workflow_run_id,
+                valid_to_run_code=True,
+                block_executed_with_code=False,
+                block_label=None,
+            )
 
         if script_mode_active and script is not None:
             # Regression-locked by tests/unit/workflow/test_mark_script_run_loaded.py
@@ -6630,7 +6690,11 @@ class WorkflowService:
         workflow_run_block_result: BlockResult | None = None
         block_executed_with_code = False
         valid_to_run_code = (
-            is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+            is_script_run
+            and loaded_script_module is not None
+            and block.label
+            and block.label in script_blocks_by_label
+            and not block.disable_cache
         )
         # requires_agent blocks must execute via agent, not code — skip code path
         block_requires_agent = False
@@ -9552,30 +9616,31 @@ class WorkflowService:
 
         return workflow_run
 
-    async def _session_download_count(self, workflow_run: WorkflowRun, context: object) -> int:
-        """This run's downloads still scoped to the browser session, which cleanup tags with the run
-        id after this grade runs — except on deployments with artifact content signing, where a code
-        block already claimed them and ``get_downloaded_files`` counts them instead. Failure-tolerant:
-        an unavailable count must not manufacture a shortfall."""
-        browser_session_id = getattr(context, "browser_session_id", None)
-        if not browser_session_id:
-            return 0
+    async def _session_download_artifact_ids(
+        self, workflow_run: WorkflowRun, context: SkyvernContext | None, download_run_id: str | None
+    ) -> set[str]:
+        """This run's downloads still scoped to the browser session, whether the watcher already
+        bound them to it or cleanup has yet to. Failure-tolerant: an unavailable read must not
+        manufacture a shortfall."""
+        browser_session_id = context.browser_session_id if context else None
+        if not browser_session_id or not download_run_id:
+            return set()
         try:
-            # Scoped to this run's window and to rows finalization has not claimed: a reused session
-            # carries earlier runs' downloads, which would otherwise satisfy the contract for a run
-            # that produced nothing.
-            return await app.DATABASE.artifacts.count_unclaimed_session_download_artifacts(
+            # This run as producer plus still-unbound rows in its window: a reused session's
+            # earlier downloads would otherwise satisfy a run that produced nothing.
+            return await app.DATABASE.artifacts.list_session_download_artifact_ids_for_run(
+                run_id=download_run_id,
                 browser_session_id=browser_session_id,
                 organization_id=workflow_run.organization_id,
                 run_started_at=workflow_run.created_at,
             )
         except Exception:
             LOG.warning(
-                "Session download count failed while grading; counting zero from this source",
+                "Session download read failed while grading; counting zero from this source",
                 workflow_run_id=workflow_run.workflow_run_id,
                 exc_info=True,
             )
-            return 0
+            return set()
 
     async def _grade_completion_contract(
         self,
@@ -9610,22 +9675,30 @@ class WorkflowService:
             context = skyvern_context.current()
             # Producer and consumer must resolve the same download key: a sub-workflow registers
             # files under the parent's run id, so the raw workflow_run_id would read an empty dir.
+            download_run_id = resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id)
             files = await app.STORAGE.get_downloaded_files(
                 organization_id=workflow_run.organization_id,
-                run_id=resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id),
+                run_id=download_run_id,
             )
-            # Session-scoped downloads are only tagged with the run id during cleanup, which runs
-            # after this grade. Counting them here keeps a real download from reading as zero;
-            # double-counting one file is harmless because the grader only ever needs a floor.
-            session_files = await self._session_download_count(workflow_run, context)
-            verdict = grade_completion_contract(criteria, registered_download_count=len(files or []) + session_files)
+            # Session-scoped downloads may not be registered under the run dir; including them
+            # keeps a real download from reading as zero.
+            session_download_ids = await self._session_download_artifact_ids(workflow_run, context, download_run_id)
+            registered = files or []
+            # The sources overlap on the same resolved run key once rows carry ids, so subtracting
+            # the ids already present in `registered` counts a stamped file once. Without ids the
+            # two reads address different storage prefixes (run dir vs browser_sessions/<id>/
+            # downloads), so they are separate files and both count.
+            registered_ids = {file.artifact_id for file in registered if file.artifact_id}
+            download_count = len(registered) + len(session_download_ids - registered_ids)
+            verdict = grade_completion_contract(criteria, registered_download_count=download_count)
             LOG.info(
                 "workflow_completion_contract_graded",
                 workflow_run_id=workflow_run.workflow_run_id,
                 satisfied=verdict.satisfied,
                 unmet_criterion_ids=list(verdict.unmet_criterion_ids),
-                registered_download_count=len(files or []),
-                session_download_count=session_files,
+                registered_download_count=len(registered),
+                session_download_count=len(session_download_ids),
+                graded_download_count=download_count,
             )
             return verdict
         except Exception:
@@ -11117,7 +11190,7 @@ class WorkflowService:
             try:
                 async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                     context = skyvern_context.current()
-                    finalization_run_id = context.run_id if context and context.run_id else workflow_run.workflow_run_id
+                    finalization_run_id = resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id)
                     try:
                         await app.STORAGE.save_downloaded_files(
                             organization_id=workflow_run.organization_id,
@@ -11130,8 +11203,7 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             skipped_file_count=len(exc.skipped_files),
                         )
-                    # Tag any session-scoped DOWNLOAD artifacts created during this
-                    # workflow run with run_id (see
+                    # Reconcile session-scoped DOWNLOAD rows the watcher left unbound (see
                     # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
                     browser_session_id = context.browser_session_id if context else None
                     if browser_session_id and finalization_run_id:
@@ -11325,7 +11397,6 @@ class WorkflowService:
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
         return PreparedWorkflowWebhook(
@@ -11335,7 +11406,6 @@ class WorkflowService:
             webhook_callback_url=workflow_run.webhook_callback_url,
             signed_payload=signed_data.signed_payload,
             headers=signed_data.headers,
-            payload_for_log=signed_data.payload_for_log,
         )
 
     async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
@@ -11345,7 +11415,6 @@ class WorkflowService:
             workflow_id=webhook.workflow_id,
             workflow_run_id=webhook.workflow_run_id,
             webhook_callback_url=webhook.webhook_callback_url,
-            payload=webhook.payload_for_log,
             headers=webhook.headers,
         )
         try:
@@ -11406,8 +11475,6 @@ class WorkflowService:
                 "Webhook failed",
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
-                webhook_data=webhook.payload_for_log,
-                resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )
@@ -11550,6 +11617,10 @@ class WorkflowService:
         if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
+        else:
+            runtime_secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if runtime_secret_values:
+                har_data = await asyncio.to_thread(redact_har_bytes, har_data, runtime_secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(
                 har_data=har_data,
@@ -11580,6 +11651,10 @@ class WorkflowService:
         if app.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run(workflow_run.workflow_run_id):
             secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
+        else:
+            runtime_secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if runtime_secret_values:
+                browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, runtime_secret_values)
         LOG.debug("Persisting browser log", browser_log_size=len(browser_log))
         if browser_log:
             await app.ARTIFACT_MANAGER.create_artifact(
@@ -11631,9 +11706,12 @@ class WorkflowService:
         secret_values = (
             app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(workflow_run.workflow_run_id)
             if redaction_enabled
-            else set()
+            else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
         )
-        if redaction_enabled:
+        # Opted-in runs always redact (even an empty full set); opted-out runs redact only when a
+        # runtime secret was actually registered, so the no-secrets case skips the redact call.
+        should_redact = redaction_enabled or bool(secret_values)
+        if should_redact:
             browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
         LOG.debug("Persisting browser log (bundled)", browser_log_size=len(browser_log))
         if browser_log:
@@ -11644,7 +11722,7 @@ class WorkflowService:
             workflow_run_id=workflow_run.workflow_run_id,
             browser_state=browser_state,
         )
-        if redaction_enabled:
+        if should_redact:
             har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
         if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
             submission_shadow.schedule_submission_signal_shadow(

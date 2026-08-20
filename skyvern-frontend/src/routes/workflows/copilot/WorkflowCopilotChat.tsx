@@ -80,7 +80,6 @@ import { ConfirmCard, shouldShowConfirmCard } from "./cards/ConfirmCard";
 import { ConnectedAccountChoiceCard } from "./cards/ConnectedAccountChoiceCard";
 import { connectedAccountChoiceLabel } from "./cards/connectedAccountChoiceLabel";
 import { DiffCard, shouldShowDiffCard } from "./cards/DiffCard";
-import { FixCard, shouldShowFixCard } from "./cards/FixCard";
 import { ReviewGateCard, getReviewGateVerdict } from "./cards/ReviewGateCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
 import {
@@ -299,8 +298,10 @@ function ConvoAggregatePill({
     earliestMs !== null && latestMs !== null && latestMs > earliestMs
       ? formatElapsedSeconds(latestMs - earliestMs)
       : null;
+  // An interrupted or user-cancelled turn carries terminal "error" without having
+  // failed, so the session pill applies the same guard as the per-turn chip.
   const anyError = turnsWithNarrative.some(
-    (m) => m.narrative?.terminal === "error",
+    (m) => m.narrative?.terminal === "error" && !m.narrative?.cancelled,
   );
   const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
   const dotClass = isInFlight
@@ -370,7 +371,7 @@ const getLatestDiffCardTurnId = (messages: ChatMessage[]): string | null => {
 };
 
 // messages.length - 1 with any trailing run_lifecycle lines skipped, so
-// proposal actions / FixCard keep attaching to the last real turn.
+// proposal actions keep attaching to the last real turn.
 const findLastTurnIndex = (messages: ChatMessage[]): number => {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.kind !== "run_lifecycle") {
@@ -399,9 +400,6 @@ type QueuedPrompt = {
   content: string;
   reason: QueuedPromptReason;
   audioBlob?: Blob | null;
-  // The one-shot fix-origin signal travels with the prompt it was seeded for, so
-  // discarding the queue (new chat, history load, agent switch) drops it too.
-  fixOrigin?: boolean;
   idempotencyKey?: string;
 };
 
@@ -626,8 +624,6 @@ interface WorkflowCopilotChatProps {
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
-  // Sent as fix_origin only on the initial turn; does not propagate to subsequent turns.
-  initialMessageFixOrigin?: boolean;
   onInitialMessageConsumed?: () => void;
   // Render as a docked panel (no float/drag/resize) instead of a floating window.
   docked?: boolean;
@@ -706,7 +702,6 @@ export function WorkflowCopilotChat({
   requiresLiveBrowser = false,
   isLiveBrowserReady = false,
   initialMessage,
-  initialMessageFixOrigin,
   onInitialMessageConsumed,
   docked = false,
   chromeless = false,
@@ -897,7 +892,6 @@ export function WorkflowCopilotChat({
     content: string;
     workflowPermanentId: string | undefined;
     mode: "ask" | "build" | null;
-    fixOrigin: boolean;
     hadAudio: boolean;
     hadBlockTarget: boolean;
     browserSessionId: string | null;
@@ -1897,7 +1891,6 @@ export function WorkflowCopilotChat({
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
   const blockBuildTargetLabelRef = useRef<string | null>(null);
-  const fixOriginPendingRef = useRef(false);
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -1913,10 +1906,7 @@ export function WorkflowCopilotChat({
 
     updateQueuedPrompt(null);
     // Drop the queued block-build target so it doesn't leak into the next message.
-    // The fix-origin signal rode on the discarded prompt; clear the ref too in case
-    // a future path set it without queuing.
     blockBuildTargetLabelRef.current = null;
-    fixOriginPendingRef.current = false;
     setMessages((prev) => prev.filter((message) => message.id !== queued.id));
     // Text already in the composer is the newer intent — the user was part way
     // through replacing the queued message — so it wins over what comes back.
@@ -2060,16 +2050,12 @@ export function WorkflowCopilotChat({
         if (!queued) {
           return;
         }
-        // New text, so the old prompt's framing must not ride along: the
-        // fix-origin flag and the block-build scope both belonged to the
-        // message being replaced.
+        // New text: the block-build scope belonged to the message being replaced.
         blockBuildTargetLabelRef.current = null;
-        fixOriginPendingRef.current = false;
         updateQueuedPrompt({
           ...queued,
           content: candidate,
           audioBlob: messageAudioBlob,
-          fixOrigin: false,
           idempotencyKey: undefined,
         });
         setMessages((prev) =>
@@ -2089,18 +2075,11 @@ export function WorkflowCopilotChat({
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
-        // Move the pending fix-origin signal off the bare ref and onto the
-        // queued prompt so a discard of the queue (new chat, history load)
-        // can't leave it set to leak into the next, unrelated turn. The drain
-        // restores it onto the ref before re-entering handleSend.
-        const queuedFixOrigin = fixOriginPendingRef.current;
-        fixOriginPendingRef.current = false;
         updateQueuedPrompt({
           id: queuedId,
           content: candidate,
           reason,
           audioBlob: messageAudioBlob,
-          fixOrigin: queuedFixOrigin,
           idempotencyKey: options.idempotencyKey,
         });
         // First queue adds the user bubble; a re-queue (a working drain that
@@ -2160,13 +2139,12 @@ export function WorkflowCopilotChat({
       }
       setIsLoading(true);
       inFlightRef.current = true;
-      // Stamped here, before the awaits below consume messageAudioBlob,
-      // fixOriginPendingRef and blockBuildTargetLabelRef.
+      // Stamped here, before the awaits below consume messageAudioBlob
+      // and blockBuildTargetLabelRef.
       lastTurnRef.current = {
         content: candidate,
         workflowPermanentId,
         mode: copilotV2Enabled ? composerMode : null,
-        fixOrigin: fixOriginPendingRef.current,
         hadAudio: messageAudioBlob !== null,
         hadBlockTarget: blockBuildTargetLabelRef.current !== null,
         browserSessionId: liveBrowserSessionId ?? null,
@@ -2466,10 +2444,6 @@ export function WorkflowCopilotChat({
           }
         };
 
-        // Consume the one-shot fix-origin signal before any awaitable send step so a pre-stream
-        // failure (e.g. getSseClient throwing) can't leave it set to leak into the next turn.
-        const fixOrigin = fixOriginPendingRef.current;
-        fixOriginPendingRef.current = false;
         const client = await getSseClient(credentialGetter);
         const targetBlockLabel = blockBuildTargetLabelRef.current;
         blockBuildTargetLabelRef.current = null;
@@ -2480,7 +2454,6 @@ export function WorkflowCopilotChat({
         // block Generate click room to arm the ref after the entry stamp.
         if (lastTurnRef.current) {
           lastTurnRef.current.hadBlockTarget = targetBlockLabel !== null;
-          lastTurnRef.current.fixOrigin = fixOrigin;
         }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
@@ -2499,7 +2472,6 @@ export function WorkflowCopilotChat({
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
-            fix_origin: fixOrigin,
             keep_pending_proposal:
               copilotUxV1Enabled && Boolean(pendingProposalTurnId),
             // Only opt in behind the flag; flag-off omits the field entirely so
@@ -2856,7 +2828,6 @@ export function WorkflowCopilotChat({
         lastTurn?.workflowPermanentId === workflowPermanentId,
       turnRequestMatches:
         lastTurn?.mode === (copilotV2Enabled ? composerMode : null) &&
-        lastTurn?.fixOrigin === Boolean(queuedPrompt.fixOrigin) &&
         lastTurn?.hadAudio === false &&
         lastTurn?.hadBlockTarget === false &&
         lastTurn?.browserSessionId === (liveBrowserSessionId ?? null) &&
@@ -2884,9 +2855,6 @@ export function WorkflowCopilotChat({
     // prompt that still needs the browser re-queues under the same id and
     // drains via the live_browser path once the session arrives.
     updateQueuedPrompt(null);
-    // Restore the fix-origin signal the prompt carried so the drained turn
-    // sends it; a re-queue (working → live_browser) re-captures it off the ref.
-    fixOriginPendingRef.current = promptToSend.fixOrigin ?? false;
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
@@ -2933,16 +2901,12 @@ export function WorkflowCopilotChat({
     // live browser isn't ready yet.
     hasAutoSentRef.current = true;
     onInitialMessageConsumedRef.current?.();
-    if (initialMessageFixOrigin) {
-      fixOriginPendingRef.current = true;
-    }
     handleSend(initialMessage).catch((error) => {
       console.error("Auto-send failed:", error);
     });
   }, [
     handleSend,
     initialMessage,
-    initialMessageFixOrigin,
     isLoading,
     isLoadingHistory,
     queuedPrompt,
@@ -3570,19 +3534,6 @@ export function WorkflowCopilotChat({
                           textareaRef.current?.focus();
                           adjustTextareaHeight();
                         }}
-                      />
-                    ) : null}
-                    {docked &&
-                    !isLoadingHistory &&
-                    isLastMessage &&
-                    shouldShowFixCard(message.narrative) ? (
-                      <FixCard
-                        turn={message.narrative}
-                        onFix={() =>
-                          handleSend(
-                            "The last run failed — diagnose the failure and fix it, then re-run.",
-                          )
-                        }
                       />
                     ) : null}
                     {(() => {

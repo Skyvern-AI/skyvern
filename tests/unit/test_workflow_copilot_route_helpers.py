@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
 from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
@@ -648,3 +649,45 @@ def test_run_grant_yaml_ignores_a_binding_that_exists_only_on_the_submitted_canv
 
 def test_run_grant_yaml_is_none_when_the_row_has_no_blocks() -> None:
     assert _run_grant_workflow_yaml(None) is None
+
+
+def _timed_out_ctx(*, workflow_yaml: str | None, last_test_ok: bool | None) -> MagicMock:
+    ctx = MagicMock()
+    ctx.last_workflow = MagicMock(name="wf")
+    ctx.last_workflow_yaml = workflow_yaml
+    ctx.last_test_ok = last_test_ok
+    ctx.last_full_workflow_test_ok = False
+    ctx.last_test_suspicious_success = False
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.last_failure_category_top = None
+    ctx.workflow_persisted = False
+    ctx.total_tokens_used = None
+    ctx.last_good_workflow = None
+    ctx.last_good_workflow_yaml = None
+    ctx.tool_activity = []
+    ctx.latest_diagnosis_repair_contract = None
+    ctx.test_after_update_done = last_test_ok is not None
+    ctx.last_update_block_count = None
+    ctx.has_staged_proposal = True
+    return ctx
+
+
+class TestTimedOutFailedTestDraftIsNotAutoApplied:
+    def test_timeout_failed_test_result_offers_review_instead_of_committing(self) -> None:
+        ctx = _timed_out_ctx(workflow_yaml="version: '1.0'", last_test_ok=False)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_workflow
+        assert result.proposal_disposition == "review_untested"
+        assert _effective_auto_accept(True, result) is False
+        assert _should_commit_staged_workflow(True, result) is False
+
+    def test_empty_timeout_result_does_not_commit_a_staged_workflow(self) -> None:
+        ctx = _timed_out_ctx(workflow_yaml=None, last_test_ok=None)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+        assert _should_commit_staged_workflow(True, result) is False

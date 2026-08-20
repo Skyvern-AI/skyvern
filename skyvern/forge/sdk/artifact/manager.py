@@ -104,8 +104,15 @@ def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workfl
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
         if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
-            return data
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
+            # Runtime-resolved secrets (e.g. verification codes) still redact from browser
+            # diagnostics under the global switch alone, matching the workflow-finalization floor.
+            if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
+                return data
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if not secret_values:
+                return data
+        else:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
     if artifact_type == ArtifactType.HAR:
@@ -508,22 +515,13 @@ class ArtifactManager:
         filename: str,
         checksum: str | None = None,
         file_size: int | None = None,
+        run_id: str | None = None,
     ) -> str:
-        """Register a session-scoped downloaded file as an Artifact row.
-
-        Used by the browser_controller's watcher write site
-        (``S3Storage.sync_browser_session_file(artifact_type="downloads")``).
-        Idempotent on ``(organization_id, browser_session_id, uri)`` — the
-        watcher fires repeatedly as a downloaded file grows, so we look up
-        the existing row before inserting.
-
-        ``run_id`` is intentionally NOT set here. The watcher runs in a
-        separate process from the agent and does not know which run is
-        currently using the session. Run finalization runs the
-        ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
-        whose ``created_at`` falls inside the run's window; a code block
-        runs the same UPDATE mid-run over its own block row's window.
-        """
+        """Register a session-scoped downloaded file as an Artifact row, idempotent on
+        ``(organization_id, browser_session_id, uri)`` because the watcher fires repeatedly as the
+        file grows. ``run_id`` is the run occupying the session when the download was observed and
+        must be resolved at that observation, not here, where a late write would name whichever run
+        holds the session now."""
         return await self._create_browser_session_artifact(
             organization_id=organization_id,
             browser_session_id=browser_session_id,
@@ -532,6 +530,7 @@ class ArtifactManager:
             artifact_type=ArtifactType.DOWNLOAD,
             checksum=checksum,
             file_size=file_size,
+            run_id=run_id,
         )
 
     async def create_browser_session_recording_artifact(
@@ -677,6 +676,7 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         checksum: str | None = None,
         file_size: int | None = None,
+        run_id: str | None = None,
     ) -> str:
         """Insert a browser-session artifact, deduplicating every type except action logs."""
         if artifact_type != ArtifactType.BROWSER_SESSION_ACTION_LOG:
@@ -687,6 +687,12 @@ class ArtifactManager:
                 artifact_type=artifact_type,
             )
             if existing is not None:
+                if run_id is not None and existing.run_id is None:
+                    await app.DATABASE.artifacts.bind_session_download_artifact_producer(
+                        artifact_id=existing.artifact_id,
+                        organization_id=organization_id,
+                        run_id=run_id,
+                    )
                 return existing.artifact_id
 
         artifact_id = generate_artifact_id()
@@ -696,6 +702,7 @@ class ArtifactManager:
             uri=uri,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            run_id=run_id,
             checksum=checksum,
             file_size=file_size,
         )
@@ -1931,6 +1938,9 @@ class ArtifactManager:
         resolved_run_id = run_id or (context.run_id if context else None)
         if not _bundling_enabled():
             for _, (artifact_type, data) in entries.items():
+                # Callers redact before archiving, but route through the gate anyway (idempotent) so
+                # no archive path can persist an unredacted browser diagnostic.
+                data = _maybe_redact_artifact_data(artifact_type, data, resolved_workflow_run_id)
                 artifact_id = generate_artifact_id()
                 uri = app.STORAGE.build_uri(
                     organization_id=step.organization_id,

@@ -732,6 +732,7 @@ const selectOptions = (el) => {
   return out;
 };
 const controlDisabled = (el) => !!(el.hasAttribute('disabled') || lower(attr(el, 'aria-disabled')) === 'true' || lower(attr(el, 'data-disabled')) === 'true');
+const controlReadonly = (el) => !!(el.readOnly === true || el.hasAttribute('readonly') || lower(attr(el, 'aria-readonly')) === 'true');
 const modalIdentity = (el) => [
   (el.tagName || '').toLowerCase(), attr(el, 'id'), classesFor(el).join(' '), attr(el, 'role'),
   attr(el, 'aria-label'), attr(el, 'title'), attr(el, 'data-testid'), attr(el, 'data-test'), attr(el, 'data-dismiss'),
@@ -797,24 +798,62 @@ for (const form of document.querySelectorAll('form')) {
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
+    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }
 
-const navTargets = [];
+const NAV_REGION_TAGS = ['header', 'nav', 'footer', 'main'];
+// Outermost landmark, so a card <header> inside <main> counts as content: resolving to the
+// nearest one splits nested landmarks into extra buckets and costs content its share.
+const navRegionOf = (el) => {
+  let region = 'other';
+  for (let cur = el.parentElement; cur; cur = cur.parentElement) {
+    const tagName = (cur.tagName || '').toLowerCase();
+    if (NAV_REGION_TAGS.indexOf(tagName) !== -1) region = tagName;
+  }
+  return region;
+};
+const navEligibleLinks = [];
+const navBuckets = new Map();
 const baseHost = location.host.toLowerCase();
 for (const link of document.querySelectorAll('a[href]')) {
-  if (navTargets.length >= MAX_NAVIGATION_TARGETS) break;
   const rawHref = attr(link, 'href');
   if (!rawHref || rawHref.startsWith('#') || lower(rawHref).startsWith('javascript:')) continue;
   let resolved; try { resolved = new URL(rawHref, location.href).href; } catch (e) { continue; }
   let host; try { host = new URL(resolved).host.toLowerCase(); } catch (e) { continue; }
   if (!host || host !== baseHost) continue;
-  const entry = { text: nodeText(link), href: resolved, selector: selectorFor(link), selector_candidates: selectorCandidatesFor(link), identity: identityFor(link) };
+  const region = navRegionOf(link);
+  const eligible = { link: link, href: resolved, region: region };
+  if (!navBuckets.has(region)) navBuckets.set(region, []);
+  navBuckets.get(region).push(eligible);
+  navEligibleLinks.push(eligible);
+}
+// A site's global header can hold more links than the whole budget, so filling in document
+// order spends every slot before the scan reaches page content. Take one per region per pass,
+// and only when the budget actually has to cut.
+const navSelected = [];
+if (navEligibleLinks.length <= MAX_NAVIGATION_TARGETS) {
+  for (const eligible of navEligibleLinks) navSelected.push(eligible);
+} else {
+  const navLists = Array.from(navBuckets.values());
+  for (let depth = 0; navSelected.length < MAX_NAVIGATION_TARGETS; depth++) {
+    let placed = false;
+    for (const bucket of navLists) {
+      if (navSelected.length >= MAX_NAVIGATION_TARGETS) break;
+      if (depth < bucket.length) { navSelected.push(bucket[depth]); placed = true; }
+    }
+    if (!placed) break;
+  }
+}
+const navTargets = [];
+for (const picked of navSelected) {
+  const link = picked.link;
+  const entry = { text: nodeText(link), href: picked.href, region: picked.region, selector: selectorFor(link), selector_candidates: selectorCandidatesFor(link), identity: identityFor(link) };
   if (link.hasAttribute('download')) entry.has_download_attr = true;
   navTargets.push(entry);
 }
+const navigationTargetsTruncated = navEligibleLinks.length > navTargets.length;
 
 const clickableSelector = (el) => {
   const tag = (el.tagName || '*').toLowerCase();
@@ -1189,6 +1228,7 @@ const visibleText = document.body ? (document.body.innerText || '') : '';
 return JSON.stringify({
   page_title: pageTitle,
   forms: forms,
+  navigation_targets_truncated: navigationTargetsTruncated,
   navigation_targets: navTargets,
   result_containers: resultContainers,
   result_containers_truncated: resultContainersTruncated,

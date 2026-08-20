@@ -281,6 +281,17 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "prompt": "Split this combined PDF into one file per document; name each by document type.",
         "parameter_keys": ["source_pdf_output"],
     },
+    "human_interaction": {
+        "block_type": "human_interaction",
+        "label": "approve_order",
+        "timeout_seconds": 3600,
+        "recipients": ["ops@example.com"],
+        "subject": "Approval needed before the order is submitted",
+        "body": "A workflow run is paused and needs someone to approve the order before it is submitted.",
+        "instructions": "Review the order total and line items, then approve to submit or reject to cancel the run.",
+        "positive_descriptor": "Approve order",
+        "negative_descriptor": "Cancel",
+    },
     "google_sheets_read": {
         "block_type": "google_sheets_read",
         "label": "read_sheet_data",

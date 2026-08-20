@@ -23,7 +23,7 @@ You have three ways to connect a client to Skyvern:
 
 |                      | OAuth (sign in with browser)                                                      | API key                                                                                                    | Local mode                                          |
 | -------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| **Best for**         | Claude Code, Codex CLI, Cursor, ChatGPT, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern                                |
+| **Best for**         | Claude Code, Claude.ai / Claude Desktop connectors, Codex CLI, Cursor, ChatGPT, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern                                |
 | **Install required** | None                                                                              | None                                                                                                       | Python 3.11+ and `pip install "skyvern[server]"`    |
 | **Credential**       | Browser sign-in with your Skyvern account                                         | API key from [app.skyvern.com](https://app.skyvern.com)                                                    | API key from your self-hosted instance              |
 | **Where it runs**    | Directly against Skyvern Cloud over HTTPS                                         | Directly against Skyvern Cloud over HTTPS                                                                  | Local Python process talking to your Skyvern server |
@@ -36,7 +36,7 @@ Skyvern Cloud exposes the full MCP tool surface at `https://api.skyvern.com/mcp/
 
 ## Option A: Sign in with browser (OAuth)
 
-Supported clients today: **Claude Code**, **Codex CLI**, **Cursor**, **ChatGPT** (custom connector), and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
+Supported clients today: **Claude Code**, **Claude.ai / Claude Desktop** (custom connector), **Codex CLI**, **Cursor**, **ChatGPT** (custom connector), and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
 
 There is **no install step**. You do not need `pip install skyvern`, Node.js, or an API key.
 
@@ -121,11 +121,24 @@ This is not the ChatGPT App Directory. You can add Skyvern as a custom MCP conne
 No API key is required — OAuth handles authentication. If your account does not yet show the Connectors option, check **Settings → Beta features** to enable it.
 
 </Tab>
+<Tab title="Claude.ai / Claude Desktop">
+
+**Custom connector**
+
+1. In Claude or Claude Desktop, open **Settings → Connectors**.
+2. Click **Add custom connector**.
+3. Enter `Skyvern` as the connector name and `https://api.skyvern.com/mcp/` as the connector URL.
+4. Click **Add**, then **Connect**, and complete the browser sign-in with your Skyvern account.
+5. Enable Skyvern from the **Search and tools** menu in a Claude chat.
+
+No API key is required — OAuth handles authentication. This remote connector is separate from the local Claude Desktop extension install described in the API-key section below.
+
+</Tab>
 </Tabs>
 
 ## Option B: API key
 
-Use this path for Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, and any client that does not yet support the MCP OAuth flow. You can also use it with Claude Code, Codex CLI, or Cursor if you prefer a static key (for example, on a server with no browser available for the OAuth callback).
+Use this path for Windsurf, Hermes, OpenClaw, headless/CI flows, and any client that does not yet support the MCP OAuth flow. You can also use it with Claude Code, Claude Desktop, Codex CLI, or Cursor if you prefer a static key (for example, on a server with no browser available for the OAuth callback).
 
 Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard, then pick your client below.
 

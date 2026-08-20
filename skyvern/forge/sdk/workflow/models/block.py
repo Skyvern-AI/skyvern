@@ -30,6 +30,7 @@ from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from functools import partial
 from pathlib import Path, PurePosixPath
+from time import monotonic
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, TypeVar, Union, cast
 from urllib.parse import quote, urlparse
@@ -48,7 +49,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Frame, Page
+from playwright.async_api import Page
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
 
@@ -140,6 +141,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.experimentation.workflow_block_engine import workflow_block_engine_override
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
@@ -242,7 +244,7 @@ from skyvern.services.self_heal_cap import check_and_increment_self_heal_cap
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
     resolve_fetch_host_ips,
@@ -256,6 +258,7 @@ from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnos
 from skyvern.webeye.cdp_download_interceptor import normalize_download_filename, settle_browser_downloads_for_context
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
@@ -1148,7 +1151,7 @@ class Block(BaseModel, abc.ABC):
         engine: RunEngine | None = None
         try:
             if isinstance(self, BaseTaskBlock):
-                engine = self.engine
+                engine = self.resolve_engine(workflow_run_id)
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
                 workflow_run_id=workflow_run_id,
@@ -1303,6 +1306,31 @@ class BaseTaskBlock(Block):
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
     include_extracted_text: bool = True
+    # Blocks built at runtime for internal machinery (loop-value and branch-condition extraction)
+    # are not part of the workflow definition, so the run-level engine A/B never saw them and must
+    # not reroute them. Private so an internal experiment toggle stays out of the published block
+    # schemas and out of stored workflow definitions.
+    _exclude_from_engine_ab: bool = PrivateAttr(default=False)
+
+    def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
+        """The engine this block dispatches to, after the per-run A/B.
+
+        Both the persisted workflow_run_blocks.engine and the execute_step dispatch read this, so
+        the recorded engine cannot disagree with the one that ran. A block pinned to a non-default
+        engine is honored as-authored, and a block the eligibility check never saw is left alone;
+        neither is ever rerouted.
+        """
+        if (
+            self.engine != RunEngine.skyvern_v1
+            or self._exclude_from_engine_ab
+            # Mirrors run_is_eligible_for_v3_ab: a block eligibility skipped as engine-inert must
+            # not be labeled v3 here either, or its row claims an engine that never ran. It does not
+            # re-check _task_block_supports_v3 because run-level eligibility already rejected the
+            # whole run if any block failed it; loosening that predicate means revisiting this.
+            or self.block_type in _ENGINE_INERT_BLOCK_TYPES
+        ):
+            return self.engine
+        return workflow_block_engine_override(workflow_run_id) or self.engine
 
     def get_all_parameters(
         self,
@@ -1786,7 +1814,7 @@ class BaseTaskBlock(Block):
                     browser_session_id=browser_session_id,
                     close_browser_on_completion=close_browser_on_completion,
                     complete_verification=self.complete_verification,
-                    engine=self.engine,
+                    engine=self.resolve_engine(workflow_run.workflow_run_id),
                 )
             except Exception as e:
                 # Make sure the task is marked as failed in the database before raising the exception
@@ -2563,12 +2591,14 @@ class ForLoopBlock(Block):
             description="Natural language extraction result",
         )
 
-        return ExtractionBlock(
+        extraction_block = ExtractionBlock(
             label=f"natural_lang_extraction_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        extraction_block._exclude_from_engine_ab = True
+        return extraction_block
 
     def _build_loop_graph(
         self,
@@ -3969,6 +3999,18 @@ CODE_BLOCK_GENERIC_FAILURE_REASON = "Failed to execute code block."
 CODE_BLOCK_FAILURE_REASON_MAX_CHARS = 2000
 
 
+def _code_block_failure_action(*, failing_line: int | None, action_order: int, response: str = "") -> Action:
+    return Action(
+        action_id=generate_action_id(),
+        action_type=ActionType.NULL_ACTION,
+        status=ActionStatus.failed,
+        action_order=action_order,
+        description=f"code error at line {failing_line}" if failing_line else "code error",
+        response=response[:500],
+        output={"code_line": failing_line},
+    )
+
+
 def _page_open_error_label(error: BaseException) -> str:
     # Playwright maps only TimeoutError/TargetClosedError to their own Python classes; every
     # other driver failure is the base Error whose .name carries the real class (e.g. TypeError).
@@ -3978,98 +4020,12 @@ def _page_open_error_label(error: BaseException) -> str:
     return type(error).__name__
 
 
-_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR = ", ".join(
-    (
-        'input[type="checkbox"][id*="captcha" i]',
-        'input[type="checkbox"][id*="robot" i]',
-        'input[type="checkbox"][name*="captcha" i]',
-        '[role="checkbox"][aria-label*="robot" i]',
-        '[role="checkbox"][aria-label*="verify" i]',
-    )
-)
-_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR = ", ".join(
-    (
-        ".g-recaptcha",
-        ".cf-turnstile",
-        ".g-recaptcha[data-sitekey]",
-        ".cf-turnstile[data-sitekey]",
-        'iframe[src*="recaptcha" i]',
-        'iframe[src*="turnstile" i]',
-        'iframe[title*="recaptcha" i]',
-        'iframe[title*="challenge" i]',
-    )
-)
-_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR = ", ".join(
-    (
-        ".g-recaptcha",
-        '[data-sitekey][class*="recaptcha" i]',
-        'iframe[src*="recaptcha" i]',
-        'iframe[title*="recaptcha" i]',
-    )
-)
-_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR = 'textarea[name="g-recaptcha-response"], textarea[id^="g-recaptcha-response"]'
-_CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS = ("www.google.com", "www.recaptcha.net")
-_CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anchor")
-_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
-# The extension arm polls a solver over the network; the scout caller has no enclosing bound.
-_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS = 12
 # A download still in flight when the block returns leaves only its partial row, which the read-back
 # filters out. Bounded because run finalization claims the file regardless; this only decides whether
 # the block's own output carries it.
 _CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS = 60
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS = 6
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS = 0.5
-# Same reason, sized from measured solves: a correct solver task returns in ~25s, so this covers one
-# with headroom while cutting the losing task of the pair, which only ends at its own 180s timeout.
-_CODE_BLOCK_TOKEN_ARM_TIMEOUT_SECONDS = 90
-_CODE_BLOCK_WIDGET_RESET_TIMEOUT_SECONDS = 3
-# Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
-_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
-_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR = ", ".join(
-    (
-        "[data-challenge-state] button[type='submit']",
-        "[data-challenge-state] button.btn-primary",
-        "[data-challenge-state] [data-action='verify']",
-        "[data-captcha-widget] button[type='submit']",
-        "[data-captcha-widget] button.btn-primary",
-        "[data-captcha-widget] [data-action='verify']",
-    )
-)
-
-
-async def _bounded_code_block_locator_count(locator: Any) -> int:
-    try:
-        return await asyncio.wait_for(locator.count(), timeout=1.0)
-    except Exception:
-        return 0
-
-
-def _is_trusted_code_block_recaptcha_anchor_url(frame_url: str | None) -> bool:
-    if not frame_url:
-        return False
-    try:
-        parsed = urlparse(frame_url)
-    except ValueError:
-        return False
-    hostname = (parsed.hostname or "").lower()
-    return (
-        parsed.scheme == "https"
-        and hostname in _CODE_BLOCK_RECAPTCHA_ANCHOR_HOSTS
-        and parsed.path in _CODE_BLOCK_RECAPTCHA_ANCHOR_PATHS
-    )
-
-
-async def _bounded_code_block_recaptcha_token_populated(scope: Frame | Page | RecordingPage) -> bool | None:
-    try:
-        async with asyncio.timeout(1):
-            fields = scope.locator(_CODE_BLOCK_RECAPTCHA_RESPONSE_SELECTOR)
-            for index in range(await fields.count()):
-                value = await fields.nth(index).input_value()
-                if value and value.strip().lower() not in {"undefined", "null"}:
-                    return True
-    except (PlaywrightError, TimeoutError):
-        return None
-    return False
 
 
 async def _code_block_solve_captcha_builtin(
@@ -4079,127 +4035,20 @@ async def _code_block_solve_captcha_builtin(
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
 ) -> bool:
-    """Solve a detected challenge through the bounded platform ladder; True when an arm passed.
+    """Solve a detected challenge through the shared bounded ladder; True when an arm passed.
 
-    The initial structural probes are intentionally cheap. Solver routes are never
-    called when neither a challenge control nor vendor marker is present, and False
-    distinguishes that no-op from a solve so callers do not re-perceive a page nothing touched.
+    Delegates to solve_challenge_ladder and translates its neutral unsolved-signal into the
+    code-block-specific error the code-block callers expect.
     """
-    checkbox = page.locator(_CODE_BLOCK_CAPTCHA_CHECKBOX_SELECTOR)
-    checkbox_count = await _bounded_code_block_locator_count(checkbox)
-    marker = page.locator(_CODE_BLOCK_CAPTCHA_MARKER_SELECTOR)
-    marker_count = await _bounded_code_block_locator_count(marker)
-    if checkbox_count == 0 and marker_count == 0:
-        return False
-
-    if checkbox_count == 1:
-        candidate = checkbox.first
-        try:
-            if await candidate.is_visible() and await candidate.is_enabled():
-                await candidate.click()
-                await page.wait_for_timeout(100)
-                if await candidate.is_checked() or await _bounded_code_block_locator_count(checkbox) == 0:
-                    continuation = page.locator(_CODE_BLOCK_CAPTCHA_CONTINUE_SELECTOR)
-                    if await _bounded_code_block_locator_count(continuation) == 1:
-                        continuation_candidate = continuation.first
-                        if await continuation_candidate.is_visible() and await continuation_candidate.is_enabled():
-                            await continuation_candidate.click()
-                            await page.wait_for_timeout(100)
-                            if await _bounded_code_block_locator_count(checkbox) == 0:
-                                return True
-                    else:
-                        # Checkbox challenges commonly complete on the checkbox
-                        # interaction itself and expose no associated continuation.
-                        return True
-        except Exception:
-            LOG.info("code block CAPTCHA checkbox arm did not solve", arm="dom_checkbox")
-
-    anchor_clicked = False
-    anchor_left_token = False
-    # A page-level locator cannot cross into reCAPTCHA's anchor iframe. Click the checkbox in-frame.
     try:
-        async with asyncio.timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS):
-            for frame in page.frames:
-                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
-                    continue
-                anchor = frame.locator("#recaptcha-anchor")
-                if await _bounded_code_block_locator_count(anchor) != 1:
-                    continue
-                candidate = await anchor.first.element_handle()
-                if candidate is None or not (await candidate.is_visible()):
-                    continue
-                # The handle is bound to the validated document. If the frame navigates after this
-                # re-check, Playwright detaches the handle instead of clicking the replacement page.
-                if not _is_trusted_code_block_recaptcha_anchor_url(frame.url):
-                    continue
-                token_scope = frame.parent_frame or page
-                token_was_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
-                if await candidate.get_attribute("aria-checked") == "true":
-                    break
-                page_url_before_click = urlparse(page.url)._replace(fragment="").geturl()
-                await candidate.click()
-                anchor_clicked = True
-                LOG.info("code block CAPTCHA anchor frame clicked", arm="recaptcha_anchor_frame")
-                await page.wait_for_timeout(_CODE_BLOCK_RECAPTCHA_ANCHOR_SETTLE_MS)
-                if frame.is_detached() and urlparse(page.url)._replace(fragment="").geturl() != page_url_before_click:
-                    LOG.info("code block CAPTCHA anchor frame solved after navigation", arm="recaptcha_anchor_frame")
-                    return True
-                token_is_populated = await _bounded_code_block_recaptcha_token_populated(token_scope)
-                if (
-                    await candidate.get_attribute("aria-checked") == "true"
-                    and token_was_populated is False
-                    and token_is_populated is True
-                ):
-                    LOG.info("code block CAPTCHA anchor frame solved", arm="recaptcha_anchor_frame")
-                    return True
-                # An inconclusive baseline fails the test above even when the click earned a token,
-                # so read the widget rather than the verdict before deciding a reset is free.
-                anchor_left_token = token_is_populated is True
-                break
-    except Exception:
-        LOG.info("code block CAPTCHA anchor frame arm did not solve", arm="recaptcha_anchor_frame")
-
-    # Clicking the anchor escalates to an image challenge whose overlay covers the page and
-    # outlives the arm, so every later click lands on it instead of the form. Resetting is the only
-    # thing that closes it (Escape does not), and it is skipped when the click left a token behind,
-    # because a reset discards one.
-    if anchor_clicked and not anchor_left_token:
-        # The settle window is approximate and the reset is destructive, so look once more: a solve
-        # that landed just past it would otherwise be discarded and escalated all over again.
-        anchor_left_token = await _bounded_code_block_recaptcha_token_populated(page) is True
-    if anchor_clicked and not anchor_left_token:
-        try:
-            async with asyncio.timeout(_CODE_BLOCK_WIDGET_RESET_TIMEOUT_SECONDS):
-                await page.evaluate(
-                    "() => { const g = window.grecaptcha;"
-                    " const api = g && g.enterprise && g.enterprise.reset ? g.enterprise : g;"
-                    " if (api && api.reset) api.reset(); }"
-                )
-        except Exception:
-            LOG.info("code block CAPTCHA widget reset did not run", arm="recaptcha_anchor_frame")
-
-    try:
-        async with asyncio.timeout(_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS):
-            if await app.AGENT_FUNCTION.auto_solve_captchas(page):
-                return True
-    except Exception:
-        LOG.info("code block CAPTCHA extension arm did not solve", arm="extension")
-
-    recaptcha = page.locator(_CODE_BLOCK_RECAPTCHA_MARKER_SELECTOR)
-    if await _bounded_code_block_locator_count(recaptcha) > 0:
-        try:
-            async with asyncio.timeout(_CODE_BLOCK_TOKEN_ARM_TIMEOUT_SECONDS):
-                if await app.AGENT_FUNCTION.solve_recaptcha_token(
-                    page,
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run_id,
-                    browser_session_id=browser_session_id,
-                ):
-                    return True
-        except Exception:
-            LOG.info("code block CAPTCHA token arm did not solve", arm="token")
-
-    raise CodeBlockCaptchaError("CAPTCHA could not be solved.")
+        return await solve_challenge_ladder(
+            page,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            browser_session_id=browser_session_id,
+        )
+    except CaptchaChallengeUnsolvedError as exc:
+        raise CodeBlockCaptchaError("CAPTCHA could not be solved.") from exc
 
 
 def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
@@ -4612,13 +4461,14 @@ async def _code_block_click_and_claim_download_builtin(
     except CodeBlockDownloadClaimError:
         raise
     except Exception as exc:
+        # Whether a monitor owned the binding is the first question asked of a claim that saw no
+        # event, and it is unanswerable after the fact.
+        claim_monitor_owns_binding = _download_monitor_owns_binding(page)
         LOG.info(
             "codeblock.download_claim_decision",
             engaged=False,
             binding=download_binding.value,
-            # Recorded on the failure path too: whether a monitor owned the binding is the first
-            # question asked of a claim that saw no event, and it is unanswerable after the fact.
-            monitor_owns_binding=_download_monitor_owns_binding(page),
+            monitor_owns_binding=claim_monitor_owns_binding,
             clicked=click_error is None,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -4627,11 +4477,12 @@ async def _code_block_click_and_claim_download_builtin(
             # A selector that no longer matches is a page failure, not a download that failed to
             # fire. Re-raise Playwright's own error so the healing path still recognises its type.
             raise click_error
-        if download_binding is DownloadBinding.SESSION_DIR:
-            # The click landed and this binding's delivery is the session watcher's and the
-            # finalization claim's to prove, not this page's to witness. Failing here would fail a
-            # download that succeeded; the execution layer still reports an unregistered intent when
-            # nothing arrives.
+        if download_binding is DownloadBinding.SESSION_DIR or claim_monitor_owns_binding:
+            # The click landed, and this binding's delivery belongs to the session watcher or to the
+            # monitor -- which denies browser-native downloads and fetches the bytes itself, so no
+            # Download event need ever reach this page. Failing here would fail a download that
+            # succeeded; the execution layer still reports an unregistered intent when nothing
+            # arrives.
             return _DOWNLOAD_CLAIM_FALLBACK_STEM
         raise CodeBlockDownloadClaimError("Clicking the affordance did not fire a browser download.") from exc
 
@@ -4916,21 +4767,40 @@ async def wrapper({default_args}):
         )
         exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
-        if not parameter_defaults:
-            return user_function
+        inner_function = user_function
+        if parameter_defaults:
+            excluded_parameter_keys = frozenset(parameter_defaults)
 
-        excluded_parameter_keys = frozenset(parameter_defaults)
+            async def filtered_user_function() -> dict[str, Any]:
+                result: Any = await user_function()
+                # An explicit `return <non-dict>` in user code yields that value directly,
+                # not the __capture_locals() dict; only the implicit dict needs the injected
+                # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
+                if not isinstance(result, dict):
+                    return result
+                return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
 
-        async def filtered_user_function() -> dict[str, Any]:
-            result: Any = await user_function()
-            # An explicit `return <non-dict>` in user code yields that value directly,
-            # not the __capture_locals() dict; only the implicit dict needs the injected
-            # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
-            if not isinstance(result, dict):
+            inner_function = filtered_user_function
+
+        async def timed_user_function() -> dict[str, Any]:
+            started_at = monotonic()
+            success = False
+            try:
+                result: Any = await inner_function()
+                success = True
                 return result
-            return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
+            finally:
+                # No await here: this runs during wait_for cancellation and must not block it.
+                LOG.info(
+                    "codeblock.inline_exec_completed",
+                    duration_ms=round((monotonic() - started_at) * 1000, 1),
+                    success=success,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                )
 
-        return filtered_user_function
+        return timed_user_function
 
     @staticmethod
     async def execute_user_function_with_timeout(
@@ -5063,9 +4933,10 @@ async def wrapper({default_args}):
         run_id: str,
         session_bound: bool,
     ) -> None:
-        """Tag this run's session-keyed DOWNLOAD artifacts so a run-scoped read can see them.
-        The watcher writes them with ``run_id`` NULL because it cannot know which run is active, and
-        the window is this block's own row so a co-tenant run's earlier downloads stay unclaimed."""
+        """Reconcile this run's session-keyed DOWNLOAD artifacts so a run-scoped read can see them.
+        The watcher binds the producing run when it observes a download; this picks up rows an older
+        watcher left unbound, windowed on this block's own row so a co-tenant run's earlier downloads
+        stay unclaimed."""
         context = skyvern_context.current()
         browser_session_id = context.browser_session_id if context else None
         if not session_bound:
@@ -6949,6 +6820,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
                 block_label=self.label,
                 browser_session_id=browser_session_id,
+                code=self.code,
             )
         except CodeBlockRunnerSelectionError as selection_error:
             return await self.build_block_result(
@@ -7009,9 +6881,21 @@ async def wrapper({default_args}):
                     block_label=self.label,
                 )
                 if secure_code_block_result is not None:
-                    await recorder.persist(recorder.recorded_actions())
-                    if secure_code_block_result.failure is not None:
-                        secure_failure = secure_code_block_result.failure
+                    recorded = recorder.recorded_actions()
+                    secure_failure = secure_code_block_result.failure
+                    if (
+                        secure_failure is not None
+                        and type(secure_failure.failing_line) is int
+                        and secure_failure.failing_line > 0
+                    ):
+                        recorded.append(
+                            _code_block_failure_action(
+                                failing_line=secure_failure.failing_line,
+                                action_order=len(recorded),
+                            )
+                        )
+                    await recorder.persist(recorded)
+                    if secure_failure is not None:
                         secure_classification = (
                             HealClassification(
                                 healable=False,
@@ -7385,15 +7269,10 @@ async def wrapper({default_args}):
             if recorder.last_recorded_exception() is not e:
                 # The exception did not come from a recorded page call; add a synthetic failure row.
                 recorded.append(
-                    Action(
-                        # Synthesized outside the recorder, so it needs its own stable id for the upsert path.
-                        action_id=generate_action_id(),
-                        action_type=ActionType.NULL_ACTION,
-                        status=ActionStatus.failed,
+                    _code_block_failure_action(
                         action_order=len(recorded),
-                        description=f"code error at line {failing_line}" if failing_line else "code error",
                         response=(failure_reason or "")[:500],
-                        output={"code_line": failing_line},
+                        failing_line=failing_line,
                     )
                 )
             await recorder.persist(recorded)
@@ -10013,13 +9892,30 @@ class FileParserBlock(Block):
 
         return FileType.CSV  # Final fallback for truly unknown files
 
-    def _detect_file_type_from_magic_bytes(self, file_path: str) -> FileType | None:
-        """Detect file type from magic bytes using the filetype library. Returns None if unrecognized."""
-        kind = filetype.guess(file_path)
-        if kind is None:
-            return None
+    _OLE_CFB_MAGIC: ClassVar[bytes] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
-        mime = kind.mime
+    def _raise_if_legacy_ole_document(self, file_path: str) -> None:
+        try:
+            with open(file_path, "rb") as file:
+                header = file.read(len(self._OLE_CFB_MAGIC))
+        except OSError:
+            return
+        if header != self._OLE_CFB_MAGIC:
+            return
+        raise InvalidFileType(
+            file_url=self.file_url,
+            file_type=FileType.DOCX,
+            error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
+        )
+
+    def _detect_file_type_from_magic_bytes(self, file_path: str) -> FileType | None:
+        """Detect file type from magic bytes using the filetype library. Returns None if unrecognized.
+
+        Raises InvalidFileType for legacy OLE Office documents (e.g. Word 97-2003 .doc), which no
+        parser here supports and which the CSV fallback would otherwise reject as binary data.
+        """
+        kind = filetype.guess(file_path)
+        mime = kind.mime if kind else None
         if mime == "application/pdf":
             return FileType.PDF
         elif mime in (
@@ -10032,8 +9928,11 @@ class FileParserBlock(Block):
         elif mime == "application/zip":
             # OOXML files are ZIP containers matched before this generic branch, so only plain archives reach it.
             return FileType.ZIP
-        elif mime.startswith("image/"):
+        elif mime is not None and mime.startswith("image/"):
             return FileType.IMAGE
+        # Unrecognized or unmapped mime (e.g. application/msword): an OLE CFB container is a legacy
+        # Office document nothing downstream can parse, so raise instead of falling back to CSV.
+        self._raise_if_legacy_ole_document(file_path)
         return None
 
     def _detect_file_encoding(self, file_path: str) -> str:
@@ -10691,6 +10590,18 @@ class FileParserBlock(Block):
             return await self._parse_docx_file(file_path)
         return None
 
+    def _bound_extraction_input_tokens(self, content_str: str) -> str:
+        tokens = encode_tokens(content_str)
+        if len(tokens) <= MAX_FILE_PARSE_INPUT_TOKENS:
+            return content_str
+        LOG.warning(
+            "File parser extraction input exceeds token limit, truncating",
+            file_url=self.file_url,
+            content_tokens=len(tokens),
+            max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+        )
+        return decode_tokens(tokens[:MAX_FILE_PARSE_INPUT_TOKENS])
+
     async def _extract_with_ai(
         self,
         content: str | list[dict[str, Any]],
@@ -10709,6 +10620,13 @@ class FileParserBlock(Block):
             content_str = json.dumps(content, separators=(",", ":"))
         else:
             content_str = content
+
+        content_str = await _run_blocking_parse_step(
+            "extraction input token bounding",
+            self.file_url,
+            self._bound_extraction_input_tokens,
+            content_str,
+        )
 
         llm_prompt = prompt_engine.load_prompt(
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
@@ -14087,6 +14005,7 @@ async def _evaluate_prompt_branch_conditions_batch(
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        extraction_block._exclude_from_engine_ab = True
 
         LOG.info(
             "Conditional branch ExtractionBlock created (batched)",
@@ -15017,6 +14936,78 @@ class WorkflowTriggerBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+
+
+_TASK_V3_SUPPORTED_BLOCK_TYPES = frozenset(
+    {
+        BlockType.TASK,
+        BlockType.NAVIGATION,
+        BlockType.LOGIN,
+        BlockType.ACTION,
+        BlockType.VALIDATION,
+        BlockType.EXTRACTION,
+    }
+)
+
+
+# Task blocks whose engine field never reaches a dispatch decision: a GOTO_URL block's task has no
+# goal or criterion, so execute_step completes it before the v3 gate, and HumanInteractionBlock
+# overrides execute and never calls execute_step at all. They neither qualify nor disqualify a run.
+_ENGINE_INERT_BLOCK_TYPES = frozenset({BlockType.GOTO_URL, BlockType.HUMAN_INTERACTION})
+
+
+def _task_block_supports_v3(task_block: BaseTaskBlock) -> bool:
+    """Whether a workflow task block is eligible to dispatch to the Task V3 native engine.
+
+    v3 doesn't implement download-completion semantics yet, so a block relying on them
+    (complete_on_download / download_suffix / download_timeout) stays on the step engine.
+    """
+    if task_block.block_type not in _TASK_V3_SUPPORTED_BLOCK_TYPES:
+        return False
+    if task_block.complete_on_download or task_block.download_suffix or task_block.download_timeout is not None:
+        return False
+    return True
+
+
+def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool) -> bool:
+    """Whether a whole workflow run may be rerouted onto v3 by the A/B.
+
+    Eligibility is a property of the RUN, not of a block: a run whose blocks disagreed about the
+    engine would drive one browser session with two engines, so no per-run outcome would be
+    attributable to either arm. One participating block v3 cannot execute therefore disqualifies
+    the run, and so does one block pinned to a non-default engine -- that block is honored
+    as-authored in both arms, but it would leave the control arm mixed.
+
+    ``blocks`` must be the flattened definition (``get_all_blocks``), i.e. the superset of task
+    blocks the run could reach. A ``block_labels`` re-run executes only a whitelisted subset of
+    that definition but is still judged against all of it, so one ineligible block elsewhere in the
+    workflow keeps the re-run on control. That is deliberate: scoping eligibility to the subset
+    would have to reproduce exactly which blocks the whitelist reaches, and getting it wrong is the
+    mixed-arm run this predicate exists to prevent -- and a partial re-run is not comparable to a
+    full run in the cohort anyway.
+
+    Script runs are excluded: their blocks execute as cached code and never reach engine dispatch,
+    so treatment would land only on the ai_fallback subset -- the blocks that already failed cached
+    execution.
+    """
+    if is_script_run:
+        return False
+    reroutable_blocks = 0
+    for block in blocks:
+        if not isinstance(block, BaseTaskBlock):
+            continue
+        if block.block_type in _ENGINE_INERT_BLOCK_TYPES:
+            continue
+        if block.engine != RunEngine.skyvern_v1:
+            return False
+        if not _task_block_supports_v3(block):
+            return False
+        if block.totp_verification_url:
+            return False
+        reroutable_blocks += 1
+    # A run with nothing to reroute would be bucketed and recorded as an exposure while both arms
+    # execute identically, diluting the experiment.
+    return reroutable_blocks > 0
 
 
 def get_all_blocks(blocks: list[BlockTypeVar]) -> list[BlockTypeVar]:

@@ -1,15 +1,23 @@
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
     MAX_LIFETIME_SECONDS,
     MAX_TIMEOUT,
+    MAX_TIMEOUT_EXCEEDED_MESSAGE,
     MIN_TIMEOUT,
+    max_timeout_exceeded_warning,
     seconds_until_expiry,
     session_is_active,
 )
 from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest
+from skyvern.webeye.schemas import BrowserSessionResponse
 
 _BASE = 60 * 60  # 1h base timeout
 _IDLE = 60 * 60  # idle out 1h after last activity
@@ -130,10 +138,49 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
         ) is (remaining > 0)
 
 
-def test_requested_timeout_above_the_cap_is_clamped() -> None:
-    # Callers that still send the old 24h ceiling get the cap, not a 422.
-    assert CreateBrowserSessionRequest(timeout=1440).timeout == MAX_TIMEOUT
-    assert CreateBrowserSessionRequest(timeout=MAX_TIMEOUT + 1).timeout == MAX_TIMEOUT
+async def _create_session(timeout: int | None) -> tuple[MagicMock, BrowserSessionResponse]:
+    app_mock = MagicMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(
+        return_value=SimpleNamespace(persistent_browser_session_id="pbs_1")
+    )
+    built_response = BrowserSessionResponse(
+        browser_session_id="pbs_1",
+        organization_id="org_1",
+        created_at=datetime(2026, 1, 1),
+        modified_at=datetime(2026, 1, 1),
+    )
+    from_browser_session = AsyncMock(return_value=built_response)
+
+    with (
+        patch.object(browser_sessions_routes, "app", app_mock),
+        patch.object(browser_sessions_routes.BrowserSessionResponse, "from_browser_session", from_browser_session),
+    ):
+        response = await browser_sessions_routes.create_browser_session(
+            CreateBrowserSessionRequest(timeout=timeout),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    return app_mock, response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [MAX_TIMEOUT + 1, 1440])
+async def test_requested_timeout_above_the_cap_is_capped_with_a_warning(timeout: int) -> None:
+    app_mock, response = await _create_session(timeout)
+
+    assert app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["timeout_minutes"] == MAX_TIMEOUT
+    assert response.warning == max_timeout_exceeded_warning(timeout)
+    assert str(timeout) in response.warning
+    assert MAX_TIMEOUT_EXCEEDED_MESSAGE in response.warning
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [MAX_TIMEOUT, 90, None])
+async def test_requested_timeout_within_the_cap_is_passed_through_without_a_warning(timeout: int | None) -> None:
+    app_mock, response = await _create_session(timeout)
+
+    assert app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["timeout_minutes"] == timeout
+    assert response.warning is None
 
 
 def test_requested_timeout_at_or_below_the_cap_is_preserved() -> None:

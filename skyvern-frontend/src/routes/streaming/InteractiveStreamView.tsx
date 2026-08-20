@@ -369,10 +369,13 @@ function InteractiveStreamView({
         {/* Chrome and viewport share previewWidth so the window sizes to the letterboxed
             picture rather than the pane, the way a real browser window frames its page.
             When the parent owns the frame it applies that width (and the border) itself,
-            around its own tab strip too, so here we just fill it. */}
+            around its own tab strip too, so here we just fill it.
+            previewWidth comes from the height alone, so a pane taller than the picture's
+            aspect ratio (the studio's browser pane) asks for more width than it has;
+            max-w-full keeps the window inside it and letterboxes instead of cropping. */}
         <div
           className={cn(
-            "mx-auto flex h-full flex-col items-center overflow-hidden",
+            "mx-auto flex h-full max-w-full flex-col items-center overflow-hidden",
             !parentOwnsFrame && "rounded-md shadow-elevated",
           )}
           style={

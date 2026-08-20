@@ -117,7 +117,11 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -381,7 +385,6 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
-    copilotFixOrigin?: unknown;
   } | null;
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
@@ -396,7 +399,6 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
-  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     clearStoredInitialCopilotMessage();
@@ -728,11 +730,13 @@ function Workspace({
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
+    enabled: isGeneratingCode,
     workflowPermanentId,
     pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "pending",
@@ -2877,7 +2881,6 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
-        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>

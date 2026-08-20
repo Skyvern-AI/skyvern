@@ -701,10 +701,10 @@ Purpose: Send email notifications. This is the "Send Email Block" in the UI.
 Structure:
 block_type: send_email
 label: <unique_label>
-smtp_host_secret_parameter_key: <param_key>     # Secret parameter key for SMTP host (required unless custom_smtp_host is set)
-smtp_port_secret_parameter_key: <param_key>     # Secret parameter key for SMTP port (required unless custom_smtp_host is set)
-smtp_username_secret_parameter_key: <param_key> # Secret parameter key for SMTP username (required unless custom_smtp_host is set)
-smtp_password_secret_parameter_key: <param_key> # Secret parameter key for SMTP password (required unless custom_smtp_host is set)
+smtp_host_secret_parameter_key: <param_key>     # Optional: Only to point at your own declared secret parameter; the platform provisions its own SMTP credentials when these are omitted
+smtp_port_secret_parameter_key: <param_key>     # Optional: See smtp_host_secret_parameter_key
+smtp_username_secret_parameter_key: <param_key> # Optional: See smtp_host_secret_parameter_key
+smtp_password_secret_parameter_key: <param_key> # Optional: See smtp_host_secret_parameter_key
 sender: <email_address>                         # Required: Sender email address
 recipients: [<email_address>]                   # Required: Recipient list
 subject: <subject_line>                         # Required: Email subject
@@ -726,15 +726,45 @@ blocks:
   - block_type: send_email
     label: notify_ops
     next_block_label: null
-    smtp_host_secret_parameter_key: smtp_host
-    smtp_port_secret_parameter_key: smtp_port
-    smtp_username_secret_parameter_key: smtp_user
-    smtp_password_secret_parameter_key: smtp_pass
     sender: "automation@example.com"
     recipients: ["ops@example.com"]
     subject: "Daily report ready"
     body: "The latest report is ready for review."
     file_attachments: ["/tmp/latest_report.pdf"]
+
+** HUMAN INTERACTION BLOCK (human_interaction) **
+
+Purpose: Pause the workflow and wait for a person. This is the "Human Interaction Block" in the UI. The run moves to the paused state, the recipients are emailed a link to the run (plus a link to the browser session when the run has one), and the workflow waits. The person opens the run in Skyvern, optionally takes control of the browser to do the step by hand, then approves - which resumes the workflow - or rejects, which cancels the run. If nobody responds within timeout_seconds the block times out and the workflow stops. Choose this block whenever a person must approve before the workflow continues, or must do something the agent cannot do itself. Prefer an automated path first: a credentialed login block signs in on its own and handles 2FA, so use it for sign-in rather than this block. Every human_interaction block turns a reusable automation into a manual step on every future run, so it is the right answer for approval gates and for steps automation genuinely cannot perform - not a shortcut past a hard login.
+
+Use Cases:
+- A person approves before the workflow continues (high-value action, compliance review, a check of extracted data)
+- A person does a step by hand in the browser that has no automated path: solving a CAPTCHA, biometric or voice verification, or a sign-in that credentialed login cannot complete
+- Escalation for a case the agent is not allowed to decide on its own
+
+Structure:
+block_type: human_interaction
+label: <unique_label>
+recipients: [<email_address>]                   # Required: Who gets notified; ask the user for an address if you do not have one
+timeout_seconds: <number>                       # Optional: How long to wait for the person before the block times out (default: 7200). A paused run is reaped after about 4.5 hours, so values beyond that do not extend the wait
+sender: <email_address>                         # Optional: A copy is BCC'd here as the record of the send (default: "hello@skyvern.com")
+subject: <subject_line>                         # Optional: Notification subject (default: "Human interaction required for workflow run")
+body: <email_body>                              # Optional: Notification body (default: "Your interaction is required for a workflow run!")
+instructions: <text>                            # Optional: What the person should do, shown beside the approve/reject controls (default: "Please review and approve or reject to continue the workflow.")
+positive_descriptor: <text>                     # Optional: Label on the approve control (default: "Approve")
+negative_descriptor: <text>                     # Optional: Label on the reject control (default: "Reject")
+
+Example:
+blocks:
+  - block_type: human_interaction
+    label: approve_order
+    next_block_label: submit_order
+    timeout_seconds: 3600
+    recipients: ["ops@example.com"]
+    subject: "Approval needed before the order is submitted"
+    body: "A workflow run is paused and needs someone to approve the order before it is submitted."
+    instructions: "Review the order total and line items, then approve to submit or reject to cancel the run."
+    positive_descriptor: "Approve order"
+    negative_descriptor: "Cancel"
 
 ** TEXT PROMPT BLOCK (text_prompt) **
 

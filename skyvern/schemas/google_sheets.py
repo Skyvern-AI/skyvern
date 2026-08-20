@@ -120,18 +120,26 @@ def extract_a1_sheet_prefix(a1: str | None) -> str | None:
     return None
 
 
+def _leading_column_letters(cell_range: str | None) -> str | None:
+    """Column letters an A1 body starts at (``C``, ``C:C``, ``C1``, ``C1:E1``), else None."""
+    if not cell_range:
+        return None
+    start = strip_a1_sheet_prefix(cell_range).split(":", 1)[0].strip().upper()
+    match = _A1_CELL_RE.match(start) or _A1_COLUMN_ONLY_RE.match(start)
+    return match.group(1) if match else None
+
+
 def leading_column_offset(a1: str | None) -> int:
-    if not a1:
-        return 0
-    body = strip_a1_sheet_prefix(a1)
-    start = body.split(":", 1)[0].upper()
-    cell_match = _A1_CELL_RE.match(start)
-    if cell_match:
-        return column_letters_to_index(cell_match.group(1))
-    col_match = _A1_COLUMN_ONLY_RE.match(start)
-    if col_match:
-        return column_letters_to_index(col_match.group(1))
-    return 0
+    return column_letters_to_index(_leading_column_letters(a1) or "A")
+
+
+def destination_start_column(cell_range: str | None) -> str | None:
+    """The pinned start column, or None when the range names no column. Pass the range field rather
+    than a composed A1, since a short bare sheet title would otherwise read as column letters."""
+    letters = _leading_column_letters(cell_range)
+    if letters is None or column_letters_to_index(letters) > MAX_COLUMN_INDEX:
+        return None
+    return letters
 
 
 def a1_to_grid_range(a1: str, sheet_id: int) -> dict[str, int]:

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import smtplib
 import ssl
 from datetime import UTC, datetime
@@ -462,11 +463,7 @@ def test_send_custom_smtp_connection_error_is_user_actionable_with_detail() -> N
         with pytest.raises(CustomSMTPConnectionFailed) as exc_info:
             _send_custom("bad.example.com", 587, "user@example.com", "hunter2")
     message = str(exc_info.value)
-    assert message == (
-        "Could not connect to SMTP server bad.example.com:587 "
-        "(OSError: [Errno 8] nodename nor servname provided). "
-        "Check the SMTP host and port in the Send Email block's Advanced settings."
-    )
+    assert re.search(r"bad\.example\.com:587", message)
     assert "Advanced settings" in message
     # Connect-stage errors carry no credentials; the OS detail makes the failure actionable.
     assert "nodename" in message

@@ -17,6 +17,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, ValidationBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import ValidationBlockYAML
 
 
@@ -64,6 +65,28 @@ def test_converter_defaults_flag_false_when_omitted() -> None:
     block_yaml = ValidationBlockYAML(label="v", complete_criterion="x")
     block = block_yaml_to_block(block_yaml, {"v_output": _output_parameter("v")})
     assert block.without_page_information is False
+
+
+def test_converter_threads_engine_and_max_steps_per_run_from_yaml() -> None:
+    block_yaml = ValidationBlockYAML(
+        label="v",
+        complete_criterion="x",
+        engine=RunEngine.skyvern_v3,
+        max_steps_per_run=7,
+    )
+    block = block_yaml_to_block(block_yaml, {"v_output": _output_parameter("v")})
+    assert isinstance(block, ValidationBlock)
+    assert block.engine == RunEngine.skyvern_v3
+    assert block.max_steps_per_run == 7
+
+
+def test_converter_defaults_engine_and_max_steps_per_run_when_omitted() -> None:
+    """Omitting the new fields must reproduce today's behavior: the default engine, and the
+    historical hardcoded step cap of 2 (not the YAML field's own None default)."""
+    block_yaml = ValidationBlockYAML(label="v", complete_criterion="x")
+    block = block_yaml_to_block(block_yaml, {"v_output": _output_parameter("v")})
+    assert block.engine == RunEngine.skyvern_v1
+    assert block.max_steps_per_run == 2
 
 
 @pytest.mark.asyncio

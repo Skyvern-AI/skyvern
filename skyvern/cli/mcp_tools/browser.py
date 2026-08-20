@@ -376,11 +376,6 @@ def _exception_message(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _is_expired_browser_session_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "code=4408" in message and "reason=session expired" in message
-
-
 def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
     return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
 
@@ -497,8 +492,8 @@ async def skyvern_navigate(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_navigate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_navigate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -658,8 +653,8 @@ async def skyvern_click(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_click", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_click", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
     source_url = _trajectory_source_url(page)
@@ -888,8 +883,8 @@ async def skyvern_drag(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_drag", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_drag", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=source_selector)
 
@@ -1068,8 +1063,8 @@ async def skyvern_file_upload(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_file_upload", ok=False, error=no_browser_error(exc))
 
     local_uploads: list[FilePayload] | None = None
     if has_local:
@@ -1182,8 +1177,8 @@ async def skyvern_hover(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_hover", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_hover", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1322,8 +1317,8 @@ async def skyvern_type(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_type", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_type", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(
         ctx=ctx,
@@ -1531,8 +1526,8 @@ async def skyvern_screenshot(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_screenshot", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_screenshot", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1609,8 +1604,8 @@ async def skyvern_scroll(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_scroll", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_scroll", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1739,8 +1734,8 @@ async def skyvern_select_option(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_select_option", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_select_option", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, value=value)
     source_url = _trajectory_source_url(page)
@@ -2044,8 +2039,8 @@ async def skyvern_press_key(
     intent = _blank_to_none(intent)
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_press_key", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_press_key", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, key=key)
     source_url = _trajectory_source_url(page)
@@ -2193,8 +2188,8 @@ async def skyvern_wait(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_wait", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_wait", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -2349,8 +2344,8 @@ async def skyvern_wait_for_either_state(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_wait_for_either_state", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_wait_for_either_state", ok=False, error=no_browser_error(exc))
 
     source_url = _trajectory_source_url(page)
     with Timer() as timer:
@@ -2438,8 +2433,8 @@ async def skyvern_evaluate(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_evaluate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_evaluate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2489,8 +2484,8 @@ async def skyvern_extract(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_extract", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_extract", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2540,20 +2535,8 @@ async def _run_paired_capture(
     started_at = time.perf_counter()
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result(action, ok=False, error=no_browser_error())
-    except Exception as exc:
-        if _is_expired_browser_session_error(exc):
-            return make_result(
-                action,
-                ok=False,
-                error=make_error(
-                    ErrorCode.SESSION_EXPIRED,
-                    "Browser session expired.",
-                    "Create a new browser session and retry this operation.",
-                ),
-            )
-        raise
+    except BrowserNotAvailableError as exc:
+        return make_result(action, ok=False, error=no_browser_error(exc))
     action_result = _action_result_factory(ctx=ctx, page=page)
     operation_functions: dict[str, Callable[..., Any]] = {
         "navigate": skyvern_navigate,
@@ -2776,8 +2759,8 @@ async def skyvern_validate(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_validate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_validate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2827,8 +2810,8 @@ async def skyvern_act(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_act", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_act", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2902,8 +2885,8 @@ async def skyvern_run_task(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_run_task", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_run_task", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3058,8 +3041,8 @@ async def skyvern_login(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_login", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_login", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3185,8 +3168,8 @@ async def skyvern_frame_switch(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -3246,8 +3229,8 @@ async def skyvern_frame_main(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_main", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_main", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3276,8 +3259,8 @@ async def skyvern_frame_list(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_list", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_list", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3323,8 +3306,8 @@ async def skyvern_find(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_find", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_find", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=value if by == "css" else None)
 
@@ -3383,8 +3366,8 @@ async def skyvern_clipboard_read(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3425,8 +3408,8 @@ async def skyvern_clipboard_write(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
 
@@ -3808,10 +3791,10 @@ async def skyvern_observe(
         if v2_enabled:
             clear_session_ref_map(session_id=session_id, cdp_url=cdp_url, generation=lookup_generation)
         raise
-    except BrowserNotAvailableError:
+    except BrowserNotAvailableError as exc:
         if v2_enabled:
             clear_session_ref_map(session_id=session_id, cdp_url=cdp_url, generation=lookup_generation)
-        return make_result("skyvern_observe", ok=False, error=no_browser_error())
+        return make_result("skyvern_observe", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -4279,14 +4262,14 @@ async def skyvern_execute(
                 generation=operation_generation,
             )
         raise
-    except BrowserNotAvailableError:
+    except BrowserNotAvailableError as exc:
         if observe_v2_enabled():
             clear_session_ref_map(
                 session_id=session_id,
                 cdp_url=cdp_url,
                 generation=operation_generation,
             )
-        return make_result("skyvern_execute", ok=False, error=no_browser_error())
+        return make_result("skyvern_execute", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
     operation_generation = (

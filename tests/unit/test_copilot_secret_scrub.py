@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -127,13 +127,22 @@ class _FakeRawResult:
 
 
 class _FakeClient:
-    def __init__(self, payload: dict[str, Any] | Exception) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any] | Exception,
+        on_call: Callable[[], None] | None = None,
+        is_error: bool = False,
+    ) -> None:
         self._payload = payload
+        self._on_call = on_call
+        self._is_error = is_error
 
     async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> _FakeRawResult:
+        if self._on_call is not None:
+            self._on_call()
         if isinstance(self._payload, Exception):
             raise self._payload
-        return _FakeRawResult(self._payload)
+        return _FakeRawResult(self._payload, self._is_error)
 
 
 def _evaluate_readback_payload() -> dict[str, Any]:
@@ -156,16 +165,21 @@ def _evaluate_readback_payload() -> dict[str, Any]:
 
 
 def _make_server(
-    ctx: AgentContext, payload: dict[str, Any] | Exception, overlay: SchemaOverlay
+    ctx: AgentContext,
+    payload: dict[str, Any] | Exception,
+    overlay: SchemaOverlay,
+    alias_map: dict[str, str] | None = None,
+    on_call: Callable[[], None] | None = None,
+    is_error: bool = False,
 ) -> SkyvernOverlayMCPServer:
     server = SkyvernOverlayMCPServer(
         transport=MagicMock(),
         overlays={"evaluate": overlay},
-        alias_map={},
+        alias_map=alias_map or {},
         allowlist=frozenset(),
         context_provider=lambda: ctx,
     )
-    server._client = _FakeClient(payload)
+    server._client = _FakeClient(payload, on_call, is_error)
     return server
 
 

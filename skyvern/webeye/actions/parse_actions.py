@@ -155,7 +155,7 @@ def parse_action(
             input_or_select_context = InputOrSelectContext.model_validate(context_dict)
         return InputTextAction(
             **base_action_dict,
-            text=action["text"],
+            text=action.get("text"),
             input_or_select_context=input_or_select_context,
             totp_code_required=totp_code_required,
         )
@@ -163,22 +163,22 @@ def parse_action(
     if action_type == ActionType.PASTE_TEXT:
         return PasteTextAction(
             **base_action_dict,
-            text=action["text"],
+            text=action.get("text"),
         )
 
     if action_type == ActionType.UPLOAD_FILE:
         # TODO: see if the element is a file input element. if it's not, convert this action into a click action
         return UploadFileAction(
             **base_action_dict,
-            file_url=action["file_url"],
+            file_url=action.get("file_url"),
         )
 
     # This action is not used in the current implementation. Click actions are used instead.
     if action_type == ActionType.DOWNLOAD_FILE:
-        return DownloadFileAction(**base_action_dict, file_name=action["file_name"])
+        return DownloadFileAction(**base_action_dict, file_name=action.get("file_name"))
 
     if action_type == ActionType.SELECT_OPTION:
-        option = action["option"]
+        option = action.get("option")
         if option is None:
             raise ValueError("SelectOptionAction requires an 'option' field")
 
@@ -206,7 +206,7 @@ def parse_action(
     if action_type == ActionType.CHECKBOX:
         return CheckboxAction(
             **base_action_dict,
-            is_checked=action["is_checked"],
+            is_checked=action.get("is_checked"),
         )
 
     if action_type == ActionType.WAIT:
@@ -354,7 +354,7 @@ def parse_action(
 
 @traced(name="skyvern.agent.parse_actions")
 def parse_actions(
-    task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Dict[str, Any]]
+    task: Task, step_id: str, step_order: int, scraped_page: ScrapedPage, json_response: list[Any]
 ) -> list[Action]:
     actions: list[Action] = []
     _span = otel_trace.get_current_span()
@@ -362,7 +362,14 @@ def parse_actions(
     context = skyvern_context.ensure_context()
     totp_code = context.totp_codes.get(task.task_id)
     totp_code_required = bool(totp_code)
+    non_object_entries: list[Any] = []
     for idx, action in enumerate(json_response):
+        # A planner refusal repaired into the actions array arrives as prose, and one bad
+        # response can carry dozens of such fragments. Collect them for a single log rather
+        # than letting each one fail inside parse_action.
+        if not isinstance(action, dict):
+            non_object_entries.append(action)
+            continue
         try:
             action_instance = parse_action(
                 action=action,
@@ -408,6 +415,16 @@ def parse_actions(
                 raw_action=action,
                 exc_info=True,
             )
+
+    if non_object_entries:
+        LOG.warning(
+            "Skipped non-object entries in the actions array",
+            task_id=task.task_id,
+            skipped_count=len(non_object_entries),
+            raw_action_count=len(json_response),
+            parsed_action_count=len(actions),
+            sample_entries=[str(entry)[:200] for entry in non_object_entries[:3]],
+        )
 
     ############################ This part of code might not be needed ############################
     # Reason #1. validation can be done in action handler but not in parser

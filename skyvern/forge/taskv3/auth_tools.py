@@ -35,11 +35,8 @@ _GUIDANCE = (
 def build_auth_tools(task: Task) -> tuple[list[ToolSpec], str]:
     """Return (tools, system-prompt guidance) for verification-code handling, or ([], "") when the
     task has no verification-code source configured (so the tool isn't offered needlessly)."""
-    # v3 only runs code sources it can actually service: a totp_verification_url task stays on the step
-    # engine (the v3 dispatch gate excludes it), so it never reaches this builder — gating on it would be
-    # dead. Credential-vault TOTP discrimination needs active_credential_parameter_key, which only v1's
-    # action handler sets, so multiple TOTP credentials can't disambiguate on v3 — not reachable today
-    # (v3 runs bare tasks, not workflow blocks); revisit with v3 credential support.
+    # totp_verification_url tasks stay on the step engine (v3 dispatch gate excludes them), so gating on
+    # it here is dead; a block with 2+ login-credential parameters still can't disambiguate TOTP.
     payload_otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
     has_code_source = bool(
         (payload_otp_value is not None and payload_otp_value.get_otp_type() == OTPType.TOTP)

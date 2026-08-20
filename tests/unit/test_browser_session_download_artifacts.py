@@ -112,7 +112,7 @@ async def test_create_browser_session_download_artifact_inserts_when_no_existing
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["checksum"] == "sha-xyz"
     assert kwargs["file_size"] == 1234
-    # No run_id at write time — claim happens at run finalization.
+    # An unresolved producer still writes the row; the claim reconciles it later.
     assert kwargs.get("run_id") is None
 
 
@@ -148,6 +148,63 @@ async def test_create_browser_session_download_artifact_is_idempotent_per_sessio
 
     assert artifact_id == "a_existing"
     mock_db_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_download_artifact_fills_an_unbound_existing_row():
+    manager = ArtifactManager()
+    existing = _make_artifact("a_existing", "s3://bucket/pbs_1/downloads/file.pdf")
+    mock_bind = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            AsyncMock(return_value=existing),
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bind_session_download_artifact_producer",
+            mock_bind,
+        ),
+    ):
+        await manager.create_browser_session_download_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            run_id="wr_a",
+        )
+
+    mock_bind.assert_awaited_once()
+    assert mock_bind.call_args.kwargs["run_id"] == "wr_a"
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_download_artifact_never_restamps_a_bound_row():
+    """A download re-uploaded as it grows can be observed after the session changed hands; the
+    producer recorded on the first write must win."""
+    manager = ArtifactManager()
+    existing = _make_artifact("a_existing", "s3://bucket/pbs_1/downloads/file.pdf", run_id="wr_a")
+    mock_bind = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            AsyncMock(return_value=existing),
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bind_session_download_artifact_producer",
+            mock_bind,
+        ),
+    ):
+        await manager.create_browser_session_download_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            run_id="wr_b",
+        )
+
+    mock_bind.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

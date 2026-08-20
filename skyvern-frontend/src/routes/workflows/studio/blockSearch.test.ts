@@ -388,6 +388,91 @@ describe("waitForNodeSettle", () => {
     await frames.tick();
     expect(resolved).toBe(true);
   });
+
+  test("does not settle while a relayout is pending, even if position already looks stable", async () => {
+    // Reproduces the race behind SKY-12050: a batched ancestor expand fires
+    // an async debounced Dagre relayout (10ms handler delay + use-debounce
+    // wait/maxWait) that hasn't landed yet when this starts polling. Position
+    // looks unchanged in that dead window, so stability alone would resolve
+    // on stale geometry.
+    const frames = makeFrameQueue();
+    const node = {
+      id: "n",
+      type: "task",
+      hidden: false,
+      position: { x: 10, y: 10 },
+      data: { label: "N" },
+    } as AppNode;
+    let pending = true;
+    let resolved = false;
+    void waitForNodeSettle("n", {
+      getNodes: () => [node],
+      getInternalNode: () => undefined,
+      requestFrame: frames.requestFrame,
+      now: () => 0,
+      isRelayoutPending: () => pending,
+    }).then(() => {
+      resolved = true;
+    });
+
+    for (let i = 0; i < BRANCH_SETTLE_STABLE_FRAMES + 2; i++) {
+      await frames.tick();
+      expect(resolved).toBe(false);
+    }
+
+    pending = false;
+    for (let i = 0; i < BRANCH_SETTLE_STABLE_FRAMES; i++) {
+      expect(resolved).toBe(false);
+      await frames.tick();
+    }
+    expect(resolved).toBe(true);
+  });
+
+  test("resets the stable-frame counter when a relayout arms mid-streak", async () => {
+    // The race this guards against isn't "pending from the start" (covered
+    // above) but the relayout arming *after* polling has already begun
+    // accumulating stable frames on pre-relayout geometry — the
+    // header-resized -> 10ms handler delay -> debounce hop described in
+    // FlowRenderer. Pins that the counter resets on that transition rather
+    // than resuming from its pre-relayout value once the relayout clears.
+    const frames = makeFrameQueue();
+    const node = {
+      id: "n",
+      type: "task",
+      hidden: false,
+      position: { x: 10, y: 10 },
+      data: { label: "N" },
+    } as AppNode;
+    let pending = false;
+    let resolved = false;
+    void waitForNodeSettle("n", {
+      getNodes: () => [node],
+      getInternalNode: () => undefined,
+      requestFrame: frames.requestFrame,
+      now: () => 0,
+      isRelayoutPending: () => pending,
+    }).then(() => {
+      resolved = true;
+    });
+
+    for (let i = 0; i < BRANCH_SETTLE_STABLE_FRAMES - 1; i++) {
+      await frames.tick();
+      expect(resolved).toBe(false);
+    }
+
+    pending = true;
+    for (let i = 0; i < BRANCH_SETTLE_STABLE_FRAMES; i++) {
+      await frames.tick();
+      expect(resolved).toBe(false);
+    }
+
+    pending = false;
+    for (let i = 0; i < BRANCH_SETTLE_STABLE_FRAMES; i++) {
+      expect(resolved).toBe(false);
+      await frames.tick();
+    }
+    expect(resolved).toBe(true);
+  });
 });
 
 describe("focusBlockTarget", () => {
@@ -415,6 +500,15 @@ describe("focusBlockTarget", () => {
     await expect(focusBlockTarget("login-node", deps)).resolves.toBe(true);
     expect(deps.selectBlock).toHaveBeenCalledWith("login-node");
     expect(deps.expandBlock).toHaveBeenCalledWith("Login");
+  });
+
+  test("does not arm the relayout gate while opening an ordinary target", async () => {
+    const beforeExpand = vi.fn();
+    const deps = makeDeps(nodes, { beforeExpand });
+
+    await expect(focusBlockTarget("login-node", deps)).resolves.toBe(true);
+
+    expect(beforeExpand).not.toHaveBeenCalled();
   });
 
   test("visible targets never switch branches or wait", async () => {
@@ -665,6 +759,32 @@ describe("focusBlockTarget — collapsed container ancestors", () => {
     );
     expect(calls.indexOf("expand:Extract row data")).toBeLessThan(
       calls.indexOf("anchor"),
+    );
+  });
+
+  test("arms the relayout gate before expanding a collapsed ancestor", async () => {
+    const collapsedNestedNodes = nodes.map((node) =>
+      node.id === "nested-node" ? { ...node, hidden: true } : node,
+    );
+    const calls: Array<string> = [];
+    const deps = makeDeps(collapsedNestedNodes, {
+      beforeExpand: vi.fn((label) => calls.push(`arm:${label}`)),
+      expandBlock: vi.fn((label) => calls.push(`expand:${label}`)),
+      waitForSettle: vi.fn(async () => {
+        calls.push("settle");
+        (
+          collapsedNestedNodes.find((node) => node.id === "nested-node") as {
+            hidden?: boolean;
+          }
+        ).hidden = false;
+      }),
+    });
+
+    await focusBlockTarget("nested-node", deps);
+
+    expect(calls).toContain("arm:Iterate rows");
+    expect(calls.indexOf("arm:Iterate rows")).toBeLessThan(
+      calls.indexOf("expand:Iterate rows"),
     );
   });
 

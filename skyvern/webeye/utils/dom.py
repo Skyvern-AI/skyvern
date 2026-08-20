@@ -1410,14 +1410,16 @@ class SkyvernElement:
 
         # Step 2: Playwright actionability confirmation. After Step 1, the element should
         # already be in the viewport so this check passes quickly.
+        # Confirm via the Locator, not a resolved ElementHandle: a Locator re-resolves the
+        # selector on every internal actionability retry, so a mid-wait DOM re-render can't
+        # leave it holding a stale, detached handle.
         try:
-            element_handler = await self.get_element_handler(timeout=timeout)
-            await element_handler.scroll_into_view_if_needed(timeout=timeout)
+            await self.get_locator().scroll_into_view_if_needed(timeout=timeout)
         except Exception as exc:
-            if not is_engine_timeout_error(exc, self._engine_selection):
+            if not is_engine_timeout_error(exc, self._engine_selection) and not is_element_detached_error(exc):
                 raise
             LOG.warning(
-                "Scroll into view timed out",
+                "Scroll into view timed out or element detached mid-scroll",
                 element_id=self.get_id(),
             )
             await self.blur()
@@ -1624,3 +1626,68 @@ class DomUtil:
         except Exception:
             LOG.warning("Failed to get skyvern element by id", element_id=element_id, exc_info=True)
             return None
+
+    def _ancestor_path(self, element_id: str) -> list[dict]:
+        def _find(nodes: list[dict], ancestors: list[dict]) -> list[dict] | None:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("id") == element_id:
+                    return ancestors
+                children = node.get("children")
+                if isinstance(children, list):
+                    result = _find(children, [*ancestors, node])
+                    if result is not None:
+                        return result
+            return None
+
+        tree = self.scraped_page.element_tree
+        if not isinstance(tree, list):
+            return []
+        return _find(tree, []) or []
+
+    async def resolve_effective_click_target(self, element: SkyvernElement) -> SkyvernElement:
+        static = element.get_element_dict()
+        tag_name = element.get_tag_name().lower()
+        if tag_name in {InteractiveElement.A, InteractiveElement.INPUT, InteractiveElement.SELECT}:
+            return element
+        if tag_name == InteractiveElement.BUTTON and not static.get("hoverOnly", False):
+            return element
+        if static.get("interactable", False) and not static.get("hoverOnly", False):
+            return element
+
+        for ancestor in reversed(self._ancestor_path(element.get_id())):
+            ancestor_id = ancestor.get("id")
+            if not isinstance(ancestor_id, str) or not ancestor_id:
+                continue
+            if not ancestor.get("interactable", False) or ancestor.get("hoverOnly", False):
+                continue
+            attrs = ancestor.get("attributes")
+            if not isinstance(attrs, dict):
+                continue
+            role = str(attrs.get("role") or "").strip().lower()
+            haspopup = str(attrs.get("aria-haspopup") or "").strip().lower()
+            if role != "combobox" and haspopup not in {"true", "listbox", "menu", "tree", "grid"}:
+                continue
+            css = self.scraped_page.id_to_css_dict.get(ancestor_id)
+            if not isinstance(css, str) or not css:
+                continue
+            locator = element.get_frame().locator(css)
+            if await locator.count() != 1:
+                continue
+            owner = SkyvernElement(
+                locator,
+                element.get_frame(),
+                ancestor,
+                self.scraped_page.id_to_element_hash.get(ancestor_id, ""),
+                engine_selection=self.engine_selection,
+            )
+            if not await owner.is_visible():
+                continue
+            LOG.info(
+                "Resolved decorative click target to stable composite owner",
+                element_id=element.get_id(),
+                owner_id=owner.get_id(),
+            )
+            return owner
+        return element

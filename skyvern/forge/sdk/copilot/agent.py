@@ -99,7 +99,10 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     anchor_recovers_entrypoint,
     extract_in_turn_entry_url,
 )
-from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    PER_TOOL_BUDGET_FAILURE_CATEGORY,
+    block_shape_hashes_by_label,
+)
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
@@ -145,7 +148,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.review_gate import build_review_projection, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.runtime import (
-    _browser_context_is_attachable,
+    BrowserProbeOutcome,
+    _browser_context_attachability,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
@@ -288,7 +292,6 @@ class RequestPolicyGuardrailInputs:
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
-    fix_origin: bool = False
     persisted_workflow_yaml: str | None = None
     selected_connected_account_id: str | None = None
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
@@ -305,23 +308,26 @@ def _manager_can_probe_registered_browser_state() -> bool:
     return app.PERSISTENT_SESSIONS_MANAGER.can_probe_registered_browser_state()
 
 
-async def _registered_browser_state_is_usable(session_id: str, organization_id: str) -> bool:
+async def _registered_browser_state_liveness(session_id: str, organization_id: str) -> BrowserProbeOutcome | None:
+    """None means this manager cannot answer at all, which is a capability, not a liveness verdict."""
     if not _manager_can_probe_registered_browser_state():
-        return False
+        return None
 
     state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
         session_id=session_id,
         organization_id=organization_id,
     )
-    return bool(state and _browser_context_is_attachable(state.browser_context))
+    if state is None:
+        return BrowserProbeOutcome.positively_unreachable
+    return _browser_context_attachability(state.browser_context)
 
 
 async def _resolve_live_browser_session_id(
     chat_request: WorkflowCopilotChatRequest,
     organization_id: str,
 ) -> str | None:
-    """Validate against a debug session for the same (org, workflow_permanent_id);
-    return None on any failure so the caller falls back to auto-create."""
+    """Ownership failures fail closed. A liveness lookup that could not complete keeps the session,
+    since failing to reach the browser is not evidence about the browser."""
     requested = chat_request.browser_session_id
     if not requested:
         return None
@@ -331,28 +337,49 @@ async def _resolve_live_browser_session_id(
             browser_session_id=requested,
             organization_id=organization_id,
         )
-        if debug_session is None:
-            LOG.warning(
-                "Copilot received an unknown browser_session_id; ignoring",
-                organization_id=organization_id,
-                requested_session_id=requested,
-            )
-            return None
-        if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
-            LOG.warning(
-                "Copilot browser_session_id is bound to a different workflow; ignoring",
-                organization_id=organization_id,
-                requested_session_id=requested,
-                expected_wpid=chat_request.workflow_permanent_id,
-                actual_wpid=debug_session.workflow_permanent_id,
-            )
-            return None
+    except Exception as exc:
+        LOG.warning(
+            "Copilot browser session ownership lookup failed; falling back to auto-create",
+            organization_id=organization_id,
+            requested_session_id=requested,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return None
 
+    # Ownership is settled before the liveness try below, whose handler returns the caller's id.
+    # An await added between these two checks would make that handler fail open.
+    if debug_session is None:
+        LOG.warning(
+            "Copilot received an unknown browser_session_id; ignoring",
+            organization_id=organization_id,
+            requested_session_id=requested,
+        )
+        return None
+    if debug_session.workflow_permanent_id != chat_request.workflow_permanent_id:
+        LOG.warning(
+            "Copilot browser_session_id is bound to a different workflow; ignoring",
+            organization_id=organization_id,
+            requested_session_id=requested,
+            expected_wpid=chat_request.workflow_permanent_id,
+            actual_wpid=debug_session.workflow_permanent_id,
+        )
+        return None
+
+    try:
         persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
         has_live_browser = persistent.is_browser_ready if persistent else False
-        has_registered_browser_state = False
+        registered_liveness: BrowserProbeOutcome | None = None
         if persistent is not None and not is_final_status(persistent.status) and not has_live_browser:
-            has_registered_browser_state = await _registered_browser_state_is_usable(requested, organization_id)
+            registered_liveness = await _registered_browser_state_liveness(requested, organization_id)
+        if registered_liveness == BrowserProbeOutcome.could_not_determine:
+            LOG.warning(
+                "Copilot browser session health signal unavailable; keeping the supplied session",
+                organization_id=organization_id,
+                requested_session_id=requested,
+            )
+            return requested
+        has_registered_browser_state = registered_liveness == BrowserProbeOutcome.attachable
 
         if (
             persistent is None
@@ -377,13 +404,13 @@ async def _resolve_live_browser_session_id(
         return requested
     except Exception as exc:
         LOG.warning(
-            "Copilot live-session validation raised; falling back to auto-create",
+            "Copilot browser session liveness lookup failed; keeping the supplied session",
             organization_id=organization_id,
             requested_session_id=requested,
             error_type=type(exc).__name__,
             exc_info=True,
         )
-        return None
+        return requested
 
 
 def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -930,13 +957,71 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
     return "\n\n" + "\n".join(line for line in lines if line)
 
 
+_SOURCE_BINDING_PROMPT_HEADER = (
+    "source_binding: hashes are text-sensitive over the block's code body, so a comment-only or "
+    "whitespace-only edit changes the hash; they are canonical only over config field order. "
+    "They also cover block config beyond the code, including declared parameter identity and its "
+    "timestamps, so a save that re-creates parameter rows reports text differs even when no code "
+    "changed; treat text differs as a weak signal that is worth re-reading the block over, never as "
+    "proof the code changed. recorded_hash is the workflow as saved when this outcome was recorded; "
+    "a staged or prior-draft run may have executed a different snapshot. current_hash is the "
+    "workflow as currently saved. This is code-match evidence, not a claim about behaviour."
+)
+_SOURCE_BINDING_UNRESOLVED = "binding unavailable (no top-level block with this label in the current saved workflow)"
+_SOURCE_BINDING_NO_RECORDED_HASH = "binding unavailable (no recorded hash for this label)"
+_RENDERED_HASH_CHARS = 12
+_SOURCE_BINDING_MAX_LABELS = 20
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _rendered_shape_hash(value: str | None) -> str:
+    short = (value or "")[:_RENDERED_HASH_CHARS]
+    if len(short) < _RENDERED_HASH_CHARS or not set(short) <= _HEX_DIGITS:
+        return "unknown"
+    return short
+
+
+def _source_binding_prompt_lines(outcome: RecordedBuildTestOutcome, ctx: CopilotContext) -> list[str]:
+    lines = [_SOURCE_BINDING_PROMPT_HEADER]
+    recorded_hashes = outcome.block_shape_hashes
+    if not recorded_hashes:
+        lines.append("- binding unavailable (no recorded block hashes)")
+        return lines
+    all_labels = list(dict.fromkeys([*recorded_hashes, *outcome.block_labels]))
+    labels = all_labels[:_SOURCE_BINDING_MAX_LABELS]
+    current_hashes = block_shape_hashes_by_label(
+        labels,
+        ctx.last_workflow.workflow_definition if ctx.last_workflow else None,
+    )
+    for label in labels:
+        recorded = recorded_hashes.get(label)
+        current = current_hashes.get(label)
+        # ";" is this line's field separator, so a label carrying one could otherwise forge a verdict.
+        cleaned_label = _clean_authoring_repair_prompt_atom(label, max_chars=80).replace(";", ",") or "(unknown)"
+        fields = [
+            f"label={cleaned_label}",
+            f"recorded_hash={_rendered_shape_hash(recorded)}",
+            f"current_hash={_rendered_shape_hash(current)}",
+        ]
+        if recorded is None:
+            fields.append(_SOURCE_BINDING_NO_RECORDED_HASH)
+        elif current is None:
+            fields.append(_SOURCE_BINDING_UNRESOLVED)
+        else:
+            fields.append("code matches" if current == recorded else "text differs")
+        lines.append("- " + "; ".join(fields))
+    if len(all_labels) > len(labels):
+        lines.append(f"- {len(all_labels) - len(labels)} more labels not shown")
+    return lines
+
+
 def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
     if ctx is None:
         return ""
     if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return ""
     outcome = ctx.latest_recorded_build_test_outcome
-    if not isinstance(outcome, RecordedBuildTestOutcome) or not outcome.is_authoritative:
+    if not isinstance(outcome, RecordedBuildTestOutcome):
         return ""
     LOG.info(
         "copilot recorded build-test outcome rendered",
@@ -955,7 +1040,9 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         f"reason_code: {_clean_authoring_repair_prompt_atom(outcome.reason_code)}",
         f"structural_key: {_clean_authoring_repair_prompt_atom(outcome.structural_key or '')}",
         f"block_labels: {_render_authoring_repair_prompt_list(outcome.block_labels)}",
+        *_source_binding_prompt_lines(outcome, ctx),
         f"page_evidence_refs: {_render_authoring_repair_prompt_list(outcome.page_evidence_refs)}",
+        f"evidence_refs: {_render_authoring_repair_prompt_list(outcome.evidence_refs)}",
     ]
     if outcome.missing_requested_output_facts:
         lines.append("missing_requested_output_facts:")
@@ -975,8 +1062,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
                 lines.append(f"- {'; '.join(fields)}")
     if outcome.workflow_run_id:
         lines.append(f"workflow_run_id: {_clean_authoring_repair_prompt_atom(outcome.workflow_run_id)}")
+    # Facts render for every outcome; the two post-run page-path directives bind the model's next
+    # action, so they keep the authority check that gated this whole section before.
     page_path_failure = outcome.page_path_failure
-    if page_path_failure is not None and page_path_failure.is_page_path:
+    if outcome.is_authoritative and page_path_failure is not None and page_path_failure.is_page_path:
         lines.extend(
             [
                 "POST-RUN PAGE-PATH CONTINUATION:",
@@ -993,7 +1082,8 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
             "Do not navigate away or re-author the workflow before attempting that bounded continuation."
         )
     elif (
-        page_path_failure is None
+        outcome.is_authoritative
+        and page_path_failure is None
         and outcome.phase == "persisted_block_run"
         and outcome.reason_code == "no_meaningful_output"
         and outcome.workflow_run_id
@@ -1392,8 +1482,8 @@ def _assemble_terminal_envelope_safe(
 def _with_unresolved_runtime_failure_note(user_response: str, failure: UnresolvedRuntimeFailure) -> str:
     label = failure.block_label or "an earlier step"
     note = (
-        f"One thing to flag: an earlier test run ({failure.workflow_run_id}) failed at "
-        f'"{label}", the failing call is still in the draft, and no later run '
+        f'One thing to flag: an earlier test run failed at "{label}", '
+        "the failing call is still in the draft, and no later run "
         "verifiably re-exercised it — so that step is still unproven."
     )
     return f"{user_response.rstrip()}\n\n{note}" if user_response.strip() else note
@@ -1913,23 +2003,29 @@ def _build_turn_halt_exit_result(
     )
 
 
-_TIMEOUT_REPLY_DEFAULT = "I ran out of time processing your request. Here's what I have so far."
+_TIMEOUT_REPLY_DEFAULT = (
+    "I ran out of time processing your request, and I don't have a draft workflow to hand over. "
+    "Tell me what to focus on and I'll try again."
+)
 _TIMEOUT_REPLY_UNVALIDATED = (
-    "I ran out of time before I could finish testing. I have a draft workflow you can keep — "
+    "I ran out of time. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _TIMEOUT_REPLY_TESTED = "I ran out of time, but I have a tested draft for you. Accept it to save, or discard."
 
-_MAX_TURNS_REPLY_DEFAULT = "I've reached the maximum number of steps. Here's what I have so far."
+_MAX_TURNS_REPLY_DEFAULT = (
+    "I've reached the maximum number of steps, and I don't have a draft workflow to hand over. "
+    "Tell me what to focus on and I'll try again."
+)
 _MAX_TURNS_REPLY_UNVALIDATED = (
-    "I've reached the maximum number of steps before I could finish testing. I have a draft "
+    "I've reached the maximum number of steps. I have a draft "
     "workflow you can keep — accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
-    "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
+    "I hit an unexpected issue. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
 )
 _UNEXPECTED_ERROR_REPLY_TESTED = (
@@ -2466,7 +2562,7 @@ def _build_wip_exit_result(
     cancelled: bool = False,
     terminal_reason: str | None = None,
 ) -> AgentResult:
-    """Selected non-success exits surface the most recent successfully parsed workflow."""
+    """Non-success exits surface the most recent successfully parsed workflow."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
     halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
@@ -2573,13 +2669,10 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_good_workflow",
         )
-    if (
-        ctx.last_workflow is not None
-        and ctx.last_workflow_yaml
-        and (ctx.last_test_ok is not False or halted_mid_progress)
-        and not ctx.last_test_suspicious_success
-    ):
-        full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
+    if ctx.last_workflow is not None and ctx.last_workflow_yaml:
+        full_test_ok = (
+            ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True and not ctx.last_test_suspicious_success
+        )
         unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
             reply = _deadline_owned_or(unvalidated_reply, recorded_failure_reply) or unvalidated_reply
@@ -2617,13 +2710,16 @@ def _build_wip_exit_result(
             ),
             exit_site="wip_last_workflow",
         )
+    # This branch carries no draft and its reply says so, so it must not report a
+    # disposition auto-accept can act on -- that would commit a staged workflow to
+    # canonical on the same turn the user is told there is nothing to hand over.
     return _build_exit_result(
         ctx,
         _deadline_owned_or(default_reply, recorded_failure_reply) or default_reply,
         global_llm_context,
         cancelled=cancelled,
         terminal_reason=effective_terminal,
-        proposal_disposition="auto_applicable",
+        proposal_disposition="no_proposal",
     )
 
 
@@ -2651,8 +2747,13 @@ def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | No
 def _build_cancelled_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
     if ctx.copilot_total_timeout_exceeded:
         LOG.info("Copilot cancellation resolved as total timeout")
-        return _build_timeout_exit_result(ctx, global_llm_context)
-    return _build_cancel_exit_result(ctx, global_llm_context)
+        result = _build_timeout_exit_result(ctx, global_llm_context)
+    else:
+        result = _build_cancel_exit_result(ctx, global_llm_context)
+    result.cancellation_iteration = ctx.copilot_turn_cancelled_iteration
+    outcome = ctx.latest_recorded_build_test_outcome
+    result.cancellation_last_recorded_phase = outcome.phase if outcome is not None else None
+    return result
 
 
 def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -4144,7 +4245,6 @@ async def _run_copilot_turn_impl(
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
-        fix_origin=getattr(chat_request, "fix_origin", False),
         persisted_workflow_yaml=persisted_workflow_yaml,
         selected_connected_account_id=selected_connected_account_id(prior_turn_outcome, chat_request.message),
         stored_completion_criteria=stored_completion_criteria,

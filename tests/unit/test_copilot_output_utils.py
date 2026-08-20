@@ -273,7 +273,7 @@ class TestSanitization:
                 "frontier_start_label": "b",
                 "current_url": "https://example.test",
                 "page_title": "Example",
-                "action_trace_summary": ["click #submit failed"],
+                "action_trace_summary": ["click #submit failed description=code error at line 18 code_line=18"],
                 "blocks": [{"label": "b", "block_type": "EXTRACTION", "status": "failed"}],
             },
         }
@@ -283,7 +283,7 @@ class TestSanitization:
         assert data["requested_block_labels"] == ["a", "b"]
         assert data["executed_block_labels"] == ["b"]
         assert data["frontier_start_label"] == "b"
-        assert data["action_trace_summary"] == ["click #submit failed"]
+        assert data["action_trace_summary"] == ["click #submit failed description=code error at line 18 code_line=18"]
         assert data["current_url"] == "https://example.test"
 
 
@@ -915,6 +915,14 @@ class TestUserFacingSuccess:
         signal = self._blocker(blocker_kind)
         result = {"ok": False, "error": signal.agent_steering_text}
         assert user_facing_success(result, blocker_signal=signal) is True
+
+    def test_true_for_paused_run(self) -> None:
+        result = {"ok": False, "data": {"control_signal": {"kind": "watchdog_paused"}}}
+        assert user_facing_success(result) is True
+
+    def test_false_for_other_watchdog_exits(self) -> None:
+        result = {"ok": False, "data": {"control_signal": {"kind": "watchdog_ceiling"}}}
+        assert user_facing_success(result) is False
 
     def test_false_for_genuine_tool_error(self) -> None:
         """Regression guard: real tool errors keep failure affect."""

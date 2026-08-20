@@ -37,7 +37,6 @@ def task_webhook_agent(monkeypatch: pytest.MonkeyPatch) -> tuple[ForgeAgent, Asy
         agent_module,
         "generate_skyvern_webhook_signature",
         lambda payload, api_key: SimpleNamespace(
-            payload_for_log='{"safe":true}',
             headers={"x-skyvern-signature": "sig"},
             signed_payload='{"signed":true}',
         ),
@@ -132,7 +131,6 @@ async def test_task_v2_webhook_delivery_exception_persists_failure_reason(
         task_v2_service,
         "generate_skyvern_webhook_signature",
         lambda payload, api_key: SimpleNamespace(
-            payload_for_log='{"safe":true}',
             headers={"x-skyvern-signature": "sig"},
             signed_payload='{"signed":true}',
         ),

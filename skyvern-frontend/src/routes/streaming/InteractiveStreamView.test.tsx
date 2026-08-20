@@ -363,6 +363,22 @@ describe("InteractiveStreamView preview width", () => {
     observer.restore();
   });
 
+  it("clamps that width to the pane, so a pane taller than the picture letterboxes instead of cropping", () => {
+    const observer = observeOneResize({
+      height: 450,
+      naturalWidth: 1600,
+      naturalHeight: 900,
+    });
+
+    const img = observer.fire(() =>
+      render(<InteractiveStreamView {...baseProps()} />),
+    );
+
+    expect(img.parentElement?.className).toContain("max-w-full");
+
+    observer.restore();
+  });
+
   it("hands the measured width to a parent that owns the frame instead of framing itself", () => {
     const onFrameWidthChange = vi.fn();
     const observer = observeOneResize({

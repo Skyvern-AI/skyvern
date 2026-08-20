@@ -19,7 +19,11 @@ import { useScriptVersionsQuery } from "@/routes/workflows/hooks/useScriptVersio
 import { useScriptVersionCodeQuery } from "@/routes/workflows/hooks/useScriptVersionCodeQuery";
 import { useWorkflowRunWithWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowRunWithWorkflowQuery";
 import { constructCacheKeyValue } from "@/routes/workflows/editor/utils";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -91,13 +95,18 @@ function WorkflowRunCode(props?: Props) {
   const parameters = workflowRun?.parameters;
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
+  const isGeneratingCode = shouldPollForGeneratedCode(
+    workflow,
+    isFinalized,
+    hasPublishedCode,
+  );
 
   const { data: blockScriptsPending, isLoading: blockScriptsPendingLoading } =
     useBlockScriptsQuery({
       cacheKey,
       cacheKeyValue,
       workflowPermanentId,
-      pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
+      pollIntervalMs: isGeneratingCode ? 3000 : undefined,
       status: "pending",
       workflowRunId: workflowRun?.workflow_run_id,
     });
@@ -173,8 +182,6 @@ function WorkflowRunCode(props?: Props) {
       ? displayScripts.main_script
       : getCode(displayBlockLabels, displayScripts?.blocks).join("")
   ).trim();
-
-  const isGeneratingCode = !isFinalized && !hasPublishedCode;
 
   // --- Edit mode state ---
   const [isEditing, setIsEditing] = useState(false);

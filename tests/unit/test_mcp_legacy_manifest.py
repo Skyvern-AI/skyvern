@@ -32,7 +32,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_browser_profile_update": "e83c3227ef13e827bd0c7d6e23bb0e03fefe2fe83e73bfa4b3ca696d151b2b61",
     "skyvern_browser_session_close": "d0923948805b1bbccd7803df1a3748426263a8bf630cf9fcbee5a21f2f463825",
     "skyvern_browser_session_connect": "7c21d99fbb35dc0199e59367373387dca0e8f8d9dd4615303a3f09f579db2d06",
-    "skyvern_browser_session_create": "25665a100837ea7336ffc0a328136906a932d24360d58bb2094e62064d20af09",
+    # Re-frozen for SKY-13272: `timeout` is now rejected above MAX_TIMEOUT instead of clamped, so the param
+    # description says "max 240" rather than "capped at 240". Description text only; the schema is unchanged.
+    "skyvern_browser_session_create": "6244d9614c04f403ee9db0c6b0cdee10f5be121cf85979b069a106044b08b161",
     "skyvern_browser_session_get": "fdf579ac23ce28eea5e243a407a8f810fdcca6ed491c2da7fbe56836b1474109",
     "skyvern_browser_session_list": "dac429184440a1f76d2a787fb81793e37220408d749f0d3cacfbd29222e55f19",
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",
@@ -126,7 +128,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
     "skyvern_workflow_retry": "da8782d457ba3bcc8b87fffb90ce9dbc287943f28260816d699233a7427b6978",
     "skyvern_workflow_run": "215941b714c8d64fdbd2e4e58e353d3650c50501a484fb37f4749404184f0fd4",
-    "skyvern_workflow_run_list": "23271543f4b55999bd7b4747b0f304054720c58c6b44ac35670928fa18764ba7",
+    # Re-frozen for SKY-14441: adds the optional `include_child_runs` param (default false, preserving the
+    # existing result set) and says in the description that child runs are excluded by default.
+    "skyvern_workflow_run_list": "5ed785968941b6b3ae3421d6d67ef15af365a2b59a9a1bd21c7bc54dff67e205",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
     "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",

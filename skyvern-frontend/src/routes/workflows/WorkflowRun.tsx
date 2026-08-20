@@ -89,6 +89,7 @@ import {
   type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
 import { RunTagsEditor } from "@/routes/tasks/components/tagging/RunTagsEditor";
+import { shouldPollForGeneratedCode } from "./utils";
 
 const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
@@ -220,6 +221,11 @@ function WorkflowRun() {
   const isWorkflowDeleted = Boolean(workflow?.deleted_at);
 
   const [hasPublishedCode, setHasPublishedCode] = useState(false);
+  const isGeneratingCode = shouldPollForGeneratedCode(
+    workflow,
+    isFinalized,
+    hasPublishedCode,
+  );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""
@@ -245,7 +251,7 @@ function WorkflowRun() {
     cacheKey,
     cacheKeyValue,
     workflowPermanentId: isWorkflowDeleted ? undefined : workflowPermanentId,
-    pollIntervalMs: !hasPublishedCode && !isFinalized ? 3000 : undefined,
+    pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "published",
     workflowRunId: workflowRun?.workflow_run_id,
   });
@@ -556,8 +562,6 @@ function WorkflowRun() {
       hasTaskv2Output ||
       webhookFailureReasonData) &&
     workflowRun.status === Status.Completed;
-
-  const isGeneratingCode = !isFinalized && !hasPublishedCode;
 
   const switchBarOptions: SwitchBarNavigationOption[] = [
     {

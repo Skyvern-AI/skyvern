@@ -82,8 +82,8 @@ async def skyvern_write_grid(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_write_grid", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_write_grid", ok=False, error=no_browser_error(exc))
 
     total = 0
     try:

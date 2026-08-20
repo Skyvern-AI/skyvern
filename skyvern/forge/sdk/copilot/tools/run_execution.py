@@ -63,6 +63,8 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
+    _blocks_by_label,
+    block_shape_hashes_by_label,
 )
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
@@ -123,6 +125,8 @@ from skyvern.forge.sdk.workflow.runtime_completion import contract_from_request_
 from skyvern.forge.sdk.workflow.service import run_selection_is_partial
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -164,8 +168,6 @@ from .credentials import (
     _server_verified_google_account_choices,
 )
 from .frontier import (
-    _blocks_by_label,
-    _frontier_label_shape_hashes,
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
@@ -407,15 +409,26 @@ async def _attach_action_traces(
         if block_result.get("status") not in _FAILED_BLOCK_STATUSES or not block.task_id:
             continue
         task_actions = actions_by_task.get(block.task_id, [])
-        block_result["action_trace"] = [
-            {
-                "action": a.action_type,
-                "status": a.status,
-                "reasoning": a.reasoning[:150] if a.reasoning else None,
-                "element": a.element_id,
+        action_trace = []
+        for action in task_actions:
+            entry = {
+                "action": action.action_type,
+                "status": action.status,
+                "reasoning": action.reasoning[:150] if action.reasoning else None,
+                "element": action.element_id,
             }
-            for a in task_actions
-        ]
+            output = action.output
+            code_line = output.get("code_line") if isinstance(output, dict) else None
+            if (
+                action.action_type == ActionType.NULL_ACTION
+                and action.status == ActionStatus.failed
+                and type(code_line) is int
+                and action.description
+            ):
+                entry["description"] = action.description[:150]
+                entry["code_line"] = code_line
+            action_trace.append(entry)
+        block_result["action_trace"] = action_trace
 
 
 async def _fetch_last_screenshot_b64(task_id: str, organization_id: str) -> str | None:
@@ -565,39 +578,47 @@ def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str
 
 
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
-    """Compact, stringified summary of action entries for the compact packet."""
+    """Render the six newest action entries chronologically for the compact packet."""
     if not action_trace:
         return []
     summary: list[str] = []
-    for entry in action_trace[-6:]:
+    for entry in reversed(action_trace[:6]):
         if not isinstance(entry, dict):
             continue
         action = entry.get("action") or "?"
         status = entry.get("status") or ""
         element = entry.get("element")
+        description = entry.get("description")
+        code_line = entry.get("code_line")
         bits = [str(action)]
         if element:
             bits.append(str(element))
         if status:
             bits.append(str(status))
+        if isinstance(description, str) and description:
+            bits.append(f"description={description}")
+        if type(code_line) is int:
+            bits.append(f"code_line={code_line}")
         summary.append(" ".join(bits).strip())
     return summary
 
 
 # Watchdog exit reasons. ``success`` means the run reached a trustworthy
 # terminal status inside the poll loop OR after the post-drain reconcile.
-# The three non-success reasons share the reconcile path but produce distinct
+# The run-ending reasons share the reconcile path but produce distinct
 # error messages: ``stagnation`` is the primary trip (no progress signals
 # for ``RUN_BLOCKS_STAGNATION_WINDOW_SECONDS`` seconds), ``ceiling`` is the
 # last-resort budget-exhausted branch, and ``task_exit_unfinalized`` is the
 # rare race where ``execute_workflow`` naturally exits before writing a
-# terminal row.
+# terminal row. ``paused`` is the exception: the run is alive and waiting on a
+# person, so it is neither cancelled nor reconciled.
 WatchdogExitReason = Literal[
     "success",
     "stagnation",
     "ceiling",
     "per_tool_budget",
     "task_exit_unfinalized",
+    "paused",
 ]
 
 
@@ -722,6 +743,16 @@ async def _watchdog_error_message(
             f"hidden validation error, or an infinite-retry loop on an action the agent "
             f"cannot detect is failing."
         )
+    elif exit_reason == "paused":
+        # A pause is a healthy waiting state rather than an uncertain outcome, so it returns here
+        # instead of picking up the shared "outcome is uncertain, do not re-invoke" tail below. This
+        # is the one arm that directs the model to relay its own text, so it carries no run id.
+        return (
+            "The run is paused at a human_interaction block, waiting for a person to approve or "
+            "reject it. It stays paused until someone acts on it in Skyvern or the block's timeout "
+            "elapses; nothing was cancelled. Tell the user the run is paused and what it is waiting "
+            "for, and do not re-run these blocks."
+        )
     elif exit_reason == "per_tool_budget":
         message = (
             f"The run exceeded the {budget_seconds}s per-tool-call budget while still "
@@ -771,24 +802,6 @@ async def _watchdog_error_message(
     return message
 
 
-def _watchdog_user_failure_reason(
-    exit_reason: WatchdogExitReason,
-    workflow_run_id: str,
-    budget_seconds: int,
-    run: WorkflowRun | None,
-) -> str:
-    if exit_reason == "stagnation":
-        body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
-    elif exit_reason == "per_tool_budget":
-        body = f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
-    elif exit_reason == "ceiling":
-        body = f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
-    else:
-        status = f" Last observed status: {run.status}." if run is not None else ""
-        body = "The run ended before recording a trustworthy terminal status." + status
-    return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
-
-
 def _watchdog_user_facing_summary(
     exit_reason: WatchdogExitReason,
     budget_seconds: int,
@@ -796,13 +809,31 @@ def _watchdog_user_facing_summary(
 ) -> str:
     if exit_reason == "stagnation":
         return f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    if exit_reason == "paused":
+        return "The run is paused, waiting for a person to approve or reject it."
     if exit_reason == "per_tool_budget":
-        return f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+        return (
+            f"The run was still making progress but ran longer than the {budget_seconds}s "
+            "allowed for a single step, so it was stopped."
+        )
     if exit_reason == "ceiling":
         return f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
     if run is not None:
         return f"The run ended before recording a trustworthy terminal status. Last observed status: {run.status}."
     return "The run ended before recording a trustworthy terminal status."
+
+
+def _per_tool_budget_failure_category(budget_seconds: int) -> dict[str, Any]:
+    # Stable entry so consecutive budget trips hash to the same streak signature; the
+    # run id in ``error_msg`` would otherwise make every trip unique.
+    return {
+        "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+        "confidence_float": 1.0,
+        "reasoning": (
+            f"The run was making progress but ran past the {budget_seconds}s "
+            "allowed for a single step, so it cannot fit in one call."
+        ),
+    }
 
 
 def _workflow_covers_labels(workflow: Workflow | None, labels: list[str]) -> bool:
@@ -898,6 +929,13 @@ def _runtime_code_security_failure_for_selected_labels(
     }
 
 
+_INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON = (
+    "This test run uses a credential that is set to be used by one run at a time, and the copilot's "
+    "in-process test run cannot hold that ordering. The run stopped instead of using the credential "
+    "alongside another run."
+)
+
+
 def _inline_sequential_credential_fence_failure(
     *,
     workflow_run_id: str,
@@ -915,14 +953,14 @@ def _inline_sequential_credential_fence_failure(
     # through the executor (stamped queued_at, gated), so it is exempt.
     if dispatch_to_worker or not sequential_credential_id:
         return None
-    failure_reason = str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id))
     return {
         "ok": False,
-        "error": failure_reason,
+        "error": str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id)),
         "data": {
             "workflow_run_id": workflow_run_id,
             "overall_status": "failed",
-            "failure_reason": failure_reason,
+            "failure_reason": _INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON,
+            "user_facing_summary": _INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON,
             "requested_block_labels": list(block_labels),
             "executed_block_labels": [],
             "planned_block_labels": list(labels_to_execute),
@@ -1864,7 +1902,9 @@ async def _run_blocks_and_collect_debug(
             debug_session_id=debug_session_id,
         )
     else:
-        session_err = await ensure_browser_session(ctx)
+        # This id is dispatched into a workflow run without ever being attached here, so an
+        # unverified session cannot be discovered later and must fail now instead.
+        session_err = await ensure_browser_session(ctx, require_verified_session=True)
         if session_err is not None:
             return session_err
         run_session_id = ctx.browser_session_id
@@ -2065,6 +2105,7 @@ async def _run_blocks_and_collect_debug(
         raise
 
     active_run_association: ActiveRunSessionAssociation | None = None
+    run_paused = False
     if run_detached_from_chat and debug_session_id and run_session_id:
         try:
             active_run_association = await publish_active_run_session(
@@ -2182,11 +2223,18 @@ async def _run_blocks_and_collect_debug(
                     exit_reason = "stagnation"
                     break
 
+                if is_paused:
+                    exit_reason = "paused"
+                    run_paused = True
+                    break
+
                 if now - started_monotonic >= budget_seconds:
                     exit_reason = budget_exit_reason
                     break
 
-            if exit_reason is not None and exit_reason != "success":
+            if exit_reason is not None and exit_reason not in ("success", "paused"):
+                # A paused run is waiting for a person, so it is deliberately excluded here:
+                # cancelling it would destroy the very state the person was asked to act on.
                 # Pre-cancel read first: a legitimate self-finalize (user/block
                 # cancel, or any terminal the run wrote itself) can land between
                 # the last poll and here, and trusting it avoids the
@@ -2224,9 +2272,6 @@ async def _run_blocks_and_collect_debug(
                 error_msg = await _watchdog_error_message(
                     exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds, dispatch_to_worker
                 )
-                user_failure_reason = _watchdog_user_failure_reason(
-                    exit_reason, workflow_run.workflow_run_id, budget_seconds, run
-                )
                 user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
                 # Dispatched runs: the worker owns the run session, so do not attach to it over CDP.
                 current_url, page_title = (
@@ -2240,7 +2285,7 @@ async def _run_blocks_and_collect_debug(
                     "data": {
                         "workflow_run_id": workflow_run.workflow_run_id,
                         "overall_status": run.status if run is not None else None,
-                        "failure_reason": user_failure_reason,
+                        "failure_reason": user_facing_summary,
                         "current_url": current_url,
                         "page_title": page_title,
                         # Omitting this reads downstream as "run session unknown", which grants a
@@ -2264,23 +2309,17 @@ async def _run_blocks_and_collect_debug(
                 }
                 result["data"]["user_facing_summary"] = user_facing_summary
                 if exit_reason == "per_tool_budget":
-                    # Stable failure_categories entry so consecutive budget trips
-                    # hash to the same streak signature; without it the run_id in
-                    # ``error_msg`` would make every trip unique.
-                    result["data"]["failure_categories"] = [
-                        {
-                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
-                            "confidence_float": 1.0,
-                            "reasoning": (
-                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
-                                "the run was making progress but cannot fit in a single tool call."
-                            ),
-                        }
-                    ]
+                    result["data"]["failure_categories"] = [_per_tool_budget_failure_category(budget_seconds)]
                 if run_cancelled_by_watchdog:
                     result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
                 return result
         except asyncio.CancelledError:
+            # A pause is detected several awaits before the result is returned, so a tool timeout
+            # landing in that window reaches here with the run alive and waiting on a person.
+            # Cancelling it would destroy the state the person was asked to act on, so leave the
+            # run to the ``finally`` below, which adopts the executor instead.
+            if run_paused:
+                raise
             # The SDK's @function_tool(timeout=...) cancelled us mid-poll. Shield
             # the cleanup so the parent cancellation can't interrupt it mid-await.
             # If the shield itself is cancelled, fall back to a detached task
@@ -2309,7 +2348,14 @@ async def _run_blocks_and_collect_debug(
             # poll loop — signal the run_task so we don't leak it. Dispatched runs have no in-process
             # task, so there is nothing to signal.
             if run_task is not None and not run_task.done():
-                run_task.cancel()
+                if run_paused:
+                    # The inline executor coroutine is what observes the approval and resumes the
+                    # run, so it has to outlive this tool call instead of being cancelled.
+                    _DETACHED_CLEANUP_TASKS.add(run_task)
+                    run_task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+                    run_task.add_done_callback(_log_detached_cleanup_failure)
+                else:
+                    run_task.cancel()
             # Soft-delete the pinned draft so it never lingers as the latest version. Gated on a final
             # run state: on the normal path the poll loop only exits once the run is terminal, but an
             # unexpected exception can reach here before the worker has loaded the draft, and deleting
@@ -2520,7 +2566,9 @@ async def _run_blocks_and_collect_debug(
 
         return build_run_blocks_response(run_ok, result_data)
     finally:
-        if active_run_association is not None:
+        # A paused run keeps its association so the pane still follows the run the person was
+        # asked to act on; the next run's generation replaces it.
+        if active_run_association is not None and not run_paused:
             try:
                 await clear_active_run_session(
                     organization_id=active_run_association.organization_id,
@@ -2960,7 +3008,11 @@ def _record_run_blocks_result(
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
     cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
     timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
-    copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
+    # A pause softens the same way: left at False the generic failed-test nudge rewrites the reply
+    # into "the test failed" about a run that is alive and waiting, and ``None`` still bars a
+    # verified proposal because that gate requires ``is True``.
+    run_paused = isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused"
+    copilot_ctx.last_test_ok = None if run_paused or (cancelled_by_watchdog and timeout_latched) else run_ok
     copilot_ctx.last_full_workflow_test_ok = False
     # Re-affirmed per run below only when this run satisfies completion; never let a
     # prior run's terminal-ready latch leak into a run that did not verify.
@@ -3221,7 +3273,7 @@ def _record_build_test_outcome(
         else (result_requested_block_labels if isinstance(result_requested_block_labels, list) else [])
     )
     requested_block_labels = [label for label in raw_requested_values if isinstance(label, str)]
-    block_shape_hashes = _frontier_label_shape_hashes(
+    block_shape_hashes = block_shape_hashes_by_label(
         requested_block_labels,
         workflow_definition,
     )
@@ -3242,7 +3294,7 @@ def _record_build_test_outcome(
                 workflow_yaml,
                 code_artifact_metadata,
             ),
-            block_shape_hashes=block_shape_hashes or {},
+            block_shape_hashes=block_shape_hashes,
         ),
     )
 

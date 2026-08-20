@@ -500,6 +500,9 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
     monkeypatch.setattr(handler, "json_to_html", Mock(return_value="<div>Committed Value</div>"))
     deterministic_select = AsyncMock(return_value=None)
     monkeypatch.setattr(handler, "_select_deterministic_custom_option", deterministic_select)
+    monkeypatch.setattr(handler, "_verify_custom_select_option_with_settle", AsyncMock(return_value=(True, "scope")))
+    monkeypatch.setattr(handler, "_verify_custom_select_option", AsyncMock(return_value=(True, "scope")))
+    monkeypatch.setattr(handler, "_wait_custom_select_render_settle", AsyncMock())
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
     monkeypatch.setattr(
         handler.LLMAPIHandlerFactory,
@@ -512,6 +515,7 @@ async def test_emerging_select_call_path_forwards_committed_value_to_shadow_matc
     scraped_page = SimpleNamespace(id_to_css_dict={})
     scraped_page_after_open = SimpleNamespace(
         id_to_css_dict={"matched-id": "[data-id=matched-id]"},
+        id_to_element_dict={"field-id": {"id": "field-id"}},
         element_tree_trimmed=[_SHADOW_OPTION],
     )
     with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):

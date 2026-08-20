@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -12,7 +12,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow import context_manager as cm
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.taskv3 import auth_tools
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
@@ -181,6 +181,45 @@ def test_get_secret_values_for_run_standalone_task_uses_global_artifact_redactio
         assert wcm.get_secret_values_for_run(None, exclude_runtime_otp=True) == set()
     finally:
         skyvern_context.reset()
+
+
+def _workflow_run_context_with_totp_credentials() -> WorkflowRunContext:
+    workflow_run_context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_test",
+        workflow_permanent_id="wp_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    workflow_run_context.values["cred_1"] = {"totp": "totp_id_1"}
+    workflow_run_context.values["cred_2"] = {"totp": "totp_id_2"}
+    workflow_run_context.secrets["totp_id_1_value"] = "SEED_ONE"
+    workflow_run_context.secrets["totp_id_2_value"] = "SEED_TWO"
+    return workflow_run_context
+
+
+def test_try_generate_totp_from_credential_disambiguates_via_active_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two TOTP-bearing credentials in the same run: with no active credential, resolution is
+    # ambiguous and yields nothing; active_credential_parameter_key (set by _execute_task_v3 for a
+    # single-login-credential block) must select exactly that credential's TOTP secret, not the other.
+    monkeypatch.setattr(otp_service, "generate_totp_code", lambda secret: f"code::{secret}")
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_test"] = _workflow_run_context_with_totp_credentials()
+    monkeypatch.setattr(otp_service.app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_test"))
+    try:
+        assert otp_service.try_generate_totp_from_credential("wr_test") is None
+    finally:
+        skyvern_context.reset()
+
+    skyvern_context.set(SkyvernContext(workflow_run_id="wr_test", active_credential_parameter_key="cred_2"))
+    try:
+        otp = otp_service.try_generate_totp_from_credential("wr_test")
+    finally:
+        skyvern_context.reset()
+    assert otp is not None
+    assert otp.value == "code::SEED_TWO"
 
 
 def test_get_secret_values_for_run_standalone_task_respects_disabled_global_artifact_redaction(

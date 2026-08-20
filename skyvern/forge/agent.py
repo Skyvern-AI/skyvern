@@ -31,6 +31,7 @@ from skyvern.constants import (
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
     SPECIAL_FIELD_VERIFICATION_CODE,
+    SPECULATIVE_COST_PERSIST_DRAIN_TIMEOUT,
     ScrapeType,
 )
 from skyvern.errors.errors import (
@@ -130,6 +131,7 @@ from skyvern.forge.sdk.experimentation.transient_ui_capture import (
     resolve_transient_ui_capture_arm,
     transient_ui_capture_arm,
 )
+from skyvern.forge.sdk.experimentation.workflow_block_engine import task_v3_disabled
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
@@ -146,6 +148,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     FileDownloadBlock,
     ValidationBlock,
+    _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.validation_evidence_router import (
@@ -418,6 +421,31 @@ def _schedule_summary_shadow_check_for_hit(
         schema=None,
         logger=shadow_logger,
     )
+
+
+_PENDING_DISCARDED_PLAN_PERSISTS: set[asyncio.Task] = set()
+
+
+async def drain_speculative_persist_tasks(context: SkyvernContext | None) -> None:
+    if context is None or not context.pending_speculative_persist_tasks:
+        return
+    pending = context.pending_speculative_persist_tasks
+    context.pending_speculative_persist_tasks = []
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=SPECULATIVE_COST_PERSIST_DRAIN_TIMEOUT,
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                LOG.warning("Speculative cost persistence task failed, cost may be unattributed", exc_info=result)
+    except TimeoutError:
+        # Bounded so a hung speculative call can't stall the run: we're back to losing
+        # the cost write, which is what happened on every path before the drain existed.
+        LOG.warning(
+            "Speculative cost persistence did not finish before clean-up, cost may be unattributed",
+            pending=len(pending),
+        )
 
 
 def _discard_background_task_result(task: asyncio.Task) -> None:
@@ -961,6 +989,7 @@ class ForgeAgent:
         api_key: str | None,
         close_browser_on_completion: bool,
         browser_session_id: str | None,
+        task_block: BaseTaskBlock | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
 
@@ -974,6 +1003,7 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import build_auth_tools
+        from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             MIN_ACTION_STEPS,
             coerce_v3_parameters,
@@ -981,7 +1011,26 @@ class ForgeAgent:
             taskv3_runaway_backstops,
         )
 
-        page = await browser_state.must_get_working_page()
+        # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
+        # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
+        # Bare tasks keep today's exact semantics: one page grabbed up front, for the run's duration.
+        if task_block is not None:
+            # Fail fast (with the same recovery attempt bare tasks get) when the page is already
+            # gone at block start; mid-run losses surface through the per-call provider instead.
+            await browser_state.must_get_working_page()
+
+            async def _page_provider() -> Any:
+                # must_get (not get): recovers a crashed/closed page via _reopen_lost_working_page,
+                # matching the step engine's per-action re-acquisition; its raise on unrecoverable
+                # loss is contained by the loop's per-tool-call error handling.
+                return await browser_state.must_get_working_page()
+
+        else:
+            initial_page = await browser_state.must_get_working_page()
+
+            async def _page_provider() -> Any:
+                return initial_page
+
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
         context = skyvern_context.current()
@@ -1009,12 +1058,88 @@ class ForgeAgent:
             goal = (
                 f"{goal}\n\nIf this becomes true, stop and finish with status=terminated: {task.terminate_criterion}"
             ).strip()
+        page_free_validation = bool(
+            task_block is not None
+            and task.task_type == TaskType.validation
+            and context
+            and context.validation_without_page_information
+        )
+        if task_block is not None and task.task_type == TaskType.validation and not page_free_validation:
+            # Same evidence router v1 consults: a router-selected data-only validation goes
+            # page-free on v3 too. Conservative — any router error keeps the page-aware path.
+            try:
+                router_result = await resolve_validation_evidence_route(
+                    task=task,
+                    step=step,
+                    complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
+                    navigation_payload_str=json.dumps(parameters) if parameters else "{}",
+                    error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else None,
+                    local_datetime=datetime.now(context.tz_info if context else None).isoformat(),
+                )
+                page_free_validation = bool(router_result.effective_without_page_information)
+            except Exception:
+                LOG.warning("task_v3 validation evidence router failed; staying page-aware", task_id=task.task_id)
+        if task_block is not None and not page_free_validation:
+            # A block resumes mid-workflow: an earlier block may already have satisfied this one's
+            # criterion (the step engine's per-step goal check gives it this for free).
+            goal = (
+                f"{goal}\n\nThis task is one block of a larger workflow and starts mid-flow. First read "
+                "the full page text (get_html) and check whether the completion criterion is ALREADY "
+                "satisfied by the page's settled, loaded content - a loading indicator, skeleton, or "
+                "empty container does NOT satisfy a criterion about visible content."
+                + (
+                    " When the goal names an action (open/click/submit), perform it unless the page "
+                    "already shows that action's RESULT."
+                    if task.task_type != TaskType.validation
+                    else ""
+                )
+                + " If the criterion is genuinely satisfied, finish with status=completed "
+                "immediately without acting. Stay "
+                "within this block's goal: never sign out, navigate away from the current flow, or undo "
+                "prior progress unless the goal explicitly asks for it."
+            ).strip()
+        if page_free_validation:
+            # This mode judges only durable inputs/prior outputs; any perception instruction would
+            # contradict it, so it replaces (not extends) the read-the-page framing above.
+            goal = (
+                f"{goal}\n\nThis is a page-free assessment task: judge ONLY from the information already "
+                "provided above and prior workflow context. Do not call observe or get_html, and do not "
+                "modify page state. Evaluate the completion and termination criteria and finish with the "
+                "matching status."
+            ).strip()
+        elif task_block is not None and task.task_type == TaskType.validation:
+            # ValidationBlock tasks judge, not act; without this the loop can treat the criteria
+            # above as something to accomplish by interacting with the page.
+            goal = (
+                f"{goal}\n\nThis is an assessment task: do not modify page state. Evaluate the completion "
+                "and termination criteria above and finish with the matching status. Ground the judgment "
+                "in the page's actual content: read the full page text (get_html) before concluding, and "
+                "never finish with status=terminated on element summaries alone — absence must be "
+                "confirmed against the full text."
+            ).strip()
+        elif task_block is not None and task.task_type == TaskType.action:
+            goal = f"{goal}\n\nThis is a single, focused action: perform it and finish.".strip()
 
         async def _should_cancel() -> bool:
             refreshed = await app.DATABASE.tasks.get_task(
                 task_id=task.task_id, organization_id=organization.organization_id
             )
-            return bool(refreshed and refreshed.status == TaskStatus.canceled)
+            if refreshed and refreshed.status in (TaskStatus.canceled, TaskStatus.timed_out):
+                return True
+            # A workflow task also stops when its parent run is canceled or reaped to timed_out, not
+            # just the task row. Fail open on a lookup error: a DB blip must not fail a healthy run.
+            if task.workflow_run_id:
+                try:
+                    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                        workflow_run_id=task.workflow_run_id, organization_id=organization.organization_id
+                    )
+                except Exception:
+                    LOG.warning("task_v3 cancel poll failed to read workflow run", task_id=task.task_id, exc_info=True)
+                    return False
+                if workflow_run and workflow_run.status in (WorkflowRunStatus.canceled, WorkflowRunStatus.timed_out):
+                    return True
+            return False
 
         download_id = resolve_run_download_id(context, fallback_run_id=task.task_id)
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
@@ -1028,25 +1153,85 @@ class ForgeAgent:
             or organization.max_steps_per_run
             or settings.MAX_STEPS_PER_RUN
         )
-        # Floor to the v3 minimum: a step-engine-tuned cap can starve the less round-efficient v3 loop.
-        step_cap = max(step_cap, MIN_ACTION_STEPS)
+        # An action or validation block owns its small budget deliberately; every other cap is sized in
+        # step-engine steps, which starves the less round-efficient v3 loop. Either signal alone marks
+        # the budget as owned — the block class settles it when task_type was left at its `general`
+        # default, which would otherwise floor an action block to many times its intended rounds.
+        atomic_block_budget = task_block is not None and (
+            isinstance(task_block, (ActionBlock, ValidationBlock))
+            or (task.task_type or TaskType.general) != TaskType.general
+        )
+        if not atomic_block_budget:
+            floored_step_cap = max(step_cap, MIN_ACTION_STEPS)
+            if floored_step_cap != step_cap and task_block is not None:
+                LOG.info(
+                    "task_v3 raised a block's action-step budget to the v3 floor",
+                    log_code="taskv3_action_budget_floored",
+                    task_id=task.task_id,
+                    block_label=task_block.label,
+                    block_type=task_block.block_type,
+                    configured_step_cap=step_cap,
+                    floored_step_cap=floored_step_cap,
+                )
+            step_cap = floored_step_cap
+        if task_block is not None:
+            # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
+            # budget unit (round-stamped action rows make prior v3 rounds count exactly).
+            workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+            if workflow_run_budget is not None:
+                total_workflow_run_steps, max_steps_per_workflow_run = workflow_run_budget
+                # The count already includes THIS block's freshly created Step(order=0), which has
+                # performed nothing yet — credit it back so a cap of N allows N actual rounds.
+                remaining_workflow_steps = max_steps_per_workflow_run - max(0, total_workflow_run_steps - 1)
+                if remaining_workflow_steps <= 0:
+                    LOG.info(
+                        "task_v3 block not started: workflow-run max steps reached",
+                        task_id=task.task_id,
+                        total_workflow_run_steps=total_workflow_run_steps,
+                        max_steps_per_workflow_run=max_steps_per_workflow_run,
+                    )
+                    step = await self.update_step(step, status=StepStatus.failed, is_last=True)
+                    task = await self.update_task(
+                        task,
+                        status=TaskStatus.failed,
+                        failure_reason=f"Workflow run reached the maximum steps ({max_steps_per_workflow_run})",
+                    )
+                    await self.clean_up_task(
+                        task=task,
+                        last_step=step,
+                        api_key=api_key,
+                        need_call_webhook=True,
+                        close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
+                    )
+                    return step, task
+                step_cap = min(step_cap, remaining_workflow_steps)
         max_turns, max_tool_calls = taskv3_runaway_backstops(step_cap)
-        auth_tools, auth_guidance = build_auth_tools(task)
         # Per-action persistence (parity with the step engine): the loop hands us each successful
         # action round, and we persist one DB row per action + one screenshot per round, so the Task
         # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
         # best-effort — billing still meters off outcome.billable_actions below.
         _tool_action_types = {
             "click": ActionType.CLICK,
+            "hover": ActionType.HOVER,
             "type": ActionType.INPUT_TEXT,
             "select_option": ActionType.SELECT_OPTION,
             "select_combobox": ActionType.SELECT_OPTION,
             "press_key": ActionType.KEYPRESS,
             "file_upload": ActionType.UPLOAD_FILE,
+            "navigate": ActionType.GOTO_URL,
+            "scroll": ActionType.SCROLL,
+            "wait": ActionType.WAIT,
+            "solve_captcha": ActionType.SOLVE_CAPTCHA,
         }
+        _billable_tool_names = frozenset(
+            {"click", "hover", "type", "select_option", "select_combobox", "press_key", "file_upload"}
+        )
         v3_persisted_actions: list[Action] = []
+        v3_round_index = 0
 
-        async def _on_action_round(round_actions: list[tuple[str, dict[str, Any]]]) -> None:
+        async def _on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+            nonlocal v3_round_index
             screenshot_artifact_id: str | None = None
             try:
                 screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
@@ -1055,17 +1240,19 @@ class ForgeAgent:
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
-            for name, args in round_actions:
+            for name, args, succeeded in round_actions:
                 try:
                     selector = args.get("selector", "") if isinstance(args, dict) else ""
                     action = Action(
                         action_type=_tool_action_types.get(name, ActionType.CLICK),
-                        status=ActionStatus.completed,
+                        status=ActionStatus.completed if succeeded else ActionStatus.failed,
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
                         step_id=step.step_id,
-                        step_order=step.order,
+                        # Round index, not the single Step's order: makes each v3 action ROUND count
+                        # as one unit of the workflow-run step budget (distinct (task, order) pairs).
+                        step_order=v3_round_index,
                         action_order=len(v3_persisted_actions),
                         description=f"task_v3 {name} {selector}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
@@ -1074,24 +1261,93 @@ class ForgeAgent:
                     await app.DATABASE.workflow_params.create_action(action=action)
                 except Exception:
                     LOG.warning("task_v3 failed to persist action row", task_id=task.task_id, exc_info=True)
+            if any(name in _billable_tool_names for name, _args, _ok in round_actions):
+                # Only billable rounds consume the budget unit; recordable-only rounds (navigate/
+                # scroll/wait) keep the current index so they never inflate the workflow-run count.
+                v3_round_index += 1
 
-        outcome = await run_task_v3_agent_loop(
-            page=page,
-            llm_caller=llm_caller,
-            goal=goal,
-            parameters=parameters,
-            starting_url=task.url,
-            downloads_dir=get_download_dir(download_id),
-            organization_id=organization.organization_id,
-            max_action_steps=step_cap,
-            max_turns=max_turns,
-            max_tool_calls=max_tool_calls,
-            step=step,
-            should_cancel=_should_cancel,
-            on_action_round=_on_action_round,
-            extra_tools=auth_tools,
-            extra_system_guidance=auth_guidance,
-        )
+        # Disambiguates multi-credential TOTP the way v1's action handler does (handler.py
+        # get_actual_value_of_parameter_if_secret), but resolved once per block instead of per keystroke:
+        # only an unambiguous single login credential is worth pinning for the whole loop.
+        credential_parameter_key: str | None = None
+        if task_block is not None:
+            login_credential_keys = [
+                parameter.key for parameter in task_block.parameters if parameter.parameter_type.is_login_credential()
+            ]
+            if len(login_credential_keys) == 1:
+                credential_parameter_key = login_credential_keys[0]
+
+        _page_fingerprint = None
+        if task_block is not None:
+            # One cheap DOM sample per call: a content hash plus length and element count, so a swap
+            # that preserves the page's shape still changes the fingerprint. Peeks with the
+            # NON-recovering accessor — recovery at finish time could navigate and induce duplicate
+            # actions; a lost page returns None (nothing to verify; accept the verdict as-is).
+            # Errors propagate: the finish gate treats them as unknown, never as settled. Timing and
+            # its deadline/cancellation bounds live with the gate, not here.
+            # Fenced to block tasks so the live bare-task arm's finish path is unchanged.
+            async def _page_fingerprint() -> str | None:
+                peek = await browser_state.get_working_page()
+                if peek is None:
+                    return None
+                probe_js = (
+                    "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
+                    " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
+                    " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+                )
+                return await peek.evaluate(probe_js)
+
+        resolve_typed_text = None
+        if task_block is not None:
+            # Local import: handler.py transitively imports this module (agent registration), so a
+            # top-level import would be circular; matches this function's other lazy imports.
+            from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
+
+            def resolve_typed_text(text: str) -> Any:
+                return get_actual_value_of_parameter_if_secret_with_task(task, text)
+
+        prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
+        if context and credential_parameter_key is not None:
+            context.active_credential_parameter_key = credential_parameter_key
+        try:
+            # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
+            # must see the pinned key, or a multi-credential context hides get_verification_code.
+            auth_tools, auth_guidance = build_auth_tools(task)
+            # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
+            # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
+            # Withheld in page-free mode: like browser_tools, a page-operating tool must not be offered
+            # when the run structurally never touches the live DOM.
+            captcha_tools: list[Any] = []
+            captcha_guidance = ""
+            if not page_free_validation:
+                captcha_tools, captcha_guidance = build_captcha_tools(
+                    task, _page_provider, organization_id=organization.organization_id
+                )
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_page_provider,
+                resolve_typed_text=resolve_typed_text,
+                page_free=page_free_validation,
+                page_fingerprint=_page_fingerprint,
+                llm_caller=llm_caller,
+                goal=goal,
+                parameters=parameters,
+                starting_url=task.url,
+                downloads_dir=get_download_dir(download_id),
+                organization_id=organization.organization_id,
+                max_action_steps=step_cap,
+                max_turns=max_turns,
+                max_tool_calls=max_tool_calls,
+                step=step,
+                should_cancel=_should_cancel,
+                on_action_round=_on_action_round,
+                extra_tools=auth_tools + captcha_tools,
+                extra_system_guidance="\n\n".join(
+                    part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
+                ),
+            )
+        finally:
+            if context and credential_parameter_key is not None:
+                context.active_credential_parameter_key = prev_active_credential_parameter_key
         LOG.info(
             "Task V3 loop finished",
             task_id=task.task_id,
@@ -1100,12 +1356,34 @@ class ForgeAgent:
             tool_calls=outcome.tool_calls,
             action_steps=outcome.action_steps,
         )
+        completion_vetoed = False
+        if outcome.status == "completed":
+            # Same deployment gate the step engine applies before accepting a completion verdict
+            # (e.g. a submit block that must show a deterministic confirmation). The loop has already
+            # returned, so a veto fails safe instead of falsely completing.
+            try:
+                gate_page = await browser_state.get_working_page()
+                completion_vetoed = not await app.AGENT_FUNCTION.gate_step_completion(
+                    task=task,
+                    step=step,
+                    task_block=task_block,
+                    page=gate_page,
+                    browser_state=browser_state,
+                )
+            except Exception:
+                LOG.warning(
+                    "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
+                )
+            if completion_vetoed:
+                LOG.info("task_v3 completion vetoed by completion gate", task_id=task.task_id)
         status_map = {
             "completed": TaskStatus.completed,
             "terminated": TaskStatus.terminated,
             "canceled": TaskStatus.canceled,
         }
         task_status = status_map.get(outcome.status, TaskStatus.failed)
+        if completion_vetoed:
+            task_status = TaskStatus.failed
         # A completed run with a data-extraction goal must actually carry data. The model declaring
         # completion with no extracted_output is a failed extraction, not an empty success — report it
         # as failed rather than fabricate an empty object that reads as a successful-but-empty result.
@@ -1124,6 +1402,11 @@ class ForgeAgent:
             step_status = StepStatus.completed
         else:
             step_status = StepStatus.failed
+        # This one step is the whole run's billing unit: a failure AFTER real page actions must still
+        # bill them (post-step billing only meters completed steps), so chargeable work completes the
+        # step even when the task fails. Canceled runs stay unbilled, matching the step engine.
+        if step_status == StepStatus.failed and outcome.billable_actions:
+            step_status = StepStatus.completed
         extracted_information = outcome.extracted_output if completed else None
         if completed and task.extracted_information_schema is not None and extracted_information is not None:
             # Repair the model's output against the schema (fill missing required fields, drop
@@ -1178,23 +1461,66 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
+        failure_category = None
         if task_status in (TaskStatus.completed, TaskStatus.canceled):
             failure_reason = None
+        elif completion_vetoed:
+            failure_reason = "task_v3 reported completion but the deployment completion gate rejected it"
         elif missing_extraction:
             failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
         else:
             failure_reason = outcome.reason or outcome.status
-        task = await self.update_task(
-            task,
-            status=task_status,
-            extracted_information=extracted_information,
-            failure_reason=failure_reason,
-        )
+        if task_status == TaskStatus.failed:
+            # Same code-level failure classification fail_task records, so v3 failures carry a
+            # failure_category like step-engine failures.
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
+            # Same user-defined error detection the step engine runs on failure, so workflows that
+            # consume configured error codes keep that contract on v3.
+            try:
+                detected_errors = await detect_user_defined_errors_for_task(
+                    task=task,
+                    step=step,
+                    browser_state=browser_state,
+                    failure_reason=failure_reason,
+                )
+                if detected_errors:
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=task.organization_id,
+                        errors=[error.model_dump() for error in detected_errors],
+                    )
+            except Exception:
+                LOG.warning("task_v3 user-defined error detection failed", task_id=task.task_id, exc_info=True)
+        need_call_webhook = True
+        try:
+            task = await self.update_task(
+                task,
+                status=task_status,
+                extracted_information=extracted_information,
+                failure_reason=failure_reason,
+                failure_category=failure_category,
+            )
+        except (TaskAlreadyTimeout, TaskAlreadyCanceled) as finalized:
+            # A reaper or cancel API finalized the row while the loop was stopping; that terminal
+            # status wins — keep it rather than routing this run through the failure path. The cancel
+            # API already webhooks synchronously, so suppress the duplicate there (v1 parity on both axes).
+            need_call_webhook = not isinstance(finalized, TaskAlreadyCanceled)
+            LOG.info(
+                "task_v3 task already finalized externally; keeping the existing terminal status",
+                task_id=task.task_id,
+                attempted_status=task_status,
+            )
+            refreshed = await app.DATABASE.tasks.get_task(
+                task_id=task.task_id, organization_id=organization.organization_id
+            )
+            if refreshed:
+                task = refreshed
         await self.clean_up_task(
             task=task,
             last_step=step,
             api_key=api_key,
-            need_call_webhook=True,
+            need_call_webhook=need_call_webhook,
             close_browser_on_completion=close_browser_on_completion,
             browser_session_id=browser_session_id,
         )
@@ -1378,22 +1704,28 @@ class ForgeAgent:
                 )
                 return step, detailed_output, None
 
+            # A bare task always qualifies; a workflow block must be an allowed type with no
+            # download semantics (v3 doesn't implement complete_on_download/download_suffix).
+            task_block_supports_v3 = task_block is None or _task_block_supports_v3(task_block)
+            if engine == RunEngine.skyvern_v3 and task_block is not None and not task_block_supports_v3:
+                LOG.info(
+                    "Task V3 block type unsupported; falling back to the step engine",
+                    task_id=task.task_id,
+                    block_label=task_block.label,
+                    block_type=task_block.block_type,
+                    reason="taskv3_unsupported_block",
+                )
+
             # Task V3 native engine: run the whole task as one persistent tool-loop and
             # complete here. Returns next_step=None, so neither retry nor execute-all-steps
             # recursion re-invokes the loop. DISABLE_TASK_V3 falls through to the step engine.
             if (
                 engine == RunEngine.skyvern_v3
-                # v3 does not yet preserve workflow download_suffix/complete_on_download, so a
-                # workflow task block falls through to the step engine until that is supported.
-                and task_block is None
-                # v3 has no 2FA/TOTP handling yet; fall back to the step engine when a TOTP
-                # verification URL is set. A bare totp_identifier proceeds on v3 (rarely exercises 2FA).
+                and task_block_supports_v3
+                # v3 now resolves TOTP via get_verification_code; only a totp_verification_url task
+                # (needs step-engine webhook delivery) stays excluded on that axis.
                 and not task.totp_verification_url
-                and not await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                    "DISABLE_TASK_V3",
-                    task.workflow_run_id or task.task_id,
-                    properties={"organization_id": task.organization_id},
-                )
+                and not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
             ):
                 try:
                     step, task = await self._execute_task_v3(
@@ -1404,6 +1736,7 @@ class ForgeAgent:
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        task_block=task_block,
                     )
                 finally:
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
@@ -1955,6 +2288,11 @@ class ForgeAgent:
         except TaskAlreadyCanceled:
             LOG.info(
                 "Task is already canceled. Can't fail the task.",
+            )
+            return False
+        except TaskAlreadyTimeout:
+            LOG.info(
+                "Task is already timed out. Can't fail the task.",
             )
             return False
         except InvalidTaskStatusTransition:
@@ -5461,10 +5799,8 @@ class ForgeAgent:
                             )
                             artifact_outcome = "partial"
                             artifact_error = "storage_partial"
-                        # Tag any session-scoped DOWNLOAD artifacts created during
-                        # this run with run_id, so GET /v1/runs/{id} surfaces them
-                        # (the watcher in browser_controller can't know the active
-                        # run at upload time — see
+                        # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
+                        # GET /v1/runs/{id} surfaces them (see
                         # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
@@ -5548,6 +5884,10 @@ class ForgeAgent:
                                     workflow_run_id=task.workflow_run_id,
                                 )
 
+        # Last point common to every terminal path, and late enough that the screenshot and
+        # download work above has already given the billed speculative call time to land.
+        await drain_speculative_persist_tasks(skyvern_context.current())
+
         # if it's a task block from workflow run,
         # we don't need to close the browser, save browser artifacts, or call webhook
         if task.workflow_run_id:
@@ -5626,7 +5966,6 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
@@ -5678,7 +6017,6 @@ class ForgeAgent:
                 LOG.info(
                     "Webhook failed",
                     task_id=task.task_id,
-                    resp=resp,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
                 )
@@ -5902,14 +6240,17 @@ class ForgeAgent:
                     continue
 
             redaction_enabled = app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id)
+            # Opted-out runs still floor runtime-resolved secrets (e.g. verification codes) out of
+            # browser diagnostics, matching the workflow-finalization sites.
             secret_values = (
                 app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
                 if redaction_enabled
-                else set()
+                else app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
             )
+            should_redact = redaction_enabled or bool(secret_values)
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
-            if redaction_enabled:
+            if should_redact:
                 har_data = await asyncio.to_thread(redact_har_bytes, har_data, secret_values)
             if settings.SKYVERN_SUBMISSION_SIGNAL_SHADOW:
                 submission_shadow.schedule_submission_signal_shadow(
@@ -5924,7 +6265,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
-            if redaction_enabled:
+            if should_redact:
                 browser_log = await asyncio.to_thread(redact_console_log_bytes, browser_log, secret_values)
             LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
 
@@ -6146,13 +6487,22 @@ class ForgeAgent:
             complete_action = None
 
         if complete_action is not None:
-            asyncio.create_task(
+            persist_task = asyncio.create_task(
                 self._persist_speculative_metadata_for_discarded_plan(
                     next_step,
                     speculative_task,
                     cancel_step=True,
-                )
+                ),
+                name=f"persist_discarded_plan_{next_step.step_id}",
             )
+            # The speculative call is already billed, so its cost write has to outlive this
+            # branch. The module-level set keeps a strong reference (an unreferenced task can be
+            # garbage collected mid-flight); the context registration is what clean_up_task
+            # drains so the write also survives run teardown.
+            _PENDING_DISCARDED_PLAN_PERSISTS.add(persist_task)
+            persist_task.add_done_callback(_PENDING_DISCARDED_PLAN_PERSISTS.discard)
+            if context := skyvern_context.current():
+                context.pending_speculative_persist_tasks.append(persist_task)
 
             working_page = page or await browser_state.must_get_working_page()
 
@@ -6838,7 +7188,7 @@ class ForgeAgent:
         task_ids = [t.task_id for t in workflow_run_tasks]
         if not task_ids:
             return 0, organization.max_steps_per_workflow_run
-        total_steps = await app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids(
+        total_steps = await app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids(
             task_ids=task_ids,
             organization_id=organization.organization_id,
         )

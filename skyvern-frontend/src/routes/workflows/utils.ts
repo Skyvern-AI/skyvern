@@ -220,6 +220,20 @@ export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
   return blockLabels;
 };
 
+export const shouldPollForGeneratedCode = (
+  workflow: WorkflowApiResponse | undefined,
+  isFinalized: boolean | null,
+  hasPublishedCode: boolean,
+) =>
+  !isFinalized &&
+  !hasPublishedCode &&
+  Boolean(
+    workflow?.workflow_definition.blocks.some(
+      (block) =>
+        block.label !== workflow.workflow_definition.finally_block_label,
+    ),
+  );
+
 /**
  * Returns run parameter entries ordered by the workflow definition's parameter array,
  * each paired with its matched workflow-parameter definition (undefined when absent).

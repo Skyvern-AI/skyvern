@@ -3912,6 +3912,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request"
+          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
           },
@@ -6609,7 +6612,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -6781,6 +6784,18 @@
               "title": "Tags"
             },
             "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
+          },
+          {
+            "name": "include_child_runs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs.",
+              "default": false,
+              "title": "Include Child Runs"
+            },
+            "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs."
           },
           {
             "name": "x-api-key",
@@ -8622,6 +8637,17 @@
             "title": "Max Retries",
             "default": 0
           },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -10376,6 +10402,18 @@
             ],
             "title": "Deleted At",
             "description": "Timestamp when the session was deleted, if applicable"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning",
+            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped; null otherwise."
           }
         },
         "type": "object",
@@ -11321,7 +11359,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -26328,6 +26366,10 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -26363,6 +26405,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
           },
           "parameter_keys": {
             "anyOf": [

@@ -38,6 +38,7 @@ PINNED_CLIENT_FIELDS = frozenset(
         "created_at",
         "modified_at",
         "deleted_at",
+        "warning",
     }
 )
 

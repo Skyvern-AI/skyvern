@@ -7,6 +7,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
@@ -86,16 +87,22 @@ def _object_bool_attr(value: object | None, attr_name: str) -> bool:
     return getattr(value, attr_name, False) is True
 
 
-def _browser_context_is_attachable(browser_context: object | None) -> bool:
+class BrowserProbeOutcome(StrEnum):
+    attachable = "attachable"
+    positively_unreachable = "positively_unreachable"
+    could_not_determine = "could_not_determine"
+
+
+def _browser_context_attachability(browser_context: object | None) -> BrowserProbeOutcome:
     if browser_context is None:
-        return False
+        return BrowserProbeOutcome.positively_unreachable
 
     # Playwright Python has no public BrowserContext.closed flag. These private
     # attrs are a best-effort early guard; fallback defaults keep future
     # Playwright changes from breaking the public browser.is_connected probe.
     impl = _playwright_private_impl(browser_context)
     if _object_bool_attr(impl, "_close_was_called") or _object_bool_attr(impl, "_closed"):
-        return False
+        return BrowserProbeOutcome.positively_unreachable
 
     # Test doubles and older Playwright-like wrappers may omit the public
     # browser property. Treat that as attachable after the private close check.
@@ -103,11 +110,16 @@ def _browser_context_is_attachable(browser_context: object | None) -> bool:
     if browser is not None:
         try:
             if not browser.is_connected():
-                return False
+                return BrowserProbeOutcome.positively_unreachable
         except Exception:
-            return False
+            # The connectivity signal itself failed. That is not an answer about the browser.
+            return BrowserProbeOutcome.could_not_determine
 
-    return True
+    return BrowserProbeOutcome.attachable
+
+
+def _browser_context_is_attachable(browser_context: object | None) -> bool:
+    return _browser_context_attachability(browser_context) == BrowserProbeOutcome.attachable
 
 
 def _copilot_session_can_access_localhost() -> bool:
@@ -322,6 +334,7 @@ class AgentContext:
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     copilot_total_timeout_exceeded: bool = False
+    copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
     model_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
@@ -642,6 +655,25 @@ async def resolve_browser_state_for_context(
     )
 
 
+async def _close_browser_session_quietly(organization_id: str, session_id: str) -> None:
+    """Bounded: the session-manager backend is often the reason we are closing at all, so an
+    unbounded close could hang the request."""
+    try:
+        await asyncio.wait_for(
+            app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id),
+            timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
+
+
+def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
+    """Retire an id that a completed resolve found unusable, unless a concurrent call already
+    replaced it — nulling a live replacement would discard the session this exists to protect."""
+    if ctx.browser_session_id == examined_session_id:
+        ctx.browser_session_id = None
+
+
 @asynccontextmanager
 async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
@@ -679,14 +711,29 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
     else:
         browser_state = await resolve_browser_state_for_context(ctx, session_id=browser_session_id)
-        if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
+        attachability = (
+            BrowserProbeOutcome.positively_unreachable
+            if browser_state is None
+            else _browser_context_attachability(browser_state.browser_context)
+        )
+        if browser_state is None or attachability != BrowserProbeOutcome.attachable:
             # Keep the session id out of the raised message -- it can propagate
             # to LLM- or user-visible output -- but log it for operators.
+            retiring = attachability == BrowserProbeOutcome.positively_unreachable
             LOG.warning(
                 "No browser context for copilot session",
                 session_id=browser_session_id,
                 organization_id=ctx.organization_id,
+                attachability=attachability.value,
+                # Whether the next call reuses this session or cold-boots a replacement, losing
+                # whatever page state it held. The tool error alone does not say which.
+                session_retired=retiring,
             )
+            # A completed resolve that found nothing attachable is the positive evidence the probe
+            # structurally cannot get, so this is where a dead id gets retired. An unavailable
+            # connectivity signal is not that evidence, so the call fails but the id survives.
+            if retiring:
+                retire_browser_session_id(ctx, browser_session_id)
             raise RuntimeError("No browser context for copilot session")
 
     override_token = set_api_key_override(ctx.api_key)
@@ -741,8 +788,35 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         reset_api_key_override(override_token)
 
 
-async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
+async def _probe_browser_session(ctx: AgentContext, session_id: str) -> BrowserProbeOutcome:
+    """Classify by what completed, never by exception type. Reaching `positively_unreachable`
+    needs both a lookup that returned and a health signal that answered; either failing to
+    complete is undetermined, since neither is evidence about the browser."""
+    try:
+        state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+        )
+        if state is None:
+            return BrowserProbeOutcome.positively_unreachable
+        attachability = _browser_context_attachability(state.browser_context)
+    except Exception as exc:
+        LOG.warning(
+            "Browser state probe failed; liveness undetermined",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return BrowserProbeOutcome.could_not_determine
+    return attachability
+
+
+async def ensure_browser_session(ctx: AgentContext, *, require_verified_session: bool = False) -> dict[str, Any] | None:
     """Create a browser session if needed. Returns None on success, error dict on failure.
+
+    Callers that hand the id onward without ever attaching cannot discover a dead session, so they
+    pass require_verified_session=True to get an infrastructure error instead of an unverified id.
 
     Exception: the self-heal path raises HealAdoptionFailed instead of returning an
     error dict, so a failed adoption aborts the turn rather than degrading to a normal
@@ -762,7 +836,17 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
         ctx.browser_session_id = None
 
     if ctx.browser_session_id:
-        persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
+        try:
+            persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
+        except Exception as exc:
+            LOG.warning(
+                "Browser session record lookup failed; status unknown",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            persistent = None
         if persistent is not None and _browser_session_status_is_final(persistent.status):
             LOG.warning(
                 "Supplied browser_session_id is closed or missing; auto-creating",
@@ -773,36 +857,50 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
             ctx.browser_session_id = None
 
     if ctx.browser_session_id:
-        try:
-            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                session_id=ctx.browser_session_id,
-                organization_id=ctx.organization_id,
-            )
-            if state and _browser_context_is_attachable(state.browser_context):
+        probed_session_id = ctx.browser_session_id
+        outcome = await _probe_browser_session(ctx, probed_session_id)
+        if outcome == BrowserProbeOutcome.attachable:
+            return None
+        if outcome == BrowserProbeOutcome.could_not_determine:
+            # Not evidence against the session, so it survives for callers that will attach and
+            # find out. A caller that never attaches gets the fault surfaced instead.
+            if not require_verified_session:
                 return None
-            LOG.warning(
-                "Supplied browser_session_id is no longer attachable; auto-creating",
-                session_id=ctx.browser_session_id,
-                organization_id=ctx.organization_id,
-            )
-        except Exception as exc:
-            LOG.warning(
-                "Browser state probe raised for supplied session; auto-creating",
-                session_id=ctx.browser_session_id,
-                organization_id=ctx.organization_id,
-                error_type=type(exc).__name__,
-                exc_info=True,
-            )
-        ctx.browser_session_id = None
+            return {"ok": False, "error": "Could not verify the browser session; please retry"}
+        LOG.warning(
+            "Supplied browser_session_id is no longer attachable; auto-creating",
+            session_id=probed_session_id,
+            organization_id=ctx.organization_id,
+        )
+        retire_browser_session_id(ctx, probed_session_id)
+        if ctx.browser_session_id:
+            # The retire declined: a concurrent call installed a replacement while the probe was in
+            # flight. Use it rather than minting a third session on top of it.
+            return None
 
     session = None
+    installed_session_id: str | None = None
     try:
         with copilot_span("browser_session_create", data={"organization_id": ctx.organization_id}):
             session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                 organization_id=ctx.organization_id,
                 timeout_minutes=30,
             )
-        ctx.browser_session_id = session.persistent_browser_session_id
+        if ctx.browser_session_id:
+            # A sibling call installed a session while this create was in flight. Adopt theirs and
+            # close ours: assigning over it would leave a live browser referenced by nobody until
+            # its timeout. The boot wait below then runs against the session that survived.
+            LOG.info(
+                "Closing a duplicate browser session; a concurrent call already installed one",
+                session_id=session.persistent_browser_session_id,
+                installed_session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+            )
+            await _close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+            session = None
+        else:
+            ctx.browser_session_id = session.persistent_browser_session_id
+            installed_session_id = ctx.browser_session_id
 
         # DefaultPersistentSessionsManager schedules chromium in a background
         # task and returns from create_session before browser_context is set,
@@ -835,21 +933,9 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
         # degraded session-manager backend, and close_session hitting the
         # same backend could hang the whole request if left unbounded.
         if session is not None:
-            try:
-                await asyncio.wait_for(
-                    app.PERSISTENT_SESSIONS_MANAGER.close_session(
-                        organization_id=ctx.organization_id,
-                        browser_session_id=session.persistent_browser_session_id,
-                    ),
-                    timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                LOG.debug(
-                    "Failed to clean up partial browser session",
-                    session_id=session.persistent_browser_session_id,
-                    exc_info=True,
-                )
-        ctx.browser_session_id = None
+            await _close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+        # Only clear an id this call installed; a sibling's session is not ours to drop.
+        retire_browser_session_id(ctx, installed_session_id)
         # Detail stays in the log above (exc_info=True). The returned string
         # flows back through the tool/agent path and could end up in
         # LLM-visible or user-visible output, so strip raw exception text

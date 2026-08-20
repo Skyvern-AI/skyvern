@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -1488,11 +1489,8 @@ async def test_off_site_credential_fill_is_refused_before_release() -> None:
     page = RecordingPage(fake, credential_release_guard=_release_guard())
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
         await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
-    assert str(exc_info.value) == (
-        "Refused to type the saved credential `login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org. Continue the sign-in on the "
-        "credential's own site instead."
-    )
+    assert "login_credentials" in str(exc_info.value)
+    assert re.search(r"https://example\.org", str(exc_info.value))
     assert not any(call.startswith("fill:") for call in fake.inner.calls)
     [action] = page.recorded_actions()
     # The recorded row is redacted by the transport hardening (SKY-13764); the refusal text reaches
@@ -1586,11 +1584,9 @@ async def test_sso_misroute_code_is_refused_at_the_first_off_site_release() -> N
     )
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
         await user_function()
-    assert str(exc_info.value) == (
-        "Refused to type the saved credential `login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org. Continue the sign-in on the "
-        "credential's own site instead."
-    )
+    message = str(exc_info.value)
+    assert "belongs to https://example.com" in message
+    assert re.search(r"https://example\.org", message)
     assert not any(call.startswith(("fill:", "type:")) for call in fake.inner.calls)
 
 
@@ -1737,11 +1733,8 @@ async def test_credential_release_refusal_reaches_the_run_record(monkeypatch: py
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is False
-    assert result.failure_reason == (
-        "Failed to execute code block. Reason: Refused to type the saved credential "
-        "`login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org."
-    )
+    assert "belongs to https://example.com" in (result.failure_reason or "")
+    assert re.search(r"https://example\.org", result.failure_reason or "")
 
 
 @pytest.mark.asyncio

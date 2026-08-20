@@ -328,6 +328,7 @@ async def test_cleanup_gates_har_and_console_redaction_on_run_gate(
     context_manager = SimpleNamespace(
         artifact_redaction_enabled=MagicMock(return_value=redaction_enabled),
         get_secret_values_for_run=MagicMock(return_value={"console-secret"}),
+        runtime_secret_values_for_artifacts=MagicMock(return_value=set()),
     )
 
     with patch("skyvern.forge.agent.app") as mock_app:
@@ -355,6 +356,44 @@ async def test_cleanup_gates_har_and_console_redaction_on_run_gate(
         assert b"console-secret" not in stored_console_log
         context_manager.get_secret_values_for_run.assert_called_once_with("wr_1")
     else:
+        # Opted-out with no runtime secrets registered: bytes pass through, and only the
+        # runtime floor (not the gated per-run set) was consulted.
         assert stored_har == har_data
         assert stored_console_log == console_log
         context_manager.get_secret_values_for_run.assert_not_called()
+        context_manager.runtime_secret_values_for_artifacts.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_floors_runtime_secret_when_opted_out() -> None:
+    # A runtime-resolved code must not survive into task HAR/console even without the
+    # per-run Mask-Secrets opt-in.
+    har_data = json.dumps(
+        {"log": {"entries": [{"request": {"headers": [{"name": "X-Code", "value": "code 424242"}]}}]}}
+    ).encode()
+    console_log = b"typed code 424242"
+    task = _make_task(workflow_run_id="wr_1")
+    browser_state = _browser_state()
+    context_manager = SimpleNamespace(
+        artifact_redaction_enabled=MagicMock(return_value=False),
+        get_secret_values_for_run=MagicMock(side_effect=AssertionError("gated set must not be consulted")),
+        runtime_secret_values_for_artifacts=MagicMock(return_value={"424242"}),
+    )
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.WORKFLOW_CONTEXT_MANAGER = context_manager
+        mock_app.BROWSER_MANAGER.cleanup_for_task = AsyncMock(return_value=browser_state)
+        mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
+        mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=console_log)
+        mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
+
+        await ForgeAgent().cleanup_browser_and_create_artifacts(
+            close_browser_on_completion=True,
+            last_step=_make_step(),
+            task=task,
+        )
+
+    entries = mock_app.ARTIFACT_MANAGER.create_task_archive.await_args.kwargs["entries"]
+    assert b"424242" not in entries["har.har"][1]
+    assert b"424242" not in entries["browser_console.log"][1]

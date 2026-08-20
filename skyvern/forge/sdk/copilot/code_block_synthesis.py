@@ -387,6 +387,10 @@ _POSITIONAL_RE = re.compile(
 # unique under Playwright strict mode.
 _BARE_TAG_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]*$")
 
+# Root containers every document already has, so a readiness wait on one encodes no precondition:
+# it either passes immediately or burns its whole timeout with the container already resolved.
+_ROOT_LOCATOR_SELECTORS = frozenset({"body", "html", ":root", "*"})
+
 
 @dataclass
 class SynthesisDiagnostics:
@@ -621,6 +625,10 @@ def _is_positional_selector(selector: str) -> bool:
     preferred verbatim; only a positional/index selector is worth trading for an ARIA role/name anchor.
     """
     return bool(_POSITIONAL_RE.search(selector))
+
+
+def is_root_locator_selector(selector: str) -> bool:
+    return selector.strip().casefold() in _ROOT_LOCATOR_SELECTORS
 
 
 def _is_bare_ambiguous_selector(selector: str) -> bool:
@@ -1494,6 +1502,21 @@ def _locator_expr(
             )
         return ""
 
+    if selector and is_root_locator_selector(selector):
+        if role and name:
+            return _get_by_role_expr_strict(role, name) if strict_selectors else _get_by_role_expr(role, name)
+        notes.append(f"dropped an interaction targeting the root container {selector!r}")
+        if diagnostics is not None:
+            diagnostics.dropped_interactions.append(
+                {
+                    "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                    "tool_name": tool_name,
+                    "selector": selector,
+                    "reason_code": "root_locator_target",
+                }
+            )
+        return ""
+
     if strict_selectors:
         if not selector:
             notes.append("dropped an interaction with no selector")
@@ -1809,6 +1832,14 @@ def _entry_target_locator(
     return first_locator, first_index
 
 
+def _binds_block_output(interaction: Mapping[str, Any]) -> bool:
+    if str(interaction.get("tool_name") or "") != "read_value":
+        return False
+    return bool(str(interaction.get("read_expression") or "").strip()) and str(
+        interaction.get("read_output_path") or ""
+    ).strip().startswith("output.")
+
+
 def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool) -> tuple[str, int]:
     last_credential_index = -1
     for index, interaction in enumerate(trajectory):
@@ -1924,7 +1955,10 @@ def synthesize_code_block(
         if parameter_binding_snapshot is not None
         else []
     )
-    compile_download_target = (
+    download_target_is_root = reached_download_target is not None and is_root_locator_selector(
+        reached_download_target.selector
+    )
+    download_target_deliverable = (
         reached_download_target is not None
         and not reached_download_target.already_registered
         and bool(reached_download_target.selector)
@@ -1933,6 +1967,19 @@ def synthesize_code_block(
         # cannot deliver.
         and can_deliver_registered_download(reached_download_target)
     )
+    compile_download_target = download_target_deliverable and not download_target_is_root
+    if download_target_is_root and download_target_deliverable and reached_download_target is not None:
+        notes.append(
+            f"dropped a download target on the root container {reached_download_target.selector!r}",
+        )
+        diagnostics.dropped_interactions.append(
+            {
+                "trajectory_index": -1,
+                "tool_name": "download",
+                "selector": reached_download_target.selector,
+                "reason_code": "root_locator_target",
+            }
+        )
     file_match_locator = ""
     file_match_selector = ""
     file_match_keys: list[str] = []
@@ -1974,6 +2021,7 @@ def synthesize_code_block(
             trajectory, reached_download_target.trajectory_anchor
         )
         if dropped_trailing:
+            notes.append(f"dropped {dropped_trailing} interaction(s) captured after the download affordance")
             diagnostics.download_terminal_anchor = reached_download_target.trajectory_anchor
             diagnostics.download_terminal_dropped_trailing = dropped_trailing
             LOG.info(
@@ -2153,8 +2201,13 @@ def synthesize_code_block(
             fallback_entry_target = durable_anchor_target
         entry_target = download_entry_target if download_entry_target else fallback_entry_target
         entry_replay_condition_active = bool(download_entry_target and fallback_entry_target)
+        # A skipped prefix is only forgivable when nothing in it would have been emitted; forgiving a
+        # span that holds the read the block returns would drop that answer with no note anywhere.
+        prefix_binds_output = any(_binds_block_output(step) for step in trajectory[entry_index:fallback_entry_index])
         entry_replay_start_index = (
-            fallback_entry_index if fallback_entry_index > entry_index and not optional_dismissal_prefix else 0
+            fallback_entry_index
+            if fallback_entry_index > entry_index and not optional_dismissal_prefix and not prefix_binds_output
+            else 0
         )
         if entry_index > 0:
             notes.append("entry URL taken from a later interaction; earlier steps had no source_url")
@@ -2162,10 +2215,10 @@ def synthesize_code_block(
             notes.append("download fallback entry target taken from a later durable interaction")
         if entry_post_auth_resume_index:
             notes.append("entry fallback can resume after authentication when login controls stay hidden")
-        elif fallback_entry_index > entry_index:
+        elif entry_replay_start_index:
             notes.append("entry replay starts at a later durable interaction")
         entry_recovery_clicks: list[tuple[int, str]] = []
-        if fallback_entry_index > entry_index:
+        if entry_replay_start_index:
             for recovery_index in range(entry_index, fallback_entry_index):
                 recovery_interaction = trajectory[recovery_index]
                 if not is_generic_entry_opener_click(recovery_interaction):
@@ -2345,6 +2398,7 @@ def synthesize_code_block(
             emit_snapshot_recovery(trajectory_index, action_indent)
             key = str(interaction.get("key") or "").strip()
             if not key:
+                notes.append("dropped a press_key interaction with no recorded key")
                 diagnostics.dropped_interactions.append(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_key"}
                 )
@@ -2369,6 +2423,7 @@ def synthesize_code_block(
             else:
                 if strict_selectors:
                     if not already_recorded(trajectory_index):
+                        notes.append("dropped an interaction with no selector")
                         diagnostics.dropped_interactions.append(
                             {
                                 "trajectory_index": trajectory_index,
@@ -2390,6 +2445,7 @@ def synthesize_code_block(
             expression = str(interaction.get("read_expression") or "").strip()
             output_path = str(interaction.get("read_output_path") or "").strip()
             if not expression or not output_path.startswith("output."):
+                notes.append("dropped a read with no expression or no output binding")
                 diagnostics.dropped_interactions.append(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_read"}
                 )
@@ -2427,6 +2483,7 @@ def synthesize_code_block(
             except (TypeError, ValueError):
                 duration_ms = 0
             if duration_ms <= 0:
+                notes.append("dropped a wait interaction with no recorded duration")
                 diagnostics.dropped_interactions.append(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_duration"}
                 )
@@ -2686,6 +2743,7 @@ def synthesize_code_block(
         if trajectory_index >= truncated_at_index or trajectory_index in laned_indices:
             continue
         unaccounted = trajectory[trajectory_index]
+        notes.append(f"dropped an unaccounted {str(unaccounted.get('tool_name') or '')!r} interaction")
         diagnostics.dropped_interactions.append(
             {
                 "trajectory_index": trajectory_index,

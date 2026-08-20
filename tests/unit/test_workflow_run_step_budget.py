@@ -32,13 +32,13 @@ async def test_returns_none_when_task_has_no_workflow_run_id() -> None:
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock()
-        mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock()
+        mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids = AsyncMock()
 
         result = await agent._check_workflow_run_step_budget(org, task)
 
     assert result is None
     mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id.assert_not_called()
-    mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids.assert_not_called()
+    mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -49,7 +49,7 @@ async def test_returns_none_when_org_has_no_cap() -> None:
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock()
-        mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock()
+        mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids = AsyncMock()
 
         result = await agent._check_workflow_run_step_budget(org, task)
 
@@ -65,13 +65,13 @@ async def test_returns_zero_count_when_workflow_run_has_no_tasks() -> None:
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock(return_value=[])
-        mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock()
+        mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids = AsyncMock()
 
         result = await agent._check_workflow_run_step_budget(org, task)
 
     assert result == (0, 20)
     # Skip the count query when there are no task ids to filter on.
-    mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids.assert_not_called()
+    mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -86,12 +86,12 @@ async def test_returns_count_and_cap_when_tasks_present() -> None:
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock(return_value=sibling_tasks)
-        mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock(return_value=18)
+        mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids = AsyncMock(return_value=18)
 
         result = await agent._check_workflow_run_step_budget(org, task)
 
     assert result == (18, 20)
-    mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids.assert_awaited_once_with(
+    mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids.assert_awaited_once_with(
         task_ids=["task-1", "task-2"],
         organization_id="org-1",
     )
@@ -99,14 +99,14 @@ async def test_returns_count_and_cap_when_tasks_present() -> None:
 
 @pytest.mark.asyncio
 async def test_treats_none_count_as_zero() -> None:
-    # ``get_total_unique_step_order_count_by_task_ids`` can return None for a no-row count.
+    # ``get_total_unique_progress_round_count_by_task_ids`` can return None for a no-row count.
     agent = ForgeAgent()
     org = _make_organization(max_steps_per_workflow_run=20)
     task = _make_task(workflow_run_id="wr-1")
 
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.DATABASE.tasks.get_tasks_by_workflow_run_id = AsyncMock(return_value=[MagicMock(task_id="task-1")])
-        mock_app.DATABASE.tasks.get_total_unique_step_order_count_by_task_ids = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.get_total_unique_progress_round_count_by_task_ids = AsyncMock(return_value=None)
 
         result = await agent._check_workflow_run_step_budget(org, task)
 

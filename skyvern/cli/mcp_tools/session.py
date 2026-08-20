@@ -92,7 +92,7 @@ def _session_create_data(
 
 async def skyvern_browser_session_create(
     timeout: Annotated[
-        int | None, Field(description=f"Session timeout in minutes (min {MIN_TIMEOUT}, capped at {MAX_TIMEOUT})")
+        int | None, Field(description=f"Session timeout in minutes (min {MIN_TIMEOUT}, max {MAX_TIMEOUT})")
     ] = DEFAULT_TIMEOUT,
     proxy_location: Annotated[
         str | dict[str, Any] | None,

@@ -12,9 +12,12 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.exceptions import SkyvernActionFailed
+from skyvern.webeye.actions.responses import ActionFailure
 
 
 @pytest.fixture
@@ -131,6 +134,55 @@ class TestAiClickEmptyActions:
 
             assert "LLM provider down" in str(exc_info.value)
             assert not isinstance(exc_info.value, SkyvernActionFailed)
+
+    @pytest.mark.asyncio
+    async def test_ai_click_warns_when_unknown_exception_falls_back_to_selector(
+        self,
+        mock_page,
+        mock_scraped_page,
+        mock_context,
+        mock_app,
+    ):
+        real_page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
+        llm_handler = AsyncMock(side_effect=RuntimeError("synthetic provider failure"))
+        selector = "#fallback-target"
+        sensitive_test_value = "SENSITIVE_TEST_VALUE"
+
+        with (
+            patch.object(real_page_ai, "_refresh_scraped_page", new_callable=AsyncMock),
+            patch(
+                "skyvern.core.script_generations.real_skyvern_page_ai.skyvern_context.ensure_context",
+                return_value=mock_context,
+            ),
+            patch("skyvern.core.script_generations.real_skyvern_page_ai.app", mock_app),
+            patch(
+                "skyvern.core.script_generations.real_skyvern_page_ai.prompt_engine.load_prompt",
+                return_value="synthetic prompt",
+            ),
+            patch(
+                "skyvern.core.script_generations.real_skyvern_page_ai._resolve_assist_llm_handler",
+                new=AsyncMock(return_value=llm_handler),
+            ),
+            capture_logs() as logs,
+        ):
+            result = await real_page_ai.ai_click(
+                selector=selector,
+                intention="synthetic intention",
+                data={"value": sensitive_test_value},
+            )
+
+        assert result == selector
+        mock_page.locator.assert_called_once_with(selector)
+        mock_page.locator.return_value.click.assert_awaited_once_with(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+        fallback_logs = [
+            log for log in logs if log["event"] == "AI click failed unexpectedly; falling back to original selector"
+        ]
+        assert len(fallback_logs) == 1
+        assert fallback_logs[0]["log_level"] == "warning"
+        assert fallback_logs[0]["selector"] == selector
+        assert sensitive_test_value not in str(logs)
+        assert "synthetic intention" not in str(logs)
+        assert not [log for log in logs if log["log_level"] == "error"]
 
     @pytest.mark.asyncio
     async def test_ai_click_falls_back_to_selector_when_llm_returns_empty(
@@ -287,3 +339,44 @@ class TestAiSelectOptionEmptyActions:
         handle_select.assert_awaited_once()
         mock_page.locator.return_value.select_option.assert_not_awaited()
         assert result == "CA"
+
+
+class TestAiSelectOptionHandlerFailures:
+    @pytest.mark.asyncio
+    async def test_handler_failure_falls_back_to_raw_select(self, mock_page, mock_scraped_page, mock_context, mock_app):
+        page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
+        action = MagicMock()
+        action.option = MagicMock(value="adapted", label=None)
+
+        with select_option_patches(page_ai, mock_context, mock_app, [action]) as handle_select:
+            handle_select.return_value = [ActionFailure(RuntimeError("selection was not committed"))]
+            result = await page_ai.ai_select_option(
+                selector="#country",
+                value="original",
+                intention="select the synthetic option",
+            )
+
+        handle_select.assert_awaited_once()
+        mock_page.locator.assert_called_once_with("#country")
+        mock_page.locator.return_value.select_option.assert_awaited_once_with(
+            "adapted", timeout=settings.BROWSER_ACTION_TIMEOUT_MS
+        )
+        assert result == "adapted"
+
+    @pytest.mark.asyncio
+    async def test_handler_failure_raises_without_selector(self, mock_page, mock_scraped_page, mock_context, mock_app):
+        page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
+        action = MagicMock()
+        action.option = MagicMock(value="adapted", label=None)
+
+        with select_option_patches(page_ai, mock_context, mock_app, [action]) as handle_select:
+            handle_select.return_value = [ActionFailure(RuntimeError("selection was not committed"))]
+            with pytest.raises(SkyvernActionFailed, match="selection was not committed"):
+                await page_ai.ai_select_option(
+                    selector=None,
+                    value="original",
+                    intention="select the synthetic option",
+                )
+
+        handle_select.assert_awaited_once()
+        mock_page.locator.assert_not_called()

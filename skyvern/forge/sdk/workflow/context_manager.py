@@ -1948,6 +1948,18 @@ class WorkflowContextManager:
             secret_values -= set(totp_values)
         return secret_values | task_secret_values
 
+    def runtime_secret_values_for_artifacts(self) -> set[str]:
+        """Runtime-resolved secrets (e.g. a v3-resolved verification code) redact under the global
+        switch alone, regardless of a run's per-workflow mask-secrets opt-in. Covers only
+        engine-minted runtime values — customer-configured credential values stay governed by the
+        per-run opt-in, matching the step engine."""
+        if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
+            return set()
+        current_context = skyvern_context.current()
+        if current_context is None:
+            return set()
+        return collect_redactable_secret_values({}, otp_values=list(current_context.runtime_secret_values))
+
     async def register_block_parameters_for_workflow_run(
         self,
         workflow_run_id: str,

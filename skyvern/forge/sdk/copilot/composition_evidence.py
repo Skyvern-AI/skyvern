@@ -98,6 +98,9 @@ _EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
 _ANTI_BOT_SCAN_BYTES = 250_000
+_NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
+    {"hidden", "submit", "button", "reset", "checkbox", "radio", "file", "image"}
+)
 
 
 class _PostRunCompositionContext(Protocol):
@@ -164,6 +167,12 @@ def _control_disabled(node: Any) -> bool:
     )
 
 
+def _control_readonly(node: Any) -> bool:
+    if not hasattr(node, "has_attr"):
+        return False
+    return bool(node.has_attr("readonly") or str(node.get("aria-readonly") or "").strip().lower() == "true")
+
+
 def _gated_submit_controls(forms: list[dict[str, Any]]) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     for form in forms:
@@ -192,6 +201,8 @@ def _evidence_metadata(
     reveal_relations_truncated: bool = False,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
+    # A non-empty inspection_warnings voids value binding for the whole packet, so only a signal
+    # about the value channels belongs here. Navigation truncation rides its own boolean field.
     inspection_warnings = ["reveal_relations_truncated"] if reveal_relations_truncated else []
     return {
         "evidence_sources": [DOM_EVIDENCE_SOURCE],
@@ -250,13 +261,71 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
+def _usable_control(control: Any) -> bool:
+    # Static HTML cannot see a stylesheet, so the fallback parser reports no `visible` flag at all
+    # and absent has to read as usable here; a control it never showed can still count.
+    return (
+        isinstance(control, dict)
+        and control.get("disabled") is not True
+        and control.get("readonly") is not True
+        and control.get("visible") is not False
+    )
+
+
+def _satisfiable_form_path(forms: Any) -> bool:
+    """True when the page offers an entry field plus an enabled submit control, so the turn can
+    complete it without a person.
+
+    The claim under refutation is that the submit control is gated. The page is authoritative about
+    disabled state, so a form whose own submit control it reports disabled corroborates the claim and
+    cannot refute it; matching the claim's prose to a control would be the harness interpreting prose.
+    A disabled control in some unrelated form says nothing about the form under consideration.
+    """
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        submit_controls = [control for control in form.get("submit_controls") or [] if isinstance(control, dict)]
+        if any(control.get("disabled") is True for control in submit_controls):
+            continue
+        has_entry_field = any(
+            _usable_control(field) and str(field.get("type") or "").strip() not in _NON_ENTRY_FIELD_TYPES
+            for field in form.get("fields") or []
+        )
+        if not has_entry_field:
+            continue
+        # A bare <button> in a form already captures as "submit"; an explicit type="button" is
+        # JS-driven and indistinguishable from Cancel without reading its label, so it does not
+        # count and the claim stands.
+        if any(
+            _usable_control(control) and str(control.get("type") or "").strip() == "submit"
+            for control in submit_controls
+        ):
+            return True
+    return False
+
+
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
     if visual_summary.get("challenge_detected") is not True:
         return False
     if interactive_challenge_controls(evidence.get("challenge_controls")):
         return True
     obstruction_kind = str(visual_summary.get("obstruction_kind") or "").strip().lower()
-    return obstruction_kind != CONSENT_OBSTRUCTION_KIND
+    if obstruction_kind == CONSENT_OBSTRUCTION_KIND:
+        return False
+    if evidence.get("visual_obstruction_candidates") or evidence.get("modal_overlays"):
+        return True
+    # Form shape may only refute the one commensurable vision claim, that the submit control
+    # is gated; occlusion is answered by the obstruction evidence above, never by shape.
+    blocked_claims = [
+        item for item in visual_summary.get("blocked_submit_controls") or [] if isinstance(item, str) and item.strip()
+    ]
+    # submit_blocked normalizes to None whenever the model omits it, so a named blocked control
+    # carries the same gating claim; keying on the boolean alone would silently disable this.
+    if visual_summary.get("submit_blocked") is not True and not blocked_claims:
+        return True
+    return not _satisfiable_form_path(evidence.get("forms"))
 
 
 def merge_visual_composition_evidence(
@@ -298,7 +367,7 @@ def merge_visual_composition_evidence(
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
         challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
-        if vision_challenge_carrier(visual_summary):
+        if challenge_confirmed and vision_challenge_carrier(visual_summary):
             challenge_state.setdefault(CHALLENGE_EVIDENCE_SOURCE_KEY, ChallengeEvidenceSource.VISION.value)
         if challenge_confirmed:
             challenge_state["detected"] = True
@@ -1192,6 +1261,7 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "page_title": "",
         "forms": [],
         "navigation_targets": [],
+        "navigation_targets_truncated": False,
         "result_containers": [],
         "result_containers_truncated": False,
         "key_value_relations": [],
@@ -2404,6 +2474,51 @@ def _anti_bot_indicators(html: str, page_title: str) -> list[str]:
     return [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in haystack]
 
 
+_DOCUMENT_REGIONS = ("header", "nav", "footer", "main")
+
+
+class _DocumentNode(Protocol):
+    name: str
+
+    def find_parents(self) -> list[_DocumentNode]: ...
+
+
+def _document_region(node: _DocumentNode) -> str:
+    """Outermost landmark ancestor, so a card <header> inside <main> counts as content.
+
+    Resolving to the nearest landmark instead splits nested landmarks into extra buckets, which
+    costs page content its share of a budget divided evenly across them.
+    """
+    region = "other"
+    for parent in node.find_parents():
+        if parent.name in _DOCUMENT_REGIONS:
+            region = parent.name
+    return region
+
+
+def _balanced_by_region(items: list[tuple[str, Any]], cap: int) -> tuple[list[Any], bool]:
+    """Take up to cap items one region at a time, keeping document order inside each region."""
+    if len(items) <= cap:
+        return [item for _, item in items], False
+    buckets: dict[str, list[Any]] = {}
+    for region, item in items:
+        buckets.setdefault(region, []).append(item)
+    selected: list[Any] = []
+    depth = 0
+    while len(selected) < cap:
+        placed = False
+        for bucket in buckets.values():
+            if len(selected) >= cap:
+                break
+            if depth < len(bucket):
+                selected.append(bucket[depth])
+                placed = True
+        if not placed:
+            break
+        depth += 1
+    return selected, len(items) > len(selected)
+
+
 def parse_composition_html(
     html: str, *, inspected_url: str, current_url: str, requested_targets: tuple[str, ...] = ()
 ) -> dict[str, Any]:
@@ -2478,6 +2593,7 @@ def parse_composition_html(
                         node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"
                     ),
                     "disabled": _control_disabled(node),
+                    "readonly": _control_readonly(node),
                     "checked": bool(node.has_attr("checked")),
                     "options": _select_options(node) if tag_name == "select" else [],
                     "selector": _bounded_selector(_selector_for(node)),
@@ -2494,23 +2610,30 @@ def parse_composition_html(
             }
         )
 
-    navigation_targets: list[dict[str, Any]] = []
+    # Selection first: _selector_for walks the whole document per link, so building an entry for
+    # every link before capping is quadratic on link-dense pages.
+    eligible_navigation: list[tuple[str, tuple[Any, str, str]]] = []
     for link in soup.find_all("a", href=True):
-        if len(navigation_targets) >= _MAX_NAVIGATION_TARGETS:
-            break
         href = str(link.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         resolved_href = urljoin(current_url or inspected_url, href)
         if not _same_origin(resolved_href, current_url or inspected_url):
             continue
-        text = _node_text(link)
-        nav_entry: dict[str, Any] = {
-            "text": _schema_text(text, 160),
+        region = _document_region(link)
+        eligible_navigation.append((region, (link, resolved_href, region)))
+    selected_navigation, navigation_targets_truncated = _balanced_by_region(
+        eligible_navigation, _MAX_NAVIGATION_TARGETS
+    )
+    navigation_targets: list[dict[str, Any]] = [
+        {
+            "text": _schema_text(_node_text(link), 160),
             "href": resolved_href[:300],
+            "region": region,
             "selector": _bounded_selector(_selector_for(link)),
         }
-        navigation_targets.append(nav_entry)
+        for link, resolved_href, region in selected_navigation
+    ]
 
     result_containers: list[dict[str, Any]] = []
     result_containers_truncated = False
@@ -2562,6 +2685,9 @@ def parse_composition_html(
         "current_url": current_url,
         "page_title": page_title,
         "forms": forms,
+        # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
+        # long navigation_targets is dropped exactly on the pages where it is true.
+        "navigation_targets_truncated": navigation_targets_truncated,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
         "result_containers_truncated": result_containers_truncated,
@@ -2685,6 +2811,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
             "required": node.get("required") is True,
             "disabled": node.get("disabled") is True,
+            "readonly": node.get("readonly") is True,
             "checked": node.get("checked") is True,
             "options": _structured_select_options(node.get("options")),
             "selector": _bounded_selector(_structured_str(node.get("selector"))),
@@ -2719,13 +2846,11 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
     }
 
 
-def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[str, Any]]:
-    targets: list[dict[str, Any]] = []
+def _structured_navigation_targets(value: Any, *, base_url: str) -> tuple[list[dict[str, Any]], bool]:
     if not isinstance(value, list):
-        return targets
+        return [], False
+    eligible: list[tuple[str, dict[str, Any]]] = []
     for link in value:
-        if len(targets) >= _MAX_NAVIGATION_TARGETS:
-            break
         if not isinstance(link, dict):
             continue
         href = _structured_str(link.get("href")).strip()
@@ -2733,13 +2858,18 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
             continue
         if not _same_origin(href, base_url):
             continue
+        # The payload comes from the page's own main world, so this is attacker-controlled text
+        # until it is clamped to the vocabulary the extractor emits.
+        reported_region = _structured_str(link.get("region"))
+        region = reported_region if reported_region in _DOCUMENT_REGIONS else "other"
         entry: dict[str, Any] = {
             "text": _schema_text(_structured_str(link.get("text")), 160),
             "href": href[:300],
+            "region": region,
             "selector": _bounded_selector(_structured_str(link.get("selector"))),
         }
-        targets.append(_attach_node_evidence(entry, link))
-    return targets
+        eligible.append((region, _attach_node_evidence(entry, link)))
+    return _balanced_by_region(eligible, _MAX_NAVIGATION_TARGETS)
 
 
 def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
@@ -3033,7 +3163,12 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
     page_title = _schema_text(_structured_str(data.get("page_title")), 240)
     forms = [form for form in (_structured_form(item) for item in data.get("forms") or []) if form is not None]
     forms = forms[:_MAX_FORMS]
-    navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
+    navigation_targets, navigation_targets_reparsed_truncated = _structured_navigation_targets(
+        data.get("navigation_targets"), base_url=base_url
+    )
+    navigation_targets_truncated = (
+        data.get("navigation_targets_truncated") is True or navigation_targets_reparsed_truncated
+    )
     result_containers = _structured_result_containers(data.get("result_containers"))
     key_value_relations = _structured_key_value_relations(data.get("key_value_relations"))
     reveal_relations_truncated = (
@@ -3069,6 +3204,9 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "current_url": current_url,
         "page_title": page_title,
         "forms": forms,
+        # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
+        # long navigation_targets is dropped exactly on the pages where it is true.
+        "navigation_targets_truncated": navigation_targets_truncated,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
         "result_containers_truncated": data.get("result_containers_truncated") is True,

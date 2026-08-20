@@ -10,8 +10,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
@@ -741,6 +744,59 @@ async def wrapper({default_args}):
         assert entry["workflow_run_block_id"] == "wrb-audit"
         # SECURITY: the raw user code must never appear in the audit payload.
         assert secret_marker not in json.dumps(entry, default=str)
+
+    @pytest.mark.asyncio
+    async def test_inline_exec_emits_completion_log_with_duration(self) -> None:
+        """Completion pairs with inline_exec_entered so a legacy run's duration needs no log join."""
+        from unittest.mock import MagicMock
+
+        from structlog.testing import capture_logs
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="duration_output",
+            description="test output",
+            output_parameter_id="op_duration",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="duration_block", code="return {'x': 1}", output_parameter=output_parameter)
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            result = await user_function()
+        assert result == {"x": 1}
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        entry = events[0]
+        assert isinstance(entry["duration_ms"], float) and entry["duration_ms"] >= 0
+        assert entry["success"] is True
+        assert entry["organization_id"] == "org-dur"
+        assert entry["workflow_run_id"] == "wr-dur"
+        assert entry["workflow_run_block_id"] == "wrb-dur"
+
+        failing_function = block.generate_async_user_function(
+            "x = 1 / 0",
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            with pytest.raises(ZeroDivisionError):
+                await failing_function()
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        assert events[0]["success"] is False
+        assert isinstance(events[0]["duration_ms"], float)
 
     @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
@@ -1776,6 +1832,72 @@ class TestCodeBlockOtpNoLeak:
         assert result.failure_reason == "Failed to execute code block. Reason: Exception: *****"
 
     @pytest.mark.asyncio
+    async def test_otp_not_leaked_in_assembled_repair_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        import pyotp
+
+        from skyvern.forge.sdk.copilot.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
+        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+        from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
+        from skyvern.webeye.actions.actions import Action
+
+        wrc = _build_wrc_with_totp_seed()
+        expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
+        recorded_actions: list[Action] = []
+
+        async def capture_actions(self: CodeBlockActionRecording, actions: list[Action]) -> None:
+            del self
+            recorded_actions.extend(actions)
+
+        monkeypatch.setattr(CodeBlockActionRecording, "persist", capture_actions)
+        result, _ = await _run_credential_code_block(
+            monkeypatch,
+            wrc,
+            code=f"code = await {_CREDENTIAL_KEY}.otp()\nraise Exception(code)",
+            label="otp_raise_payload",
+        )
+
+        for action in recorded_actions:
+            action.task_id = "task-otp"
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=recorded_actions)
+
+        class _AppStub:
+            DATABASE = mock_db
+
+        monkeypatch.setattr(run_execution_module, "app", _AppStub())
+        block = MagicMock(task_id="task-otp")
+        block_result = {
+            "label": "otp_raise_payload",
+            "block_type": "code",
+            "status": "failed",
+            "failure_reason": result.failure_reason,
+        }
+        await _attach_action_traces([block], [block_result], _ORG_ID)
+        action_trace_summary = _summarize_action_trace(block_result["action_trace"])
+        del block_result["action_trace"]
+        payload = build_run_blocks_response(
+            False,
+            {
+                "workflow_run_id": _WORKFLOW_RUN_ID,
+                "overall_status": "failed",
+                "failure_reason": result.failure_reason,
+                "blocks": [block_result],
+                "action_trace_summary": action_trace_summary,
+            },
+        )
+        sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", payload)
+        serialized = json.dumps(sanitized)
+
+        assert expected_code not in serialized
+        assert _RFC_TOTP_SEED not in serialized
+        assert "code_line" in serialized
+
+    @pytest.mark.asyncio
     async def test_legacy_totp_not_leaked_in_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import pyotp
 
@@ -2284,3 +2406,80 @@ class TestCodeBlockTemplateSecretScoping:
         assert "ph_p2" not in template_data
         assert not any(key.endswith("_real_password") for key in template_data)
         assert template_data[self.UNDECLARED_KEY]["password"] == "ph_p2"
+
+
+class TestFailedReadinessWaitPropagates:
+    @staticmethod
+    def _page_whose_readiness_wait_times_out() -> object:
+        class TimingOutLocator:
+            async def wait_for(self, **kwargs: object) -> None:
+                raise PlaywrightTimeoutError(
+                    'Locator.wait_for: Timeout 30000ms exceeded.\nwaiting for locator("body") to be visible'
+                )
+
+        page = MagicMock(spec=Page)
+        page.locator = lambda _selector: TimingOutLocator()
+        return page
+
+    async def _execute(self, monkeypatch: pytest.MonkeyPatch, code: str) -> tuple[object, list[object]]:
+        page = self._page_whose_readiness_wait_times_out()
+
+        class ReadyBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+
+            async def get_working_page(self) -> object:
+                return page
+
+        persisted: list[object] = []
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> ReadyBrowserState:
+            return ReadyBrowserState()
+
+        async def record_output(self: object, ctx: object, run_id: object, value: object) -> None:
+            persisted.append(value)
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(
+            CodeBlock, "get_workflow_run_context", lambda self, run_id: FakeWorkflowRunContext(values={})
+        )
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        now = datetime.now(timezone.utc)
+        block = CodeBlock(
+            label="read_summary",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="read_summary_output",
+                description="test output",
+                output_parameter_id="op_read_summary",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+        return result, persisted
+
+    @pytest.mark.asyncio
+    async def test_failed_readiness_wait_fails_the_run_without_a_derived_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, persisted = await self._execute(
+            monkeypatch,
+            'await page.locator("body").wait_for(state="visible", timeout=30000)\n'
+            'return {"summary": "24 results found"}\n',
+        )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "24 results found" not in json.dumps(persisted)
+        assert all(value in (None, {}) for value in persisted)

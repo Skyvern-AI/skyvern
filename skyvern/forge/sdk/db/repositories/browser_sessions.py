@@ -661,6 +661,7 @@ class BrowserSessionsRepository(BaseRepository):
             values: dict[str, str | None] = {
                 "bound_workflow_permanent_id": None,
                 "bound_key": None,
+                "download_run_id": None,
             }
             if expected_runnable_id is None:
                 statement = statement.where(PersistentBrowserSessionModel.runnable_id.is_(None))
@@ -877,6 +878,7 @@ class BrowserSessionsRepository(BaseRepository):
         provisioning_deadline_at: datetime | None = None,
         bound_workflow_permanent_id: str | None = None,
         bound_key: str | None = None,
+        download_run_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -908,6 +910,7 @@ class BrowserSessionsRepository(BaseRepository):
                 organization_id=organization_id,
                 runnable_type=runnable_type,
                 runnable_id=runnable_id,
+                download_run_id=download_run_id or runnable_id,
                 timeout_minutes=timeout_minutes,
                 proxy_location=serialized_proxy_location,
                 proxy_session_id=proxy_session_id,
@@ -959,10 +962,15 @@ class BrowserSessionsRepository(BaseRepository):
 
             if status:
                 persistent_browser_session.status = status
+                if status in FINAL_STATUSES:
+                    # A session that has reached a final status is no longer producing downloads, so the
+                    # producer key must not survive it even when the caller omits completed_at.
+                    persistent_browser_session.download_run_id = None
             if timeout_minutes:
                 persistent_browser_session.timeout_minutes = timeout_minutes
             if completed_at:
                 persistent_browser_session.completed_at = to_naive_utc(completed_at)
+                persistent_browser_session.download_run_id = None
             if started_at:
                 persistent_browser_session.started_at = to_naive_utc(started_at)
             if generate_browser_profile is not None:
@@ -1089,6 +1097,7 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str,
         *,
         runnable_generation_id: str | None = None,
+        download_run_id: str | None = None,
     ) -> None:
         """Occupy a specific persistent browser session."""
         async with self.Session() as session:
@@ -1112,6 +1121,7 @@ class BrowserSessionsRepository(BaseRepository):
                     runnable_type=runnable_type,
                     runnable_id=runnable_id,
                     runnable_generation_id=runnable_generation_id,
+                    download_run_id=download_run_id or runnable_id,
                 )
                 .returning(PersistentBrowserSessionModel)
             )
@@ -1169,9 +1179,9 @@ class BrowserSessionsRepository(BaseRepository):
                         )
                     )
                 result = await session.scalars(
-                    statement.values(runnable_type=None, runnable_id=None, runnable_generation_id=None).returning(
-                        PersistentBrowserSessionModel
-                    )
+                    statement.values(
+                        runnable_type=None, runnable_id=None, runnable_generation_id=None, download_run_id=None
+                    ).returning(PersistentBrowserSessionModel)
                 )
                 persistent_browser_session = result.first()
                 if persistent_browser_session is None:
@@ -1200,6 +1210,7 @@ class BrowserSessionsRepository(BaseRepository):
             persistent_browser_session.runnable_type = None
             persistent_browser_session.runnable_id = None
             persistent_browser_session.runnable_generation_id = None
+            persistent_browser_session.download_run_id = None
             await session.commit()
             await session.refresh(persistent_browser_session)
             return PersistentBrowserSession.model_validate(persistent_browser_session)
@@ -1221,6 +1232,7 @@ class BrowserSessionsRepository(BaseRepository):
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
                 persistent_browser_session.completed_at = naive_utc_now()
                 persistent_browser_session.status = "completed"
+                persistent_browser_session.download_run_id = None
                 await session.commit()
                 await session.refresh(persistent_browser_session)
                 return PersistentBrowserSession.model_validate(persistent_browser_session)

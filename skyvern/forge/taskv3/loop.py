@@ -22,6 +22,8 @@ from typing import Any, Awaitable, Callable, Literal
 
 import structlog
 
+from skyvern.exceptions import SkyvernContextWindowExceededError
+
 LOG = structlog.get_logger()
 
 ToolStatus = Literal["ok", "error"]
@@ -54,6 +56,8 @@ class ToolSpec:
     handler: ToolHandler
     terminal: bool = False
     billable: bool = False  # a page-mutating browser action that meters like a step-engine action
+    recordable: bool = False  # persisted as an action row (with screenshot) but not billed/budgeted
+    compactable: bool = False  # a large perception result safe to elide from the transcript once superseded
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -74,7 +78,18 @@ class LoopOutcome:
     turns: int = 0
     tool_calls: int = 0
     action_steps: int = 0
+    # Wall-clock spent inside tool handlers, summed over the run. Serial by construction, so it is
+    # directly comparable against the run's total duration.
+    tool_seconds: float = 0.0
+    # Turns where the model answered with prose instead of a tool call, costing a full round trip
+    # plus the NO_TOOL_CALL_NUDGE recovery turn.
+    no_tool_call_turns: int = 0
+    # Whether tool_choice was still being sent when the run ended. Distinguishes a run that was
+    # asked to force tool calls from one where the request was degraded away mid-run.
+    tool_choice_in_effect: bool = False
     billable_actions: list[str] = field(default_factory=list)
+    # Perception snapshots are compacted in place during the run, so superseded observe/get_html
+    # content is already elided here — treat as lossy if ever persisted for audit.
     messages: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -131,6 +146,35 @@ NO_TOOL_CALL_NUDGE = (
     "finish(status, reason, extracted_output) if the goal is complete. Emit a tool call now."
 )
 
+# Perception-stall policy: N consecutive byte-identical snapshots from the same perception
+# (compactable) tool mean the page has stopped changing in response to actions — a page gated by
+# something the run cannot perceive or operate otherwise burns the whole budget on identical
+# re-observes. Only compactable tools count: action tools legitimately return the same string
+# every call ("waited"), so they can never witness "the page is unchanged".
+PERCEPTION_STALL_NUDGE_AFTER = 6
+PERCEPTION_STALL_TERMINATE_AFTER = 15
+
+# Stable, facetable prefix for the stall verdict's reason — telemetry queries key on it to measure
+# how often the policy fires; change it only with the dashboards that read it.
+PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
+
+
+def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str]) -> str:
+    """One warning naming every stalled perception tool and the unblockers this run actually has —
+    a model that cannot see the gate won't reach for solve_captcha unless the symptom names it."""
+    symptoms = "; ".join(f"{name} has returned byte-identical output {count} times in a row" for name, count in stalled)
+    options = []
+    if "solve_captcha" in available_tools:
+        options.append("if the page may be waiting on a verification widget, call solve_captcha")
+    if "get_html" in available_tools:
+        options.append("take ONE targeted get_html look at the region that should be changing")
+    options.append("if the goal is already met, call finish(status=completed)")
+    options.append("if genuinely blocked, call finish(status=terminated) naming the blocker as the reason")
+    return (
+        f"The page is not changing: {symptoms}, despite your actions. Do not keep re-observing, "
+        "waiting, or repeating the same action. Your options: " + "; ".join(options) + "."
+    )
+
 
 def _append_skipped_tool_results(
     messages: list[dict[str, Any]], remaining: list[tuple[str, str, dict[str, Any]]], reason: str
@@ -143,13 +187,58 @@ def _append_skipped_tool_results(
         )
 
 
-def make_finish_tool() -> ToolSpec:
+def make_finish_tool(
+    page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
+    max_settle_deferrals: int = 2,
+    should_cancel: Callable[[], Awaitable[bool]] | None = None,
+    deadline_at: float | None = None,
+    settle_wait_seconds: float = 0.7,
+) -> ToolSpec:
+    """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
+    page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
+    accepted) unless two samples `settle_wait_seconds` apart match, so the model re-verifies against
+    the settled state instead of a mid-render shell — delayed loads otherwise produce stochastic
+    false completions. A sampling error is unknown, not settled: it defers. The wait between samples
+    is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
+    True, so probing cannot outlive the loop's own bounds."""
+    deferrals = 0
+
+    async def _settled() -> bool:
+        assert page_fingerprint is not None  # gated by the caller's None check
+        first = await page_fingerprint()
+        if first is None:
+            return True  # no page to sample (non-recovering peek): accept the verdict as-is
+        wait = settle_wait_seconds
+        if deadline_at is not None:
+            wait = min(wait, deadline_at - time.monotonic())
+        if wait > 0:
+            await asyncio.sleep(wait)
+        if should_cancel is not None and await should_cancel():
+            return False  # defer: the loop's cancellation check ends the run before another turn
+        return first == await page_fingerprint()
+
     async def handler(args: dict[str, Any]) -> ToolResult:
+        nonlocal deferrals
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
+        if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
+            try:
+                settled = await _settled()
+            except Exception:
+                # Fail closed: an exception while probing is evidence of nothing, so the verdict is
+                # deferred for re-verification rather than validated. The deferral cap still bounds it.
+                settled = False
+            if not settled:
+                deferrals += 1
+                return ToolResult.error(
+                    "the page was still rendering, or could not be verified as settled, when you "
+                    "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
+                    "present in the loaded content (not a loading indicator or empty container), "
+                    "then finish again."
+                )
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
             data={
@@ -179,6 +268,45 @@ def make_finish_tool() -> ToolSpec:
     )
 
 
+_COMPACTED_PREFIX = "[superseded "
+
+
+def _compact_transcript(messages: list[dict[str, Any]], snapshot_indices: set[int]) -> None:
+    """Bound the persistent conversation by eliding stale perception snapshots.
+
+    The full transcript is re-sent every turn, so large perception outputs (an `observe` snapshot the
+    agent has already acted past, or a 20k-char `get_html` dump) otherwise pile up until the token
+    backstop trips on perception-heavy pages. `snapshot_indices` holds the message indices of the
+    *successful* perception results (recorded as they are appended); keep the newest of each such tool
+    and replace older ones' content with a short placeholder. Two things are deliberately protected:
+
+    - The most-recent round (results after the last assistant message) is never touched — a single turn
+      can batch several perception calls, and compaction runs *before* the model has seen that round's
+      results, so eliding any of them would drop data the model requested but never read.
+    - Only a successful snapshot is ever a candidate: a skip/error result is never recorded in
+      `snapshot_indices`, so it can neither be elided nor shadow the real snapshot and leave the agent
+      with no usable page view — regardless of content length (a verbose provider error included).
+
+    Only a `tool` message's content is shrunk, never removed, so every tool_call keeps a matching result
+    and the transcript stays valid. Eliding also drops the index, so re-running is a no-op and an elided
+    placeholder can never re-anchor as the live snapshot."""
+    if not snapshot_indices:
+        return
+    last_assistant_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            last_assistant_idx = i
+            break
+    seen: set[str] = set()
+    for i in sorted(snapshot_indices, reverse=True):
+        name = messages[i]["name"]
+        if i > last_assistant_idx or name not in seen:
+            seen.add(name)  # the still-unread latest round, or the newest snapshot of this tool — keep
+            continue
+        messages[i]["content"] = f"{_COMPACTED_PREFIX}{name} output elided to bound context]"
+        snapshot_indices.discard(i)
+
+
 async def run_agent_tool_loop(
     *,
     llm_caller: Any,
@@ -192,12 +320,14 @@ async def run_agent_tool_loop(
     organization_id: str | None = None,
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
-    on_action_round: Callable[[list[tuple[str, dict[str, Any]]]], Awaitable[None]] | None = None,
+    on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     deadline_seconds: float | None = None,
     retryable_call_exceptions: tuple[type[BaseException], ...] = (),
     max_call_retries: int = 0,
     call_retry_base_delay: float = 1.0,
+    stall_nudge_after: int | None = PERCEPTION_STALL_NUDGE_AFTER,
+    stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     openai_tools = [tool.to_openai_tool() for tool in tools]
@@ -209,10 +339,36 @@ async def run_agent_tool_loop(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    # Indices into `messages` of successful perception results, recorded as they are appended so
+    # compaction can keep only the newest of each without inferring "real snapshot" from content size.
+    snapshot_indices: set[int] = set()
+    # Per perception tool: (last successful content, consecutive identical count). One previous
+    # content is held per tool, so memory stays bounded by the tool set.
+    stall_counts: dict[str, tuple[str, int]] = {}
 
     outcome: LoopOutcome | None = None
+    # Mutable for the run: a provider that rejects tool_choice rejects it every turn, so a drop
+    # made once must stick.
+    active_call_kwargs = dict(call_kwargs or {})
+
+    def _degrade_tool_choice(exc: BaseException) -> bool:
+        """Drop tool_choice and report whether the turn is worth re-issuing.
+
+        Called only when the turn is otherwise about to end the run, so the cost is one extra call
+        on a run that was already failing. A context-window overflow is excluded because dropping a
+        parameter provably cannot fix it.
+        """
+        if isinstance(exc, SkyvernContextWindowExceededError):
+            return False
+        if active_call_kwargs.pop("tool_choice", None) is None:
+            return False
+        LOG.warning("taskv3 loop retrying without tool_choice", turn=turns, exc_info=True)
+        return True
+
     turns = 0
+    no_tool_call_turns = 0
     total_tool_calls = 0
+    tool_seconds = 0.0
     total_tokens = 0
     billable_actions: list[str] = []
     action_steps = 0
@@ -236,6 +392,9 @@ async def run_agent_tool_loop(
             break
         turns += 1
 
+        # Elide superseded perception results before re-sending the transcript, so a perception-heavy
+        # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
+        _compact_transcript(messages, snapshot_indices)
         llm_caller.message_history = list(messages)
         # Retry only the LLM call on transient provider errors. No browser tool has run this
         # turn, so re-issuing the same call is side-effect-free — unlike a whole-task retry,
@@ -252,12 +411,21 @@ async def run_agent_tool_loop(
                     tools=openai_tools,
                     use_message_history=True,
                     raw_response=True,
-                    **(call_kwargs or {}),
+                    **active_call_kwargs,
                 )
                 break
             except retryable_call_exceptions as exc:
                 call_attempt += 1
                 if call_attempt > max_call_retries:
+                    # A provider rejecting the parameter surfaces here, not in the generic handler
+                    # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
+                    # the retryable type. Degrading only after the transient budget is spent keeps
+                    # a passing blip from disabling the lever for the rest of the run.
+                    if _degrade_tool_choice(exc):
+                        # Spend the transient budget once, not once per parameter set: the degraded
+                        # turn gets a single shot, which is what "last resort" is worth.
+                        call_attempt = max_call_retries
+                        continue
                     LOG.warning(
                         "taskv3 loop LLM call failed after retries", turn=turns, attempts=call_attempt, exc_info=True
                     )
@@ -266,6 +434,8 @@ async def run_agent_tool_loop(
                 LOG.info("taskv3 loop retrying transient LLM error", turn=turns, attempt=call_attempt)
                 await asyncio.sleep(call_retry_base_delay * (2 ** (call_attempt - 1)))
             except Exception as exc:
+                if _degrade_tool_choice(exc):
+                    continue
                 LOG.warning("taskv3 loop LLM call failed", turn=turns, exc_info=True)
                 outcome = LoopOutcome("loop_error", f"llm_call_failed: {type(exc).__name__}: {exc}")
                 break
@@ -290,11 +460,14 @@ async def run_agent_tool_loop(
         messages.append(assistant_message)
 
         if not tool_calls:
+            no_tool_call_turns += 1
+            LOG.info("taskv3 loop turn produced no tool call", turn=turns)
             messages.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
             continue
 
         turn_did_action = False
-        round_actions: list[tuple[str, dict[str, Any]]] = []
+        stall_nudges_due: list[tuple[str, int]] = []
+        round_actions: list[tuple[str, dict[str, Any], bool]] = []
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
             # cancellation that arrives mid-batch before the next click/type/submit runs. Neither
@@ -316,6 +489,7 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
                 break
             total_tool_calls += 1
+            tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             else:
@@ -328,13 +502,59 @@ async def run_agent_tool_loop(
                 except Exception as exc:
                     LOG.warning("taskv3 tool handler raised", tool=tool_name, exc_info=True)
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}")
+            tool_duration_seconds = time.monotonic() - tool_started_at
+            tool_seconds += tool_duration_seconds
+            # The only per-tool-call timing the engine has: tool execution is the majority of a v3
+            # run's wall-clock and otherwise emits nothing at all. Names, sizes and booleans only —
+            # argument values and result content carry end-user data and must not be logged.
+            LOG.info(
+                "taskv3 tool call finished",
+                # A hallucinated name would otherwise put unbounded model output into an indexed
+                # field on every call; the name itself stays in the tool result the model reads.
+                tool=tool_name if spec is not None else "unknown_tool",
+                tool_status=result.status,
+                duration_seconds=tool_duration_seconds,
+                result_chars=len(result.content),
+                # Truthiness, not presence: the tools treat a null or empty selector as absent and
+                # fall back to scanning the whole page, which is the case this field exists to find.
+                selector_present=bool(args.get("selector")),
+                billable=bool(spec is not None and spec.billable),
+                turn=turns,
+                batch_size=len(tool_calls),
+                batch_index=idx,
+            )
 
+            if spec is not None and spec.compactable and result.status == "ok":
+                snapshot_indices.add(len(messages))  # index this successful snapshot will occupy, pre-append
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result.content}
             )
-            if spec is not None and spec.billable and result.status == "ok":
-                billable_actions.append(tool_name)
-                round_actions.append((tool_name, args))
+            if spec is not None and spec.compactable and result.status == "ok":
+                prev = stall_counts.get(tool_name)
+                identical_count = prev[1] + 1 if prev is not None and prev[0] == result.content else 1
+                stall_counts[tool_name] = (result.content, identical_count)
+                if stall_terminate_after is not None and identical_count >= stall_terminate_after:
+                    LOG.info(
+                        "taskv3 loop perception stalled", tool=tool_name, identical_count=identical_count, turn=turns
+                    )
+                    outcome = LoopOutcome(
+                        "terminated",
+                        f"{PERCEPTION_STALL_REASON_PREFIX} {identical_count} consecutive byte-identical "
+                        f"{tool_name} snapshots — the page stopped changing in response to actions, so the goal "
+                        "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
+                        "cross-origin frame)",
+                    )
+                    _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "perception stalled")
+                    break
+                if stall_nudge_after is not None and identical_count == stall_nudge_after:
+                    stall_nudges_due.append((tool_name, identical_count))
+            if spec is not None and (spec.billable or spec.recordable):
+                # Dispatched page actions enter the round with their outcome: a failed billable round
+                # still consumed budget and must persist (else later blocks undercount the run
+                # budget); recordable tools persist for artifact parity without billing/budget.
+                round_actions.append((tool_name, args, result.status == "ok"))
+                if spec.billable and result.status == "ok":
+                    billable_actions.append(tool_name)
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}
@@ -352,6 +572,10 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "earlier tool call in this batch failed")
                 break
 
+        # Warn only after the batch completes: a user message may not sit between an assistant
+        # turn's tool results, and the model reads it with the snapshot that tripped it.
+        if outcome is None and stall_nudges_due:
+            messages.append({"role": "user", "content": _stall_nudge_text(stall_nudges_due, set(tool_by_name))})
         # A "step" is one action round: a turn that ran >=1 page-mutating action. Perception-only
         # turns (observe/get_html) don't consume the caller's step budget — the step engine bundles
         # perception into each step, so counting v3's perception rounds against the same budget
@@ -371,7 +595,10 @@ async def run_agent_tool_loop(
         outcome = LoopOutcome("loop_error", "loop exited without an outcome")
 
     outcome.turns = turns
+    outcome.no_tool_call_turns = no_tool_call_turns
+    outcome.tool_choice_in_effect = "tool_choice" in active_call_kwargs
     outcome.tool_calls = total_tool_calls
+    outcome.tool_seconds = tool_seconds
     outcome.action_steps = action_steps
     outcome.billable_actions = billable_actions
     outcome.messages = messages
