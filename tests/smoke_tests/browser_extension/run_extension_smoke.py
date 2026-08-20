@@ -160,6 +160,87 @@ async def _wait_for_pairing(runtime: BrowserExtensionRuntime, timeout_seconds: f
     return runtime.extension_connected
 
 
+def _install_pairing_url_capture(directory: Path) -> Path:
+    capture_path = directory / "pairing-urls.log"
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"with Path({str(capture_path)!r}).open('a') as output:\n"
+        "    output.write(sys.argv[-1] + '\\n')\n"
+    )
+    for executable_name in ("open", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        executable = directory / executable_name
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(0o700)
+    return capture_path
+
+
+def _pairing_url_count(capture_path: Path) -> int:
+    if not capture_path.exists():
+        return 0
+    return len([line for line in capture_path.read_text(encoding="utf-8").splitlines() if line])
+
+
+def _assert_one_pairing_url(capture_path: Path, previous_count: int) -> None:
+    current_count = _pairing_url_count(capture_path)
+    if current_count != previous_count + 1:
+        raise AssertionError(f"expected one pairing URL for this client, captured {current_count - previous_count}")
+
+
+async def _read_next_pairing_url(capture_path: Path, previous_count: int, timeout_seconds: float = 20.0) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        if capture_path.exists():
+            urls = [line for line in capture_path.read_text(encoding="utf-8").splitlines() if line]
+            if len(urls) > previous_count:
+                return urls[previous_count]
+        await asyncio.sleep(0.1)
+    raise TimeoutError("broker did not open a pairing URL within 20 seconds")
+
+
+async def _approve_next_pairing(
+    context: BrowserContext,
+    capture_path: Path,
+    previous_count: int,
+    timeout_seconds: float = 20.0,
+) -> None:
+    pairing_url = await _read_next_pairing_url(capture_path, previous_count, timeout_seconds)
+    existing_confirmations = {page for page in context.pages if "pairing_confirm.html" in page.url}
+    pairing_page = await context.new_page()
+    await pairing_page.goto(pairing_url, wait_until="domcontentloaded")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    confirmation: Page | None = None
+    while loop.time() < deadline:
+        confirmation = next(
+            (
+                page
+                for page in context.pages
+                if page not in existing_confirmations and "pairing_confirm.html" in page.url and not page.is_closed()
+            ),
+            None,
+        )
+        if confirmation is not None and await confirmation.locator("#approve-button").is_enabled():
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise TimeoutError("extension did not show an enabled pairing approval within 20 seconds")
+    assert confirmation is not None
+
+    await confirmation.locator("#approve-button").click()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        if await confirmation.locator("body").get_attribute("data-state") == "success":
+            await pairing_page.close()
+            await confirmation.close()
+            return
+        await asyncio.sleep(0.1)
+    raise TimeoutError("extension did not confirm pairing approval within 20 seconds")
+
+
 async def _start_runner(
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> tuple[web.AppRunner, int]:
@@ -262,6 +343,7 @@ async def _run_mcp_phase(
     relay_port: int,
     pairing_token: str,
     legacy_mode: bool,
+    pairing_url_capture: Path,
     report: SmokeReport,
 ) -> None:
     env_overrides = {
@@ -276,6 +358,7 @@ async def _run_mcp_phase(
         env_overrides=env_overrides,
     )
     session_created = False
+    session_create_started = False
     async with Client(transport, timeout=60) as client:
         await _wait_for_popup_connection(popup_page)
 
@@ -283,10 +366,30 @@ async def _run_mcp_phase(
             return unwrap_tool_result(await client.call_tool_mcp(name, arguments or {}))
 
         try:
-            session_result = await call_tool("skyvern_browser_session_create")
+            session_create_started = True
+            if legacy_mode:
+                session_result = await call_tool("skyvern_browser_session_create")
+            else:
+                previous_count = _pairing_url_count(pairing_url_capture)
+                session_task = asyncio.create_task(call_tool("skyvern_browser_session_create"))
+                try:
+                    await _approve_next_pairing(context, pairing_url_capture, previous_count)
+                except BaseException:
+                    if not session_task.done():
+                        session_task.cancel()
+                    try:
+                        incomplete_result = await session_task
+                    except BaseException:
+                        pass
+                    else:
+                        session_created = incomplete_result.get("ok") is True
+                    raise
+                session_result = await session_task
             if session_result.get("ok") is not True:
                 raise AssertionError(f"session create failed: {_tool_error(session_result)}")
             session_created = True
+            if not legacy_mode:
+                _assert_one_pairing_url(pairing_url_capture, previous_count)
             assert pairing_token not in repr(session_result)
             assert CDP_URL_PATTERN.search(repr(session_result)) is None
 
@@ -332,9 +435,15 @@ async def _run_mcp_phase(
             assert await fixture_page.locator("#text-input").input_value() == SMOKE_TEXT
             report.pass_check("mcp coordinate type", f"x={type_x:.1f}, y={type_y:.1f}")
         finally:
-            if session_created:
-                close_result = await call_tool("skyvern_browser_session_close")
-                assert close_result.get("ok") is True, _tool_error(close_result)
+            if session_create_started:
+                try:
+                    close_result = await call_tool("skyvern_browser_session_close")
+                except Exception:
+                    if session_created:
+                        raise
+                else:
+                    if session_created:
+                        assert close_result.get("ok") is True, _tool_error(close_result)
 
 
 async def _pair_extension(
@@ -343,6 +452,8 @@ async def _pair_extension(
     extension_id: str,
     relay_port: int,
     pairing_token: str,
+    legacy_mode: bool,
+    pairing_url_capture: Path,
 ) -> Page:
     popup_page = await context.new_page()
     await popup_page.goto(f"chrome-extension://{extension_id}/popup.html", wait_until="domcontentloaded")
@@ -350,9 +461,16 @@ async def _pair_extension(
     await popup_page.locator("#bridge-port").fill(str(relay_port))
     await popup_page.locator("#pairing-token").fill(pairing_token)
     await popup_page.locator("#connection-button").click()
+    if not legacy_mode:
+        previous_count = _pairing_url_count(pairing_url_capture)
+        if not await runtime.begin_pairing():
+            raise RuntimeError("broker did not start this client's pairing flow")
+        await _approve_next_pairing(context, pairing_url_capture, previous_count)
     if not await _wait_for_pairing(runtime):
         popup_error = await popup_page.locator("#connection-error").text_content()
         raise TimeoutError(f"extension did not pair within 15 seconds; popup error: {popup_error or 'none'}")
+    if not legacy_mode:
+        _assert_one_pairing_url(pairing_url_capture, previous_count)
     return popup_page
 
 
@@ -452,12 +570,16 @@ async def run_smoke(*, legacy_mode: bool) -> int:
     else:
         os.environ.pop(TOKEN_ENV, None)
     redactions = [pairing_token] if pairing_token is not None else []
+    previous_path = os.environ.get("PATH")
     runtime: BrowserExtensionRuntime | None = None
     playwright: Playwright | None = None
     persistent_context: BrowserContext | None = None
     bridge_browser: Browser | None = None
     fixture_servers: FixtureServers | None = None
     profile_dir: tempfile.TemporaryDirectory[str] | None = None
+    opener_dir = tempfile.TemporaryDirectory(prefix="skyvern-extension-smoke-opener-")
+    pairing_url_capture = _install_pairing_url_capture(Path(opener_dir.name))
+    os.environ["PATH"] = f"{opener_dir.name}:{previous_path or '/usr/bin:/bin'}"
     evidence_dir = tempfile.TemporaryDirectory(prefix="skyvern-extension-smoke-evidence-")
     screenshot_path = (Path(evidence_dir.name) / "smoke_navigate.png").resolve()
     broker_port: int | None = None
@@ -494,6 +616,8 @@ async def run_smoke(*, legacy_mode: bool) -> int:
             args=[
                 f"--disable-extensions-except={extension_path}",
                 f"--load-extension={extension_path}",
+                "--use-mock-keychain",
+                "--password-store=basic",
             ],
         )
         discovered_extension_id = await _discover_extension_id(persistent_context)
@@ -504,7 +628,15 @@ async def run_smoke(*, legacy_mode: bool) -> int:
         mode = "legacy opt-out" if legacy_mode else "broker default"
         report.pass_check("setup", f"mode={mode}, relay port={relay_port}, extension ID={extension_id}")
 
-        popup_page = await _pair_extension(persistent_context, runtime, extension_id, relay_port, pairing_token)
+        popup_page = await _pair_extension(
+            persistent_context,
+            runtime,
+            extension_id,
+            relay_port,
+            pairing_token,
+            legacy_mode,
+            pairing_url_capture,
+        )
         assert runtime.extension_connected
         report.pass_check("extension paired")
 
@@ -541,6 +673,7 @@ async def run_smoke(*, legacy_mode: bool) -> int:
             relay_port,
             pairing_token,
             legacy_mode,
+            pairing_url_capture,
             report,
         )
     except Exception as exc:
@@ -564,6 +697,14 @@ async def run_smoke(*, legacy_mode: bool) -> int:
             os.environ.pop(TOKEN_ENV, None)
         else:
             os.environ[TOKEN_ENV] = previous_token
+        if previous_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = previous_path
+        try:
+            opener_dir.cleanup()
+        except Exception as exc:
+            report.fail_check("cleanup", _safe_text(f"temporary opener: {type(exc).__name__}: {exc}", redactions))
 
     report.print_summary()
     return 1 if report.failed else 0
