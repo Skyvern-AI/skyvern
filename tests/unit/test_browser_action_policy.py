@@ -17,20 +17,26 @@ from skyvern.forge.sdk.browser_action_policy import (
     BrowserActionPolicy,
     BrowserActionRequest,
     BrowserOrigin,
+    ElementDestination,
     ObservationVerdict,
+    ObservedElement,
     PageObservation,
     PolicyDecision,
     PolicyOutcome,
     PolicyReason,
     ProtectedReference,
     ProtectedReferenceKind,
+    ResolvedTarget,
     RuntimeOriginAuthority,
+    TargetKind,
     canonicalize_origin,
     classify_action_type,
     coerce_verdict,
     decide_browser_action,
     declare_origin,
     declare_policy,
+    hydrate_destination,
+    with_resolved_target,
 )
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -53,6 +59,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     NewTabAction,
     NullAction,
+    PasteTextAction,
     ReloadPageAction,
     ScrollAction,
     SelectOption,
@@ -73,11 +80,17 @@ EPOCH = 7
 # The runtime authority the existing gates are exercised against: established, and wide enough that
 # it never narrows the ceiling. Tests about authority itself pass their own.
 FULL_AUTHORITY = RuntimeOriginAuthority(state=AuthorityState.ESTABLISHED, origins=POLICY.allowed_origins)
+# Scrape-time destination facts for the element the standard test click lands on: a same-origin
+# anchor. Facts ATTACH a target but never establish completeness — a main-world-sourced fact must
+# never be able to produce ALLOWED — so a hydrated mutating action still reads INCOMPLETE.
+ANCHOR_HOME = ElementDestination(kind=TargetKind.ANCHOR, url=HOME)
+OBSERVED_HASH = "eh-observed"
 
 # Every concrete action model at its minimum valid construction, keyed by discriminator.
 CONCRETE_ACTIONS: dict[ActionType, Action] = {
     ActionType.CLICK: ClickAction(element_id="1"),
     ActionType.INPUT_TEXT: InputTextAction(element_id="1", text="hello"),
+    ActionType.PASTE_TEXT: PasteTextAction(element_id="1", text="a\tb"),
     ActionType.UPLOAD_FILE: UploadFileAction(element_id="1", file_url="https://example.com/f.pdf"),
     ActionType.DOWNLOAD_FILE: DownloadFileAction(file_name="f.pdf"),
     ActionType.SELECT_OPTION: SelectOptionAction(element_id="1", option=SelectOption(label="a")),
@@ -118,6 +131,7 @@ def build_request(
     evidence: PageObservation | None = None,
     omit_evidence: bool = False,
     authority: RuntimeOriginAuthority = FULL_AUTHORITY,
+    destination: ElementDestination | None = None,
 ) -> BrowserActionRequest:
     if not omit_evidence and evidence is None:
         evidence = PageObservation(
@@ -125,9 +139,16 @@ def build_request(
             observation_epoch=EPOCH if evidence_epoch is None else evidence_epoch,
             verdict=verdict,
         )
+    projection = project_for(action)
+    if destination is not None:
+        projection = hydrate_destination(
+            projection,
+            claimed_element_hash=None,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=destination),
+        )
     return BrowserActionRequest(
         policy=policy,
-        projection=project_for(action),
+        projection=projection,
         authority=authority,
         evidence=None if omit_evidence else evidence,
         request_epoch=request_epoch,
@@ -390,13 +411,14 @@ class TestClassificationCoverage:
 
         assert project_action(ClickAction(element_id="1")) == project_action(ClickAction(element_id="2"))
 
-    def test_navigation_targets_are_extracted(self) -> None:
-        assert project_for(GotoUrlAction(url=HOME)).target.urls == (HOME,)
-        assert project_for(NewTabAction(url=HOME)).target.urls == (HOME,)
-        assert project_for(DownloadFileAction(file_name="f", download_url=HOME)).target.urls == (HOME,)
-        assert project_for(ClickAction(element_id="1")).target.urls == ()
-        assert project_for(UploadFileAction(element_id="1", file_url=HOME)).target.urls == (HOME,)
-        assert project_for(ClickAction(element_id="1", file_url=HOME)).target.urls == (HOME,)
+    def test_navigation_targets_are_typed_page_targets(self) -> None:
+        page_home = ResolvedTarget(kind=TargetKind.PAGE, url=HOME)
+        assert project_for(GotoUrlAction(url=HOME)).target.resolved == (page_home,)
+        assert project_for(NewTabAction(url=HOME)).target.resolved == (page_home,)
+        assert project_for(DownloadFileAction(file_name="f", download_url=HOME)).target.resolved == (page_home,)
+        assert project_for(ClickAction(element_id="1")).target.resolved == ()
+        assert project_for(UploadFileAction(element_id="1", file_url=HOME)).target.resolved == (page_home,)
+        assert project_for(ClickAction(element_id="1", file_url=HOME)).target.resolved == (page_home,)
 
     def test_fetchable_file_urls_are_origin_checked(self) -> None:
         decision = decide_browser_action(
@@ -428,7 +450,7 @@ class TestUnclassifiableProjections:
         projection = ActionProjection(
             action_type=ActionType.GOTO_URL,
             action_class=None,
-            target=ActionTarget(urls=("https://totally-evil.example/",)),
+            target=ActionTarget(resolved=(ResolvedTarget(kind=TargetKind.PAGE, url="https://totally-evil.example/"),)),
         )
         decision = decide_browser_action(
             BrowserActionRequest(
@@ -564,12 +586,30 @@ class TestProtectedReferences:
         assert decision.outcome is PolicyOutcome.DENIED
         assert PolicyReason.UNOWNED_PROTECTED_REFERENCE in decision.reasons
 
-    def test_complete_owned_reference_allows(self) -> None:
+    def test_complete_owned_reference_opens_the_reference_gate(self) -> None:
+        # No mutating element action can reach ALLOWED any more — main-world facts never establish
+        # completeness — so the twin is restated as exact reasons: with the reference satisfied,
+        # the ONLY remaining denial is the incomplete destination. Reference reasons absent proves
+        # the gate opened.
+        form_home = ElementDestination(kind=TargetKind.FORM, url=HOME, method="post")
+        decision = decide_browser_action(
+            build_request(
+                InputTextAction(element_id="1", text="x", totp_code_required=True),
+                protected_references=(secret_ref(),),
+                destination=form_home,
+            )
+        )
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert decision.reasons == (PolicyReason.INCOMPLETE_DESTINATION,)
+
+    def test_verification_code_entry_is_destination_opaque(self) -> None:
+        # Element-less mutating actions name no control, so no destination fact can ever complete
+        # them. The reference being satisfied does not make the destination known.
         decision = decide_browser_action(
             build_request(VerificationCodeAction(verification_code="1"), protected_references=(code_ref(),))
         )
-        assert decision.outcome is PolicyOutcome.ALLOWED
-        assert decision.reasons == ()
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert decision.reasons == (PolicyReason.INCOMPLETE_DESTINATION,)
 
 
 class TestOriginAuthorization:
@@ -610,21 +650,25 @@ class TestRuntimeAuthority:
     anyway on UNVERIFIED_OBSERVATION and the assertions would hold against any implementation.
     """
 
+    # GOTO_URL is the axis-isolation vehicle here: its target is model-declared (genuinely known,
+    # so it completes) — a hydrated click can no longer reach ALLOWED at all, which would make
+    # every deny below prove nothing about the authority gate.
+
     def test_unwired_authority_denies_an_action_inside_the_ceiling(self) -> None:
-        decision = decide_browser_action(build_request(ClickAction(element_id="1"), authority=UNWIRED_AUTHORITY))
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), authority=UNWIRED_AUTHORITY))
         assert decision.outcome is PolicyOutcome.DENIED
         assert decision.reasons == (PolicyReason.UNWIRED_RUNTIME_AUTHORITY,)
 
     def test_established_authority_over_the_same_origin_allows(self) -> None:
         # The twin of the test above. If this one fails, the deny above proves nothing: it would be
         # denying for some reason other than the authority gate.
-        decision = decide_browser_action(build_request(ClickAction(element_id="1"), authority=FULL_AUTHORITY))
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), authority=FULL_AUTHORITY))
         assert decision.outcome is PolicyOutcome.ALLOWED
         assert decision.reasons == ()
 
     def test_missing_authority_denies(self) -> None:
         authority = RuntimeOriginAuthority(state=AuthorityState.MISSING, origins=POLICY.allowed_origins)
-        decision = decide_browser_action(build_request(ClickAction(element_id="1"), authority=authority))
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), authority=authority))
         assert decision.outcome is PolicyOutcome.DENIED
         assert decision.reasons == (PolicyReason.MISSING_RUNTIME_AUTHORITY,)
 
@@ -632,7 +676,7 @@ class TestRuntimeAuthority:
         # ADR-0011: rotation or conflict after a browser context is bound is permanent, and the
         # origins it used to carry do not buy it back.
         authority = RuntimeOriginAuthority(state=AuthorityState.INVALIDATED, origins=POLICY.allowed_origins)
-        decision = decide_browser_action(build_request(ClickAction(element_id="1"), authority=authority))
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), authority=authority))
         assert decision.outcome is PolicyOutcome.DENIED
         assert decision.reasons == (PolicyReason.INVALIDATED_RUNTIME_AUTHORITY,)
 
@@ -641,7 +685,8 @@ class TestRuntimeAuthority:
         wide = declare_policy(owner_id=OWNER, origin_urls=[HOME, other])
         narrow = RuntimeOriginAuthority(state=AuthorityState.ESTABLISHED, origins=frozenset({declare_origin(other)}))
         decision = decide_browser_action(
-            build_request(ClickAction(element_id="1"), policy=wide, page_url=HOME, authority=narrow)
+            # The target points inside the granted set, so the page origin is the only reason.
+            build_request(GotoUrlAction(url=other), policy=wide, page_url=HOME, authority=narrow)
         )
         assert decision.outcome is PolicyOutcome.DENIED
         assert decision.reasons == (PolicyReason.PAGE_ORIGIN_NOT_AUTHORIZED,)
@@ -652,9 +697,7 @@ class TestRuntimeAuthority:
             state=AuthorityState.ESTABLISHED,
             origins=frozenset({HOME_ORIGIN, declare_origin(outside)}),
         )
-        decision = decide_browser_action(
-            build_request(ClickAction(element_id="1"), page_url=outside, authority=authority)
-        )
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME), page_url=outside, authority=authority))
         assert decision.outcome is PolicyOutcome.DENIED
         assert decision.reasons == (PolicyReason.PAGE_ORIGIN_NOT_AUTHORIZED,)
 
@@ -782,7 +825,12 @@ class TestReasonPrecedence:
         projection = ActionProjection(
             action_type=ActionType.GOTO_URL,
             action_class=ActionClass.NAVIGATION,
-            target=ActionTarget(urls=("https://evil.example/a", "https://evil.example/b")),
+            target=ActionTarget(
+                resolved=(
+                    ResolvedTarget(kind=TargetKind.PAGE, url="https://evil.example/a"),
+                    ResolvedTarget(kind=TargetKind.PAGE, url="https://evil.example/b"),
+                )
+            ),
         )
         decision = decide_browser_action(
             BrowserActionRequest(
@@ -801,6 +849,8 @@ class TestReasonPrecedence:
             "unknown_action",
             "action_model_mismatch",
             "unresolvable_target",
+            "incomplete_destination",
+            "element_hash_mismatch",
             "missing_page_evidence",
             "stale_page_evidence",
             "missing_protected_reference",
@@ -818,9 +868,277 @@ class TestReasonPrecedence:
         }
 
 
-class TestHappyPath:
-    def test_clean_authorized_mutating_action_allows(self) -> None:
+class TestDestinationCompleteness:
+    """SKY-12875 AC6: a destination-opaque control is INCOMPLETE, never implicitly safe. The
+    completeness default at projection time is therefore False for every mutating action — an
+    unhydrated projection must read as unknown-destination, not as no-destination-to-check."""
+
+    def test_element_targeted_mutating_actions_start_incomplete(self) -> None:
+        for action in (
+            ClickAction(element_id="1"),
+            InputTextAction(element_id="1", text="x"),
+            SelectOptionAction(element_id="1", option=SelectOption(label="a")),
+            CheckboxAction(element_id="1", is_checked=True),
+            UploadFileAction(element_id="1", file_url=HOME),
+        ):
+            assert project_for(action).target.complete is False, action.action_type
+
+    def test_element_less_mutating_actions_are_permanently_incomplete(self) -> None:
+        # No control named means no destination fact can ever complete them: KEYPRESS can submit a
+        # form, SOLVE_CAPTCHA and VERIFICATION_CODE type into elements the projection cannot see.
+        for action in (
+            KeypressAction(keys=["Enter"]),
+            SolveCaptchaAction(),
+            VerificationCodeAction(verification_code="1"),
+        ):
+            assert project_for(action).target.complete is False, action.action_type
+
+    def test_navigation_with_an_explicit_url_is_complete(self) -> None:
+        assert project_for(GotoUrlAction(url=HOME)).target.complete is True
+        assert project_for(NewTabAction(url=HOME)).target.complete is True
+
+    def test_reload_targets_the_current_page_and_is_complete(self) -> None:
+        # The destination is exactly the page origin, which the page-origin gate already checks.
+        assert project_for(ReloadPageAction()).target.complete is True
+
+    def test_go_forward_is_incomplete(self) -> None:
+        # The history destination is unknowable before execution.
+        assert project_for(GoForwardAction()).target.complete is False
+
+    def test_byte_carrying_download_is_incomplete(self) -> None:
+        # SKY-12874 called confining a byte download the sink's job; under the opaque-never-safe
+        # rule the honest preflight classification is incomplete. With a URL it is a PAGE target.
+        assert project_for(DownloadFileAction(file_name="f")).target.complete is False
+        assert project_for(DownloadFileAction(file_name="f", download_url=HOME)).target.complete is True
+
+    def test_recovery_classes_are_not_destination_gated(self) -> None:
+        for action in (WaitAction(), ScrollAction(), GoBackAction(), ExtractAction(), TerminateAction()):
+            assert project_for(action).target.complete is True, action.action_type
+
+    def test_incomplete_destination_denies_gated_classes_only(self) -> None:
         decision = decide_browser_action(build_request(ClickAction(element_id="1")))
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+        benign = ActionProjection(
+            action_type=ActionType.WAIT,
+            action_class=ActionClass.BENIGN,
+            target=ActionTarget(complete=False),
+        )
+        decision = decide_browser_action(
+            BrowserActionRequest(
+                policy=POLICY,
+                projection=benign,
+                authority=FULL_AUTHORITY,
+                request_epoch=EPOCH,
+                evidence=PageObservation(page_url=HOME, observation_epoch=EPOCH, verdict=ObservationVerdict.NO_MATCH),
+            )
+        )
+        assert PolicyReason.INCOMPLETE_DESTINATION not in decision.reasons
+
+    def test_go_forward_reports_incomplete_destination(self) -> None:
+        decision = decide_browser_action(build_request(GoForwardAction()))
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+
+class TestDestinationHydration:
+    """SKY-12875: scrape-time DOM facts become typed resolved targets. The facts are stale,
+    untrusted preflight input — they can complete a destination or flag an identity mismatch, and
+    they can never substitute for evidence, verdict or authority."""
+
+    def test_anchor_facts_resolve_a_typed_anchor_target_without_completing(self) -> None:
+        projection = hydrate_destination(
+            project_for(ClickAction(element_id="1")),
+            claimed_element_hash=None,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=ANCHOR_HOME),
+        )
+        assert projection.target.resolved == (ResolvedTarget(kind=TargetKind.ANCHOR, url=HOME),)
+        # A main-world-sourced fact never establishes completeness: it names where the page CLAIMS
+        # the click goes, not where native activation goes.
+        assert projection.target.complete is False
+        assert projection.defects == ()
+
+    def test_form_facts_resolve_a_typed_form_target_without_completing(self) -> None:
+        form = ElementDestination(kind=TargetKind.FORM, url="https://example.com/submit", method="post")
+        projection = hydrate_destination(
+            project_for(InputTextAction(element_id="1", text="x")),
+            claimed_element_hash=None,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=form),
+        )
+        assert projection.target.resolved == (
+            ResolvedTarget(kind=TargetKind.FORM, url="https://example.com/submit", method="post"),
+        )
+        assert projection.target.complete is False
+
+    def test_hydration_appends_to_model_derived_targets(self) -> None:
+        # A click that fetches a file AND sits on an anchor carries both destinations.
+        projection = hydrate_destination(
+            project_for(ClickAction(element_id="1", file_url=HOME)),
+            claimed_element_hash=None,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=ANCHOR_HOME),
+        )
+        assert ResolvedTarget(kind=TargetKind.PAGE, url=HOME) in projection.target.resolved
+        assert ResolvedTarget(kind=TargetKind.ANCHOR, url=HOME) in projection.target.resolved
+
+    def test_an_unobserved_element_stays_incomplete(self) -> None:
+        projection = hydrate_destination(
+            project_for(ClickAction(element_id="1")),
+            claimed_element_hash=None,
+            observed=None,
+        )
+        assert projection.target.complete is False
+        assert projection.target.resolved == ()
+
+    def test_an_opaque_destination_stays_incomplete(self) -> None:
+        # The element was observed and bears no destination-carrying structure: a plain button, a
+        # div with a JS handler. Observed does not mean safe.
+        for destination in (None, ElementDestination(kind=TargetKind.ANCHOR, url=None)):
+            projection = hydrate_destination(
+                project_for(ClickAction(element_id="1")),
+                claimed_element_hash=None,
+                observed=ObservedElement(element_hash=OBSERVED_HASH, destination=destination),
+            )
+            assert projection.target.complete is False
+            assert projection.target.resolved == ()
+
+    def test_a_hash_mismatch_is_a_defect_and_discards_the_facts(self) -> None:
+        # The action claims one element identity, the observation recorded another. The facts keyed
+        # by that id describe an element the action was not planned against.
+        projection = hydrate_destination(
+            project_for(ClickAction(element_id="1")),
+            claimed_element_hash="stale-hash-from-a-previous-run",
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=ANCHOR_HOME),
+        )
+        assert PolicyReason.ELEMENT_HASH_MISMATCH in projection.defects
+        assert projection.target.complete is False
+        assert projection.target.resolved == ()
+
+        decision = decide_browser_action(
+            BrowserActionRequest(
+                policy=POLICY,
+                projection=projection,
+                authority=FULL_AUTHORITY,
+                request_epoch=EPOCH,
+                evidence=PageObservation(page_url=HOME, observation_epoch=EPOCH, verdict=ObservationVerdict.NO_MATCH),
+            )
+        )
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.ELEMENT_HASH_MISMATCH in decision.reasons
+
+    def test_a_matching_claimed_hash_hydrates(self) -> None:
+        projection = hydrate_destination(
+            project_for(ClickAction(element_id="1")),
+            claimed_element_hash=OBSERVED_HASH,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=ANCHOR_HOME),
+        )
+        assert projection.defects == ()
+        assert projection.target.resolved != ()
+
+    def test_a_defective_projection_is_never_hydrated(self) -> None:
+        # The element_id that keyed the lookup came from a model whose field layout cannot be
+        # trusted, so the facts it found must not be attached.
+        mismatched = ClickAction(element_id="1", action_type=ActionType.GOTO_URL)
+        projection = hydrate_destination(
+            project_for(mismatched),
+            claimed_element_hash=None,
+            observed=ObservedElement(element_hash=OBSERVED_HASH, destination=ANCHOR_HOME),
+        )
+        assert projection.target.resolved == ()
+        assert PolicyReason.ACTION_MODEL_MISMATCH in projection.defects
+
+    def test_a_cross_origin_form_is_denied_on_its_target_origin(self) -> None:
+        exfil = ElementDestination(kind=TargetKind.FORM, url="https://collector.example/steal", method="post")
+        decision = decide_browser_action(build_request(InputTextAction(element_id="1", text="x"), destination=exfil))
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.TARGET_ORIGIN_NOT_AUTHORIZED in decision.reasons
+
+    def test_a_same_origin_form_passes_the_target_gate_but_never_allows(self) -> None:
+        form = ElementDestination(kind=TargetKind.FORM, url=HOME, method="post")
+        decision = decide_browser_action(build_request(InputTextAction(element_id="1", text="x"), destination=form))
+        assert PolicyReason.TARGET_ORIGIN_NOT_AUTHORIZED not in decision.reasons
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+    def test_a_forged_safe_fact_can_never_produce_allowed(self) -> None:
+        # The gate falsification, kept as a test: a page that hides ping= from a patched main-world
+        # getAttribute yields a perfectly safe-looking fact. With established authority, a clean
+        # verdict and fresh evidence, the decision must still be DENIED — a main-world-sourced
+        # fact must never be what establishes completeness.
+        decision = decide_browser_action(
+            build_request(
+                ClickAction(element_id="1"),
+                destination=ANCHOR_HOME,
+                authority=FULL_AUTHORITY,
+                verdict=ObservationVerdict.NO_MATCH,
+            )
+        )
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert decision.reasons == (PolicyReason.INCOMPLETE_DESTINATION,)
+
+    def test_a_malformed_resolved_url_denies_as_missing_target_origin(self) -> None:
+        # javascript: resolves to a syntactically valid URL with no usable origin.
+        weird = ElementDestination(kind=TargetKind.ANCHOR, url="javascript:void(0)")
+        decision = decide_browser_action(build_request(ClickAction(element_id="1"), destination=weird))
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.MISSING_TARGET_ORIGIN in decision.reasons
+
+    def test_facts_are_never_authorization(self) -> None:
+        # The AC stated as an executable sentence: perfect destination facts change nothing about
+        # evidence, verdict or authority. Metadata is preflight input, not final authorization.
+        decision = decide_browser_action(
+            build_request(
+                ClickAction(element_id="1"),
+                destination=ANCHOR_HOME,
+                authority=UNWIRED_AUTHORITY,
+                verdict=ObservationVerdict.UNKNOWN,
+                omit_evidence=True,
+            )
+        )
+        assert decision.outcome is PolicyOutcome.DENIED
+        assert PolicyReason.MISSING_PAGE_EVIDENCE in decision.reasons
+        assert PolicyReason.UNVERIFIED_OBSERVATION in decision.reasons
+        assert PolicyReason.UNWIRED_RUNTIME_AUTHORITY in decision.reasons
+
+    def test_tab_resolution_attaches_a_typed_tab_target(self) -> None:
+        projection = with_resolved_target(
+            project_for(SwitchTabAction(tab_index=1)),
+            ResolvedTarget(kind=TargetKind.TAB, url="https://example.com/other-tab"),
+        )
+        assert projection.target.resolved == (ResolvedTarget(kind=TargetKind.TAB, url="https://example.com/other-tab"),)
+        assert projection.target.complete is True
+
+    def test_an_unresolvable_tab_stays_incomplete(self) -> None:
+        projection = with_resolved_target(project_for(SwitchTabAction(tab_index=9)), None)
+        assert projection.target.resolved == ()
+        assert projection.target.complete is False
+
+    def test_a_defective_projection_never_gains_a_runtime_target(self) -> None:
+        # The twin of hydrate_destination's defect guard: a model whose field layout the core just
+        # refused to trust must not be handed a target either, let alone marked complete.
+        mismatched = SwitchTabAction(tab_index=1, action_type=ActionType.CLICK)
+        projection = with_resolved_target(
+            project_for(mismatched),
+            ResolvedTarget(kind=TargetKind.TAB, url="https://evil.example/x"),
+        )
+        assert projection.target.resolved == ()
+        assert projection.target.complete is False
+        assert PolicyReason.ACTION_MODEL_MISMATCH in projection.defects
+
+    def test_a_defective_projection_reads_incomplete_not_complete(self) -> None:
+        # An unknowable destination must not read "complete" just because the defect reasons
+        # already deny; honesty of the record outlives today's reason set.
+        rogue = NullAction()
+        rogue.action_type = "teleport"  # type: ignore[assignment]
+        assert project_for(rogue).target.complete is False
+        assert project_for(ClickAction(element_id="1", action_type=ActionType.GOTO_URL)).target.complete is False
+
+
+class TestHappyPath:
+    def test_clean_authorized_navigation_allows(self) -> None:
+        # The only ALLOWED path for a destination-bearing action is a model-declared URL; a
+        # hydrated mutating action can never reach ALLOWED (see the forged-safe-fact test).
+        decision = decide_browser_action(build_request(GotoUrlAction(url=HOME)))
         assert decision == PolicyDecision(outcome=PolicyOutcome.ALLOWED, reasons=())
 
     def test_decisions_are_immutable(self) -> None:
@@ -829,7 +1147,7 @@ class TestHappyPath:
             decision.outcome = PolicyOutcome.DENIED  # type: ignore[misc]
 
     def test_deciding_twice_yields_an_equal_decision(self) -> None:
-        request = build_request(ClickAction(element_id="1"))
+        request = build_request(ClickAction(element_id="1"), destination=ANCHOR_HOME)
         assert decide_browser_action(request) == decide_browser_action(request)
 
 
@@ -882,6 +1200,9 @@ class TestPurity:
             BrowserActionPolicy,
             BrowserActionRequest,
             PolicyDecision,
+            ResolvedTarget,
+            ElementDestination,
+            ObservedElement,
         ):
             assert dataclasses.is_dataclass(obj)
             assert obj.__dataclass_params__.frozen is True, obj.__name__

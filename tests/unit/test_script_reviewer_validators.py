@@ -1067,3 +1067,22 @@ class TestConditionalCodeSelfOutputRejection:
         assert error is not None
         assert "Branch_block_output" in error
         assert "None" in error
+
+
+class TestValidateMethodKwargsClickDesiredState:
+    """SKY-14051: a reviewer rewrite that preserves click's desired_state kwarg must not be
+    rejected as an invented kwarg, or _validate_method_kwargs forces retries until the LLM
+    strips the guard it's meant to protect."""
+
+    def setup_method(self) -> None:
+        self.reviewer = ScriptReviewer()
+
+    def test_desired_state_is_an_allowed_click_kwarg(self) -> None:
+        code = 'await page.click(selector="#toggle", ai="fallback", prompt="toggle it", desired_state=True)'
+        assert self.reviewer._validate_method_kwargs(code) is None
+
+    def test_unknown_click_kwarg_is_still_rejected(self) -> None:
+        code = 'await page.click(selector="#toggle", made_up_kwarg=True)'
+        error = self.reviewer._validate_method_kwargs(code)
+        assert error is not None
+        assert "made_up_kwarg" in error

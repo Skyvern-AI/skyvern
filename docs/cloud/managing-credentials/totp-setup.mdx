@@ -13,6 +13,8 @@ keywords:
   - verification
 ---
 
+import WebhookSignatureVerification from "/snippets/webhook-signature-verification.mdx";
+
 Skyvern supports three 2FA methods for automated logins. **Authenticator App (TOTP)** is fully automatic: Skyvern generates codes locally. **Email** and **Text Message** require you to push codes via the UI or API. All three are configured on the [password credential](/cloud/managing-credentials/password-credentials) itself.
 
 ## Authenticator App (TOTP)
@@ -187,21 +189,7 @@ Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and 
 }
 ```
 
-Validate the `x-skyvern-signature` header to confirm the request came from Skyvern:
-
-```python
-import hashlib, hmac
-
-def validate_skyvern_request(request) -> bool:
-    signature = request.headers["x-skyvern-signature"]
-    payload = request.body()  # bytes
-    expected = hmac.new(
-        SKYVERN_API_KEY.encode("utf-8"),
-        msg=payload,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    return signature == expected
-```
+<WebhookSignatureVerification />
 
 ---
 

@@ -24,9 +24,11 @@ from skyvern.forge.sdk.browser_action_policy import (
     ActionTarget,
     AuthorityState,
     BrowserActionRequest,
+    ElementDestination,
     PolicyOutcome,
     PolicyReason,
     RuntimeOriginAuthority,
+    TargetKind,
     declare_origin,
     declare_policy,
 )
@@ -36,6 +38,8 @@ from skyvern.forge.sdk.browser_action_preflight import (
     preflight_action,
     preflight_batch,
     preflight_derived_action,
+    preflight_dialog_response,
+    record_observed_tabs,
     stamp_parsed_actions,
 )
 from skyvern.forge.sdk.core import skyvern_context
@@ -127,8 +131,19 @@ def observing(monkeypatch: pytest.MonkeyPatch):
         skyvern_context.reset()
 
 
-def scrape(page: FakePage, context: SkyvernContext, *, hashes: tuple[str, ...] = ("h1", "h2")) -> None:
-    advance_observation_epoch(page, main_frame_url=page.main_frame.url, element_hashes=hashes)
+def scrape(
+    page: FakePage,
+    context: SkyvernContext,
+    *,
+    hashes: dict[str, str] | None = None,
+    destinations: dict[str, dict] | None = None,
+) -> None:
+    advance_observation_epoch(
+        page,
+        main_frame_url=page.main_frame.url,
+        element_hashes={"1": "h1", "2": "h2"} if hashes is None else hashes,
+        destinations=destinations,
+    )
 
 
 class TestObservationEpochs:
@@ -143,18 +158,18 @@ class TestObservationEpochs:
 
     def test_the_epoch_is_bound_to_the_scraped_element_hashes(self, observing: SkyvernContext) -> None:
         page = FakePage()
-        scrape(page, observing, hashes=("h1", "h2"))
+        scrape(page, observing, hashes={"1": "h1", "2": "h2"})
         first = observing.browser_observation_epoch
-        scrape(page, observing, hashes=("h1", "h3"))
+        scrape(page, observing, hashes={"1": "h1", "2": "h3"})
         second = observing.browser_observation_epoch
         assert first is not None and second is not None
         assert first.element_digest != second.element_digest
 
     def test_hash_order_does_not_change_the_binding(self, observing: SkyvernContext) -> None:
         page = FakePage()
-        scrape(page, observing, hashes=("h1", "h2"))
+        scrape(page, observing, hashes={"1": "h1", "2": "h2"})
         first = observing.browser_observation_epoch
-        scrape(page, observing, hashes=("h2", "h1"))
+        scrape(page, observing, hashes={"2": "h2", "1": "h1"})
         second = observing.browser_observation_epoch
         assert first is not None and second is not None
         assert first.element_digest == second.element_digest
@@ -230,6 +245,492 @@ class TestObservationEpochs:
         assert preflight_action(action_models.ClickAction(element_id="1"), page, site="test") is None
 
 
+class TestEpochCarriesDestinationFacts:
+    """SKY-12875: the accepted scrape's per-element hashes and destination facts ride the epoch,
+    parsed into typed records at write time so nothing downstream touches raw page-shaped dicts."""
+
+    def test_the_epoch_records_per_element_hashes_and_typed_facts(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(
+            page,
+            observing,
+            hashes={"e1": "h1"},
+            destinations={"e1": {"kind": "anchor", "url": HOME}},
+        )
+        epoch = observing.browser_observation_epoch
+        assert epoch is not None
+        assert epoch.element_hashes == {"e1": "h1"}
+        assert epoch.destinations == {"e1": ElementDestination(kind=TargetKind.ANCHOR, url=HOME)}
+
+    def test_form_facts_parse_with_method(self, observing: SkyvernContext) -> None:
+        scrape(
+            FakePage(),
+            observing,
+            hashes={"e1": "h1"},
+            destinations={"e1": {"kind": "form", "url": HOME, "method": "post"}},
+        )
+        epoch = observing.browser_observation_epoch
+        assert epoch is not None
+        assert epoch.destinations == {"e1": ElementDestination(kind=TargetKind.FORM, url=HOME, method="post")}
+
+    def test_malformed_page_controlled_facts_degrade_to_factless_not_a_crash(self, observing: SkyvernContext) -> None:
+        # A dropped record leaves the element observed-but-factless, which classifies INCOMPLETE —
+        # the same fail-closed state as no record. PAGE and TAB are runtime-resolved kinds and must
+        # not be forgeable from page-controlled input.
+        scrape(
+            FakePage(),
+            observing,
+            hashes={"e1": "h1", "e2": "h2", "e3": "h3", "e4": "h4", "e5": "h5"},
+            destinations={
+                "e1": "not-a-dict",
+                "e2": {"kind": "teleport", "url": HOME},
+                "e3": {"kind": "page", "url": HOME},
+                "e4": {"kind": "tab", "url": HOME},
+                "e5": {"kind": "form", "url": 7, "method": ["x"]},
+                7: {"kind": "anchor", "url": HOME},
+            },
+        )
+        epoch = observing.browser_observation_epoch
+        assert epoch is not None
+        assert epoch.destinations == {"e5": ElementDestination(kind=TargetKind.FORM, url=None, method=None)}
+
+    def test_an_unhashable_kind_drops_the_record_not_the_epoch(self, observing: SkyvernContext) -> None:
+        # A hostile page that could make fact parsing raise would SUPPRESS the epoch advance and
+        # with it every later observation. The record dies; the observation must not.
+        scrape(
+            FakePage(),
+            observing,
+            hashes={"e1": "h1", "e2": "h2"},
+            destinations={"e1": {"kind": ["anchor"], "url": HOME}, "e2": {"kind": "anchor", "url": HOME}},
+        )
+        epoch = observing.browser_observation_epoch
+        assert epoch is not None, "the hostile record suppressed the epoch advance"
+        assert set(epoch.destinations) == {"e2"}
+
+    def test_the_scrape_call_site_passes_both_maps(self) -> None:
+        # The tests above drive advance_observation_epoch directly; this binds the production call.
+        source = ast.parse(Path("skyvern/webeye/scraper/scraper.py").read_text())
+        calls = [
+            node
+            for node in ast.walk(source)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "advance_observation_epoch"
+        ]
+        assert len(calls) == 1, "expected exactly the accepted-scrape call site"
+        keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
+        assert keywords["element_hashes"] == "id_to_element_hash"
+        assert keywords["destinations"] == "destinations"
+
+
+ANCHOR_HOME_FACTS = {"kind": "anchor", "url": HOME}
+
+
+class TestDestinationHydrationWiring:
+    """SKY-12875: scrape-time facts reach the decision through the preflight, and only under the
+    same digest-provenance the evidence axis uses — facts from a different observation than the
+    action's plan are wrong facts, not stale ones."""
+
+    def test_facts_for_the_planned_element_attach_but_never_complete(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing, hashes={"1": "h1"}, destinations={"1": ANCHOR_HOME_FACTS})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        # The fact surfaces as a typed target in the evidence, and the destination still reads
+        # INCOMPLETE: a main-world-sourced fact never establishes completeness.
+        assert emitted[0]["target_origins"] == ["https://example.com"]
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+        assert PolicyReason.UNWIRED_RUNTIME_AUTHORITY in decision.reasons
+
+    def test_an_observed_but_destination_opaque_element_reads_incomplete(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing, hashes={"1": "h1"})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+    def test_an_unobserved_element_reads_incomplete(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing, hashes={"2": "h2"}, destinations={"2": ANCHOR_HOME_FACTS})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+    def test_a_cross_origin_form_fact_surfaces_the_target_origin_denial(self, observing: SkyvernContext) -> None:
+        observing.browser_action_authority = ESTABLISHED
+        page = FakePage()
+        scrape(
+            page,
+            observing,
+            hashes={"1": "h1"},
+            destinations={"1": {"kind": "form", "url": "https://collector.example/steal", "method": "post"}},
+        )
+        action = action_models.InputTextAction(element_id="1", text="account number")
+        stamp_parsed_actions([action])
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.TARGET_ORIGIN_NOT_AUTHORIZED in decision.reasons
+
+    def test_facts_from_a_different_observation_are_never_attached(self, observing: SkyvernContext) -> None:
+        # The current epoch HAS facts for this element id, but the action was planned under an
+        # older observation. Attaching them would describe an element the plan never saw.
+        page = FakePage()
+        scrape(page, observing, hashes={"1": "h1"})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        scrape(page, observing, hashes={"1": "h1"}, destinations={"1": ANCHOR_HOME_FACTS})
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.STALE_PAGE_EVIDENCE in decision.reasons
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+    def test_a_claimed_hash_contradicting_the_observation_is_reported(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing, hashes={"1": "h-live"}, destinations={"1": ANCHOR_HOME_FACTS})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        action.skyvern_element_hash = "h-from-a-previous-run"
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.ELEMENT_HASH_MISMATCH in decision.reasons
+        assert PolicyReason.INCOMPLETE_DESTINATION in decision.reasons
+
+    def test_a_matching_claimed_hash_hydrates(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing, hashes={"1": "h-live"}, destinations={"1": ANCHOR_HOME_FACTS})
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        action.skyvern_element_hash = "h-live"
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.ELEMENT_HASH_MISMATCH not in decision.reasons
+        assert emitted[0]["target_origins"] == ["https://example.com"]
+
+    def test_an_element_less_action_with_a_hallucinated_hash_is_untouched(self, observing: SkyvernContext) -> None:
+        # parse_actions clears element_id on non-web actions but leaves the hallucinated hash in
+        # place; an ungated check would deny every WAIT carrying LLM garbage.
+        page = FakePage()
+        scrape(page, observing)
+        action = action_models.WaitAction()
+        stamp_parsed_actions([action])
+        action.skyvern_element_hash = "hallucinated"
+        decision = preflight_action(action, page, site="test")
+        assert decision is not None
+        assert PolicyReason.ELEMENT_HASH_MISMATCH not in decision.reasons
+
+    def test_the_decision_event_carries_canonical_target_origins_only(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(
+            page,
+            observing,
+            hashes={"1": "h1"},
+            destinations={"1": {"kind": "form", "url": "https://collector.example/x?ssn=123-45-6789"}},
+        )
+        action = action_models.ClickAction(element_id="1")
+        stamp_parsed_actions([action])
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_action(action, page, site="test")
+        assert len(emitted) == 1
+        assert emitted[0]["target_origins"] == ["https://collector.example"]
+        assert "ssn" not in repr(emitted[0])
+
+
+class TestObservedTabs:
+    """SKY-12875: SwitchTab resolves against the recorded prompt tab list and nothing else. No
+    record, an out-of-range index, or a record from another epoch resolves nothing — the answer is
+    incomplete, never agreement with live browser state."""
+
+    def test_a_recorded_tab_resolves_to_a_typed_tab_target(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        record_observed_tabs([HOME, "https://example.com/other-tab"])
+        action = action_models.SwitchTabAction(tab_index=1)
+        stamp_parsed_actions([action])
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_action(action, page, site="test")
+        assert len(emitted) == 1
+        assert emitted[0]["target_origins"] == ["https://example.com"]
+
+    @pytest.mark.parametrize("tab_index", [-1, 2, 99])
+    def test_an_out_of_range_index_resolves_nothing(self, observing: SkyvernContext, tab_index: int) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        record_observed_tabs([HOME, "https://example.com/other-tab"])
+        action = action_models.SwitchTabAction(tab_index=tab_index)
+        stamp_parsed_actions([action])
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_action(action, page, site="test")
+        assert emitted[0]["target_origins"] == []
+
+    def test_a_record_from_another_epoch_resolves_nothing(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        record_observed_tabs([HOME, "https://example.com/other-tab"])
+        scrape(page, observing)
+        action = action_models.SwitchTabAction(tab_index=1)
+        stamp_parsed_actions([action])
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_action(action, page, site="test")
+        assert emitted[0]["target_origins"] == []
+
+    def test_recording_without_an_epoch_records_nothing(self, observing: SkyvernContext) -> None:
+        record_observed_tabs([HOME])
+        assert observing.browser_observed_tabs is None
+
+    def test_recording_is_a_no_op_while_disabled(
+        self, observing: SkyvernContext, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scrape(FakePage(), observing)
+        monkeypatch.setattr(settings, "BROWSER_ACTION_POLICY_MODE", "disabled")
+        record_observed_tabs([HOME])
+        assert observing.browser_observed_tabs is None
+
+    @pytest.mark.asyncio
+    async def test_build_open_tabs_context_records_even_for_a_single_tab(self, observing: SkyvernContext) -> None:
+        # The <=1 early return must not skip the record: a later SWITCH_TAB judged against a stale
+        # record is exactly the mismatch this exists to surface.
+        from skyvern.webeye.utils.page import build_open_tabs_context
+
+        page = FakePage()
+        scrape(page, observing)
+        browser_state = MagicMock()
+        browser_state.list_valid_pages = AsyncMock(return_value=[page])
+        assert await build_open_tabs_context(browser_state, page) is None
+        assert observing.browser_observed_tabs is not None
+        assert observing.browser_observed_tabs.urls == (HOME,)
+
+
+class TestDialogResponsePreflight:
+    """SKY-12875: THE CHOICE IS THE CAPABILITY. Every response a page can branch on is evaluated —
+    confirm and prompt accept AND dismiss, beforeunload both ways — because a probe showed a page
+    firing an exfil POST specifically on dismissal. Only alert is exempt: one possible response
+    means no choice. The caller discards the decision: observe mode never changes what a dialog
+    does."""
+
+    def test_confirm_acceptance_on_the_observed_page_is_evaluated(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        decision = preflight_dialog_response(page, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert decision.outcome is PolicyOutcome.DENIED
+        # Page-bound evidence exists; what denies is the unverified content and the empty seam.
+        assert PolicyReason.MISSING_PAGE_EVIDENCE not in decision.reasons
+        assert PolicyReason.UNVERIFIED_OBSERVATION in decision.reasons
+        assert PolicyReason.UNWIRED_RUNTIME_AUTHORITY in decision.reasons
+
+    def test_prompt_acceptance_is_evaluated(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        decision = preflight_dialog_response(page, dialog_type="prompt", response="accept", site="test")
+        assert decision is not None
+        assert decision.outcome is PolicyOutcome.DENIED
+
+    def test_acceptance_checks_the_exact_page_origin(self, observing: SkyvernContext) -> None:
+        observing.browser_action_authority = ESTABLISHED
+        page = FakePage(url="https://evil.example/lure")
+        scrape(page, observing)
+        decision = preflight_dialog_response(page, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert PolicyReason.PAGE_ORIGIN_NOT_AUTHORIZED in decision.reasons
+
+    def test_acceptance_on_an_unobserved_page_has_no_evidence(self, observing: SkyvernContext) -> None:
+        observed, other = FakePage(), FakePage()
+        scrape(observed, observing)
+        decision = preflight_dialog_response(other, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert PolicyReason.MISSING_PAGE_EVIDENCE in decision.reasons
+
+    def test_navigation_since_the_scrape_voids_the_evidence(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        page.navigate_to("https://example.com/somewhere-else")
+        decision = preflight_dialog_response(page, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert PolicyReason.MISSING_PAGE_EVIDENCE in decision.reasons
+
+    def test_a_registered_page_of_none_has_no_evidence(self, observing: SkyvernContext) -> None:
+        scrape(FakePage(), observing)
+        decision = preflight_dialog_response(None, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert PolicyReason.MISSING_PAGE_EVIDENCE in decision.reasons
+
+    @pytest.mark.parametrize(
+        ("dialog_type", "response"),
+        [
+            ("confirm", "accept"),
+            ("confirm", "dismiss"),
+            ("prompt", "accept"),
+            ("prompt", "dismiss"),
+            ("beforeunload", "accept"),
+            ("beforeunload", "dismiss"),
+        ],
+    )
+    def test_every_response_carrying_a_choice_is_evaluated(
+        self, observing: SkyvernContext, dialog_type: str, response: str
+    ) -> None:
+        # THE CHOICE IS THE CAPABILITY: a real-Chromium probe fired an exfil POST specifically on
+        # DISMISS, and beforeunload commits a pending navigation one way and cancels it the other.
+        # Both branches of a choice therefore evaluate as MUTATING. Beforeunload dismissal is
+        # listed even though no listener here produces it: an unlisted pair fails OPEN by silently
+        # returning None, so the table covers the capability, not today's callers.
+        page = FakePage()
+        scrape(page, observing)
+        decision = preflight_dialog_response(page, dialog_type=dialog_type, response=response, site="test")
+        assert decision is not None
+        assert decision.outcome is PolicyOutcome.DENIED
+
+    @pytest.mark.parametrize(
+        ("dialog_type", "response"),
+        [
+            ("alert", "accept"),
+            ("alert", "dismiss"),
+            ("somethingnew", "accept"),
+        ],
+    )
+    def test_choiceless_or_unknown_responses_are_not_evaluated(
+        self, observing: SkyvernContext, dialog_type: str, response: str
+    ) -> None:
+        # Alert has a single possible response — no choice exists, so answering it decides
+        # nothing; its message text is the verdict axis, not a response capability. Probed in real
+        # Chromium: a page cannot tell accept from dismiss on an alert.
+        page = FakePage()
+        scrape(page, observing)
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            assert preflight_dialog_response(page, dialog_type=dialog_type, response=response, site="test") is None
+        assert emitted == []
+
+    def test_the_dialog_decision_event_names_the_response(self, observing: SkyvernContext) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_dialog_response(page, dialog_type="confirm", response="dismiss", site="test")
+        assert len(emitted) == 1
+        assert emitted[0]["dialog_response"] == "dismiss"
+
+    def test_disabled_mode_evaluates_nothing(self, observing: SkyvernContext, monkeypatch: pytest.MonkeyPatch) -> None:
+        page = FakePage()
+        scrape(page, observing)
+        monkeypatch.setattr(settings, "BROWSER_ACTION_POLICY_MODE", "disabled")
+        assert preflight_dialog_response(page, dialog_type="confirm", response="accept", site="test") is None
+
+    def test_no_context_evaluates_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "BROWSER_ACTION_POLICY_MODE", "observe")
+        skyvern_context.reset()
+        assert preflight_dialog_response(FakePage(), dialog_type="confirm", response="accept", site="test") is None
+
+    def test_an_unenrolled_run_emits_nothing(self, observing: SkyvernContext) -> None:
+        observing.browser_action_policy = None
+        page = FakePage()
+        scrape(page, observing)
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            decision = preflight_dialog_response(page, dialog_type="confirm", response="accept", site="test")
+        assert decision is not None
+        assert decision.outcome is PolicyOutcome.NOT_ENROLLED
+        assert emitted == []
+
+    def test_an_internal_fault_never_escapes(self, observing: SkyvernContext) -> None:
+        broken = ExplodingPage()
+        scrape(broken, observing)
+        assert preflight_dialog_response(broken, dialog_type="confirm", response="accept", site="test") is None
+
+    def test_the_dialog_decision_event_carries_the_dialog_type_and_canonical_origin(
+        self, observing: SkyvernContext
+    ) -> None:
+        page = FakePage(url="https://example.com/apply?ssn=123-45-6789")
+        scrape(page, observing)
+        emitted: list[dict] = []
+        with patch.object(preflight.LOG, "info", lambda _event, **kwargs: emitted.append(kwargs)):
+            preflight_dialog_response(page, dialog_type="prompt", response="accept", site="test")
+        assert len(emitted) == 1
+        assert emitted[0]["dialog_type"] == "prompt"
+        assert emitted[0]["page_origin"] == declare_origin(HOME).canonical
+        assert "ssn" not in repr(emitted[0])
+
+
+class TestDialogAcceptBoundary:
+    """The tree-wide dialog surface, pinned. skyvern/cli/mcp_tools/inspection.py registers the only
+    other dialog listener and it is dismiss-only, which keeps it outside the capability table (a
+    dismissal commits nothing and supplies no text). A new accept site anywhere fails here until a
+    human decides whether it needs the acceptance preflight."""
+
+    @staticmethod
+    def _python_files() -> list[Path]:
+        files = [path for root in ("skyvern", "cloud") for path in Path(root).rglob("*.py")]
+        assert len(files) > 100, "the sweep found too few files — the scan is broken, not the tree"
+        return files
+
+    def test_dialog_accepts_exist_only_in_the_dialog_handler(self) -> None:
+        accepting: dict[str, int] = {}
+        for path in self._python_files():
+            tree = ast.parse(path.read_text())
+            count = sum(
+                1
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "accept"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "dialog"
+            )
+            if count:
+                accepting[str(path)] = count
+        # Receiver-name scoped by design: `dialog.accept(...)` written literally. An alias would
+        # evade this scan; the behavioural parity tests are the load-bearing assurance.
+        # 3 = the alert direct accept + the two accept arms of the _respond choke point.
+        assert accepting == {"skyvern/webeye/dialog_handler.py": 3}, accepting
+
+    def test_dialog_listener_registrations_are_pinned(self) -> None:
+        registering: list[str] = []
+        for path in self._python_files():
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "on"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "dialog"
+                ):
+                    registering.append(str(path))
+        assert sorted(registering) == [
+            "skyvern/cli/mcp_tools/inspection.py",
+            "skyvern/webeye/dialog_handler.py",
+        ], registering
+
+    def test_the_cli_inspection_listener_never_accepts(self) -> None:
+        tree = ast.parse(Path("skyvern/cli/mcp_tools/inspection.py").read_text())
+        handler = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_on_dialog"
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(handler)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "dismiss" in calls, "the auto-dismiss disappeared — re-decide the dialog boundary"
+        assert "accept" not in calls, "the CLI inspection handler now ACCEPTS — it needs the acceptance preflight"
+
+
 class TestTheScrapeAdvancesTheEpoch:
     """AC1. Every test above calls ``advance_observation_epoch`` directly, so on their own they
     prove the epoch machinery works and nothing about whether a scrape ever reaches it."""
@@ -265,7 +766,15 @@ class TestStampingHappensAtTheParsePoint:
     whole batch later handed such an action provenance for an observation it predates."""
 
     @staticmethod
-    async def _generate(injected: list | None, parsed, *, extraction: bool = True, otp=None) -> list:
+    async def _generate(
+        injected: list | None,
+        parsed,
+        *,
+        extraction: bool = True,
+        otp=None,
+        primary_default: object | None = None,
+        captured_defaults: list[object] | None = None,
+    ) -> list:
         async def fake_extract(*_a, **_k):
             return parsed
 
@@ -288,9 +797,23 @@ class TestStampingHappensAtTheParsePoint:
         task.workflow_run_id = "wr"
         task.task_id = "tsk"
         llm = AsyncMock(return_value={"actions": []})
+        resolved_primary_default = primary_default or object()
+
+        def resolve_override(_llm_key: str | None, *, default: object) -> AsyncMock:
+            if captured_defaults is not None:
+                captured_defaults.append(default)
+            return llm
+
         with (
             patch.object(ForgeAgent, "create_extract_action", fake_extract),
-            patch("skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler", return_value=llm),
+            patch(
+                "skyvern.forge.agent.get_org_aware_primary_llm_api_handler",
+                return_value=resolved_primary_default,
+            ),
+            patch(
+                "skyvern.forge.agent.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                side_effect=resolve_override,
+            ),
         ):
             actions, _, _ = await ForgeAgent._generate_step_actions(
                 agent,
@@ -315,6 +838,21 @@ class TestStampingHappensAtTheParsePoint:
                 context=None,
             )
         return actions
+
+    @pytest.mark.asyncio
+    async def test_planner_uses_org_aware_primary_handler_as_default(self) -> None:
+        primary_default = object()
+        captured_defaults: list[object] = []
+
+        await self._generate(
+            None,
+            None,
+            extraction=False,
+            primary_default=primary_default,
+            captured_defaults=captured_defaults,
+        )
+
+        assert captured_defaults == [primary_default]
 
     @pytest.mark.asyncio
     async def test_an_action_injected_before_the_scrape_is_never_stamped(self, observing: SkyvernContext) -> None:
@@ -441,6 +979,10 @@ class TestObserveModeIsAPureObserver:
         "goto",
         "bring_to_front",
         "evaluate",
+        # SKY-12875: the dialog preflight OBSERVES a dialog response; answering one is the
+        # handler's job, and this module acquiring either verb would make observe behavioural.
+        "accept",
+        "dismiss",
     }
 
     def test_the_preflight_module_calls_nothing_state_changing(self) -> None:
@@ -457,7 +999,7 @@ class TestObserveModeIsAPureObserver:
         # The reviewer found F1 by behaviour rather than by diff, so this sweeps every site rather
         # than the one that was wrong.
         offenders = []
-        for path in ("skyvern/forge/agent.py", "skyvern/webeye/actions/handler.py"):
+        for path in ("skyvern/forge/agent.py", "skyvern/webeye/actions/handler.py", "skyvern/webeye/dialog_handler.py"):
             tree = ast.parse(Path(path).read_text())
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
@@ -709,6 +1251,7 @@ class TestInternalFailuresAreVisible:
         "INTERNAL_ERROR_OUTCOME",
         "'Failed to advance the browser action observation epoch'",
         "'Failed to stamp actions with an observation epoch'",
+        "'Failed to record the observed open tabs'",
         "site",
         "[]",
         "[reason.value for reason in decision.reasons]",
@@ -717,6 +1260,12 @@ class TestInternalFailuresAreVisible:
         "action.observation_epoch",
         "None if observation is None else observation.observation_epoch",
         "None if origin is None else origin.canonical",
+        # Canonical origins only, computed above the call; the sensitive full URLs never appear.
+        "target_origins",
+        # The Playwright dialog type: one of alert/beforeunload/confirm/prompt, never page text.
+        "dialog_type",
+        # Which branch of the choice was taken: "accept" or "dismiss", never page text.
+        "response",
         "type(error).__name__",
         "_error_location(error)",
     }
@@ -724,7 +1273,7 @@ class TestInternalFailuresAreVisible:
     # why it is barred outright rather than checked for a kwarg — swapping warning for exception in
     # a handler is a one-word edit that reads as harmless.
     PERMITTED_LOG_METHODS = {"info", "warning"}
-    LOG_CALL_COUNT = 4
+    LOG_CALL_COUNT = 7
 
     @staticmethod
     def _log_calls() -> list:
@@ -1115,10 +1664,14 @@ class TestReprojectionOfDerivedActions:
         assert action.action_type == ActionType.TERMINATE
 
     def test_every_conversion_site_is_wired_to_the_right_preflight(self) -> None:
-        wired = _preflight_calls(Path("skyvern/webeye/actions/handler.py")) | _preflight_calls(
-            Path("skyvern/forge/agent.py")
+        wired = (
+            _preflight_calls(Path("skyvern/webeye/actions/handler.py"))
+            | _preflight_calls(Path("skyvern/forge/agent.py"))
+            | _preflight_calls(Path("skyvern/webeye/dialog_handler.py"))
         )
         assert wired == {
+            # Confirm/prompt acceptance, at the one choke point every accept routes through.
+            "dialog_handler": "preflight_dialog_response",
             # Judged as a batch; stamped earlier, at the point it was parsed out of the scrape.
             "step_action_batch": "preflight_batch",
             # Synthesized by the runtime after a reload. Judged, never stamped — stamping happens
@@ -1169,7 +1722,7 @@ class TestObserveModeIsNotBehavioural:
         monkeypatch.setattr(settings, "BROWSER_ACTION_POLICY_MODE", "observe")
         skyvern_context.reset()
         assert skyvern_context.current() is None
-        advance_observation_epoch(FakePage(), main_frame_url=HOME, element_hashes=())
+        advance_observation_epoch(FakePage(), main_frame_url=HOME, element_hashes={})
         stamp_parsed_actions([action_models.ClickAction(element_id="1")])
 
     def test_decisions_carry_no_page_content(self, observing: SkyvernContext) -> None:

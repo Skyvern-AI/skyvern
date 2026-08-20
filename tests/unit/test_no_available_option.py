@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -1134,7 +1134,7 @@ class TestDeterministicCustomSelect:
         selected_element.get_locator().count = AsyncMock(return_value=1)
         # A text-input combobox anchor is resettable, so an inconclusive read-back must NOT hard-fail.
         readback_scope_element = _FakeAnchorElement(tag_name="input")
-        monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+        monkeypatch.setattr(handler, "get_input_value", AsyncMock(side_effect=[""]))
 
         result = await _select_deterministic_custom_option(
             execute=True,
@@ -1151,7 +1151,7 @@ class TestDeterministicCustomSelect:
 
         assert result is None
         selected_element.click.assert_awaited_once()
-        readback_scope_element.get_locator().fill.assert_awaited_once_with("")
+        assert readback_scope_element.get_locator().fill.await_args_list == [call("")]
         readback_scope_element.click.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1174,16 +1174,16 @@ class TestDeterministicCustomSelect:
         )
         readback_scope_element = _FakeAnchorElement()
 
-        assert (
-            await _verify_custom_select_option(
-                matched_element=matched_element,  # type: ignore[arg-type]
-                readback_scope_element=readback_scope_element,  # type: ignore[arg-type]
-                anchor_is_combobox_input=False,
-                matched_element_id="choice-radio",
-                matched_label="Choice",
-            )
-            is True
+        verified, _ = await _verify_custom_select_option(
+            matched_element=matched_element,  # type: ignore[arg-type]
+            readback_scope_element=readback_scope_element,  # type: ignore[arg-type]
+            anchor_is_combobox_input=False,
+            matched_element_id="choice-radio",
+            matched_label="Choice",
+            use_strict_verification=False,
         )
+
+        assert verified is True
 
     @pytest.mark.asyncio
     async def test_readback_accepts_scoped_trigger_reflection_without_synthetic_token(self) -> None:
@@ -1196,21 +1196,22 @@ class TestDeterministicCustomSelect:
             captured["arg"] = arg
             if "const nestedChoice =" in expression:
                 return None
-            return True
+            return {"matched": True, "branch": "scope_trigger_text"}
 
         readback_scope_element = _FakeAnchorElement()
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(handler.SkyvernFrame, "evaluate", AsyncMock(side_effect=evaluate))
-            outcome = await _verify_custom_select_option(
+            verified, _ = await _verify_custom_select_option(
                 matched_element=matched_element,  # type: ignore[arg-type]
                 readback_scope_element=readback_scope_element,  # type: ignore[arg-type]
                 anchor_is_combobox_input=False,
                 matched_element_id="choice-radio",
                 matched_label="Choice",
+                use_strict_verification=False,
             )
 
-        assert outcome is True
+        assert verified is True
         script = str(captured["expression"])
         assert "document.querySelectorAll" not in script
         assert "data-selected-option-id" not in script
@@ -1235,15 +1236,16 @@ class TestDeterministicCustomSelect:
                 "evaluate",
                 _stub_evaluate(matched_state=None, committed=False),
             )
-            outcome = await _verify_custom_select_option(
+            verified, _ = await _verify_custom_select_option(
                 matched_element=matched_element,  # type: ignore[arg-type]
                 readback_scope_element=readback_scope_element,  # type: ignore[arg-type]
                 anchor_is_combobox_input=True,
                 matched_element_id="source-wake",
                 matched_label="WAKE",
+                use_strict_verification=False,
             )
 
-        assert outcome is False
+        assert verified is False
 
     @pytest.mark.asyncio
     async def test_handle_select_option_action_does_not_value_fallback_after_deterministic_readback_failure(
@@ -1499,15 +1501,16 @@ class TestDeterministicCustomSelect:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(handler.SkyvernFrame, "evaluate", AsyncMock(side_effect=evaluate))
-            outcome = await _verify_custom_select_option(
+            verified, _ = await _verify_custom_select_option(
                 matched_element=matched_element,  # type: ignore[arg-type]
                 readback_scope_element=readback_scope_element,  # type: ignore[arg-type]
                 anchor_is_combobox_input=False,
                 matched_element_id="matched-option",
                 matched_label="Job Board",
+                use_strict_verification=False,
             )
 
-        assert outcome is False
+        assert verified is False
         script = str(captured["expression"])
         assert script.count('"output"') == 0
         assert script.count("document.querySelectorAll") == 0
@@ -1885,6 +1888,50 @@ class TestCustomSelectMissRespectsOptionality:
         anchor_element.coordinate_click.assert_awaited()
         anchor_element.press_key.assert_any_await("Escape")
         value_fallback.assert_not_awaited()
+
+
+class TestClickCustomSelectMiss:
+    @pytest.mark.asyncio
+    async def test_click_reports_the_sequential_dropdown_miss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        element = _FakeAnchorElement()
+        element.has_attr = AsyncMock(return_value=False)
+        dom = MagicMock()
+        dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
+        page = MagicMock(url="https://example.test/form")
+        page.evaluate = AsyncMock(return_value=False)
+        frame = MagicMock()
+        incremental = MagicMock()
+        incremental.start_listen_dom_increment = AsyncMock()
+        incremental.stop_listen_dom_increment = AsyncMock()
+        miss = NoAvailableOptionFoundForCustomSelection(
+            reason="target not in list", target_value="Choice", observed_options=["Alpha"]
+        )
+
+        monkeypatch.setattr(handler, "DomUtil", MagicMock(return_value=dom))
+        monkeypatch.setattr(handler, "get_or_create_wait_config", AsyncMock(return_value=None))
+        monkeypatch.setattr(handler.asyncio, "sleep", AsyncMock())
+        monkeypatch.setattr(handler, "resolve_engine_selection_for_task", MagicMock(return_value=None))
+        monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
+        monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock(return_value=incremental))
+        monkeypatch.setattr(handler, "chain_click", AsyncMock(return_value=[handler.ActionSuccess()]))
+        monkeypatch.setattr(
+            handler,
+            "handle_sequential_click_with_submit_bypass",
+            AsyncMock(side_effect=miss),
+        )
+
+        results = await handler.handle_click_action(
+            action=handler.ClickAction(element_id="field-control"),
+            page=page,
+            scraped_page=MagicMock(),
+            task=_task(),  # type: ignore[arg-type]
+            step=MagicMock(),
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[-1], handler.ActionFailure)
+        assert results[-1].exception_type == NoAvailableOptionFoundForCustomSelection.__name__
+        assert results[-1].skip_remaining_actions is True
 
 
 class TestSequentialSelectMarksWidgetMutation:

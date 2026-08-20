@@ -5,22 +5,51 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from skyvern.core.script_generations.generate_script import CodeGenResult
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.repositories.scripts import WorkflowScriptUpsertStatus
+from skyvern.forge.sdk.routes import scripts as scripts_routes
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.scripts import (
+    CreateScriptRequest,
     DeployCachedScriptCacheContext,
     DeployCachedScriptRequest,
+    DeployCachedScriptResponse,
+    DeployScriptRequest,
     FileEncoding,
     ScriptFileCreate,
     ScriptStatus,
     WorkflowScript,
 )
-from skyvern.services import cached_script_deploy_service
+from skyvern.services import cached_script_deploy_service, script_service, workflow_script_service
 
 
 def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
+
+def _script_file(path: str, source: str, *, mime_type: str = "text/x-python") -> ScriptFileCreate:
+    return ScriptFileCreate(
+        path=path,
+        content=_b64(source),
+        encoding=FileEncoding.BASE64,
+        mime_type=mime_type,
+    )
+
+
+_REALISTIC_GENERATED_MAIN = """
+import skyvern
+
+@skyvern.workflow(title="t")
+async def run(parameters):
+    page, context = await skyvern.setup(parameters, dict)
+    try:
+        await page.wait_for_load_state()
+    except TimeoutError:
+        pass
+    else:
+        await skyvern.run_task(prompt="...", label="step_a", cache_key="step_a")
+"""
 
 
 def _workflow(
@@ -144,6 +173,18 @@ def _request(
     )
 
 
+async def _deploy_files(files: list[ScriptFileCreate]) -> DeployCachedScriptResponse:
+    return await cached_script_deploy_service.deploy_cached_script(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        request=_request(_REALISTIC_GENERATED_MAIN, dry_run=False, files=files),
+    )
+
+
+def _validate_uploaded_source(source: str) -> dict[str, bytes]:
+    return script_service.validate_uploaded_script_files([_script_file("main.py", source)])
+
+
 @pytest.fixture(autouse=True)
 def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     workflow = _workflow()
@@ -201,15 +242,25 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         async def create_script(self, **kwargs: object) -> SimpleNamespace:
             state.created_scripts.append(kwargs)
             return SimpleNamespace(
-                script_id="s_created",
+                script_id=kwargs.get("script_id", "s_created"),
                 script_revision_id="sr_created",
-                version=1,
+                version=kwargs.get("version", 1),
                 run_id=kwargs.get("run_id"),
+                created_at=datetime.now(timezone.utc),
             )
 
         async def create_script_file(self, **kwargs: object) -> SimpleNamespace:
             state.created_files.append(kwargs)
             return SimpleNamespace(file_id=f"sf_{len(state.created_files)}")
+
+        async def get_latest_script_version(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(script_id="s_existing", script_revision_id="sr_existing", version=1, run_id=None)
+
+        async def get_script_files(self, **_: object) -> list[object]:
+            return []
+
+        async def get_script_blocks_by_script_revision_id(self, **_: object) -> list[object]:
+            return []
 
         async def upsert_script_block(self, **kwargs: object) -> SimpleNamespace:
             state.created_blocks.append(kwargs)
@@ -230,6 +281,13 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
                 workflow_script=workflow_script,
                 previous_workflow_script=state.previous_workflow_script,
             )
+
+        async def get_workflow_script(self, **kwargs: object) -> None:
+            return None
+
+        async def create_workflow_script(self, **kwargs: object) -> SimpleNamespace:
+            state.workflow_script_upserts.append(kwargs)
+            return SimpleNamespace(**kwargs)
 
         async def soft_delete_workflow_script_if_matches(self, **kwargs: object) -> bool:
             state.soft_deleted_workflow_scripts.append(kwargs["workflow_script"])
@@ -265,6 +323,15 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         SimpleNamespace(detect_ats_platform=lambda domain: None),
     )
     return state
+
+
+def _assert_no_persistence_writes(state: SimpleNamespace) -> None:
+    assert state.created_scripts == []
+    assert state.artifacts == []
+    assert state.created_files == []
+    assert state.created_blocks == []
+    assert state.workflow_script_upserts == []
+    assert state.workflow_updates == []
 
 
 @pytest.mark.asyncio
@@ -723,6 +790,564 @@ async def run(parameters):
     assert _stub_app.soft_deleted_script_revisions == ["sr_created"]
 
 
+@pytest.mark.parametrize(
+    ("module_name", "source"),
+    [
+        ("runpy", "import runpy\nrunpy.run_module('helper')\n"),
+        ("pickle", "import pickle\nvalue = pickle.loads(payload)\n"),
+        ("marshal", "import marshal\nvalue = marshal.loads(payload)\n"),
+        ("subprocess", "import subprocess\nsubprocess.Popen(['true'])\n"),
+        ("ctypes", "import ctypes\n"),
+        ("socket", "import socket\n"),
+        ("operator", "import operator\noperator.attrgetter('__class__')\n"),
+        ("multiprocessing", "import multiprocessing\n"),
+        ("importlib", "import importlib\n"),
+        ("zipimport", "import zipimport\nz = zipimport.zipimporter('x.zip')\nz.load_module('payload')\n"),
+        ("imp", "import imp\nimp.load_source('payload', 'payload.dat')\n"),
+        ("pkgutil", "import pkgutil\nloader = pkgutil.get_importer('x.zip')\n"),
+        ("zipfile", "import zipfile\nzipfile.ZipFile('x.zip').extractall('payload')\n"),
+        ("_pickle", "import _pickle\n"),
+        ("_socket", "import _socket\n"),
+        ("_posixsubprocess", "import _posixsubprocess\n"),
+        ("_ctypes", "import _ctypes\n"),
+        ("_multiprocessing", "import _multiprocessing\n"),
+        ("_thread", "import _thread\n"),
+        ("_socket", "from _socket import socket\n"),
+        ("subprocess", "from subprocess import Popen\n"),
+        ("nt", "import nt\n"),
+        ("posix", "import posix\n"),
+        (
+            "logging",
+            "import logging.config\nlogging.config.dictConfig({'version': 1, 'handler': {'()': 'os.system'}})\n",
+        ),
+    ],
+)
+def test_uploaded_python_rejects_module_execution_imports(module_name: str, source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert module_name in str(exc.value.detail)
+
+
+@pytest.mark.parametrize("module_name", ["os", "shutil", "nt", "posix"])
+def test_uploaded_python_rejects_wildcard_imports(module_name: str) -> None:
+    source = f"from {module_name} import *\n"
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "Wildcard imports" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("blocked_name", "source"),
+    [
+        ("eval", "value = eval('1 + 1')\n"),
+        ("exec", "exec('value = 1')\n"),
+        ("__import__", "module = __import__('json')\n"),
+        ("compile", "code = compile('value = 1', '<string>', 'exec')\n"),
+        ("builtins", "import builtins as runtime\nvalue = runtime.eval('1 + 1')\n"),
+        ("getattr", "g = getattr\nvalue = g(object, '__subclasses__')\n"),
+        ("getattr", "dispatch = {'f': getattr}\nvalue = dispatch['f'](object, '__class__')\n"),
+        ("setattr", "setter = setattr\nsetter(object, 'x', 1)\n"),
+        ("delattr", "deleter = delattr\n"),
+        ("vars", "inspect_vars = vars\n"),
+        ("globals", "namespace = globals\n"),
+    ],
+)
+def test_uploaded_python_rejects_dynamic_execution_builtins(blocked_name: str, source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert blocked_name in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("blocked_name", "source"),
+    [
+        (
+            "eval",
+            "locals()['__builtins__']['eval'](\"__import__('os').system('id')\")\n",
+        ),
+        ("locals", "d = locals()\n"),
+        ("eval", "d = {}\nx = d['eval']\n"),
+        ("builtins", "import builtins\nb = builtins\nb.compile('1', '<s>', 'exec')\n"),
+        ("builtins", "import builtins\nb = builtins\nx = b.locals()\n"),
+        ("builtins", "import builtins\n"),
+        ("builtins", "from builtins import compile as c\n"),
+    ],
+    ids=[
+        "locals-chain",
+        "locals-bare",
+        "blocked-subscript-key",
+        "rebound-builtins-compile",
+        "rebound-builtins-locals",
+        "import-builtins",
+        "from-builtins",
+    ],
+)
+def test_uploaded_python_rejects_locals_and_builtins_module_escapes(blocked_name: str, source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert blocked_name in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nvalue = os.getenv('KEY')\nos.makedirs('output', exist_ok=True)\n",
+        "from urllib.parse import urlsplit\nupdated = urlsplit('https://example.com')._replace(scheme='http')\n",
+        "value = '{}'.format(1)\n",
+        "value = '{0} {name}'.format('x', name='y')\n",
+        "value = '{0.name}'.format(obj)\n",
+        "value = '{d[key]}'.format(d=mapping)\n",
+        "__all__ = ['run']\n",
+        "import re\nvalue = re.compile('ok')\n",
+        "value = __file__\n",
+        "if __name__ == '__main__':\n    pass\n",
+        "value = module.__name__\n",
+        "value = module.__all__\n",
+        "value = module.__doc__\n",
+        "value = page.context\n",
+        "value = page.request\n",
+        "from __future__ import annotations\n",
+        "import os.path\n",
+        "import sys\n",
+        "value = '{}-{}'.format(a, b)\n",
+        "template = '{}/{}'\nvalue = template.format(a, b)\n",
+        "class C:\n    def __init__(self):\n        self._value = 1\n\n    def get(self):\n        return self._value\n",
+        "class C(Base):\n    def __init__(self):\n        super().__init__()\n",
+    ],
+)
+def test_uploaded_python_accepts_deployed_python_apis(source: str) -> None:
+    assert _validate_uploaded_source(source) == {"main.py": source.encode("utf-8")}
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "import os\nos.system('true')\n",
+        "import os\nos.popen('true')\n",
+        "import os\nos.posix_spawn('/bin/true', ['/bin/true'], {})\n",
+        "import os\nos.posix_spawnp('true', ['true'], {})\n",
+        "import os\nos.spawnv(os.P_WAIT, '/bin/true', ['/bin/true'])\n",
+        "import os\nos.spawnve(os.P_WAIT, '/bin/true', ['/bin/true'], {})\n",
+        "import os\nos.spawnvp(os.P_WAIT, 'true', ['true'])\n",
+        "import os\nos.spawnvpe(os.P_WAIT, 'true', ['true'], {})\n",
+        "import os\nos.forkpty()\n",
+        "import os\nos.execle('/bin/true', 'true', {})\n",
+        "leak = ().__class__\n",
+        "leak = f.__globals__\n",
+        "leak = ().__class__.__subclasses__()\n",
+        "from builtins import __dict__ as namespace\nleak = namespace['eval']\n",
+        "import asyncio\nasyncio.get_event_loop().subprocess_shell(proto, 'id')\n",
+        "import asyncio\nasyncio.get_event_loop().subprocess_exec(proto, 'id')\n",
+        ("import typing\nclass C:\n    value: \"__import__('os').system('id')\"\ntyping.get_type_hints(C)\n"),
+        (
+            "import typing_extensions\nclass C:\n"
+            "    value: \"__import__('os').system('id')\"\n"
+            "typing_extensions.get_type_hints(C)\n"
+        ),
+        (
+            "import os\nfrom string import Formatter\nclass C: pass\n"
+            'run = Formatter().get_field("0.__init__.__globals__[os].system", (C(),), {})[0]\n'
+            "run('id')\n"
+        ),
+        "class C:\n    def leak(self):\n        return self.__class__\n",
+        "class C(Base):\n    def leak(self):\n        return super().__class__\n",
+    ],
+)
+def test_uploaded_python_rejects_execution_and_escape_attributes(snippet: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(snippet)
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class C: pass\nvalue = '{0.__init__.__globals__[__builtins__]}'.format(C())\n",
+        "class C: pass\nvalue = str.format('{0.__init__.__globals__[__builtins__]}', C())\n",
+        "class C: pass\ntemplate = '{0.__init__.__globals__[__builtins__]}'\nvalue = template.format(C())\n",
+        ("class C: pass\ntemplate = '{0.__init__' + '.__globals__[__builtins__]}'\nvalue = template.format(C())\n"),
+        "value = '{item[__class__]}'.format(item={})\n",
+        "value = '{0:{1.__class__}}'.format('x', object())\n",
+    ],
+)
+def test_uploaded_python_rejects_constant_format_field_traversal(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "format field" in str(exc.value.detail)
+
+
+def test_uploaded_python_rejects_runtime_format_string() -> None:
+    source = "def render(template, value):\n    return template.format(value)\n"
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "statically resolvable" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__reduce__",
+        "__reduce_ex__",
+        "__dict__",
+        "__class__",
+        "__init_subclass__",
+    ],
+)
+def test_uploaded_python_rejects_reflection_dunders_on_a_rebound_self(attribute: str) -> None:
+    # ``self`` is an ordinary identifier: a module-level script can bind it to any object, so the
+    # self/super carve-out is a name match and must not extend to reflection dunders.
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(f'self = ""\nvalue = self.{attribute}\n')
+
+    assert exc.value.status_code == 400
+
+
+def test_uploaded_python_rejects_the_rebound_self_subclasses_chain() -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(
+            'self = ""\n'
+            'self = self.__getattribute__("__class__")\n'
+            'self = self.__getattribute__("__base__")\n'
+            'self = self.__getattribute__("__subclasses__")\n'
+            "self = self()\n"
+            "value = len(self)\n"
+        )
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class A:\n    def f(self):\n        return self._value\n",
+        "class A:\n    def f(self):\n        return self._helper()\n",
+        "class A(B):\n    def __init__(self):\n        super().__init__()\n",
+        "class A(B):\n    def __enter__(self):\n        return super().__enter__()\n",
+    ],
+)
+def test_uploaded_python_still_allows_ordinary_self_and_super_use(source: str) -> None:
+    _validate_uploaded_source(source)
+
+
+def test_uploaded_python_rejects_formatter_vformat() -> None:
+    source = "import string\nvalue = string.Formatter().vformat('{0.__globals__[__builtins__]}', [fn], {})\n"
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "vformat" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        ("class C: pass\nmethod = '{0.__init__.__globals__[__builtins__]}'.format\nvalue = method(C())\n"),
+        ("class C: pass\nmethod = str.format\nvalue = method('{0.__init__.__globals__[__builtins__]}', C())\n"),
+    ],
+)
+def test_uploaded_python_rejects_format_callable_alias(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "called directly" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize("file_path", ["main.PY", "main.Py", "helper.PY"])
+def test_uploaded_python_rejects_unsafe_uppercase_extension(file_path: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        script_service.validate_uploaded_script_files([_script_file(file_path, "import os\nos.system('id')\n")])
+
+    assert exc.value.status_code == 400
+    assert "system" in str(exc.value.detail)
+
+
+def test_uploaded_python_rejects_unparseable_file() -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source("def broken(:\n    pass\n")
+
+    assert exc.value.status_code == 400
+    assert "main.py" in str(exc.value.detail)
+
+
+def test_uploaded_python_rejects_parser_stack_overflow() -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source("+" * 200_000 + "1")
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Python file 'main.py' does not parse"
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, RecursionError])
+def test_uploaded_python_handles_parser_resource_errors(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
+) -> None:
+    def raise_parser_error(*_: object, **__: object) -> None:
+        raise error_type
+
+    monkeypatch.setattr(script_service, "is_safe_script_code", raise_parser_error)
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source("value = 1\n")
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Python file 'main.py' does not parse"
+
+
+@pytest.mark.asyncio
+async def test_build_file_tree_validates_when_decoded_bytes_are_omitted(_stub_app: SimpleNamespace) -> None:
+    files = [_script_file("main.py", "import os\nos.system('id')\n")]
+
+    with pytest.raises(HTTPException) as exc:
+        await script_service.build_file_tree(
+            files=files,
+            organization_id="org_test",
+            script_id="s_test",
+            script_version=1,
+            script_revision_id="sr_test",
+        )
+
+    assert exc.value.status_code == 400
+    _assert_no_persistence_writes(_stub_app)
+
+
+@pytest.mark.asyncio
+async def test_generated_script_persists_unparseable_main_for_repair(
+    monkeypatch: pytest.MonkeyPatch, _stub_app: SimpleNamespace
+) -> None:
+    source = "async def broken(:\n    pass\n"
+
+    async def transform_workflow_run_to_code_gen_input(**_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            file_name="main.py",
+            workflow_run={},
+            workflow={},
+            workflow_blocks=[{"label": "step_a"}],
+            actions_by_task={},
+            task_v2_child_blocks={},
+        )
+
+    async def generate_workflow_script_python_code(**_: object) -> CodeGenResult:
+        return CodeGenResult(source_code=source, blocks_created=1, blocks_failed=0)
+
+    async def skip_mint_audit(**_: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        workflow_script_service,
+        "transform_workflow_run_to_code_gen_input",
+        transform_workflow_run_to_code_gen_input,
+    )
+    monkeypatch.setattr(
+        workflow_script_service,
+        "generate_workflow_script_python_code",
+        generate_workflow_script_python_code,
+    )
+    monkeypatch.setattr(workflow_script_service, "is_adaptive_caching", lambda *_: False)
+    monkeypatch.setattr(workflow_script_service, "_log_mint_audit_findings", skip_mint_audit)
+
+    await workflow_script_service.generate_workflow_script(
+        workflow_run=SimpleNamespace(workflow_run_id="wr_test"),
+        workflow=SimpleNamespace(
+            workflow_id="wf_test",
+            workflow_permanent_id="wpid_test",
+            organization_id="org_test",
+            title="test",
+            cache_key="default",
+        ),
+        script=SimpleNamespace(script_id="s_test", script_revision_id="sr_test", version=1),
+        rendered_cache_key_value="default:test",
+    )
+
+    assert _stub_app.artifacts[0]["data"] == source.encode("utf-8")
+    assert _stub_app.created_files[0]["file_path"] == "main.py"
+
+
+@pytest.mark.asyncio
+async def test_generated_script_tolerance_still_rejects_parseable_policy_violation(
+    _stub_app: SimpleNamespace,
+) -> None:
+    files = [_script_file("main.py", "import os\nos.system('command')\n")]
+
+    with pytest.raises(HTTPException) as exc:
+        await script_service.build_file_tree(
+            files=files,
+            organization_id="org_test",
+            script_id="s_test",
+            script_version=1,
+            script_revision_id="sr_test",
+            allow_invalid_python_syntax=True,
+        )
+
+    assert exc.value.status_code == 400
+    _assert_no_persistence_writes(_stub_app)
+
+
+@pytest.mark.parametrize("file_path", ["data.pkl", "data.pickle"])
+def test_uploaded_python_rejects_pickle_file_with_pandas_loader(file_path: str) -> None:
+    files = [
+        _script_file("main.py", f"import pandas\nvalue = pandas.read_pickle('{file_path}')\n"),
+        _script_file(file_path, "serialized payload", mime_type="application/octet-stream"),
+    ]
+
+    with pytest.raises(HTTPException) as exc:
+        script_service.validate_uploaded_script_files(files)
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import pandas\nvalue = pandas.read_pickle('data.bin')\n",
+        "from pandas import read_pickle\nvalue = read_pickle('data.bin')\n",
+        "import numpy as np\nvalue = np.load('data.npy', allow_pickle=True)\n",
+        "from numpy import load\nvalue = load('data.npy', None, True)\n",
+        "import numpy as np\noptions = {}\nvalue = np.load('data.npy', **options)\n",
+        "import numpy as np\n(loader,) = (np.load,)\nvalue = loader('data.npy', allow_pickle=True)\n",
+        "import numpy as np\nloader = [np.load][0]\nvalue = loader('data.npy', allow_pickle=True)\n",
+        ("import numpy as np\ndef run(loader=np.load):\n    return loader('data.npy', allow_pickle=True)\n"),
+    ],
+)
+def test_uploaded_python_rejects_pickle_backed_dependency_loaders(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import numpy as np\nvalue = np.load('data.npy')\n",
+        "import numpy as np\nvalue = np.load('data.npy', allow_pickle=False)\n",
+    ],
+)
+def test_uploaded_python_allows_numpy_load_without_pickle(source: str) -> None:
+    _validate_uploaded_source(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import yaml\nvalue = yaml.unsafe_load(payload)\n",
+        "from yaml import unsafe_load as load\nvalue = load(payload)\n",
+        "import yaml\nvalue = yaml.load(payload, Loader=yaml.UnsafeLoader)\n",
+        "import yaml\nvalue = yaml.load(payload, yaml.UnsafeLoader)\n",
+        "import yaml\nvalue = yaml.load(payload, Loader=loader_type)\n",
+        "import yaml\noptions = {'Loader': yaml.SafeLoader}\nvalue = yaml.load(payload, **options)\n",
+        "import yaml\nload = yaml.load\nvalue = load(payload, Loader=yaml.UnsafeLoader)\n",
+        "import yaml\nvalue = yaml.unsafe_load_all(payload)\n",
+        "import yaml\nvalue = yaml.load_all(payload, Loader=yaml.Loader)\n",
+        "import yaml\nvalue = yaml.load_all(payload)\n",
+        "import yaml\nvalue = yaml.load_all(payload, yaml.CLoader)\n",
+        "from yaml import unsafe_load_all as load_stream\nvalue = load_stream(payload)\n",
+    ],
+)
+def test_uploaded_python_rejects_unsafe_yaml_loaders(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "YAML" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import yaml\nvalue = yaml.safe_load(payload)\n",
+        "import yaml\nvalue = yaml.load(payload, Loader=yaml.SafeLoader)\n",
+        "import yaml\nvalue = yaml.load(payload, yaml.SafeLoader)\n",
+        "from yaml import SafeLoader, load\nvalue = load(payload, Loader=SafeLoader)\n",
+        "import yaml\nvalue = yaml.safe_load_all(payload)\n",
+        "import yaml\nvalue = yaml.full_load_all(payload)\n",
+        "import yaml\nvalue = yaml.load_all(payload, Loader=yaml.SafeLoader)\n",
+    ],
+)
+def test_uploaded_python_allows_safe_yaml_loaders(source: str) -> None:
+    _validate_uploaded_source(source)
+
+
+@pytest.mark.asyncio
+async def test_create_script_route_rejects_eval_upload(_stub_app: SimpleNamespace) -> None:
+    request = CreateScriptRequest(files=[_script_file("main.py", "value = eval('1 + 1')\n")])
+
+    with pytest.raises(HTTPException) as exc:
+        await scripts_routes.create_script(request, SimpleNamespace(organization_id="org_test"))
+
+    assert exc.value.status_code == 400
+    _assert_no_persistence_writes(_stub_app)
+
+
+@pytest.mark.asyncio
+async def test_deploy_script_route_rejects_eval_upload(_stub_app: SimpleNamespace) -> None:
+    request = DeployScriptRequest(files=[_script_file("main.py", "value = eval('1 + 1')\n")])
+
+    with pytest.raises(HTTPException) as exc:
+        await scripts_routes.deploy_script(request, "s_existing", SimpleNamespace(organization_id="org_test"))
+
+    assert exc.value.status_code == 400
+    _assert_no_persistence_writes(_stub_app)
+
+
+@pytest.mark.asyncio
+async def test_commit_mode_accepts_blocked_names_as_parameter_field_declarations(
+    _stub_app: SimpleNamespace,
+) -> None:
+    source = (
+        """from pydantic import BaseModel
+
+
+class WorkflowParameters(BaseModel):
+    format: str
+    system: str
+    os: str
+    stdout: str
+"""
+        + _REALISTIC_GENERATED_MAIN
+    )
+
+    response = await _deploy_files([_script_file("main.py", source)])
+
+    assert response.script_was_created is True
+    assert _stub_app.created_files[0]["file_path"] == "main.py"
+
+
+@pytest.mark.asyncio
+async def test_commit_mode_leaves_non_python_files_unaffected(_stub_app: SimpleNamespace) -> None:
+    non_python_content = "import os\nexec('value = 1')\ndef broken(\n"
+    files = [
+        _script_file("main.py", _REALISTIC_GENERATED_MAIN),
+        _script_file("notes.txt", non_python_content, mime_type="text/plain"),
+    ]
+
+    response = await _deploy_files(files)
+
+    assert response.script_was_created is True
+    assert [file["file_path"] for file in _stub_app.created_files] == ["main.py", "notes.txt"]
+    assert _stub_app.artifacts[1]["data"] == non_python_content.encode("utf-8")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "file_path",
@@ -841,7 +1466,7 @@ async def run(parameters):
 
 @pytest.mark.asyncio
 async def test_dry_run_rejects_oversized_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cached_script_deploy_service, "_MAX_SCRIPT_FILE_BYTES", 4)
+    monkeypatch.setattr(script_service, "_MAX_SCRIPT_FILE_BYTES", 4)
     source = """
 import skyvern
 
@@ -1009,3 +1634,49 @@ async def run(parameters):
 
     assert exc.value.status_code == 409
     assert "became stale" in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import logging.config\n",
+        "from logging.config import dictConfig\ndictConfig({'version': 1})\n",
+        "from logging import config\nconfig.dictConfig({'version': 1})\n",
+        "import logging.config as c\nc.dictConfig({'version': 1})\n",
+        "import logging\nlogging.config.dictConfig({'version': 1})\n",
+        "import logging\nlogging.config.fileConfig('logging.ini')\n",
+        "import logging\nlogging.config.BaseConfigurator({}).resolve('os.system')\n",
+        "import logging\nlogging.config.BaseConfigurator({}).convert('ext://os.system')\n",
+        "import logging\nlogging.config.dictConfigClass({}).configure()\n",
+        "import logging\nlogging.config.listen(9999)\n",
+    ],
+    ids=[
+        "import-submodule",
+        "from-submodule",
+        "from-parent",
+        "aliased",
+        "dict-config",
+        "file-config",
+        "base-configurator-resolve",
+        "base-configurator-convert",
+        "dict-config-class",
+        "listen",
+    ],
+)
+def test_uploaded_python_rejects_logging_config_callable_resolution(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import logging\nlog = logging.getLogger(__name__)\nlog.info('ready')\n",
+        "from logging import getLogger\nlog = getLogger('run')\n",
+    ],
+    ids=["module", "from-import"],
+)
+def test_uploaded_python_allows_ordinary_logging(source: str) -> None:
+    _validate_uploaded_source(source)

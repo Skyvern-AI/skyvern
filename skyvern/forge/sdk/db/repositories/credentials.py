@@ -203,6 +203,8 @@ class CredentialRepository(BaseRepository):
         tested_url: str | None = None,
         user_context: str | None = None,
         save_browser_session_intent: bool | None = None,
+        auto_profile_disabled: bool | None = None,
+        run_sequentially: bool | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         proxy_session_id: str | None | object = _UNSET,
         rotate_proxy_session_id: bool = False,
@@ -232,6 +234,10 @@ class CredentialRepository(BaseRepository):
                 credential.user_context = user_context
             if save_browser_session_intent is not None:
                 credential.save_browser_session_intent = save_browser_session_intent
+            if auto_profile_disabled is not None:
+                credential.auto_profile_disabled = auto_profile_disabled
+            if run_sequentially is not None:
+                credential.run_sequentially = run_sequentially
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,

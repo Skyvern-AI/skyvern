@@ -3193,6 +3193,7 @@ class RawSkyvern:
     def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -3207,8 +3208,11 @@ class RawSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -3274,6 +3278,7 @@ class RawSkyvern:
             "v1/browser_sessions",
             method="POST",
             json={
+                "url": url,
                 "timeout": timeout,
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
@@ -3621,7 +3626,7 @@ class RawSkyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -8793,6 +8798,7 @@ class AsyncRawSkyvern:
     async def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -8807,8 +8813,11 @@ class AsyncRawSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -8874,6 +8883,7 @@ class AsyncRawSkyvern:
             "v1/browser_sessions",
             method="POST",
             json={
+                "url": url,
                 "timeout": timeout,
                 "proxy_location": convert_and_respect_annotation_metadata(
                     object_=proxy_location, annotation=CreateBrowserSessionRequestProxyLocation, direction="write"
@@ -9221,7 +9231,7 @@ class AsyncRawSkyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.

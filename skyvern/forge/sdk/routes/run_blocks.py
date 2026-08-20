@@ -8,6 +8,7 @@ from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.routes.code_samples import (
     DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
     DOWNLOAD_FILES_CODE_SAMPLE_TS,
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
 from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.run_blocks import BaseRunBlockRequest, CredentialType, DownloadFilesRequest, LoginRequest
@@ -63,6 +65,7 @@ async def _run_workflow_and_build_response(
     webhook_url: str | None,
     totp_verification_url: str | None,
     totp_identifier: str | None,
+    caller_type: CallerType,
     x_api_key: str | None,
     x_user_agent: str | None = None,
 ) -> WorkflowRunResponse:
@@ -97,6 +100,15 @@ async def _run_workflow_and_build_response(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    # Every API-key-created run counts toward first_api_run; the user agent only
+    # selects the workflow trigger type and must not override resolved auth.
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=organization.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller_type,
+    )
 
     return WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
@@ -152,10 +164,16 @@ async def login(
     request: Request,
     background_tasks: BackgroundTasks,
     login_request: LoginRequest,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    organization = caller.organization
+    await PermissionCheckerFactory.get_instance().check(
+        organization, browser_session_id=login_request.browser_session_id
+    )
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
+
     url = _validate_url(login_request.url)
     totp_verification_url = _validate_url(login_request.totp_url)
     webhook_url = _validate_url(login_request.webhook_url)
@@ -289,6 +307,7 @@ async def login(
         totp_identifier=resolved_totp_identifier,
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
+        caller_type=caller.caller_type,
     )
 
 
@@ -316,10 +335,16 @@ async def download_files(
     request: Request,
     background_tasks: BackgroundTasks,
     download_files_request: DownloadFilesRequest,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    organization = caller.organization
+    await PermissionCheckerFactory.get_instance().check(
+        organization, browser_session_id=download_files_request.browser_session_id
+    )
+    await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
+
     url = _validate_url(download_files_request.url)
     totp_verification_url = _validate_url(download_files_request.totp_url)
     webhook_url = _validate_url(download_files_request.webhook_url)
@@ -382,4 +407,5 @@ async def download_files(
         totp_identifier=download_files_request.totp_identifier,
         x_api_key=x_api_key,
         x_user_agent=x_user_agent,
+        caller_type=caller.caller_type,
     )

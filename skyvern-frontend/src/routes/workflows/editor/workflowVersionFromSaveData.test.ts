@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { parse } from "yaml";
 
 import { ProxyLocation } from "@/api/types";
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
@@ -10,6 +11,7 @@ import type {
 import {
   preservedFinallyBlockLabel,
   workflowVersionFromSaveData,
+  yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 
 const definition: WorkflowDefinition = {
@@ -24,6 +26,7 @@ function makeSaveData(
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: "https://example.test/hook",
     persistBrowserSession: true,
+    reuseBrowserSession: true,
     browserProfileId: "bp_1",
     browserProfileKey: "key_1",
     model: null,
@@ -35,6 +38,7 @@ function makeSaveData(
     codeVersion: null,
     scriptCacheKey: "cache_1",
     aiFallback: true,
+    maskSecrets: true,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
@@ -92,8 +96,10 @@ describe("workflowVersionFromSaveData", () => {
     });
     expect(version.proxy_location).toBe(ProxyLocation.Residential);
     expect(version.persist_browser_session).toBe(true);
+    expect(version.reuse_browser_session).toBe(true);
     expect(version.browser_profile_id).toBe("bp_1");
     expect(version.cache_key).toBe("cache_1");
+    expect(version.mask_secrets).toBe(true);
     expect(version.extra_http_headers).toEqual({ a: "b" });
     expect(version.adaptive_caching).toBe(true);
   });
@@ -134,5 +140,92 @@ describe("preservedFinallyBlockLabel", () => {
     expect(preservedFinallyBlockLabel(null, ["step_1"])).toBe(null);
     expect(preservedFinallyBlockLabel(undefined, ["step_1"])).toBe(null);
     expect(preservedFinallyBlockLabel("", ["step_1"])).toBe(null);
+  });
+});
+
+describe("yamlCommitInputs", () => {
+  test("unwraps a full export and preserves its parameters", () => {
+    const nested = {
+      version: 2,
+      parameters: [
+        {
+          key: "target_url",
+          parameter_type: "workflow",
+          workflow_parameter_type: "string",
+        },
+      ],
+      blocks: [
+        {
+          label: "open_target",
+          block_type: "goto_url",
+          url: "https://example.test/",
+        },
+      ],
+    };
+    const fullExport = {
+      title: "wf",
+      proxy_location: "RESIDENTIAL",
+      workflow_definition: nested,
+      run_sequentially: false,
+    };
+    const draft = "title: wf\nworkflow_definition:\n  parameters: []\n";
+
+    const { definition, definitionYaml } = yamlCommitInputs(
+      fullExport as unknown as typeof nested,
+      draft,
+    );
+    expect(definition).toBe(nested);
+    expect(definition.parameters).toHaveLength(1);
+    expect(definition.parameters[0]?.key).toBe("target_url");
+    expect(definitionYaml).not.toBe(draft);
+    const roundTrip = parse(definitionYaml);
+    expect(roundTrip.blocks).toEqual(nested.blocks);
+    expect(roundTrip.parameters).toEqual(nested.parameters);
+    expect(roundTrip.title).toBeUndefined();
+  });
+
+  test("returns a definition-only draft byte-exact", () => {
+    const draft =
+      "parameters: []\nblocks:\n  # user's comment\n  - label: a\n    block_type: goto_url\n";
+    const parsed = parse(draft);
+
+    const { definition, definitionYaml } = yamlCommitInputs(parsed, draft);
+    expect(definition).toBe(parsed);
+    expect(definitionYaml).toBe(draft);
+  });
+
+  test("keeps raw text for a NaN draft", () => {
+    expect(yamlCommitInputs(NaN, ".nan # keep").definitionYaml).toBe(
+      ".nan # keep",
+    );
+  });
+
+  test("prefers top-level blocks when both shapes are present", () => {
+    const input = {
+      blocks: [{ label: "a", block_type: "goto_url" }],
+      workflow_definition: { parameters: [], blocks: [] },
+    };
+    const draft = "blocks: []\nworkflow_definition:\n  blocks: []\n";
+
+    const { definition, definitionYaml } = yamlCommitInputs(input, draft);
+    expect(definition).toBe(input);
+    expect(definitionYaml).toBe(draft);
+  });
+
+  test("leaves malformed and non-object shapes alone", () => {
+    const draft = "workflow_definition: invalid\n";
+    const inputs = [
+      { workflow_definition: "invalid" },
+      { workflow_definition: [] },
+      [],
+      null,
+      undefined,
+    ];
+
+    for (const input of inputs) {
+      const { definition, definitionYaml } = yamlCommitInputs(input, draft);
+      expect(definition).toBe(input);
+      expect(definitionYaml).toBe(draft);
+    }
   });
 });

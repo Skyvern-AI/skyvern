@@ -100,6 +100,7 @@ function WorkflowEditor() {
 
   const settings: WorkflowSettings = {
     persistBrowserSession: workflow.persist_browser_session,
+    reuseBrowserSession: workflow.reuse_browser_session ?? false,
     pinSavedSessionIp: workflow.pin_saved_session_ip ?? false,
     browserProfileId: workflow.browser_profile_id ?? null,
     browserProfileKey: workflow.browser_profile_key ?? null,
@@ -119,6 +120,7 @@ function WorkflowEditor() {
     scriptCacheKey: workflow.cache_key,
     aiFallback: workflow.ai_fallback ?? true,
     enableSelfHealing: workflow.enable_self_healing ?? false,
+    maskSecrets: workflow.mask_secrets ?? false,
     runSequentially: workflow.run_sequentially ?? false,
     sequentialKey: workflow.sequential_key ?? null,
     finallyBlockLabel:

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import exists, func, or_, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
+from skyvern.constants import DEFAULT_SCRIPT_RUN_ID, DEFAULT_WORKFLOW_TITLES
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, declare_policy
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
@@ -43,10 +48,19 @@ from skyvern.forge.sdk.workflow.browser_action_policy_enrollment import (
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.runtime_completion import carried_contract, with_contract
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
+
 LOG = structlog.get_logger()
+WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS = 10
+
+
+class WorkflowCreationLockTimeout(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -94,6 +108,63 @@ def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> N
 class WorkflowsRepository(BaseRepository):
     """Database operations for workflow management."""
 
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        db_engine: AsyncEngine | None = None,
+        sqlite_workflow_creation_lock: asyncio.Lock | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._db_engine = db_engine
+        self._sqlite_workflow_creation_lock = sqlite_workflow_creation_lock
+
+    @asynccontextmanager
+    async def acquire_workflow_creation_lock(self, lock_key: str) -> AsyncIterator[None]:
+        if self._sqlite_workflow_creation_lock is None and self._db_engine is None:
+            raise RuntimeError("Workflow creation locking requires a database engine")
+
+        async with AsyncExitStack() as stack:
+            lock_timeout = asyncio.timeout(WORKFLOW_CREATION_LOCK_TIMEOUT_SECONDS)
+            try:
+                async with lock_timeout:
+                    if self._sqlite_workflow_creation_lock is not None:
+                        await stack.enter_async_context(self._sqlite_workflow_creation_lock)
+                    await stack.enter_async_context(
+                        self._workflow_creation_transaction(
+                            None if self._sqlite_workflow_creation_lock is not None else lock_key
+                        )
+                    )
+            except TimeoutError as exc:
+                if lock_timeout.expired():
+                    raise WorkflowCreationLockTimeout from exc
+                raise
+            yield
+
+    @asynccontextmanager
+    async def _workflow_creation_transaction(self, lock_key: str | None = None) -> AsyncIterator[None]:
+        if self._db_engine is None:
+            raise RuntimeError("Workflow creation locking requires a database engine")
+        if lock_key is not None:
+            while True:
+                async with self._db_engine.connect() as connection:
+                    async with connection.begin():
+                        acquired = await connection.scalar(
+                            text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                            {"key": lock_key},
+                        )
+                        if acquired:
+                            async with self.Session.bind_connection(connection):
+                                yield
+                            return
+                # ponytail: Polling frees the SQL pool; use a lock service if this key becomes hot.
+                await asyncio.sleep(0.1)
+        async with self._db_engine.connect() as connection:
+            async with connection.begin():
+                async with self.Session.bind_connection(connection):
+                    yield
+
     async def _policy_of_latest_version(
         self, session: Any, workflow_permanent_id: str, organization_id: str | None
     ) -> object | None:
@@ -114,6 +185,44 @@ class WorkflowsRepository(BaseRepository):
             query = query.filter_by(organization_id=organization_id)
         return carried_policy(await session.scalar(query))
 
+    @db_operation("rename_workflow_if_still_default")
+    async def rename_workflow_if_still_default(
+        self,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        title: str,
+    ) -> bool:
+        """Name a workflow only while it is still unnamed, atomically; returns whether it renamed.
+
+        Deliberately does not stamp ``created_by``/``edited_by`` — naming is not authorship, and
+        ``is_workflow_copilot_authored`` treats any copilot stamp as permanent lineage.
+        """
+        newer_version_exists = (
+            select(WorkflowModel.workflow_id)
+            .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
+            .filter(WorkflowModel.workflow_id != workflow_id)
+            .filter(WorkflowModel.deleted_at.is_(None))
+            .filter(
+                WorkflowModel.version
+                > select(WorkflowModel.version).filter_by(workflow_id=workflow_id).scalar_subquery()
+            )
+        )
+        rename_query = (
+            update(WorkflowModel)
+            .where(WorkflowModel.workflow_id == workflow_id)
+            .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+            .where(WorkflowModel.organization_id == organization_id)
+            .where(WorkflowModel.deleted_at.is_(None))
+            .where(WorkflowModel.title.in_(DEFAULT_WORKFLOW_TITLES))
+            .where(~exists(newer_version_exists))
+            .values(title=title)
+        )
+        async with self.Session() as session:
+            result = await session.execute(rename_query)
+            await session.commit()
+            return bool(result.rowcount)
+
     @db_operation("create_workflow")
     async def create_workflow(
         self,
@@ -130,6 +239,8 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        reuse_browser_session: bool = False,
+        mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
         browser_profile_key: str | None = None,
@@ -150,13 +261,14 @@ class WorkflowsRepository(BaseRepository):
         folder_id: str | None = None,
         created_by: str | None = None,
         edited_by: str | None = None,
+        workflow_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             # Policy is never taken from the caller's definition: a new version inherits exactly what
             # the previous one stored, so no save path can add, widen or clear an enrollment.
             carried = (
                 await self._policy_of_latest_version(session, workflow_permanent_id, organization_id)
-                if workflow_permanent_id
+                if workflow_permanent_id and version != 1
                 else None
             )
             workflow = WorkflowModel(
@@ -173,6 +285,8 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                reuse_browser_session=reuse_browser_session,
+                mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
                 browser_profile_key=browser_profile_key,
@@ -194,6 +308,8 @@ class WorkflowsRepository(BaseRepository):
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
+            if workflow_id:
+                workflow.workflow_id = workflow_id
             if version:
                 workflow.version = version
             session.add(workflow)
@@ -287,8 +403,8 @@ class WorkflowsRepository(BaseRepository):
     @db_operation("is_workflow_copilot_authored")
     async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
         """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
-        durable signal: user saves re-stamp created_by/edited_by, while copilot back-stamps v1 on
-        copilot-born workflows. Deleted versions still count — provenance is historical."""
+        durable signal: user saves re-stamp created_by/edited_by. Deleted versions still count —
+        provenance is historical."""
         copilot_version_exists = (
             select(WorkflowModel.workflow_id)
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
@@ -780,6 +896,8 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        reuse_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -833,6 +951,10 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if reuse_browser_session is not None:
+                    workflow.reuse_browser_session = reuse_browser_session
+                if mask_secrets is not None:
+                    workflow.mask_secrets = mask_secrets
                 if pin_saved_session_ip is not None:
                     workflow.pin_saved_session_ip = pin_saved_session_ip
                 if browser_profile_id is not _UNSET:
@@ -1101,6 +1223,8 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        reuse_browser_session: bool | None = None,
+        mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         browser_profile_key: str | None | object = _UNSET,
@@ -1116,6 +1240,7 @@ class WorkflowsRepository(BaseRepository):
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
         edited_by: str | None | object = _UNSET,
+        preserve_completion_contract: bool = True,
     ) -> Workflow:
         """One-session, one-commit update of the workflow row + definition-parameter rows.
 
@@ -1165,8 +1290,15 @@ class WorkflowsRepository(BaseRepository):
                 # not depend on caller-side object identity between the
                 # top-level parameters list and each block's field.
                 _align_block_output_parameters(workflow_definition)
+                definition_json = workflow_definition.model_dump(mode="json")
+                if preserve_completion_contract:
+                    definition_json = with_contract(definition_json, carried_contract(workflow.workflow_definition))
+                elif definition_json.get("completion_contract") is None:
+                    # An exact Copilot-owned deletion is authoritative. Ordinary rebuilds keep the
+                    # default above because their models omit this field without intending a clear.
+                    definition_json.pop("completion_contract", None)
                 workflow.workflow_definition = with_policy(
-                    workflow_definition.model_dump(mode="json"), carried_policy(workflow.workflow_definition)
+                    definition_json, carried_policy(workflow.workflow_definition)
                 )
             if version is not None:
                 workflow.version = version
@@ -1190,6 +1322,10 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if reuse_browser_session is not None:
+                workflow.reuse_browser_session = reuse_browser_session
+            if mask_secrets is not None:
+                workflow.mask_secrets = mask_secrets
             if pin_saved_session_ip is not None:
                 workflow.pin_saved_session_ip = pin_saved_session_ip
             if browser_profile_id is not _UNSET:

@@ -1,8 +1,11 @@
-"""Tests for skipping block description LLM calls on for-loop iterations.
+"""Tests for skipping block description LLM calls on for-loop iterations,
+and for the content-hash cache that skips regeneration across runs.
 
 Validates that execute_safe only dispatches description generation when
 current_index is None (not in a loop) or 0 (first iteration), and skips
-it for current_index > 0 (subsequent iterations).
+it for current_index > 0 (subsequent iterations). Also validates that
+_generate_workflow_run_block_description serves identical block configs
+from app.CACHE instead of re-calling the LLM every run.
 """
 
 from datetime import UTC, datetime
@@ -10,7 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.workflow.models.block import Block, TaskBlock
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 
@@ -65,7 +69,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -81,7 +85,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -97,12 +101,31 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
 
             await block.execute_safe(workflow_run_id="wr_1", current_index=5)
+
+            mock_gen_desc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_description_in_script_mode(self) -> None:
+        block = _make_block()
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch(
+                "skyvern.forge.sdk.workflow.models.block.skyvern_context.current",
+                return_value=SkyvernContext(script_mode=True),
+            ),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
+        ):
+            _setup_mocks(mock_app)
+
+            await block.execute_safe(workflow_run_id="wr_1")
 
             mock_gen_desc.assert_not_called()
 
@@ -113,7 +136,7 @@ class TestDescriptionSkippedOnLoopIterations:
 
         with (
             patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
-            patch.object(Block, "execute", new_callable=AsyncMock, return_value=_block_result()),
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, return_value=_block_result()),
             patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock) as mock_gen_desc,
         ):
             _setup_mocks(mock_app)
@@ -122,3 +145,71 @@ class TestDescriptionSkippedOnLoopIterations:
                 await block.execute_safe(workflow_run_id="wr_1", current_index=i)
 
             assert mock_gen_desc.call_count == 1
+
+
+class TestDescriptionContentHashCache:
+    def _patch_app(self, mock_app: MagicMock, cached: object = None, cache_error: bool = False) -> AsyncMock:
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        if cache_error:
+            mock_app.CACHE.get = AsyncMock(side_effect=RuntimeError("redis down"))
+            mock_app.CACHE.set = AsyncMock(side_effect=RuntimeError("redis down"))
+        else:
+            mock_app.CACHE.get = AsyncMock(return_value=cached)
+            mock_app.CACHE.set = AsyncMock()
+        llm = AsyncMock(return_value={"summary": "fresh summary"})
+        mock_app.SECONDARY_LLM_API_HANDLER = llm
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_skips_llm_call(self) -> None:
+        block = _make_block()
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            llm = self._patch_app(mock_app, cached="cached summary")
+
+            await block._generate_workflow_run_block_description("wrb_1", "org_1")
+
+            llm.assert_not_called()
+            mock_app.DATABASE.observer.update_workflow_run_block.assert_awaited_once()
+            assert (
+                mock_app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["description"]
+                == "cached summary"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_generates_and_stores(self) -> None:
+        block = _make_block()
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            llm = self._patch_app(mock_app, cached=None)
+
+            await block._generate_workflow_run_block_description("wrb_1", "org_1")
+
+            llm.assert_awaited_once()
+            mock_app.CACHE.set.assert_awaited_once()
+            key, value = mock_app.CACHE.set.await_args.args
+            assert key.startswith("wrb-description:")
+            assert value == "fresh summary"
+
+    @pytest.mark.asyncio
+    async def test_identical_blocks_share_a_cache_key(self) -> None:
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            self._patch_app(mock_app, cached=None)
+
+            await _make_block()._generate_workflow_run_block_description("wrb_1", "org_1")
+            await _make_block()._generate_workflow_run_block_description("wrb_2", "org_1")
+
+            keys = {call.args[0] for call in mock_app.CACHE.get.await_args_list}
+            assert len(keys) == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_errors_fall_through_to_generation(self) -> None:
+        block = _make_block()
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            llm = self._patch_app(mock_app, cache_error=True)
+
+            await block._generate_workflow_run_block_description("wrb_1", "org_1")
+
+            llm.assert_awaited_once()
+            mock_app.DATABASE.observer.update_workflow_run_block.assert_awaited_once()
+            assert (
+                mock_app.DATABASE.observer.update_workflow_run_block.await_args.kwargs["description"] == "fresh summary"
+            )

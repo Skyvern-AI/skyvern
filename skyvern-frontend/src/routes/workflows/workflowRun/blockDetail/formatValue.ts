@@ -15,4 +15,17 @@ function stringifyTimelineValue(value: unknown): string {
   }
 }
 
+// Strings copy raw (unquoted) so identifiers paste cleanly; objects/arrays copy
+// their full subtree as pretty-printed JSON.
+export function jsonClipboardText(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 export { stringifyTimelineValue };

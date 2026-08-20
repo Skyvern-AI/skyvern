@@ -19,9 +19,9 @@ type WorkflowYamlEditorState = {
   registerCommit: (
     commit: ((persist?: boolean) => Promise<boolean>) | null,
   ) => void;
-  // Serializes the live canvas and opens the editor. Registered by the
-  // embedded Workspace so shell chrome (the Editor pane header's toggle) can
-  // enter Code mode without owning the serialization.
+  // Serializes the live canvas and opens the editor. Registered by Workspace
+  // so header chrome outside its closure (studio's Editor pane header, the
+  // legacy overflow menu) can enter Code mode without owning the serialization.
   enterYamlMode: (() => void) | null;
   registerEnterYamlMode: (enter: (() => void) | null) => void;
   close: () => void;

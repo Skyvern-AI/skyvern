@@ -2,7 +2,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    computed_field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import Self, deprecated
 
 from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
@@ -21,7 +29,12 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
-from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
+from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
+    ProxyLocationInput,
+    ScriptRunResponse,
+    _validate_browser_address,
+)
 from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
@@ -37,6 +50,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     start_fresh_browser: bool = False
+    reuse_browser_session: bool | None = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
@@ -62,6 +76,13 @@ class WorkflowRequestBody(BaseModel):
     @classmethod
     def validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
+
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
+        if info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY):
+            return browser_address
+        return _validate_browser_address(browser_address)
 
     @model_validator(mode="after")
     def _reject_start_fresh_with_session(self) -> Self:
@@ -116,6 +137,10 @@ class WorkflowDefinition(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+    completion_contract: dict[str, Any] | None = Field(
+        default=None,
+        description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
+    )
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -168,6 +193,8 @@ class Workflow(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    reuse_browser_session: bool = False
+    mask_secrets: bool = False
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
     browser_profile_key: str | None = None
@@ -262,6 +289,9 @@ class WorkflowRun(BaseModel):
     browser_seed_source: BrowserSeedSource | None = None
     browser_sink_profile_id: str | None = None
     start_fresh_browser: bool | None = None
+    reuse_browser_session: bool | None = None
+    # Internal admission identity. It can contain routing inputs and must never enter API payloads.
+    reuse_bound_key: str | None = Field(default=None, exclude=True)
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
@@ -285,6 +315,7 @@ class WorkflowRun(BaseModel):
     job_id: str | None = None
     depends_on_workflow_run_id: str | None = None
     sequential_key: str | None = None
+    sequential_credential_id: str | None = None
     ai_fallback: bool | None = None
     code_gen: bool | None = None
     trigger_type: WorkflowRunTriggerType | None = None
@@ -315,6 +346,29 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+
+def resolve_reuse_browser_session(*, run_override: bool | None, workflow_default: bool) -> bool:
+    """Resolve browser-session reuse with the run override taking precedence."""
+    return workflow_default if run_override is None else run_override
+
+
+def should_acquire_reused_session(
+    *,
+    browser_session_id: str | None,
+    start_fresh_browser: bool | None,
+    run_override: bool | None,
+    workflow_default: bool,
+) -> bool:
+    """Whether this run should acquire its workflow-bound browser session."""
+    return (
+        browser_session_id is None
+        and not start_fresh_browser
+        and resolve_reuse_browser_session(
+            run_override=run_override,
+            workflow_default=workflow_default,
+        )
+    )
 
 
 def is_adaptive_caching_from_effective_state(

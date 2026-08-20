@@ -37,6 +37,7 @@ from skyvern.schemas.action_log import (
     ActionLogPage,
     sanitize_action_log_event,
 )
+from skyvern.schemas.browser_session_timeouts import MAX_TIMEOUT, MAX_TIMEOUT_EXCEEDED_MESSAGE
 from skyvern.schemas.browser_sessions import (
     CreateBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
@@ -158,6 +159,7 @@ async def get_browser_sessions_all(
     summary="Create a session",
     responses={
         200: {"description": "Successfully created browser session"},
+        400: {"description": f"Requested timeout exceeds the {MAX_TIMEOUT}-minute maximum"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
         404: {"description": "Browser profile not found"},
     },
@@ -171,6 +173,8 @@ async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
+    if browser_session_request.timeout is not None and browser_session_request.timeout > MAX_TIMEOUT:
+        raise HTTPException(status_code=400, detail=MAX_TIMEOUT_EXCEEDED_MESSAGE)
     proxy_location = browser_session_request.proxy_location
     proxy_session_id = browser_session_request.proxy_session_id
     if browser_session_request.browser_profile_id:
@@ -201,6 +205,7 @@ async def create_browser_session(
 
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
+        url=browser_session_request.url,
         timeout_minutes=browser_session_request.timeout,
         proxy_location=proxy_location,
         proxy_session_id=proxy_session_id,
@@ -208,6 +213,7 @@ async def create_browser_session(
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
+        needs_live_view=browser_session_request.needs_live_view,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 
@@ -330,6 +336,27 @@ async def update_browser_session(
         200: {"description": "Successfully retrieved browser session details"},
         404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
+        503: {
+            "description": "Downloaded files could not be returned",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail"],
+                        "properties": {
+                            "detail": {
+                                "type": "object",
+                                "required": ["code", "retryable"],
+                                "properties": {
+                                    "code": {"type": "string", "enum": ["downloaded_files_unavailable"]},
+                                    "retryable": {"type": "boolean"},
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.get(
@@ -350,7 +377,12 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+    return await BrowserSessionResponse.from_browser_session(
+        browser_session,
+        app.STORAGE,
+        fail_download_lookup=True,
+        include_stream_transport=True,
+    )
 
 
 @base_router.get(

@@ -33,12 +33,13 @@ exact threat the vault architecture is designed to prevent.
 import asyncio
 import json
 import time
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Annotated, Any, NoReturn
 
 import pyotp
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query, Response, status
 from onepassword.client import Client as OnePasswordClient
 from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
 from sqlalchemy.exc import IntegrityError
@@ -111,10 +112,14 @@ from skyvern.forge.sdk.schemas.organizations import (
     Organization,
     TestConnectionResponse,
 )
-from skyvern.forge.sdk.schemas.totp_codes import OTPType, TOTPCode, TOTPCodeCreate
+from skyvern.forge.sdk.schemas.totp_codes import OTPType, RawTOTPCodeAccepted, TOTPCode, TOTPCodeCreate
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
+    CustomCredentialConfigurationError,
+    CustomCredentialNotConfiguredError,
+)
 from skyvern.forge.sdk.services.credentials import (
     AuthenticatorTotpErrorCode,
     AuthenticatorTotpParseResult,
@@ -123,6 +128,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
     parse_totp_config,
 )
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
@@ -145,8 +151,14 @@ from skyvern.schemas.workflows import (
     WorkflowParameterYAML,
     WorkflowStatus,
 )
-from skyvern.services.otp_service import OTPValue, parse_otp_login, redact_otp_identifier_for_log
+from skyvern.services.otp_service import (
+    InsufficientCreditsForOTPParse,
+    OTPValue,
+    parse_otp_login,
+    redact_otp_identifier_for_log,
+)
 from skyvern.services.run_service import cancel_workflow_run
+from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
@@ -181,6 +193,7 @@ _SAVED_AUTHENTICATOR_SECRET_INVALID_DETAIL = (
     "Saved authenticator key is invalid. Edit the credential and paste the raw setup key "
     "or full otpauth:// URI from the website's 2FA setup screen."
 )
+CREDENTIAL_WRITE_CONFLICT_DETAIL = "Credential was modified by another request. Please retry."
 _TOTP_CODE_PREVIEW_CACHE_MAX_ENTRIES = 1024
 
 
@@ -405,11 +418,15 @@ async def fetch_credential_item_background(item_id: str) -> None:
         LOG.exception("Failed to fetch credential item from Bitwarden in background", item_id=item_id, error=str(e))
 
 
-@legacy_base_router.post("/totp")
+@legacy_base_router.post(
+    "/totp",
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
+)
 @legacy_base_router.post("/totp/", include_in_schema=False)
 @base_router.post(
     "/credentials/totp",
     response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
     summary="Send TOTP code",
     description="Forward a TOTP (2FA, MFA) email or sms message containing the code to Skyvern. This endpoint stores the code in database so that Skyvern can use it while running tasks/workflows.",
     tags=["Credentials"],
@@ -428,12 +445,14 @@ async def fetch_credential_item_background(item_id: str) -> None:
 @base_router.post(
     "/credentials/totp/",
     response_model=TOTPCode,
+    responses={402: {"description": "Insufficient credits to parse OTP content"}},
     include_in_schema=False,
 )
 async def send_totp_code(
     data: TOTPCodeCreate,
-    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TOTPCode:
+    totp_identifier = normalize_identifier_if_email(data.totp_identifier)
     redacted_totp_identifier = redact_otp_identifier_for_log(data.totp_identifier)
     LOG.info(
         "Saving OTP code",
@@ -457,15 +476,25 @@ async def send_totp_code(
         if not workflow_run:
             raise HTTPException(status_code=400, detail=f"Invalid workflow run id: {data.workflow_run_id}")
     content = data.content.strip()
-    otp_value: OTPValue | None = OTPValue(value=content, type=data.type or OTPType.TOTP)
+    otp_value: OTPValue | None = OTPValue(value=content)
+    otp_parse_skipped_for_insufficient_credits = False
     parse_exception_type_name: str | None = None
     # We assume the user is sending the code directly when the length of code is less than or equal to 10
     if len(content) > 10:
         try:
-            otp_value = await parse_otp_login(content, curr_org.organization_id, enforced_otp_type=data.type)
+            otp_value = await parse_otp_login(content, curr_org.organization_id)
+        except InsufficientCreditsForOTPParse:
+            otp_value = None
+            otp_parse_skipped_for_insufficient_credits = True
         except Exception as e:
             otp_value = None
             parse_exception_type_name = type(e).__name__
+
+    if otp_parse_skipped_for_insufficient_credits and len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Insufficient credits to parse OTP content",
+        )
 
     if parse_exception_type_name:
         # parse_otp_login raised, meaning the OTP-extraction dependency (LLM backend)
@@ -488,20 +517,33 @@ async def send_totp_code(
         )
 
     if not otp_value:
-        LOG.error(
-            "Failed to parse otp login",
+        if len(data.content) > settings.TOTP_RAW_CONTENT_MAX_LENGTH:
+            raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        raw_row = await app.DATABASE.otp.create_raw_otp_code(
             organization_id=curr_org.organization_id,
-            totp_identifier=redacted_totp_identifier,
+            totp_identifier=totp_identifier,
+            content=data.content,
             task_id=data.task_id,
             workflow_id=data.workflow_id,
             workflow_run_id=data.workflow_run_id,
+            source=data.source,
+            expired_at=data.expired_at,
+        )
+        LOG.info(
+            "Persisted raw OTP content",
+            organization_id=curr_org.organization_id,
+            totp_identifier=redacted_totp_identifier,
+            totp_code_id=raw_row.totp_code_id,
             content_length=len(data.content),
         )
-        raise HTTPException(status_code=400, detail="Failed to parse otp login")
+        pending = RawTOTPCodeAccepted.from_raw_row(raw_row)
+        return Response(  # type: ignore[return-value]
+            content=pending.model_dump_json(), status_code=200, media_type="application/json"
+        )
 
     return await app.DATABASE.otp.create_otp_code(
         organization_id=curr_org.organization_id,
-        totp_identifier=data.totp_identifier,
+        totp_identifier=totp_identifier,
         content=data.content,
         code=otp_value.value,
         task_id=data.task_id,
@@ -530,7 +572,7 @@ async def send_totp_code(
     include_in_schema=False,
 )
 async def get_totp_codes(
-    curr_org: Organization = Depends(org_auth_service.get_current_org),
+    curr_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     totp_identifier: str | None = Query(
         None,
         description="Filter by TOTP identifier such as an email or phone number.",
@@ -654,7 +696,7 @@ async def create_credential(
         ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     if isinstance(data.credential, NonEmptyPasswordCredential):
         await _normalize_authenticator_totp_for_organization_or_raise(
@@ -662,12 +704,22 @@ async def create_credential(
             organization_id=current_org.organization_id,
         )
 
+    await app.AGENT_FUNCTION.validate_credential_write(
+        organization_id=current_org.organization_id,
+        credential_type=data.credential_type,
+        credential=data.credential,
+        existing_credential=None,
+    )
+
     # Validate the profile link BEFORE provisioning, so an invalid/managed/cross-org/owned profile
     # rejects with a 400 without leaving an orphan credential (and vault secret) behind.
     if data.browser_profile_id is not None:
         await _validate_credential_browser_profile_id(data.browser_profile_id, current_org.organization_id)
 
-    credential_service = await _get_credential_vault_service(vault_type_override=data.vault_type)
+    credential_service = await _get_credential_vault_service(
+        vault_type_override=data.vault_type,
+        organization_id=current_org.organization_id,
+    )
 
     try:
         credential = await credential_service.create_credential(organization_id=current_org.organization_id, data=data)
@@ -685,7 +737,8 @@ async def create_credential(
 
     pin_provided = "pin_saved_session_ip" in data.model_fields_set
     bpid_provided = "browser_profile_id" in data.model_fields_set
-    if bpid_provided or pin_provided:
+    auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
+    if bpid_provided or pin_provided or auto_profile_disabled_provided:
         # Only pass browser_profile_id when the caller sent it, so a pin-only request never passes the
         # omitted default (None) into the repo's unlink sentinel.
         profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
@@ -695,7 +748,15 @@ async def create_credential(
             **profile_update,
             # Only touch the pin when the caller sent it — supplying a profile alone must not reset it.
             pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
         )
+
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_credential_saved,
+        organization_id=current_org.organization_id,
+        credential_id=credential.credential_id,
+        credential_type=data.credential_type,
+    )
 
     return _convert_to_response(credential)
 
@@ -813,7 +874,7 @@ async def rename_credential(
         ...,
         description="The credential fields to update",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -843,6 +904,15 @@ async def rename_credential(
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
         update_kwargs["save_browser_session_intent"] = data.save_browser_session_intent
+    if data.auto_profile_disabled is not None:
+        update_kwargs["auto_profile_disabled"] = data.auto_profile_disabled
+    if data.run_sequentially is True and not app.AGENT_FUNCTION.supports_sequential_credentials():
+        raise HTTPException(
+            status_code=400,
+            detail="Sequential credential execution is not supported by this deployment",
+        )
+    if data.run_sequentially is not None:
+        update_kwargs["run_sequentially"] = data.run_sequentially
     _apply_proxy_pin_update(
         update_kwargs,
         proxy_location_was_set="proxy_location" in data.model_fields_set,
@@ -851,7 +921,18 @@ async def rename_credential(
         proxy_session_id=data.proxy_session_id,
         rotate_proxy_session_id=data.rotate_proxy_session_id,
     )
-    updated = await _update_credential_or_profile_conflict(**update_kwargs)
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
+            organization_id=current_org.organization_id,
+            credential_id=credential_id,
+        )
+    async with write_guard:
+        updated = await _update_credential_or_profile_conflict(**update_kwargs)
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
@@ -880,7 +961,7 @@ async def test_login(
         ...,
         description="The login credentials and URL to test",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
@@ -903,7 +984,7 @@ async def test_login(
         ),
     )
 
-    credential_service = await _get_credential_vault_service()
+    credential_service = await _get_credential_vault_service(organization_id=organization_id)
     credential = await credential_service.create_credential(
         organization_id=organization_id,
         data=create_request,
@@ -1092,7 +1173,7 @@ async def test_credential(
         ...,
         description="Test configuration including the login URL",
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
@@ -1323,7 +1404,7 @@ async def get_test_credential_status(
         description="The workflow run ID from the test initiation",
         examples=["wr_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestCredentialStatusResponse:
     organization_id = current_org.organization_id
 
@@ -1434,7 +1515,7 @@ async def cancel_credential_test(
         description="The workflow run ID to cancel",
         examples=["wr_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CancelTestResponse:
     organization_id = current_org.organization_id
 
@@ -1706,6 +1787,90 @@ async def _create_browser_profile_after_workflow(
                 )
 
 
+async def _delete_replaced_credential_item(
+    *,
+    credential_service: CredentialVaultService,
+    organization_id: str,
+    item_id: str,
+    vault_type: CredentialVaultType,
+) -> None:
+    try:
+        deleted = await credential_service.post_delete_credential_item(item_id, organization_id)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to delete replaced credential vault item",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+            error_type=type(exc).__name__,
+        )
+    else:
+        if deleted:
+            return
+        LOG.warning(
+            "Credential vault provider rejected replaced item cleanup",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+        )
+
+    try:
+        await app.AGENT_FUNCTION.on_credential_item_orphaned(
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+        )
+    except Exception as exc:
+        LOG.error(
+            "Failed to schedule replaced credential vault item cleanup",
+            organization_id=organization_id,
+            item_id=item_id,
+            vault_type=vault_type,
+            error_type=type(exc).__name__,
+        )
+
+
+async def _write_lock_decision_is_stale(*, sampled_credential: Credential, latest_credential: Credential) -> bool:
+    # Vault backends that update secrets in place keep item_id stable, so the lock decision
+    # itself has to be re-evaluated against the refreshed row rather than inferred from item_id.
+    requires_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=latest_credential,
+    )
+    return latest_credential.item_id != sampled_credential.item_id or requires_lock
+
+
+async def _raise_if_superseded_by_concurrent_write(
+    *,
+    credential_service: CredentialVaultService,
+    credential_id: str,
+    organization_id: str,
+    written_item_id: str,
+    replaced_item_id: str,
+    vault_type: CredentialVaultType,
+) -> None:
+    latest_credential = await app.DATABASE.credentials.get_credential(
+        credential_id=credential_id, organization_id=organization_id
+    )
+    if latest_credential is not None and latest_credential.item_id == written_item_id:
+        return
+
+    LOG.warning(
+        "Credential update was superseded by a concurrent write",
+        credential_id=credential_id,
+        organization_id=organization_id,
+        written_item_id=written_item_id,
+    )
+    if written_item_id != replaced_item_id:
+        await _delete_replaced_credential_item(
+            credential_service=credential_service,
+            organization_id=organization_id,
+            item_id=written_item_id,
+            vault_type=vault_type,
+        )
+    raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+
+
 @legacy_base_router.put("/credentials/{credential_id}")
 @legacy_base_router.put("/credentials/{credential_id}/", include_in_schema=False)
 @base_router.post(
@@ -1751,7 +1916,7 @@ async def update_credential(
         ],
         openapi_extra={"x-fern-sdk-parameter-name": "data"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     existing_credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -1759,10 +1924,15 @@ async def update_credential(
     if not existing_credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    if isinstance(data.credential, NonEmptyPasswordCredential):
-        await _normalize_authenticator_totp_for_organization_or_raise(
-            data.credential,
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=data.credential,
+        existing_credential=existing_credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
             organization_id=current_org.organization_id,
+            credential_id=credential_id,
         )
 
     if data.browser_profile_id is not None:
@@ -1770,36 +1940,86 @@ async def update_credential(
             data.browser_profile_id, current_org.organization_id, current_credential_id=credential_id
         )
 
-    vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
-    if not credential_service:
-        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+    async with write_guard:
+        if requires_write_lock:
+            existing_credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id, organization_id=current_org.organization_id
+            )
+            if not existing_credential:
+                raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    old_item_id = existing_credential.item_id
+        if isinstance(data.credential, NonEmptyPasswordCredential):
+            await _normalize_authenticator_totp_for_organization_or_raise(
+                data.credential,
+                organization_id=current_org.organization_id,
+            )
 
-    try:
-        updated_credential = await credential_service.update_credential(
-            credential=existing_credential,
+        await app.AGENT_FUNCTION.validate_credential_write(
+            organization_id=current_org.organization_id,
+            credential_type=data.credential_type,
+            credential=data.credential,
+            existing_credential=existing_credential,
+        )
+
+        vault_type = existing_credential.vault_type or CredentialVaultType.BITWARDEN
+        credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if not credential_service:
+            raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+        old_item_id = existing_credential.item_id
+
+        if not requires_write_lock:
+            latest_credential = await app.DATABASE.credentials.get_credential(
+                credential_id=credential_id, organization_id=current_org.organization_id
+            )
+            if latest_credential is None or (
+                await _write_lock_decision_is_stale(
+                    sampled_credential=existing_credential,
+                    latest_credential=latest_credential,
+                )
+            ):
+                raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+
+        write_request = await app.AGENT_FUNCTION.prepare_credential_update(
+            credential_service=credential_service,
+            existing_credential=existing_credential,
             data=data,
         )
-    except SkyvernHttpException as e:
-        detail = (
-            f"Custom credential service returned {e.error_message}"
-            if e.error_message
-            else f"Custom credential service returned HTTP {e.status_code}"
-        )
-        raise HTTPException(status_code=502, detail=detail)
 
-    # Schedule background cleanup of old vault item if the item_id changed
-    if old_item_id != updated_credential.item_id:
-        background_tasks.add_task(
-            credential_service.post_delete_credential_item,
-            old_item_id,
-            existing_credential.organization_id,
-        )
+        try:
+            updated_credential = await credential_service.update_credential(
+                credential=existing_credential,
+                data=write_request,
+            )
+        except SkyvernHttpException as e:
+            detail = (
+                f"Custom credential service returned {e.error_message}"
+                if e.error_message
+                else f"Custom credential service returned HTTP {e.status_code}"
+            )
+            raise HTTPException(status_code=502, detail=detail)
 
-    if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
-        background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
+        if not requires_write_lock:
+            await _raise_if_superseded_by_concurrent_write(
+                credential_service=credential_service,
+                credential_id=credential_id,
+                organization_id=current_org.organization_id,
+                written_item_id=updated_credential.item_id,
+                replaced_item_id=old_item_id,
+                vault_type=vault_type,
+            )
+
+        if old_item_id != updated_credential.item_id:
+            background_tasks.add_task(
+                _delete_replaced_credential_item,
+                credential_service=credential_service,
+                organization_id=existing_credential.organization_id,
+                item_id=old_item_id,
+                vault_type=vault_type,
+            )
+
+        if updated_credential.vault_type == CredentialVaultType.BITWARDEN:
+            background_tasks.add_task(fetch_credential_item_background, updated_credential.item_id)
 
     _clear_cached_totp_code_preview(organization_id=current_org.organization_id, credential_id=credential_id)
 
@@ -1808,7 +2028,8 @@ async def update_credential(
     # (pin omitted) must not reset the pin.
     pin_provided = "pin_saved_session_ip" in data.model_fields_set
     bpid_provided = "browser_profile_id" in data.model_fields_set
-    if bpid_provided or pin_provided:
+    auto_profile_disabled_provided = "auto_profile_disabled" in data.model_fields_set
+    if bpid_provided or pin_provided or auto_profile_disabled_provided:
         # Only pass browser_profile_id when the caller sent it — a pin-only update must not pass the
         # field's omitted default (None) and unlink the profile via the repo's unlink sentinel.
         profile_update: dict[str, Any] = {"browser_profile_id": data.browser_profile_id} if bpid_provided else {}
@@ -1817,6 +2038,7 @@ async def update_credential(
             organization_id=current_org.organization_id,
             **profile_update,
             pin_saved_session_ip=data.pin_saved_session_ip if pin_provided else None,
+            auto_profile_disabled=data.auto_profile_disabled if auto_profile_disabled_provided else None,
         )
 
     return _convert_to_response(updated_credential)
@@ -1855,7 +2077,7 @@ async def delete_credential(
         examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> None:
     credential = await app.DATABASE.credentials.get_credential(
         credential_id=credential_id, organization_id=current_org.organization_id
@@ -1863,28 +2085,55 @@ async def delete_credential(
     if not credential:
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
 
-    vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
-    credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
-    if not credential_service:
-        raise HTTPException(status_code=400, detail="Unsupported credential storage type")
-
-    try:
-        await credential_service.delete_credential(credential)
-    except SkyvernHttpException as e:
-        detail = (
-            f"Custom credential service returned {e.error_message}"
-            if e.error_message
-            else f"Custom credential service returned HTTP {e.status_code}"
+    requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+        credential=None,
+        existing_credential=credential,
+    )
+    write_guard: AbstractAsyncContextManager[None] = nullcontext()
+    if requires_write_lock:
+        write_guard = app.AGENT_FUNCTION.credential_write_lock(
+            organization_id=current_org.organization_id,
+            credential_id=credential_id,
         )
-        raise HTTPException(status_code=502, detail=detail)
 
-    # Schedule background cleanup if the service implements it
-    if vault_type != CredentialVaultType.CUSTOM:
-        background_tasks.add_task(
-            credential_service.post_delete_credential_item,
-            credential.item_id,
-            credential.organization_id,
+    async with write_guard:
+        latest_credential = await app.DATABASE.credentials.get_credential(
+            credential_id=credential_id, organization_id=current_org.organization_id
         )
+        if not latest_credential:
+            raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
+        if not requires_write_lock and (
+            await _write_lock_decision_is_stale(
+                sampled_credential=credential,
+                latest_credential=latest_credential,
+            )
+        ):
+            raise HTTPException(status_code=409, detail=CREDENTIAL_WRITE_CONFLICT_DETAIL)
+        credential = latest_credential
+
+        vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
+        credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
+        if not credential_service:
+            raise HTTPException(status_code=400, detail="Unsupported credential storage type")
+
+        try:
+            await credential_service.delete_credential(credential)
+        except SkyvernHttpException as e:
+            detail = (
+                f"Custom credential service returned {e.error_message}"
+                if e.error_message
+                else f"Custom credential service returned HTTP {e.status_code}"
+            )
+            raise HTTPException(status_code=502, detail=detail)
+
+        if vault_type != CredentialVaultType.CUSTOM:
+            background_tasks.add_task(
+                _delete_replaced_credential_item,
+                credential_service=credential_service,
+                organization_id=credential.organization_id,
+                item_id=credential.item_id,
+                vault_type=vault_type,
+            )
 
     # Reap the credential's living browser profile so deleting a credential doesn't silently orphan
     # its cookie-bearing archive (unbounded S3 growth). Kept if a live owner still references it. The
@@ -1976,7 +2225,7 @@ async def get_credential_totp_code(
         description="The unique identifier of the credential",
         examples=["cred_1234567890"],
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialTotpCodeResponse:
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -2009,6 +2258,12 @@ async def get_credential_totp_code(
             else f"Custom credential service returned HTTP {e.status_code}"
         )
         raise HTTPException(status_code=502, detail=detail)
+    except CustomCredentialNotConfiguredError as e:
+        # Already reported by the vault service; re-logging here would double-count an expected refusal.
+        raise HTTPException(
+            status_code=400,
+            detail="Custom credential service is not configured for this organization",
+        ) from e
     except Exception as e:
         LOG.exception(
             "Failed to retrieve credential item for TOTP code preview",
@@ -2081,7 +2336,7 @@ async def get_credential(
         examples=["cred_1234567890"],
         openapi_extra={"x-fern-sdk-parameter-name": "credential_id"},
     ),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     """Return non-sensitive metadata for a single credential.
 
@@ -2125,7 +2380,7 @@ async def get_credential(
     include_in_schema=False,
 )
 async def get_credentials(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
     page: int = Query(
         1,
         ge=1,
@@ -2205,7 +2460,7 @@ def _to_credential_folder_response(folder: CredentialFolderModel, credential_cou
 @base_router.post("/credential_folders/", response_model=CredentialFolder, include_in_schema=False)
 async def create_credential_folder(
     data: CredentialFolderCreate = Body(..., description="The credential folder to create"),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.create_credential_folder(
         organization_id=current_org.organization_id,
@@ -2231,7 +2486,7 @@ async def create_credential_folder(
 @base_router.get("/credential_folders/{folder_id}/", response_model=CredentialFolder, include_in_schema=False)
 async def get_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.get_credential_folder(
         folder_id=folder_id,
@@ -2264,7 +2519,7 @@ async def get_credential_folders(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> list[CredentialFolder]:
     folders = await app.DATABASE.credential_folders.get_credential_folders(
         organization_id=current_org.organization_id,
@@ -2302,7 +2557,7 @@ async def get_credential_folders(
 async def update_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
     data: CredentialFolderUpdate = Body(...),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialFolder:
     folder = await app.DATABASE.credential_folders.update_credential_folder(
         folder_id=folder_id,
@@ -2335,7 +2590,7 @@ async def update_credential_folder(
 @base_router.delete("/credential_folders/{folder_id}/", include_in_schema=False)
 async def delete_credential_folder(
     folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> dict:
     success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
         folder_id=folder_id,
@@ -2365,7 +2620,7 @@ async def delete_credential_folder(
 async def update_credential_folder_assignment(
     credential_id: str = Path(..., description="The ID of the credential.", examples=["cred_1234567890"]),
     data: UpdateCredentialFolderRequest = Body(...),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CredentialResponse:
     try:
         credential = await app.DATABASE.credential_folders.set_credential_folder(
@@ -2395,7 +2650,7 @@ async def update_credential_folder_assignment(
     include_in_schema=False,
 )
 async def get_onepassword_token(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CreateOnePasswordTokenResponse:
     """
     Get the current OnePassword service account token for the organization.
@@ -2441,7 +2696,7 @@ async def get_onepassword_token(
     include_in_schema=False,
 )
 async def list_onepassword_items(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> OnePasswordItemsResponse:
     org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
         current_org.organization_id,
@@ -2576,7 +2831,7 @@ async def list_onepassword_items(
     include_in_schema=False,
 )
 async def list_bitwarden_items(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenItemsResponse:
     org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
         current_org.organization_id,
@@ -2621,7 +2876,7 @@ async def list_bitwarden_items(
 )
 async def update_onepassword_token(
     data: CreateOnePasswordTokenRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CreateOnePasswordTokenResponse:
     """
     Create or update a OnePassword service account token for the current organization.
@@ -2678,7 +2933,7 @@ async def update_onepassword_token(
 )
 async def clear_org_auth_credential(
     credential_provider: str = Path(..., description="The organization auth credential provider to clear."),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> ClearOrganizationAuthTokenResponse:
     """
     Clear the current organization auth credential for the organization.
@@ -2732,7 +2987,7 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
     include_in_schema=False,
 )
 async def get_bitwarden_credential(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenCredentialResponse:
     """
     Get the current Bitwarden credential for the organization.
@@ -2779,7 +3034,7 @@ async def get_bitwarden_credential(
 )
 async def update_bitwarden_credential(
     request: CreateBitwardenCredentialRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> BitwardenCredentialResponse:
     """
     Create or update a Bitwarden credential for the current organization.
@@ -2831,7 +3086,7 @@ async def update_bitwarden_credential(
     include_in_schema=False,
 )
 async def get_azure_client_secret_credential(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> AzureClientSecretCredentialResponse:
     """
     Get the current Azure Client Secret Credential for the organization.
@@ -2878,7 +3133,7 @@ async def get_azure_client_secret_credential(
 )
 async def update_azure_client_secret_credential(
     request: CreateAzureClientSecretCredentialRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> AzureClientSecretCredentialResponse:
     """
     Create or update an Azure Client Secret Credential for the current organization.
@@ -2934,7 +3189,7 @@ async def update_azure_client_secret_credential(
     include_in_schema=False,
 )
 async def get_custom_credential_service_config(
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Get the current custom credential service configuration for the organization.
@@ -2981,7 +3236,7 @@ async def get_custom_credential_service_config(
 )
 async def update_custom_credential_service_config(
     request: CreateCustomCredentialServiceConfigRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> CustomCredentialServiceConfigResponse:
     """
     Create or update a custom credential service configuration for the current organization.
@@ -3039,7 +3294,7 @@ async def update_custom_credential_service_config(
 )
 async def test_custom_credential_service_connection(
     request: CreateCustomCredentialServiceConfigRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> TestConnectionResponse:
     """
     Test connectivity to the custom credential service API.
@@ -3103,30 +3358,47 @@ async def test_custom_credential_service_connection(
 
 async def _get_credential_vault_service(
     vault_type_override: CredentialVaultType | None = None,
+    organization_id: str | None = None,
 ) -> CredentialVaultService:
+    """Resolve the vault service for a request.
+
+    Callers about to write a secret pass ``organization_id`` so a vault configured per organization
+    is preflighted here and an unusable configuration is refused before the write is attempted.
+    """
+    settings = SettingsManager.get_settings()
     vault_type = vault_type_override or settings.CREDENTIAL_VAULT_TYPE
+    service: CredentialVaultService
     if vault_type == CredentialVaultType.SKYVERN:
         if not settings.is_local_credential_vault_enabled():
             raise HTTPException(status_code=400, detail="Skyvern local credential vault is not enabled")
         if not app.SKYVERN_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Skyvern local credential vault is not configured")
-        return app.SKYVERN_CREDENTIAL_VAULT_SERVICE
+        service = app.SKYVERN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.BITWARDEN:
-        return app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
+        service = app.BITWARDEN_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.AZURE_VAULT:
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
-        return app.AZURE_CREDENTIAL_VAULT_SERVICE
+        service = app.AZURE_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.GCP:
         if not app.GCP_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="GCP credential vault is not supported")
-        return app.GCP_CREDENTIAL_VAULT_SERVICE
+        service = app.GCP_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.CUSTOM:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
-        return app.CUSTOM_CREDENTIAL_VAULT_SERVICE
+        service = app.CUSTOM_CREDENTIAL_VAULT_SERVICE
     else:
         raise HTTPException(status_code=400, detail="Credential storage not supported")
+
+    if organization_id is not None:
+        try:
+            await service.validate_organization_configuration(organization_id)
+        except CustomCredentialConfigurationError as e:
+            # Already reported by the vault service; re-logging here would double-count.
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return service
 
 
 async def _delete_temporary_test_login_credential(
@@ -3175,10 +3447,12 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
@@ -3195,10 +3469,12 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,
@@ -3212,10 +3488,12 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             name=credential.name,
             vault_type=credential.vault_type,
             browser_profile_id=credential.browser_profile_id,
+            auto_profile_disabled=credential.auto_profile_disabled,
             pin_saved_session_ip=credential.pin_saved_session_ip,
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            run_sequentially=credential.run_sequentially,
             folder_id=credential.folder_id,
             proxy_location=credential.proxy_location,
             proxy_session_id=credential.proxy_session_id,

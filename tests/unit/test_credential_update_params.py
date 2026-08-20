@@ -9,6 +9,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.routes import credentials as credentials_routes
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialType,
     CredentialVaultType,
     TotpType,
+    UpdateCredentialRequest,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -55,6 +57,7 @@ def _make_password_credential(**overrides: object) -> Credential:
         "card_brand": None,
         "secret_label": None,
         "browser_profile_id": None,
+        "auto_profile_disabled": None,
         "tested_url": None,
         "user_context": None,
         "save_browser_session_intent": False,
@@ -299,6 +302,23 @@ async def test_repo_update_credential_accepts_save_browser_session_intent() -> N
 
 
 @pytest.mark.asyncio
+async def test_repo_update_credential_accepts_auto_profile_disabled() -> None:
+    mock_credential = MagicMock()
+    mock_credential.name = "test"
+    mock_credential.auto_profile_disabled = False
+    repo = _make_credential_repo(mock_credential)
+
+    with patch("skyvern.forge.sdk.schemas.credentials.Credential.model_validate", return_value=MagicMock()):
+        await repo.update_credential(
+            credential_id="cred_123",
+            organization_id="org_123",
+            auto_profile_disabled=True,
+        )
+
+    assert mock_credential.auto_profile_disabled is True
+
+
+@pytest.mark.asyncio
 async def test_repo_update_credential_accepts_tested_url() -> None:
     mock_credential = MagicMock()
     mock_credential.name = "test"
@@ -402,6 +422,7 @@ async def test_route_pin_only_update_does_not_pass_browser_profile_id(monkeypatc
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(credentials=SimpleNamespace(get_credential=AsyncMock(return_value=existing))),
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: vault_service},
+        AGENT_FUNCTION=AgentFunction(),
     )
     monkeypatch.setattr(credentials_routes, "app", fake_app)
     monkeypatch.setattr(credentials_routes, "_update_credential_or_profile_conflict", conflict)
@@ -1093,7 +1114,11 @@ async def test_validate_browser_profile_id_allows_relink_to_same_credential(monk
     )
 
 
-def _stored_credential(browser_profile_id: str | None = None, pin: bool = False) -> Credential:
+def _stored_credential(
+    browser_profile_id: str | None = None,
+    pin: bool = False,
+    auto_profile_disabled: bool | None = None,
+) -> Credential:
     return Credential(
         credential_id="cred_123",
         organization_id="org_123",
@@ -1106,6 +1131,7 @@ def _stored_credential(browser_profile_id: str | None = None, pin: bool = False)
         card_brand=None,
         secret_label=None,
         browser_profile_id=browser_profile_id,
+        auto_profile_disabled=auto_profile_disabled,
         pin_saved_session_ip=pin,
         created_at=datetime(2026, 1, 1),
         modified_at=datetime(2026, 1, 1),
@@ -1149,6 +1175,28 @@ async def test_create_credential_links_validated_browser_profile_id(monkeypatch:
     assert kwargs["pin_saved_session_ip"] is True
     assert response.browser_profile_id == "bp_plain"
     assert response.pin_saved_session_ip is True
+
+
+@pytest.mark.asyncio
+async def test_create_credential_persists_auto_profile_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
+    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    update_credential = AsyncMock(return_value=_stored_credential(auto_profile_disabled=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    response = await credentials_routes.create_credential(
+        background_tasks=BackgroundTasks(),
+        data=CreateCredentialRequest(
+            name="test",
+            credential_type=CredentialType.PASSWORD,
+            credential={"username": "user", "password": "pw"},
+            auto_profile_disabled=True,
+        ),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert update_credential.await_args.kwargs["auto_profile_disabled"] is True
+    assert response.auto_profile_disabled is True
 
 
 @pytest.mark.asyncio
@@ -1216,6 +1264,30 @@ async def test_rename_credential_sets_pin_and_validated_browser_profile_id(monke
     kwargs = update_credential.await_args.kwargs
     assert kwargs["browser_profile_id"] == "bp_plain"
     assert kwargs["pin_saved_session_ip"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [True, False])
+async def test_rename_credential_sets_auto_profile_disabled_without_unlinking(
+    monkeypatch: pytest.MonkeyPatch,
+    disabled: bool,
+) -> None:
+    existing = _stored_credential(browser_profile_id="bp_existing", auto_profile_disabled=not disabled)
+    updated = _stored_credential(browser_profile_id="bp_existing", auto_profile_disabled=disabled)
+    update_credential = AsyncMock(return_value=updated)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    response = await credentials_routes.rename_credential(
+        credential_id="cred_123",
+        data=UpdateCredentialRequest(auto_profile_disabled=disabled),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert update_credential.await_args.kwargs["auto_profile_disabled"] is disabled
+    assert "browser_profile_id" not in update_credential.await_args.kwargs
+    assert response.browser_profile_id == "bp_existing"
+    assert response.auto_profile_disabled is disabled
 
 
 def test_credential_route_treats_null_advanced_key_as_no_explicit_identity() -> None:
@@ -1331,6 +1403,7 @@ async def test_update_credential_route_applies_validated_browser_profile_and_pin
         credential=NonEmptyPasswordCredential(username="user@example.com", password="pw"),
         browser_profile_id="bp_plain",
         pin_saved_session_ip=True,
+        auto_profile_disabled=True,
     )
 
     response = await credentials_routes.update_credential(
@@ -1343,6 +1416,7 @@ async def test_update_credential_route_applies_validated_browser_profile_and_pin
     kwargs = update_credential.await_args.kwargs
     assert kwargs["browser_profile_id"] == "bp_plain"
     assert kwargs["pin_saved_session_ip"] is True
+    assert kwargs["auto_profile_disabled"] is True
     assert response.browser_profile_id == "bp_plain"
     assert response.pin_saved_session_ip is True
 
@@ -1499,3 +1573,67 @@ async def test_create_credential_profile_alone_does_not_reset_pin(monkeypatch: p
     )
 
     assert update_credential.await_args.kwargs["pin_saved_session_ip"] is None
+
+
+def test_update_run_sequentially_documents_drain_before_enable_window() -> None:
+    # The false->true toggle does not retroactively serialize runs that were already active when the
+    # flag flipped on (they were never stamped with the credential). That adoption-window limitation is
+    # documented on the field rather than enforced with a broad active-run scan; pin the warning so the
+    # contract is not silently dropped.
+    description = UpdateCredentialRequest.model_fields["run_sequentially"].description or ""
+    assert "after this flag is enabled" in description
+    assert "Drain" in description
+
+
+def test_oss_agent_function_does_not_support_sequential_credentials() -> None:
+    assert AgentFunction().supports_sequential_credentials() is False
+
+
+@pytest.mark.asyncio
+async def test_oss_route_rejects_enabling_sequential_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(run_sequentially=False)
+    update_credential = AsyncMock(return_value=_make_password_credential(run_sequentially=True))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(
+        forge_app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(supports_sequential_credentials=lambda: False),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=UpdateCredentialRequest(run_sequentially=True),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Sequential credential execution is not supported by this deployment"
+    update_credential.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_oss_route_allows_disabling_sequential_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(run_sequentially=True)
+    updated = _make_password_credential(run_sequentially=False)
+    update_credential = AsyncMock(return_value=updated)
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+    monkeypatch.setattr(
+        forge_app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            supports_sequential_credentials=lambda: False,
+            should_lock_credential_write=AsyncMock(return_value=False),
+        ),
+    )
+
+    response = await credentials_routes.rename_credential(
+        credential_id="cred_123",
+        data=UpdateCredentialRequest(run_sequentially=False),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    assert response.run_sequentially is False
+    assert update_credential.await_args.kwargs["run_sequentially"] is False

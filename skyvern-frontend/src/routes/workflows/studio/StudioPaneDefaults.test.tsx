@@ -12,6 +12,7 @@ import { useStudioShellStore } from "@/store/StudioShellStore";
 import { shouldOpenCopilotPaneForHandoff } from "../discoverCopilotHandoff";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
+import { StudioWorkflowDeletedContext } from "./StudioShellContext";
 import { useStudioPanes } from "./useStudioPanes";
 
 const { toastMock } = vi.hoisted(() => ({
@@ -23,11 +24,30 @@ vi.mock("@/components/ui/use-toast", () => ({
 }));
 
 function PanesProbe() {
-  const { panes, togglePane, openPane } = useStudioPanes();
+  const {
+    panes,
+    resolveLivePanes,
+    togglePane,
+    openPane,
+    setOpenPanes,
+    setPanesOrder,
+  } = useStudioPanes();
+  const location = useLocation();
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
+      <output data-testid="live-panes">{resolveLivePanes().join(",")}</output>
+      <output data-testid="address">
+        {location.pathname}
+        {location.search}
+        {location.hash}
+      </output>
       <button onClick={() => togglePane("overview")}>toggle-overview</button>
+      <button onClick={() => togglePane("copilot")}>toggle-copilot</button>
+      <button onClick={() => setPanesOrder(["editor", "copilot"])}>
+        reorder-copilot
+      </button>
+      <button onClick={() => setOpenPanes(["editor"])}>show-editor-only</button>
       <button onClick={() => openPane("editor")}>open-editor</button>
       <button onClick={() => openPane("browser")}>open-browser</button>
     </div>
@@ -52,17 +72,21 @@ function renderStudio({
   path = "/workflows/wpid_1/studio",
   hasBlocks = true,
   stageWidth,
+  workflowDeletedAt = null,
 }: {
   path?: string;
   hasBlocks?: boolean;
   stageWidth?: number;
+  workflowDeletedAt?: string | null;
 } = {}) {
   const tree = (
     <MemoryRouter initialEntries={[path]}>
-      <StudioPaneDefaultsProvider hasBlocks={hasBlocks}>
-        {stageWidth !== undefined ? <StageProbe width={stageWidth} /> : null}
-        <PanesProbe />
-      </StudioPaneDefaultsProvider>
+      <StudioWorkflowDeletedContext.Provider value={workflowDeletedAt}>
+        <StudioPaneDefaultsProvider hasBlocks={hasBlocks}>
+          {stageWidth !== undefined ? <StageProbe width={stageWidth} /> : null}
+          <PanesProbe />
+        </StudioPaneDefaultsProvider>
+      </StudioWorkflowDeletedContext.Provider>
     </MemoryRouter>
   );
   return { ...render(tree), tree };
@@ -70,6 +94,14 @@ function renderStudio({
 
 function panesText(): string {
   return screen.getByTestId("panes").textContent ?? "";
+}
+
+function livePanesText(): string {
+  return screen.getByTestId("live-panes").textContent ?? "";
+}
+
+function addressText(): string {
+  return screen.getByTestId("address").textContent ?? "";
 }
 
 afterEach(cleanup);
@@ -135,9 +167,8 @@ describe("cold-entry default panes (the four contexts)", () => {
 });
 
 // Mirrors Workspace's mount-effect wiring for the handoff into the studio shell:
-// open the Copilot pane once when a seeded prompt lands, threading the handoff
-// route state through so the pane-open navigation does not wipe it. `threadState`
-// lets a test reproduce the pre-fix bug where the state was dropped.
+// open the Copilot pane once when a seeded prompt lands. `threadState` verifies
+// that the pane hook retains an existing handoff when a caller omits state.
 function HandoffProbe({
   embedded = true,
   hasInitialCopilotMessage = true,
@@ -229,7 +260,7 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
     expect(messageText()).toBe("Fill out the contact form");
   });
 
-  test("a state-wiping open would drop the seeded prompt (regression guard)", () => {
+  test("retains a seeded prompt when the pane caller omits route state", () => {
     renderHandoff(
       { threadState: false },
       {
@@ -238,7 +269,7 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
       },
     );
     expect(panesText()).toBe("editor,browser,copilot");
-    expect(messageText()).toBe("");
+    expect(messageText()).toBe("Fill out the contact form");
   });
 });
 
@@ -265,6 +296,71 @@ describe("narrow-viewport clamp of shared links", () => {
     renderStudio({ path: FOUR_PANES, stageWidth: 600 });
     fireEvent.click(screen.getByText("toggle-overview"));
     expect(panesText()).toBe("copilot,editor,overview");
+  });
+
+  test("clamps the runtime-restored Copilot selection", () => {
+    useStudioShellStore
+      .getState()
+      .setCopilotSelection("edit", { open: true, index: 0 });
+    renderStudio({
+      path: "/workflows/wpid_1/studio?panes=editor,browser,copilot",
+      stageWidth: 600,
+    });
+    expect(panesText()).toBe("copilot,editor");
+    expect(livePanesText()).toBe("editor,browser");
+  });
+
+  test("clamps a deleted workflow without restoring blocked Copilot", () => {
+    useStudioShellStore
+      .getState()
+      .setCopilotSelection("run", { open: true, index: 0 });
+    renderStudio({
+      path: "/workflows/wpid_1/studio?wr=wr_1",
+      stageWidth: 500,
+      workflowDeletedAt: "2026-08-12T00:00:00Z",
+    });
+    expect(panesText()).toBe("browser");
+    expect(livePanesText()).toBe("browser");
+  });
+
+  test("a Copilot-only close does not reveal a clamp-hidden run pane", () => {
+    const address = "/workflows/wpid_1/studio?panes=copilot,overview#proof";
+    renderStudio({ path: address, stageWidth: 300 });
+    expect(panesText()).toBe("copilot");
+
+    fireEvent.click(screen.getByText("toggle-copilot"));
+    expect(panesText()).toBe("");
+    expect(addressText()).toBe(address);
+
+    fireEvent.click(screen.getByText("toggle-copilot"));
+    expect(panesText()).toBe("copilot");
+    expect(addressText()).toBe(address);
+  });
+
+  test("a Copilot-only reorder does not reveal a clamp-hidden run pane", () => {
+    const address =
+      "/workflows/wpid_1/studio?panes=copilot,editor,overview#proof";
+    renderStudio({ path: address, stageWidth: 600 });
+    expect(panesText()).toBe("copilot,editor");
+
+    fireEvent.click(screen.getByText("reorder-copilot"));
+
+    expect(panesText()).toBe("editor,copilot");
+    expect(addressText()).toBe(address);
+  });
+
+  test("an exact override removes clamp-hidden non-Copilot panes", () => {
+    const address =
+      "/workflows/wpid_1/studio?panes=copilot,editor,overview#proof";
+    renderStudio({ path: address, stageWidth: 600 });
+    expect(panesText()).toBe("copilot,editor");
+
+    fireEvent.click(screen.getByText("show-editor-only"));
+
+    expect(panesText()).toBe("editor");
+    expect(addressText()).toBe(
+      "/workflows/wpid_1/studio?panes=copilot,editor#proof",
+    );
   });
 });
 
@@ -304,7 +400,7 @@ describe("narrow-viewport nudge", () => {
   test("a pane write marks the coach mark as learned", () => {
     renderStudio({ stageWidth: 2000 });
     expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(false);
-    fireEvent.click(screen.getByText("open-editor"));
+    fireEvent.click(screen.getByText("toggle-overview"));
     expect(useStudioFirstRunStore.getState().coachMarkSeen).toBe(true);
   });
 });

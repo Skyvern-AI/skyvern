@@ -29,7 +29,7 @@ vi.mock("./runview/RunView", () => ({
     >
       {props.onRetry ? (
         <button type="button" onClick={props.onRetry}>
-          Retry as-is
+          Retry
         </button>
       ) : null}
     </div>
@@ -119,7 +119,7 @@ describe("RunTab retry navigation", () => {
     mockWorkflowRun();
     renderAt("/workflows/wpid_abc/studio?wr=run_1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry as-is" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_abc/run",
@@ -142,7 +142,7 @@ describe("RunTab retry navigation", () => {
     mockWorkflowRun({ workflow_run_id: "run_latest" });
     renderAt("/workflows/wpid_abc/studio");
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry as-is" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(workflowRunQueryMock).toHaveBeenCalledWith({
       workflowRunId: "run_latest",
@@ -161,7 +161,7 @@ describe("RunTab retry navigation", () => {
     mockWorkflowRun({ task_v2: { task_id: "task_synthetic" } });
     renderAt("/workflows/wpid_abc/studio?wr=run_1");
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry as-is" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
       "/agents/wpid_abc/run",

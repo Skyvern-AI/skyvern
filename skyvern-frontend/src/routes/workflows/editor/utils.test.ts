@@ -32,6 +32,7 @@ const baseWorkflow = {
   extra_http_headers: null,
   cdp_connect_headers: null,
   persist_browser_session: false,
+  reuse_browser_session: false,
   pin_saved_session_ip: false,
   browser_profile_id: null,
   browser_profile_key: null,
@@ -50,6 +51,7 @@ const baseWorkflow = {
   enable_self_healing: false,
   adaptive_caching: null,
   code_version: null,
+  mask_secrets: false,
   run_sequentially: false,
   sequential_key: null,
   folder_id: null,
@@ -108,6 +110,37 @@ describe("getInitialParameters", () => {
     ]);
     expect(initialParameters[1]).not.toHaveProperty("dataType");
   });
+
+  test("hydrates a no-default credential_id parameter as an empty selection", () => {
+    const workflow: WorkflowApiResponse = {
+      ...baseWorkflow,
+      workflow_definition: {
+        ...baseWorkflow.workflow_definition,
+        parameters: [
+          {
+            parameter_type: "workflow",
+            workflow_id: "w_test",
+            workflow_parameter_id: "wp_credential_input",
+            key: "credential_id",
+            description: null,
+            workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+            default_value: null,
+            created_at: "2026-06-23T00:00:00Z",
+            modified_at: "2026-06-23T00:00:00Z",
+            deleted_at: null,
+          },
+        ],
+      },
+    };
+
+    expect(getInitialParameters(workflow)).toEqual([
+      expect.objectContaining({
+        key: "credential_id",
+        parameterType: "credential",
+        credentialId: "",
+      }),
+    ]);
+  });
 });
 
 describe("skyvernCredentialToParameterYAML", () => {
@@ -160,6 +193,40 @@ describe("skyvernCredentialToParameterYAML", () => {
       selection_strategy: "round_robin",
       fallback_credential_ids: null,
       fallback_trigger: null,
+      key: "credentials",
+      description: null,
+    });
+  });
+
+  test("serializes a credential with no selection as a null-default workflow parameter", () => {
+    const parameter: SkyvernCredential = {
+      key: "credentials",
+      parameterType: "credential",
+      credentialId: "",
+    };
+
+    expect(skyvernCredentialToParameterYAML(parameter)).toEqual({
+      parameter_type: "workflow",
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: null,
+      key: "credentials",
+      description: null,
+    });
+  });
+
+  test("serializes a no-selection credential with fallback config as a null-default workflow parameter", () => {
+    const parameter: SkyvernCredential = {
+      key: "credentials",
+      parameterType: "credential",
+      credentialId: "",
+      fallbackCredentialIds: ["cred_backup"],
+      fallbackTrigger: "credential_failures",
+    };
+
+    expect(skyvernCredentialToParameterYAML(parameter)).toEqual({
+      parameter_type: "workflow",
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: null,
       key: "credentials",
       description: null,
     });
@@ -268,6 +335,21 @@ describe("applySkyvernCredentialEdit", () => {
 
     expect(edited.credentialIds).toBeNull();
     expect(edited.selectionStrategy).toBeNull();
+  });
+
+  test("clearing the credential drops rotation and fallback config (at-will)", () => {
+    const edited = applySkyvernCredentialEdit(
+      {
+        ...previous,
+        credentialIds: ["cred_primary", "cred_rotate_1"],
+        selectionStrategy: "round_robin",
+      },
+      { key: "portal_credential", credentialId: "" },
+    );
+
+    expect(edited.credentialId).toBe("");
+    expect(edited.credentialIds ?? null).toBeNull();
+    expect(edited.fallbackCredentialIds ?? null).toBeNull();
   });
 
   test("returns a plain credential parameter when adding (no previous value)", () => {

@@ -2,22 +2,31 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
+from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter
-from skyvern.forge.sdk.workflow.service import WorkflowService, _credential_id_from_setup_parameter
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    OutputParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.services.workflow_service import workflow_request_body_from_existing_run
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
 def _workflow(*, persist: bool = False, pick: str | None = None, key: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         persist_browser_session=persist,
+        reuse_browser_session=False,
         browser_profile_id=pick,
         browser_profile_key=key,
         pin_saved_session_ip=False,
@@ -32,6 +41,8 @@ def _run(retried_from_workflow_run_id: str | None = None) -> SimpleNamespace:
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -290,6 +301,27 @@ async def test_credential_override_heal_only_under_engine(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_explicit_pick_never_consults_the_credential_opt_out_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deliberate pick outranks the automatic opt-out: both the workflow dropdown pick and the run-form
+    # override must resolve without ever reaching the credential resolver that carries the gate, so no
+    # future gate placement there can suppress a pick. Seeds, but never as a workflow sink (read-only).
+    svc = _svc(monkeypatch, pick_role="credential", credential=None)
+    credential_seed = AsyncMock(return_value=None)
+    monkeypatch.setattr(svc, "_resolve_credential_browser_profile_id_for_setup", credential_seed)
+
+    seed, source, sink = await _resolve(svc, _workflow(pick="bp_opted_out_cred"))
+    assert (seed, sink) == ("bp_opted_out_cred", None)
+    assert source is not BrowserSeedSource.fresh
+
+    assert await _resolve(svc, _workflow(), override="bp_opted_out_cred") == (
+        "bp_opted_out_cred",
+        BrowserSeedSource.override,
+        None,
+    )
+    credential_seed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pick_beats_browser_profile_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # Correction 3: an explicit plain pick wins deterministically over browser_profile_key. The key only
     # selects WHICH own auto-profile applies in the no-pick rows, so it is ignored (never ensured) here.
@@ -490,6 +522,8 @@ async def test_resolve_and_stamp_is_idempotent_when_already_stamped(monkeypatch:
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id="bp_cred",
         browser_seed_source=BrowserSeedSource.credential,
         browser_sink_profile_id=None,
@@ -517,6 +551,8 @@ async def test_resolve_and_stamp_keeps_session_attached_profile(monkeypatch: pyt
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id="pbs_1",
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id="bp_from_session",
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -545,6 +581,8 @@ async def test_resolve_and_stamp_skips_profileless_live_session(monkeypatch: pyt
         workflow_run_id="wr_test",
         organization_id="o_test",
         browser_session_id="pbs_1",
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
         browser_sink_profile_id=None,
@@ -705,10 +743,15 @@ async def test_maybe_pin_active_credential_applies_without_seed(monkeypatch: pyt
     assert update_run.await_args.kwargs["extra_http_headers"] == {"x-sky-proxy": "ps_active"}
 
 
-# --- credential id extraction (rotation-aware) -------------------------------
+# --- credential parameter builder (shared) -----------------------------------
 
 
-def _credential_parameter(key: str, credential_id: str, credential_ids: list[str] | None = None) -> CredentialParameter:
+def _credential_parameter(
+    key: str,
+    credential_id: str,
+    credential_ids: list[str] | None = None,
+    fallback_credential_ids: list[str] | None = None,
+) -> CredentialParameter:
     now = datetime.now(timezone.utc)
     return CredentialParameter(
         key=key,
@@ -716,24 +759,10 @@ def _credential_parameter(key: str, credential_id: str, credential_ids: list[str
         workflow_id="wf_test",
         credential_id=credential_id,
         credential_ids=credential_ids or [],
+        fallback_credential_ids=fallback_credential_ids or [],
         created_at=now,
         modified_at=now,
     )
-
-
-def test_credential_id_prefers_run_selection_over_static() -> None:
-    # Rotation: the per-run selected credential (in parameter_values, keyed by parameter key) wins.
-    param = _credential_parameter("login", credential_id="cred_static", credential_ids=["cred_a", "cred_b"])
-    assert _credential_id_from_setup_parameter(param, {"login": "cred_b"}) == "cred_b"
-
-
-def test_credential_id_falls_back_to_static_credential_id() -> None:
-    param = _credential_parameter("login", credential_id="cred_static")
-    assert _credential_id_from_setup_parameter(param, {}) == "cred_static"
-
-
-def test_credential_id_none_for_unrelated_parameter() -> None:
-    assert _credential_id_from_setup_parameter(SimpleNamespace(key="not_a_cred"), {}) is None
 
 
 # --- retry re-resolves instead of pinning ------------------------------------
@@ -754,6 +783,7 @@ def _existing_run(
         browser_profile_id=browser_profile_id,
         browser_seed_source=browser_seed_source,
         start_fresh_browser=start_fresh_browser,
+        reuse_browser_session=None,
         max_screenshot_scrolls=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
@@ -812,14 +842,44 @@ def _output_parameter(key: str) -> OutputParameter:
     return OutputParameter(output_parameter_id=f"{key}_id", key=key, workflow_id="wf", created_at=now, modified_at=now)
 
 
-def _login_block(label: str, credential_param: CredentialParameter) -> LoginBlock:
+def _login_block(
+    label: str,
+    credential_param: CredentialParameter | WorkflowParameter,
+    *,
+    url: str = "https://example.com/login",
+) -> LoginBlock:
     return LoginBlock(
-        url="https://example.com/login",
+        url=url,
         label=label,
         title=label,
         navigation_goal="log in",
         output_parameter=_output_parameter(f"{label}_out"),
         parameters=[credential_param],
+    )
+
+
+def _string_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        workflow_id="wf_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _workflow_credential_parameter(key: str, default_value: str | None) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        workflow_id="wf_test",
+        default_value=default_value,
+        created_at=now,
+        modified_at=now,
     )
 
 
@@ -832,25 +892,87 @@ def _workflow_with_blocks(*blocks: LoginBlock) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 async def test_setup_credential_resolves_single_login_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})  # no run context at setup
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
         "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_1")))
 
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     assert result == "bp_cred"
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_opt_out_resolves_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=True)),
+    )
+    get_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred"))
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
+    workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_1")))
+
+    result = await WorkflowService()._resolve_setup_credential_seed(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        engine_enabled=True,
+        parameter_values={},
+    )
+
+    assert result is None
+    get_browser_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mid_run_credential_opt_out_is_engine_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_resolve_login_block_credential_ids", AsyncMock(return_value=["cred_1"]))
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=True)),
+    )
+    get_browser_profile = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred"))
+    monkeypatch.setattr(app.DATABASE.browser_sessions, "get_browser_profile", get_browser_profile)
+    engine_enabled = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", engine_enabled)
+    workflow_run = SimpleNamespace(organization_id="o_test")
+    block = SimpleNamespace(parameters=[])
+
+    opted_out = await svc._resolve_login_block_browser_profile_id(
+        block=block,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run=workflow_run,  # type: ignore[arg-type]
+    )
+    flag_off = await svc._resolve_login_block_browser_profile_id(
+        block=block,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run=workflow_run,  # type: ignore[arg-type]
+    )
+
+    assert opted_out is None
+    assert flag_off == "bp_cred"
+    assert get_browser_profile.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -864,8 +986,9 @@ async def test_setup_credential_defers_when_multiple_login_blocks(monkeypatch: p
 
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     # Ambiguous which login block executes -> defer to the mid-run stamp, don't even look one up.
@@ -875,10 +998,11 @@ async def test_setup_credential_defers_when_multiple_login_blocks(monkeypatch: p
 
 @pytest.mark.asyncio
 async def test_setup_credential_best_effort_on_profile_lookup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})  # no run context at setup
     monkeypatch.setattr(
         app.DATABASE.credentials,
         "get_credential",
-        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred")),
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_cred", auto_profile_disabled=False)),
     )
     monkeypatch.setattr(
         app.DATABASE.browser_sessions,
@@ -890,11 +1014,234 @@ async def test_setup_credential_best_effort_on_profile_lookup_failure(monkeypatc
     # A transient failure degrades to a fresh seed instead of failing setup.
     result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
         workflow=workflow,  # type: ignore[arg-type]
-        parameter_values={},
+        workflow_run_id="wr_test",
         organization_id="o_test",
+        parameter_values={},
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_pool_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The defect surface: a pool credential (credential_ids) is invisible to the old in-memory setup
+    # extractor, so setup seeded fresh while the block resolved the pool selection. That split brain only
+    # bites when a cached-script / pre-navigating block opens the browser before the login block, locking
+    # the mid-run loader out (get_or_create returns the already-open context) — leaving setup as the only
+    # loader that can seed. Setup must resolve the pool selection via the SAME rich path as the block.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    # The run's rotation selection is already persisted (select_credential_for_run is idempotent per run).
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_pool"),
+    )
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool", auto_profile_disabled=False))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_pool")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_pool"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_pool"  # pool selection, not the static id
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_fallback_db_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fallback retry persists a DB credential selection that differs from the parameter's static id.
+    # The old in-memory extractor returned the static (primary) id, seeding the wrong account's profile;
+    # the block resolved the DB selection. Setup must read the same DB selection.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_fallback"),
+    )
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(browser_profile_id="bp_fallback", auto_profile_disabled=False)
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_fallback")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", fallback_credential_ids=["cred_fallback"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_fallback"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_fallback"  # DB selection wins over static
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_uses_same_rich_resolver_as_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression pin: setup resolves the single login block's credential through the identical resolver
+    # the mid-run stamp uses (_resolve_login_block_credential_ids), so the two can never disagree.
+    svc = WorkflowService()
+    rich = AsyncMock(return_value=["cred_rich"])
+    monkeypatch.setattr(svc, "_resolve_login_block_credential_ids", rich)
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich", auto_profile_disabled=False)),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_rich")),
+    )
+    workflow = _workflow_with_blocks(_login_block("login", _credential_parameter("login", "cred_static")))
+
+    result = await svc._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == "bp_rich"
+    rich.assert_awaited_once()
+    assert rich.await_args.args[1:] == ("wr_test", "o_test", "wpid_test")
+
+
+@pytest.mark.asyncio
+async def test_setup_pin_resolves_pool_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The sibling pin resolver had the identical gap: a pool/DB-selected credential was invisible, so a
+    # pinning credential's dedicated IP was not applied at setup. It now resolves via the same rich path.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(
+        app.DATABASE.workflow_run_credential_selections,
+        "get_selection",
+        AsyncMock(return_value="cred_pool"),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.credentials,
+        "get_credential",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                credential_id="cred_pool", pin_saved_session_ip=True, proxy_session_id="ps_pool"
+            )
+        ),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login", "cred_primary", credential_ids=["cred_a", "cred_pool"]))
+    )
+
+    result = await WorkflowService()._resolve_active_credential_pin_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={},
+    )
+
+    assert result == ("cred_pool", "ps_pool")
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_prefers_request_value_over_default_for_workflow_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Setup runs before run parameters are persisted, so a request-supplied WorkflowParameter/CREDENTIAL_ID
+    # value lives only in the in-memory render params. Seeding must use it, not the parameter default, or a
+    # cached-script run seeds the wrong account.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(browser_profile_id="bp_request", auto_profile_disabled=False)
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_request")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _workflow_credential_parameter("login_wp", "cred_default_a"))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_wp": "cred_request_b"},
+    )
+
+    assert result == "bp_request"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_request_b"  # request value, not the default
+
+
+@pytest.mark.asyncio
+async def test_setup_credential_resolves_dereferenced_binding_for_fallback_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fallback-configured CredentialParameter whose credential_id indirectly references another parameter
+    # is dereferenced by the render pipeline into the in-memory params. With no persisted fallback selection
+    # yet, the rich resolver would return the raw reference; setup must use the dereferenced value.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    monkeypatch.setattr(app.DATABASE.workflow_run_credential_selections, "get_selection", AsyncMock(return_value=None))
+    get_credential = AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref", auto_profile_disabled=False))
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    monkeypatch.setattr(
+        app.DATABASE.browser_sessions,
+        "get_browser_profile",
+        AsyncMock(return_value=SimpleNamespace(browser_profile_id="bp_deref")),
+    )
+    workflow = _workflow_with_blocks(
+        _login_block("login", _credential_parameter("login_cred", "raw_reference", fallback_credential_ids=["fb"]))
+    )
+
+    result = await WorkflowService()._resolve_credential_browser_profile_id_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_cred": "cred_deref_b"},
+    )
+
+    assert result == "bp_deref"
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_deref_b"  # dereferenced, not "raw_reference"
+
+
+@pytest.mark.asyncio
+async def test_setup_pin_prefers_request_value_over_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The pin resolver shares the setup credential resolution, so a request-supplied credential's pin must
+    # win over the parameter default's pin.
+    monkeypatch.setattr(app.WORKFLOW_CONTEXT_MANAGER, "workflow_run_contexts", {})
+    get_credential = AsyncMock(
+        return_value=SimpleNamespace(credential_id="cred_b", pin_saved_session_ip=True, proxy_session_id="ps_b")
+    )
+    monkeypatch.setattr(app.DATABASE.credentials, "get_credential", get_credential)
+    workflow = _workflow_with_blocks(
+        _login_block("login", _workflow_credential_parameter("login_wp", "cred_default_a"))
+    )
+
+    result = await WorkflowService()._resolve_active_credential_pin_for_setup(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        parameter_values={"login_wp": "cred_b"},
+    )
+
+    assert result == ("cred_b", "ps_b")
+    assert get_credential.await_args.kwargs["credential_id"] == "cred_b"  # request value, not the default
 
 
 @pytest.mark.asyncio
@@ -914,7 +1261,9 @@ async def test_login_block_cached_browser_degrades_instead_of_credential_seeding
         AsyncMock(return_value=SimpleNamespace(incompatible_reason=None, attach_browser_session_id=None)),
     )
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: object())  # browser exists
+    # Browser exists but was NOT booted from the resolved profile (applied id is None).
+    open_state = SimpleNamespace(browser_artifacts=BrowserArtifacts())
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: open_state)
     get_or_create = AsyncMock()
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
     update = AsyncMock()
@@ -984,3 +1333,343 @@ async def test_login_block_no_cached_browser_still_credential_seeds(monkeypatch:
         browser_profile_id="cred_profile_x",
         browser_seed_source=BrowserSeedSource.credential,
     )
+
+
+@pytest.mark.asyncio
+async def test_login_block_open_browser_booted_from_profile_keeps_credential_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A script/setup boot already applied the setup-stamped credential profile; the loader must keep
+    # credential provenance instead of degrading a genuinely-loaded seed.
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(svc, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="cred_profile_x"))
+    monkeypatch.setattr(
+        svc,
+        "_evaluate_debug_session_profile_decision",
+        AsyncMock(return_value=SimpleNamespace(incompatible_reason=None, attach_browser_session_id=None)),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
+    open_state = SimpleNamespace(browser_artifacts=BrowserArtifacts(applied_browser_profile_id="cred_profile_x"))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: open_state)
+    get_or_create = AsyncMock()
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    update = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update)
+    reloaded = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.credential,
+        browser_profile_id="cred_profile_x",
+        start_fresh_browser=False,
+        workflow_permanent_id="wpid",
+    )
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=reloaded))
+
+    block = SimpleNamespace(navigation_goal="log in", url="https://site.example/home", label="login")
+    run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.credential, start_fresh_browser=False, workflow_permanent_id="wpid"
+    )
+    result = await svc._prepare_login_block_browser_profile(
+        block=block,  # type: ignore[arg-type]
+        workflow_run=run,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    update.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="cred_profile_x",
+        browser_seed_source=BrowserSeedSource.credential,
+    )
+    get_or_create.assert_not_awaited()  # the open browser already holds the profile
+    assert result.browser_seed_source == BrowserSeedSource.credential
+    assert block.navigation_goal.startswith("A saved browser session has been loaded.")
+
+
+@pytest.mark.asyncio
+async def test_login_block_boot_degrades_when_profile_not_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The created browser (e.g. a remote/vendor type) accepted the profile id but never loaded it —
+    # the run must degrade instead of staying credential-stamped over an unrelated context.
+    get_or_create = AsyncMock(
+        return_value=SimpleNamespace(
+            get_working_page=AsyncMock(return_value=None),
+            browser_artifacts=BrowserArtifacts(),
+        )
+    )
+    degraded_run = SimpleNamespace(browser_seed_source=BrowserSeedSource.degraded_fresh, browser_profile_id=None)
+
+    log = MagicMock()
+    monkeypatch.setattr(service_module, "LOG", log)
+
+    result, update, _ = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url="https://login.example/session",
+        values={},
+        get_or_create=get_or_create,
+        get_workflow_run=AsyncMock(side_effect=[None, degraded_run]),
+    )
+
+    assert update.await_args_list[-1].kwargs == {
+        "workflow_run_id": "wr_test",
+        "browser_profile_id": None,
+        "browser_seed_source": BrowserSeedSource.degraded_fresh,
+    }
+    assert result is degraded_run
+    expected_log = next(
+        call
+        for call in log.info.call_args_list
+        if call.args[0] == "Saved browser profile was not applied; falling back to normal login"
+    )
+    assert "exc_info" not in expected_log.kwargs
+    assert not any(
+        call.args[0] == "Saved browser profile failed to load, falling back to normal login"
+        for call in log.warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_login_block_boot_keeps_credential_when_profile_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = SimpleNamespace(url="https://login.example/session", wait_for_load_state=AsyncMock())
+    get_or_create = AsyncMock(
+        return_value=SimpleNamespace(
+            get_working_page=AsyncMock(return_value=page),
+            browser_artifacts=BrowserArtifacts(applied_browser_profile_id="cred_profile_x"),
+        )
+    )
+
+    _, update, block = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url="https://login.example/session",
+        values={},
+        get_or_create=get_or_create,
+    )
+
+    update.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="cred_profile_x",
+        browser_seed_source=BrowserSeedSource.credential,
+    )
+    assert block.navigation_goal.startswith("A saved browser session has been loaded.")
+
+
+@pytest.mark.asyncio
+async def test_login_block_boot_skips_not_applied_check_for_debug_session_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A compatible debug-session attach returns the PBS browser, whose artifacts do not carry the
+    # profile id; compat was already evaluated, so the not-applied degrade must not fire.
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(svc, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="cred_profile_x"))
+    monkeypatch.setattr(
+        svc,
+        "_evaluate_debug_session_profile_decision",
+        AsyncMock(return_value=SimpleNamespace(incompatible_reason=None, attach_browser_session_id="pbs_1")),
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
+    page = SimpleNamespace(url="https://site.example/home", wait_for_load_state=AsyncMock())
+    get_or_create = AsyncMock(
+        return_value=SimpleNamespace(
+            get_working_page=AsyncMock(return_value=page),
+            browser_artifacts=BrowserArtifacts(),
+        )
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    update = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=None))
+
+    block = SimpleNamespace(navigation_goal="log in", url="https://site.example/home", label="login")
+    run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.credential, start_fresh_browser=False, workflow_permanent_id="wpid"
+    )
+    await svc._prepare_login_block_browser_profile(
+        block=block,  # type: ignore[arg-type]
+        workflow_run=run,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+
+    update.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="cred_profile_x",
+        browser_seed_source=BrowserSeedSource.credential,
+    )
+
+
+async def _prepare_login_block_profile_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    url: str,
+    values: dict[str, str],
+    get_or_create: AsyncMock,
+    get_workflow_run: AsyncMock | None = None,
+) -> tuple[object, AsyncMock, LoginBlock]:
+    context = WorkflowRunContext(
+        workflow_title="Workflow",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    context.values.update(values)
+    for key in values:
+        context.parameters[key] = _string_parameter(key)
+    # The stub app auto-mocks WORKFLOW_CONTEXT_MANAGER attributes as AsyncMocks, so the real manager is
+    # installed here to exercise the actual context lookup the renderer does.
+    context_manager = WorkflowContextManager()
+    context_manager.workflow_run_contexts["wr_test"] = context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", context_manager)
+
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(svc, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="cred_profile_x"))
+    monkeypatch.setattr(
+        svc,
+        "_evaluate_debug_session_profile_decision",
+        AsyncMock(return_value=SimpleNamespace(incompatible_reason=None, attach_browser_session_id=None)),
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    update = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update)
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        get_workflow_run or AsyncMock(return_value=None),
+    )
+
+    block = _login_block("login", _credential_parameter("login", "cred_1"), url=url)
+    run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.credential,
+        start_fresh_browser=False,
+        workflow_permanent_id="wpid",
+    )
+    result = await svc._prepare_login_block_browser_profile(
+        block=block,
+        workflow_run=run,  # type: ignore[arg-type]
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_session_id=None,
+    )
+    return result, update, block
+
+
+@pytest.mark.parametrize(
+    ("raw_url", "values", "expected_url"),
+    [
+        pytest.param(
+            "{{ some_url_parameter }}",
+            {"some_url_parameter": "login.example/session"},
+            "https://login.example/session",
+            id="templated",
+        ),
+        pytest.param(
+            "https://login.example/session",
+            {},
+            "https://login.example/session",
+            id="literal",
+        ),
+        pytest.param(
+            "some_url_parameter",
+            {"some_url_parameter": "https://login.example/session"},
+            "https://login.example/session",
+            id="direct_parameter_key",
+        ),
+        pytest.param(
+            # Pins the resolution ORDER: the direct key must be substituted BEFORE jinja runs, or the
+            # nested template survives unrendered.
+            "url_param",
+            {"url_param": "{{ host }}/login", "host": "login.example"},
+            "https://login.example/login",
+            id="direct_parameter_key_holding_a_template",
+        ),
+        pytest.param(
+            "login.example/session",
+            {},
+            "https://login.example/session",
+            id="schemeless_literal_is_normalized",
+        ),
+        pytest.param(
+            "https://www.www.login.example/session",
+            {},
+            "https://www.www.login.example/session",
+            id="schemed_literal_is_passed_through_uncanonicalized",
+        ),
+        pytest.param(
+            "not a url",
+            {},
+            "not a url",
+            id="schemeless_literal_that_fails_validation_keeps_raw",
+        ),
+        pytest.param(
+            "{{ some_url_parameter }}",
+            {"some_url_parameter": "not a url"},
+            "{{ some_url_parameter }}",
+            id="renders_to_invalid_url_keeps_raw",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_login_block_profile_boot_resolves_url(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_url: str,
+    values: dict[str, str],
+    expected_url: str,
+) -> None:
+    page = SimpleNamespace(url=expected_url, wait_for_load_state=AsyncMock())
+    get_or_create = AsyncMock(
+        return_value=SimpleNamespace(
+            get_working_page=AsyncMock(return_value=page),
+            browser_artifacts=BrowserArtifacts(applied_browser_profile_id="cred_profile_x"),
+        )
+    )
+
+    _, _, block = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url=raw_url,
+        values=values,
+        get_or_create=get_or_create,
+    )
+
+    assert get_or_create.await_args.kwargs["url"] == expected_url
+    assert block.url == raw_url
+
+
+@pytest.mark.asyncio
+async def test_login_block_profile_boot_unresolved_url_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_or_create = AsyncMock(side_effect=RuntimeError("profile boot failed"))
+    degraded_run = SimpleNamespace(
+        browser_seed_source=BrowserSeedSource.degraded_fresh,
+        browser_profile_id=None,
+    )
+
+    raw_url = "{{ missing_url_parameter }}"
+    log = MagicMock()
+    monkeypatch.setattr(service_module, "LOG", log)
+
+    result, update, _ = await _prepare_login_block_profile_boot(
+        monkeypatch,
+        url=raw_url,
+        values={},
+        get_or_create=get_or_create,
+        get_workflow_run=AsyncMock(side_effect=[None, degraded_run]),
+    )
+
+    assert get_or_create.await_args.kwargs["url"] == raw_url
+    assert update.await_args_list[-1].kwargs == {
+        "workflow_run_id": "wr_test",
+        "browser_profile_id": None,
+        "browser_seed_source": BrowserSeedSource.degraded_fresh,
+    }
+    assert result is degraded_run
+    unexpected_log = next(
+        call
+        for call in log.warning.call_args_list
+        if call.args[0] == "Saved browser profile failed to load, falling back to normal login"
+    )
+    assert unexpected_log.kwargs["exc_info"] is True

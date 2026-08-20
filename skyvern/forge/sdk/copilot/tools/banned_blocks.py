@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
-from skyvern.forge.sdk.copilot.enforcement import PROBABLE_SITE_BLOCK_STREAK_STOP_AT
-from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
-from ._shared import _iter_yaml_blocks, _parse_workflow_blocks
+from ._shared import _parse_workflow_blocks
 
 
 class CopilotBlockPolicyStatus(StrEnum):
@@ -194,13 +191,34 @@ def _code_only_browser_unavailable_types() -> list[str]:
     )
 
 
-def _code_only_browser_pending_details() -> list[str]:
+def _code_only_browser_pending_details(settled_block_types: frozenset[str] | None = None) -> list[str]:
+    settled = settled_block_types or frozenset()
     return [
         _render_block_policy_detail(block_type, policy)
         for block_type, policy in sorted(_COPILOT_BLOCK_TYPE_POLICIES.items())
         if policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
         and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
+        and block_type not in settled
     ]
+
+
+def _extract_existing_code_only_pending_block_types(prior_workflow_yaml: str | None) -> frozenset[str]:
+    blocks = _parse_workflow_blocks(prior_workflow_yaml)
+    if not blocks:
+        return frozenset()
+
+    existing_types: set[str] = set()
+    for _label, block_type in _collect_banned_block_items(blocks, _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES):
+        normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
+        policy = _COPILOT_BLOCK_TYPE_POLICIES.get(normalized)
+        if (
+            policy is not None
+            and policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
+            and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
+        ):
+            existing_types.add(normalized)
+
+    return frozenset(existing_types)
 
 
 def _code_only_browser_unavailable_summary() -> str:
@@ -219,19 +237,53 @@ def _code_only_browser_validation_guidance() -> str:
     )
 
 
-def _code_only_browser_schema_guidance() -> list[str]:
-    return [
+def _login_is_settled(settled_block_types: frozenset[str] | None) -> bool:
+    return bool(settled_block_types) and "login" in (settled_block_types or frozenset())
+
+
+def _code_only_browser_schema_guidance(settled_block_types: frozenset[str] | None = None) -> list[str]:
+    guidance = [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
         _code_only_browser_unavailable_summary(),
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, and use await <key>.otp() for authenticator, email, or SMS one-time codes. Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
+        "The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
     ]
+    if not _login_is_settled(settled_block_types):
+        guidance.append(
+            "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, use await <key>.otp() for authenticator, email, or SMS one-time codes, and use await <key>.magic_link(page) when the scouted page offers an emailed sign-in link; that broker navigates the page without exposing the sign-in link to authored code. Never put literal secret values in code; scout credential fields with fill_credential_field."
+        )
+    return guidance
 
 
-def _code_only_browser_authoring_prompt() -> str:
-    pending = "\n".join(f"- {detail}" for detail in _code_only_browser_pending_details())
+def _code_only_browser_credential_login_rules(settled_block_types: frozenset[str] | None = None) -> str:
+    """Expose credential accessors without prescribing login control flow."""
+    return """- A `credential_id` workflow parameter resolves to a credential object with
+  `<key>.username`, `<key>.password`, `await <key>.otp()` for one-time codes, and
+  `await <key>.magic_link(page)` for an emailed sign-in link without exposing the sign-in link to authored code;
+  scout fields with
+  `fill_credential_field`, never embed literal secrets.
+- The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while
+  scouting; this is an available capability, not a required login step.\n"""
+
+
+def _code_only_browser_block_status_section(settled_block_types: frozenset[str] | None = None) -> str:
+    sections = []
+    details = _code_only_browser_pending_details(settled_block_types)
+    if details:
+        rendered = "\n".join(f"- {detail}" for detail in details)
+        sections.append(f"Code-native capabilities still pending plumbing:\n{rendered}")
+    if settled_block_types:
+        settled = ", ".join(f"`{block_type}`" for block_type in sorted(settled_block_types))
+        sections.append(f"Already saved in this workflow, inherited as-is and not pending conversion: {settled}.")
+    return "\n\n".join(sections)
+
+
+def _code_only_browser_authoring_prompt(settled_block_types: frozenset[str] | None = None) -> str:
+    pending = _code_only_browser_block_status_section(settled_block_types)
+    credential_login_rules = _code_only_browser_credential_login_rules(settled_block_types)
     return f"""
 ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
@@ -240,11 +292,10 @@ ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 Rules:
 - Browser/page/session durable steps must be focused `code` blocks.
 - Allowed non-browser helper blocks remain available: `conditional`, `for_loop`,
-  `while_loop`, `send_email`, S3/Google Sheets helpers, file parsers, and triggers.
+  `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file
+  parsers, and triggers.
 - {_code_only_browser_validation_guidance()}
-- Do not call `get_run_results` before a real workflow run exists.
 
-Code-native capabilities still pending plumbing:
 {pending}
 
 Runtime facts:
@@ -256,28 +307,12 @@ Runtime facts:
   `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.
 - For browser reads, prefer visible anchors, locator text, block outputs, and
   MCP/scout evidence gathered before authoring.
-- A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, and `await <key>.otp()` for one-time codes; scout fields with
-  `fill_credential_field`, never embed literal secrets.
-- Credentialed login code must be idempotent. After `goto`, wait for either the
-  login form or an already-authenticated page anchor; only fill username/password
-  when the login fields are visible, and after submit wait for a logged-in page
-  anchor instead of relying only on `networkidle`.
-- After a credentialed login submit or navigation commit, call
-  `await solve_captcha(page)` before waiting for post-login anchors. This helper
-  owns any platform-managed verification challenge; do not locate or interact
-  with challenge controls directly.
-- After challenge handling, wait for either the observed one-time-code field or
-  a real authenticated-page anchor. If an OTP field appears, fill it with
-  `await <credential_key>.otp()`, submit the observed Next/Verify control, and
-  then wait for the authenticated anchor. Do not treat disappearance of the
-  login fields as proof of authentication.
-- Return JSON-safe structured data plus visible evidence text for records, totals,
+{credential_login_rules}- Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
-- For an extraction-intent `code` block, propose a typed `extraction_schema` (named
-  fields with types) from the goal and the scouted page, ASK_QUESTION to confirm or
-  adjust which fields to grab, then carry the confirmed JSON Schema as
-  `extraction_schema` on `code_artifact_metadata` and conform the block's `return` to it.
+- For an extraction-intent `code` block, derive a typed `extraction_schema` (named
+  fields with types) from the goal and the scouted page, carry it as
+  `extraction_schema` on `code_artifact_metadata`, conform the block's `return` to it,
+  and name the fields you chose when you deliver so the user can adjust them.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 
@@ -413,112 +448,3 @@ def _detect_new_banned_blocks(
     prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
     prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [], active_banned_types)}
     return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
-
-
-_CHALLENGE_WAIT_PATTERN = re.compile(
-    r"\b(anti[-_\s]?bot|bot[-_\s]?block|captcha|challenge|human[-_\s]?verification|ip[-_\s]?block|waf)\b",
-    re.IGNORECASE,
-)
-
-
-def _has_confirmed_waf_or_site_block(ctx: Any) -> bool:
-    if getattr(ctx, "last_test_anti_bot", None):
-        return True
-    return _get_int_attr(ctx, "probable_site_block_streak_count") >= PROBABLE_SITE_BLOCK_STREAK_STOP_AT
-
-
-def _get_int_attr(ctx: Any, name: str, default: int = 0) -> int:
-    value = getattr(ctx, name, default)
-    return value if isinstance(value, int) else default
-
-
-def _block_challenge_wait_text(block: dict[str, Any]) -> str:
-    values = []
-    for key in ("label", "title", "description", "navigation_goal", "complete_criterion"):
-        value = block.get(key)
-        if isinstance(value, str):
-            values.append(value)
-    return " ".join(values)
-
-
-def _detect_timing_only_challenge_wait_blocks(submitted_yaml: str | None) -> list[str]:
-    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
-    if submitted_blocks is None:
-        return []
-    labels: list[str] = []
-    for block in _iter_yaml_blocks(submitted_blocks):
-        raw_type = block.get("block_type")
-        if not isinstance(raw_type, str) or raw_type.strip().lower() != "wait":
-            continue
-        label = block.get("label")
-        if not isinstance(label, str):
-            continue
-        if _CHALLENGE_WAIT_PATTERN.search(_block_challenge_wait_text(block)):
-            labels.append(label)
-    return labels
-
-
-def _composition_evidence_has_challenge(ctx: AgentContext) -> bool:
-    evidence = getattr(ctx, "composition_page_evidence", None)
-    if not isinstance(evidence, dict):
-        return False
-    if evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"):
-        return True
-    challenge_state = evidence.get("challenge_state")
-    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
-
-
-def _detect_new_http_request_blocks(submitted_yaml: str | None, prior_workflow_yaml: str | None) -> list[str]:
-    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
-    if submitted_blocks is None:
-        return []
-    prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
-    prior_labels: set[str] = set()
-    for block in _iter_yaml_blocks(prior_blocks or []):
-        if str(block.get("block_type") or "").strip().lower() != "http_request":
-            continue
-        label = block.get("label")
-        if isinstance(label, str):
-            prior_labels.add(label)
-    labels: list[str] = []
-    for block in _iter_yaml_blocks(submitted_blocks):
-        if str(block.get("block_type") or "").strip().lower() != "http_request":
-            continue
-        label = block.get("label")
-        if isinstance(label, str) and label not in prior_labels:
-            labels.append(label)
-    return labels
-
-
-def _challenge_http_request_reject_message(
-    ctx: AgentContext, submitted_yaml: str | None, prior_workflow_yaml: str | None
-) -> str | None:
-    if not _composition_evidence_has_challenge(ctx):
-        return None
-    labels = _detect_new_http_request_blocks(submitted_yaml, prior_workflow_yaml)
-    if not labels:
-        return None
-    labels_text = ", ".join(sorted(set(labels)))
-    return (
-        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}raw http_request blocks are not allowed for a page with observed "
-        "anti-bot or human-verification challenge evidence. "
-        f"Offending labels: [{labels_text}]. "
-        "Use browser workflow blocks grounded in the observed page, include challenge handling only when visible, "
-        "or stop and report the observed challenge blocker if it cannot be completed."
-    )
-
-
-def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | None) -> str | None:
-    if not _has_confirmed_waf_or_site_block(ctx):
-        return None
-    labels = _detect_timing_only_challenge_wait_blocks(submitted_yaml)
-    if not labels:
-        return None
-    labels_text = ", ".join(sorted(set(labels)))
-    return (
-        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}timing-only challenge wait blocks are not allowed after confirmed "
-        "anti-bot/WAF or repeated site-block evidence. "
-        f"Offending labels: [{labels_text}]. "
-        "Do not add wait/delay-only blocks for this blocker; use a conditional challenge check that takes a "
-        "real action, try a materially different proxy/source if allowed, or stop and explain the blocker."
-    )

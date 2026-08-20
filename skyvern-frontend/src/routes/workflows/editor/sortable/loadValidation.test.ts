@@ -38,6 +38,7 @@ function code(label: string, next: string | null): CodeBlock {
     output_parameter: op(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
   };
 }
 
@@ -232,6 +233,55 @@ describe("validateWorkflowBlocks", () => {
     ).toThrow(/Duplicate block label/);
   });
 
+  test("allows an out-of-band finally block with no inbound edges", () => {
+    const blocks: Array<WorkflowBlock> = [
+      code("B1", "B2"),
+      code("B2", null),
+      code("F", null),
+    ];
+
+    expect(() => validateWorkflowBlocks(blocks, null, "F")).not.toThrow();
+    expect(() => validateWorkflowBlocks(blocks)).toThrow(
+      /Disconnected blocks detected: blocks \(B1, F\)/,
+    );
+  });
+
+  test("ignores an edge targeting the finally block", () => {
+    expect(() =>
+      validateWorkflowBlocks(
+        [code("start", "finally"), code("finally", null)],
+        null,
+        "finally",
+      ),
+    ).not.toThrow();
+  });
+
+  test("rejects duplicate labels when the duplicated label is the finally block", () => {
+    expect(() =>
+      validateWorkflowBlocks(
+        [code("start", null), code("finally", null), code("finally", null)],
+        null,
+        "finally",
+      ),
+    ).toThrow(/Duplicate block label/);
+  });
+
+  // Both halves of the getElements pipeline are needed: defaulting must not
+  // invent an edge into the finally block, and the validator must strip it.
+  test("an all-null chain around a non-last finally block stays valid", () => {
+    const blocks = applySequentialDefaulting(
+      [code("B1", null), code("F", null), code("B2", null)],
+      "F",
+    );
+
+    expect(blocks.map((b) => [b.label, b.next_block_label])).toEqual([
+      ["B1", "B2"],
+      ["F", null],
+      ["B2", null],
+    ]);
+    expect(() => validateWorkflowBlocks(blocks, null, "F")).not.toThrow();
+  });
+
   test("rejects dangling next_block_label", () => {
     expect(() =>
       validateWorkflowBlocks([code("B1", "DOES_NOT_EXIST")]),
@@ -261,22 +311,16 @@ describe("validateWorkflowBlocks", () => {
   });
 
   test("recurses into loop_blocks and reports the failing nesting level", () => {
-    const innerBad: Array<WorkflowBlock> = [code("L1", "L2"), code("L2", "L1")];
-    const loop: ForLoopBlock = {
-      label: "FOR1",
-      block_type: "for_loop",
-      continue_on_failure: false,
-      model: null,
-      next_block_label: null,
-      output_parameter: op("FOR1"),
-      loop_over: { key: "items" } as never,
-      loop_blocks: innerBad,
-      loop_variable_reference: null,
-      complete_if_empty: false,
-      data_schema: null,
-    };
+    const loop = forLoop("FOR1", [code("L1", "L2"), code("L2", "L1")]);
     expect(() => validateWorkflowBlocks([loop])).toThrow(
       /Circular reference.+inside loop FOR1|inside loop FOR1.+cycle/,
+    );
+  });
+
+  test("still recurses into loop_blocks when the only block is the finally block", () => {
+    const loop = forLoop("FOR1", [code("L1", "L2"), code("L2", "L1")]);
+    expect(() => validateWorkflowBlocks([loop], null, "FOR1")).toThrow(
+      /inside loop FOR1/,
     );
   });
 });

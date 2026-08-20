@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import datetime
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.sql.elements import ColumnElement
 
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -19,6 +20,37 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
 LOG = structlog.get_logger()
+
+
+def _session_download_scope_filters(
+    browser_session_id: str,
+    organization_id: str,
+    run_started_at: datetime.datetime,
+) -> list[ColumnElement[bool]]:
+    """Session-scoped DOWNLOAD rows written inside the run's window. The lower bound applies to
+    stamped rows too: a canonical download key can name a parent workflow, whose pre-start downloads
+    are not this run's."""
+    return [
+        ArtifactModel.browser_session_id == browser_session_id,
+        ArtifactModel.organization_id == organization_id,
+        ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+        ArtifactModel.created_at >= run_started_at,
+    ]
+
+
+def _session_download_filters(
+    run_id: str,
+    browser_session_id: str,
+    organization_id: str,
+    run_started_at: datetime.datetime,
+) -> list[ColumnElement[bool]]:
+    """In-window rows attributable to ``run_id``: the watcher stamped this run as producer, or the
+    row is still unbound. The unbound arm is the legacy shape, kept for rows written before
+    stamping."""
+    return [
+        *_session_download_scope_filters(browser_session_id, organization_id, run_started_at),
+        or_(ArtifactModel.run_id == run_id, ArtifactModel.run_id.is_(None)),
+    ]
 
 
 class ArtifactsRepository(BaseRepository):
@@ -76,6 +108,59 @@ class ArtifactsRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_artifact)
             return convert_to_artifact(new_artifact, self.debug_enabled)
+
+    @db_operation("refresh_download_artifact_content")
+    async def refresh_download_artifact_content(
+        self,
+        artifact_id: str,
+        organization_id: str,
+        checksum: str,
+        file_size: int | None,
+    ) -> None:
+        # file_size is written unconditionally: a None (size unreadable) is more honest than a
+        # fresh checksum paired with the previous content's length.
+        async with self.Session() as session:
+            await session.execute(
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact_id,
+                    ArtifactModel.organization_id == organization_id,
+                    ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+                )
+                .values(checksum=checksum, file_size=file_size)
+            )
+            await session.commit()
+
+    @db_operation("update_artifact_uri")
+    async def update_artifact_uri(
+        self,
+        artifact_id: str,
+        organization_id: str,
+        uri: str,
+        file_size: int | None = None,
+    ) -> Artifact | None:
+        update_values: dict[str, Any] = {"uri": uri}
+        if file_size is not None:
+            update_values["file_size"] = file_size
+
+        async with self.Session() as session:
+            query = (
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact_id,
+                    ArtifactModel.organization_id == organization_id,
+                )
+                .values(**update_values)
+                .returning(ArtifactModel)
+            )
+            artifact = await session.scalar(query)
+            if artifact is None:
+                return None
+            # Read the row before committing: commit expires the instance, and the
+            # refetch it would trigger runs outside the async greenlet context.
+            converted = convert_to_artifact(artifact, self.debug_enabled)
+            await session.commit()
+            return converted
 
     @traced(name="skyvern.db.bulk_create_artifacts")
     @db_operation("bulk_create_artifacts")
@@ -522,27 +607,58 @@ class ArtifactsRepository(BaseRepository):
         organization_id: str,
         run_started_at: datetime.datetime,
     ) -> int:
-        """Tag session-scoped DOWNLOAD artifacts that landed during this run with ``run_id``.
-
-        Called at run finalization. ``occupy_browser_session`` ensures at
-        most one run is active on a session at a time, so the time-window
-        match is unambiguous.
-
-        Returns the number of rows updated. Idempotent: re-running picks up
-        only ``run_id IS NULL`` rows, so a retry after success is a no-op.
-        """
+        """Reconcile in-window session-scoped DOWNLOAD rows the watcher left unbound onto ``run_id``,
+        returning the number updated. Idempotent: an already-stamped row is never re-stamped, so a
+        retry after success is a no-op."""
         async with self.Session() as session:
             result = await session.execute(
                 update(ArtifactModel)
-                .where(ArtifactModel.browser_session_id == browser_session_id)
-                .where(ArtifactModel.organization_id == organization_id)
-                .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                .where(*_session_download_scope_filters(browser_session_id, organization_id, run_started_at))
                 .where(ArtifactModel.run_id.is_(None))
-                .where(ArtifactModel.created_at >= run_started_at)
                 .values(run_id=run_id)
             )
             await session.commit()
             return result.rowcount or 0
+
+    @db_operation("bind_session_download_artifact_producer")
+    async def bind_session_download_artifact_producer(
+        self,
+        artifact_id: str,
+        organization_id: str,
+        run_id: str,
+    ) -> bool:
+        """Fill an unbound row's producing run. Never re-stamps: the watcher re-uploads a download as
+        it grows, and a later observation can fall after the session changed hands."""
+        async with self.Session() as session:
+            result = await session.execute(
+                update(ArtifactModel)
+                .where(ArtifactModel.artifact_id == artifact_id)
+                .where(ArtifactModel.organization_id == organization_id)
+                .where(ArtifactModel.artifact_type == ArtifactType.DOWNLOAD)
+                .where(ArtifactModel.run_id.is_(None))
+                .values(run_id=run_id)
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
+    @db_operation("list_session_download_artifact_ids_for_run")
+    async def list_session_download_artifact_ids_for_run(
+        self,
+        run_id: str,
+        browser_session_id: str,
+        organization_id: str,
+        run_started_at: datetime.datetime,
+    ) -> set[str]:
+        """Ids of the session-scoped DOWNLOAD artifacts attributable to this run, both stamped and
+        still-unbound in-window rows, so a grader reading before the claim is not short. Ids rather
+        than a count because a caller combining this with a run-scoped read would double-count."""
+        async with self.Session() as session:
+            result = await session.scalars(
+                select(ArtifactModel.artifact_id).where(
+                    *_session_download_filters(run_id, browser_session_id, organization_id, run_started_at)
+                )
+            )
+            return set(result.all())
 
     @db_operation("delete_artifact_for_browser_session")
     async def delete_artifact_for_browser_session(
@@ -672,6 +788,21 @@ class ArtifactsRepository(BaseRepository):
                 and_(
                     ArtifactModel.organization_id == organization_id,
                     ArtifactModel.task_id == task_id,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    @db_operation("delete_artifacts_by_ids")
+    async def delete_artifacts_by_ids(self, *, organization_id: str, artifact_ids: list[str]) -> None:
+        if not artifact_ids:
+            return
+
+        async with self.Session() as session:
+            stmt = delete(ArtifactModel).where(
+                and_(
+                    ArtifactModel.organization_id == organization_id,
+                    ArtifactModel.artifact_id.in_(artifact_ids),
                 )
             )
             await session.execute(stmt)

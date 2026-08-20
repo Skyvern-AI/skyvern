@@ -1,10 +1,17 @@
 """Tests for all OSS repository instantiations + dependency injection."""
 
 import inspect
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from skyvern.forge.sdk.db.models import OrganizationModel
+from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
 
 def test_credential_repository_instantiation():
@@ -79,6 +86,100 @@ async def test_otp_repository_can_include_unscoped_workflow_run_rows_in_sql():
     assert "totp_codes.workflow_run_id = :workflow_run_id_1" in sql
     assert "totp_codes.workflow_run_id IS NULL" in sql
     assert " OR " in sql
+    assert "totp_codes.parse_status = :parse_status_1" in sql
+    await repo.get_raw_otp_codes(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        workflow_run_id="wr_test",
+        include_unscoped_workflow_run=True,
+        created_after=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    sql = str(session.query)
+    assert "totp_codes.parse_status = :parse_status_1" in sql
+    assert "totp_codes.workflow_run_id IS NULL" in sql
+    assert "totp_codes.created_at >=" in sql
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_stores_blank_run_scoping_ids_as_null():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
+
+    class CapturingWriteSession:
+        added = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def add(self, obj):
+            self.added = obj
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            obj.totp_code_id = "otp_test"
+            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    session = CapturingWriteSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+
+    await repo.create_otp_code(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        content="123456",
+        code="123456",
+        otp_type=OTPType.TOTP,
+        task_id="",
+        workflow_id="",
+        workflow_run_id="",
+    )
+
+    assert session.added.workflow_run_id is None
+    assert session.added.workflow_id is None
+    assert session.added.task_id is None
+
+
+@pytest.mark.asyncio
+async def test_otp_repository_creates_raw_row_without_fabricated_code():
+    from skyvern.forge.sdk.db.repositories.otp import OTPRepository
+
+    class CapturingWriteSession:
+        added = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def add(self, obj):
+            self.added = obj
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, obj):
+            obj.totp_code_id = "otp_raw"
+            obj.created_at = obj.modified_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    session = CapturingWriteSession()
+    repo = OTPRepository(session_factory=lambda: session, debug_enabled=False)
+    result = await repo.create_raw_otp_code(
+        organization_id="o_test",
+        totp_identifier="otp@example.test",
+        content="unparsed content",
+        workflow_run_id="",
+    )
+
+    assert result.totp_code_id == "otp_raw"
+    assert session.added.code is None
+    assert session.added.otp_type is None
+    assert session.added.parse_status == "raw"
+    assert session.added.workflow_run_id is None
 
 
 def test_debug_repository_instantiation():
@@ -102,6 +203,43 @@ def test_organizations_repository_instantiation():
     assert hasattr(repo, "create_organization")
     assert hasattr(repo, "create_org_auth_token")
     assert hasattr(repo, "validate_org_auth_token")
+
+
+@pytest.mark.asyncio
+async def test_organizations_repository_persists_and_clears_default_llm_keys(sqlite_engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(OrganizationModel(organization_id="o_defaults", organization_name="Defaults Org"))
+        await session.commit()
+
+    repo = OrganizationsRepository(session_factory=session_factory, debug_enabled=False)
+    updated = await repo.update_organization(
+        "o_defaults",
+        default_llm_key="CUSTOM_LLM_oat_primary",
+        default_secondary_llm_key="CUSTOM_LLM_oat_secondary",
+    )
+
+    assert updated.default_llm_key == "CUSTOM_LLM_oat_primary"
+    assert updated.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key == "CUSTOM_LLM_oat_primary"
+        assert stored.default_secondary_llm_key == "CUSTOM_LLM_oat_secondary"
+
+    cleared = await repo.update_organization(
+        "o_defaults",
+        clear_default_llm_key=True,
+        clear_default_secondary_llm_key=True,
+    )
+
+    assert cleared.default_llm_key is None
+    assert cleared.default_secondary_llm_key is None
+    async with session_factory() as session:
+        stored = await session.get(OrganizationModel, "o_defaults")
+        assert stored is not None
+        assert stored.default_llm_key is None
+        assert stored.default_secondary_llm_key is None
 
 
 def test_schedules_repository_instantiation():
@@ -287,3 +425,40 @@ def test_agent_db_defines_no_delegator_methods():
         "Add data-access methods to the domain repository and call it via the typed attribute "
         "(e.g. db.tasks.get_task) instead of adding delegators to AgentDB."
     )
+
+
+async def _create_task_with_status(monkeypatch: pytest.MonkeyPatch, status: str):
+    from skyvern.forge.sdk.db.repositories import tasks as tasks_module
+
+    session = make_mock_session(MagicMock())
+    monkeypatch.setattr(tasks_module, "convert_to_task", lambda model, *args, **kwargs: model)
+    repo = tasks_module.TasksRepository(
+        session_factory=lambda: MockAsyncSessionCtx(session),
+        debug_enabled=False,
+    )
+
+    return await repo.create_task(
+        url="https://example.test/",
+        title=None,
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload=None,
+        status=status,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_running_is_not_created_after_it_started(monkeypatch: pytest.MonkeyPatch):
+    """queued_seconds is started_at - created_at, so a task created already-running must not
+    stamp started_at ahead of the flush-time created_at default."""
+    task = await _create_task_with_status(monkeypatch, TaskStatus.running.value)
+
+    assert task.started_at is not None
+    assert task.created_at == task.started_at
+
+
+@pytest.mark.asyncio
+async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatch: pytest.MonkeyPatch):
+    task = await _create_task_with_status(monkeypatch, TaskStatus.created.value)
+
+    assert task.started_at is None

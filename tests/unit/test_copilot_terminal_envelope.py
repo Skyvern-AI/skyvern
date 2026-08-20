@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+)
+from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     TerminalOutcomeEnvelope,
@@ -16,6 +21,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
     render_terminal_message,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import _stash_recorded_run_outcome
+from skyvern.forge.sdk.copilot.tools.workflow_update import _record_workflow_update_result
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -34,7 +40,7 @@ def _assemble(**overrides: Any):
         "halt_kind": None,
         "attempted": None,
         "workflow_mutated": False,
-        "turn_outcome_response_kind": None,
+        "workflow_attempted": True,
     }
     defaults.update(overrides)
     envelope = assemble_terminal_envelope(**defaults)
@@ -42,28 +48,28 @@ def _assemble(**overrides: Any):
     return envelope
 
 
-def test_run_anchor_prefers_last_not_demonstrated_even_if_later_run_demonstrated() -> None:
+def test_run_anchor_reports_the_actual_latest_run() -> None:
     envelope = _assemble(
         run_outcomes=[
             _run_outcome("not_demonstrated", "The checkout did not reach confirmation."),
-            _run_outcome("demonstrated", "A later scout run succeeded."),
+            _run_outcome("not_evaluated", "A later scout run completed."),
         ]
     )
 
-    assert envelope.run_verdict == "not_demonstrated"
-    assert envelope.run_display_reason == "The checkout did not reach confirmation."
+    assert envelope.run_verdict == "not_evaluated"
+    assert envelope.run_display_reason == "A later scout run completed."
 
 
 def test_run_anchor_falls_back_to_latest_final_verdict_when_no_not_demonstrated() -> None:
     envelope = _assemble(
         run_outcomes=[
-            _run_outcome("not_evaluated", "Could not evaluate."),
-            _run_outcome("demonstrated", "Confirmed."),
+            _run_outcome("not_evaluated", "First run completed."),
+            _run_outcome("not_evaluated", "Later run completed."),
         ]
     )
 
-    assert envelope.run_verdict == "demonstrated"
-    assert envelope.run_display_reason == "Confirmed."
+    assert envelope.run_verdict == "not_evaluated"
+    assert envelope.run_display_reason == "Later run completed."
 
 
 def test_run_anchor_empty_when_no_recorded_outcomes() -> None:
@@ -87,19 +93,60 @@ def test_unknown_halt_kind_degrades_to_stopped_never_question() -> None:
     assert finalized.next_state == "stopped"
 
 
-def test_anchor_supersession_divergence_is_logged() -> None:
-    with structlog.testing.capture_logs() as logs:
-        _assemble(
-            run_outcomes=[
-                _run_outcome("not_demonstrated", "The checkout did not reach confirmation."),
-                _run_outcome("demonstrated", "A later scout run succeeded."),
-            ]
-        )
-    assert any("anchored a not_demonstrated verdict" in log["event"] for log in logs)
+def test_anchor_uses_the_latest_final_run_fact() -> None:
+    envelope = _assemble(
+        run_outcomes=[
+            _run_outcome("not_demonstrated", "The checkout did not reach confirmation."),
+            _run_outcome("not_evaluated", "A later run completed."),
+        ]
+    )
 
-    with structlog.testing.capture_logs() as logs:
-        _assemble(run_outcomes=[_run_outcome("not_demonstrated", "No later run.")])
-    assert not any("anchored a not_demonstrated verdict" in log["event"] for log in logs)
+    assert envelope.run_verdict == "not_evaluated"
+    assert envelope.run_display_reason == "A later run completed."
+
+
+def _interim_outcome(verdict: str, display_reason: str | None = None) -> RecordedRunOutcome:
+    return RecordedRunOutcome(verdict=verdict, display_reason=display_reason, role="interim_build_test")
+
+
+def test_run_anchor_ignores_interim_not_demonstrated_when_recorded_run_follows() -> None:
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The scout has not produced the goal yet."),
+            _run_outcome("not_evaluated", "The later run completed."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_evaluated"
+    assert envelope.run_display_reason == "The later run completed."
+
+
+def test_run_anchor_keeps_interim_amber_when_no_adjudicated_outcome() -> None:
+    # Repair ceiling: the loop stops after a suspicious-success run without ever
+    # producing an adjudicated outcome, so the interim not_demonstrated is the turn's
+    # honest terminal verdict and must still anchor amber.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "The run completed but did not demonstrate the goal."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The run completed but did not demonstrate the goal."
+
+
+def test_run_anchor_prefers_adjudicated_not_demonstrated_over_earlier_interim() -> None:
+    # A genuine adjudicated failure on the completed workflow anchors amber even when an
+    # earlier interim run also went not_demonstrated.
+    envelope = _assemble(
+        run_outcomes=[
+            _interim_outcome("not_demonstrated", "Interim scout, still building."),
+            _run_outcome("not_demonstrated", "The extraction returned no value."),
+        ]
+    )
+
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "The extraction returned no value."
 
 
 @pytest.mark.parametrize(
@@ -134,13 +181,12 @@ def test_next_state_derivation(
         ({"response_type": "ASK_QUESTION"}, "question"),
         ({"verified": True, "workflow_applied": True}, "update"),
         ({"proposal_disposition": "review_untested"}, "update"),
-        ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": False}, "answer"),
-        ({"turn_outcome_response_kind": "diagnose", "workflow_mutated": True}, "stopped"),
-        ({"turn_outcome_response_kind": "refuse", "workflow_mutated": False}, "answer"),
-        ({"turn_outcome_response_kind": "refuse", "workflow_mutated": True}, "stopped"),
-        ({"turn_outcome_response_kind": "recover", "workflow_mutated": False}, "answer"),
-        ({"turn_outcome_response_kind": "recover", "workflow_mutated": True}, "stopped"),
-        ({"turn_outcome_response_kind": "build", "workflow_mutated": False}, "stopped"),
+        ({"workflow_attempted": False, "workflow_mutated": False}, "answer"),
+        ({"workflow_attempted": True, "workflow_mutated": False}, "stopped"),
+        ({"workflow_attempted": False, "workflow_mutated": True}, "stopped"),
+        ({"workflow_attempted": False, "blocker_reason": "blocked"}, "stopped"),
+        ({"workflow_attempted": False, "halt_kind": "halted"}, "stopped"),
+        ({"workflow_attempted": False, "terminal_cause": "max_turns_exceeded"}, "stopped"),
     ],
 )
 def test_response_kind_derivation(kwargs: dict[str, Any], expected_response_kind: str) -> None:
@@ -216,7 +262,7 @@ def test_finalize_applied_state_keeps_question_for_user_action_required() -> Non
 
 
 def test_finalize_applied_state_preserves_answer_when_not_promoted_to_update() -> None:
-    envelope = _assemble(turn_outcome_response_kind="diagnose", workflow_mutated=False)
+    envelope = _assemble(workflow_attempted=False, workflow_mutated=False)
     assert envelope.response_kind == "answer"
 
     finalized = finalize_applied_state(envelope, applied=False)
@@ -233,8 +279,8 @@ def test_terminal_envelope_outcomes_survive_per_run_pointer_reset() -> None:
         workflow_run_id="wr_first",
     )
     second = RecordedRunOutcome(
-        verdict="demonstrated",
-        display_reason="A later scout replay succeeded.",
+        verdict="not_evaluated",
+        display_reason="A later scout replay completed.",
         workflow_run_id="wr_second",
     )
 
@@ -247,14 +293,14 @@ def test_terminal_envelope_outcomes_survive_per_run_pointer_reset() -> None:
     _stash_recorded_run_outcome(ctx, second)
     outcomes = agent_module._terminal_envelope_run_outcomes(ctx)
 
-    assert [outcome.verdict for outcome in outcomes] == ["not_demonstrated", "demonstrated"]
+    assert [outcome.verdict for outcome in outcomes] == ["not_demonstrated", "not_evaluated"]
     assert outcomes[0].display_reason == "Checkout never reached confirmation."
-    assert outcomes[1].display_reason == "A later scout replay succeeded."
+    assert outcomes[1].display_reason == "A later scout replay completed."
 
     envelope = _assemble(run_outcomes=outcomes)
 
-    assert envelope.run_verdict == "not_demonstrated"
-    assert envelope.run_display_reason == "Checkout never reached confirmation."
+    assert envelope.run_verdict == "not_evaluated"
+    assert envelope.run_display_reason == "A later scout replay completed."
 
 
 def test_terminal_envelope_outcomes_seed_from_constructor_last_run_outcome() -> None:
@@ -264,7 +310,7 @@ def test_terminal_envelope_outcomes_seed_from_constructor_last_run_outcome() -> 
         workflow_run_id="wr_ctor",
     )
     second = RecordedRunOutcome(
-        verdict="demonstrated",
+        verdict="not_evaluated",
         display_reason="Appended after construction.",
         workflow_run_id="wr_runtime",
     )
@@ -277,7 +323,7 @@ def test_terminal_envelope_outcomes_seed_from_constructor_last_run_outcome() -> 
     assert ctx.terminal_envelope_run_outcomes == [first, second]
 
 
-def test_terminal_envelope_outcomes_clear_on_workflow_edit_evidence_reset() -> None:
+def test_terminal_envelope_outcomes_survive_workflow_edit() -> None:
     ctx = make_copilot_ctx()
     _stash_recorded_run_outcome(
         ctx,
@@ -288,13 +334,19 @@ def test_terminal_envelope_outcomes_clear_on_workflow_edit_evidence_reset() -> N
         ),
     )
 
-    clear_terminal_evidence_on_workflow_edit(ctx)
+    edited_workflow = SimpleNamespace(proxy_location=None, workflow_definition=SimpleNamespace(blocks=[]))
+    _record_workflow_update_result(
+        ctx,
+        {"ok": True, "_workflow": edited_workflow, "data": {"block_count": 1}},
+        prior_definition=SimpleNamespace(blocks=[]),
+    )
     outcomes = agent_module._terminal_envelope_run_outcomes(ctx)
     envelope = _assemble(run_outcomes=outcomes)
 
-    assert ctx.terminal_envelope_run_outcomes == []
-    assert outcomes == []
-    assert envelope.run_verdict is None
+    assert [outcome.workflow_run_id for outcome in ctx.terminal_envelope_run_outcomes] == ["wr_before_reset"]
+    assert [outcome.workflow_run_id for outcome in outcomes] == ["wr_before_reset"]
+    assert envelope.run_verdict == "not_demonstrated"
+    assert envelope.run_display_reason == "Checkout never reached confirmation."
 
 
 def test_terminal_envelope_outcomes_reanchor_to_new_outcome_after_workflow_edit() -> None:
@@ -307,8 +359,6 @@ def test_terminal_envelope_outcomes_reanchor_to_new_outcome_after_workflow_edit(
             workflow_run_id="wr_old",
         ),
     )
-    clear_terminal_evidence_on_workflow_edit(ctx)
-
     _stash_recorded_run_outcome(
         ctx,
         RecordedRunOutcome(
@@ -320,8 +370,7 @@ def test_terminal_envelope_outcomes_reanchor_to_new_outcome_after_workflow_edit(
     outcomes = agent_module._terminal_envelope_run_outcomes(ctx)
     envelope = _assemble(run_outcomes=outcomes)
 
-    assert len(outcomes) == 1
-    assert outcomes[0].workflow_run_id == "wr_new"
+    assert [outcome.workflow_run_id for outcome in outcomes] == ["wr_old", "wr_new"]
     assert envelope.run_verdict == "not_demonstrated"
     assert envelope.run_display_reason == "New failed run after edit."
 
@@ -348,11 +397,36 @@ def test_safe_wrapper_returns_none_when_assembly_raises(monkeypatch: pytest.Monk
         halt_kind=None,
         attempted=None,
         workflow_mutated=False,
-        turn_outcome_response_kind=None,
+        workflow_attempted=False,
         final_message="reply",
     )
 
     assert envelope is None
+
+
+def test_safe_wrapper_omits_recorded_output_from_telemetry() -> None:
+    output_report = 'Recorded output from the latest completed run: {"customer_record":"synthetic"}'
+
+    with structlog.testing.capture_logs() as logs:
+        envelope = agent_module._assemble_terminal_envelope_safe(
+            response_type="REPLY",
+            verified=False,
+            workflow_applied=False,
+            proposal_disposition="no_proposal",
+            run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", output_report=output_report)],
+            blocker_reason=None,
+            halt_kind=None,
+            attempted="ran the workflow",
+            workflow_mutated=True,
+            workflow_attempted=True,
+            final_message="I tested it.",
+        )
+
+    assert envelope is not None
+    assert envelope["run_output_report"] == output_report
+    terminal_log = next(log for log in logs if log["event"] == "copilot_terminal_envelope")
+    assert "run_output_report" not in terminal_log
+    assert output_report not in str(terminal_log)
 
 
 def test_render_terminal_message_stopped_not_demonstrated_contains_verbatim_reason_without_continuation() -> None:
@@ -415,6 +489,47 @@ def test_render_terminal_message_no_run_blocker_stop_keeps_blocker_evidence() ->
     assert blocker in rendered
 
 
+def test_render_terminal_message_appends_exact_recorded_output_to_completed_run() -> None:
+    output_report = (
+        'Recorded output from the latest completed run: {"extract_document_output":'
+        '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
+    )
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=[RecordedRunOutcome(verdict="not_evaluated", output_report=output_report)],
+    )
+
+    rendered, replaced = render_terminal_message(
+        envelope,
+        "I created and tested the reusable workflow.",
+        cancelled=False,
+    )
+
+    assert output_report in rendered
+    assert "Resale Demand Package (Required Statement of Fees - Demand)" in rendered
+    assert replaced is True
+
+
+def test_render_terminal_message_omits_unsafe_recorded_output_report() -> None:
+    envelope = _assemble(
+        proposal_disposition="review_tested",
+        run_outcomes=[
+            RecordedRunOutcome(
+                verdict="not_evaluated",
+                output_report=(
+                    'Recorded output from the latest completed run: {"access_token":"sk-example-secret-value"}'
+                ),
+            )
+        ],
+    )
+    message = "I created and tested the reusable workflow."
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rendered == message
+    assert replaced is False
+
+
 @pytest.mark.parametrize(
     ("next_state", "cancelled"),
     [
@@ -452,3 +567,173 @@ def test_render_terminal_message_keeps_answer_kind_replies_on_stopped_state() ->
 
     assert rendered == message
     assert replaced is False
+
+
+def test_render_terminal_message_keeps_deadline_copy_on_stopped_fallthrough() -> None:
+    envelope = _assemble(
+        proposal_disposition="auto_applicable",
+        run_outcomes=[],
+        terminal_cause="deadline_expired",
+    )
+    message = agent_module._TIMEOUT_REPLY_DEFAULT
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "stopped"
+    assert envelope.response_kind == "stopped"
+    assert rendered == message
+    assert rendered != "I stopped without confirming the goal was met."
+    assert replaced is True
+
+
+def test_render_terminal_message_still_generic_without_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", run_outcomes=[])
+
+    rendered, replaced = render_terminal_message(envelope, agent_module._TIMEOUT_REPLY_DEFAULT, cancelled=False)
+
+    assert rendered == "I stopped without confirming the goal was met."
+    assert replaced is True
+
+
+def test_render_terminal_message_held_draft_text_survives_with_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="review_untested", terminal_cause="deadline_expired")
+    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "proposal_pending"
+    assert rendered == message
+    assert replaced is True
+
+
+def test_render_terminal_message_held_draft_unreplaced_without_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="review_untested")
+    message = agent_module._TIMEOUT_REPLY_UNVALIDATED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert rendered == message
+    assert replaced is False
+
+
+def test_render_terminal_message_cancelled_turn_ignores_deadline_cause() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
+
+    rendered, replaced = render_terminal_message(envelope, "cancelled-text", cancelled=True)
+
+    assert rendered == "cancelled-text"
+    assert replaced is False
+
+
+def test_render_terminal_message_completed_turn_is_not_stamped_by_deadline_cause() -> None:
+    # replaced=True overwrites a distinct narrativeSummary downstream, so an
+    # applied turn that happens to expire must not be stamped with its own text.
+    envelope = _assemble(
+        verified=True,
+        workflow_applied=True,
+        proposal_disposition="auto_applicable",
+        terminal_cause="deadline_expired",
+    )
+    message = agent_module._TIMEOUT_REPLY_TESTED
+
+    rendered, replaced = render_terminal_message(envelope, message, cancelled=False)
+
+    assert envelope.next_state == "completed"
+    assert rendered == message
+    assert replaced is False
+
+
+def test_deadline_cause_survives_envelope_round_trip() -> None:
+    envelope = _assemble(proposal_disposition="auto_applicable", terminal_cause="deadline_expired")
+
+    payload = envelope.model_dump(mode="json")
+    finalized = finalize_applied_state(TerminalOutcomeEnvelope.model_validate(payload), applied=False)
+
+    assert payload["terminal_cause"] == "deadline_expired"
+    assert finalized.model_dump(mode="json")["terminal_cause"] == "deadline_expired"
+
+
+def test_envelope_carries_deadline_cause_when_blocker_override_rewrote_the_reason() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Reply without updating the workflow.",
+        user_facing_reason="I can't update or run this workflow on this turn.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="no_mutation_run_blocked",
+        blocked_tool="update_workflow",
+    )
+
+    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason != "timeout"
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+
+
+def test_envelope_has_no_cause_when_deadline_did_not_expire() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+
+    result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is None
+
+
+def test_max_turns_exit_types_the_cause_and_logs_the_backstop_fields() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_config = CopilotConfig()
+    ctx.copilot_run_start_monotonic = time.monotonic() - 12.0
+    ctx.enforcement_pass_count = 3
+    ctx.model_calls_this_turn = 12
+
+    with structlog.testing.capture_logs() as logs:
+        result = agent_module._handle_max_turns_exceeded(ctx, global_llm_context=None)
+
+    assert ctx.copilot_max_turns_exceeded is True
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+    backstop_logs = [entry for entry in logs if entry.get("event") == "copilot_max_turns_exceeded"]
+    assert len(backstop_logs) == 1
+    assert backstop_logs[0]["limit"] == 200
+    assert backstop_logs[0]["iteration"] == 3
+    assert backstop_logs[0]["model_call_count"] == 12
+    assert backstop_logs[0]["elapsed_seconds"] == pytest.approx(12.0, abs=1.0)
+
+
+def test_max_turns_exit_without_deadline_is_not_an_untyped_stop() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is not None
+    assert result.terminal_envelope["terminal_cause"] == "max_turns_exceeded"
+
+
+def test_deadline_wins_when_both_capacity_latches_are_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.copilot_max_turns_exceeded = True
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] == "deadline_expired"
+
+
+def test_max_turns_exit_has_no_cause_when_neither_latch_is_set() -> None:
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = False
+    ctx.copilot_max_turns_exceeded = False
+
+    result = agent_module._build_max_turns_exit_result(ctx, global_llm_context=None)
+
+    assert result.terminal_envelope is not None
+    assert result.terminal_envelope["terminal_cause"] is None

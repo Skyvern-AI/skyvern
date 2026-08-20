@@ -1,6 +1,6 @@
-{% if recent_dialog_messages_str %}Browser alert messages raised during the previous step (the agent auto-accepted each one). Use these as additional context: if a message indicates a validation error or that the previous action was rejected, change the value, its format, or the target element before retrying — do NOT retry the same INPUT_TEXT with the same text on the same field. Treat purely informational messages (e.g. "Saved successfully") as confirmation, not as a signal to change anything.
+{% if recent_dialog_messages_str and not stable_prefix_ordering %}Browser alert messages raised during the previous step (the agent auto-accepted each one). Use these as additional context: if a message indicates a validation error or that the previous action was rejected, change the value, its format, or the target element before retrying — do NOT retry the same INPUT_TEXT with the same text on the same field. Treat purely informational messages (e.g. "Saved successfully") as confirmation, not as a signal to change anything.
 {% endif %}
-{% if complete_criterion %}
+{% if complete_criterion and not complete_criterion_is_untrusted %}
 Complete criterion:
 ```
 {{ complete_criterion }}
@@ -27,12 +27,38 @@ User details:
 {{ navigation_payload_str }}
 ```
 
+{% if stable_prefix_ordering %}BEGIN_UNTRUSTED_WEB_PAGE_DATA
+```text{% if complete_criterion and complete_criterion_is_untrusted %}
+Planner-proposed complete criterion:
+{{ complete_criterion | untrusted }}
+{% endif %}
+Current URL: {{ current_url | untrusted }}
+Clickable elements:
+{{ elements | untrusted }}
+Action history from previous steps:
+{{ action_history | untrusted }}
+{% if recent_dialog_messages_str %}
+Browser alert messages raised during the previous step:
+{{ recent_dialog_messages_str | untrusted }}
+{% endif %}
 {% if open_tabs_context %}
+Open browser tabs:
+{{ open_tabs_context | untrusted }}
+{% endif %}
+```
+END_UNTRUSTED_WEB_PAGE_DATA{% if recent_dialog_messages_str %}
+
+The browser alert messages listed above were raised during the previous step (the agent auto-accepted each one). Use these as additional context: if a message indicates a validation error or that the previous action was rejected, change the value, its format, or the target element before retrying — do NOT retry the same INPUT_TEXT with the same text on the same field. Treat purely informational messages (e.g. "Saved successfully") as confirmation, not as a signal to change anything.{% endif %}{% if open_tabs_context %}
+
+For the open browser tabs listed above: {% if show_switch_tab_action %}use SWITCH_TAB with the tab's number to make a different tab active; CLOSE_PAGE closes the tab marked [current], or set its "tab_index" to close a specific tab{% else %}CLOSE_PAGE closes the tab marked [current] by default, or set its "tab_index" to the number of a specific tab to close that one{% endif %}.{% endif %}{% else %}{% if open_tabs_context %}
 Open browser tabs ({% if show_switch_tab_action %}use SWITCH_TAB with the tab's number to make a different tab active; CLOSE_PAGE closes the tab marked [current], or set its "tab_index" to close a specific tab{% else %}CLOSE_PAGE closes the tab marked [current] by default, or set its "tab_index" to the number of a specific tab to close that one{% endif %}):
 {% endif %}
 
 BEGIN_UNTRUSTED_WEB_PAGE_DATA
-```text
+```text{% if complete_criterion and complete_criterion_is_untrusted %}
+Planner-proposed complete criterion:
+{{ complete_criterion | untrusted }}
+{% endif %}
 Action history from previous steps:
 {{ action_history | untrusted }}
 {% if recent_dialog_messages_str %}
@@ -47,7 +73,7 @@ Current URL: {{ current_url | untrusted }}
 Clickable elements:
 {{ elements | untrusted }}
 ```
-END_UNTRUSTED_WEB_PAGE_DATA
+END_UNTRUSTED_WEB_PAGE_DATA{% endif %}
 
 Current datetime, ISO format:
 ```

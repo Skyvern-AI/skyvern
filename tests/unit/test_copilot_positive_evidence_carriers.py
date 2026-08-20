@@ -517,6 +517,7 @@ def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> S
         composition_page_evidence=baseline,
         pre_run_page_reference=None,
         workflow_verification_evidence=SimpleNamespace(),
+        browser_session_id=None,
     )
 
 
@@ -607,7 +608,7 @@ async def test_dispatched_producer_confirms_value_only_post_run(monkeypatch: pyt
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence["observed_after_workflow_run"] is True
     assert ctx.composition_page_evidence["workflow_run_id"] == "wr_disp"
@@ -617,6 +618,33 @@ async def test_dispatched_producer_confirms_value_only_post_run(monkeypatch: pyt
     assert verdict.state == "satisfied"
     assert verdict.reason_code == "evidence_confirms"
     assert verdict.evidence_source == "independent_page_evidence"
+
+
+@pytest.mark.asyncio
+async def test_dispatched_producer_prefers_worker_artifact_over_a_substituted_session_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CDP read that landed on a replacement session still satisfies the usable check, so without
+    the session comparison it would be stamped, refused, and leave the run with no evidence."""
+    artifacts = [_html_artifact("art_action", ArtifactType.HTML_ACTION)]
+    _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
+    ctx = _producer_ctx()
+
+    async def fake_read(
+        inner_ctx: object, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None]:
+        return {"observed_empty_page": True, "current_url": current_url}, "pbs_replacement", None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
+    )
+
+    stored = ctx.composition_page_evidence
+    assert stored["source_browser_session_id"] == "pbs_run_disp"
+    assert stored["observed_after_workflow_run"] is True
+    assert "WTR-1842-DEMO" in page_evidence_prose_text(stored)
 
 
 def test_select_terminal_prefers_html_action_over_later_scrape() -> None:
@@ -662,7 +690,7 @@ async def test_dispatched_producer_selects_terminal_html_action(monkeypatch: pyt
     )
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     prose = page_evidence_prose_text(ctx.composition_page_evidence)
     assert "WTR-1842-DEMO" in prose
@@ -675,7 +703,7 @@ async def test_dispatched_producer_confirms_from_html_scrape_when_only_family(mo
     _stub_app(monkeypatch, artifacts, {"art_scrape": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.evidence_source == "independent_page_evidence"
@@ -687,7 +715,7 @@ async def test_dispatched_producer_negative_control_value_absent(monkeypatch: py
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_NO_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.reason_code != "evidence_confirms"
@@ -699,7 +727,7 @@ async def test_dispatched_producer_value_in_baseline_does_not_confirm(monkeypatc
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx(pre_run_prose="Prior page already showed WTR-1842-DEMO earlier.")
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.reason_code != "evidence_confirms"
@@ -716,7 +744,7 @@ async def test_dispatched_producer_stale_baseline_not_pinned_fails_closed(monkey
         "workflow_run_id": "wr_prior",
     }
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.pre_run_page_reference is None
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
@@ -728,7 +756,7 @@ async def test_dispatched_producer_abstains_without_terminal_artifact(monkeypatc
     _stub_app(monkeypatch, artifacts=[], retrieved={})
     ctx = _producer_ctx(pre_run_prose=None)
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence is None
 
@@ -760,7 +788,7 @@ async def _dispatched_packet(monkeypatch: pytest.MonkeyPatch, html: str) -> dict
     _stub_app(monkeypatch, [_html_artifact("art_page", ArtifactType.HTML_ACTION)], {"art_page": html.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence is not None
     return ctx.composition_page_evidence
@@ -800,3 +828,179 @@ async def test_dispatched_packet_carries_static_disabled_submit_control(monkeypa
     challenge_state = packet["challenge_state"]
     assert challenge_state["gates_submit_controls"] is False
     assert challenge_state["gated_submit_controls"] == []
+
+
+def _star_ctx() -> _GroundingCtx:
+    # Authored output contract declares the extraction's output path, so the block label is accepted.
+    ctx = _GroundingCtx()
+    ctx.code_artifact_metadata = {
+        "extract_star_count": {"claimed_outcomes": [{"goal_value_paths": ["output.star_count"]}]}
+    }
+    return ctx
+
+
+def _value_present_criterion() -> object:
+    return make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="value_present",
+    )
+
+
+# block_outputs shape is copied from a real live code-only run (wr_555210248334407824): the
+# extraction block nests its value under an ``output`` key beside ``evidence_text``.
+def _star_snapshot(value: object = 22600) -> RunEvidenceSnapshot:
+    return RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "22.6k stars", "output": {"star_count": value}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+
+
+def test_value_present_requested_output_credited_by_presence() -> None:
+    verdicts = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())
+    assert len(verdicts) == 1
+    verdict = verdicts[0]
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "requested_output_present"
+
+
+def test_value_present_requested_output_reaches_full_satisfaction() -> None:
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())[0]
+    result = CompletionVerificationResult(status="evaluated", criterion_ids=["c_star"], verdicts=[verdict])
+    assert result.is_fully_satisfied() is True
+
+
+def test_value_present_requested_output_abstains_when_value_missing() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "no count found", "output": {}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_typed_shape_without_expected_value_still_abstains() -> None:
+    # A shape that is NOT value_present (e.g. numeric_identifier) must keep abstaining on a present
+    # value with no exact expected_output_value to prove -- the fix is scoped to value_present only.
+    criterion = make_completion_criterion(
+        "c_star",
+        "the star count is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="numeric_identifier",
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [criterion], _star_snapshot())[0]
+    assert verdict.state != "satisfied"
+
+
+@pytest.mark.parametrize("sentinel", ["N/A", "unknown", "Not Found", "  none  ", "-", "TBD"])
+def test_value_present_not_found_sentinel_abstains(sentinel: str) -> None:
+    # A failed extraction that returns a not-found sentinel instead of an empty value must not
+    # verify: presence of "N/A"/"unknown" abstains rather than crediting delivery.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "no count", "output": {"star_count": sentinel}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_when_emitting_block_failed() -> None:
+    # Positive success signal: a value emitted by a block that failed is not a verified delivery.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"evidence_text": "22.6k stars", "output": {"star_count": 22600}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+        failed_block_labels=["extract_star_count"],
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_on_structured_error_payload() -> None:
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count": {"output": {"star_count": {"error": "extraction failed"}}}},
+        block_output_sources={"extract_star_count": "runtime_output"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_credit_uses_presence_grounding_mode() -> None:
+    verdict = grade_requested_output_criteria(_star_ctx(), [_value_present_criterion()], _star_snapshot())[0]
+    assert verdict.state == "satisfied"
+    assert verdict.grounding_mode == "presence"
+
+
+def test_value_present_requiring_independent_evidence_abstains_on_self_emitted() -> None:
+    # A value_present criterion that requests independent evidence is not certified by a self-emitted
+    # (runtime_output) block value; the independence bar is preserved.
+    criterion = make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_shape="value_present",
+        requested_output_evidence_source="independent_run_evidence",
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [criterion], _star_snapshot())[0]
+    assert verdict.state != "satisfied"
+
+
+def test_value_present_abstains_when_registered_output_producer_block_failed() -> None:
+    # The value resolves via the <label>_output registered-output key, but its producer block failed;
+    # the failed-block guard resolves the bare producer label so this still abstains.
+    ctx = _GroundingCtx()
+    ctx.code_artifact_metadata = {
+        "extract_star_count_output": {"claimed_outcomes": [{"goal_value_paths": ["output.star_count"]}]}
+    }
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={"extract_star_count_output": {"output": {"star_count": 22600}}},
+        block_output_sources={"extract_star_count_output": "registered_output_parameter"},
+        failed_block_labels=["extract_star_count"],
+    )
+    verdict = grade_requested_output_criteria(ctx, [_value_present_criterion()], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+# Byte-exact rows from the SKY-13332 live witness (wr_557702915819208430) and the SKY-13200 custody
+# dir: a dashboard renders "8.45K" while the block registers the integer 8450, and the same tile's
+# "-8.0%" delta yields a bare 8 that must not pass as the count.
+_DELTA_DIGIT_EVIDENCE = "Visitors\n-8.0%"
+_TILE_EVIDENCE = "Visitors\n-15.0%\n8.45K\nvs. 9.99K prior"
+
+
+def test_literal_containment_alone_would_miss_the_correct_extraction() -> None:
+    # Pins why the numeric-equivalence half is load-bearing: the correct value is not a substring of
+    # the tile that displays it, so a containment-only rule leaves a right answer unconfirmable.
+    assert _boundary_delimited_present("8450", _TILE_EVIDENCE) is False
+
+
+def _exact_value_criterion(value: str) -> object:
+    return make_completion_criterion(
+        "c_star",
+        "the number of stars for https://example.com/example-org/example-repo is retrieved",
+        output_path="output.star_count",
+        expected_output_value=value,
+    )
+
+
+def test_registered_scalar_does_not_witness_itself() -> None:
+    # The delta digit reached a verified terminal because the block's own registered output counted
+    # as independent confirmation of that same value.
+    snapshot = RunEvidenceSnapshot(
+        block_outputs={
+            "extract_star_count_output": {
+                "evidence_text": _DELTA_DIGIT_EVIDENCE,
+                "output": {"star_count": 8},
+            }
+        },
+        block_output_sources={"extract_star_count_output": "registered_output_parameter"},
+    )
+    verdict = grade_requested_output_criteria(_star_ctx(), [_exact_value_criterion("8")], snapshot)[0]
+    assert verdict.state != "satisfied"
+
+
+def test_runtime_output_scalar_still_credits_normally() -> None:
+    # The narrowing targets the self-witnessing source only; ordinary runtime_output grading is
+    # untouched, so the reject does not swallow the legitimate path.
+    verdict = grade_requested_output_criteria(_star_ctx(), [_exact_value_criterion("22600")], _star_snapshot())[0]
+    assert verdict.state == "satisfied"

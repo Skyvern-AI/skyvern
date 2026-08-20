@@ -85,8 +85,13 @@ if __name__ == "__main__":
         # Omit log_level= so uvicorn.Config.configure_logging() doesn't reset setup_logger()'s uvicorn.error WARNING.
         access_log=False,
         log_config={"version": 1, "disable_existing_loggers": False},
+        # uvloop can double-close a recycled fd after create_connection cancellation (MagicStack/uvloop#740).
+        loop="asyncio",
         reload=reload,
         reload_excludes=reload_excludes,
         factory=True,
         ws="websockets-sansio",
+        # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=120.0,
     )

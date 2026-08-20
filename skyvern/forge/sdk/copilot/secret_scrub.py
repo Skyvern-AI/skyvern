@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64
-
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
@@ -25,22 +23,24 @@ _SESSION_SCRUB_VALUES: dict[str, list[str]] = {}
 _MAX_SCRUB_SESSIONS = 1024
 
 # Substring-replacing a short value into stored content corrupts it: a six-digit OTP occurs by
-# chance inside ports, counts, and ids. Rewrites that persist apply this floor; log redaction does
-# not, because over-redacting a log line is cheap and leaking a secret into one is not.
+# chance inside ports, counts, and ids. Rewrites of the stored workflow apply this floor — both the
+# persisted row and the draft an edit anchors against, which have to stay the same string. Log
+# redaction does not, because over-redacting a log line is cheap and leaking a secret into one is not.
 MIN_PERSISTED_REDACTION_LENGTH = 8
 
-_ALL_VALUES_CACHE: tuple[tuple[int, int], list[str]] | None = None
+_ALL_VALUES_CACHE: tuple[tuple[tuple[str, tuple[str, ...]], ...], list[str]] | None = None
 
 
-def _registry_fingerprint() -> tuple[int, int]:
+def _registry_fingerprint() -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Cheap key that changes on any registry mutation, including a direct one.
 
-    Values are append-only and deduped per session, so the total count moves whenever a value is
-    added and the session count moves whenever one is added or dropped. Deriving the key from the
-    data rather than a hand-maintained counter means a caller that mutates the dict directly cannot
-    be served a stale list.
+    Keyed by each session's values so clearing and reusing a session ID with the same value count
+    cannot serve stale credentials from the prior session lifetime.
+
+    Deriving the key from the data rather than a hand-maintained counter means a caller that
+    mutates the dict directly cannot be served a stale list.
     """
-    return len(_SESSION_SCRUB_VALUES), sum(len(values) for values in _SESSION_SCRUB_VALUES.values())
+    return tuple(sorted((session_id, tuple(values)) for session_id, values in _SESSION_SCRUB_VALUES.items()))
 
 
 def _session_id(ctx: AgentContext) -> str | None:
@@ -114,7 +114,22 @@ def scrub_secrets_from_text(ctx: AgentContext, text: str) -> str:
     return text
 
 
+def scrub_all_registered_from_text(text: str) -> str:
+    """Session-agnostic counterpart to ``scrub_secrets_from_text`` for reporting seams.
+
+    Exception text is serialized where no ``AgentContext`` is in scope, so this scrubs against
+    every session's values for the same reason ``all_registered_secret_values`` does.
+    """
+    for value in all_registered_secret_values():
+        text = text.replace(value, REDACTED_SECRET_PLACEHOLDER)
+    return text
+
+
 def scrub_secrets_from_structure(ctx: AgentContext, obj: Any) -> Any:
+    # Lazy: output_utils costs ~7.7s to import, and this module is on the logging and span
+    # exception paths, where that would be paid by whichever request raises first.
+    from skyvern.forge.sdk.copilot.output_utils import is_valid_image_base64  # noqa: PLC0415
+
     values = _registered_scrub_values(ctx)
     if not values:
         return obj

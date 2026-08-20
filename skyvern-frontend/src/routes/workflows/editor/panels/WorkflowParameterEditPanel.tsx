@@ -316,6 +316,16 @@ function WorkflowParameterEditPanel({
         },
   );
 
+  // A Skyvern/custom credential can be left without a default so the workflow runs at-will
+  // (the credential is supplied at run time, or the run proceeds unauthenticated). This
+  // mirrors the "Use Default Value" opt-in on other input parameters, defaulting to on.
+  const [useDefaultCredential, setUseDefaultCredential] = useState(
+    initialValues?.parameterType === "credential" &&
+      parameterIsSkyvernCredential(initialValues)
+      ? initialValues.credentialId !== ""
+      : true,
+  );
+
   const [sourceParameterKey, setSourceParameterKey] = useState<
     string | undefined
   >(
@@ -406,6 +416,13 @@ function WorkflowParameterEditPanel({
 
   const isCredentialSelected = parameterType === "credential";
   const showCredentialFields = type === "workflow" && isCredentialSelected;
+  // A rotation pool or fallback config serializes to a block-scoped credential parameter,
+  // which cannot be left without a default — force the default on there.
+  const skyvernCredentialHasPoolConfig =
+    initialValues?.parameterType === "credential" &&
+    parameterIsSkyvernCredential(initialValues) &&
+    ((initialValues.credentialIds?.length ?? 0) >= 2 ||
+      (initialValues.fallbackCredentialIds?.length ?? 0) > 0);
 
   // Determine what fields to show based on credential data type and source
   const showBitwardenPasswordFields =
@@ -537,6 +554,7 @@ function WorkflowParameterEditPanel({
                     // Clear default value state when switching to credential type
                     // since credentials don't use default values
                     if (!wasCredential && isNowCredential) {
+                      setUseDefaultCredential(true);
                       setDefaultValueState({
                         hasDefaultValue: false,
                         defaultValue: null,
@@ -1002,34 +1020,78 @@ function WorkflowParameterEditPanel({
 
           {/* Skyvern Managed Credential Selector */}
           {showSkyvernCredentialSelector && (
-            <div className="space-y-1">
-              <div className="flex gap-2">
-                <Label className="text-xs text-tertiary-foreground">
-                  Skyvern Credential
-                </Label>
-                <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
-              </div>
-              <CredentialParameterSourceSelector
-                value={credentialId}
-                onChange={(value) => setCredentialId(value)}
-              />
+            <div className="space-y-2">
+              {!skyvernCredentialHasPoolConfig && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    checked={useDefaultCredential}
+                    onCheckedChange={(checked) => {
+                      const next = Boolean(checked);
+                      setUseDefaultCredential(next);
+                      if (!next) {
+                        setCredentialId("");
+                      }
+                    }}
+                  />
+                  <Label className="text-xs text-tertiary-foreground">
+                    Use Default Value
+                  </Label>
+                  <HelpTooltip content="A default credential is applied on every run. Uncheck to leave it unset — the workflow runs without a credential unless one is supplied at run time." />
+                </div>
+              )}
+              {useDefaultCredential && (
+                <div className="space-y-1">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Skyvern Credential
+                    </Label>
+                    <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
+                  </div>
+                  <CredentialParameterSourceSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                  />
+                </div>
+              )}
             </div>
           )}
 
           {/* Custom Credential Service Selector */}
           {showCustomCredentialSelector && (
-            <div className="space-y-1">
-              <div className="flex gap-2">
-                <Label className="text-xs text-tertiary-foreground">
-                  Custom Credential
-                </Label>
-                <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
-              </div>
-              <CredentialParameterSourceSelector
-                value={credentialId}
-                onChange={(value) => setCredentialId(value)}
-                vault_type="custom"
-              />
+            <div className="space-y-2">
+              {!skyvernCredentialHasPoolConfig && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    checked={useDefaultCredential}
+                    onCheckedChange={(checked) => {
+                      const next = Boolean(checked);
+                      setUseDefaultCredential(next);
+                      if (!next) {
+                        setCredentialId("");
+                      }
+                    }}
+                  />
+                  <Label className="text-xs text-tertiary-foreground">
+                    Use Default Value
+                  </Label>
+                  <HelpTooltip content="A default credential is applied on every run. Uncheck to leave it unset — the workflow runs without a credential unless one is supplied at run time." />
+                </div>
+              )}
+              {useDefaultCredential && (
+                <div className="space-y-1">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Custom Credential
+                    </Label>
+                    <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
+                  </div>
+                  <CredentialParameterSourceSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                    vault_type="custom"
+                  />
+                </div>
+              )}
             </div>
           )}
 
@@ -1166,18 +1228,21 @@ function WorkflowParameterEditPanel({
                     credentialSource === "skyvern" ||
                     credentialSource === "custom"
                   ) {
-                    if (!credentialId) {
+                    const requireCredential =
+                      useDefaultCredential || skyvernCredentialHasPoolConfig;
+                    if (requireCredential && !credentialId) {
                       toast({
                         variant: "destructive",
                         title: "Failed to save input",
-                        description: "Credential is required",
+                        description:
+                          "Select a credential, or uncheck Use Default Value to leave it unset",
                       });
                       return;
                     }
                     onSave(
                       applySkyvernCredentialEdit(initialValues, {
                         key,
-                        credentialId,
+                        credentialId: requireCredential ? credentialId : "",
                         description,
                       }),
                     );

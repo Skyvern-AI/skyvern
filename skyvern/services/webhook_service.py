@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,7 +41,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
 
@@ -247,7 +248,7 @@ async def replay_run_webhook(
     if not url_to_use:
         raise MissingWebhookTarget()
 
-    validated_url = _validate_target_url(url_to_use)
+    validated_url, resolved_ips = await _validate_target_url(url_to_use)
 
     status_code, latency_ms, response_body, error = await _deliver_webhook(
         url=validated_url,
@@ -255,6 +256,7 @@ async def replay_run_webhook(
         headers=signed_data.headers,
         organization_id=organization_id,
         run_id=run_id,
+        resolved_ips=resolved_ips,
     )
 
     return RunWebhookReplayResponse(
@@ -298,6 +300,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
+        RunType.task_v3,
     }:
         return await _build_task_payload(
             organization_id=organization_id,
@@ -477,6 +480,7 @@ async def _deliver_webhook(
     headers: dict[str, str],
     organization_id: str | None = None,
     run_id: str | None = None,
+    resolved_ips: tuple[str, ...] | None = None,
 ) -> tuple[int | None, int, str | None, str | None]:
     start = perf_counter()
     status_code: int | None = None
@@ -491,6 +495,7 @@ async def _deliver_webhook(
             timeout_seconds=60.0,
             organization_id=organization_id,
             run_id=run_id,
+            resolved_ips=resolved_ips,
         )
         status_code = response.status_code
         body_text = response.text or ""
@@ -520,17 +525,14 @@ def _as_run_type_str(run_type: RunType | str | None) -> str:
     return "unknown"
 
 
-def _validate_target_url(url: str) -> str:
+async def _validate_target_url(url: str) -> tuple[str, tuple[str, ...]]:
     url = url.strip()
     try:
-        validated_url = validate_url(url)
-        if not validated_url:
-            raise SkyvernHTTPException("Invalid webhook URL.", status_code=status.HTTP_400_BAD_REQUEST)
-        return validated_url
+        return await asyncio.to_thread(validate_fetch_url_with_resolved_ips, url)
     except BlockedHost as exc:
         raise SkyvernHTTPException(
             message=(
-                f"This URL is blocked by SSRF protection. {str(exc)} "
+                f"{str(exc)} It is either blocked by SSRF protection or could not be resolved. "
                 "Add the host to ALLOWED_HOSTS to test internal endpoints or use an external receiver "
                 "such as webhook.site or requestbin.com."
             ),

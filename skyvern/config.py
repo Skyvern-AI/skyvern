@@ -1,10 +1,11 @@
 import logging
 import os
 import platform
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from skyvern import constants
@@ -72,6 +73,12 @@ _DEFAULT_ENV_FILES = tuple(
 LOG = logging.getLogger(__name__)
 
 
+class CodeBlockMode(StrEnum):
+    enabled = "enabled"
+    entitlement = "entitlement"
+    disabled = "disabled"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_DEFAULT_ENV_FILES, extra="ignore")
 
@@ -89,6 +96,10 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # Configurable safety caps. The defaults are rollout candidates, not capacity-calibrated policy.
+    BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES: int = Field(default=100 * 1024 * 1024, gt=0)
+    BROWSER_DOWNLOAD_MAX_RUN_SIZE_BYTES: int = Field(default=512 * 1024 * 1024, gt=0)
+    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=64, gt=0)
     # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
     # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
     # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
@@ -109,6 +120,7 @@ class Settings(BaseSettings):
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
+    WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
     # an exact approval, so an enforcing value must be unrepresentable rather than merely unused.
     BROWSER_ACTION_POLICY_MODE: Literal["disabled", "observe"] = "disabled"
@@ -121,6 +133,15 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
+    # a run stops starting new steps against that browser. Sized so a healthy run — which lands
+    # hundreds of successful operations per step, any one of which resets the count — cannot reach
+    # it, while a browser answering nothing does within a single step. 0 disables the check.
+    BROWSER_DEGRADED_TIMEOUT_STRIKES: int = 8
+    # Best-effort per-action capture inside a code block. Awaited in the user's own call chain,
+    # so its cost lands on CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS; kept far under the browser
+    # default because a page that cannot answer in this budget is already dying.
+    CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS: int = 3000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     # Pre-screenshot readiness guard; kept short so a page that never settles
     # degrades fast instead of burning the full loading-timeout budget.
@@ -134,6 +155,21 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
+    # Eval-fleet levers below: each one changes task_v2 planner behavior, so they default off and
+    # the benchmark values file turns them on. Do not flip a default to True without an org gate.
+    TASK_V2_SKIP_COMPLETION_CHECK_AFTER_NAVIGATE: bool = False
+    # Carry the planner's required_subgoals leg-checklist forward into the next planner
+    # prompt so it refines rather than re-derives it each iteration.
+    TASK_V2_CARRY_SUBGOALS: bool = False
+    # Final N% of planner iterations: inject a wrap-up directive telling the planner to converge on
+    # open required_subgoals instead of starting new legs (prevents budget exhaustion). 0 disables.
+    TASK_V2_CONVERGE_PCT: int = 0
+    # litellm num_retries for direct (non-router) LLM calls; 0 keeps current behavior.
+    # Raise for low-QPM keys (e.g. local Vertex smoke) so 429s back off and retry instead of failing the run.
+    LLM_DIRECT_NUM_RETRIES: int = 0
+    # Umbrella for specific self-contained mini goals, per-block complete_criterion, and inline loop_values.
+    # Default-off; the eval fleet forces it on and prod opts in per-org via the experimentation flag.
+    PLANNER_MINI_GOAL_IMPROVEMENTS: bool = False
     # Upper bound on the number of open tabs screenshotted at task_v2 completion so the
     # trajectory judge can verify "keep N tabs open" rubrics without unbounded artifact spend.
     MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2: int = 20
@@ -188,21 +224,17 @@ class Settings(BaseSettings):
     # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
-    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
-    COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Consecutive repair runs that make no newly-verified forward progress before the
-    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
-    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
-    # Bounded settle-then-re-perceive after a non-advancing click on a precondition-gated control:
-    # re-probe the side-effect-free extractor a few times (hard-capped) until a just-issued AJAX populates.
-    COPILOT_CLICK_SETTLE_MAX_PROBES: int = 3
-    COPILOT_CLICK_SETTLE_DELAY_SECONDS: float = 0.6
-    COPILOT_CLICK_SETTLE_DEADLINE_SECONDS: float = 3.5
-    # Kill switch for the clickable-controls grounding channel: when off, composition evidence omits the
-    # clickable_controls key entirely, reverting both the re-perception attach and the evaluate steer.
-    COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED: bool = True
+    COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
+    # A capture that runs out of time yields no page evidence at all, so the scout falls back to
+    # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
+    # tail off and a third of captures returned nothing.
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
+    # Let an asynchronously rendered page settle before the scout's one factual evidence recapture.
+    COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS: float = 0.6
+    # Kill switch for the factual clickable-controls evidence channel.
+    COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED: bool = True
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
@@ -215,8 +247,10 @@ class Settings(BaseSettings):
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
-    WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
+    # Process-global override of the per-turn copilot deadline, read once at import;
+    # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
+    WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS: int | None = Field(default=None, gt=0)
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
@@ -227,6 +261,10 @@ class Settings(BaseSettings):
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
+    # Local-development escape hatch: run a copilot block test run in the API process when sandbox
+    # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
+    # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
+    COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     # Default code_only for MCP block/workflow tools. Off = permissive.
     MCP_CODE_ONLY_MODE: bool = False
     # Default for the bounded code-block self-heal; off by default.
@@ -241,12 +279,16 @@ class Settings(BaseSettings):
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
+    # Custom SMTP sends connect directly from the worker, so private/internal hosts are
+    # blocked by default; self-hosted deployments with internal SMTP relays can enable.
+    ALLOW_SMTP_INTERNAL_HOSTS: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
+    UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
     # Artifact storage settings
     ARTIFACT_STORAGE_PATH: str = f"{SKYVERN_DIR}/artifacts"
@@ -262,10 +304,19 @@ class Settings(BaseSettings):
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
+    # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
+    # retention period cannot be used to pin storage indefinitely; omitting retention_days
+    # still means "no expiry of its own", governed by the org's data-retention policy.
+    MAX_UPLOADED_FILE_RETENTION_DAYS: int = Field(default=365, gt=0)
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
+    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
+    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
+    # None keeps the LIST fallback for every run.
+    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -329,6 +380,11 @@ class Settings(BaseSettings):
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    # When set, a ForLoopBlock snapshots the open tabs before the loop and, between iterations,
+    # closes only tabs opened during an iteration — preserving the pre-loop baseline (e.g. a
+    # deliverable tab) and the working page. Bounds tab growth in long loops so per-iteration
+    # research tabs don't bloat the open-tabs planner context. Default-off; on for the eval fleet.
+    RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS: bool = False
     BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
@@ -379,6 +435,11 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
+    # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
+    # keep-alive bytes can hold a call open forever; the hard deadline bounds it in wall-clock time.
+    # Only the direct AsyncOpenAI client path (api_handler_factory.LLMCaller) applies this today.
+    ENFORCE_LLM_HARD_DEADLINE: bool = True
+    LLM_HARD_DEADLINE_GRACE_SECONDS: float = Field(default=10.0, ge=0)
     LLM_CONFIG_MAX_TOKENS: int = 4096
     LLM_CONFIG_TEMPERATURE: float = 0
     LLM_CONFIG_SUPPORT_VISION: bool = True  # Whether the model supports vision
@@ -398,13 +459,23 @@ class Settings(BaseSettings):
     ENABLE_VERTEX_AI: bool = False
     ENABLE_AZURE_CUA: bool = False
     ENABLE_OPENAI_COMPATIBLE: bool = False
+    ENABLE_XAI: bool = False
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
+    # xAI
+    XAI_API_KEY: str | None = None
+    XAI_API_BASE: str = "https://api.x.ai/v1"
+    XAI_REASONING_EFFORT: str | None = "medium"
     # ANTHROPIC
     ANTHROPIC_API_KEY: str | None = None
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
+    # Task V3 native engine (skyvern-3.0) model; empty falls back to LLM_KEY. Cloud pins the validated model.
+    TASK_V3_LLM_KEY: str = ""
+    # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
+    # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
+    TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -599,6 +670,7 @@ class Settings(BaseSettings):
 
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
+    TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -610,7 +682,7 @@ class Settings(BaseSettings):
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
     # Where credentials are stored: skyvern, bitwarden, azure_vault, gcp, or custom
-    CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+    CREDENTIAL_VAULT_TYPE: str = "skyvern"
     ENABLE_LOCAL_CREDENTIAL_VAULT: bool | None = None
     LOCAL_CREDENTIAL_VAULT_PATH: str = str(Path.home() / ".skyvern" / "credential_vault")
     LOCAL_CREDENTIAL_VAULT_KEY: str | None = None
@@ -644,7 +716,11 @@ class Settings(BaseSettings):
     ENABLE_CSS_SVG_PARSING: bool = True
 
     ENABLE_LOG_ARTIFACTS: bool = False
-    ENABLE_CODE_BLOCK: bool = True
+    ENABLE_SECRET_ARTIFACT_REDACTION: bool = True
+    ENABLE_SECRET_VISUAL_MASKING: bool = True
+    CODE_BLOCK_MODE: CodeBlockMode = CodeBlockMode.enabled
+    DISABLE_CODE_BLOCK_EXECUTION: bool | None = None
+    ENABLE_CODE_BLOCK: bool | None = None
 
     TASK_BLOCKED_SITE_FALLBACK_URL: str = "https://www.google.com"
 
@@ -777,8 +853,16 @@ class Settings(BaseSettings):
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
+    # Which infrastructure this process runs on ("aws", "hetzner", or "local"
+    # for self-hosted/dev); stamped on run-telemetry metrics so run time and
+    # cost can be split by infra. Cloud deploy configs set it explicitly.
+    INFRA_PROVIDER: str = "local"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
     OTEL_METRICS_ENABLED: bool = True
+    # Comma-separated instrument-name globs allowed to export; everything else is
+    # dropped at the SDK so accidental instrumentation cannot inflate metrics cost.
+    # Empty disables the allowlist (export everything).
+    OTEL_METRICS_ALLOWLIST: str = "skyvern.*,persistent_browsers.*,redis.connection_pool.*,db.connection_pool.*,api.event_loop.*,webeye.browser_factory.*,analytics.*"
     OTEL_LOGS_ENABLED: bool = True
     OTEL_EXPORTER_INSECURE: bool = True
     # Log level for the OTLP gRPC exporter's own logger. Raise above WARNING (e.g.
@@ -804,6 +888,52 @@ class Settings(BaseSettings):
 
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
+
+    @model_validator(mode="after")
+    def _resolve_legacy_code_block_settings(self) -> "Settings":
+        # Must be captured before CODE_BLOCK_MODE is assigned below: pydantic adds an assigned
+        # field to model_fields_set immediately, so reading it after would mark every mode explicit.
+        explicit_code_block_mode = "CODE_BLOCK_MODE" in self.model_fields_set
+        if not explicit_code_block_mode:
+            if self.DISABLE_CODE_BLOCK_EXECUTION is True:
+                self.CODE_BLOCK_MODE = CodeBlockMode.disabled
+            elif self.ENABLE_CODE_BLOCK is False:
+                self.CODE_BLOCK_MODE = CodeBlockMode.entitlement
+            elif self.ENABLE_CODE_BLOCK is True:
+                self.CODE_BLOCK_MODE = CodeBlockMode.enabled
+
+        for legacy_name in ("DISABLE_CODE_BLOCK_EXECUTION", "ENABLE_CODE_BLOCK"):
+            if legacy_name not in self.model_fields_set:
+                continue
+            if explicit_code_block_mode:
+                LOG.warning(
+                    "%s=%r is deprecated and ignored; using CODE_BLOCK_MODE=%s",
+                    legacy_name,
+                    getattr(self, legacy_name),
+                    self.CODE_BLOCK_MODE.value,
+                )
+            else:
+                LOG.warning(
+                    "%s=%r is deprecated; using CODE_BLOCK_MODE=%s",
+                    legacy_name,
+                    getattr(self, legacy_name),
+                    self.CODE_BLOCK_MODE.value,
+                )
+
+        return self
+
+    @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
+    @classmethod
+    def _worker_stall_dump_seconds_or_default(cls, value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            LOG.warning("Invalid WORKER_STALL_DUMP_SECONDS=%r; using default 0", value)
+            return 0
+
+    @property
+    def is_skyvern_base_url_explicitly_configured(self) -> bool:
+        return "SKYVERN_BASE_URL" in self.model_fields_set
 
     def get_model_name_to_llm_key(self, organization_id: str | None = None) -> dict[str, dict[str, str]]:
         """
@@ -835,6 +965,9 @@ class Settings(BaseSettings):
         }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
+
+        if self.ENABLE_XAI:
+            mapping["grok-4.5"] = {"llm_key": "XAI_GROK_4_5", "label": "Grok 4.5"}
 
         # Their configs are registered only under ENABLE_OPENROUTER, so without it the dropdown
         # would offer models that resolve to unregistered configs and fail at runtime.

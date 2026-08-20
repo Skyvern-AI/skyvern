@@ -12,6 +12,7 @@ from fastapi import params as fastapi_params
 
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowRequest
 
 
@@ -58,6 +59,7 @@ class TestWorkflowSaveHookFires:
 
         mock_workflow = MagicMock()
         mock_workflow.organization_id = "o_123"
+        mock_workflow.workflow_permanent_id = "wpid_123"
 
         mock_db = MagicMock()
         mock_db.workflows.update_workflow = AsyncMock(return_value=mock_workflow)
@@ -83,6 +85,7 @@ class TestWorkflowSaveHookFires:
         mock_agent_fn.on_workflow_saved.assert_awaited_once_with(
             organization_id="o_123",
             edited_by="u_456",
+            workflow_permanent_id="wpid_123",
         )
 
     @pytest.mark.asyncio
@@ -92,6 +95,7 @@ class TestWorkflowSaveHookFires:
 
         mock_workflow = MagicMock()
         mock_workflow.organization_id = "o_123"
+        mock_workflow.workflow_permanent_id = "wpid_123"
 
         mock_db = MagicMock()
         mock_db.workflows.update_workflow = AsyncMock(return_value=mock_workflow)
@@ -115,6 +119,7 @@ class TestWorkflowSaveHookFires:
         mock_agent_fn.on_workflow_saved.assert_awaited_once_with(
             organization_id="o_123",
             edited_by=None,
+            workflow_permanent_id="wpid_123",
         )
 
 
@@ -301,6 +306,180 @@ class TestWorkflowRoutesThreadUser:
             assert user_param.default.dependency is org_auth_service.get_current_user_id_or_none
 
 
+class TestRunCreatedHookWiring:
+    @staticmethod
+    def _caller() -> org_auth_service.CallerContext:
+        organization = MagicMock(organization_id="o_123")
+        return org_auth_service.CallerContext(
+            organization=organization,
+            caller_id="o_123",
+            caller_type=CallerType.API_KEY,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_routes_schedule_run_created_hook(self) -> None:
+        from skyvern.forge.sdk.routes import agent_protocol
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+        from skyvern.schemas.runs import WorkflowRunRequest
+
+        caller = self._caller()
+        background_tasks = MagicMock()
+        workflow_run = MagicMock(workflow_run_id="wr_new", workflow_id="wf_version")
+        checker = MagicMock()
+        checker.check = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=MagicMock(title="Test"))
+
+        with (
+            patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
+            patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=workflow_run)),
+            patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
+            patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
+            patch.object(agent_protocol.analytics, "capture"),
+            patch.object(agent_protocol, "app", mock_app),
+        ):
+            await agent_protocol.run_workflow(
+                request=MagicMock(),
+                background_tasks=background_tasks,
+                workflow_run_request=WorkflowRunRequest(workflow_id="wpid_1"),
+                caller=caller,
+                template=False,
+                x_api_key=None,
+                x_max_steps_override=None,
+                x_user_agent=None,
+            )
+            await agent_protocol.run_workflow_legacy(
+                request=MagicMock(),
+                background_tasks=background_tasks,
+                workflow_id="wpid_1",
+                workflow_request=WorkflowRequestBody(),
+                version=None,
+                caller=caller,
+                template=False,
+                x_api_key=None,
+                x_max_steps_override=None,
+                x_user_agent=None,
+            )
+
+        assert background_tasks.add_task.call_count == 2
+        for call in background_tasks.add_task.call_args_list:
+            assert call.args == (mock_app.AGENT_FUNCTION.on_run_created,)
+            assert call.kwargs == {
+                "organization_id": "o_123",
+                "run_id": "wr_new",
+                "run_type": "workflow_run",
+                "caller_type": caller.caller_type,
+            }
+
+    @pytest.mark.asyncio
+    async def test_retry_route_schedules_run_created_hook(self) -> None:
+        from skyvern.forge.sdk.routes import agent_protocol
+        from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
+
+        caller = self._caller()
+        background_tasks = MagicMock()
+        original_run = MagicMock(
+            workflow_run_id="wr_old",
+            workflow_id="wf_old",
+            workflow_permanent_id="wpid_1",
+            browser_session_id=None,
+            ignore_inherited_workflow_system_prompt=False,
+        )
+        original_run.status.is_final.return_value = True
+        original_workflow = MagicMock(organization_id="o_123", version=1, title="Test")
+        retried_run = MagicMock(workflow_run_id="wr_retry")
+        checker = MagicMock()
+        checker.check = AsyncMock()
+        mock_app = MagicMock()
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=original_run)
+        mock_app.DATABASE.workflow_runs.get_workflow_run_parameters = AsyncMock(return_value=[])
+        mock_app.DATABASE.debug.has_block_run_for_workflow_run = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.get_active_grouped_tags_for_run = AsyncMock(return_value={})
+        mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
+        mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=original_workflow)
+        mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
+
+        with (
+            patch.object(agent_protocol.PermissionCheckerFactory, "get_instance", return_value=checker),
+            patch.object(agent_protocol.workflow_service, "run_workflow", AsyncMock(return_value=retried_run)),
+            patch.object(
+                agent_protocol.workflow_service,
+                "workflow_request_body_from_existing_run",
+                return_value=WorkflowRequestBody(),
+            ),
+            patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
+            patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
+            patch.object(agent_protocol.analytics, "capture"),
+            patch.object(agent_protocol, "app", mock_app),
+        ):
+            await agent_protocol.retry_workflow_run(
+                request=MagicMock(),
+                background_tasks=background_tasks,
+                workflow_run_id="wr_old",
+                caller=caller,
+                x_api_key=None,
+                x_max_steps_override=None,
+                x_user_agent=None,
+            )
+
+        background_tasks.add_task.assert_called_once_with(
+            mock_app.AGENT_FUNCTION.on_run_created,
+            organization_id="o_123",
+            run_id="wr_retry",
+            run_type="workflow_run",
+            caller_type=caller.caller_type,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_block_helper_schedules_run_created_hook(self) -> None:
+        from skyvern.forge.sdk.routes import run_blocks
+
+        background_tasks = MagicMock()
+        workflow_run = MagicMock(workflow_run_id="wr_block")
+        organization = MagicMock(organization_id="o_123")
+        run_block_request = MagicMock(
+            proxy_location=None,
+            browser_session_id=None,
+            browser_profile_id=None,
+            start_fresh_browser=False,
+            browser_address=None,
+            max_screenshot_scrolling_times=None,
+            extra_http_headers=None,
+        )
+        mock_app = MagicMock()
+
+        with (
+            patch.object(run_blocks.workflow_service, "run_workflow", AsyncMock(return_value=workflow_run)),
+            patch.object(run_blocks.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
+            patch.object(run_blocks, "WorkflowRunRequest", side_effect=lambda **kwargs: kwargs),
+            patch.object(run_blocks, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
+            patch.object(run_blocks, "app", mock_app),
+        ):
+            await run_blocks._run_workflow_and_build_response(
+                request=MagicMock(),
+                background_tasks=background_tasks,
+                new_workflow=MagicMock(workflow_id="wf_1", title="Test"),
+                workflow_id="wpid_1",
+                organization=organization,
+                run_block_request=run_block_request,
+                webhook_url=None,
+                totp_verification_url=None,
+                totp_identifier=None,
+                caller_type=CallerType.API_KEY,
+                x_api_key="api-key",
+                x_user_agent=run_blocks.org_auth_service.SKYVERN_UI_USER_AGENT,
+            )
+
+        background_tasks.add_task.assert_called_once_with(
+            mock_app.AGENT_FUNCTION.on_run_created,
+            organization_id="o_123",
+            run_id="wr_block",
+            run_type="workflow_run",
+            caller_type=CallerType.API_KEY,
+        )
+
+
 class TestWorkflowRunCompleteHookFires:
     """_update_workflow_run_status fires on_workflow_run_completed for final statuses."""
 
@@ -310,6 +489,7 @@ class TestWorkflowRunCompleteHookFires:
         mock_agent_fn.on_workflow_run_completed = AsyncMock()
 
         mock_workflow_run = MagicMock()
+        mock_workflow_run.workflow_run_id = "wr_1"
         mock_workflow_run.organization_id = "o_789"
         mock_workflow_run.workflow_id = "wf_1"
         mock_workflow_run.workflow_permanent_id = "wpid_1"
@@ -325,7 +505,10 @@ class TestWorkflowRunCompleteHookFires:
         mock_status.is_final.return_value = True
 
         mock_db = MagicMock()
+        # Final transitions claim the flip via the conditional update first.
+        mock_db.workflow_runs.update_workflow_run_if_not_final = AsyncMock(return_value=mock_workflow_run)
         mock_db.workflow_runs.update_workflow_run = AsyncMock(return_value=mock_workflow_run)
+        mock_db.tags.apply_system_run_tag_changes = AsyncMock()
 
         with (
             patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
@@ -345,12 +528,69 @@ class TestWorkflowRunCompleteHookFires:
                 workflow_run_id="wr_1",
                 status=mock_status,
             )
-            await asyncio.sleep(0)
+            while svc._background_tasks:
+                await asyncio.gather(*tuple(svc._background_tasks))
 
         mock_agent_fn.on_workflow_run_completed.assert_awaited_once_with(
             organization_id="o_789",
             workflow_id="wf_1",
+            workflow_run_id="wr_1",
             status=mock_status,
+            workflow_run=mock_workflow_run,
+        )
+        mock_agent_fn.on_workflow_run_terminal.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_awaits_terminal_hook_before_browser_cleanup(self) -> None:
+        mock_agent_fn = MagicMock(spec=AgentFunction)
+        mock_agent_fn.on_workflow_run_terminal = AsyncMock()
+
+        mock_workflow = MagicMock()
+        mock_workflow_run = MagicMock()
+        mock_workflow_run.workflow_run_id = "wr_1"
+        mock_workflow_run.organization_id = "o_789"
+        mock_workflow_run.status = "completed"
+
+        browser_cleanup_result = MagicMock()
+        browser_cleanup_result.browser_state = None
+        browser_cleanup_result.tasks = []
+        browser_cleanup_result.all_workflow_task_ids = []
+        browser_cleanup_result.child_workflow_run_ids = []
+        browser_cleanup_result.close_browser_on_completion = True
+
+        async def clean_up_browser(**_: object) -> MagicMock:
+            mock_agent_fn.on_workflow_run_terminal.assert_awaited_once_with(
+                workflow_run_id="wr_1",
+                organization_id="o_789",
+                status="completed",
+            )
+            return browser_cleanup_result
+
+        with (
+            patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.service.analytics.capture"),
+        ):
+            mock_app.AGENT_FUNCTION = mock_agent_fn
+            mock_app.ARTIFACT_MANAGER.wait_for_upload_aiotasks = AsyncMock()
+            mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context = MagicMock()
+
+            from skyvern.forge.sdk.workflow.service import WorkflowService
+
+            svc = WorkflowService.__new__(WorkflowService)
+            svc._clean_up_workflow_browser = AsyncMock(side_effect=clean_up_browser)
+            svc._schedule_credential_fallback_retry = MagicMock()
+
+            await svc.clean_up_workflow(
+                workflow=mock_workflow,
+                workflow_run=mock_workflow_run,
+                need_call_webhook=False,
+            )
+
+        mock_agent_fn.on_workflow_run_terminal.assert_awaited_once_with(
+            workflow_run_id="wr_1",
+            organization_id="o_789",
+            status="completed",
         )
 
     @pytest.mark.asyncio
@@ -386,3 +626,4 @@ class TestWorkflowRunCompleteHookFires:
             await asyncio.sleep(0)
 
         mock_agent_fn.on_workflow_run_completed.assert_not_awaited()
+        mock_agent_fn.on_workflow_run_terminal.assert_not_awaited()

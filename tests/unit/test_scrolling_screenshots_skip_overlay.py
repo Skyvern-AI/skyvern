@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import skyvern.webeye.utils.page as page_module
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.utils.page import ScreenshotMode
 
 
@@ -68,12 +69,15 @@ async def test_scrolling_helper_skips_overlay_when_draw_boxes_false() -> None:
         scroll_heights=[2000, 2000, 2000, 2000],
     )
     page = MagicMock(name="page")
+    engine_selection = MagicMock(spec=BrowserEngineSelection)
+    captured_selections: list[BrowserEngineSelection | None] = []
 
-    async def _fake_screenshot(page, mode):  # noqa: D401, ARG001
+    async def _fake_screenshot(page, mode, engine_selection=None):  # noqa: ANN001, D401, ARG001
+        captured_selections.append(engine_selection)
         return b"snap"
 
     with (
-        patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=stub)),
+        patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=stub)) as create_instance,
         patch.object(page_module, "_current_viewpoint_screenshot_helper", _fake_screenshot),
     ):
         screenshots, positions = await page_module._scrolling_screenshots_helper(
@@ -82,11 +86,14 @@ async def test_scrolling_helper_skips_overlay_when_draw_boxes_false() -> None:
             draw_boxes=False,
             max_number=4,
             mode=ScreenshotMode.DETAILED,
+            engine_selection=engine_selection,
         )
 
     # We still scrolled + captured screenshots normally.
     assert len(screenshots) >= 1
     assert positions == sorted(positions)
+    assert captured_selections == [engine_selection] * len(screenshots)
+    create_instance.assert_awaited_once_with(frame=page, engine_selection=engine_selection)
     # No overlay build or removal fired.
     assert "build_elements_and_draw_bounding_boxes" not in stub.calls
     assert "remove_bounding_boxes" not in stub.calls
@@ -107,12 +114,15 @@ async def test_scrolling_helper_non_scrollable_page_skips_overlay() -> None:
     stub.is_window_scrollable = _is_window_scrollable  # type: ignore[method-assign]
 
     page = MagicMock(name="page")
+    engine_selection = MagicMock(spec=BrowserEngineSelection)
+    captured_selections: list[BrowserEngineSelection | None] = []
 
-    async def _fake_screenshot(page, mode):  # noqa: D401, ARG001
+    async def _fake_screenshot(page, mode, engine_selection=None):  # noqa: ANN001, D401, ARG001
+        captured_selections.append(engine_selection)
         return b"snap"
 
     with (
-        patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=stub)),
+        patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=stub)) as create_instance,
         patch.object(page_module, "_current_viewpoint_screenshot_helper", _fake_screenshot),
     ):
         screenshots, positions = await page_module._scrolling_screenshots_helper(
@@ -121,9 +131,12 @@ async def test_scrolling_helper_non_scrollable_page_skips_overlay() -> None:
             draw_boxes=False,
             max_number=1,
             mode=ScreenshotMode.DETAILED,
+            engine_selection=engine_selection,
         )
 
     assert screenshots == [b"snap"]
     assert positions == [0]
+    assert captured_selections == [engine_selection]
+    create_instance.assert_awaited_once_with(frame=page, engine_selection=engine_selection)
     assert "build_elements_and_draw_bounding_boxes" not in stub.calls
     assert "remove_bounding_boxes" not in stub.calls

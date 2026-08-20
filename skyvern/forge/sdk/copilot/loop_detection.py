@@ -5,11 +5,12 @@ Two independent guards:
 * ``detect_tool_loop`` fires on strictly consecutive same-identity streaks
   (A-A-A over one tool_step_identity). Resets the moment the identity
   changes, so oscillating and argument-distinct patterns bypass it by design.
-* ``detect_failed_tool_step_loop`` fires on N repeated failures of the
-  same (tool, args) pair, even when other tools dispatch in between.
-  Block-running credential/config failures are keyed by failure category
-  instead, because draft arguments can change while the init failure does not.
-  A successful invocation of the same step resets its counter.
+* ``detect_failed_tool_step_loop`` fires on N block-running credential/config
+  failures, keyed by failure category because draft arguments can change while
+  the init failure does not. It deliberately does not count same-(tool, args)
+  retries: an identical retry means the model learned nothing from the error,
+  which is the error message's problem, not grounds to end the turn.
+  A successful invocation of the same tool resets its counters.
 """
 
 from __future__ import annotations
@@ -20,34 +21,13 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
 from skyvern.forge.failure_classifier import classify_from_failure_reason
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    clear_blocker_signal_for_reason_codes,
-    maybe_clear_blocker_signal_on_tool_success,
-)
+from skyvern.forge.sdk.copilot.blocker_signal import maybe_clear_blocker_signal_on_tool_success
 
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
 LOOP_DETECTED_MARKER = "LOOP DETECTED:"
 ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES = frozenset({"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"})
-RECONCILIATION_PROGRESS_TOOL_NAMES = frozenset(
-    {
-        "click",
-        "evaluate",
-        "get_browser_screenshot",
-        "inspect_page_for_composition",
-        "press_key",
-        "run_blocks_and_collect_debug",
-        "scroll",
-        "select_option",
-        "type_text",
-        "update_and_run_blocks",
-        "update_workflow",
-    }
-)
-RECONCILIATION_REQUIRES_INPUT_REASON_CODES = frozenset({"tool_error_pending_reconciliation_requires_input"})
-WORKFLOW_PERSISTENCE_TOOL_NAMES = frozenset({"update_workflow", "update_and_run_blocks"})
-WORKFLOW_RUN_CREATION_TOOL_NAMES = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
 
 def detect_tool_loop(
@@ -74,50 +54,6 @@ def detect_tool_loop(
         tracker.append(identity)
 
     return None
-
-
-def record_consecutive_tool_result_boundary(
-    tracker: list[str],
-    tool_name: str,
-    arguments: Mapping[str, Any] | None = None,
-) -> None:
-    # No-op on a same-name boundary regardless of arguments: streak identity is owned by
-    # admission-time detect_tool_loop, so re-seeding on completion order could clobber a
-    # live argument-distinct streak.
-    if tracker and tracker[-1].startswith(f"{tool_name}:"):
-        return
-    tracker.clear()
-    tracker.append(tool_step_identity(tool_name, arguments))
-
-
-def _result_records_workflow_progress(tool_name: str, result: Mapping[str, Any]) -> bool:
-    if result.get("ok") is True and "_workflow" in result:
-        return True
-
-    data = result.get("data")
-    if not isinstance(data, Mapping):
-        return False
-
-    if tool_name in WORKFLOW_PERSISTENCE_TOOL_NAMES and data.get("workflow_updated") is True:
-        return True
-
-    workflow_run_id = data.get("workflow_run_id")
-    return tool_name in WORKFLOW_RUN_CREATION_TOOL_NAMES and isinstance(workflow_run_id, str) and bool(workflow_run_id)
-
-
-def record_consecutive_tool_result_boundary_for_ctx(
-    ctx: Any,
-    tool_name: str,
-    result: Mapping[str, Any],
-    arguments: Mapping[str, Any] | None = None,
-) -> None:
-    tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if not isinstance(tracker, list):
-        return
-    if _result_records_workflow_progress(tool_name, result):
-        tracker.clear()
-        return
-    record_consecutive_tool_result_boundary(tracker, tool_name, arguments)
 
 
 def _normalize_step_argument(value: Any) -> Any:
@@ -216,28 +152,15 @@ def detect_failed_tool_step_loop(
         return None
 
     category_failure = _detect_argument_insensitive_failed_tool_loop(tracker, tool_name, threshold)
-    if category_failure is not None:
-        category, failure_count = category_failure
-        next_attempt = failure_count + 1
-        return (
-            f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
-            f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
-            "This failure is not tied to the draft arguments. Fix the credential/configuration, "
-            "ask the user, or produce your final JSON response."
-        )
-
-    identity = tool_step_identity(tool_name, arguments)
-    failure_count = tracker.get(identity, 0)
-    next_attempt = failure_count + 1
-    if next_attempt < threshold:
+    if category_failure is None:
         return None
-
+    category, failure_count = category_failure
+    next_attempt = failure_count + 1
     return (
         f"{LOOP_DETECTED_MARKER} '{tool_name}' has already failed "
-        f"{failure_count} consecutive times with these arguments; "
-        f"blocking attempt #{next_attempt}. "
-        "Use different arguments, a DIFFERENT tool, ask the user, "
-        "or produce your final JSON response."
+        f"{failure_count} times with {category}; blocking attempt #{next_attempt}. "
+        "This failure is not tied to the draft arguments. Fix the credential/configuration, "
+        "ask the user, or produce your final JSON response."
     )
 
 
@@ -248,14 +171,14 @@ def record_tool_step_result(
     result: Mapping[str, Any],
     threshold: int = MAX_REPEATED_FAILED_STEP,
 ) -> None:
-    identity = tool_step_identity(tool_name, arguments)
     if result.get("ok", True):
-        tracker.pop(identity, None)
+        tracker.pop(tool_step_identity(tool_name, arguments), None)
         _clear_argument_insensitive_failure_identities(tracker, tool_name)
         return
 
-    identity = _argument_insensitive_failure_identity(tool_name, result) or identity
-    tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
+    identity = _argument_insensitive_failure_identity(tool_name, result)
+    if identity is not None:
+        tracker[identity] = min(tracker.get(identity, 0) + 1, threshold)
 
 
 def clear_failed_step_tracker_for_tools(
@@ -270,47 +193,13 @@ def clear_failed_step_tracker_for_tools(
             del tracker[key]
 
 
-def _ctx_failed_step_tracker(ctx: Any) -> MutableMapping[str, int] | None:
-    tracker = getattr(ctx, "failed_tool_step_tracker", None)
-    return tracker if isinstance(tracker, dict) else None
-
-
-def detect_failed_tool_step_loop_for_ctx(
-    ctx: Any,
-    tool_name: str,
-    arguments: Mapping[str, Any] | None = None,
-) -> str | None:
-    tracker = _ctx_failed_step_tracker(ctx)
-    if tracker is None:
-        return None
-    return detect_failed_tool_step_loop(tracker, tool_name, arguments)
-
-
 def record_tool_step_result_for_ctx(
     ctx: Any,
     tool_name: str,
     arguments: Mapping[str, Any] | None,
     result: Mapping[str, Any],
 ) -> None:
-    tracker = _ctx_failed_step_tracker(ctx)
-    if tracker is not None:
-        record_tool_step_result(tracker, tool_name, arguments, result)
-    record_consecutive_tool_result_boundary_for_ctx(ctx, tool_name, result, arguments)
     # Strict ``is True`` check: a malformed result dict missing ``ok`` entirely
     # must not be treated as success and accidentally clear a blocker signal.
     if result.get("ok") is True:
-        if (
-            getattr(ctx, "pending_reconciliation_requires_user_input", False)
-            and tool_name in RECONCILIATION_PROGRESS_TOOL_NAMES
-        ):
-            ctx.pending_reconciliation_requires_user_input = False
-            ctx.pending_reconciliation_run_id = None
-            clear_blocker_signal_for_reason_codes(ctx, RECONCILIATION_REQUIRES_INPUT_REASON_CODES)
         maybe_clear_blocker_signal_on_tool_success(ctx, tool_name)
-
-
-def clear_failed_step_tracker_for_tools_in_ctx(ctx: Any, tool_names: Iterable[str]) -> None:
-    tracker = _ctx_failed_step_tracker(ctx)
-    if tracker is None:
-        return
-    clear_failed_step_tracker_for_tools(tracker, tool_names)

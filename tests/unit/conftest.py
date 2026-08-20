@@ -5,7 +5,9 @@ import itertools
 import logging
 import shutil
 import sys
-from collections.abc import AsyncGenerator, Callable
+import threading
+from collections.abc import AsyncGenerator, Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -21,10 +23,43 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
+
+# Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
+LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+
+@pytest.fixture
+def legacy_download_uris(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """file:// URIs into a synthetic legacy repo root: one canonical file plus every escape class.
+
+    Points the module's ``REPO_ROOT_DIR`` at the temporary root, so anything reaching the legacy
+    file:// branch resolves against this lab rather than the real repository.
+    """
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    (downloads / "STORMBREAKER-safe.txt").write_text("STORMBREAKER-safe-body")
+    (tmp_path / "downloads-evil").mkdir()
+    (tmp_path / "downloads-evil" / "STORMBREAKER-secret.txt").write_text("STORMBREAKER-sibling-secret")
+    (tmp_path / "outside").mkdir()
+    outside_secret = tmp_path / "outside" / "STORMBREAKER-secret.txt"
+    outside_secret.write_text("STORMBREAKER-outside-secret")
+    (downloads / "STORMBREAKER-link").symlink_to(outside_secret)
+
+    monkeypatch.setattr(files, "REPO_ROOT_DIR", tmp_path)
+    return {
+        "canonical": (downloads / "STORMBREAKER-safe.txt").as_uri(),
+        "parent_traversal": (downloads / ".." / "outside" / "STORMBREAKER-secret.txt").as_uri(),
+        # Percent-encoded, so a check running before URL decoding cannot be what blocks it.
+        "encoded_dot_dot": f"file://{downloads}/%2E%2E/outside/STORMBREAKER-secret.txt",
+        "sibling_prefix": (tmp_path / "downloads-evil" / "STORMBREAKER-secret.txt").as_uri(),
+        "symlink_escape": (downloads / "STORMBREAKER-link").as_uri(),
+    }
 
 
 @pytest.fixture
@@ -37,6 +72,26 @@ def fingerprint_secret_key(monkeypatch: pytest.MonkeyPatch) -> str:
 
     monkeypatch.setattr(settings, "SECRET_KEY", FINGERPRINT_TEST_SECRET_KEY)
     return FINGERPRINT_TEST_SECRET_KEY
+
+
+@pytest.fixture
+def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
+    def _make(
+        *,
+        workflow_run_id: str = "wr_mask_secrets",
+        mask_secrets: bool = True,
+        secrets: dict[str, str] | None = None,
+        runtime_otp_values: set[str] | None = None,
+    ) -> WorkflowContextManager:
+        manager = WorkflowContextManager()
+        manager.workflow_run_contexts[workflow_run_id] = SimpleNamespace(
+            mask_secrets=mask_secrets,
+            secrets=dict(secrets or {}),
+            runtime_otp_values=set(runtime_otp_values or set()),
+        )
+        return manager
+
+    return _make
 
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
@@ -84,6 +139,16 @@ def reset_collapse_xp_assignment_memo():
     _clear()
     yield
     _clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_mcp_stateless_http_mode():
+    """Keep MCP transport mode from leaking between independently collected test files."""
+    from skyvern.cli.core import session_manager
+
+    session_manager.set_stateless_http_mode(False)
+    yield
+    session_manager.set_stateless_http_mode(False)
 
 
 # -- shared copilot agent-template rendering helper --
@@ -245,6 +310,9 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.get_element_handler = AsyncMock(return_value=MagicMock())
     el.input_sequentially = AsyncMock()
     el.input_clear = AsyncMock()
+    el.input_fill = AsyncMock()
+    el.refresh_locator_if_stale = AsyncMock()
+    el.apply_secret_visual_mask = AsyncMock()
     el.scroll_into_view = AsyncMock()
     el.press_key = AsyncMock()
     el.blur = AsyncMock()
@@ -257,3 +325,162 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
 
         el.get_attr = AsyncMock(side_effect=_get_attr)
     return el
+
+
+@dataclass
+class DownloadDestinationHarness:
+    """A real HTTP server plus a stubbed resolver, for exercising download destination checks.
+
+    Both host names answer on the same loopback server. ``public_host`` is allow-listed so it
+    passes validation; ``internal_host`` is not, and resolves to a loopback address, so the
+    validator must refuse it. Redirects are served for real, so a test never has to model how a
+    given HTTP client follows them.
+    """
+
+    public_base: str
+    internal_base: str
+    other_base: str
+    requested_paths: list[str]
+    requested_hosts: list[str]
+    cookies_by_path: dict[str, str]
+
+    PUBLIC_BODY = b"%PDF-1.4 attachment payload"
+    INTERNAL_BODY = b"INTERNAL-ONLY PAYLOAD"
+
+    def reached_internal(self) -> bool:
+        return any(host.startswith("internal-host.test") for host in self.requested_hosts)
+
+
+@pytest.fixture
+def download_destinations(monkeypatch: pytest.MonkeyPatch) -> Iterator[DownloadDestinationHarness]:
+    import socket as socket_module
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from skyvern.config import settings
+
+    public_host, internal_host, other_host = "public-host.test", "internal-host.test", "other-host.test"
+    requested_paths: list[str] = []
+    requested_hosts: list[str] = []
+    cookies_by_path: dict[str, str] = {}
+    holder: dict[str, str] = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested_paths.append(self.path)
+            requested_hosts.append(self.headers.get("Host", ""))
+            cookies_by_path[self.headers.get("Host", "").split(":")[0]] = self.headers.get("Cookie", "")
+            if self.path in ("/redirect-to-internal", "/redirect-to-other"):
+                target = holder["internal"] if self.path == "/redirect-to-internal" else holder["other"]
+                self.send_response(302)
+                self.send_header("Location", f"{target}/attachment")
+                self.end_headers()
+                return
+            if self.path == "/notfound":
+                body = b'{"error": "not found"}'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = (
+                DownloadDestinationHarness.INTERNAL_BODY
+                if self.path == "/internal"
+                else DownloadDestinationHarness.PUBLIC_BODY
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    holder["internal"] = f"http://{internal_host}:{port}"
+    holder["other"] = f"http://{other_host}:{port}"
+
+    real_getaddrinfo = socket_module.getaddrinfo
+    mapped = {public_host, internal_host, other_host}
+
+    def fake_getaddrinfo(host: str, port_arg: object = None, *args: object, **kwargs: object) -> list:
+        if host in mapped:
+            return [(socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("127.0.0.1", port_arg or 0))]
+        return real_getaddrinfo(host, port_arg, *args, **kwargs)
+
+    monkeypatch.setattr(socket_module, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(settings, "ALLOWED_HOSTS", [*settings.ALLOWED_HOSTS, public_host, other_host])
+
+    try:
+        yield DownloadDestinationHarness(
+            public_base=f"http://{public_host}:{port}",
+            internal_base=holder["internal"],
+            other_base=holder["other"],
+            requested_paths=requested_paths,
+            requested_hosts=requested_hosts,
+            cookies_by_path=cookies_by_path,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def fake_api_request_context() -> Callable[[], object]:
+    """Build a stand-in for Playwright's ``APIRequestContext``.
+
+    Requests are issued for real over HTTP. Redirect handling mirrors the driver's measured
+    behaviour: hops are followed unless the caller passes ``max_redirects=0``, in which case the
+    3xx response is returned with its ``Location`` header intact.
+    """
+    import asyncio
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    class _Response:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes, url: str) -> None:
+            self.status = status
+            self.headers = headers
+            self.url = url
+            self._body = body
+
+        @property
+        def ok(self) -> bool:
+            return 200 <= self.status < 300
+
+        async def body(self) -> bytes:
+            return self._body
+
+    class _FakeAPIRequestContext:
+        def __init__(self) -> None:
+            self.requested_urls: list[str] = []
+
+        async def get(self, url: str, max_redirects: int | None = None, **kwargs: object) -> _Response:
+            self.requested_urls.append(url)
+
+            def _fetch() -> _Response:
+                opener = (
+                    urllib.request.build_opener(_NoRedirect) if max_redirects == 0 else urllib.request.build_opener()
+                )
+                try:
+                    with opener.open(urllib.request.Request(url)) as response:
+                        return _Response(response.status, dict(response.headers), response.read(), response.url)
+                except urllib.error.HTTPError as error:
+                    return _Response(error.code, dict(error.headers), error.read(), url)
+
+            return await asyncio.to_thread(_fetch)
+
+    def _build() -> object:
+        return _FakeAPIRequestContext()
+
+    return _build

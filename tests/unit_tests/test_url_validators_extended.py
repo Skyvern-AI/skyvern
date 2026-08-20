@@ -1,5 +1,7 @@
 """Extended tests for URL validators module."""
 
+import re
+
 import pytest
 
 from skyvern.exceptions import InvalidUrl
@@ -60,7 +62,9 @@ class TestEncodeUrl:
         result = encode_url(url)
         # Unicode should be percent-encoded, original characters should not appear
         assert "路径" not in result
-        assert "example.com/" in result
+        # re.search rather than ``in``: CodeQL's py/incomplete-url-substring-sanitization reads a
+        # hostname-literal ``in`` check as broken sanitization (OSS alert #89); this is an assertion.
+        assert re.search(r"example\.com/", result)
         # "路径" in UTF-8 is encoded as %E8%B7%AF%E5%BE%84
         assert "%E8%B7%AF%E5%BE%84" in result
 
@@ -140,6 +144,12 @@ class TestPrependSchemeAndValidateUrl:
         """Completely invalid URL should raise InvalidUrl."""
         with pytest.raises(InvalidUrl):
             prepend_scheme_and_validate_url("not a valid url at all!!!")
+
+    @pytest.mark.parametrize("url", ["http://[", "http://[::1", "https://]"])
+    def test_malformed_ipv6_raises_invalid_url_not_value_error(self, url):
+        """Unterminated IPv6 literals make stdlib urlparse raise ValueError; it must surface as InvalidUrl."""
+        with pytest.raises(InvalidUrl):
+            prepend_scheme_and_validate_url(url)
 
 
 class TestEncodeUrlEdgeCases:

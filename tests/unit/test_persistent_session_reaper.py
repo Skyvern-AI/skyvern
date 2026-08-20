@@ -2,6 +2,7 @@
 Chromium + record_video ffmpeg encoders don't leak."""
 
 import asyncio
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,8 +13,28 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.run_enums import RunType
 from skyvern.webeye import default_persistent_sessions_manager as manager_mod
 from skyvern.webeye.default_persistent_sessions_manager import BrowserSession, DefaultPersistentSessionsManager
+from skyvern.webeye.real_browser_manager import RealBrowserManager, _PersistentSessionLease
 
 MODULE = "skyvern.webeye.default_persistent_sessions_manager"
+
+
+@pytest.fixture(autouse=True)
+def browser_manager() -> Iterator[RealBrowserManager]:
+    """The reaper reads in-process session leases off app.BROWSER_MANAGER, and the real app proxy
+    raises unless a ForgeApp was started. Yielding the manager lets a test register a live lease."""
+    manager = RealBrowserManager()
+    with patch.object(manager_mod, "app", SimpleNamespace(BROWSER_MANAGER=manager)):
+        yield manager
+
+
+def _lease(browser_manager: RealBrowserManager, runnable_id: str, session_id: str) -> None:
+    """Register the lease production writes when a runnable acquires a persistent session."""
+    browser_manager._persistent_session_leases[runnable_id] = _PersistentSessionLease(
+        session_id=session_id,
+        organization_id="org_test",
+        runnable_id=runnable_id,
+        browser_state=MagicMock(),
+    )
 
 
 def _make_manager(uncompleted_sessions: list, owned_ids: list[str] | None = None) -> DefaultPersistentSessionsManager:
@@ -25,8 +46,11 @@ def _make_manager(uncompleted_sessions: list, owned_ids: list[str] | None = None
     db.browser_sessions = MagicMock()
     db.browser_sessions.get_uncompleted_persistent_browser_sessions = AsyncMock(return_value=uncompleted_sessions)
     db.workflow_runs = MagicMock()
+    db.tasks = MagicMock()
     # Default: the owning run row is gone (stale). Tests that need a live/terminal owner override this.
+    # Both owner lookups are real AsyncMocks so an assert_not_awaited() on them can actually fail.
     db.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+    db.tasks.get_task = AsyncMock(return_value=None)
     manager = DefaultPersistentSessionsManager(database=db)
     # Register the browsers this process "holds" — the reaper only touches these.
     held = owned_ids if owned_ids is not None else [s.persistent_browser_session_id for s in uncompleted_sessions]
@@ -46,6 +70,28 @@ def _session(
     if started_minutes_ago is not None:
         started_at = datetime.now(timezone.utc) - timedelta(minutes=started_minutes_ago)
     return MagicMock(
+        persistent_browser_session_id=session_id,
+        organization_id="org_test",
+        started_at=started_at,
+        timeout_minutes=timeout_minutes,
+        runnable_id=runnable_id,
+        runnable_type=runnable_type,
+    )
+
+
+def _real_session(
+    session_id: str,
+    started_minutes_ago: float | None,
+    timeout_minutes: int | None,
+    runnable_id: str | None = None,
+    runnable_type: str | None = None,
+) -> SimpleNamespace:
+    """A row carrying only the fields the reaper reads. A MagicMock row auto-creates whatever
+    attribute a gate checks, which makes a guard test pass without the guard existing."""
+    started_at = None
+    if started_minutes_ago is not None:
+        started_at = datetime.now(timezone.utc) - timedelta(minutes=started_minutes_ago)
+    return SimpleNamespace(
         persistent_browser_session_id=session_id,
         organization_id="org_test",
         started_at=started_at,
@@ -223,16 +269,142 @@ async def test_does_not_reap_terminal_owned_session_before_expiry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_protects_expired_session_with_unknown_runnable_type() -> None:
-    # A runnable_id set with a runnable_type the reaper can't authoritatively resolve stays protected:
-    # no broad age-only fallback, so this is left to its owner's teardown rather than reaped.
+@pytest.mark.parametrize("unresolvable_type", ["script", "task_v2", None])
+async def test_reaps_expired_session_with_unresolvable_runnable_type(unresolvable_type: str | None) -> None:
+    # An owner type the reaper can't resolve (script today, any new runnable type tomorrow) used to
+    # pin its session forever: no owner lookup exists, so it was treated as live on every pass. It
+    # now gets no liveness protection and falls through to the ordinary timeout+grace gate.
     sessions = [
-        _session(
-            "pbs_unknown",
+        _real_session(
+            "pbs_unresolvable",
             started_minutes_ago=180,
             timeout_minutes=60,
-            runnable_id="tsk_unknown",
-            runnable_type="task_v2",
+            runnable_id="s_dead",
+            runnable_type=unresolvable_type,
+        )
+    ]
+    manager = _make_manager(sessions)
+    manager.close_session = AsyncMock()
+
+    await manager.reap_expired_sessions()
+
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_unresolvable")
+    # No per-type liveness semantics were invented: neither known-owner lookup was attempted.
+    manager.database.workflow_runs.get_workflow_run.assert_not_awaited()
+    manager.database.tasks.get_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protects_expired_session_leased_by_a_live_in_process_runnable(
+    browser_manager: RealBrowserManager,
+) -> None:
+    # Nothing renews a standalone script's session, so a script running longer than its session
+    # timeout would lose its browser mid-run — the case workflow_run/task owners survive via their
+    # liveness lookup. The lease this process holds is that signal for an unresolvable owner.
+    sessions = [
+        _real_session(
+            "pbs_leased",
+            started_minutes_ago=180,
+            timeout_minutes=60,
+            runnable_id="s_running",
+            runnable_type="script",
+        )
+    ]
+    manager = _make_manager(sessions)
+    manager.close_session = AsyncMock()
+    _lease(browser_manager, "s_running", "pbs_leased")
+
+    await manager.reap_expired_sessions()
+
+    manager.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protects_expired_session_while_a_runnable_is_still_acquiring_it(
+    browser_manager: RealBrowserManager,
+) -> None:
+    # begin_session publishes occupancy before the lease exists, so an expired session being reused
+    # would otherwise be reapable for the whole attach and fail the run it was just handed to.
+    sessions = [
+        _real_session(
+            "pbs_attaching",
+            started_minutes_ago=180,
+            timeout_minutes=60,
+            runnable_id="s_attaching",
+            runnable_type="script",
+        )
+    ]
+    manager = _make_manager(sessions)
+    manager.close_session = AsyncMock()
+    browser_manager._acquiring_session_runnables["s_attaching"] = 1
+
+    await manager.reap_expired_sessions()
+
+    manager.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaps_expired_session_once_its_lease_is_released(browser_manager: RealBrowserManager) -> None:
+    # The lease is dropped at the run's terminal boundary, which is what makes the protection above
+    # self-clearing rather than the indefinite protection this PR removes.
+    sessions = [
+        _real_session(
+            "pbs_released",
+            started_minutes_ago=180,
+            timeout_minutes=60,
+            runnable_id="s_done",
+            runnable_type="script",
+        )
+    ]
+    manager = _make_manager(sessions)
+    manager.close_session = AsyncMock()
+    _lease(browser_manager, "s_done", "pbs_released")
+
+    await manager.reap_expired_sessions()
+    manager.close_session.assert_not_awaited()
+
+    browser_manager._persistent_session_leases.pop("s_done")
+    await manager.reap_expired_sessions()
+
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_released")
+
+
+@pytest.mark.asyncio
+async def test_lease_does_not_protect_a_session_owned_by_a_terminal_workflow_run(
+    browser_manager: RealBrowserManager,
+) -> None:
+    # Resolvable owners keep their existing contract: the DB verdict decides, and a lingering lease
+    # for a terminal run must not start protecting a session the reaper already reclaims today.
+    sessions = [
+        _real_session(
+            "pbs_wr_dead",
+            started_minutes_ago=180,
+            timeout_minutes=60,
+            runnable_id="wr_dead",
+            runnable_type=RunType.workflow_run,
+        )
+    ]
+    manager = _make_manager(sessions)
+    manager.database.workflow_runs.get_workflow_run = AsyncMock(return_value=_workflow_run(WorkflowRunStatus.failed))
+    manager.close_session = AsyncMock()
+    _lease(browser_manager, "wr_dead", "pbs_wr_dead")
+
+    await manager.reap_expired_sessions()
+
+    manager.close_session.assert_awaited_once_with("org_test", "pbs_wr_dead")
+
+
+@pytest.mark.asyncio
+async def test_does_not_reap_unresolvable_owner_before_timeout() -> None:
+    # The fall-through hands unresolvable owners to the timeout+grace gate, not to an unconditional
+    # reap: still inside its window, a script-owned session is untouched.
+    sessions = [
+        _real_session(
+            "pbs_script_live",
+            started_minutes_ago=1,
+            timeout_minutes=60,
+            runnable_id="s_live",
+            runnable_type="script",
         )
     ]
     manager = _make_manager(sessions)
@@ -241,7 +413,6 @@ async def test_protects_expired_session_with_unknown_runnable_type() -> None:
     await manager.reap_expired_sessions()
 
     manager.close_session.assert_not_awaited()
-    manager.database.workflow_runs.get_workflow_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -563,21 +734,52 @@ async def test_reconcile_reclaims_completed_row_whose_owning_run_is_dead() -> No
 
 
 @pytest.mark.asyncio
-async def test_reconcile_protects_completed_row_with_unknown_owner_type() -> None:
-    # An owner we can't authoritatively resolve (unrecognized runnable type) is treated as active, so
-    # reconcile never reclaims a session we can't prove is unowned — same fail-safe as the reaper.
+async def test_reconcile_reclaims_completed_row_with_unresolvable_owner_type() -> None:
+    # Same fall-through as the reaper: an owner type we can't resolve no longer protects the row, so a
+    # completed row left occupied by a script run is reclaimed instead of leaking its local state.
     manager = _make_manager([], owned_ids=[])
-    _hold_local_session(manager, "pbs_unknown_owner")
-    row = _completed_row("pbs_unknown_owner")
-    row.runnable_id = "task_1"
-    row.runnable_type = "task_run"
+    _hold_local_session(manager, "pbs_unresolvable_owner")
+    row = SimpleNamespace(
+        persistent_browser_session_id="pbs_unresolvable_owner",
+        organization_id="org_test",
+        completed_at=datetime.now(timezone.utc),
+        status="completed",
+        runnable_id="s_dead",
+        runnable_type="script",
+        should_export_profile=lambda: True,
+    )
+    manager.database.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=row)
+    manager._release_local_browser_session = AsyncMock()
+
+    await manager.reconcile_local_sessions()
+
+    manager._release_local_browser_session.assert_awaited_once_with(
+        "org_test", "pbs_unresolvable_owner", export_profile=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_active_row_with_unresolvable_owner_type() -> None:
+    # Reconcile's own gate still governs after the fall-through: a live, uncompleted row is left to
+    # ordinary expiration even though its owner type is unresolvable.
+    manager = _make_manager([], owned_ids=[])
+    _hold_local_session(manager, "pbs_unresolvable_live")
+    row = SimpleNamespace(
+        persistent_browser_session_id="pbs_unresolvable_live",
+        organization_id="org_test",
+        completed_at=None,
+        status="running",
+        runnable_id="s_live",
+        runnable_type="script",
+        should_export_profile=lambda: True,
+    )
     manager.database.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=row)
     manager._release_local_browser_session = AsyncMock()
 
     await manager.reconcile_local_sessions()
 
     manager._release_local_browser_session.assert_not_awaited()
-    assert "pbs_unknown_owner" in manager._browser_sessions
+    assert "pbs_unresolvable_live" in manager._browser_sessions
 
 
 @pytest.mark.asyncio
@@ -832,12 +1034,15 @@ async def test_reaper_loop_runs_reconcile_after_reap_even_when_reap_fails() -> N
     # Wiring: each reaper pass runs reconcile after reap, and a reap failure must not skip reconcile.
     manager = _make_manager([], owned_ids=[])
     manager.reap_expired_sessions = AsyncMock(side_effect=RuntimeError("reap boom"))
-    manager.reconcile_local_sessions = AsyncMock()
 
-    sleep_mock = AsyncMock(side_effect=[None, asyncio.CancelledError()])
-    with patch(f"{MODULE}.asyncio.sleep", sleep_mock):
-        with pytest.raises(asyncio.CancelledError):
-            await manager._reap_expired_sessions_loop(1)
+    async def reconcile_then_cancel() -> None:
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        current_task.cancel()
+
+    manager.reconcile_local_sessions = AsyncMock(side_effect=reconcile_then_cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await manager._reap_expired_sessions_loop(0)
 
     manager.reap_expired_sessions.assert_awaited_once()
     manager.reconcile_local_sessions.assert_awaited_once()

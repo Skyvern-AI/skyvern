@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
@@ -122,30 +123,6 @@ def make_copilot_ctx(**overrides: object) -> CopilotContext:
     return CopilotContext(**defaults)
 
 
-def make_raw_loaded_result_context(
-    *,
-    include_sample_rows: bool = False,
-    include_text: bool = False,
-    include_user_goal: bool = False,
-) -> str:
-    target: dict[str, object] = {
-        "selector": '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]',
-        "is_table": True,
-        "row_selector": 'tr[data-account="987654321"]',
-        "row_count": 2,
-    }
-    if include_sample_rows:
-        target["sample_rows"] = ["Jane Customer account 123456"]
-    if include_text:
-        target["text"] = "Jane Customer statement results"
-    target["structure_signature"] = "legacy-selector-derived-sig"
-    payload: dict[str, object] = {}
-    if include_user_goal:
-        payload["user_goal"] = "extract loaded results"
-    payload["loaded_result_targets"] = [target]
-    return json.dumps(payload)
-
-
 def make_verified_goal_contract(
     *, next_action: RepairNextAction = RepairNextAction.NO_CHANGE
 ) -> DiagnosisRepairContract:
@@ -208,4 +185,87 @@ def make_completion_criterion(
         mint_degrade=mint_degrade,  # type: ignore[arg-type]
         requested_output_floor_rekeyed=requested_output_floor_rekeyed,
         floor_rekeyed_from_path=floor_rekeyed_from_path,
+    )
+
+
+def two_page_login_yaml(*, submit_selector: str = "Login") -> str:
+    """The shape copilot emits in code-block mode: branch bodies are code inside one always-executed
+    block, so a passing run can traverse it without reaching the guarded call."""
+    return f"""
+    title: Sign in and read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          await page.fill("#user", "demo")
+          await page.click("#submit")
+          if await page.locator("#token").count():
+              await page.get_by_role("button", name="{submit_selector}", exact=True).click()
+          return {{"visitors": "9.42K"}}
+    """
+
+
+def straight_line_login_yaml() -> str:
+    """One always-executed code block with no branching: executing it reaches every call in it."""
+    return """
+    title: Sign in and read the metric
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: sign_in_and_read
+        code: |
+          await page.fill("#user", "demo")
+          await page.get_by_role("button", name="Login", exact=True).click()
+          return {"visitors": "9.42K"}
+    """
+
+
+def failed_second_factor_run(run_id: str) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        attempted_block_label="sign_in_and_read",
+        attempted_call_ref="role:button:Login",
+        verdict="repairable_failure",
+        reason_code="runtime_block_failure",
+        workflow_run_id=run_id,
+        block_labels=["sign_in_and_read"],
+        structural_failure_identity="locator-timeout-identity",
+    )
+
+
+def passing_run(run_id: str, block_labels: list[str]) -> RecordedBuildTestOutcome:
+    return RecordedBuildTestOutcome(
+        phase="persisted_block_run",
+        attempted_tool="update_and_run_blocks",
+        verdict="progress_observed",
+        reason_code="run_completed_unevaluated",
+        workflow_run_id=run_id,
+        block_labels=block_labels,
+        structural_failure_identity="",
+        evidence_refs=["rows:1"],
+    )
+
+
+InteractionFieldValue = str | int | bool | None | list[Any] | dict[str, Any]
+
+
+def carried_interaction(**fields: InteractionFieldValue) -> dict[str, Any]:
+    """One entry of the cross-turn carried trajectory.
+
+    The record is plain interaction dicts, so this only spares tests the brace noise.
+    """
+    return dict(fields)
+
+
+def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
+    """Build a fake CallModelData payload with a model_data.input list.
+
+    ``CallModelData.context`` is the run context itself (``TContext | None``), not a wrapper around
+    one; a fake that nests it hides an attribute error behind a passing test.
+    """
+    return SimpleNamespace(
+        model_data=SimpleNamespace(input=list(items), instructions=instructions),
+        context=context,
     )

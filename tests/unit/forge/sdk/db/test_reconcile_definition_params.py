@@ -175,6 +175,44 @@ async def test_reconcile_in_place_preserves_id_and_updates_fields(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_toggles_credential_default_in_place(
+    agent_db: AgentDB, seeded_workflow: dict[str, str]
+) -> None:
+    """Clearing a credential's default (making it at-will) updates the same row in place,
+    preserving the id that workflow_run_parameters reference."""
+    workflow_id = seeded_workflow["workflow_id"]
+
+    await _reconcile(
+        agent_db,
+        seeded_workflow,
+        [_wp("credential", WorkflowParameterType.CREDENTIAL_ID, workflow_id=workflow_id, default_value="cred_abc")],
+    )
+    persisted = await agent_db.workflow_params.get_workflow_parameters(workflow_id=workflow_id)
+    assert len(persisted) == 1
+    assert persisted[0].default_value == "cred_abc"
+    original_id = persisted[0].workflow_parameter_id
+
+    # Clearing the default on re-save must update the same row in place.
+    await _reconcile(
+        agent_db,
+        seeded_workflow,
+        [
+            _wp(
+                "credential",
+                WorkflowParameterType.CREDENTIAL_ID,
+                workflow_id=workflow_id,
+                default_value=None,
+                param_id="wp_freshly_generated_different",
+            )
+        ],
+    )
+    persisted = await agent_db.workflow_params.get_workflow_parameters(workflow_id=workflow_id)
+    assert len(persisted) == 1
+    assert persisted[0].workflow_parameter_id == original_id
+    assert persisted[0].default_value is None
+
+
+@pytest.mark.asyncio
 async def test_reconcile_removes_absent_parameter(agent_db: AgentDB, seeded_workflow: dict[str, str]) -> None:
     workflow_id = seeded_workflow["workflow_id"]
     initial = [

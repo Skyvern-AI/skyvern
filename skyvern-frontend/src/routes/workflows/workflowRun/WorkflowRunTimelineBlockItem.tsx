@@ -16,11 +16,7 @@ import {
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
-import {
-  CODE_BLOCK_FALLBACK_TITLE,
-  getCodeBlockTitle,
-  workflowBlockTitle,
-} from "../editor/nodes/types";
+import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
@@ -36,7 +32,12 @@ import {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
-import { findCodeStepForLine } from "../workflowBlockUtils";
+import {
+  describeRecordedAction,
+  findCodeStepForLine,
+  isRecorderCallText,
+  normalizeInlineText,
+} from "../workflowBlockUtils";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -89,6 +90,7 @@ const INDENT_PX = 14;
 const MAX_INDENT_RAIL_DEPTH = 6;
 const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
 const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
+export const TIMELINE_DESCRIPTOR_SEPARATOR = "·";
 
 const railHighlightStyle = {
   marginLeft: `-${RAIL_HIGHLIGHT_OFFSET_PX}px`,
@@ -149,11 +151,6 @@ function StatusDot({
   );
 }
 
-function normalizeInlineText(value: string | null | undefined): string | null {
-  const normalized = value?.replace(/\s+/g, " ").trim();
-  return normalized ? normalized : null;
-}
-
 function getActionSummary(action: ActionsApiResponse): string | null {
   return (
     normalizeInlineText(action.reasoning) ??
@@ -190,6 +187,8 @@ type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
   summary: string | null;
+  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  detail: string | null;
   tone: "default" | "error";
 };
 
@@ -217,15 +216,13 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  const stepText =
-    !isCodeError && matchedStep
-      ? (normalizeInlineText(matchedStep.title) ??
-        normalizeInlineText(matchedStep.description))
-      : null;
   const parts = [
-    stepText ??
-      getActionSummary(action) ??
-      normalizeInlineText(action.description),
+    // This row hides its label from sighted users, so it falls back to the readable type
+    // where the chat, which always shows the label, prints nothing.
+    isCodeError
+      ? getActionSummary(action)
+      : (describeRecordedAction(action, matchedStep) ??
+        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -233,6 +230,10 @@ function getCodeActionRowPresentation(
     icon,
     label,
     summary: parts.length > 0 ? parts.join(" · ") : null,
+    detail:
+      !isCodeError && isRecorderCallText(action.description)
+        ? normalizeInlineText(action.description)
+        : null,
     tone: isCodeError ? "error" : "default",
   };
 }
@@ -251,8 +252,19 @@ function countSchemaFields(value: WorkflowRunBlock["data_schema"]): number {
 }
 
 function getTimelineDescriptor(block: WorkflowRunBlock): string {
+  const description = normalizeInlineText(block.description);
+
+  if (block.block_type === WorkflowBlockTypes.Code) {
+    return (
+      description ??
+      normalizeInlineText(block.prompt) ??
+      normalizeInlineText(block.instructions) ??
+      "Code block"
+    );
+  }
+
   const explicit =
-    normalizeInlineText(block.description) ??
+    description ??
     normalizeInlineText(block.navigation_goal) ??
     normalizeInlineText(block.data_extraction_goal) ??
     normalizeInlineText(block.prompt) ??
@@ -287,23 +299,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-// getCodeBlockTitle ends at the bare "Code" label for prompt-less runs, which
-// dropped the reasoning subtitle the timeline used to show. Fall back to the
-// block reasoning (description) before bare "Code", normalized like a prompt.
-function getCodeBlockTimelineName(
-  block: WorkflowRunBlock,
-  steps: Array<CodeBlockStep>,
-): string {
-  const title = getCodeBlockTitle({ prompt: block.prompt, steps });
-  if (title !== CODE_BLOCK_FALLBACK_TITLE) {
-    return title;
-  }
-  const reasoning = normalizeInlineText(block.description);
-  return reasoning
-    ? getCodeBlockTitle({ prompt: reasoning, steps: [] })
-    : title;
 }
 
 function getLoopIterationGroups(
@@ -520,7 +515,7 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
@@ -532,6 +527,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
+              detail: null,
               tone: "default" as const,
             };
 
@@ -557,6 +553,7 @@ function TimelineActionRows({
                   onActionClick({ block, action });
                 }}
                 aria-pressed={isActive}
+                title={detail ?? undefined}
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
                 <StatusDot
@@ -988,12 +985,8 @@ function WorkflowRunTimelineBlockItem({
   const definitionCodeSteps = isCodeBlock
     ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
     : [];
-  const blockName = isCodeBlock
-    ? getCodeBlockTimelineName(block, definitionCodeSteps)
-    : (block.label ?? block.title ?? blockTypeTitle);
-  const descriptor = isCodeBlock
-    ? (block.label ?? "Code block")
-    : getTimelineDescriptor(block);
+  const blockName = block.label ?? blockTypeTitle;
+  const descriptor = getTimelineDescriptor(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
@@ -1185,7 +1178,7 @@ function WorkflowRunTimelineBlockItem({
               {blockName}
             </span>
             <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
-              · {descriptor}
+              {TIMELINE_DESCRIPTOR_SEPARATOR} {descriptor}
             </span>
             {isFinallyBlock && (
               <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">

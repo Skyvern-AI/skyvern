@@ -50,6 +50,27 @@ async def test_evict_with_expected_skips_when_cache_holds_different_state(
 
 
 @pytest.mark.asyncio
+async def test_detach_only_evict_does_not_close_remote_browser_context(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    browser_state = MagicMock()
+    browser_state.close = AsyncMock()
+    browser_state.detach_remote_driver = AsyncMock()
+    manager._browser_sessions["pbs_local"] = BrowserSession(browser_state=browser_state)
+
+    await manager.evict_cached_browser_state(
+        "pbs_local",
+        "org_local",
+        expected=browser_state,
+        detach_remote_driver=True,
+    )
+
+    browser_state.detach_remote_driver.assert_awaited_once_with()
+    browser_state.close.assert_not_awaited()
+    assert "pbs_local" not in manager._browser_sessions
+
+
+@pytest.mark.asyncio
 async def test_evict_swallows_target_closed_during_close(
     manager: DefaultPersistentSessionsManager,
 ) -> None:

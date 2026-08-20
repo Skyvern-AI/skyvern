@@ -28,6 +28,7 @@ def _workflow(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         persist_browser_session=persist_browser_session,
+        reuse_browser_session=False,
         pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_key=browser_profile_key,
         proxy_location=proxy_location,
@@ -92,10 +93,14 @@ def _workflow_run(
         organization_id="org_test",
         browser_session_id=None,
         browser_profile_id=browser_profile_id,
+        browser_address=None,
         browser_seed_source=None,
         browser_sink_profile_id=None,
         retried_from_workflow_run_id=None,
         proxy_location=proxy_location,
+        reuse_browser_session=None,
+        reuse_bound_key=None,
+        start_fresh_browser=False,
     )
 
 
@@ -264,7 +269,12 @@ async def _setup_profile_with_reconcile_failure(
             request_id="req_test",
             workflow_request=workflow_request,
             workflow_permanent_id="wpid_test",
-            organization=SimpleNamespace(organization_id="org_test", organization_name="Test Org"),
+            organization=SimpleNamespace(
+                organization_id="org_test",
+                organization_name="Test Org",
+                default_llm_key=None,
+                default_secondary_llm_key=None,
+            ),
         )
     except Exception as exc:
         caught = exc
@@ -768,6 +778,8 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         browser_session_id="pbs_requested",
         browser_profile_id=None,
         start_fresh_browser=request.start_fresh_browser,
+        reuse_browser_session=request.reuse_browser_session,
+        reuse_bound_key=None,
         proxy_location=request.proxy_location,
         webhook_callback_url=request.webhook_callback_url,
         totp_verification_url=request.totp_verification_url,

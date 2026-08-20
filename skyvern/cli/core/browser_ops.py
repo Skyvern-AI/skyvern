@@ -11,25 +11,111 @@ import json
 import os
 import re
 import time
+from contextlib import suppress
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 import structlog
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
-from .guards import GuardError
+from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
+from .perception_telemetry import track_perception_probe
 
 LOG = structlog.get_logger(__name__)
+
+TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
+COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
+OBSERVE_V2_ENV = "SKYVERN_MCP_OBSERVE_V2"
+
+# Per-request rollout decision (set by the cloud MCP middleware from the org-keyed
+# PostHog flag). None means "no decision here" - fall back to the process env var,
+# which stays the sole control for stdio and self-hosted servers.
+_OBSERVE_V2_OVERRIDE: ContextVar[bool | None] = ContextVar("skyvern_mcp_observe_v2_override", default=None)
+
+
+def observe_v2_env_enabled() -> bool:
+    """Return the raw process-env observe-v2 setting, ignoring any per-request override."""
+    return os.getenv(OBSERVE_V2_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_observe_v2_override(value: bool | None) -> Token[bool | None]:
+    """Pin the observe-v2 decision for the current context; returns the reset token."""
+    return _OBSERVE_V2_OVERRIDE.set(value)
+
+
+def reset_observe_v2_override(token: Token[bool | None]) -> None:
+    _OBSERVE_V2_OVERRIDE.reset(token)
+
+
+def observe_v2_enabled() -> bool:
+    """Return whether the default-off observe v2 experiment is enabled.
+
+    An org-keyed per-request override (cloud rollout flag) wins over the env var.
+    """
+    override = _OBSERVE_V2_OVERRIDE.get()
+    if override is not None:
+        return override
+    return observe_v2_env_enabled()
+
+
+_COORDINATE_PASSWORD_TARGET_JS = """
+() => {
+  let element = document.activeElement;
+  while (element) {
+    const tag = (element.tagName || "").toLowerCase();
+    if (tag === "iframe" || tag === "frame") {
+      try {
+        element = element.contentDocument?.activeElement || null;
+      } catch {
+        return null;
+      }
+      if (!element) return null;
+      continue;
+    }
+    const shadowRoot = element.shadowRoot;
+    const shadowActiveElement = shadowRoot?.activeElement;
+    if (shadowActiveElement) {
+      element = shadowActiveElement;
+      continue;
+    }
+    if (tag.includes("-") && !shadowRoot) return null;
+    break;
+  }
+  if (!element || typeof element.getAttribute !== "function") return null;
+  const tag = (element.tagName || "").toLowerCase();
+  const type = (element.getAttribute("type") || "").toLowerCase();
+  const autocomplete = (element.getAttribute("autocomplete") || "").toLowerCase();
+  return tag === "input" && (type === "password" || autocomplete.includes("password"));
+}
+"""
+
+LOCALHOST_RECOVERY_HINT = (
+    "Run `pip install skyvern && skyvern browser serve --tunnel` to bridge "
+    "your local dev server to a cloud browser via ngrok. "
+    "Or use `local=true` in skyvern_browser_session_create for a local browser."
+)
+
+
+# Lifecycle states in ascending strength. A document that has committed is really there even
+# when a later state never arrives, so navigation degrades down this ladder rather than
+# reporting a failure for a page that is already loaded and usable.
+_LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
+_WEAKER_LOAD_STATE_TIMEOUT_MS = 1000
 
 
 @dataclass
 class NavigateResult:
     url: str
     title: str
+    load_state: str = "load"
 
 
 @dataclass
@@ -62,14 +148,57 @@ def parse_extract_schema(schema: str | dict[str, Any] | None) -> dict[str, Any] 
         raise GuardError(f"Invalid JSON schema: {e}", "Provide schema as a valid JSON string")
 
 
+async def _reached_load_state(page: Any, requested: str, budget_ms: int) -> str:
+    """Return the strongest lifecycle state the committed document actually reached.
+
+    Anything below ``requested`` is probed briefly: those states have already fired in
+    every healthy navigation, so the short budget only bounds a document that stalled.
+    """
+    weaker_states = _LOAD_STATE_LADDER[1 : _LOAD_STATE_LADDER.index(requested) + 1]
+    for index, state in enumerate(reversed(weaker_states)):
+        try:
+            await page.wait_for_load_state(
+                state,
+                timeout=budget_ms if index == 0 else _WEAKER_LOAD_STATE_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            continue
+        return state
+    return "commit"
+
+
 async def do_navigate(
     page: Any,
     url: str,
     timeout: int = 30000,
     wait_until: str | None = None,
+    *,
+    can_access_localhost: bool = False,
+    is_localhost_destination: bool = False,
 ) -> NavigateResult:
-    await page.goto(url, timeout=timeout, wait_until=wait_until)
-    return NavigateResult(url=page.url, title=await page.title())
+    validate_wait_until(wait_until)
+    try:
+        validated_url = await asyncio.to_thread(validate_fetch_url, url)
+    except BlockedHost as e:
+        if not (can_access_localhost and is_localhost_destination):
+            hint = LOCALHOST_RECOVERY_HINT if is_localhost_destination else "Use a public HTTP(S) URL"
+            raise GuardError(str(e), hint) from e
+        validated_url = url
+    except SkyvernHTTPException as e:
+        raise GuardError(str(e), "Use a valid public HTTP(S) URL") from e
+
+    # Commit first so a navigation that never reaches the document still fails, then wait for
+    # the requested lifecycle state separately: a page whose `load` never fires is navigated,
+    # not failed, and reporting the weaker state beats a false failure on a usable page.
+    started = time.monotonic()
+    await page.goto(validated_url, timeout=timeout, wait_until="commit")
+    requested = wait_until or "load"
+    load_state = "commit"
+    if requested != "commit":
+        # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
+        remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
+        load_state = await _reached_load_state(page, requested, remaining_ms)
+    return NavigateResult(url=page.url, title=await page.title(), load_state=load_state)
 
 
 async def do_screenshot(
@@ -116,6 +245,49 @@ async def do_extract(
     parsed_schema = parse_extract_schema(schema)
     extracted = await page.extract(prompt=prompt, schema=parsed_schema, skip_refresh=skip_refresh)
     return ExtractResult(extracted=extracted)
+
+
+async def do_click_at(
+    page: Any,
+    x: float,
+    y: float,
+    button: str = "left",
+    click_count: int = 1,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y, button=button, click_count=click_count)
+
+
+async def do_type_at(
+    page: Any,
+    x: float,
+    y: float,
+    text: str,
+    clear_first: bool = False,
+    press_enter: bool = False,
+) -> None:
+    raw_page = page.page if hasattr(page, "page") else page
+    await raw_page.mouse.click(x, y)
+    try:
+        is_password = await raw_page.evaluate(_COORDINATE_PASSWORD_TARGET_JS)
+    except Exception as exc:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        ) from exc
+    if is_password is True:
+        raise GuardError(TYPE_PASSWORD_REFUSAL_MESSAGE, CREDENTIAL_HINT)
+    if is_password is not False:
+        raise GuardError(
+            COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE,
+            "Use a selector or intent to target a verified non-password input",
+        )
+    if clear_first:
+        await raw_page.keyboard.press("ControlOrMeta+A")
+        await raw_page.keyboard.press("Backspace")
+    await raw_page.keyboard.type(text)
+    if press_enter:
+        await raw_page.keyboard.press("Enter")
 
 
 # -- Semantic locators --
@@ -705,6 +877,15 @@ async ({ scopeSelector, includeValues }) => {
       .map((element) => {
         const tag = element.tagName.toLowerCase();
         const item = { role: roleFor(element), name: text(element), tag, selector: cssPath(element) };
+        const safeIdRefs = (attribute) => (element.getAttribute(attribute) || "")
+          .split(/\s+/)
+          .filter((value) => /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/.test(value))
+          .slice(0, 8)
+          .join(" ");
+        const ariaControls = safeIdRefs("aria-controls");
+        const ariaOwns = safeIdRefs("aria-owns");
+        if (ariaControls) item.aria_controls = ariaControls;
+        if (ariaOwns) item.aria_owns = ariaOwns;
         if (includeValues === true && !isPassword(element) && ["input", "textarea", "select", "option"].includes(tag)) {
           item.value = element.value || element.getAttribute("value") || "";
         }
@@ -718,6 +899,28 @@ async ({ scopeSelector, includeValues }) => {
     }
   }
 }
+"""
+
+_OBSERVE_PAGE_TEXT_MAX_CHARS = 4000
+# Prefer Chromium's browser-owned loaderId; page evaluation is the fallback. Prefix both with
+# their source: consumers trust only `cdp:` markers for document identity (a hostile page can
+# pin timeOrigin), so a `page:` marker refuses ref durability rather than certifying sameness.
+_OBSERVE_DOCUMENT_ID_JS = "() => String(performance.timeOrigin)"
+_OBSERVE_PAGE_TEXT_JS = rf"""
+({{ scopeSelector }}) => {{
+  const root = scopeSelector ? document.querySelector(scopeSelector) : document.body;
+  // innerText of a non-rendered root degrades to raw descendant text, which would ship
+  // inline <script>/<style> bodies and hidden text to the model. Only rendered roots
+  // contribute page text; a hidden root yields the empty envelope instead.
+  const rendered = !!root && (root.checkVisibility ? root.checkVisibility() : root.getClientRects().length > 0);
+  const text = (rendered ? (root.innerText ?? root.textContent ?? "") : "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {{
+    content: text.slice(0, {_OBSERVE_PAGE_TEXT_MAX_CHARS}),
+    truncated: text.length > {_OBSERVE_PAGE_TEXT_MAX_CHARS},
+  }};
+}}
 """
 
 
@@ -861,6 +1064,8 @@ class ObservedElement:
     selector: str | None = None
     value: str | None = None
     options: list[str] | None = None
+    aria_controls: str | None = None
+    aria_owns: str | None = None
     match_index: int = 0
     needs_disambiguation: bool = False
 
@@ -882,6 +1087,9 @@ class ObserveResult:
     elements: list[ObservedElement]
     element_count: int
     total_on_page: int
+    page_text: str | None = None
+    page_text_truncated: bool = False
+    document_id: str | None = None
 
 
 def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -922,13 +1130,14 @@ async def _get_dom_observe_elements(
             raise ObserveFrameError(frame_name, frame_url or "", RuntimeError("frame does not support evaluate"))
         return []
     try:
-        async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
-            if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
-                await evaluate(JS_FUNCTION_DEFS)
-            result = await evaluate(
-                _OBSERVE_INTERACTABLES_JS,
-                {"scopeSelector": selector, "includeValues": include_values},
-            )
+        async with track_perception_probe(evaluate_page_scan=True):
+            async with asyncio.timeout(_DOM_SCAN_TIMEOUT_SECONDS):
+                if await evaluate(_DOMUTILS_INTERACTABILITY_READY_JS) is not True:
+                    await evaluate(JS_FUNCTION_DEFS)
+                result = await evaluate(
+                    _OBSERVE_INTERACTABLES_JS,
+                    {"scopeSelector": selector, "includeValues": include_values},
+                )
     except Exception as exc:
         if frame_name is not None:
             raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
@@ -983,6 +1192,10 @@ def _merge_dom_observe_elements(
                         existing["value"] = dom_element["value"]
                     if dom_element.get("options") and not existing.get("children"):
                         existing["options"] = dom_element.get("options")
+                    if dom_element.get("aria_controls"):
+                        existing["aria_controls"] = dom_element["aria_controls"]
+                    if dom_element.get("aria_owns"):
+                        existing["aria_owns"] = dom_element["aria_owns"]
                     matched_existing = True
                     if dom_selector:
                         selector_seen.add(dom_selector)
@@ -993,6 +1206,50 @@ def _merge_dom_observe_elements(
                 selector_seen.add(dom_selector)
 
     return merged
+
+
+async def get_observe_document_id(page: Any) -> str | None:
+    """Read the current document revision marker without taking an observe snapshot."""
+    working_frame = getattr(page, "_working_frame", None)
+    target = working_frame if working_frame is not None else page
+    raw_page = getattr(page, "page", page)
+    session_target = working_frame if working_frame is not None else raw_page
+    cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
+
+    # The session is cached on the page so the marker costs no attach per call; a cached one can be
+    # dead (page closed, target gone), so that case evicts and retries once before falling back.
+    attempts = 2 if cdp is not None else 1
+    for _ in range(attempts):
+        try:
+            async with track_perception_probe():
+                if cdp is None:
+                    cdp = await raw_page.context.new_cdp_session(session_target)
+                    try:
+                        session_target._skyvern_observe_cdp_session = cdp
+                    except Exception:
+                        pass
+                frame_tree = await cdp.send("Page.getFrameTree")
+                loader_id = frame_tree.get("frameTree", {}).get("frame", {}).get("loaderId")
+        except Exception:
+            if cdp is not None:
+                if getattr(session_target, "_skyvern_observe_cdp_session", None) is cdp:
+                    try:
+                        delattr(session_target, "_skyvern_observe_cdp_session")
+                    except Exception:
+                        pass
+                with suppress(Exception):
+                    await cdp.detach()
+            cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
+            continue
+        if isinstance(loader_id, str):
+            return f"cdp:{loader_id}"
+        break
+    try:
+        async with track_perception_probe():
+            value = await target.evaluate(_OBSERVE_DOCUMENT_ID_JS)
+    except Exception:
+        return None
+    return f"page:{value}" if isinstance(value, str) else None
 
 
 async def do_observe(
@@ -1029,6 +1286,10 @@ async def do_observe(
                 working_frame.url,
                 RuntimeError("frame is detached"),
             )
+    document_id_before: str | None = None
+    if observe_v2_enabled():
+        document_id_before = await get_observe_document_id(page)
+
     observe_target = working_frame if working_frame is not None else page
     if working_frame is not None:
         # Legacy page accessibility iframe roots are unreliable; DOM-only avoids cross-document merges.
@@ -1051,6 +1312,26 @@ async def do_observe(
         frame_name=working_frame.name if working_frame is not None else None,
         frame_url=working_frame.url if working_frame is not None else None,
     )
+
+    page_text: str | None = None
+    page_text_truncated = False
+    document_id: str | None = None
+    if observe_v2_enabled():
+        try:
+            async with track_perception_probe(evaluate_page_scan=True):
+                text_context = await observe_target.evaluate(_OBSERVE_PAGE_TEXT_JS, {"scopeSelector": selector})
+            if isinstance(text_context, dict) and isinstance(text_context.get("content"), str):
+                page_text = text_context["content"]
+                page_text_truncated = text_context.get("truncated") is True
+        except Exception:
+            LOG.debug("Best-effort observe page-text capture failed", exc_info=True)
+        # A same-URL replacement during extraction would tag pre-swap selectors (or page text)
+        # with the replacement document's id, blessing stale evidence. The marker therefore
+        # brackets extraction and text capture: any change, or an unreadable side, refuses
+        # durability instead.
+        document_id_after = await get_observe_document_id(page)
+        if document_id_before is not None and document_id_before == document_id_after:
+            document_id = document_id_after
 
     if interactive_only:
         all_elements = [e for e in all_elements if e.get("role") in INTERACTIVE_ROLES]
@@ -1098,6 +1379,8 @@ async def do_observe(
                 selector=elem.get("selector"),
                 value=elem.get("value"),
                 options=elem.get("options") or _extract_options(elem),
+                aria_controls=elem.get("aria_controls"),
+                aria_owns=elem.get("aria_owns"),
                 match_index=match_index,
                 needs_disambiguation=full_group_size[key] > 1,
             )
@@ -1111,12 +1394,21 @@ async def do_observe(
     else:
         title = await page.title()
 
+    if observe_v2_enabled() and document_id is not None:
+        # Extend the bracket over the title read: a swap landing after extraction but before
+        # return refuses durability the same way — degrade to None, never publish torn identity.
+        if await get_observe_document_id(page) != document_id:
+            document_id = None
+
     return ObserveResult(
         url=working_frame.url if working_frame is not None else page.url,
         title=title,
         elements=observed,
         element_count=len(observed),
         total_on_page=total,
+        page_text=page_text,
+        page_text_truncated=page_text_truncated,
+        document_id=document_id,
     )
 
 
@@ -1133,6 +1425,9 @@ def serialize_elements(elements: list[ObservedElement]) -> list[dict[str, Any]]:
             "value": e.value,
             "options": e.options,
         }
+        if observe_v2_enabled():
+            fields["aria_controls"] = e.aria_controls
+            fields["aria_owns"] = e.aria_owns
         if e.needs_disambiguation:
             fields["match_index"] = e.match_index
         result.append({k: v for k, v in fields.items() if k in _ELEMENT_KEEP_ALWAYS or (v is not None and v != "")})
@@ -1177,6 +1472,7 @@ _ALLOWED_EXECUTE_TOOLS = frozenset(
         "hover",
         "scroll",
         "wait",
+        "wait_for_either_state",
         "observe",
         "screenshot",
         "evaluate",
@@ -1222,7 +1518,8 @@ async def do_execute(
     dispatch_fn: Any,
     steps: list[ExecuteStep],
     stop_on_error: bool = True,
-    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool] | None = None,
+    on_ref_map_update: Callable[[dict[str, dict[str, Any]]], bool | Awaitable[bool]] | None = None,
+    fail_on_ref_map_rejection: bool = False,
 ) -> ExecuteResult:
     """Execute a sequence of deterministic browser operations in one batch.
 
@@ -1253,14 +1550,16 @@ async def do_execute(
         try:
             result = await dispatch_fn(step, ref_map)
             # DESIGN-4: Each observe REPLACES the entire ref_map (not merges).
-            # If session publication rejects the snapshot (a concurrent navigation
-            # invalidated it), the batch must not act on it either.
             if step.tool == "observe" and result and "elements" in result:
                 new_map = ref_map_from_elements(result["elements"])
-                if on_ref_map_update is None or on_ref_map_update(new_map):
-                    ref_map = new_map
+                if on_ref_map_update is None:
+                    accepted = True
                 else:
-                    ref_map = {}
+                    publication = on_ref_map_update(new_map)
+                    accepted = publication if isinstance(publication, bool) else await publication
+                if not accepted and fail_on_ref_map_rejection:
+                    raise RuntimeError("observe_snapshot_superseded: ref publication was rejected")
+                ref_map = new_map if accepted else {}
 
             wall_ms = int((time.monotonic() - t0) * 1000)
             results.append(StepResult(step=i, tool=step.tool, ok=True, wall_ms=wall_ms, data=result))

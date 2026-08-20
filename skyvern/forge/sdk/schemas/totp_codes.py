@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -65,8 +66,9 @@ class TOTPCodeCreate(TOTPCodeBase):
     )
     type: OTPType | None = Field(
         default=None,
-        description="Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.",
+        description="Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.",
         examples=["totp", "magic_link"],
+        deprecated=True,
     )
 
     @field_validator("content")
@@ -83,3 +85,39 @@ class TOTPCode(TOTPCodeCreate):
     created_at: datetime = Field(..., description="The timestamp when the TOTP code was created.")
     modified_at: datetime = Field(..., description="The timestamp when the TOTP code was modified.")
     otp_type: OTPType | None = Field(None, description="The type of the OTP code.")
+
+
+class RawTOTPCode(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    totp_code_id: str
+    totp_identifier: str
+    organization_id: str
+    content: str
+    task_id: str | None
+    workflow_id: str | None
+    workflow_run_id: str | None
+    source: str | None
+    created_at: datetime
+    expired_at: datetime | None
+
+
+class RawTOTPCodeAccepted(TOTPCode):
+    status: Literal["raw_pending"] = "raw_pending"
+
+    @classmethod
+    def from_raw_row(cls, raw_row: RawTOTPCode) -> "RawTOTPCodeAccepted":
+        return cls(
+            totp_code_id=raw_row.totp_code_id,
+            totp_identifier=raw_row.totp_identifier,
+            organization_id=raw_row.organization_id,
+            content=raw_row.content,
+            code="",
+            task_id=raw_row.task_id,
+            workflow_id=raw_row.workflow_id,
+            workflow_run_id=raw_row.workflow_run_id,
+            source=raw_row.source,
+            created_at=raw_row.created_at,
+            modified_at=raw_row.created_at,
+            expired_at=raw_row.expired_at,
+        )

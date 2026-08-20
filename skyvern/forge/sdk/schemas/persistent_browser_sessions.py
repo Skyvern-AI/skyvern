@@ -61,6 +61,7 @@ class Extensions(StrEnum):
 
 
 FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE = "forced_workflow_run"
+SESSION_RETIREMENT_RUNNABLE_TYPE = "session_retirement"
 
 
 class PersistentBrowserSession(BaseModel):
@@ -70,6 +71,8 @@ class PersistentBrowserSession(BaseModel):
     organization_id: str
     runnable_type: str | None = None
     runnable_id: str | None = None
+    runnable_generation_id: str | None = None
+    download_run_id: str | None = None
     browser_address: str | None = None
     ip_address: str | None = None
     # Server-side only: the upstream CDP endpoint and the adapter that dials it. browser_address
@@ -77,6 +80,10 @@ class PersistentBrowserSession(BaseModel):
     # BrowserSessionResponse.from_browser_session is the allowlist that enforces the former.
     upstream_cdp_url: str | None = None
     browser_vendor: str | None = None
+    # The upstream provider's own id for this browser. Server-side only, under the same allowlist
+    # as the two fields above. It is the sole handle for terminating a session out of band, so the
+    # orphan reaper reads it off the row after the process that created the session is gone.
+    browser_id: str | None = None
     status: str | None = None
     timeout_minutes: int | None = None
     proxy_location: ProxyLocationInput = None
@@ -88,6 +95,8 @@ class PersistentBrowserSession(BaseModel):
     compute_cost: Decimal | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    close_requested_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
     deleted_at: datetime | None = None
@@ -95,9 +104,22 @@ class PersistentBrowserSession(BaseModel):
     browser_type: PersistentBrowserType | None = None
     browser_profile_id: str | None = None
     generate_browser_profile: bool = False
+    bound_workflow_permanent_id: str | None = None
+    bound_key: str | None = None
     # False once a requested browser_profile_id failed to load at launch (fell back to a fresh profile),
     # so teardown exported under the session id rather than the bp_ id.
     browser_profile_loaded: bool = True
+
+    @property
+    def is_browser_ready(self) -> bool:
+        """Whether a browser exists for this session and can be connected to.
+
+        Keyed on upstream_cdp_url and NOT on browser_address: a client-facing address can be
+        minted when the session is created, before anything is provisioned, so its presence says
+        only that an address was issued. The session worker writes this column in the same call
+        that starts the session clock, which is what makes it the readiness signal.
+        """
+        return bool(self.upstream_cdp_url)
 
     @field_validator("proxy_location", mode="before")
     @classmethod

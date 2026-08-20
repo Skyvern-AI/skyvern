@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -12,7 +12,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage, recorded_action_from_payload
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    PendingAction,
+    RecordingPage,
+    recorded_action_from_payload,
+)
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action
 
@@ -27,6 +32,45 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+_RECORDER_OWNED_ACTION_FIELDS = (
+    "action_id",
+    "source_action_id",
+    "action_type",
+    "status",
+    "action_order",
+    "screenshot_artifact_id",
+    "started_at",
+    "finished_at",
+    "created_at",
+    "modified_at",
+)
+
+
+def _null_redacted_scalars(original: Any, masked: Any) -> Any:
+    if isinstance(original, bool | int | float) and isinstance(masked, str):
+        return None
+    if isinstance(original, dict) and isinstance(masked, dict):
+        return {
+            key: _null_redacted_scalars(original[key], value) if key in original else value
+            for key, value in masked.items()
+        }
+    if isinstance(original, list) and isinstance(masked, list):
+        return [
+            _null_redacted_scalars(original[index], value) if index < len(original) else value
+            for index, value in enumerate(masked)
+        ]
+    return masked
+
+
+def _page_closed(page: Page) -> bool | None:
+    # Separates "page was already gone" from "page was alive but hung" — a screenshot TimeoutError
+    # alone cannot tell them apart. Must not raise: the caller is an except handler whose remaining
+    # work still has to persist the action row.
+    try:
+        return page.is_closed()
+    except Exception:
+        return None
+
 
 class CodeBlockActionRecording:
     """Records the page operations of one CodeBlock execution and persists them against a container task."""
@@ -40,6 +84,8 @@ class CodeBlockActionRecording:
         workflow_run_block_id: str,
         organization_id: str | None,
         workflow_run_context: WorkflowRunContext,
+        redaction_parameters: dict[str, object] | None = None,
+        credential_release_guard: CredentialReleaseGuard | None = None,
     ) -> None:
         self._code_block = code_block
         self._page = page
@@ -47,13 +93,23 @@ class CodeBlockActionRecording:
         self._workflow_run_block_id = workflow_run_block_id
         self._organization_id = organization_id
         self._workflow_run_context = workflow_run_context
+        self._redaction_parameters = redaction_parameters or {}
         self._task: Task | None = None
         self._step: Step | None = None
         self._workflow_run_block: WorkflowRunBlock | None = None
         self._screenshot_tasks: list[asyncio.Task[None]] = []
+        self._recorded_action_metadata: dict[int, dict[str, object]] = {}
         self._recording_enabled = False
         self._finalized = False
-        self.recording_page = RecordingPage(page, on_action=self._recorded_action_sink)
+        self.recording_page = RecordingPage(
+            page,
+            on_action=self._recorded_action_sink,
+            on_pending_action=self._navigation_still_pending,
+            credential_release_guard=credential_release_guard,
+        )
+
+    def set_redaction_parameters(self, parameters: dict[str, object]) -> None:
+        self._redaction_parameters = parameters
 
     @property
     def task(self) -> Task | None:
@@ -64,6 +120,32 @@ class CodeBlockActionRecording:
 
     def last_recorded_exception(self) -> BaseException | None:
         return self.recording_page.last_recorded_exception()
+
+    async def _navigation_still_pending(self, pending_action: PendingAction) -> None:
+        LOG.warning(
+            "codeblock.navigation_still_pending",
+            workflow_run_id=self._workflow_run_id,
+            workflow_run_block_id=self._workflow_run_block_id,
+            block_label=self._code_block.label,
+            action_type=pending_action.action_type.value,
+            action_order=pending_action.action_order,
+            code_line=pending_action.code_line,
+            call_name=pending_action.call_name,
+            threshold_seconds=pending_action.threshold_seconds,
+        )
+
+    def _remember_action_metadata(self, action: Action) -> dict[str, object]:
+        metadata = self._recorded_action_metadata.get(id(action))
+        if metadata is None:
+            payload = action.model_dump(mode="json", warnings=False)
+            metadata = {field: payload[field] for field in _RECORDER_OWNED_ACTION_FIELDS}
+            model_fields = type(action).model_fields
+            for field in payload.keys() - action.model_fields_set:
+                model_field = model_fields.get(field)
+                if model_field is not None and model_field.default_factory is None and not model_field.is_required():
+                    metadata[field] = model_field.get_default(call_default_factory=False)
+            self._recorded_action_metadata[id(action)] = metadata
+        return metadata
 
     async def create_task_and_step(self) -> None:
         """Create the container task/step that anchors recorded actions (promptless blocks included)."""
@@ -78,7 +160,6 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to create code block recording task",
                 workflow_run_block_id=self._workflow_run_block_id,
-                exc_info=True,
             )
 
     async def link_block(self) -> None:
@@ -96,7 +177,6 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to link code block recording task to workflow run block",
                 workflow_run_block_id=self._workflow_run_block_id,
-                exc_info=True,
             )
             await self.finalize(success=False)
 
@@ -105,6 +185,7 @@ class CodeBlockActionRecording:
         # (run timeline, copilot narration) see it mid-block instead of only at block end.
         if not self._recording_enabled:
             return
+        metadata = self._remember_action_metadata(action)
         # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
         # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
         # only the page-free S3 upload is deferred off the critical path.
@@ -114,42 +195,51 @@ class CodeBlockActionRecording:
                     workflow_run_block_id=self._workflow_run_block_id, organization_id=self._organization_id
                 )
             run_block = self._workflow_run_block
-            screenshot = await self._page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            screenshot = await self._page.screenshot(timeout=settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS)
         except Exception:
             LOG.warning(
                 "Code block screenshot capture failed",
                 workflow_run_block_id=self._workflow_run_block_id,
-                exc_info=True,
+                page_closed=_page_closed(self._page),
             )
         else:
 
             async def _upload() -> None:
                 try:
-                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                    artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
                         workflow_run_block=run_block,
                         artifact_type=ArtifactType.SCREENSHOT_ACTION,
                         data=screenshot,
                     )
+                    action.screenshot_artifact_id = artifact_id
+                    metadata["screenshot_artifact_id"] = artifact_id
                 except Exception:
                     LOG.warning(
                         "Code block screenshot upload failed",
                         workflow_run_block_id=self._workflow_run_block_id,
-                        exc_info=True,
                     )
 
             self._screenshot_tasks.append(asyncio.create_task(_upload()))
 
         # Streamed row carries no screenshot yet (upload deferred); the end-of-block batch upserts it in.
-        await self._persist_action(action)
+        await self._persist_action(action, metadata)
 
-    async def _persist_action(self, action: Action) -> None:
+    async def _persist_action(self, action: Action, metadata: dict[str, object]) -> None:
         # Best-effort like the screenshot sink: recording must never change block outcome. Both the streamed
         # write and the end-of-block batch route through here and upsert on action_id, so they converge on
         # one row instead of double-inserting.
         if not self._recording_enabled or self._task is None or self._step is None:
             return
         try:
-            masked = self._workflow_run_context.mask_secrets_in_data([action.model_dump(mode="json")])[0]
+            payload = action.model_dump(mode="json", warnings=False)
+            masked = self._workflow_run_context.mask_secrets_in_data([payload])[0]
+            masked = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, self._redaction_parameters)
+            # A matching bool/number becomes a string placeholder, which typed Action fields reject.
+            # Null it recursively so subclass defaults cannot silently restore user-controlled values.
+            masked = _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else {}
+            # IDs, timestamps, and implicit model defaults come from a snapshot taken before user
+            # code can mutate the action. Explicit page/action fields remain masked.
+            masked.update(metadata)
             persisted = recorded_action_from_payload(masked)
             persisted.task_id = self._task.task_id
             persisted.step_id = self._step.step_id
@@ -160,8 +250,7 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to persist recorded code block action",
                 workflow_run_block_id=self._workflow_run_block_id,
-                action_order=action.action_order,
-                exc_info=True,
+                action_order=metadata.get("action_order"),
             )
 
     async def _drain_screenshots(self) -> None:
@@ -175,7 +264,7 @@ class CodeBlockActionRecording:
         if not recorded or not self._recording_enabled or self._task is None or self._step is None:
             return
         for action in recorded:
-            await self._persist_action(action)
+            await self._persist_action(action, self._remember_action_metadata(action))
 
     async def finalize(self, success: bool) -> None:
         # Finalize both task and step on every exit path (incl. CancelledError via a finally); idempotent.
@@ -201,7 +290,6 @@ class CodeBlockActionRecording:
             LOG.warning(
                 "Failed to finalize code block task status",
                 workflow_run_block_id=self._workflow_run_block_id,
-                exc_info=True,
             )
         if not success or self._step is None:
             return
@@ -214,5 +302,36 @@ class CodeBlockActionRecording:
                 "Code block billing hook failed",
                 workflow_run_block_id=self._workflow_run_block_id,
                 task_id=self._task.task_id,
-                exc_info=True,
+            )
+        await self._record_final_url()
+
+    async def _record_final_url(self) -> None:
+        """Persist the page this block ended on; the failure path records the same column."""
+        if not self._organization_id:
+            return
+        try:
+            page_url = self._page.url
+            final_url = self._workflow_run_context.mask_secrets_in_data(page_url)
+        except Exception:
+            LOG.warning(
+                "Failed to read the end URL of a code block",
+                workflow_run_block_id=self._workflow_run_block_id,
+            )
+            return
+        if not isinstance(final_url, str) or not final_url:
+            return
+        if final_url != page_url:
+            # Masking altering the URL means a login/MFA step left a credential or OTP in the query
+            # string. The masked form is not a page anything can be resumed against, so record none.
+            return
+        try:
+            await app.DATABASE.observer.update_workflow_run_block(
+                workflow_run_block_id=self._workflow_run_block_id,
+                organization_id=self._organization_id,
+                final_url=final_url,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to persist the end URL of a code block",
+                workflow_run_block_id=self._workflow_run_block_id,
             )

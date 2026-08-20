@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, stamp_page_evidence_provenance
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 
 from ._shared import (
@@ -378,21 +378,25 @@ def _record_composition_page_observation(
     elif source_tool == "evaluate":
         evidence.update(_normalize_evaluate_page_schema(observed_data))
     run_id = ctx.last_run_blocks_workflow_run_id
-    if isinstance(run_id, str) and run_id:
-        evidence["workflow_run_id"] = run_id
-        evidence["observed_after_workflow_run"] = True
+    evidence = stamp_page_evidence_provenance(
+        evidence,
+        source_browser_session_id=ctx.browser_session_id,
+        run_id=run_id,
+        run_browser_session_id=ctx.last_run_blocks_browser_session_id,
+    )
     _mark_post_run_page_observed(
         ctx,
         source_tool=source_tool,
         url=url,
         page_evidence=evidence if has_bounded_page_schema(evidence) else None,
+        source_browser_session_id=ctx.browser_session_id,
     )
 
     observation_step: int | None = None
     if append_to_flow and has_bounded_page_schema(evidence):
         actual_reached_via = reached_via
         if reached_via == "auto":
-            if isinstance(run_id, str) and run_id:
+            if evidence.get("observed_after_workflow_run") is True:
                 actual_reached_via = "post_run"
             elif _consume_pending_browser_interaction_observation(ctx, current_url=url, evidence=evidence):
                 actual_reached_via = "interaction"

@@ -70,7 +70,9 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
+    PLATFORM_SMTP_AWS_KEYS,
     RESERVED_PARAMETER_KEYS,
+    UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
     AWSSecretParameter,
     AzureVaultCredentialParameter,
     BitwardenCreditCardDataParameter,
@@ -329,7 +331,7 @@ def convert_workflow_definition(
     block_label_mapping = {}
     blocks: list[BlockTypeVar] = []
     for block_yaml in workflow_definition_yaml.blocks:
-        block = block_yaml_to_block(block_yaml, parameters)
+        block = block_yaml_to_block(block_yaml, parameters, workflow_id=workflow_id)
         blocks.append(block)
         block_label_mapping[block.label] = block
 
@@ -343,6 +345,7 @@ def convert_workflow_definition(
         finally_block_label=workflow_definition_yaml.finally_block_label,
         error_code_mapping=workflow_definition_yaml.error_code_mapping,
         workflow_system_prompt=workflow_definition_yaml.workflow_system_prompt,
+        completion_contract=workflow_definition_yaml.completion_contract,
     )
 
     LOG.info(
@@ -464,6 +467,7 @@ def _reconcile_code_block_step_spans(
 def block_yaml_to_block(
     block_yaml: BLOCK_YAML_TYPES,
     parameters: dict[str, PARAMETER_TYPE],
+    workflow_id: str = "",
 ) -> BlockTypeVar:
     output_parameter = cast(OutputParameter, parameters[f"{block_yaml.label}_output"])
     base_kwargs = _build_block_kwargs(block_yaml, output_parameter)
@@ -492,7 +496,10 @@ def block_yaml_to_block(
             include_action_history_in_verification=block_yaml.include_action_history_in_verification,
         )
     elif block_yaml.block_type == BlockType.FOR_LOOP:
-        loop_blocks = [block_yaml_to_block(loop_block, parameters) for loop_block in block_yaml.loop_blocks]
+        loop_blocks = [
+            block_yaml_to_block(loop_block, parameters, workflow_id=workflow_id)
+            for loop_block in block_yaml.loop_blocks
+        ]
 
         loop_over_parameter: Parameter | None = None
         if block_yaml.loop_over_parameter_key:
@@ -521,7 +528,10 @@ def block_yaml_to_block(
             data_schema=block_yaml.data_schema,
         )
     elif block_yaml.block_type == BlockType.WHILE_LOOP:
-        loop_blocks = [block_yaml_to_block(loop_block, parameters) for loop_block in block_yaml.loop_blocks]
+        loop_blocks = [
+            block_yaml_to_block(loop_block, parameters, workflow_id=workflow_id)
+            for loop_block in block_yaml.loop_blocks
+        ]
 
         condition_yaml = block_yaml.condition
         criteria_type = condition_yaml.criteria_type
@@ -605,6 +615,7 @@ def block_yaml_to_block(
             **base_kwargs,
             code=block_yaml.code,
             parameters=_resolve_block_parameters(block_yaml, parameters),
+            error_code_mapping=block_yaml.error_code_mapping,
             prompt=block_yaml.prompt,
             steps=code_block_steps,
         )
@@ -651,15 +662,15 @@ def block_yaml_to_block(
             path=block_yaml.path,
         )
     elif block_yaml.block_type == BlockType.SEND_EMAIL:
+        smtp_parameter_keys = {
+            "smtp_host": block_yaml.smtp_host_secret_parameter_key,
+            "smtp_port": block_yaml.smtp_port_secret_parameter_key,
+            "smtp_username": block_yaml.smtp_username_secret_parameter_key,
+            "smtp_password": block_yaml.smtp_password_secret_parameter_key,
+        }
+        has_custom_smtp_host = bool(block_yaml.custom_smtp_host and block_yaml.custom_smtp_host.strip())
         missing_smtp_keys = [
-            key
-            for key in (
-                block_yaml.smtp_host_secret_parameter_key,
-                block_yaml.smtp_port_secret_parameter_key,
-                block_yaml.smtp_username_secret_parameter_key,
-                block_yaml.smtp_password_secret_parameter_key,
-            )
-            if key not in parameters
+            key for key in smtp_parameter_keys.values() if key and key not in parameters and not has_custom_smtp_host
         ]
         if missing_smtp_keys:
             raise InvalidWorkflowDefinition(
@@ -667,12 +678,55 @@ def block_yaml_to_block(
                 f"{', '.join(sorted(set(missing_smtp_keys)))}. "
                 "Declare these parameters in the workflow before using them."
             )
+
+        def _smtp_parameter(name: str) -> AWSSecretParameter:
+            key = smtp_parameter_keys[name] or name
+            declared = parameters.get(key)
+            if isinstance(declared, AWSSecretParameter):
+                return declared
+            now = datetime.now(UTC)
+            if has_custom_smtp_host:
+                # The custom path never reads the platform-sender secrets, but the model
+                # requires them structurally, so this stub stays out of `parameters`.
+                return AWSSecretParameter(
+                    parameter_type=ParameterType.AWS_SECRET,
+                    key=name,
+                    description="Unused placeholder; this block sends via custom SMTP.",
+                    aws_key=UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
+                    aws_secret_parameter_id=f"placeholder_{name}",
+                    workflow_id="",
+                    created_at=now,
+                    modified_at=now,
+                )
+            if declared is not None:
+                raise InvalidWorkflowDefinition(
+                    f"Send email block '{block_yaml.label}' needs parameter '{key}' to be an AWS secret "
+                    "parameter, but the workflow declares it as "
+                    f"{declared.parameter_type.value}. Rename that parameter or send via custom_smtp_host."
+                )
+            provisioned = AWSSecretParameter(
+                parameter_type=ParameterType.AWS_SECRET,
+                key=name,
+                description=f"Skyvern platform SMTP {name}",
+                aws_key=PLATFORM_SMTP_AWS_KEYS[name],
+                aws_secret_parameter_id=generate_aws_secret_parameter_id(),
+                workflow_id=workflow_id,
+                created_at=now,
+                modified_at=now,
+            )
+            parameters[key] = provisioned
+            return provisioned
+
         return SendEmailBlock(
             **base_kwargs,
-            smtp_host=parameters[block_yaml.smtp_host_secret_parameter_key],
-            smtp_port=parameters[block_yaml.smtp_port_secret_parameter_key],
-            smtp_username=parameters[block_yaml.smtp_username_secret_parameter_key],
-            smtp_password=parameters[block_yaml.smtp_password_secret_parameter_key],
+            smtp_host=_smtp_parameter("smtp_host"),
+            smtp_port=_smtp_parameter("smtp_port"),
+            smtp_username=_smtp_parameter("smtp_username"),
+            smtp_password=_smtp_parameter("smtp_password"),
+            custom_smtp_host=block_yaml.custom_smtp_host,
+            custom_smtp_port=block_yaml.custom_smtp_port,
+            custom_smtp_username=block_yaml.custom_smtp_username,
+            custom_smtp_password=block_yaml.custom_smtp_password,
             sender=block_yaml.sender,
             recipients=block_yaml.recipients,
             subject=block_yaml.subject,
@@ -703,13 +757,14 @@ def block_yaml_to_block(
         return ValidationBlock(
             **base_kwargs,
             task_type=TaskType.validation,
+            engine=block_yaml.engine,
             parameters=validation_block_parameters,
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
             without_page_information=block_yaml.without_page_information,
-            # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
-            max_steps_per_run=2,
+            # Default is 2 (1 attempt + 1 retry); an explicit yaml value overrides it.
+            max_steps_per_run=block_yaml.max_steps_per_run if block_yaml.max_steps_per_run is not None else 2,
         )
 
     elif block_yaml.block_type == BlockType.ACTION:
@@ -737,7 +792,8 @@ def block_yaml_to_block(
             disable_cache=block_yaml.disable_cache,
             # DO NOT run complete verification for action block
             complete_verification=False,
-            max_steps_per_run=1,
+            # Default is 1 (a single atomic action); an explicit yaml value overrides it.
+            max_steps_per_run=block_yaml.max_steps_per_run if block_yaml.max_steps_per_run is not None else 1,
         )
 
     elif block_yaml.block_type == BlockType.NAVIGATION:
@@ -758,6 +814,7 @@ def block_yaml_to_block(
             totp_identifier=block_yaml.totp_identifier,
             disable_cache=block_yaml.disable_cache,
             complete_criterion=block_yaml.complete_criterion,
+            complete_criterion_is_untrusted=block_yaml.complete_criterion_is_untrusted,
             terminate_criterion=block_yaml.terminate_criterion,
             complete_verification=block_yaml.complete_verification,
             include_action_history_in_verification=block_yaml.include_action_history_in_verification,

@@ -1,3 +1,4 @@
+import asyncio
 from time import perf_counter
 
 import httpx
@@ -32,7 +33,7 @@ from skyvern.services.webhook_service import (
     build_sample_workflow_run_payload,
     replay_run_webhook,
 )
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import pinned_ip_client, validate_fetch_url_with_resolved_ips
 
 LOG = structlog.get_logger()
 
@@ -70,24 +71,15 @@ async def test_webhook(
 
     # Validate the URL (raises BlockedHost or SkyvernHTTPException for invalid URLs)
     try:
-        validated_url = validate_url(request.webhook_url)
-        if not validated_url:
-            return TestWebhookResponse(
-                status_code=None,
-                latency_ms=0,
-                response_body="",
-                headers_sent={},
-                error="Invalid webhook URL",
-            )
+        validated_url, resolved_ips = await asyncio.to_thread(validate_fetch_url_with_resolved_ips, request.webhook_url)
     except BlockedHost as exc:
-        blocked_host: str | None = getattr(exc, "host", None)
         return TestWebhookResponse(
             status_code=None,
             latency_ms=0,
             response_body="",
             headers_sent={},
             error=(
-                f"This URL is blocked by SSRF protection (host: {blocked_host or 'unknown'}). "
+                f"{exc} It is either blocked by SSRF protection or could not be resolved. "
                 "Add the host to ALLOWED_HOSTS to test internal endpoints or use an external receiver "
                 "such as webhook.site or requestbin.com."
             ),
@@ -143,7 +135,7 @@ async def test_webhook(
     error = None
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with pinned_ip_client(resolved_ips) as client:
             response = await client.post(
                 validated_url,
                 content=signed_data.signed_payload,

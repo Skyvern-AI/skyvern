@@ -1,13 +1,6 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useWorkflowSchedulesQuery } from "@/routes/workflows/hooks/useWorkflowSchedulesQuery";
 import {
   useCreateScheduleMutation,
@@ -148,42 +141,18 @@ function WorkflowSchedulePanel({ onClose }: Props) {
         </ScrollAreaViewport>
       </ScrollArea>
 
-      <Dialog
+      <ConfirmDialog
         open={deleteDialogState.open}
         onOpenChange={(open) => {
-          if (!open && !deleteSchedule.isPending) {
+          if (!open) {
             setDeleteDialogState({ open: false, scheduleId: null });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Schedule</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this schedule? This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={deleteSchedule.isPending}
-              onClick={() =>
-                setDeleteDialogState({ open: false, scheduleId: null })
-              }
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteSchedule.isPending}
-              onClick={handleDeleteConfirm}
-            >
-              {deleteSchedule.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title="Delete schedule?"
+        description={<p>This schedule will be permanently deleted.</p>}
+        isPending={deleteSchedule.isPending}
+        onConfirm={handleDeleteConfirm}
+      />
     </div>
   );
 }

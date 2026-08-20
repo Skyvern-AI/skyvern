@@ -29,7 +29,6 @@ async def get_action_history(
         if window_step.output and window_step.output.actions_and_results:
             actions_and_results.extend(window_step.output.actions_and_results)
 
-    # exclude successful action from history
     action_history = [
         {
             "action": action.model_dump(

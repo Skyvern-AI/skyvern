@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import re
-import time
 import unicodedata
 from enum import StrEnum
 from typing import Literal
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat
-from skyvern.forge.sdk.copilot.context import sanitize_global_llm_context_for_prompt
-from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.strings import escape_code_fences
 
@@ -60,16 +53,6 @@ class RequestSlotAntecedentFamily(StrEnum):
     UNDECIDABLE = "undecidable"
 
 
-class RequestSlotProducerFailureKind(StrEnum):
-    MISSING_HANDLER = "missing_handler"
-    PROMPT_RENDER_ERROR = "prompt_render_error"
-    TIMEOUT = "timeout"
-    PROVIDER_ERROR = "provider_error"
-    EMPTY_OUTPUT = "empty_output"
-    INVALID_OUTPUT = "invalid_output"
-    INCONSISTENT_OUTPUT = "inconsistent_output"
-
-
 class RequestSlotDatumTargetV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -91,6 +74,19 @@ class RequestSlotProducerInputV1(BaseModel):
     retained_history: tuple[str, ...] = Field(max_length=8)
     global_context: str = Field(max_length=32_768)
     datum_targets: tuple[RequestSlotDatumTargetV1, ...] = Field(default=(), max_length=64)
+    # Requested-output fields the deterministic detector found in the message. Each obliges the
+    # producer to anchor a slot on it or refute it by name; silence stops being a valid answer
+    # for a field the message demonstrably requests (SKY-13329).
+    detected_output_candidates: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @field_validator("detected_output_candidates")
+    @classmethod
+    def _validate_detected_output_candidates(cls, candidates: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not candidate.strip() or len(candidate) > 64 for candidate in candidates):
+            raise ValueError("detected output candidates must be non-empty and at most 64 characters")
+        if len({candidate.casefold() for candidate in candidates}) != len(candidates):
+            raise ValueError("detected output candidates must be unique")
+        return candidates
 
     @field_validator("retained_history")
     @classmethod
@@ -166,6 +162,13 @@ class RequestSlotDatumDeclineDeclarationV1(BaseModel):
     declined: Literal[True]
 
 
+class RequestSlotCandidateRefutationV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    candidate: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=256)
+
+
 class RequestSlotEnvelopeV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -174,12 +177,14 @@ class RequestSlotEnvelopeV1(BaseModel):
     datum_bindings: tuple[RequestSlotDatumBindingDeclarationV1 | RequestSlotDatumDeclineDeclarationV1, ...] = Field(
         default=(), max_length=64
     )
+    candidate_refutations: tuple[RequestSlotCandidateRefutationV1, ...] = Field(default=(), max_length=8)
 
 
 def _request_digest(
     version: str,
     sources: tuple[RequestSlotSourceV1, ...],
     datum_targets: tuple[RequestSlotDatumTargetV1, ...],
+    detected_output_candidates: tuple[str, ...] = (),
 ) -> str:
     digest_payload: list[object] = [
         version,
@@ -189,6 +194,8 @@ def _request_digest(
     # targeted producer contracts identity-complete for replay and caching.
     if datum_targets:
         digest_payload.append([target.model_dump(mode="json") for target in datum_targets])
+    if detected_output_candidates:
+        digest_payload.append(list(detected_output_candidates))
     encoded = json.dumps(
         digest_payload,
         ensure_ascii=True,
@@ -198,7 +205,9 @@ def _request_digest(
 
 
 def request_slot_request_digest(request: RequestSlotProducerInputV1) -> str:
-    return _request_digest(request.version, request_slot_sources(request), request.datum_targets)
+    return _request_digest(
+        request.version, request_slot_sources(request), request.datum_targets, request.detected_output_candidates
+    )
 
 
 _CANONICAL_SLOT_LEAF_PREFIX = "request_slot_"
@@ -289,6 +298,7 @@ class RequestSlotContractV1(BaseModel):
     count: int = Field(ge=0, le=64)
     datum_bindings: tuple[CanonicalRequestSlotDatumBindingV1, ...] = Field(default=(), max_length=64)
     datum_declines: tuple[CanonicalRequestSlotDatumDeclineV1, ...] = Field(default=(), max_length=64)
+    candidate_refutations: tuple[RequestSlotCandidateRefutationV1, ...] = Field(default=(), max_length=8)
 
     @model_validator(mode="after")
     def _validate_derived_membership(self) -> RequestSlotContractV1:
@@ -334,37 +344,6 @@ class RequestSlotContractV1(BaseModel):
                     raise ValueError("slot membership contains overlapping source anchors")
             previous = slot
         return self
-
-
-class RequestSlotProducerResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    status: Literal["success", "failure"]
-    attempts: int = Field(ge=0, le=_MAX_CLASSIFIER_ATTEMPTS)
-    contract: RequestSlotContractV1 | None = None
-    failure_kind: RequestSlotProducerFailureKind | None = None
-
-    @model_validator(mode="after")
-    def _validate_exclusive_result(self) -> RequestSlotProducerResult:
-        if self.status == "success":
-            if self.contract is None or self.failure_kind is not None or self.attempts == 0:
-                raise ValueError("success requires a contract, at least one attempt, and no failure")
-        elif self.contract is not None or self.failure_kind is None:
-            raise ValueError("failure requires a failure kind and no contract")
-        return self
-
-    @classmethod
-    def success(cls, contract: RequestSlotContractV1, *, attempts: int) -> RequestSlotProducerResult:
-        return cls(status="success", attempts=attempts, contract=contract)
-
-    @classmethod
-    def failure(
-        cls,
-        failure_kind: RequestSlotProducerFailureKind,
-        *,
-        attempts: int,
-    ) -> RequestSlotProducerResult:
-        return cls(status="failure", attempts=attempts, failure_kind=failure_kind)
 
 
 def _middle_truncate(text: str, cap: int) -> str:
@@ -484,6 +463,33 @@ def canonicalize_request_slots(
             raise ValueError(f"source anchors overlap in {item[1].source_id}")
         previous = item
 
+    # Mirror of the datum-target coverage rule above: every detector candidate is answered — a slot
+    # anchored on it, or a refutation naming it. An envelope silent on a candidate is invalid output.
+    candidates_by_fold = {candidate.casefold(): candidate for candidate in request.detected_output_candidates}
+    refuted_folds: set[str] = set()
+    for refutation in envelope.candidate_refutations:
+        fold = refutation.candidate.casefold()
+        if fold not in candidates_by_fold:
+            raise ValueError(f"refutation names an undetected candidate: {refutation.candidate}")
+        if fold in refuted_folds:
+            raise ValueError(f"candidate refuted more than once: {refutation.candidate}")
+        refuted_folds.add(fold)
+    answer_quotes = [declaration.source_quote.casefold() for declaration, _, _, _ in resolved] + [
+        binding.source_quote.casefold()
+        for binding in envelope.datum_bindings
+        if isinstance(binding, RequestSlotDatumBindingDeclarationV1)
+    ]
+    # Either containment direction answers: the detector composes phrases wider than the tile of
+    # text a producer legitimately quotes ("adjacent account number" vs "account number").
+    quoted_folds = {
+        fold for fold in candidates_by_fold if any(fold in quote or quote in fold for quote in answer_quotes)
+    }
+    unanswered = sorted(set(candidates_by_fold) - refuted_folds - quoted_folds)
+    if unanswered:
+        # Reported, not refused: refusing costs the whole slot contract and every criterion in it,
+        # where the only thing proven is that the producer stayed silent on a detected field.
+        LOG.info("copilot_request_slot_candidates_unanswered", unanswered=unanswered)
+
     digest = request_slot_request_digest(request)
     canonical_slots: list[CanonicalRequestSlotV1] = []
     seen_paths: set[str] = set()
@@ -570,127 +576,52 @@ def canonicalize_request_slots(
         count=len(canonical_slots),
         datum_bindings=tuple(canonical_bindings),
         datum_declines=tuple(canonical_declines),
+        candidate_refutations=envelope.candidate_refutations,
     )
 
 
-def _render_prompt(request: RequestSlotProducerInputV1) -> str:
-    safe_global_context = sanitize_global_llm_context_for_prompt(request.global_context)
-    sources = request_slot_sources(request)
-    return prompt_engine.load_prompt(
-        template=PROMPT_NAME,
-        request_sources=json.dumps(
-            [source.model_dump(mode="json") for source in sources],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-        workflow_context=_safe_prompt_text(request.workflow_context, _MAX_WORKFLOW_PROMPT_CHARS),
-        latest_assistant_turn=_safe_prompt_text(request.latest_assistant_turn, _MAX_TRANSCRIPT_ANCHOR_PROMPT_CHARS),
-        global_context=_safe_prompt_text(safe_global_context, _MAX_GLOBAL_CONTEXT_PROMPT_CHARS),
-        datum_targets=json.dumps(
-            [target.model_dump(mode="json") for target in request.datum_targets],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ),
-    )
+def request_slot_contract_disagreements(
+    first: RequestSlotContractV1,
+    second: RequestSlotContractV1,
+) -> tuple[str, ...]:
+    """Dotted paths of the fields two classifier attempts disagreed on — names only, never values.
 
-
-def _is_empty_output(raw: object) -> bool:
-    return raw is None or (isinstance(raw, str) and not raw.strip())
-
-
-def _parse_envelope(raw: object) -> RequestSlotEnvelopeV1 | None:
-    try:
-        payload = raw if isinstance(raw, str) else json.dumps(raw)
-        return RequestSlotEnvelopeV1.model_validate_json(payload)
-    except (TypeError, ValueError, ValidationError):
-        return None
+    A run that degrades on oscillation records that it happened but not what moved, which leaves the
+    difference between a producer flipping one judgment and one drifting wholesale unmeasurable.
+    """
+    fields: list[str] = []
+    for name in ("version", "request_digest", "count"):
+        if getattr(first, name) != getattr(second, name):
+            fields.append(name)
+    if len(first.slots) != len(second.slots):
+        fields.append("slots.count")
+    else:
+        for index, (first_slot, second_slot) in enumerate(zip(first.slots, second.slots, strict=True)):
+            for name in ("ordinal", "source_id", "plane", "pinability", "antecedent_family"):
+                if getattr(first_slot, name) != getattr(second_slot, name):
+                    fields.append(f"slots.{index}.{name}")
+            if not (
+                first_slot.source_start < second_slot.source_end and second_slot.source_start < first_slot.source_end
+            ):
+                fields.append(f"slots.{index}.source_span")
+    if len(first.datum_bindings) != len(second.datum_bindings):
+        fields.append("datum_bindings.count")
+    else:
+        for index, (first_binding, second_binding) in enumerate(
+            zip(first.datum_bindings, second.datum_bindings, strict=True)
+        ):
+            for name in ("criterion_index", "datum_field", "datum_value", "criterion_outcome_sha256", "slot_id"):
+                if getattr(first_binding, name) != getattr(second_binding, name):
+                    fields.append(f"datum_bindings.{index}.{name}")
+    if first.datum_declines != second.datum_declines:
+        fields.append("datum_declines")
+    if first.candidate_refutations != second.candidate_refutations:
+        fields.append("candidate_refutations")
+    return tuple(fields)
 
 
 def request_slot_contracts_agree(
     first: RequestSlotContractV1,
     second: RequestSlotContractV1,
 ) -> bool:
-    if first.version != second.version or first.request_digest != second.request_digest or first.count != second.count:
-        return False
-    slots_agree = all(
-        first_slot.ordinal == second_slot.ordinal
-        and first_slot.source_id == second_slot.source_id
-        and first_slot.plane == second_slot.plane
-        and first_slot.pinability == second_slot.pinability
-        and first_slot.antecedent_family == second_slot.antecedent_family
-        and first_slot.source_start < second_slot.source_end
-        and second_slot.source_start < first_slot.source_end
-        for first_slot, second_slot in zip(first.slots, second.slots, strict=True)
-    )
-    bindings_agree = len(first.datum_bindings) == len(second.datum_bindings) and all(
-        first_binding.criterion_index == second_binding.criterion_index
-        and first_binding.datum_field == second_binding.datum_field
-        and first_binding.datum_value == second_binding.datum_value
-        and first_binding.criterion_outcome_sha256 == second_binding.criterion_outcome_sha256
-        and first_binding.slot_id == second_binding.slot_id
-        for first_binding, second_binding in zip(first.datum_bindings, second.datum_bindings, strict=True)
-    )
-    return slots_agree and bindings_agree and first.datum_declines == second.datum_declines
-
-
-async def produce_request_slots(
-    *,
-    request: RequestSlotProducerInputV1,
-    handler: LLMAPIHandler | None,
-    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
-) -> RequestSlotProducerResult:
-    if handler is None:
-        return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.MISSING_HANDLER, attempts=0)
-    try:
-        prompt = _render_prompt(request)
-    except Exception as exc:
-        LOG.warning("request-slot prompt render failed", error=str(exc))
-        return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.PROMPT_RENDER_ERROR, attempts=0)
-
-    deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-    candidate_contract: RequestSlotContractV1 | None = None
-    for attempt in range(1, _MAX_CLASSIFIER_ATTEMPTS + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt - 1)
-        try:
-            raw = await asyncio.wait_for(
-                handler(prompt=prompt, prompt_name=PROMPT_NAME),
-                timeout=remaining,
-            )
-        except asyncio.TimeoutError:
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt)
-        except EmptyLLMResponseError:
-            last_failure = RequestSlotProducerFailureKind.EMPTY_OUTPUT
-            continue
-        except InvalidLLMResponseFormat:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        except Exception as exc:
-            if attempt < _MAX_CLASSIFIER_ATTEMPTS and is_retriable_llm_error(exc):
-                continue
-            if time.monotonic() >= deadline:
-                return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.TIMEOUT, attempts=attempt)
-            LOG.warning("request-slot classifier provider failed", error=str(exc), attempt=attempt)
-            return RequestSlotProducerResult.failure(RequestSlotProducerFailureKind.PROVIDER_ERROR, attempts=attempt)
-
-        if _is_empty_output(raw):
-            last_failure = RequestSlotProducerFailureKind.EMPTY_OUTPUT
-            continue
-        envelope = _parse_envelope(raw)
-        if envelope is None:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        try:
-            contract = canonicalize_request_slots(request=request, envelope=envelope)
-        except ValueError:
-            last_failure = RequestSlotProducerFailureKind.INVALID_OUTPUT
-            continue
-        if candidate_contract is not None and request_slot_contracts_agree(candidate_contract, contract):
-            return RequestSlotProducerResult.success(candidate_contract, attempts=attempt)
-        candidate_contract = contract
-
-    if candidate_contract is not None:
-        last_failure = RequestSlotProducerFailureKind.INCONSISTENT_OUTPUT
-    return RequestSlotProducerResult.failure(last_failure, attempts=_MAX_CLASSIFIER_ATTEMPTS)
+    return not request_slot_contract_disagreements(first, second)

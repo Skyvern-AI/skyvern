@@ -11,6 +11,8 @@ import {
   getReadableActionType,
   type ActionsApiResponse,
 } from "@/api/types";
+import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
+import { CopyButton } from "@/components/CopyButton";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
@@ -19,6 +21,7 @@ import {
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import { jsonClipboardText } from "./formatValue";
 import { BlockDetailFailure } from "./shared";
 
 type InspectorField = {
@@ -233,10 +236,19 @@ function JsonNode({
 
   const isOpen = hasSearch || expanded.has(path);
   const childCount = children.length;
+  const copyButton = (
+    // The path keeps accessible names unique when the same key repeats at
+    // different depths (e.g. two "id" fields).
+    <CopyButton
+      value={() => jsonClipboardText(value)}
+      ariaLabel={`Copy ${path === "$" ? label : path.slice(2)}`}
+      className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/jsonnode:opacity-100 [&_svg]:size-3"
+    />
+  );
 
   if (!isExpandable) {
     return (
-      <div className="flex min-w-0 items-start gap-1 py-0.5 text-xs">
+      <div className="group/jsonnode flex min-w-0 items-start gap-1 py-0.5 text-xs">
         <span className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="shrink-0 text-muted-foreground dark:text-slate-500">
           <HighlightedText text={label} search={search} />
@@ -244,31 +256,35 @@ function JsonNode({
         <span className="min-w-0 break-words font-mono text-tertiary-foreground">
           <HighlightedText text={primitivePreview(value)} search={search} />
         </span>
+        {copyButton}
       </div>
     );
   }
 
   return (
     <div className="min-w-0 text-xs">
-      <button
-        type="button"
-        onClick={() => onToggle(path)}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-muted/60 focus-visible:ring-1 focus-visible:ring-foreground/40"
-      >
-        {isOpen ? (
-          <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
-        ) : (
-          <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
-        )}
-        <span className="shrink-0 text-muted-foreground">
-          <HighlightedText text={label} search={search} />
-        </span>
-        {!isOpen && (
-          <span className="min-w-0 truncate font-mono text-tertiary-foreground">
-            {expandablePreview(value, childCount)}
+      <div className="group/jsonnode flex min-w-0 items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onToggle(path)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-muted/60 focus-visible:ring-1 focus-visible:ring-foreground/40"
+        >
+          {isOpen ? (
+            <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          ) : (
+            <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          )}
+          <span className="shrink-0 text-muted-foreground">
+            <HighlightedText text={label} search={search} />
           </span>
-        )}
-      </button>
+          {!isOpen && (
+            <span className="min-w-0 truncate font-mono text-tertiary-foreground">
+              {expandablePreview(value, childCount)}
+            </span>
+          )}
+        </button>
+        {copyButton}
+      </div>
       {isOpen && (
         <div className="ml-4 border-l border-border pl-3">
           {children.map(([childKey, childValue]) => (
@@ -410,6 +426,11 @@ function getActionSummaryFields(
   );
   pushField(fields, "Reasoning", action.reasoning);
   pushField(fields, "Intention", action.intention);
+  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
+  // this panel is the reachable home for it.
+  if (isRecorderCallText(action.description)) {
+    pushField(fields, "Recorded call", action.description);
+  }
   return fields;
 }
 

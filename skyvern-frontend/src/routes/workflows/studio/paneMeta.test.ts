@@ -37,21 +37,29 @@ describe("paneAccessibleName", () => {
 
   test("the run pane's controls keep the stable name 'Run'", () => {
     // The pane's own controls (region/close/drag) announce "Run", matching the
-    // "Run: wr_…" content; "Past Runs" is the rail selector's name (railLabel).
+    // "Run: wr_…" content; "Past Runs" is the idle run control's label.
     expect(paneAccessibleName("overview")).toBe("Run");
     expect(paneLabel("overview", "wr_5538abcdef")).toBe("Run: wr_5538…");
   });
 });
 
 describe("railLabel", () => {
-  test("the run pane's rail tab is the 'Past Runs' selector", () => {
-    expect(railLabel("overview")).toBe("Past Runs");
+  test("the run pane's rail tab names the inspected run with its full id", () => {
+    // Untruncated on purpose: the top bar is where run ids are read and copied.
+    expect(railLabel("overview", "wr_556219201027773764")).toBe(
+      "View Run: wr_556219201027773764",
+    );
   });
 
-  test("other tabs match their pane's accessible name", () => {
+  test("falls back to the 'Past Runs' selector name with no run", () => {
+    expect(railLabel("overview")).toBe("Past Runs");
+    expect(railLabel("overview", null)).toBe("Past Runs");
+  });
+
+  test("other tabs match their pane's accessible name, ignoring the run id", () => {
     expect(railLabel("copilot")).toBe("Copilot");
     expect(railLabel("editor")).toBe("Editor");
-    expect(railLabel("browser")).toBe("Browser");
+    expect(railLabel("browser", "wr_5538abcdef")).toBe("Browser");
   });
 });
 

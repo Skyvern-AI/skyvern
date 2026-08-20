@@ -8,6 +8,7 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.azure import AzureUri, StandardBlobTier
 from skyvern.forge.sdk.api.files import (
@@ -15,25 +16,29 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     get_download_dir,
     get_skyvern_temp_dir,
-    make_temp_directory,
-    unzip_files,
+    unzip_bytes_to_temp_directory,
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
+    SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    key_is_org_scoped,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.utils.script_file_paths import build_script_file_storage_uri
+from skyvern.webeye.video_utils import prepare_recording_for_upload
 
 LOG = structlog.get_logger()
 
@@ -149,11 +154,17 @@ class AzureStorage(BaseStorage):
         return await self.async_client.download_file(artifact.uri)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_sas_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_sas_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_sas_urls,
+            presign_sensitive=lambda uris: self.async_client.create_sas_urls(
+                uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         tier = await self._get_storage_tier_for_org(artifact.organization_id)
@@ -213,14 +224,7 @@ class AzureStorage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
-
-        temp_dir = make_temp_directory(prefix="skyvern_browser_session_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
-        return temp_dir
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_session_")
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         browser_session_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -262,19 +266,7 @@ class AzureStorage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
-
-        temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        try:
-            unzip_files(temp_zip_file_path, temp_dir)
-        finally:
-            # The downloaded archive is a delete=False temp file; remove it so cookie-bearing zips
-            # don't accumulate in TEMP_PATH on every profile retrieve (e.g. each cookie-only bank).
-            temp_zip_file.close()
-            os.unlink(temp_zip_file_path)
-        return temp_dir
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check via blob metadata — avoids downloading the whole archive."""
@@ -561,6 +553,7 @@ class AzureStorage(BaseStorage):
         """Save files from local download directory to Azure."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        skipped_files: list[str] = []
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -595,6 +588,7 @@ class AzureStorage(BaseStorage):
                     run_id=run_id,
                     exc_info=True,
                 )
+                skipped_files.append(file)
                 continue
 
             # Register the file as an Artifact so GET run output can serve it via
@@ -619,6 +613,9 @@ class AzureStorage(BaseStorage):
                         run_id=run_id,
                         exc_info=True,
                     )
+                    skipped_files.append(file)
+        if skipped_files:
+            raise DownloadSaveIncompleteError(skipped_files)
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         # Artifact-first — see s3.py::get_downloaded_files for rationale. When
@@ -738,6 +735,10 @@ class AzureStorage(BaseStorage):
             return None
         return sas_urls[0], uploaded_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -760,13 +761,59 @@ class AzureStorage(BaseStorage):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to Azure."""
-        # Anchor per-run clip offsets to browser close, captured before the upload below.
-        recording_finalized_at = datetime.now(timezone.utc)
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
+
+        if artifact_type == "videos":
+            # Anchor per-run clip offsets to browser close, captured before the
+            # potentially slow prepare+upload below so upload time does not shift clips.
+            recording_finalized_at = recording_finalized_at or datetime.now(timezone.utc)
+            async with prepare_recording_for_upload(local_file_path) as prepared_upload:
+                upload_file_path = prepared_upload.path
+                upload_remote_path = replace_file_extension(remote_path, prepared_upload.file_extension)
+                uri = self._build_browser_session_uri(
+                    organization_id, browser_session_id, artifact_type, upload_remote_path, date
+                )
+                await self.async_client.upload_file_from_path(uri, upload_file_path, tier=tier, tags=tags)
+
+                # See s3.py for recording artifact fallback rationale.
+                checksum = calculate_sha256_for_file(upload_file_path)
+                file_size = _safe_get_file_size(upload_file_path)
+                await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                    uri=uri,
+                    filename=os.path.basename(upload_remote_path),
+                    checksum=checksum,
+                    file_size=file_size,
+                )
+
+                async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
+                    clip_uri = self._build_browser_session_uri(
+                        organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
+                    )
+                    await self.async_client.upload_file_from_path(clip_uri, clip_path, tier=tier, tags=tags)
+                    return clip_uri
+
+                try:
+                    await sync_run_recording_clips(
+                        organization_id=organization_id,
+                        browser_session_id=browser_session_id,
+                        source_path=upload_file_path,
+                        upload_clip=_upload_clip,
+                        now=recording_finalized_at,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
+                    )
+            return uri
+
         await self.async_client.upload_file_from_path(uri, local_file_path, tier=tier, tags=tags)
 
         if artifact_type == "downloads":
@@ -777,55 +824,17 @@ class AzureStorage(BaseStorage):
             # propagate so the watcher's bounded retry can recover from a
             # transient DB outage — both ops are idempotent.
             is_partial = remote_path.endswith(BROWSER_DOWNLOADING_SUFFIX)
-            checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
-            file_size = None if is_partial else _safe_get_file_size(local_file_path)
+            download_checksum = None if is_partial else calculate_sha256_for_file(local_file_path)
+            download_file_size = None if is_partial else _safe_get_file_size(local_file_path)
             await app.ARTIFACT_MANAGER.create_browser_session_download_artifact(
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
                 uri=uri,
                 filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
+                checksum=download_checksum,
+                file_size=download_file_size,
+                run_id=None if is_partial else producer_run_id,
             )
-        elif artifact_type == "videos":
-            # Recording uploaded once at session close — see s3.py. Artifact-
-            # row creation is best-effort: the only caller swallows
-            # exceptions without retry, so the gated legacy listing fallback
-            # in ``get_shared_recordings_in_browser_session`` is the safety
-            # net for missed writes (when the session has no RECORDING rows
-            # we fall through to the Azure LIST path, so a row-less recording
-            # still surfaces via the legacy SAS URL).
-            checksum = calculate_sha256_for_file(local_file_path)
-            file_size = _safe_get_file_size(local_file_path)
-            await app.ARTIFACT_MANAGER.create_browser_session_recording_artifact(
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-                uri=uri,
-                filename=os.path.basename(remote_path),
-                checksum=checksum,
-                file_size=file_size,
-            )
-
-            async def _upload_clip(run_id: str, clip_path: str, filename: str) -> str:
-                clip_uri = self._build_browser_session_uri(
-                    organization_id, browser_session_id, RUN_RECORDING_PATH_SEGMENT, f"{run_id}/{filename}", date
-                )
-                await self.async_client.upload_file_from_path(clip_uri, clip_path, tier=tier, tags=tags)
-                return clip_uri
-
-            try:
-                await sync_run_recording_clips(
-                    organization_id=organization_id,
-                    browser_session_id=browser_session_id,
-                    source_path=local_file_path,
-                    upload_clip=_upload_clip,
-                    now=recording_finalized_at,
-                )
-            except Exception:
-                LOG.warning(
-                    "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True
-                )
-
         return uri
 
     async def delete_browser_session_file(
@@ -889,13 +898,13 @@ class AzureStorage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.blob_path.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.blob_path, allowed_prefixes):
                 return
 
         # Artifacts container: blob paths use v1/{env}/{org}/
         if parsed_uri.container == settings.AZURE_STORAGE_CONTAINER_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.blob_path.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.blob_path, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

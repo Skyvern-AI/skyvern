@@ -3,18 +3,24 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-import structlog
 from pydantic import BaseModel
 
+from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-
-LOG = structlog.get_logger(__name__)
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 
 TerminalNextState = Literal["completed", "proposal_pending", "awaiting_user_input", "stopped"]
 TerminalResponseKind = Literal["question", "update", "answer", "stopped"]
-_FINAL_RUN_VERDICTS = frozenset({"demonstrated", "not_demonstrated", "not_evaluated"})
+TerminalCause = Literal["deadline_expired", "max_turns_exceeded"]
+_FINAL_RUN_VERDICTS = frozenset({"not_demonstrated", "not_evaluated"})
 _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
+
+INTERRUPTED_TERMINAL_REASON = "interrupted"
+INTERRUPTED_TERMINAL_MESSAGE = (
+    "This turn was interrupted before it could finish — the server stopped part-way through it. "
+    "Send your message again to retry."
+)
 
 
 class TerminalOutcomeEnvelope(BaseModel):
@@ -23,11 +29,13 @@ class TerminalOutcomeEnvelope(BaseModel):
     workflow_applied: bool = False
     run_verdict: str | None = None
     run_display_reason: str | None = None
+    run_output_report: str | None = None
     blocker_reason: str | None = None
     halt_kind: str | None = None
     user_action_required: bool = False
     attempted: str | None = None
     response_kind: TerminalResponseKind
+    terminal_cause: TerminalCause | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -43,19 +51,13 @@ def assemble_terminal_envelope(
     halt_kind: str | None,
     attempted: str | None,
     workflow_mutated: bool,
-    turn_outcome_response_kind: str | None,
+    workflow_attempted: bool,
+    terminal_cause: TerminalCause | None = None,
 ) -> TerminalOutcomeEnvelope | None:
     run_outcome = _select_run_outcome_anchor(run_outcomes)
-    superseding_outcome = _later_demonstrated_after_anchor(run_outcomes, run_outcome)
-    if run_outcome is not None and superseding_outcome is not None:
-        LOG.info(
-            "Terminal envelope anchored a not_demonstrated verdict past a later demonstrated run",
-            anchored_workflow_run_id=run_outcome.workflow_run_id,
-            anchored_reason_code=run_outcome.reason_code,
-            later_workflow_run_id=superseding_outcome.workflow_run_id,
-        )
     run_verdict = run_outcome.verdict if run_outcome is not None else None
     run_display_reason = _clean_text(run_outcome.display_reason) if run_outcome is not None else None
+    run_output_report = _safe_output_report(run_outcome.output_report) if run_outcome is not None else None
     user_action_required = response_type == "ASK_QUESTION"
     next_state = _derive_next_state(
         user_action_required=user_action_required,
@@ -67,7 +69,8 @@ def assemble_terminal_envelope(
         user_action_required=user_action_required,
         next_state=next_state,
         workflow_mutated=workflow_mutated,
-        turn_outcome_response_kind=turn_outcome_response_kind,
+        workflow_attempted=workflow_attempted,
+        explicit_stop=bool(run_outcome or blocker_reason or halt_kind or terminal_cause),
     )
     return TerminalOutcomeEnvelope(
         next_state=next_state,
@@ -75,11 +78,13 @@ def assemble_terminal_envelope(
         workflow_applied=workflow_applied,
         run_verdict=run_verdict,
         run_display_reason=run_display_reason,
+        run_output_report=run_output_report,
         blocker_reason=_clean_text(blocker_reason),
         halt_kind=_clean_text(halt_kind),
         user_action_required=user_action_required,
         attempted=_clean_text(attempted),
         response_kind=response_kind,
+        terminal_cause=terminal_cause,
     )
 
 
@@ -108,26 +113,51 @@ def finalize_applied_state(
     )
 
 
+def interrupted_terminal_envelope() -> TerminalOutcomeEnvelope:
+    """Envelope for a turn whose process died mid-run — stopped, but never user-cancelled."""
+    return TerminalOutcomeEnvelope(
+        next_state="stopped",
+        verified=False,
+        response_kind="stopped",
+        halt_kind=INTERRUPTED_TERMINAL_REASON,
+    )
+
+
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:
-    # Diagnose/refuse answers share next_state="stopped" but their text IS the
-    # deliverable — only stopped-kind turns get the honest-stop replacement.
-    if cancelled or envelope.next_state != "stopped" or envelope.response_kind != "stopped":
+    output_report = _safe_output_report(envelope.run_output_report)
+    # A deadline-expired turn already authored copy naming time and the draft's
+    # state; replaced=True is what syncs it to the surfaces hydration prefers.
+    # "completed" is excluded because replaced=True also overwrites a distinct
+    # narrativeSummary, and an applied turn's summary is not the terminal text.
+    # "awaiting_user_input" needs no exclusion: it requires ASK_QUESTION, and a deadline
+    # always exits through _build_wip_exit_result, which only ever builds REPLY results.
+    if envelope.terminal_cause == "deadline_expired" and not cancelled and envelope.next_state != "completed":
+        if output_report and not _text_contains(agent_message, output_report):
+            return _append_sentence(agent_message, output_report), True
+        return agent_message, True
+
+    # A plain reply with no concrete workflow/run/blocker evidence is an answer
+    # even though next_state remains "stopped"; only stopped-kind turns get the
+    # honest-stop replacement.
+    if cancelled:
+        return agent_message, False
+
+    if envelope.next_state != "stopped" or envelope.response_kind != "stopped":
+        if output_report and not _text_contains(agent_message, output_report):
+            return _append_sentence(agent_message, output_report), True
         return agent_message, False
 
     if envelope.run_verdict == "not_demonstrated":
         message = "I ran the workflow, but I could not confirm the goal was met."
     elif envelope.run_verdict == "not_evaluated":
-        message = "I ran the workflow, but this turn finished without outcome evaluation."
-    elif envelope.run_verdict == "demonstrated":
-        message = (
-            "I ran the workflow and the latest run demonstrated the requested outcome, "
-            "but this turn stopped before applying and finishing it."
-        )
+        message = "I ran the workflow. The latest recorded run completed."
     else:
         message = "I stopped without confirming the goal was met."
 
     if envelope.run_display_reason:
         message = _append_labeled_sentence(message, label="Reason", text=envelope.run_display_reason)
+    if output_report and not _text_contains(message, output_report):
+        message = _append_sentence(message, output_report)
 
     blocker_reason = envelope.blocker_reason
     if blocker_reason and not _text_contains(message, blocker_reason):
@@ -139,25 +169,13 @@ def _select_run_outcome_anchor(run_outcomes: Sequence[RecordedRunOutcome]) -> Re
     final_outcomes = [outcome for outcome in run_outcomes if outcome.verdict in _FINAL_RUN_VERDICTS]
     if not final_outcomes:
         return None
-    last_not_demonstrated = [outcome for outcome in final_outcomes if outcome.verdict == "not_demonstrated"]
-    if last_not_demonstrated:
-        return last_not_demonstrated[-1]
+    # The terminal reports the run record in order. An interim event is not a terminal
+    # run when a recorded run exists; otherwise the latest interim event is the only
+    # run fact available.
+    recorded = [outcome for outcome in final_outcomes if outcome.role != "interim_build_test"]
+    if recorded:
+        return recorded[-1]
     return final_outcomes[-1]
-
-
-def _later_demonstrated_after_anchor(
-    run_outcomes: Sequence[RecordedRunOutcome], anchor: RecordedRunOutcome | None
-) -> RecordedRunOutcome | None:
-    if anchor is None or anchor.verdict != "not_demonstrated":
-        return None
-    seen_anchor = False
-    for outcome in run_outcomes:
-        if outcome is anchor:
-            seen_anchor = True
-            continue
-        if seen_anchor and outcome.verdict == "demonstrated":
-            return outcome
-    return None
 
 
 def _derive_next_state(
@@ -181,7 +199,8 @@ def _derive_response_kind(
     user_action_required: bool,
     next_state: TerminalNextState,
     workflow_mutated: bool | None = None,
-    turn_outcome_response_kind: str | None = None,
+    workflow_attempted: bool = False,
+    explicit_stop: bool = False,
     prior_response_kind: TerminalResponseKind | None = None,
 ) -> TerminalResponseKind:
     if user_action_required:
@@ -190,11 +209,11 @@ def _derive_response_kind(
         return "update"
     if prior_response_kind == "answer":
         return "answer"
-    # Refusals and repeat-reply recover escalations are complete answer-only
-    # replies, not halted work — their text must survive envelope rendering.
-    if workflow_mutated is False and turn_outcome_response_kind in ("diagnose", "refuse", "recover"):
-        return "answer"
-    return "stopped"
+    if prior_response_kind is not None:
+        return "stopped"
+    if workflow_mutated or workflow_attempted or explicit_stop:
+        return "stopped"
+    return "answer"
 
 
 def normalize_shadow_reason_text(text: object, *, strip_trailing_punctuation: bool = False) -> str | None:
@@ -223,6 +242,24 @@ def _clean_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _safe_output_report(value: str | None) -> str | None:
+    text = _clean_text(value)
+    if text is None or redact_raw_secrets_for_prompt(text) != text:
+        return None
+    try:
+        assert_clean_user_facing_text(text)
+    except ValueError:
+        return None
+    return text
+
+
+def _append_sentence(base: str, text: str) -> str:
+    prefix = base.rstrip()
+    if prefix and prefix[-1:] not in ".!?":
+        prefix += "."
+    return f"{prefix} {text}".strip()
 
 
 def _append_labeled_sentence(base: str, *, label: str, text: str) -> str:

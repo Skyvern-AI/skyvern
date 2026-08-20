@@ -102,7 +102,9 @@ class CriterionVerdict:
     evidence_ref: str | None = None
     missing_evidence: str | None = None
     output_path: str | None = None
-    grounding_mode: Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean"] | None = None
+    grounding_mode: (
+        Literal["exact_value", "shape", "missing", "terminal_record", "judgment_boolean", "presence"] | None
+    ) = None
     expected_output_shape: str | None = None
     has_exact_value: bool = False
     requested_output_evidence_source: str | None = None
@@ -374,11 +376,6 @@ class CompletionVerificationResult:
 
 
 @dataclass(frozen=True)
-class DeliveredUnverifiedTerminalState:
-    observed_verdicts: tuple[CriterionVerdict, ...]
-
-
-@dataclass(frozen=True)
 class RunEvidenceSnapshot:
     workflow_run_id: str | None = None
     block_outputs: dict[str, Any] = field(default_factory=dict)
@@ -545,7 +542,6 @@ _MISSING_VERDICT_EVIDENCE = "judge did not return a verdict for this criterion"
 _INCOMPLETE_VALIDATION_CLASSIFICATION_CONTRACT = "incomplete typed classification contract"
 _INCOMPLETE_VALIDATION_CLASSIFICATION_ABSTENTION_REASON = "validation_classification_incomplete_contract"
 _MISSING_REGISTERED_DOWNLOAD_EVIDENCE = "run output did not include a non-empty registered browser download"
-_DELIVERED_UNVERIFIED_OUTPUT_SOURCES = frozenset({"runtime_output", "registered_output_parameter"})
 
 
 def registered_download_completion_criterion() -> CompletionCriterion:
@@ -2517,20 +2513,6 @@ def _has_independent_satisfied_requested_output_corroborator(
     )
 
 
-def _judgment_tier_satisfied_corroborator(
-    verdict_by_id: dict[str, CriterionVerdict],
-    criterion_id: str,
-) -> CriterionVerdict | None:
-    for verdict in verdict_by_id.values():
-        if (
-            verdict.satisfied
-            and _is_requested_output_corroborator_id(verdict.criterion_id, criterion_id)
-            and verdict.evidence_source in _FLOOR_REKEYED_DELIVERABLE_CREDIT_SOURCES
-        ):
-            return verdict
-    return None
-
-
 def _is_requested_output_corroborator_id(candidate_id: str, criterion_id: str) -> bool:
     prefix = f"{criterion_id}__requested_output_corroborator"
     if candidate_id == prefix:
@@ -2795,134 +2777,6 @@ def only_degraded_blocking(result: CompletionVerificationResult) -> bool:
     return blocking <= degraded
 
 
-def _delivered_unverified_observed_verdict(verdict: CriterionVerdict) -> bool:
-    if not verdict.evidence_ref or not verdict.output_path:
-        return False
-    normalized_path = verdict.output_path.removeprefix("output.").strip()
-    if normalized_path.split(".")[-1] == "evidence_text":
-        return False
-    if verdict.evidence_source not in _DELIVERED_UNVERIFIED_OUTPUT_SOURCES:
-        return False
-    if verdict.self_emitted_judgment_not_independent:
-        return False
-    if verdict.requested_output_evidence_source == "independent_run_evidence":
-        return False
-    if verdict.grounding_mode in {"shape", "judgment_boolean"}:
-        return False
-    if verdict.satisfied:
-        return (
-            verdict.reason_code == "evidence_confirms"
-            and verdict.grounding_mode == "exact_value"
-            and verdict.has_exact_value
-        )
-    return _is_structural_requested_output_abstention(verdict) and not verdict.has_exact_value
-
-
-def degraded_contract_delivered_unverified_terminal_state(
-    result: CompletionVerificationResult | None,
-    *,
-    run_ok: bool,
-    workflow_run_id: str | None,
-    latest_workflow_run_id: str | None,
-    artifact_health_blocked: bool,
-    terminal_blocked: bool,
-) -> DeliveredUnverifiedTerminalState | None:
-    if (
-        result is None
-        or result.status != "evaluated"
-        or result.is_fully_satisfied()
-        or not run_ok
-        or not workflow_run_id
-        or workflow_run_id != latest_workflow_run_id
-        or artifact_health_blocked
-        or terminal_blocked
-    ):
-        return None
-    degraded = degraded_lane_criterion_ids(result)
-    if not degraded:
-        return None
-    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
-    decision = plain_outcome_no_evidence_abstention_decision(result, verdict_by_id)
-    plain_outcome_abstained_ids = set(decision.criterion_ids) if decision else set()
-    observed: list[CriterionVerdict] = []
-    blocking: set[str] = set()
-    for criterion_id in result.criterion_ids:
-        verdict = verdict_by_id.get(criterion_id)
-        if verdict is not None and _delivered_unverified_observed_verdict(verdict):
-            observed.append(verdict)
-            continue
-        if verdict is not None and verdict.satisfied:
-            continue
-        if verdict is not None and result.is_structural_contingent_abstention(verdict):
-            continue
-        if criterion_id in plain_outcome_abstained_ids:
-            continue
-        blocking.add(criterion_id)
-    if not observed or not blocking or not blocking <= degraded:
-        return None
-    return DeliveredUnverifiedTerminalState(observed_verdicts=tuple(observed))
-
-
-def zero_requested_output_criteria_credit(
-    result: CompletionVerificationResult | None,
-    *,
-    has_meaningful_registered_output: bool,
-) -> bool:
-    """A satisfied run-plane verdict crediting completion when no requested-output
-    criterion formed to grade the delivered payload is an unverified deliverable,
-    not a verified success. Keying on meaningful produced content (not mere payload
-    presence) lets a reach-state goal whose only registered output is an empty
-    task-output envelope (e.g. login-only) keep crediting normally."""
-    return (
-        result is not None
-        and result.status == "evaluated"
-        and result.requested_output_criteria_count == 0
-        and has_meaningful_registered_output
-        and result.is_fully_satisfied()
-    )
-
-
-@dataclass(frozen=True)
-class FloorRekeyedDeliverableCredit:
-    criterion_ids: tuple[str, ...]
-    evidence_sources: tuple[str, ...]
-    evidence_refs: tuple[str, ...]
-    output_paths: tuple[str, ...]
-
-
-def floor_rekeyed_deliverable_credit(
-    result: CompletionVerificationResult | None,
-) -> FloorRekeyedDeliverableCredit | None:
-    """Credit a floor-rekeyed presence-only deliverable on a fully satisfied run when every marked
-    criterion carries its own satisfied requested-output corroborator whose derived evidence_source is
-    judgment-tier. Registered-output and self-emitted corroboration earn no credit and keep hedging."""
-    if result is None or result.status != "evaluated" or not result.is_fully_satisfied():
-        return None
-    marked_ids = list(dict.fromkeys(result.floor_rekeyed_criterion_ids))
-    if not marked_ids:
-        return None
-    verdict_by_id = {verdict.criterion_id: verdict for verdict in result.verdicts}
-    evidence_sources: list[str] = []
-    evidence_refs: list[str] = []
-    output_paths: list[str] = []
-    for criterion_id in marked_ids:
-        marked = verdict_by_id.get(criterion_id)
-        if marked is None:
-            return None
-        corroborator = _judgment_tier_satisfied_corroborator(verdict_by_id, criterion_id)
-        if corroborator is None or corroborator.evidence_source is None:
-            return None
-        evidence_sources.append(corroborator.evidence_source)
-        evidence_refs.append(corroborator.evidence_ref or "")
-        output_paths.append(result.floor_rekeyed_output_path_by_criterion_id.get(criterion_id, ""))
-    return FloorRekeyedDeliverableCredit(
-        criterion_ids=tuple(marked_ids),
-        evidence_sources=tuple(evidence_sources),
-        evidence_refs=tuple(evidence_refs),
-        output_paths=tuple(output_paths),
-    )
-
-
 def gradeable_completion_criteria(criteria: Iterable[CompletionCriterion]) -> list[CompletionCriterion]:
     return [
         criterion
@@ -3059,75 +2913,6 @@ def carry_floor_rekeyed_path_backing(
     return replace(result, floor_rekeyed_backed_by_criterion_id=merged)
 
 
-@dataclass(frozen=True)
-class FloorRekeyedEmissionWithhold:
-    criterion_ids: tuple[str, ...]
-    unbacked_output_paths: tuple[str, ...]
-    backed_output_paths: tuple[str, ...]
-
-
-def floor_rekeyed_effective_marked_ids(result: CompletionVerificationResult) -> list[str]:
-    """Floor-rekeyed markers that required an emission this run: the marked set minus the
-    structurally-unfired contingent (abstained) markers, which needed no emission to fire."""
-    abstained = result.abstained_criterion_ids()
-    return [criterion_id for criterion_id in result.floor_rekeyed_criterion_ids if criterion_id not in abstained]
-
-
-def floor_rekeyed_emission_withhold(
-    result: CompletionVerificationResult | None,
-) -> FloorRekeyedEmissionWithhold | None:
-    """A fully satisfied run whose floor-rekeyed emission markers lack a meaningful runtime value at
-    their original path delivered no emission that corroboration can substitute for. Keyed on the typed
-    marker id-set (never payload emptiness) so never-minted reach-state and structurally-unfired
-    contingent markers are untouched, and a missing backing entry reads as unbacked to fail closed."""
-    if result is None or result.status != "evaluated" or not result.is_fully_satisfied():
-        return None
-    effective_ids = floor_rekeyed_effective_marked_ids(result)
-    if not effective_ids:
-        return None
-    unbacked_ids: list[str] = []
-    unbacked_paths: list[str] = []
-    backed_paths: list[str] = []
-    for criterion_id in effective_ids:
-        path = result.floor_rekeyed_output_path_by_criterion_id.get(criterion_id, "")
-        if result.floor_rekeyed_backed_by_criterion_id.get(criterion_id, False):
-            backed_paths.append(path)
-        else:
-            unbacked_ids.append(criterion_id)
-            unbacked_paths.append(path)
-    if not unbacked_ids:
-        return None
-    return FloorRekeyedEmissionWithhold(
-        criterion_ids=tuple(unbacked_ids),
-        unbacked_output_paths=tuple(unbacked_paths),
-        backed_output_paths=tuple(backed_paths),
-    )
-
-
-def floor_rekeyed_emission_lane_fields(result: CompletionVerificationResult | None) -> dict[str, Any] | None:
-    """Structured fingerprint fields for the floor-rekeyed emission lane, emitted whenever an
-    evaluated result carries markers — on satisfied and unsatisfied results alike, independent of
-    outcome."""
-    if result is None or result.status != "evaluated" or not result.floor_rekeyed_criterion_ids:
-        return None
-    effective_ids = floor_rekeyed_effective_marked_ids(result)
-    backed_ids = [cid for cid in effective_ids if result.floor_rekeyed_backed_by_criterion_id.get(cid, False)]
-    unbacked_ids = [cid for cid in effective_ids if cid not in backed_ids]
-    withhold = floor_rekeyed_emission_withhold(result)
-    return {
-        "criterion_ids": list(result.floor_rekeyed_criterion_ids),
-        "effective_criterion_ids": list(effective_ids),
-        "abstained_excluded_criterion_ids": sorted(set(result.floor_rekeyed_criterion_ids) - set(effective_ids)),
-        "backed_criterion_ids": backed_ids,
-        "unbacked_criterion_ids": unbacked_ids,
-        "backed_output_paths": [result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in backed_ids],
-        "unbacked_output_paths": [
-            result.floor_rekeyed_output_path_by_criterion_id.get(cid, "") for cid in unbacked_ids
-        ],
-        "engaged": withhold is not None,
-    }
-
-
 async def evaluate_completion_criteria(
     criteria: list[CompletionCriterion],
     snapshot: RunEvidenceSnapshot,
@@ -3168,8 +2953,8 @@ async def evaluate_completion_criteria(
             contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             structural_unfired_criterion_ids=structural_unfired_ids,
         )
-    except Exception as exc:
-        LOG.warning("completion-verification judge failed", error=str(exc))
+    except Exception:
+        LOG.warning("completion-verification judge failed")
         return CompletionVerificationResult(
             status="unavailable",
             criterion_ids=criterion_ids,

@@ -277,10 +277,7 @@ async def test_ensure_browser_session_times_out_and_cleans_up(monkeypatch: pytes
     result = await ensure_browser_session(ctx)
     assert result == {"ok": False, "error": "Failed to create browser session"}
     assert ctx.browser_session_id is None
-    mock_manager.close_session.assert_awaited_once_with(
-        organization_id="org_1",
-        browser_session_id="bs_2",
-    )
+    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_2")
 
 
 @pytest.mark.asyncio

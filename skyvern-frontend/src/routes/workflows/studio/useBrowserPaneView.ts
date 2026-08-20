@@ -12,6 +12,7 @@ import {
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import {
   resolveBrowserPaneView,
+  resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
@@ -88,12 +89,12 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     failed: visuals.failed,
   });
 
-  // Recording pins the live surface to the debug browser (the recorder drives
-  // it), even if an inspected run happens to be streaming elsewhere.
-  const liveSurface: "debug" | "run" =
-    !isRecording && visuals.running && !runInDebugSession && runId != null
-      ? "run"
-      : "debug";
+  const liveSurface = resolveLiveSurface({
+    recording: isRecording,
+    running: visuals.running,
+    runInDebugSession,
+    hasRunId: runId != null,
+  });
 
   return {
     view,

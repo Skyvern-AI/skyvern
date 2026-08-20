@@ -38,6 +38,7 @@ async def _call_complete_verify(
     *,
     task_overrides: dict[str, Any],
     use_termination_prompt: bool,
+    complete_criterion_is_untrusted: bool = False,
 ) -> dict[str, Any]:
     agent = ForgeAgent()
     now = datetime.now(UTC)
@@ -99,6 +100,7 @@ async def _call_complete_verify(
         organization_id=task.organization_id,
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
+        complete_criterion_is_untrusted=complete_criterion_is_untrusted,
     )
     skyvern_context.set(context)
     try:
@@ -142,14 +144,32 @@ async def test_wrapped_goal_and_criterion_thread_under_termination_prompt(monkey
         monkeypatch,
         task_overrides={
             "navigation_goal": compose_mini_goal(main_goal=MAIN_GOAL, mini_goal=MINI_GOAL),
+            "complete_criterion": "The pricing page is visible",
             "terminate_criterion": compose_mini_goal(main_goal=MAIN_GOAL, mini_goal=TERMINATE_MINI),
         },
         use_termination_prompt=True,
     )
     assert captured["navigation_goal"] == MINI_GOAL
+    assert captured["complete_criterion"] == "The pricing page is visible"
+    assert captured["complete_criterion_is_untrusted"] is False
     assert captured["terminate_criterion"] == TERMINATE_MINI
     assert captured["big_goal_context"] == MAIN_GOAL
     assert captured["template_name"] == "check-user-goal-with-termination"
+
+
+@pytest.mark.asyncio
+async def test_planner_authored_criterion_is_untrusted_with_wrapped_goal(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = await _call_complete_verify(
+        monkeypatch,
+        task_overrides={
+            "navigation_goal": compose_mini_goal(main_goal=MAIN_GOAL, mini_goal=MINI_GOAL),
+            "complete_criterion": "The planner-observed result is visible",
+        },
+        use_termination_prompt=False,
+        complete_criterion_is_untrusted=True,
+    )
+    assert captured["complete_criterion"] == "The planner-observed result is visible"
+    assert captured["complete_criterion_is_untrusted"] is True
 
 
 @pytest.mark.asyncio
@@ -164,6 +184,7 @@ async def test_unwrapped_goal_passes_through_with_no_context(monkeypatch: pytest
     )
     assert captured["navigation_goal"] == "Submit the contact form"
     assert captured["complete_criterion"] == "A thank-you banner is visible"
+    assert captured["complete_criterion_is_untrusted"] is False
     assert captured["terminate_criterion"] is None
     assert captured["big_goal_context"] is None
     assert captured["action_history"] == ""

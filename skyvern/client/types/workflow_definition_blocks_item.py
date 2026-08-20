@@ -732,6 +732,10 @@ class WorkflowDefinitionBlocksItem_SendEmail(UniversalBaseModel):
     smtp_port: AwsSecretParameter
     smtp_username: AwsSecretParameter
     smtp_password: AwsSecretParameter
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str

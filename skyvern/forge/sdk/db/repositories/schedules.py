@@ -303,6 +303,24 @@ class SchedulesRepository(BaseRepository):
             rows = (await session.scalars(stmt)).all()
             return [convert_to_workflow_schedule(r, self.debug_enabled) for r in rows]
 
+    @db_operation("get_all_schedules")
+    async def get_all_schedules(
+        self,
+        organization_id: str | None = None,
+    ) -> list[WorkflowSchedule]:
+        """Fetch all non-deleted schedules — including disabled/paused ones — optionally filtered by org.
+
+        Unlike get_all_enabled_schedules, this does not filter on `enabled`, because a generation
+        migration must re-point every persisted Temporal schedule (paused schedules included) while
+        preserving their paused state.
+        """
+        async with self.Session() as session:
+            stmt = select(WorkflowScheduleModel).where(WorkflowScheduleModel.deleted_at.is_(None))
+            if organization_id:
+                stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
+            rows = (await session.scalars(stmt)).all()
+            return [convert_to_workflow_schedule(r, self.debug_enabled) for r in rows]
+
     @db_operation("has_schedule_fired_since")
     async def has_schedule_fired_since(
         self,

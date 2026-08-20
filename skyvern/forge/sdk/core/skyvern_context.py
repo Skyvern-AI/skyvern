@@ -12,12 +12,14 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from skyvern.config import settings
+from skyvern.schemas.run_enums import RunEngine
+from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
 
     from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy, RuntimeOriginAuthority
-    from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch
+    from skyvern.forge.sdk.browser_action_preflight import ObservationEpoch, ObservedTabs
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
     # Deferred import: skyvern_context.py sits below the service layer and
@@ -87,6 +89,8 @@ class SkyvernContext:
     request_id: str | None = None
     organization_id: str | None = None
     organization_name: str | None = None
+    org_default_llm_key: str | None = None
+    org_default_secondary_llm_key: str | None = None
     task_id: str | None = None
     step_id: str | None = None
     workflow_id: str | None = None
@@ -96,12 +100,31 @@ class SkyvernContext:
     task_v2_id: str | None = None
     max_steps_override: int | None = None
     browser_session_id: str | None = None
+    # Immutable lease identity returned by the successful PBS begin_session call. Consumers carry
+    # both values forward; they never reconstruct ownership from mutable task or session rows.
+    browser_session_runnable_id: str | None = None
+    browser_session_runnable_generation_id: str | None = None
+    # Set only by run_sdk_action when it mints a bookkeeping run for a standalone action. A minted
+    # run never begins the browser session, so it must not be presented as the expected owner.
+    workflow_run_is_synthetic: bool = False
+    # Set by run_sdk_action for EVERY inline action, whether it minted the run or the caller supplied an
+    # existing (possibly already-terminal) run id. The browser is driven directly by the caller across
+    # calls, so a run-scoped external allocation under it must never be an owner-terminal early-reap
+    # input — unlike workflow_run_is_synthetic, this stays true for the supplied-run reuse path too.
+    is_sdk_inline_action: bool = False
     browser_runtime: str | None = None
+    browser_address_is_server_assigned: bool = False
+    browser_health: BrowserHealth = field(default_factory=BrowserHealth)
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
+    # Set only by the in-process copilot block-test path, on that run's own context. A dispatched
+    # run's context is rebuilt on the worker and never carries it, so runner selection can tell the
+    # two apart instead of inferring it from a process-wide capability.
+    copilot_inline_execution: bool = False
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
+    complete_criterion_is_untrusted: bool = False
     download_suffix: str | None = None
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     active_credential_parameter_key: str | None = None
@@ -110,6 +133,10 @@ class SkyvernContext:
     # builtins.set, not set: the module-level `set` context setter below shadows the
     # builtin for anything that resolves the name after import.
     downloaded_pdf_sources: set[str] = field(default_factory=builtins.set)
+    # Per-task secret values (e.g. a resolved verification code) to scrub from artifacts/logs. Task-
+    # scoped so bare tasks with no workflow-run context are still redacted; unioned into
+    # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
+    runtime_secret_values: set[str] = field(default_factory=builtins.set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -117,6 +144,11 @@ class SkyvernContext:
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None
     feature_flag_entries: dict[str, bool | str | None] = field(default_factory=dict)
+    # Absolute event-loop time the run body's elapsed-time budget expires, set alongside the
+    # asyncio.timeout that enforces it. None when nothing is enforcing one. Read by work that
+    # may block for a long time, so it can give up and return rather than be cancelled — a
+    # cancellation propagates as BaseException and skips handlers that degrade gracefully.
+    max_elapsed_deadline: float | None = None
 
     # feature flags
     enable_page_ready_wait: bool = False
@@ -126,11 +158,38 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    use_artifact_bundling: bool = False
     # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
+    # PRESERVE_TRANSIENT_UI_CAPTURE experiment arm, resolved per run. Tri-state: True=treatment
+    # (suppress a scroll that would dismiss an open transient popup), False=control (shadow-detect
+    # only), None=off (undefined/no-provider/error -> current scrolling behavior).
+    preserve_transient_ui_capture: bool | None = None
+    # Pinned once resolve_transient_ui_capture_arm resolves the arm (including off/None), so a TTL
+    # expiry or mid-run flag ramp cannot flip the arm later in the same run.
+    preserve_transient_ui_capture_resolved: bool = False
+    # Single-flight the first-use provider resolution when parallel blocks/branches share one
+    # context, so it is queried at most once per run (mirrors slim_output_variant_lock).
+    preserve_transient_ui_capture_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Count of CONSECUTIVE agent-step captures the treatment arm has suppressed scrolling on. Co-owned
+    # by the two agent-step capture sites — the agent-step scrape (scrape_web_unsafe with
+    # allow_transient_ui_suppression=True) and the post-action screenshot
+    # (record_artifacts_after_action) — via decide_transient_ui_suppression: incremented when a
+    # capture suppresses, reset to 0 when a qualifying popup is not detected, and frozen at the cap
+    # while a stale expanded trigger keeps matching so later captures fall back to legacy scrolling.
+    # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
+    # extraction / error-detection scrapes never touch it.
+    transient_ui_consecutive_suppressions: int = 0
+    # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
+    # task block of that run dispatches to, or None for control.
+    workflow_block_engine_override: RunEngine | None = None
+    # The workflow run the override above was resolved for. A nested execution sharing this context
+    # (an inline child workflow run) has its own id and its own definition, so it must re-resolve
+    # rather than inherit an arm that was never checked against its blocks.
+    workflow_block_engine_resolved_run_id: str | None = None
+    # Single-flight the first-use provider resolution when parallel branches share one context.
+    workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
@@ -197,6 +256,10 @@ class SkyvernContext:
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
     speculative_plans: dict[str, Any] = field(default_factory=dict)
+    # Writes that persist the cost of an already-billed speculative LLM call. They are
+    # started as background tasks so the completion path doesn't wait on the LLM call,
+    # and drained at task clean-up so the write can't be dropped when the run tears down.
+    pending_speculative_persist_tasks: list[asyncio.Task] = field(default_factory=list)
 
     """
     Example output value:
@@ -225,8 +288,8 @@ class SkyvernContext:
     # Per-step prompt token breakdown (SKY-9718). Written by prompt-build sites
     # (prompt_engine.load_prompt_with_elements_tracked + the cached extract-action
     # path in agent.py); read + cleared by the LLM API handler when emitting the
-    # "LLM API handler duration metrics" log so html_token_count / html_pct land
-    # alongside the existing input_tokens / llm_cost on the same row.
+    # "LLM API handler duration metrics" log so the locally-counted prompt size
+    # lands alongside the provider's input_tokens / llm_cost on the same row.
     last_prompt_breakdown: dict[str, Any] | None = None
 
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload
@@ -260,6 +323,11 @@ class SkyvernContext:
     # Newest accepted scrape (SKY-12874). Advanced by the scrape itself; actions are stamped with
     # the epoch they were planned under so an observation cannot vouch for a plan built before it.
     browser_observation_epoch: ObservationEpoch | None = None
+
+    # The open-tab list exactly as the planner's prompt rendered it, bound to the epoch it was
+    # rendered under (SKY-12875). A SwitchTabAction's tab_index resolves against this record and
+    # nothing else; no record, or a record from another epoch, resolves nothing.
+    browser_observed_tabs: ObservedTabs | None = None
 
     def set_enrich_tree_mode(self, mode: Any) -> None:
         self.enrich_tree_mode = parse_enrich_tree_mode(mode)
@@ -305,6 +373,11 @@ class SkyvernContext:
     def pop_totp_code(self, task_id: str) -> None:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
+
+    def register_secret_value(self, value: str | None) -> None:
+        """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed)."""
+        if value:
+            self.runtime_secret_values.add(value)
 
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""
@@ -418,6 +491,20 @@ def ensure_context() -> SkyvernContext:
     if context is None:
         raise RuntimeError("No skyvern context")
     return context
+
+
+def record_browser_timeout(operation: BrowserOperation) -> None:
+    """Note that a browser-protocol operation went unanswered. Outside a run there is nothing to
+    tally against, and callers are hot paths, so a missing context is silently a no-op."""
+    context = current()
+    if context is not None:
+        context.browser_health.record_timeout(operation)
+
+
+def record_browser_success() -> None:
+    context = current()
+    if context is not None:
+        context.browser_health.record_success()
 
 
 def set(context: SkyvernContext) -> None:

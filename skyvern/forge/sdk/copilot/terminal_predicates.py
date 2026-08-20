@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext
 
@@ -23,27 +25,12 @@ def outcome_criteria_evaluated(ctx: AgentContext) -> bool:
     return result is not None and result.status == "evaluated"
 
 
-def _has_same_run_committed_demonstrated_outcome(ctx: AgentContext) -> bool:
-    outcome = getattr(ctx, "last_run_outcome", None)
-    run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    return (
-        getattr(outcome, "verdict", None) == "demonstrated"
-        and isinstance(run_id, str)
-        and bool(run_id)
-        and getattr(outcome, "workflow_run_id", None) == run_id
-    )
-
-
 def outcome_fully_verified(ctx: AgentContext) -> bool:
-    """Whether the judge confirmed every outcome criterion from this run's evidence.
-
-    The verdict is authoritative over run status: a run that reached the goal is
-    recognized even when it was canceled or only partially completed.
-    """
+    """Whether the isolated unattended verifier confirmed every criterion."""
+    if getattr(ctx, "turn_origin", TurnOrigin.interactive) != TurnOrigin.runtime_self_heal:
+        return False
     if artifact_health_blocked(ctx):
         return False
-    if _has_same_run_committed_demonstrated_outcome(ctx):
-        return True
     if not outcome_criteria_evaluated(ctx):
         return False
     result = ctx.completion_verification_result

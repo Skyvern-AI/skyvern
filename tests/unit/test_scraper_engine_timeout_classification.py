@@ -16,9 +16,11 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.exceptions import ScrapingFailed, SkyvernPageAnalysisTimeout
+from skyvern.config import settings
+from skyvern.exceptions import NoElementFound, ScrapingFailed, ScrapingFailedBlankPage, SkyvernPageAnalysisTimeout
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.scraper import scraper
+from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 _TIMEOUT_REASON_MARKER = "page-analysis timeout"
 
@@ -60,6 +62,138 @@ async def _run_scrape_and_capture(browser_state: SimpleNamespace, error: BaseExc
                 max_retries=0,
             )
     return exc_info.value
+
+
+def _scraped_page() -> ScrapedPage:
+    return ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=MagicMock(),
+        _clean_up_func=AsyncMock(),
+        _scrape_exclude=None,
+    )
+
+
+class TestScrapeWebsiteEmptyTreeRecovery:
+    def _rig(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        results: list[object],
+        *,
+        support_empty_page: bool = False,
+    ) -> SimpleNamespace:
+        page = SimpleNamespace(goto=AsyncMock(), url="https://example.test/path")
+        browser_state = SimpleNamespace(
+            engine_selection=None,
+            get_working_page=AsyncMock(return_value=None),
+            must_get_working_page=AsyncMock(return_value=page),
+        )
+        cleanup_element_tree = AsyncMock()
+        scrape_exclude = AsyncMock()
+        scrape_web_unsafe = AsyncMock(side_effect=results)
+        sleep = AsyncMock()
+        log = MagicMock()
+        monkeypatch.setattr(scraper, "scrape_web_unsafe", scrape_web_unsafe)
+        monkeypatch.setattr(scraper.asyncio, "sleep", sleep)
+        monkeypatch.setattr(scraper, "LOG", log)
+
+        unsafe_kwargs = {
+            "browser_state": browser_state,
+            "url": "https://example.test/path",
+            "cleanup_element_tree": cleanup_element_tree,
+            "scrape_exclude": scrape_exclude,
+            "take_screenshots": False,
+            "draw_boxes": False,
+            "max_screenshot_number": 2,
+            "scroll": False,
+            "support_empty_page": support_empty_page,
+            "wait_seconds": 1.25,
+            "must_included_tags": ["button"],
+            "allow_transient_ui_suppression": True,
+        }
+        return SimpleNamespace(
+            browser_state=browser_state,
+            log=log,
+            page=page,
+            scrape_web_unsafe=scrape_web_unsafe,
+            sleep=sleep,
+            unsafe_kwargs=unsafe_kwargs,
+            website_kwargs={**unsafe_kwargs, "max_retries": 0},
+        )
+
+    @pytest.mark.asyncio
+    async def test_settle_rescrape_returns_without_refetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scraped_page = _scraped_page()
+        rig = self._rig(monkeypatch, [NoElementFound(), scraped_page])
+
+        result = await scraper.scrape_website(**rig.website_kwargs)
+
+        assert result is scraped_page
+        assert rig.scrape_web_unsafe.await_args_list == [call(**rig.unsafe_kwargs), call(**rig.unsafe_kwargs)]
+        rig.page.goto.assert_not_awaited()
+        rig.sleep.assert_awaited_once_with(3)
+        assert rig.log.info.call_args_list == [
+            call("Retrying scrape after empty element tree", url=rig.unsafe_kwargs["url"], attempt=1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_refetch_rescrape_returns_after_one_refetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scraped_page = _scraped_page()
+        rig = self._rig(monkeypatch, [NoElementFound(), NoElementFound(), scraped_page])
+
+        result = await scraper.scrape_website(**rig.website_kwargs)
+
+        assert result is scraped_page
+        assert rig.scrape_web_unsafe.await_args_list == [call(**rig.unsafe_kwargs)] * 3
+        rig.browser_state.must_get_working_page.assert_awaited_once_with()
+        rig.page.goto.assert_awaited_once_with("https://example.test/path", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        assert rig.sleep.await_args_list == [call(3), call(3)]
+        assert rig.log.info.call_args_list == [
+            call("Retrying scrape after empty element tree", url=rig.unsafe_kwargs["url"], attempt=1),
+            call("Retrying scrape after empty element tree", url=rig.unsafe_kwargs["url"], attempt=2),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_terminal_empty_tree_wraps_like_any_scrape_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        errors = [NoElementFound(), NoElementFound(), NoElementFound()]
+        rig = self._rig(monkeypatch, errors)
+        monkeypatch.setattr(scraper, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
+
+        with pytest.raises(ScrapingFailed) as exc_info:
+            await scraper.scrape_website(**rig.website_kwargs)
+
+        assert exc_info.value.__cause__ is errors[-1]
+        assert rig.scrape_web_unsafe.await_args_list == [call(**rig.unsafe_kwargs)] * 3
+        rig.page.goto.assert_awaited_once_with("https://example.test/path", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+        assert rig.sleep.await_args_list == [call(3), call(3)]
+
+    @pytest.mark.asyncio
+    async def test_blank_page_failure_bypasses_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = ScrapingFailedBlankPage()
+        rig = self._rig(monkeypatch, [error])
+
+        with pytest.raises(ScrapingFailedBlankPage) as exc_info:
+            await scraper.scrape_website(**rig.website_kwargs)
+
+        assert exc_info.value is error
+        rig.scrape_web_unsafe.assert_awaited_once_with(**rig.unsafe_kwargs)
+        rig.browser_state.must_get_working_page.assert_not_awaited()
+        rig.page.goto.assert_not_awaited()
+        rig.sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_support_empty_page_returns_without_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        scraped_page = _scraped_page()
+        rig = self._rig(monkeypatch, [scraped_page], support_empty_page=True)
+
+        result = await scraper.scrape_website(**rig.website_kwargs)
+
+        assert result is scraped_page
+        rig.scrape_web_unsafe.assert_awaited_once_with(**rig.unsafe_kwargs)
+        rig.browser_state.must_get_working_page.assert_not_awaited()
+        rig.page.goto.assert_not_awaited()
+        rig.sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -166,24 +300,31 @@ async def test_incremental_tree_propagates_non_timeout_without_retry() -> None:
 
 
 def test_resolve_engine_selection_for_task_reads_live_browser_state() -> None:
-    from skyvern.forge import app
-    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
 
     selection = _selection("engine-a", _EngineAError, _EngineATimeout)
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
     get_for_task = MagicMock(return_value=SimpleNamespace(engine_selection=selection))
-    with patch.object(app.BROWSER_MANAGER, "get_for_task", get_for_task):
-        assert resolve_engine_selection_for_task(task) is selection  # type: ignore[arg-type]
+    browser_manager = SimpleNamespace(get_for_task=get_for_task)
+    assert resolve_engine_selection_for_task(task, browser_manager) is selection  # type: ignore[arg-type]
     get_for_task.assert_called_once_with("tsk_1", workflow_run_id="wr_1")
 
 
 def test_resolve_engine_selection_for_task_returns_none_when_no_browser_state() -> None:
-    from skyvern.forge import app
-    from skyvern.webeye.actions.handler import resolve_engine_selection_for_task
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
 
     task = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
-    with patch.object(app.BROWSER_MANAGER, "get_for_task", MagicMock(return_value=None)):
-        assert resolve_engine_selection_for_task(task) is None  # type: ignore[arg-type]
+    browser_manager = SimpleNamespace(get_for_task=MagicMock(return_value=None))
+    assert resolve_engine_selection_for_task(task, browser_manager) is None  # type: ignore[arg-type]
+
+
+def test_resolve_engine_selection_for_task_returns_none_without_task() -> None:
+    from skyvern.webeye.browser_engine import resolve_engine_selection_for_task
+
+    get_for_task = MagicMock()
+    browser_manager = SimpleNamespace(get_for_task=get_for_task)
+    assert resolve_engine_selection_for_task(None, browser_manager) is None  # type: ignore[arg-type]
+    get_for_task.assert_not_called()
 
 
 @pytest.mark.asyncio

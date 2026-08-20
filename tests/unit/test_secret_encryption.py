@@ -144,3 +144,123 @@ async def test_encrypt_workflow_definition_secrets_recurses_and_binds_fields(ena
     error = str(exc_info.value)
     assert "nested-test-value" not in error
     assert nested_download.sftp_password not in error
+
+
+@pytest.mark.asyncio
+async def test_encrypt_workflow_definition_secrets_encrypts_send_email_custom_smtp_password(
+    enabled_encryption: None,
+) -> None:
+    send_email = SimpleNamespace(
+        block_type=BlockType.SEND_EMAIL,
+        custom_smtp_host="smtp.example.com",
+        custom_smtp_username="user@example.com",
+        custom_smtp_password="send-email-test-value",
+    )
+    templated_send_email = SimpleNamespace(
+        block_type=BlockType.SEND_EMAIL,
+        custom_smtp_host=None,
+        custom_smtp_username=None,
+        custom_smtp_password="{{ smtp_password_param }}",
+    )
+    definition = SimpleNamespace(blocks=[send_email, templated_send_email])
+
+    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
+
+    assert is_encrypted_secret(send_email.custom_smtp_password)
+    assert "send-email-test-value" not in send_email.custom_smtp_password
+    assert send_email.custom_smtp_host == "smtp.example.com"
+    assert send_email.custom_smtp_username == "user@example.com"
+    assert templated_send_email.custom_smtp_password == "{{ smtp_password_param }}"
+    assert (
+        await decrypt_secret_field_value(
+            send_email.custom_smtp_password,
+            organization_id="o_x",
+            field_name="custom_smtp_password",
+        )
+        == "send-email-test-value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_email_literal_password_with_jinja_chars_is_still_encrypted(enabled_encryption: None) -> None:
+    send_email = SimpleNamespace(
+        block_type=BlockType.SEND_EMAIL,
+        custom_smtp_host="smtp.example.com",
+        custom_smtp_username="user@example.com",
+        custom_smtp_password="pa{{7*7}}ss",
+    )
+    definition = SimpleNamespace(blocks=[send_email])
+
+    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
+
+    assert is_encrypted_secret(send_email.custom_smtp_password)
+    assert (
+        await decrypt_secret_field_value(
+            send_email.custom_smtp_password,
+            organization_id="o_x",
+            field_name="custom_smtp_password",
+        )
+        == "pa{{7*7}}ss"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_email_password_that_is_entirely_a_jinja_expression_is_encrypted(
+    enabled_encryption: None,
+) -> None:
+    # Only a bare parameter reference ("{{ name }}") may stay a template. A password that
+    # happens to be a full Jinja EXPRESSION ("{{7*7}}") must be treated as a literal:
+    # encrypted at rest, and never rendered (rendering would corrupt it to "49").
+    send_email = SimpleNamespace(
+        block_type=BlockType.SEND_EMAIL,
+        custom_smtp_host="smtp.example.com",
+        custom_smtp_username="user@example.com",
+        custom_smtp_password="{{7*7}}",
+    )
+    definition = SimpleNamespace(blocks=[send_email])
+
+    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
+
+    assert is_encrypted_secret(send_email.custom_smtp_password)
+    assert (
+        await decrypt_secret_field_value(
+            send_email.custom_smtp_password,
+            organization_id="o_x",
+            field_name="custom_smtp_password",
+        )
+        == "{{7*7}}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_email_bare_parameter_reference_stays_a_template(enabled_encryption: None) -> None:
+    send_email = SimpleNamespace(
+        block_type=BlockType.SEND_EMAIL,
+        custom_smtp_host="smtp.example.com",
+        custom_smtp_username="user@example.com",
+        custom_smtp_password="{{ smtp_password_param }}",
+    )
+    definition = SimpleNamespace(blocks=[send_email])
+
+    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
+
+    assert send_email.custom_smtp_password == "{{ smtp_password_param }}"
+
+
+@pytest.mark.asyncio
+async def test_destination_fields_keep_partial_template_behavior(enabled_encryption: None) -> None:
+    # FileUpload/FileDownload sensitive fields keep the historical rule: any Jinja-looking
+    # value skips encryption so partial template composition keeps working.
+    upload = SimpleNamespace(
+        block_type=BlockType.FILE_UPLOAD,
+        aws_secret_access_key=None,
+        azure_storage_account_key=None,
+        sftp_password="prefix-{{ sftp_password_param }}",
+        sftp_private_key=None,
+        sftp_private_key_passphrase=None,
+    )
+    definition = SimpleNamespace(blocks=[upload])
+
+    await encrypt_workflow_definition_secrets(definition, organization_id="o_x")
+
+    assert upload.sftp_password == "prefix-{{ sftp_password_param }}"

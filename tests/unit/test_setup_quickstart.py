@@ -29,6 +29,7 @@ def _patch_detection(monkeypatch: pytest.MonkeyPatch, *, claude_code: bool = Fal
     monkeypatch.setattr("skyvern.cli.setup_commands._is_cursor_installed", lambda: cursor)
     monkeypatch.setattr("skyvern.cli.setup_commands._is_windsurf_installed", lambda: False)
     monkeypatch.setattr("skyvern.cli.setup_commands._is_claude_desktop_installed", lambda: False)
+    monkeypatch.setattr("skyvern.cli.setup_commands._is_opencode_installed", lambda: False)
 
 
 def _patch_env(monkeypatch: pytest.MonkeyPatch, env: tuple[str, str] = _FAKE_ENV) -> None:
@@ -47,6 +48,7 @@ def test_detect_handles_exception_gracefully(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("skyvern.cli.setup_commands._is_cursor_installed", lambda: True)
     monkeypatch.setattr("skyvern.cli.setup_commands._is_windsurf_installed", lambda: False)
     monkeypatch.setattr("skyvern.cli.setup_commands._is_claude_desktop_installed", lambda: False)
+    monkeypatch.setattr("skyvern.cli.setup_commands._is_opencode_installed", lambda: False)
 
     detected, not_detected = _detect_installed_tools()
     assert {t.name for t in detected} == {"Cursor"}

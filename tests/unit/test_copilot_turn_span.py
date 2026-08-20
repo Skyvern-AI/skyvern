@@ -53,19 +53,15 @@ async def _stub_build_request_policy_with_child_span(*_args: Any, **_kwargs: Any
     )
 
 
-async def _stub_build_request_policy_proceed(*_args: Any, **_kwargs: Any) -> RequestPolicy:
-    return RequestPolicy(user_response_policy="ask_clarification", clarification_question="?")
-
-
 async def _raise_unhandled_turn_error(*_args: Any, **_kwargs: Any) -> None:
     raise RuntimeError("boom")
 
 
 @pytest.fixture
-def patched_build_request_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+def patched_request_policy_trust_floor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         copilot_agent,
-        "build_request_policy",
+        "build_request_policy_trust_floor",
         _stub_build_request_policy_with_child_span,
     )
 
@@ -80,7 +76,7 @@ def _find_span(spans: list[Any], name: str) -> Any:
 @pytest.mark.asyncio
 async def test_copilot_turn_span_parents_inner_spans(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request(message="Hello, build me a workflow")
     chat_history = [_user_message("prior question")]
@@ -109,14 +105,14 @@ async def test_copilot_turn_span_parents_inner_spans(
     assert attrs.get("workflow_permanent_id") == "wpid_xyz"
     # Zero-based: one prior user msg in history → this turn is index 1.
     assert attrs.get("copilot.turn_index") == 1
-    preview = attrs.get("copilot.user_message_preview")
-    assert isinstance(preview, str) and preview.startswith("Hello")
+    assert "copilot.user_message_preview" not in attrs
+    assert attrs.get("copilot.user_message_length") == len(chat_request.message)
 
 
 @pytest.mark.asyncio
 async def test_copilot_turn_span_uses_explicit_turn_index(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request()
     chat_history = [_user_message("a"), _user_message("b"), _user_message("c")]
@@ -139,7 +135,7 @@ async def test_copilot_turn_span_uses_explicit_turn_index(
 @pytest.mark.asyncio
 async def test_copilot_turn_span_omits_session_id_when_missing(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     chat_request = _make_chat_request(workflow_copilot_chat_id=None)
 
@@ -159,9 +155,9 @@ async def test_copilot_turn_span_omits_session_id_when_missing(
 
 
 @pytest.mark.asyncio
-async def test_copilot_turn_span_preview_is_single_line_and_truncated(
+async def test_copilot_turn_span_ingress_telemetry_is_content_free(
     span_exporter: Any,
-    patched_build_request_policy: None,
+    patched_request_policy_trust_floor: None,
 ) -> None:
     long_msg = "Line one\nLine two with extra content " + ("x" * 200)
     chat_request = _make_chat_request(message=long_msg)
@@ -177,12 +173,9 @@ async def test_copilot_turn_span_preview_is_single_line_and_truncated(
     )
 
     turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
-    preview = dict(turn_span.attributes or {}).get("copilot.user_message_preview")
-    assert isinstance(preview, str)
-    assert "\n" not in preview
-    assert "\r" not in preview
-    assert len(preview) <= copilot_agent._USER_MESSAGE_PREVIEW_MAX_CHARS
-    assert preview.endswith("…")
+    attrs = dict(turn_span.attributes or {})
+    assert "copilot.user_message_preview" not in attrs
+    assert attrs.get("copilot.user_message_length") == len(long_msg)
 
 
 @pytest.mark.asyncio
@@ -212,9 +205,3 @@ async def test_outer_turn_recovery_records_error_attrs_on_turn_span(
     assert attrs.get("copilot.error_exception_type") == "RuntimeError"
     assert attrs.get("copilot.error_reply_proposal_disposition") == result.proposal_disposition
     assert attrs.get("copilot.error_workflow_modified") is False
-
-
-def test_build_user_message_preview_redacts_known_secret_patterns() -> None:
-    preview = copilot_agent._build_user_message_preview("password: hunter2 please")
-    assert "hunter2" not in preview
-    assert "REDACTED_SECRET" in preview

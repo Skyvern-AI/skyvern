@@ -54,11 +54,8 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    CopilotBuiltUnverified,
-    _check_enforcement,
-    built_complete_without_evaluated_outcome,
     built_unverified_repair_inert_context,
-    verified_goal_claim_authorized,
+    outcome_fully_verified,
     verified_goal_satisfied_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -68,9 +65,9 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _parse_completion_criteria,
     normalized_criterion_outcome_key,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools.completion import (
     _apply_present_value_upgrades,
-    _outcome_failure_warrants_repair,
     _split_criteria_by_plane,
 )
 from tests.unit.copilot_test_helpers import make_completion_criterion as _criterion
@@ -330,6 +327,17 @@ def test_reconcile_no_criteria_anywhere_is_noop() -> None:
             ),
             id="antecedent-family",
         ),
+        pytest.param(
+            (
+                CompletionCriterion(
+                    id="__copilot_requested_output__output_visitors_last_7_days",
+                    outcome="the number of visitors in the last 7 days is output",
+                    output_path="output.visitors_last_7_days",
+                    requested_output_label="visitors",
+                ),
+            ),
+            id="requested-output-label",
+        ),
     ],
 )
 def test_criteria_json_round_trip_preserves_fields(criteria: tuple[CompletionCriterion, ...]) -> None:
@@ -554,6 +562,25 @@ def test_typed_boolean_validation_classification_round_trip_preserves_shape_and_
     assert reloaded == (criterion,)
     assert reloaded[0].expected_output_shape == "goal_judgment_boolean"
     assert reloaded[0].requested_output_evidence_source == "independent_run_evidence"
+
+
+def test_validation_classification_contract_is_rendered_without_legacy_permission_fields() -> None:
+    criterion = CompletionCriterion(
+        id="c0",
+        outcome="The run classifies whether the target page is login-gated.",
+        kind="validation_classification",
+        classification_output_key="login_gated",
+        expected_classification=True,
+    )
+
+    summary = RequestPolicy(completion_criteria=[criterion]).prompt_summary()
+
+    assert "validation_classification_output_contracts:" in summary
+    assert "criterion_id: c0" in summary
+    assert "return_key: login_gated" in summary
+    assert "expected_value: true" in summary
+    assert "allow_update_workflow" not in summary
+    assert "allow_run_blocks" not in summary
 
 
 def _neutral_reported_boolean(
@@ -1648,18 +1675,6 @@ def _no_repair_unverified_contract() -> DiagnosisRepairContract:
     )
 
 
-def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
-    ctx = _legacy_verified_ctx()
-
-    assert ctx.completion_verification_result is None
-    assert verified_goal_satisfied_context(ctx) is False
-    assert verified_goal_claim_authorized(ctx) is False
-    assert built_complete_without_evaluated_outcome(ctx) is True
-
-    with pytest.raises(CopilotBuiltUnverified):
-        _check_enforcement(ctx)
-
-
 def test_structural_abstention_no_repair_terminalizes_without_authorizing_success_claim() -> None:
     ctx = _ctx(
         last_test_ok=True,
@@ -1672,7 +1687,7 @@ def test_structural_abstention_no_repair_terminalizes_without_authorizing_succes
     assert ctx.completion_verification_result.is_fully_satisfied() is False
     assert verified_goal_satisfied_context(ctx) is False
     assert built_unverified_repair_inert_context(ctx) is True
-    assert verified_goal_claim_authorized(ctx) is False
+    assert outcome_fully_verified(ctx) is False
 
 
 def test_structural_abstention_terminalization_rejects_real_unsatisfied_verdicts() -> None:
@@ -1699,16 +1714,12 @@ def test_structural_abstention_terminalization_rejects_contradictions() -> None:
     assert built_unverified_repair_inert_context(ctx) is False
 
 
-def test_claim_authorized_with_adjudicated_evidence() -> None:
+def test_legacy_demonstrated_record_has_no_interactive_terminal_authority() -> None:
     ctx = _legacy_verified_ctx()
-    ctx.completion_verification_result = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
-    assert verified_goal_claim_authorized(ctx) is True
-
-
-def test_unknown_only_verdicts_never_route_to_repair() -> None:
-    ctx = _ctx(last_workflow_yaml="workflow_definition:\n  blocks:\n    - block_type: extraction\n      label: e\n")
-    all_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
-    assert _outcome_failure_warrants_repair(ctx, all_unknown) is False
+    ctx.last_run_blocks_workflow_run_id = "wr_1"
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_1")
+    ctx.completion_verification_result = _evaluated(_verdict("c0", "unsatisfied", "evidence_contradicts"))
+    assert outcome_fully_verified(ctx) is False
 
 
 def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuardrailInputs:
@@ -1720,7 +1731,6 @@ def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuar
         global_llm_context="",
         organization_id="org-1",
         request_policy_handler=None,
-        turn_intent_handler=None,
         stored_completion_criteria=snapshot,
     )
 

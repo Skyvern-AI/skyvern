@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import importlib.metadata
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, cast
 
+import structlog
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Playwright
 from playwright.async_api import TimeoutError as _PlaywrightTimeoutError
@@ -39,11 +40,27 @@ from skyvern.webeye.browser_errors import (
     classify_browser_error,
 )
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.tasks import Task
+    from skyvern.webeye.browser_manager import BrowserManager
+
+LOG = structlog.get_logger()
+
 BrowserDriverStarter = Callable[[], Awaitable[Playwright]]
 BrowserEngineErrorLoader = Callable[[], "tuple[type[BaseException], type[BaseException]]"]
+BrowserEngineRichErrorLoader = Callable[[], "BrowserEngineRichErrorTypes"]
+UNSET_SELECTION = cast("BrowserEngineSelection | None", object())
 
 STOCK_ENGINE_NAME = "playwright"
 RUSTWRIGHT_ENGINE_NAME = "rustwright"
+SKYCDP_ENGINE_NAME = "skycdp"
+
+# skycdp is an in-tree, attach-only raw-CDP driver: no driver subprocess, no bundled browser, no
+# launcher. It arrives DENY-ALL for the same reason Rustwright does — a driver swap is a behavioural
+# risk, not a config change, and the measured conformance surface is still narrower than the
+# Playwright surface production uses. A source is carved in only once its behaviours are covered by
+# tests/browser_e2e/test_skycdp_conformance.py.
+SKYCDP_ALLOWED_BROWSER_SOURCES: frozenset[str] = frozenset()
 
 # Rustwright is registered so the adapter contract exists, but it is DENY-ALL (empty capability set)
 # and thus not rollout-capable: no production browser source may select it. Paths it would serve
@@ -77,6 +94,12 @@ class BrowserEngineUnavailable(SkyvernException):
         super().__init__(f"Browser engine {name!r} is registered but its driver package is not installed")
 
 
+class BrowserEngineBootstrapError(SkyvernException):
+    """A selected driver could not launch a usable browser context (a boot failure before any usable
+    context exists). Raised by a launch seam to mark a narrow experiment-engine launch failure that the
+    acquisition boundary may degrade once to the selection's classical boot fallback."""
+
+
 class BrowserSourceNotSupportedByEngine(SkyvernException):
     """Raised when a resolved browser source is outside the selected engine's capability set."""
 
@@ -106,6 +129,21 @@ class BrowserEngineMetadata:
 
 
 @dataclass(frozen=True)
+class BrowserEngineRichErrorTypes:
+    """Native identities for the richer taxonomy families a driver package exposes, beyond the
+    base+timeout pair every driver has. A spec's rich loader imports these lazily from the driver
+    package (never at spec construction); each family is optional — an empty tuple means the engine
+    exposes no distinct native class for it (its detection, if any, is left to a predicate-based
+    boundary), never a silent downgrade. Carried onto the selection so ``classify_error`` can preserve
+    target-closed / CDP-transport / retryable distinctions instead of flattening them into the base.
+    """
+
+    target_closed_types: tuple[type[BaseException], ...] = ()
+    cdp_connection_types: tuple[type[BaseException], ...] = ()
+    retryable_types: tuple[type[BaseException], ...] = ()
+
+
+@dataclass(frozen=True)
 class BrowserEngineSelection:
     """A single run's pinned engine. Immutable; created once and carried through the browser
     resource's whole lifetime. Concurrent runs hold distinct selections with no shared state, so
@@ -118,10 +156,23 @@ class BrowserEngineSelection:
     timeout_error_type: type[BaseException]
     metadata: BrowserEngineMetadata
     selection_reason: str
-    # Derived once from the two identities above (which ``select()`` loaded lazily from the driver
+    # The richer taxonomy families' native identities, loaded lazily by ``select()`` from the driver
+    # package alongside the base+timeout pair. Each defaults empty: an engine that exposes no distinct
+    # native class for a family (e.g. stock Playwright has no dedicated CDP-transport class) simply
+    # leaves it unbound. A directly-constructed selection with none of these still binds base+timeout.
+    target_closed_error_types: tuple[type[BaseException], ...] = ()
+    cdp_connection_error_types: tuple[type[BaseException], ...] = ()
+    retryable_error_types: tuple[type[BaseException], ...] = ()
+    # One-shot classical fallback used ONLY if THIS selection's driver fails to boot at the run's
+    # browser-ownership boundary, before any browser/page resource exists (see
+    # ``RealBrowserManager._create_browser_state``). ``None`` (the default, and what ``select()`` always
+    # produces) means no fallback — a boot failure fails the run as before. The fallback itself carries
+    # no further fallback, so the degrade is exactly one hop and never fires after a browser side effect.
+    boot_fallback_selection: BrowserEngineSelection | None = None
+    # Derived once from the identities above (which ``select()`` loaded lazily from the driver
     # package), never passed in: the immutable error-family binding that ``classify_error`` uses. The
-    # base+timeout pair is the stable public identity every driver exposes; richer families would be
-    # supplied here only if a package exposed additional stable public identities.
+    # base+timeout pair is the stable public identity every driver exposes; the richer families are
+    # populated only for the native classes the selected engine actually exposes.
     error_families: BrowserEngineErrorFamilies = field(init=False)
 
     def __post_init__(self) -> None:
@@ -135,16 +186,37 @@ class BrowserEngineSelection:
                 f"timeout identity {self.timeout_error_type.__name__} must be {self.error_type.__name__} or a "
                 f"subclass of it; got an incompatible hierarchy for engine {self.name!r}"
             )
+        # Invariant: every richer-family native identity must itself be a subclass of the engine's base
+        # error, so a positive classification implies is_engine_error — the selection can never match a
+        # foreign engine's class into one of its own families. A richer type outside the base family
+        # would let classification fire on an error this engine did not raise (foreign-engine false
+        # classification); fail loudly rather than bind it. Stdlib/transport errors that are not engine
+        # errors belong to a predicate at the boundary, not to these native-identity bindings.
+        for family_name, types in (
+            ("target_closed_error_types", self.target_closed_error_types),
+            ("cdp_connection_error_types", self.cdp_connection_error_types),
+            ("retryable_error_types", self.retryable_error_types),
+        ):
+            for entry in types:
+                if not (isinstance(entry, type) and issubclass(entry, self.error_type)):
+                    raise BrowserErrorFamiliesConfigError(
+                        f"{family_name} entry {entry!r} must be a subclass of the engine's base error "
+                        f"{self.error_type.__name__} for engine {self.name!r}"
+                    )
         # A real driver's timeout is a distinct subclass of its base error, so both identities occupy
         # separate families. Only when an engine reports the same class for both (base is the timeout)
         # is the base entry dropped: the class already appears in the more-specific timeout family,
-        # which classification checks first, and a native type may live in only one family.
+        # which classification checks first, and a native type may live in only one family. The richer
+        # families' one-type-per-family / disjointness checks are enforced by BrowserEngineErrorFamilies.
         base_error_types = () if self.error_type is self.timeout_error_type else (self.error_type,)
         object.__setattr__(
             self,
             "error_families",
             BrowserEngineErrorFamilies(
                 timeout_types=(self.timeout_error_type,),
+                target_closed_types=self.target_closed_error_types,
+                cdp_connection_types=self.cdp_connection_error_types,
+                retryable_types=self.retryable_error_types,
                 base_error_types=base_error_types,
             ),
         )
@@ -182,6 +254,15 @@ class BrowserEngineSelection:
         }
 
 
+def resolve_engine_selection_for_task(
+    task: Task | None, browser_manager: BrowserManager
+) -> BrowserEngineSelection | None:
+    if task is None:
+        return None
+    browser_state = browser_manager.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    return browser_state.engine_selection if browser_state is not None else None
+
+
 @dataclass(frozen=True)
 class BrowserEngineSpec:
     """Immutable registry entry describing how to materialize one engine.
@@ -195,10 +276,21 @@ class BrowserEngineSpec:
     _start_driver: BrowserDriverStarter
     _load_error_types: BrowserEngineErrorLoader
     allowed_browser_sources: frozenset[str] | None = None
+    # Optional lazy loader for the richer taxonomy families' native identities. ``None`` means the
+    # engine binds only base+timeout (the richer families stay empty). Like ``_load_error_types`` it
+    # is never called at spec construction, so a spec for an absent engine stays inert until selected.
+    _load_rich_error_types: BrowserEngineRichErrorLoader | None = None
 
     def is_installed(self) -> bool:
+        # Validate BOTH loaders under the one installed/unavailable contract: an engine whose base
+        # driver imports but whose richer-family identities do not (e.g. a private target-closed module
+        # drifts) is NOT usable, because select() would fail closed on that same import. Reporting it
+        # installed would let a default resolver pick it and then have select() raise; validating both
+        # here keeps is_installed() and select() consistent so the default falls back instead.
         try:
             self._load_error_types()
+            if self._load_rich_error_types is not None:
+                self._load_rich_error_types()
             return True
         except ImportError:
             return False
@@ -206,13 +298,18 @@ class BrowserEngineSpec:
     def select(self, *, selection_reason: str) -> BrowserEngineSelection:
         try:
             error_type, timeout_error_type = self._load_error_types()
+            rich = self._load_rich_error_types() if self._load_rich_error_types is not None else None
         except ImportError as exc:
             raise BrowserEngineUnavailable(self.name) from exc
+        rich = rich if rich is not None else BrowserEngineRichErrorTypes()
         return BrowserEngineSelection(
             name=self.name,
             start_driver=self._start_driver,
             error_type=error_type,
             timeout_error_type=timeout_error_type,
+            target_closed_error_types=rich.target_closed_types,
+            cdp_connection_error_types=rich.cdp_connection_types,
+            retryable_error_types=rich.retryable_types,
             metadata=BrowserEngineMetadata(
                 name=self.name,
                 version=resolve_engine_version(self.name),
@@ -255,6 +352,35 @@ def _stock_error_types() -> tuple[type[BaseException], type[BaseException]]:
     return _PlaywrightError, _PlaywrightTimeoutError
 
 
+def _stock_rich_error_types() -> BrowserEngineRichErrorTypes:
+    # Stock Playwright exposes a distinct native target-closed class; it has no dedicated native class
+    # for CDP-transport or retryable failures (those are message/stdlib-shaped and detected by a
+    # predicate at the boundary, not bound here), so those families stay empty. The target-closed class
+    # lives in a PRIVATE module (playwright._impl._errors) with no API-stability guarantee, imported
+    # lazily here so it never resolves at module import.
+    #
+    # Stock is the always-on default path (the OSS default resolver selects it unguarded, and cloud
+    # falls back to it as last resort), so its richer-family binding must never make stock globally
+    # unavailable. Target-closed detection is additive/best-effort, so if a future Playwright bump
+    # moves or drops that private module we degrade to empty rich families (base+timeout, from the
+    # stable public surface, still bind) with a warning — rather than fail select() and break browser
+    # creation for every run. The except is narrow (ImportError from this one optional import); it is
+    # stock-specific and does NOT relax the fail-loud contract for non-stock/explicitly-selected engines.
+    try:
+        from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
+    except ImportError:
+        LOG.warning(
+            "playwright_private_target_closed_import_unavailable",
+            detail=(
+                "playwright._impl._errors.TargetClosedError could not be imported (likely a Playwright "
+                "upgrade moved it); stock engine binds no target-closed family this run. Base and "
+                "timeout families are unaffected."
+            ),
+        )
+        return BrowserEngineRichErrorTypes()
+    return BrowserEngineRichErrorTypes(target_closed_types=(PlaywrightTargetClosedError,))
+
+
 async def _start_rustwright_driver() -> Playwright:
     from rustwright.async_api import async_playwright as rustwright_async_playwright
 
@@ -268,11 +394,46 @@ def _rustwright_error_types() -> tuple[type[BaseException], type[BaseException]]
     return RustwrightError, RustwrightTimeoutError
 
 
+def _rustwright_rich_error_types() -> BrowserEngineRichErrorTypes:
+    # Rustwright (evaluated at rev f4d8091 / 0.1.0a2) exposes a public ``TargetClosedError`` that
+    # subclasses its base ``Error`` and is disjoint from ``TimeoutError`` — same shape as stock. Like
+    # stock it exposes no distinct native CDP-transport or retryable class (its dead-port connect
+    # errors land on the base ``Error`` family), so those stay empty. Imported lazily: this is never
+    # called until a run selects rustwright, so an image lacking the package stays inert.
+    from rustwright.async_api import TargetClosedError as RustwrightTargetClosedError
+
+    return BrowserEngineRichErrorTypes(target_closed_types=(RustwrightTargetClosedError,))
+
+
+async def _start_skycdp_driver() -> Playwright:
+    from skyvern.webeye.skycdp import async_skycdp
+
+    # Structurally a Playwright driver for the one surface a CDP-connect run uses
+    # (``chromium.connect_over_cdp``); it is not a playwright.Playwright, and cannot be.
+    return cast(Playwright, await async_skycdp().start())
+
+
+def _skycdp_error_types() -> tuple[type[BaseException], type[BaseException]]:
+    from skyvern.webeye.skycdp.errors import CdpError, CdpTimeoutError
+
+    return CdpError, CdpTimeoutError
+
+
+def _skycdp_rich_error_types() -> BrowserEngineRichErrorTypes:
+    from skyvern.webeye.skycdp.errors import CdpConnectionError, CdpTargetClosedError
+
+    return BrowserEngineRichErrorTypes(
+        target_closed_types=(CdpTargetClosedError,),
+        cdp_connection_types=(CdpConnectionError,),
+    )
+
+
 PLAYWRIGHT_SPEC = BrowserEngineSpec(
     name=STOCK_ENGINE_NAME,
     _start_driver=_start_stock_driver,
     _load_error_types=_stock_error_types,
     allowed_browser_sources=None,
+    _load_rich_error_types=_stock_rich_error_types,
 )
 
 RUSTWRIGHT_SPEC = BrowserEngineSpec(
@@ -280,11 +441,21 @@ RUSTWRIGHT_SPEC = BrowserEngineSpec(
     _start_driver=_start_rustwright_driver,
     _load_error_types=_rustwright_error_types,
     allowed_browser_sources=RUSTWRIGHT_ALLOWED_BROWSER_SOURCES,
+    _load_rich_error_types=_rustwright_rich_error_types,
+)
+
+SKYCDP_SPEC = BrowserEngineSpec(
+    name=SKYCDP_ENGINE_NAME,
+    _start_driver=_start_skycdp_driver,
+    _load_error_types=_skycdp_error_types,
+    allowed_browser_sources=SKYCDP_ALLOWED_BROWSER_SOURCES,
+    _load_rich_error_types=_skycdp_rich_error_types,
 )
 
 REGISTRY = BrowserEngineRegistry()
 REGISTRY.register(PLAYWRIGHT_SPEC)
 REGISTRY.register(RUSTWRIGHT_SPEC)
+REGISTRY.register(SKYCDP_SPEC)
 
 
 @dataclass(frozen=True)

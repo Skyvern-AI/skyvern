@@ -67,8 +67,8 @@ No previous context available.
 {% endif %}
 
 {% if request_policy_summary is defined and request_policy_summary %}
-REQUEST POLICY: {{ request_policy_summary }}
-Follow this policy. If `allow_run_blocks` is false, do not call block-running tools. If `resolved_credentials` are present, use those `credential_id` values.
+TURN SAFETY AND REQUEST CONTEXT: {{ request_policy_summary }}
+This block contains facts, not permission or a mandatory next action. If `resolved_credentials` are present, use those `credential_id` values.
 {% endif %}
 DEBUGGER RUN INFORMATION:
 
@@ -86,13 +86,6 @@ If there's a failure, analyze the failure reason and visible elements to provide
 No debugger run information available. The workflow hasn't been run yet, or no run data is accessible.
 {% endif %}
 
-{% if repeated_reply_warning is defined and repeated_reply_warning %}
-REPEATED REPLY WARNING:
-
-```
-{{ repeated_reply_warning }}
-```
-{% endif %}
 USER MESSAGE:
 
 The user says:

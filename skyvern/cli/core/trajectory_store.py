@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
+
 MAX_ENTRIES = 200
 # Budget for trajectory_json AS EMBEDDED in the tool response: _json_size measures the
 # double-encoded length (the string re-escapes when the response dict is serialized),
@@ -27,6 +29,23 @@ class _Trajectory:
 _trajectories: dict[tuple[str | None, str], _Trajectory] = {}
 
 
+def _redaction_shape_preserved(source: Any, redacted: Any) -> bool:
+    if type(source) is dict:
+        if type(redacted) is not dict or len(source) != len(redacted):
+            return False
+        return all(
+            type(left) is type(right) and left == right and _redaction_shape_preserved(source[left], redacted[right])
+            for left, right in zip(source, redacted, strict=True)
+        )
+    if type(source) in (list, tuple):
+        return (
+            type(source) is type(redacted)
+            and len(source) == len(redacted)
+            and all(_redaction_shape_preserved(left, right) for left, right in zip(source, redacted, strict=True))
+        )
+    return type(source) in (str, int, float, bool, type(None)) and type(source) is type(redacted)
+
+
 def _sweep_expired(now: float) -> None:
     expired = [key for key, trajectory in _trajectories.items() if now - trajectory.last_touch > TTL_SECONDS]
     for key in expired:
@@ -39,8 +58,21 @@ def _json_size(entries: list[dict[str, Any]]) -> int:
 
 
 def append_trajectory_entry(*, api_key_hash: str | None, session_id: str, entry: dict[str, Any]) -> None:
-    stored_entry = deepcopy(entry)
-    entry_size = _json_size([stored_entry])
+    redactor = current_codeblock_log_redactor()
+    stored_entry: dict[str, Any] | None
+    if redactor is None:
+        stored_entry = deepcopy(entry)
+        entry_size = _json_size([stored_entry])
+    else:
+        try:
+            redacted = redactor(entry)
+            stored_entry = (
+                deepcopy(redacted) if type(redacted) is dict and _redaction_shape_preserved(entry, redacted) else None
+            )
+            entry_size = _json_size([stored_entry]) if stored_entry is not None else MAX_BYTES + 1
+        except BaseException:
+            stored_entry = None
+            entry_size = MAX_BYTES + 1
     now = time.monotonic()
     _sweep_expired(now)
     key = (api_key_hash, session_id)
@@ -48,7 +80,7 @@ def append_trajectory_entry(*, api_key_hash: str | None, session_id: str, entry:
     entries = list(previous.entries) if previous else []
     truncated = previous.truncated if previous else False
 
-    if entry_size > MAX_BYTES:
+    if stored_entry is None or entry_size > MAX_BYTES:
         truncated = True
     else:
         entries.append(stored_entry)

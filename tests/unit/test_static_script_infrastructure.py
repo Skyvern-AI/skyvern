@@ -227,3 +227,60 @@ class TestValidationFailureLimit:
         # Should stop at page 2 (3rd consecutive failure)
         assert len(pages) == 3
         assert pages[-1] == "p2:STOPPED"
+
+
+# ---------------------------------------------------------------------------
+# Stale static-pin block migration: cache_key extraction from run_signature
+# ---------------------------------------------------------------------------
+
+
+class TestRunSignatureCacheKey:
+    """A static (marker) pin re-imports the live platform module, so a persisted
+    block whose cache_key the module no longer defines must be detectable and
+    dropped — otherwise it runs the agent with the placeholder goal
+    ``Static script: <cache_key>`` instead of the block's real prompt."""
+
+    def test_extracts_cache_key_from_run_task_signature(self) -> None:
+        from skyvern.forge.sdk.workflow.service import _run_signature_cache_key
+
+        signature = (
+            "await skyvern.run_task(\n"
+            "    label = 'Ensure Account',\n"
+            "    cache_key = 'create_account',\n"
+            "    prompt = 'Static script: create_account',\n"
+            ")"
+        )
+        assert _run_signature_cache_key(signature) == "create_account"
+
+    def test_extracts_double_quoted_cache_key(self) -> None:
+        from skyvern.forge.sdk.workflow.service import _run_signature_cache_key
+
+        assert _run_signature_cache_key('await skyvern.run_task(cache_key="fill_application")') == "fill_application"
+
+    def test_returns_none_without_cache_key_kwarg(self) -> None:
+        from skyvern.forge.sdk.workflow.service import _run_signature_cache_key
+
+        assert _run_signature_cache_key("await skyvern.fill_application(page, context)") is None
+
+    def test_returns_none_for_empty_signature(self) -> None:
+        from skyvern.forge.sdk.workflow.service import _run_signature_cache_key
+
+        assert _run_signature_cache_key(None) is None
+        assert _run_signature_cache_key("") is None
+
+    def test_stale_block_detection_mirrors_hasattr_resolution(self) -> None:
+        from skyvern.forge.sdk.workflow.service import _run_signature_cache_key
+
+        module = types.ModuleType("fake_platform")
+        module.fill_application = lambda *a, **k: None  # type: ignore[attr-defined]
+
+        blocks = {
+            "Fill": "await skyvern.run_task(cache_key = 'fill_application', prompt = 'Static script: fill_application')",
+            "Ensure Account": "await skyvern.run_task(cache_key = 'create_account', prompt = 'Static script: create_account')",
+        }
+        stale = [
+            label
+            for label, sig in blocks.items()
+            if (ck := _run_signature_cache_key(sig)) is not None and not hasattr(module, ck)
+        ]
+        assert stale == ["Ensure Account"]

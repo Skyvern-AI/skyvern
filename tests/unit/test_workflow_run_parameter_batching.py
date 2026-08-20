@@ -15,11 +15,25 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import InvalidCredentialId, MissingValueForParameter, WorkflowRunParameterPersistenceError
+from skyvern.exceptions import (
+    InvalidCredentialId,
+    InvalidWorkflowParameter,
+    MissingValueForParameter,
+    SkyvernHTTPException,
+    UnrecognizedWorkflowParameters,
+    WorkflowRunParameterPersistenceError,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.models.parameter import (
+    BitwardenCreditCardDataParameter,
+    BitwardenLoginCredentialParameter,
+    CredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -51,6 +65,7 @@ def _make_service_with_mocks(
     persist_browser_session: bool = False,
     browser_profile_id: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
+    definition_parameters: list | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     """Helper to build a WorkflowService with mocked internals for setup_workflow_run tests."""
     service = WorkflowService()
@@ -71,13 +86,14 @@ def _make_service_with_mocks(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=WorkflowDefinition(blocks=[], parameters=[]),
+        workflow_definition=WorkflowDefinition(blocks=[], parameters=definition_parameters or []),
     )
     workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=workflow_parameters)  # type: ignore[method-assign]
+    service._resolve_sequential_credential_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
     if batch_side_effect:
         service.create_workflow_run_parameters = AsyncMock(side_effect=batch_side_effect)  # type: ignore[method-assign]
     else:
@@ -87,11 +103,17 @@ def _make_service_with_mocks(
     else:
         service.create_workflow_run_parameter = AsyncMock()  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    service.get_workflow_output_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     # Seed resolution is exercised in test_seed_precedence_engine; here it is a pass-through so these
     # setup_workflow_run tests (param batching / tagging / trigger types) don't need seed fixtures.
     service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key="CUSTOM_LLM_oat_smart",
+        default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+    )
     return service, organization, workflow_run
 
 
@@ -340,6 +362,365 @@ async def test_setup_workflow_run_raises_on_missing_required_parameters() -> Non
             )
 
     service.create_workflow_run_parameters.assert_not_awaited()
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_missing_at_will_credential() -> None:
+    """A credential_id parameter with no default and no value is skipped instead of raising."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_not_awaited()
+    service.create_workflow_run_parameters.assert_not_awaited()
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_rejects_misspelled_credential_key() -> None:
+    """SKY-14006: a credential sent under a key the workflow does not declare used to be dropped
+    silently, leaving the at-will credential null and the run to fail deep in a login block."""
+    at_will_cred = _make_workflow_parameter(
+        "credentials_default", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credentials": "cred_123"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(UnrecognizedWorkflowParameters) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    message = str(exc_info.value)
+    assert "credentials" in message
+    assert "credentials_default" in message
+    assert "cred_123" not in message
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_unrelated_unknown_key_alongside_an_omitted_credential() -> None:
+    """A caller who simply never sends the at-will credential (the case
+    _is_optional_credential_parameter exists to permit) must not 400 just because the same request
+    carries an unrelated extra key that doesn't resemble the omitted credential's key."""
+    at_will_cred = _make_workflow_parameter(
+        "credentials_default", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"client_request_id": "req-abc-123"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opted_out_value", [None, "   "])
+async def test_setup_workflow_run_allows_unknown_keys_when_the_credential_was_opted_out(
+    opted_out_value: str | None,
+) -> None:
+    """Sending the credential key as null or blank is a caller who knows the key and means "run
+    without a credential" — an unrelated extra key must not turn that into a 400."""
+    at_will_cred = _make_workflow_parameter(
+        "credentials_default", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credentials_default": opted_out_value, "leftover_key": "whatever"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_ignores_unknown_keys_when_nothing_is_unresolved() -> None:
+    """Extra request keys stay tolerated when every parameter resolved — existing API clients
+    send them and the run is not degraded by them."""
+    param = _make_workflow_parameter("api_key")
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[param])
+
+    request = WorkflowRequestBody(data={"api_key": "value", "leftover_key": "whatever"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_accepts_credential_parameter_override_key() -> None:
+    """A CredentialParameter key lives in the definition, not the parameter rows, and is a valid
+    per-run override key — it must not read as unknown."""
+    at_will_cred = _make_workflow_parameter(
+        "credentials_default", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID
+    )
+    now = datetime.now(tz=timezone.utc)
+    rotating = CredentialParameter(
+        credential_parameter_id="cp_rotating",
+        workflow_id="wf_test",
+        key="rotating_login",
+        credential_id="cred_primary",
+        credential_ids=["cred_primary", "cred_backup"],
+        created_at=now,
+        modified_at=now,
+    )
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[at_will_cred],
+        definition_parameters=[rotating],
+    )
+
+    request = WorkflowRequestBody(data={"rotating_login": "cred_backup"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.workflow_run_credential_selections.get_selection = AsyncMock(return_value=None)
+        mock_app.DATABASE.workflow_run_credential_selections.create_selection = AsyncMock()
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    service.mark_workflow_run_as_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_treats_blank_value_as_absent_for_at_will_credential() -> None:
+    """A blank credential id for a no-default credential counts as absent, not as a lookup."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credential": "   "})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_not_awaited()
+    service.create_workflow_run_parameters.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_still_validates_provided_credential_for_at_will_parameter() -> None:
+    """Providing a non-empty invalid credential id must still 400, even for a no-default credential."""
+    at_will_cred = _make_workflow_parameter("credential", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[at_will_cred])
+
+    request = WorkflowRequestBody(data={"credential": "cred_missing"})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
+
+        with pytest.raises(InvalidCredentialId) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert "cred_missing" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_credential_with_default_uses_default() -> None:
+    """A credential with a default keeps today's fall-back-to-default behavior when omitted."""
+    with_default_cred = _make_workflow_parameter(
+        "credential",
+        workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        default_value="cred_id_0",
+    )
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[with_default_cred])
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(
+            return_value=[SimpleNamespace(credential_id="cred_id_0")]
+        )
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    mock_app.DATABASE.credentials.get_credentials_by_ids.assert_awaited_once()
+    service.create_workflow_run_parameters.assert_awaited_once()
+    _, kwargs = service.create_workflow_run_parameters.call_args
+    assert kwargs["workflow_parameter_values"] == [(with_default_cred, "cred_id_0")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_sequential_credential_rejects_binding_to_at_will_credential() -> None:
+    """A CredentialParameter whose credential_id references a no-default, unprovided credential
+    parameter must fail with a clear error instead of validating the literal key as an id."""
+    now = datetime.now(tz=timezone.utc)
+    at_will_param = _make_workflow_parameter("opt_cred", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+    credential_parameter = CredentialParameter(
+        credential_parameter_id="cp_test",
+        workflow_id="wf_test",
+        key="portal_credential",
+        credential_id="opt_cred",
+        created_at=now,
+        modified_at=now,
+    )
+    workflow = SimpleNamespace(
+        workflow_definition=WorkflowDefinition(blocks=[], parameters=[credential_parameter, at_will_param]),
+    )
+    organization = Organization(
+        organization_id="org_test", organization_name="Test Org", created_at=now, modified_at=now
+    )
+
+    service = WorkflowService()
+    with pytest.raises(SkyvernHTTPException, match="has no default and was not provided"):
+        await service._resolve_sequential_credential_id(
+            workflow=workflow,  # type: ignore[arg-type]
+            workflow_run=SimpleNamespace(workflow_run_id="wr_test"),  # type: ignore[arg-type]
+            organization=organization,
+            parameter_values={},
+            credential_selections={},
+        )
+
+
+def _setup_log_calls(mock_log: object, level: str) -> list:
+    return [c for c in getattr(mock_log, level).call_args_list if "Error while setting up workflow run" in c.args[0]]
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_logs_client_4xx_as_warning_without_traceback() -> None:
+    """A client 4xx (missing param) is expected input, so the setup-failure log drops to warning
+    without a traceback while keeping the error_type field for dashboards."""
+    required_param = _make_workflow_parameter("api_key")  # no default_value
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[required_param])
+
+    request = WorkflowRequestBody(data={})
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log,
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(MissingValueForParameter):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert not _setup_log_calls(mock_log, "exception")
+    warning_calls = _setup_log_calls(mock_log, "warning")
+    assert len(warning_calls) == 1
+    warning_kwargs = warning_calls[0].kwargs
+    assert warning_kwargs["error_type"] == "skyvern.exceptions.MissingValueForParameter"
+    assert "exc_info" not in warning_kwargs
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_logs_unexpected_defect_as_error_with_traceback() -> None:
+    """A non-client (5xx-class) failure is a real defect, so it keeps error+traceback via LOG.exception."""
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    service._resolve_and_stamp_run_seed = AsyncMock(side_effect=RuntimeError("unexpected setup bug"))  # type: ignore[method-assign]
+
+    request = WorkflowRequestBody(data={})
+
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.service.LOG") as mock_log,
+    ):
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        with pytest.raises(RuntimeError):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=request,
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+
+    assert len(_setup_log_calls(mock_log, "exception")) == 1
+    assert not _setup_log_calls(mock_log, "warning")
     service.mark_workflow_run_as_failed.assert_awaited_once()
 
 
@@ -735,6 +1116,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     parent_context = SkyvernContext(
         organization_id="org_test",
         organization_name="Test Org",
+        org_default_llm_key="CUSTOM_LLM_oat_parent_smart",
+        org_default_secondary_llm_key="CUSTOM_LLM_oat_parent_fast",
         workflow_run_id="wr_parent",
         root_workflow_run_id="wr_root",
         run_id="wr_parent",
@@ -760,6 +1143,8 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.workflow_run_id == "wr_test"
     assert current_context.run_id == "wr_parent"
     assert current_context.root_workflow_run_id == "wr_root"
+    assert current_context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
+    assert current_context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
     assert current_context.trigger_type == WorkflowRunTriggerType.api
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state
@@ -917,3 +1302,205 @@ async def test_setup_workflow_run_inherits_browser_profile_for_normal_run() -> N
 
     assert request.browser_profile_id == "bp_workflow"
     assert request.cdp_connect_headers == {"authorization": "Bearer workflow"}
+
+
+def _make_bitwarden_login_parameter(bitwarden_item_id: str | None) -> BitwardenLoginCredentialParameter:
+    now = datetime.now(tz=timezone.utc)
+    return BitwardenLoginCredentialParameter(
+        bitwarden_login_credential_parameter_id="blcp_test",
+        workflow_id="wf_test",
+        key="bw_login",
+        bitwarden_client_id_aws_secret_key="client_id",
+        bitwarden_client_secret_aws_secret_key="client_secret",
+        bitwarden_master_password_aws_secret_key="master_password",
+        bitwarden_item_id=bitwarden_item_id,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _make_bitwarden_credit_card_parameter(bitwarden_item_id: str) -> BitwardenCreditCardDataParameter:
+    now = datetime.now(tz=timezone.utc)
+    return BitwardenCreditCardDataParameter(
+        bitwarden_credit_card_data_parameter_id="bccdp_test",
+        workflow_id="wf_test",
+        key="bw_credit_card",
+        bitwarden_client_id_aws_secret_key="client_id",
+        bitwarden_client_secret_aws_secret_key="client_secret",
+        bitwarden_master_password_aws_secret_key="master_password",
+        bitwarden_collection_id="collection",
+        bitwarden_item_id=bitwarden_item_id,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+async def _run_setup_with_bitwarden_item_id(
+    *,
+    bitwarden_item_id: str | None,
+    request_data: dict | None,
+    workflow_parameters: list[WorkflowParameter] | None = None,
+    output_parameter_keys: list[str] | None = None,
+    credential_parameter: BitwardenCreditCardDataParameter | None = None,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    service, organization, workflow_run = _make_service_with_mocks(
+        workflow_parameters=workflow_parameters or [],
+        definition_parameters=[credential_parameter or _make_bitwarden_login_parameter(bitwarden_item_id)],
+    )
+    service.get_workflow_output_parameters = AsyncMock(  # type: ignore[method-assign]
+        return_value=[SimpleNamespace(key=key) for key in output_parameter_keys or []]
+    )
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+        result = await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data=request_data),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+    return result, service
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_bitwarden_item_id_from_run_parameter_template() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ item_ref }}",
+            request_data={"item_ref": "test"},
+            workflow_parameters=[_make_workflow_parameter("item_ref")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_bitwarden_item_id_from_bare_key_reference() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="item_ref",
+            request_data={"item_ref": "test"},
+            workflow_parameters=[_make_workflow_parameter("item_ref")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_uuid_literal_bitwarden_item_id() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(bitwarden_item_id="not-a-uuid", request_data=None)
+
+
+@pytest.mark.asyncio
+async def test_setup_marks_run_failed_on_invalid_bitwarden_item_id() -> None:
+    service, organization, _ = _make_service_with_mocks(
+        workflow_parameters=[],
+        definition_parameters=[_make_bitwarden_login_parameter("not-a-uuid")],
+    )
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        mock_app.DATABASE.tags.apply_run_tag_changes = AsyncMock()
+        with pytest.raises(InvalidWorkflowParameter):
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data=None),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+            )
+    service.mark_workflow_run_as_failed.assert_awaited_once()
+    failure_reason = service.mark_workflow_run_as_failed.await_args.kwargs["failure_reason"]
+    assert "Bitwarden item ID" in failure_reason
+
+
+@pytest.mark.asyncio
+async def test_setup_accepts_valid_uuid_bitwarden_item_id_from_run_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="{{ item_ref }}",
+        request_data={"item_ref": "3d8b857e-31d0-44b2-8276-b28900b7f112"},
+        workflow_parameters=[_make_workflow_parameter("item_ref")],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_bitwarden_item_id_only_resolvable_at_run_time() -> None:
+    for source in ("{{ login_block.item_id }}", None, ""):
+        result, _ = await _run_setup_with_bitwarden_item_id(bitwarden_item_id=source, request_data=None)
+        assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_bitwarden_item_id_referencing_real_output_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="extract_output",
+        request_data=None,
+        output_parameter_keys=["extract_output"],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_output_suffixed_literal_without_matching_output_parameter() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(bitwarden_item_id="test_output", request_data=None)
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_non_string_bitwarden_item_id_from_run_parameter() -> None:
+    for value in (123, True, ["3d8b857e-31d0-44b2-8276-b28900b7f112"]):
+        with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+            await _run_setup_with_bitwarden_item_id(
+                bitwarden_item_id="{{ item_ref }}",
+                request_data={"item_ref": value},
+                workflow_parameters=[
+                    _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+                ],
+            )
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_falsy_bare_key_item_id_for_login_parameter() -> None:
+    result, _ = await _run_setup_with_bitwarden_item_id(
+        bitwarden_item_id="item_ref",
+        request_data={"item_ref": 0},
+        workflow_parameters=[_make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)],
+    )
+    assert result.workflow_run_id == "wr_test"
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_falsy_template_item_id_for_login_parameter() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ item_ref }}",
+            request_data={"item_ref": 0},
+            workflow_parameters=[
+                _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_falsy_item_id_for_credit_card_parameter() -> None:
+    for value in (0, False):
+        with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+            await _run_setup_with_bitwarden_item_id(
+                bitwarden_item_id=None,
+                request_data={"item_ref": value},
+                workflow_parameters=[
+                    _make_workflow_parameter("item_ref", workflow_parameter_type=WorkflowParameterType.JSON)
+                ],
+                credential_parameter=_make_bitwarden_credit_card_parameter("item_ref"),
+            )
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_composite_template_item_id_with_known_parameters() -> None:
+    with pytest.raises(InvalidWorkflowParameter, match="Bitwarden item ID"):
+        await _run_setup_with_bitwarden_item_id(
+            bitwarden_item_id="{{ prefix }}-{{ suffix }}",
+            request_data={"prefix": "abc", "suffix": "def"},
+            workflow_parameters=[_make_workflow_parameter("prefix"), _make_workflow_parameter("suffix")],
+        )

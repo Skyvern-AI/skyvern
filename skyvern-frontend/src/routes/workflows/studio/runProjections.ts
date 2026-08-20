@@ -16,6 +16,10 @@ import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
 
 export type RunOutcome = "idle" | "running" | "failed" | "success";
 
+// Sentinel formatElapsed returns for a run with no usable start; callers that
+// hide the value instead of rendering a bare dash must compare against this.
+export const ELAPSED_NEVER_STARTED = "—";
+
 // Run timestamps are naive ISO (no Z), so normalize to UTC before diffing — else
 // a live run's (now - start) is skewed by the local timezone offset.
 export function formatElapsed(
@@ -23,11 +27,11 @@ export function formatElapsed(
   endIso: string | null,
 ): string {
   if (!startIso) {
-    return "—";
+    return ELAPSED_NEVER_STARTED;
   }
   const start = new Date(normalizeUtcTimestamp(startIso)).getTime();
   if (Number.isNaN(start)) {
-    return "—";
+    return ELAPSED_NEVER_STARTED;
   }
   const endMs = endIso
     ? new Date(normalizeUtcTimestamp(endIso)).getTime()

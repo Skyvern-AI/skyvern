@@ -20,7 +20,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT, SAVE_DOWNLOADED_FILES_TIMEOUT
-from skyvern.exceptions import PDFParsingError
+from skyvern.exceptions import DownloadSaveIncompleteError, PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
@@ -29,7 +29,10 @@ from skyvern.forge.sdk.api.files import (
     validate_local_file_path,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_secondary_llm_api_handler,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -156,6 +159,9 @@ class PdfFillBlock(Block):
     llm_key: str | None = None
     parameters: list[PARAMETER_TYPE] = []
 
+    def _own_llm_key(self) -> str | None:
+        return self.llm_key
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         parameters = list(self.parameters)
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
@@ -181,6 +187,10 @@ class PdfFillBlock(Block):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
                 self.file_url = extract_file_url_from_block_output(file_url_parameter_value) or file_url_parameter_value
+            else:
+                # Absent optional parameter: fail on the empty URL rather than
+                # treating the literal parameter key as a URL.
+                self.file_url = ""
 
         self.file_url = _render_string(self.file_url)
         self.prompt = _render_string(self.prompt)
@@ -201,7 +211,7 @@ class PdfFillBlock(Block):
         if prompt_config_handler:
             return prompt_config_handler
 
-        secondary_handler = app.SECONDARY_LLM_API_HANDLER
+        secondary_handler = get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)
         if secondary_handler:
             return secondary_handler
 
@@ -1016,6 +1026,14 @@ class PdfFillBlock(Block):
         try:
             async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                 await app.STORAGE.save_downloaded_files(organization_id=organization_id, run_id=workflow_run_id)
+        except DownloadSaveIncompleteError as exc:
+            # The filled PDF may be among the files that did save; read back what registered.
+            LOG.warning(
+                "Storage skipped saving some downloaded files; reading back what registered",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_file_count=len(exc.skipped_files),
+            )
         except Exception:
             LOG.warning(
                 "PdfFillBlock failed to register filled PDF as downloaded file",

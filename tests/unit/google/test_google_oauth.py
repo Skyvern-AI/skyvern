@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, call
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
+from skyvern.exceptions import DownloadFileMaxSizeExceeded
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
@@ -22,7 +24,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthClientConfigRequest,
     UpdateGoogleOAuthCredentialRequest,
 )
-from skyvern.forge.sdk.services import google_drive_service, google_oauth_service
+from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, oauth_consent
 from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 
 
@@ -63,11 +65,26 @@ def test_coerce_scopes_accepts_strings_and_iterables() -> None:
     assert google_oauth_service._coerce_scopes("") == _default_scopes_list()
 
 
-def test_google_sheets_scopes_includes_drive_file_and_metadata_readonly() -> None:
-    scopes = google_oauth_service.GOOGLE_SHEETS_SCOPES
-    assert "https://www.googleapis.com/auth/spreadsheets" in scopes
-    assert "https://www.googleapis.com/auth/drive.file" in scopes
-    assert "https://www.googleapis.com/auth/drive.metadata.readonly" in scopes
+def test_google_oauth_scope_profiles_are_exact() -> None:
+    assert google_oauth_service.GOOGLE_SHEETS_SCOPES == (
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    )
+    assert google_oauth_service.GOOGLE_GMAIL_SCOPES == ("https://www.googleapis.com/auth/gmail.readonly",)
+    assert google_oauth_service.GOOGLE_DRIVE_SCOPES == ("https://www.googleapis.com/auth/drive",)
+
+
+def test_sheets_credentials_granted_drive_file_still_satisfy_the_sheets_profile() -> None:
+    """Credentials consented before drive.file left the profile must keep working without reconsent."""
+    granted_with_drive_file = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+    ]
+    assert google_oauth_service.has_required_scopes(
+        granted_with_drive_file,
+        google_oauth_service.GOOGLE_SHEETS_SCOPES,
+    )
 
 
 def test_google_drive_scope_profile_uses_full_drive_scope_for_folder_uploads() -> None:
@@ -97,6 +114,11 @@ def test_google_drive_extract_folder_id(value: str, expected: str) -> None:
     assert google_drive_service.extract_folder_id(value) == expected
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_google_drive_extract_folder_id_treats_blank_as_my_drive_root(value: str | None) -> None:
+    assert google_drive_service.extract_folder_id(value) is None
+
+
 def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
     with pytest.raises(ValueError, match="folder URL"):
         google_drive_service.extract_folder_id("https://drive.google.com/file/d/file_123/view")
@@ -105,6 +127,421 @@ def test_google_drive_extract_folder_id_rejects_non_folder_url() -> None:
 def test_google_drive_extract_folder_id_rejects_non_google_folder_url() -> None:
     with pytest.raises(ValueError, match=r"https://\*\.google\.com"):
         google_drive_service.extract_folder_id("https://attacker.example.com/folders/folder_123")
+
+
+@pytest.mark.parametrize("builder_name", ["build_multipart_upload_request", "build_resumable_initiate_request"])
+def test_google_drive_upload_omits_parents_without_folder_id(builder_name: str, tmp_path) -> None:
+    source = tmp_path / "report.txt"
+    source.write_text("hello-drive")
+
+    request = getattr(google_drive_service, builder_name)(
+        access_token="at-1",
+        file_path=str(source),
+        folder_id=None,
+    )
+
+    assert b'"parents"' not in request.content
+    assert b'"report.txt"' in request.content
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("file_123", "file_123"),
+        ("https://drive.google.com/file/d/file_123/view?usp=sharing", "file_123"),
+    ],
+)
+def test_google_drive_extract_file_id(value: str, expected: str) -> None:
+    assert google_drive_service.extract_file_id(value) == expected
+
+
+def test_google_drive_extract_file_reference_preserves_resource_key() -> None:
+    reference = google_drive_service.extract_file_reference(
+        "https://drive.google.com/file/d/file_123/view?resourcekey=resource_key_123"
+    )
+
+    assert reference.file_id == "file_123"
+    assert reference.resource_key == "resource_key_123"
+
+
+def test_google_drive_extract_file_id_rejects_non_drive_host() -> None:
+    with pytest.raises(ValueError, match="drive.google.com"):
+        google_drive_service.extract_file_id("https://attacker.example.com/file/d/file_123/view")
+
+
+@pytest.mark.asyncio
+async def test_google_drive_downloads_private_file_with_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = b"private-drive"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer at-1"
+        assert request.headers["X-Goog-Drive-Resource-Keys"] == "file_123/resource_key_123"
+        if request.url.params.get("alt") == "media" and request.url.params.get("redirected") != "true":
+            return httpx.Response(
+                307,
+                headers={
+                    "Location": (
+                        "https://www.googleapis.com/drive/v3/files/file_123"
+                        "?alt=media&supportsAllDrives=true&redirected=true"
+                    )
+                },
+            )
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=payload, headers={"Content-Length": str(len(payload))})
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "../private report.pdf",
+                "mimeType": "application/pdf",
+                "size": str(len(payload)),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        resource_key="resource_key_123",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path) == output_dir / "private report.pdf"
+    assert Path(downloaded_path).read_bytes() == payload
+    assert len(requests) == 3
+    assert requests[0].url.params["fields"] == "id,name,mimeType,size"
+    assert requests[0].url.params["supportsAllDrives"] == "true"
+    assert requests[1].url.params["alt"] == "media"
+    assert requests[1].url.params["supportsAllDrives"] == "true"
+    assert requests[2].url.params["redirected"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_strips_bearer_token_on_cross_origin_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    payload = b"private-drive"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "drive.usercontent.google.com":
+            assert "Authorization" not in request.headers
+            return httpx.Response(200, content=payload)
+
+        assert request.headers["Authorization"] == "Bearer at-1"
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://drive.usercontent.google.com/download?id=file_123"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+                "size": str(len(payload)),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == payload
+    assert [request.url.host for request in requests] == [
+        "www.googleapis.com",
+        "www.googleapis.com",
+        "drive.usercontent.google.com",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_retries_transient_metadata_and_media_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = {"metadata": 0, "media": 0}
+    sleep = AsyncMock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_type = "media" if request.url.params.get("alt") == "media" else "metadata"
+        attempts[request_type] += 1
+        if attempts[request_type] == 1:
+            return httpx.Response(
+                503 if request_type == "metadata" else 429,
+                json={"error": {"code": 503, "message": "retry"}},
+                headers={"Retry-After": "0"},
+            )
+        if request_type == "media":
+            return httpx.Response(200, content=b"private-drive")
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+            },
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == b"private-drive"
+    assert attempts == {"metadata": 2, "media": 2}
+    assert sleep.await_args_list == [call(0.0), call(0.0)]
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_retries_transient_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = {"metadata": 0, "media": 0}
+    sleep = AsyncMock()
+
+    class FailingBody(httpx.AsyncByteStream):
+        def __init__(self, request: httpx.Request) -> None:
+            self.request = request
+
+        async def __aiter__(self) -> Any:
+            yield b"stale-partial-bytes"
+            raise httpx.ReadTimeout("transient Drive failure", request=self.request)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_type = "media" if request.url.params.get("alt") == "media" else "metadata"
+        attempts[request_type] += 1
+        if request_type == "metadata" and attempts[request_type] == 1:
+            raise httpx.ConnectError("transient Drive failure", request=request)
+        if request_type == "media" and attempts[request_type] == 1:
+            return httpx.Response(200, request=request, stream=FailingBody(request))
+        if request_type == "media":
+            return httpx.Response(200, content=b"private-drive")
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "private.pdf",
+                "mimeType": "application/pdf",
+            },
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 3)
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_123",
+        output_dir=str(tmp_path / "downloads"),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path).read_bytes() == b"private-drive"
+    assert attempts == {"metadata": 2, "media": 2}
+    assert sleep.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_stops_after_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+    sleep = AsyncMock()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503,
+            json={"error": {"code": 503, "message": "still unavailable"}},
+            headers={"Retry-After": "0"},
+        )
+
+    monkeypatch.setattr(google_drive_service.settings, "GOOGLE_DRIVE_API_MAX_RETRIES", 2)
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep)
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.status == 503
+    assert attempts == 2
+    sleep.assert_awaited_once_with(0.0)
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_uses_unique_name_for_sanitized_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    names = {
+        "file_a": "Q4 (final).pdf",
+        "file_b": "Q4 final.pdf",
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        file_id = request.url.path.rsplit("/", 1)[-1]
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=file_id.encode())
+        return httpx.Response(
+            200,
+            json={
+                "id": file_id,
+                "name": names[file_id],
+                "mimeType": "application/pdf",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    first_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_a",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+    second_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="file_b",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(first_path).name == "Q4 final.pdf"
+    assert Path(second_path).name == "Q4 final (1).pdf"
+    assert Path(first_path).read_bytes() == b"file_a"
+    assert Path(second_path).read_bytes() == b"file_b"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_reports_native_document_as_not_downloadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "native_123",
+                "name": "Native document",
+                "mimeType": "application/vnd.google-apps.document",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="native_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.code == "fileNotDownloadable"
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_rejects_declared_oversize_before_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "large.bin",
+                "mimeType": "application/octet-stream",
+                "size": str(2 * 1024 * 1024),
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    with pytest.raises(DownloadFileMaxSizeExceeded):
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(output_dir),
+            max_size_mb=1,
+        )
+
+    assert len(requests) == 1
+    assert not output_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_removes_partial_file_when_stream_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b"x" * (1024 * 1024 + 1)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("alt") == "media":
+            return httpx.Response(200, content=payload)
+        return httpx.Response(
+            200,
+            json={
+                "id": "file_123",
+                "name": "large.bin",
+                "mimeType": "application/octet-stream",
+            },
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    with pytest.raises(DownloadFileMaxSizeExceeded):
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="file_123",
+            output_dir=str(output_dir),
+            max_size_mb=1,
+        )
+
+    assert output_dir.exists()
+    assert list(output_dir.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -242,7 +679,7 @@ async def test_google_drive_upload_does_not_retry_retryable_create_response(
     # Keep the backoff mock module-local so unrelated asyncio users cannot look like upload retries.
     process_sleep = asyncio.sleep
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
     assert asyncio.sleep is process_sleep
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
@@ -275,7 +712,7 @@ async def test_google_drive_upload_retries_connection_failures_before_request(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -304,7 +741,7 @@ async def test_google_drive_upload_does_not_retry_ambiguous_transport_failure(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -664,7 +1101,7 @@ async def test_google_drive_resumable_initiation_retries_connect_error(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -695,7 +1132,7 @@ async def test_google_drive_resumable_initiation_does_not_retry_read_timeout(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -796,7 +1233,7 @@ async def test_google_drive_resumable_requeries_offset_after_double_transport_fa
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -882,7 +1319,7 @@ async def test_google_drive_resumable_resumes_after_chunk_429(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -926,7 +1363,7 @@ async def test_google_drive_resumable_resumes_after_chunk_rate_limit_403(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     uploaded = await google_drive_service.upload_file(
         access_token="at-1",
@@ -1093,7 +1530,7 @@ async def test_google_drive_resumable_non_advancing_308_bails(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await asyncio.wait_for(
@@ -1134,7 +1571,7 @@ async def test_google_drive_resumable_malformed_range_after_progress_does_not_re
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -1215,7 +1652,7 @@ async def test_google_drive_resumable_exhausts_attempts_raises(
 
     _install_google_drive_transport(monkeypatch, handler)
     sleep_mock = AsyncMock()
-    monkeypatch.setattr(google_drive_service, "asyncio", SimpleNamespace(sleep=sleep_mock))
+    monkeypatch.setattr(google_drive_service, "_sleep", sleep_mock)
 
     with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
         await google_drive_service.upload_file(
@@ -2040,10 +2477,12 @@ async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch:
     response = await google_oauth_routes.google_oauth_authorize(
         request=request,
         current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
     )
 
     assert response.authorize_url == "https://auth"
     assert start_mock.await_args.kwargs["credential_id"] == "goac_existing"
+    assert start_mock.await_args.kwargs["initiator_id"] == "user_1"
 
 
 @pytest.mark.asyncio
@@ -2061,6 +2500,7 @@ async def test_authorize_route_returns_404_when_credential_not_reauthorizable(
         await google_oauth_routes.google_oauth_authorize(
             request=request,
             current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_1",
         )
     assert exc_info.value.status_code == 404
 
@@ -2084,11 +2524,33 @@ def test_build_authorize_url_includes_required_params(monkeypatch: pytest.Monkey
     assert params["scope"] == " ".join(google_oauth_service.GOOGLE_SHEETS_SCOPES)
     assert params["access_type"] == "offline"
     assert params["prompt"] == "consent"
+    assert "include_granted_scopes" not in params
     assert params["state"] == "abc123"
     # PKCE: a code_challenge must be on the URL and the verifier returned for replay.
     assert params["code_challenge_method"] == "S256"
     assert params["code_challenge"]
     assert code_verifier and len(code_verifier) >= 43
+
+
+@pytest.mark.parametrize("profile", ["google_sheets", "gmail", "google_drive"])
+def test_build_authorize_url_uses_exact_scope_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    scopes = google_oauth_service.scopes_for_profile(profile)
+
+    url, _ = google_oauth_service.build_authorize_url(
+        redirect_uri="https://app/settings/google/callback",
+        state="abc123",
+        scopes=scopes,
+    )
+
+    params = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+    assert params["scope"] == " ".join(scopes)
+    assert "include_granted_scopes" not in params
 
 
 def test_build_authorize_url_passes_autogenerate_code_verifier_explicitly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2197,6 +2659,7 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
         organization_id="org_1",
         redirect_uri="https://x/cb",
         credential_name="my-cred",
+        initiator_id="user_1",
     )
 
     assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
@@ -2206,7 +2669,9 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
     assert insert_kwargs["organization_id"] == "org_1"
     assert insert_kwargs["credential_name"] == "my-cred"
     assert insert_kwargs["consent_redirect_uri"] == "https://x/cb"
-    assert insert_kwargs["consent_nonce"] == result.state
+    assert insert_kwargs["consent_nonce"] == oauth_consent.consent_nonce(result.state, "user_1")
+    # The value handed to Google must never be the value we look rows up by.
+    assert insert_kwargs["consent_nonce"] != result.state
     assert insert_kwargs["client_id"] == "cid"
     # The verifier must be in the same insert as everything else — no second
     # round-trip — so a crash mid-flow can't leave a verifier-less pending row.
@@ -2260,6 +2725,7 @@ async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: 
         organization_id="org_1",
         redirect_uri="https://x/cb",
         credential_id="goac_existing",
+        initiator_id="user_1",
     )
 
     assert result.authorize_url.startswith(google_oauth_service.GOOGLE_AUTHORIZE_ENDPOINT)
@@ -2269,7 +2735,8 @@ async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: 
     reauth_mock.assert_awaited_once()
     kwargs = reauth_mock.await_args.kwargs
     assert kwargs["credential_id"] == "goac_existing"
-    assert kwargs["consent_nonce"] == result.state
+    assert kwargs["consent_nonce"] == oauth_consent.consent_nonce(result.state, "user_1")
+    assert kwargs["consent_nonce"] != result.state
     assert kwargs["client_id"] == "cid"
     # The originally granted scopes are re-requested so the reconnected credential stays usable.
     assert "scope=" in result.authorize_url
@@ -2423,7 +2890,8 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
 
     result = await google_oauth_service.promote_pending_credential(
         organization_id="org_1",
-        nonce="nonce-xyz",
+        state="state-xyz",
+        initiator_id="user_1",
         refresh_token="rt-plain",
         scopes_granted="https://a https://b",
     )
@@ -2433,7 +2901,8 @@ async def test_promote_pending_credential_encrypts_and_calls_repo(monkeypatch: p
     promote_mock.assert_awaited_once()
     kwargs = promote_mock.await_args.kwargs
     assert kwargs["organization_id"] == "org_1"
-    assert kwargs["nonce"] == "nonce-xyz"
+    assert kwargs["nonce"] == oauth_consent.consent_nonce("state-xyz", "user_1")
+    assert kwargs["nonce"] != "state-xyz"
     assert kwargs["encrypted_refresh_token"] == "ENC::rt"
     assert kwargs["encrypted_method"] == EncryptMethod.AES
     assert kwargs["scopes_granted"] == ["https://a", "https://b"]
@@ -2457,10 +2926,14 @@ async def test_load_pending_consent_context_delegates_to_repo(monkeypatch: pytes
 
     result = await google_oauth_service.load_pending_consent_context(
         organization_id="org_1",
-        nonce="nonce-xyz",
+        state="state-xyz",
+        initiator_id="user_1",
     )
     assert result is expected
-    fake_repo.load_pending_by_nonce.assert_awaited_once_with(organization_id="org_1", nonce="nonce-xyz")
+    fake_repo.load_pending_by_nonce.assert_awaited_once_with(
+        organization_id="org_1",
+        nonce=oauth_consent.consent_nonce("state-xyz", "user_1"),
+    )
 
 
 class _FakeOAuth2Session:
@@ -2743,6 +3216,7 @@ async def test_load_credential_secrets_decrypts_repo_payload(monkeypatch: pytest
     assert secrets.scopes == ["https://a", "https://b"]
     assert secrets.client_id == "client-1"
     assert secrets.credential_version == credential_version
+    assert secrets.encrypted_refresh_token == "ENC::rt"
     decrypt_mock.assert_awaited_once_with("ENC::rt", EncryptMethod.AES)
 
 
@@ -2946,6 +3420,128 @@ async def test_access_token_from_secrets_missing_access_token_raises(monkeypatch
 
     with pytest.raises(google_oauth_service.MissingAccessTokenError):
         await google_oauth_service.access_token_from_secrets(secrets)
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_persists_google_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["https://a"],
+        credential_version=credential_version,
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+    encrypt = AsyncMock(return_value="encrypted-rt-rotated")
+    monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(encrypt=encrypt))
+
+    result = await google_oauth_service.refresh_and_rotate(
+        organization_id="org_1",
+        credential_id="goac_1",
+        credential_secrets=secrets,
+    )
+
+    assert result.access_token == "at-refreshed"
+    encrypt.assert_awaited_once_with("rt-rotated", EncryptMethod.AES)
+    assert update_active_refresh_token.await_args is not None
+    assert update_active_refresh_token.await_args.kwargs["expected_encrypted_refresh_token"] == "encrypted-rt-original"
+    assert result.credential_version == update_active_refresh_token.await_args.kwargs["now"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_preserves_version_without_refresh_token_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        scopes=["https://a"],
+        credential_version=credential_version,
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-original")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+
+    result = await google_oauth_service.refresh_and_rotate(
+        organization_id="org_1",
+        credential_id="goac_1",
+        credential_secrets=secrets,
+    )
+
+    assert result == google_oauth_service.GoogleRefreshResult(
+        access_token="at-refreshed",
+        credential_version=credential_version,
+    )
+    update_active_refresh_token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_and_rotate_rejects_failed_google_token_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt-original",
+        credential_version=datetime.datetime(2026, 7, 30, 12, 0, 0),
+        encrypted_refresh_token="encrypted-rt-original",
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "credentials_from_secrets",
+        AsyncMock(return_value=SimpleNamespace(token="at-refreshed", refresh_token="rt-rotated")),
+    )
+    update_active_refresh_token = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(update_active_refresh_token=update_active_refresh_token),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "encryptor",
+        SimpleNamespace(encrypt=AsyncMock(return_value="encrypted-rt-rotated")),
+    )
+
+    with pytest.raises(
+        google_oauth_service.RotatedRefreshTokenPersistenceError,
+        match="reconnect the Google account",
+    ):
+        await google_oauth_service.refresh_and_rotate(
+            organization_id="org_1",
+            credential_id="goac_1",
+            credential_secrets=secrets,
+        )
+
+    update_active_refresh_token.assert_awaited_once()
 
 
 def test_validate_redirect_uri_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3272,6 +3868,7 @@ async def test_google_oauth_callback_rejects_changed_client_before_exchange(
         await google_oauth_routes.google_oauth_callback(
             CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
             current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_1",
         )
 
     assert exc_info.value.status_code == 409
@@ -3279,7 +3876,7 @@ async def test_google_oauth_callback_rejects_changed_client_before_exchange(
         exc_info.value.detail
         == "Google OAuth client configuration changed since consent started; restart the connection"
     )
-    load_mock.assert_awaited_once_with(organization_id="org_1", nonce="nonce")
+    load_mock.assert_awaited_once_with(organization_id="org_1", state="nonce", initiator_id="user_1")
     resolve_mock.assert_awaited_once_with("org_1")
     exchange_mock.assert_not_awaited()
 
@@ -3349,6 +3946,7 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
     response = await google_oauth_routes.google_oauth_callback(
         CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
         current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
     )
 
     assert response.credential.id == "goac_1"
@@ -3361,10 +3959,330 @@ async def test_google_oauth_callback_allows_matching_or_legacy_client(
     )
     promote_mock.assert_awaited_once_with(
         organization_id="org_1",
-        nonce="nonce",
+        state="nonce",
+        initiator_id="user_1",
         refresh_token="refresh-token",
         scopes_granted=["https://www.googleapis.com/auth/spreadsheets"],
     )
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_email_capture_is_authoritative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    gmail_scope = google_oauth_service.GOOGLE_GMAIL_SCOPES[0]
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_1",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=[gmail_scope],
+        scopes_granted=[gmail_scope],
+        email_address="old@example.test",
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_pending_consent_context",
+        AsyncMock(
+            return_value=PendingConsentContext(
+                credential_id=credential.id,
+                consent_redirect_uri="https://x/cb",
+                consent_code_verifier="verifier",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "resolve_client_config",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
+                config=None,
+                source="missing",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "exchange_code_for_tokens",
+        AsyncMock(
+            return_value={
+                "refresh_token": "refresh-token",
+                "access_token": "access-token",
+                "scope": gmail_scope,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "promote_pending_credential",
+        AsyncMock(return_value=credential),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value="Fresh@Example.Test"),
+    )
+    update_email_address = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state="nonce"),
+        current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_1",
+    )
+
+    assert response.credential.email_address == "fresh@example.test"
+    update_email_address.assert_awaited_once_with(
+        organization_id="org_1",
+        credential_id="goac_1",
+        email_address="fresh@example.test",
+        only_if_null=False,
+        expected_version=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_uses_post_rotation_version_and_normalizes_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pre_rotation_version = datetime.datetime(2026, 7, 30, 12, 0, 0)
+    post_rotation_version = datetime.datetime(2026, 7, 30, 12, 1, 0)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_rotated",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=pre_rotation_version,
+        modified_at=pre_rotation_version,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(return_value="secrets"),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleRefreshResult(
+                access_token="access-token",
+                credential_version=post_rotation_version,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value="Rotated@Example.Test"),
+    )
+    update_email_address = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    update_email_address.assert_awaited_once_with(
+        organization_id="org_1",
+        credential_id="goac_rotated",
+        email_address="rotated@example.test",
+        only_if_null=True,
+        expected_version=post_rotation_version,
+    )
+    assert credential.email_address == "rotated@example.test"
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_randomizes_candidates_and_uses_null_and_version_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credentials = [
+        GoogleOAuthCredentialBase(
+            id=f"goac_{index}",
+            organization_id="org_1",
+            credential_name="Default",
+            provider="google",
+            state="active",
+            scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+            scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+            created_at=now,
+            modified_at=now + datetime.timedelta(seconds=index),
+        )
+        for index in range(5)
+    ]
+    selected = [credentials[4], credentials[2], credentials[0]]
+    sample = MagicMock(return_value=selected)
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monkeypatch.setattr(google_oauth_routes.random, "sample", sample)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(side_effect=lambda **kwargs: kwargs["credential_id"]),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            side_effect=lambda *, organization_id, credential_id, credential_secrets: (
+                google_oauth_service.GoogleRefreshResult(
+                    access_token=f"token-{credential_secrets}",
+                    credential_version=next(item.modified_at for item in selected if item.id == credential_id),
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(side_effect=lambda access_token: f"{access_token}@example.test"),
+    )
+    update_email_address = AsyncMock(side_effect=[True, False, True])
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "update_email_address",
+        update_email_address,
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=credentials,
+    )
+
+    sample.assert_called_once_with(credentials, k=3)
+    assert [awaited.kwargs["credential_id"] for awaited in update_email_address.await_args_list] == [
+        credential.id for credential in selected
+    ]
+    assert all(awaited.kwargs["only_if_null"] is True for awaited in update_email_address.await_args_list)
+    assert [awaited.kwargs["expected_version"] for awaited in update_email_address.await_args_list] == [
+        credential.modified_at for credential in selected
+    ]
+    assert selected[0].email_address == "token-goac_4@example.test"
+    assert selected[1].email_address is None
+    assert selected[2].email_address == "token-goac_0@example.test"
+    assert google_oauth_routes._EMAIL_BACKFILL_FAILURES == {}
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_does_not_retry_failed_resolution_within_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_failed",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    monotonic_time = [100.0]
+    monkeypatch.setattr(google_oauth_routes.time, "monotonic", lambda: monotonic_time[0])
+    load_secrets = AsyncMock(return_value="secrets")
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        load_secrets,
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "refresh_and_rotate",
+        AsyncMock(
+            return_value=google_oauth_service.GoogleRefreshResult(
+                access_token="access-token",
+                credential_version=now,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        google_oauth_routes.google_gmail_service,
+        "fetch_profile_email",
+        AsyncMock(return_value=None),
+    )
+
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    load_secrets.assert_awaited_once()
+
+    monotonic_time[0] = 3701.0
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    assert load_secrets.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_google_email_backfill_caches_cancelled_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = GoogleOAuthCredentialBase(
+        id="goac_slow",
+        organization_id="org_1",
+        credential_name="Default",
+        provider="google",
+        state="active",
+        scopes_requested=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        scopes_granted=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+        created_at=now,
+        modified_at=now,
+    )
+    monkeypatch.setattr(google_oauth_routes, "_EMAIL_BACKFILL_FAILURES", {})
+    load_secrets = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "load_credential_secrets",
+        load_secrets,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await google_oauth_routes._backfill_google_email_addresses(
+            organization_id="org_1",
+            credentials=[credential],
+        )
+    await google_oauth_routes._backfill_google_email_addresses(
+        organization_id="org_1",
+        credentials=[credential],
+    )
+
+    load_secrets.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3653,3 +4571,165 @@ def test_google_oauth_credential_response_exposes_app_origin() -> None:
 
     resp_no_origin = GoogleOAuthCredentialResponse(credential=cred)
     assert resp_no_origin.app_origin is None
+
+
+class _ConsentRepoDouble:
+    """In-memory stand-in for the consent-nonce lifecycle: insert, look up, consume once."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    async def insert_pending_credential(self, **kwargs: Any) -> SimpleNamespace:
+        self.rows[kwargs["consent_nonce"]] = kwargs
+        return SimpleNamespace(id=kwargs["credential_id"], organization_id=kwargs["organization_id"])
+
+    async def load_pending_by_nonce(
+        self,
+        organization_id: str,
+        nonce: str,
+        now: datetime.datetime | None = None,
+    ) -> Any:
+        from skyvern.forge.sdk.db.repositories.google_oauth import PendingConsentContext
+
+        row = self.rows.get(nonce)
+        if row is None or row["organization_id"] != organization_id:
+            return None
+        return PendingConsentContext(
+            credential_id=row["credential_id"],
+            consent_redirect_uri=row["consent_redirect_uri"],
+            consent_code_verifier=row["consent_code_verifier"],
+            consent_app_origin=row.get("consent_app_origin"),
+            client_id=row.get("client_id"),
+        )
+
+    async def promote_pending_to_active(
+        self,
+        organization_id: str,
+        nonce: str,
+        **kwargs: Any,
+    ) -> GoogleOAuthCredentialBase:
+        row = self.rows.pop(nonce, None)
+        if row is None or row["organization_id"] != organization_id:
+            raise google_oauth_service.InvalidConsentNonceError("Unknown or already consumed OAuth consent nonce")
+        return GoogleOAuthCredentialBase(
+            id=row["credential_id"],
+            organization_id=organization_id,
+            credential_name=row["credential_name"],
+            provider="google",
+            state=google_oauth_service.STATE_ACTIVE,
+            scopes_requested=row["scopes_requested"],
+            scopes_granted=list(kwargs["scopes_granted"]),
+            created_at=datetime.datetime.utcnow(),
+            modified_at=datetime.datetime.utcnow(),
+        )
+
+
+def _install_consent_flow_doubles(monkeypatch: pytest.MonkeyPatch, repo: _ConsentRepoDouble) -> AsyncMock:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=False),
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=repo, organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock())),
+        raising=False,
+    )
+    monkeypatch.setattr(google_oauth_service, "encryptor", SimpleNamespace(encrypt=AsyncMock(return_value="ENC::rt")))
+    monkeypatch.setattr(google_oauth_service.app, "CACHE", SimpleNamespace(set=AsyncMock()), raising=False)
+    exchange_mock = AsyncMock(
+        return_value={
+            "access_token": "at",
+            "refresh_token": "rt",
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+        }
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "exchange_code_for_tokens", exchange_mock)
+    return exchange_mock
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_rejects_state_redeemed_by_another_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A consent challenge is redeemable only by the caller that started it."""
+    repo = _ConsentRepoDouble()
+    exchange_mock = _install_consent_flow_doubles(monkeypatch, repo)
+
+    start = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_other",
+        )
+
+    assert exc_info.value.status_code == 400
+    # Reject before spending the one-time authorization code.
+    exchange_mock.assert_not_awaited()
+    # The challenge stays redeemable by the caller that started it.
+    assert len(repo.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_oauth_callback_consumes_state_and_rejects_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _ConsentRepoDouble()
+    _install_consent_flow_doubles(monkeypatch, repo)
+
+    start = await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    response = await google_oauth_routes.google_oauth_callback(
+        CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+        current_org=SimpleNamespace(organization_id="org_1"),
+        current_user_id="user_initiator",
+    )
+    assert response.credential.state == google_oauth_service.STATE_ACTIVE
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=start.state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_initiator",
+        )
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["", "not-a-real-state"])
+async def test_google_oauth_callback_rejects_unusable_state(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    repo = _ConsentRepoDouble()
+    exchange_mock = _install_consent_flow_doubles(monkeypatch, repo)
+    await google_oauth_service.start_authorization(
+        organization_id="org_1",
+        redirect_uri="https://x/cb",
+        initiator_id="user_initiator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.google_oauth_callback(
+            CreateGoogleOAuthCallbackRequest(code="code", state=state),
+            current_org=SimpleNamespace(organization_id="org_1"),
+            current_user_id="user_initiator",
+        )
+
+    assert exc_info.value.status_code == 400
+    exchange_mock.assert_not_awaited()

@@ -299,6 +299,28 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
     ).toEqual(["Toggled persist browser session"]);
   });
 
+  it("names a browser-session reuse toggle", () => {
+    const base = snapshotOf(
+      saveData({ settings: { reuseBrowserSession: false } }),
+    );
+    expect(
+      summarizeWorkflowChanges(
+        saveData({ settings: { reuseBrowserSession: true } }),
+        base,
+      ),
+    ).toEqual(["Toggled reuse browser session"]);
+  });
+
+  it("names a secret masking toggle", () => {
+    const base = snapshotOf(saveData({ settings: { maskSecrets: false } }));
+    expect(
+      summarizeWorkflowChanges(
+        saveData({ settings: { maskSecrets: true } }),
+        base,
+      ),
+    ).toEqual(["Toggled secret masking"]);
+  });
+
   it("groups a browser-profile change into one line", () => {
     const base = snapshotOf(
       saveData({
@@ -332,6 +354,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
       proxyLocation: "RESIDENTIAL",
       webhookCallbackUrl: "https://h",
       persistBrowserSession: true,
+      reuseBrowserSession: false,
       pinSavedSessionIp: false,
       browserProfileId: "p",
       browserProfileKey: "k",
@@ -345,6 +368,7 @@ describe("summarizeWorkflowChanges (snapshot baseline)", () => {
       scriptCacheKey: "c",
       aiFallback: true,
       enableSelfHealing: false,
+      maskSecrets: false,
       runSequentially: true,
       sequentialKey: "s",
       finallyBlockLabel: "f",

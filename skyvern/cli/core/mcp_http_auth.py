@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from fastapi import HTTPException
+from fastmcp.server.dependencies import get_http_request
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -28,6 +32,7 @@ from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
+from .session_manager import request_session_scope
 
 LOG = structlog.get_logger(__name__)
 API_KEY_HEADER = "x-api-key"
@@ -63,6 +68,8 @@ _DEFAULT_REMOTE_BASE_URL = "https://api.skyvern.com"
 _MCP_REALM = "mcp"
 _RESOURCE_CLAIM_KEYS = ("resource",)
 _TOKEN_CLOCK_SKEW_SECONDS = 60.0
+_SCOPED_RESOURCE_SUFFIX_RE = re.compile(r"/x/[a-z0-9_-]+$")
+_scoped_mcp_resources_enabled = False
 
 _OrgEntitiesGetter = Callable[[str, str], Awaitable[list[Any]]]
 _OrgAuthTokenGetter = Callable[[str, OrganizationAuthTokenType], Awaitable[Any | None]]
@@ -173,14 +180,24 @@ def _validate_token_issuer(payload: dict[str, object], expected_issuer: str) -> 
         raise HTTPException(status_code=401, detail="Token issuer is not valid for this MCP resource")
 
 
-def _normalize_resource(resource: str) -> str:
-    """Strip a trailing slash so audience / resource comparisons are slash-agnostic.
+def set_scoped_mcp_resources_enabled(enabled: bool) -> None:
+    global _scoped_mcp_resources_enabled
+    _scoped_mcp_resources_enabled = enabled
 
-    Centralized here so ``_validate_token_audience``,
-    ``_validate_token_resource_claims``, and any future validator apply the
-    same normalization rule to both sides of the comparison.
+
+def _normalize_resource(resource: str) -> str:
+    """Normalize MCP resource URI variants before auth comparisons.
+
+    Strip trailing slashes. When the deployment also mounts scoped MCP routing,
+    structurally strip one trailing ``/x/<segment>`` suffix before comparing.
+    Scope-name validation stays with the cloud router / shared cloud normalizer;
+    OSS streamable HTTP does not serve those routes, so scoped resources stay
+    distinct unless explicitly enabled by the host app.
     """
-    return resource.rstrip("/")
+    normalized = resource.rstrip("/")
+    if _scoped_mcp_resources_enabled:
+        return _SCOPED_RESOURCE_SUFFIX_RE.sub("", normalized)
+    return normalized
 
 
 def _validate_token_audience(payload: dict[str, object], expected_resource: str) -> None:
@@ -198,8 +215,8 @@ def _validate_token_audience(payload: dict[str, object], expected_resource: str)
     else:
         audiences = []
 
-    # Slash-agnostic compare: tokens whose `aud` was minted against either
-    # `.../mcp` or `.../mcp/` validate against either expected form.
+    # Resource compare: tokens whose `aud` was minted against canonical or
+    # scoped MCP URL variants validate against either expected form.
     expected_norm = _normalize_resource(expected_resource)
     if not any(_normalize_resource(a) == expected_norm for a in audiences):
         raise HTTPException(status_code=401, detail="Token audience is not valid for this MCP resource")
@@ -598,11 +615,50 @@ def _service_unavailable_response(message: str) -> JSONResponse:
     )
 
 
+def request_organization_id() -> str | None:
+    """Return the org id MCPAPIKeyMiddleware pinned on the current HTTP request.
+
+    None outside an HTTP request (stdio) or before authentication ran. The write
+    side is `_forward_authenticated_request` below; keep reader and writer together.
+    """
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return None
+    return getattr(getattr(request, "state", None), "organization_id", None)
+
+
 class MCPAPIKeyMiddleware:
     """Require x-api-key or Authorization: Bearer for MCP HTTP transport."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
+
+    async def _forward_authenticated_request(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        organization_id: str,
+        api_key: str,
+    ) -> None:
+        scope.setdefault("state", {})
+        scope["state"]["organization_id"] = organization_id
+        scope["user"] = AuthenticatedUser(
+            AccessToken(
+                token="mcp-http-session-owner",
+                client_id=organization_id,
+                subject=hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+                scopes=[],
+            )
+        )
+        token = set_api_key_override(api_key)
+        try:
+            with request_session_scope(organization_id):
+                await self.app(scope, receive, send)
+        finally:
+            reset_api_key_override(token)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -657,13 +713,13 @@ class MCPAPIKeyMiddleware:
 
         try:
             resolution = await validate_mcp_oauth_token(bearer_token)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = resolution.validation.organization_id
-            token = set_api_key_override(resolution.api_key)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                reset_api_key_override(token)
+            await self._forward_authenticated_request(
+                scope,
+                receive,
+                send,
+                organization_id=resolution.validation.organization_id,
+                api_key=resolution.api_key,
+            )
             return
         except HTTPException as e:
             if e.status_code == 503:
@@ -682,8 +738,6 @@ class MCPAPIKeyMiddleware:
         # Fall back: treat Bearer value as a raw API key
         try:
             validation = await validate_mcp_api_key(bearer_token)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = validation.organization_id
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 if oauth_service_error is not None:
@@ -705,18 +759,18 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
 
-        token = set_api_key_override(bearer_token)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            reset_api_key_override(token)
+        await self._forward_authenticated_request(
+            scope,
+            receive,
+            send,
+            organization_id=validation.organization_id,
+            api_key=bearer_token,
+        )
 
     async def _handle_api_key(self, scope: Scope, receive: Receive, send: Send, api_key: str) -> None:
         """Validate x-api-key header and forward the request (original flow)."""
         try:
             validation = await validate_mcp_api_key(api_key)
-            scope.setdefault("state", {})
-            scope["state"]["organization_id"] = validation.organization_id
         except HTTPException as e:
             if e.status_code in {401, 403}:
                 response = _unauthorized_response(_INVALID_API_KEY_MESSAGE, include_oauth_challenge=False)
@@ -733,8 +787,10 @@ class MCPAPIKeyMiddleware:
             await response(scope, receive, send)
             return
 
-        token = set_api_key_override(api_key)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            reset_api_key_override(token)
+        await self._forward_authenticated_request(
+            scope,
+            receive,
+            send,
+            organization_id=validation.organization_id,
+            api_key=api_key,
+        )

@@ -24,14 +24,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     RegisteredBlockerEvidence,
     RunEvidenceSnapshot,
     _contingent_metadata_for_criteria,
-    _is_structural_requested_output_abstention,
     _satisfying_evidence_is_admissible,
     carry_criterion_metadata,
     carry_degraded_criterion_ids,
     carry_floor_rekeyed_criterion_ids,
     carry_floor_rekeyed_path_backing,
     combine_verification_results,
-    effective_unmet_verdicts,
     evaluate_completion_criteria,
     grade_definition_criteria,
     grade_fallback_floor_reached_end_state_criteria,
@@ -45,23 +43,15 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     gradeable_completion_criteria,
     is_fallback_floor_base_criterion,
     is_registered_download_completion_criterion,
-    only_degraded_blocking,
     registered_download_completion_criterion,
     structural_unfired_contingent_criterion_ids,
-    summarize_unsatisfied_outcomes,
-    verdict_missing_evidence,
 )
-from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
 from skyvern.forge.sdk.copilot.reached_download_target import (
-    DOWNLOAD_KIND_ATTRIBUTE,
-    DOWNLOAD_KIND_EXTENSION,
-    DOWNLOAD_KIND_REGISTERED,
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
-    ReachedDownloadTarget,
     derive_from_block_outputs,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -73,8 +63,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_neutral_reported_boolean_criterion,
 )
 from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
-from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 
 from ._shared import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -90,7 +80,6 @@ from ._shared import (
     _workflow_output_parameter_payloads,
 )
 from .blockers import (
-    _active_run_terminal_evidence_detected,
     _analyze_run_blocks,
     _artifact_challenge_flag_from_result,
     _run_blocks_structured_blocker_message,
@@ -98,12 +87,13 @@ from .blockers import (
 
 LOG = structlog.get_logger()
 
-_TYPED_DOWNLOAD_KINDS = frozenset({DOWNLOAD_KIND_REGISTERED, DOWNLOAD_KIND_ATTRIBUTE, DOWNLOAD_KIND_EXTENSION})
 _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
 # and observation flag cannot be traversed as observed page content.
-_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
+_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset(
+    {"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"}
+)
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"
@@ -120,22 +110,6 @@ _VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT = (
 def _completion_request_policy(copilot_ctx: Any) -> Any | None:
     try:
         return copilot_ctx.request_policy
-    except AttributeError:
-        return None
-
-
-def _is_typed_download_target(value: object) -> bool:
-    if isinstance(value, ReachedDownloadTarget):
-        return value.download_kind in _TYPED_DOWNLOAD_KINDS
-    if not isinstance(value, dict):
-        return False
-    download_kind = value.get("download_kind")
-    return isinstance(download_kind, str) and download_kind in _TYPED_DOWNLOAD_KINDS
-
-
-def _ctx_reached_download_target(copilot_ctx: Any) -> object | None:
-    try:
-        return copilot_ctx.reached_download_target
     except AttributeError:
         return None
 
@@ -206,10 +180,6 @@ def _minted_registered_download_requested_output_count(criteria: list[Completion
 
 
 def _has_typed_download_signal(copilot_ctx: Any, result: dict[str, Any]) -> bool:
-    if _is_typed_download_target(_ctx_reached_download_target(copilot_ctx)):
-        return True
-    if _is_typed_download_target(_result_data(result).get("reached_download_target")):
-        return True
     return _result_has_registered_download_block_output(result)
 
 
@@ -591,7 +561,9 @@ async def _maybe_run_completion_verification_from_page_observation(
     title: str = "",
     observed_data: object | None = None,
 ) -> CompletionVerificationResult | None:
-    """Verify completion only after failed or authoritative-unsatisfied runs."""
+    """Verify completion only for the isolated unattended recovery agent."""
+    if getattr(copilot_ctx, "turn_origin", None) != TurnOrigin.runtime_self_heal:
+        raise RuntimeError("page-observation completion verification is runtime-self-heal only")
 
     existing = getattr(copilot_ctx, "completion_verification_result", None)
     if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():
@@ -807,14 +779,12 @@ def _download_file_name(value: Any) -> str | None:
 def _completion_evidence_payload(output: Any) -> Any:
     if not isinstance(output, dict):
         return output
-    nested_output = output.get("output")
+    # Root scope only: the execution layer binds registration keys at the root of every block
+    # output, so keys found only in a nested scope are the code's own claim, not registration.
     has_download_output = any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
-    has_nested_download_output = isinstance(nested_output, dict) and any(
-        nested_output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS
-    )
-    if not has_download_output and not has_nested_download_output:
+    if not has_download_output:
         return output
-    download_output = output if has_download_output or not isinstance(nested_output, dict) else nested_output
+    download_output = output
     names: list[str] = []
     if name := _download_file_name(download_output.get("downloaded_file_name")):
         names.append(name)
@@ -834,20 +804,11 @@ def _completion_evidence_payload(output: Any) -> Any:
         payload["downloaded_file_artifact_count"] = len(artifacts)
     if names:
         payload["downloaded_file_names"] = list(dict.fromkeys(names))[:_MAX_EVIDENCE_FILE_NAMES]
-    if has_nested_download_output and not has_download_output and isinstance(nested_output, dict):
-        preserved_output = {
-            key: value
-            for key, value in nested_output.items()
-            if key not in REGISTERED_DOWNLOAD_OUTPUT_KEYS and key not in {"page", "download"}
-        }
-        if preserved_output:
-            payload["output"] = preserved_output
     return payload
 
 
 _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
     {
-        "ACTIVE_RUN_TERMINAL_EVIDENCE",
         "ANTI_BOT_DETECTION",
         "AUTH_FAILURE",
         "BROWSER_ERROR",
@@ -900,8 +861,6 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
     even though the run did not finish cleanly — recognition must not key on run status.
     """
     if bool(result.get("ok", False)):
-        return False
-    if _active_run_terminal_evidence_detected(result):
         return False
     if _run_blocks_structured_blocker_message(result, copilot_ctx):
         return False
@@ -1531,36 +1490,6 @@ def _deterministic_run_verification_result(
     )
 
 
-async def _maybe_run_completion_verification(
-    copilot_ctx: Any, result: dict[str, Any], handler_start: float
-) -> CompletionVerificationResult | None:
-    if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
-        return None
-    if not (
-        _is_outcome_evidence_candidate(copilot_ctx, result)
-        or _is_unfinished_run_verification_candidate(copilot_ctx, result)
-    ):
-        return None
-    criteria = _completion_verification_criteria(copilot_ctx)
-    criteria = _reconcile_download_completion_criterion(copilot_ctx, result, criteria)
-    verification = await _completion_verification_from_run_result(copilot_ctx, result, handler_start, criteria)
-    if verification is None:
-        return None
-    verification = replace(
-        verification,
-        registered_blocker_evidence_by_request_slot_id=dict(
-            _build_run_evidence_snapshot(copilot_ctx, result).registered_blocker_evidence_by_request_slot_id
-        ),
-    )
-    verification = carry_criterion_metadata(verification, criteria)
-    verification = _carry_degraded_ids(copilot_ctx, verification)
-    verification = carry_floor_rekeyed_criterion_ids(verification, criteria)
-    run_data = result.get("data")
-    return _carry_floor_rekeyed_backing(
-        copilot_ctx, verification, criteria, run_data if isinstance(run_data, dict) else None
-    )
-
-
 async def _completion_verification_from_run_result(
     copilot_ctx: Any, result: dict[str, Any], handler_start: float, criteria: list[CompletionCriterion]
 ) -> CompletionVerificationResult | None:
@@ -1787,181 +1716,18 @@ async def _completion_verification_from_run_result(
     )
 
 
-def _outcome_unverified_reason(
-    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
-) -> str | None:
-    if completion_verification is None:
-        return None
-    if completion_verification.status == "evaluated":
-        if completion_verification.is_fully_satisfied():
-            return None
-        if completion_verification.no_gradeable_run_plane:
-            return (
-                "The run completed but the goal outcome could not be independently verified "
-                "(no run-gradeable outcome in this contract). Review the draft before using it."
-            )
-        policy = getattr(copilot_ctx, "request_policy", None)
-        criteria: list[CompletionCriterion] = list(policy.completion_criteria) if policy is not None else []
-        known_good = _known_good_revision_hint(copilot_ctx)
-        missing_detail = _missing_evidence_detail(completion_verification, criteria)
-        validation_review_hint = _validation_review_output_contract_hint(completion_verification, criteria)
-        if missing_detail:
-            return (
-                "The run completed but did not demonstrate the goal outcome(s). "
-                f"Missing evidence: {missing_detail}. "
-                "Add or fix the block that produces the missing outcome evidence, then "
-                f"re-run.{validation_review_hint}{known_good}"
-            )
-        unmet = summarize_unsatisfied_outcomes(completion_verification, criteria)
-        detail = f": {unmet}" if unmet else ""
-        # Keep the legacy fallback live for malformed evaluated results with no unmet verdict details.
-        return (
-            f"The run completed but did not demonstrate the goal outcome(s){detail}. "
-            "Add or fix the block that produces the missing outcome evidence, "
-            f"then re-run.{validation_review_hint}{known_good}"
-        )
-    # An 'unavailable' result reaches here only when verification was required;
-    # fail closed and ask for a re-run rather than claim an unverified success.
-    return (
-        "The run completed but the goal outcome could not be verified (verification was unavailable). "
-        "Re-run to verify the outcome before reporting success."
-    )
-
-
-def _known_good_revision_hint(copilot_ctx: Any) -> str:
-    turn_state = getattr(copilot_ctx, "completion_criteria_turn_state", None)
-    if turn_state is not None and getattr(turn_state, "known_good_yaml_available", False):
-        return (
-            " A previously tested revision of this workflow satisfied every criterion; if repairs regress "
-            "working blocks, prefer restoring that revision over rewriting them."
-        )
-    return ""
-
-
-def _validation_review_output_contract_hint(
-    completion_verification: CompletionVerificationResult, criteria: list[CompletionCriterion]
-) -> str:
-    fallback_floor_ids = {criterion.id for criterion in criteria if is_fallback_floor_base_criterion(criterion)}
-    if not fallback_floor_ids:
-        return ""
-    for verdict in completion_verification.verdicts:
-        if verdict.criterion_id in fallback_floor_ids and verdict.state == "unsatisfied":
-            if verdict.reason_code == "no_evidence":
-                return _VALIDATION_REVIEW_OUTPUT_CONTRACT_HINT
-    return ""
-
-
-def _missing_evidence_detail(
-    completion_verification: CompletionVerificationResult, criteria: list[CompletionCriterion]
-) -> str | None:
-    outcome_by_id = {criterion.id: criterion.outcome for criterion in criteria}
-    parts: list[str] = []
-    for verdict in effective_unmet_verdicts(completion_verification):
-        missing_evidence = verdict_missing_evidence(verdict)
-        if not missing_evidence:
-            continue
-        outcome = outcome_by_id.get(verdict.criterion_id)
-        if isinstance(outcome, str) and outcome.strip():
-            parts.append(f"{outcome}: {missing_evidence}")
-        else:
-            parts.append(f"{verdict.criterion_id}: {missing_evidence}")
-    return "; ".join(parts) if parts else None
-
-
-def _outcome_failure_warrants_repair(
-    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
-) -> bool:
-    """Whether an unmet outcome should route to suspicious-success/repair rather
-    than continue-building.
-
-    Contradicting evidence is always a real failure. Absence of evidence is a
-    failure only once the workflow has an outcome-producing block; while the agent
-    is still adding blocks toward the goal, an unmet criterion is expected, and the
-    run should keep building. Terminal success stays withheld in both cases via the
-    verification result, so this only governs the repair directive, not the gate.
-    """
-    if completion_verification is None:
-        return False
-    if only_degraded_blocking(completion_verification):
-        return False
-    unmet_verdicts = effective_unmet_verdicts(completion_verification)
-    if any(
-        verdict.reason_code == "evidence_contradicts"
-        and not completion_verification.is_structural_contingent_abstention(verdict)
-        for verdict in unmet_verdicts
-    ):
-        return True
-    # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
-    # (absent judge signal, unmappable definition checks) never warrants repair.
-    if not any(
-        verdict.state == "unsatisfied"
-        and not _is_structural_requested_output_abstention(verdict)
-        and not completion_verification.is_structural_contingent_abstention(verdict)
-        for verdict in unmet_verdicts
-    ):
-        return False
-    return _current_workflow_has_evidence_block(copilot_ctx)
-
-
-def _tool_visible_result_after_completion_verification(
-    copilot_ctx: Any,
-    result: dict[str, Any],
-    completion_verification: CompletionVerificationResult | None,
-) -> dict[str, Any]:
-    if outcome_fully_verified(copilot_ctx):
-        return result
-    outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
-    if outcome_unverified_reason is None:
-        return result
-    data = result.get("data")
-    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
-    if (
-        copilot_ctx.delivered_unverified_terminal
-        and isinstance(run_id, str)
-        and run_id == copilot_ctx.delivered_unverified_workflow_run_id
-    ):
-        return result
-    if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
-        return result
-
-    copied_data = dict(data) if isinstance(data, dict) else {}
-    copied_data["failure_reason"] = outcome_unverified_reason
-    copied_data["completion_verification"] = (
-        completion_verification.to_trace_data() if completion_verification is not None else None
-    )
-    categories = copied_data.get("failure_categories")
-    copied_categories = list(categories) if isinstance(categories, list) else []
-    copied_categories.insert(
-        0,
-        {
-            "category": "OUTCOME_UNVERIFIED",
-            "confidence_float": 1.0,
-            "reasoning": outcome_unverified_reason,
-        },
-    )
-    copied_data["failure_categories"] = copied_categories
-    return {
-        **result,
-        "ok": False,
-        "error": outcome_unverified_reason,
-        "data": copied_data,
-    }
+def _stamp_turn_budget_on_result(copilot_ctx: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """Expose the remaining loop budget without interpreting the run result."""
+    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
+    return result
 
 
 def _emit_completion_verification_trace(
     copilot_ctx: Any, completion_verification: CompletionVerificationResult
 ) -> None:
-    block_count = getattr(copilot_ctx, "last_update_block_count", None)
-    policy = getattr(copilot_ctx, "request_policy", None)
-    contract = policy.completion_contract if policy is not None else None
-    heuristic_would_block = isinstance(block_count, int) and _goal_likely_needs_more_blocks(
-        getattr(copilot_ctx, "user_message", ""), block_count, contract
-    )
     trace_data = {
         **completion_verification.to_trace_data(),
-        "heuristic_would_block": heuristic_would_block,
         "evidence_block_present": _current_workflow_has_evidence_block(copilot_ctx),
-        "warrants_repair": _outcome_failure_warrants_repair(copilot_ctx, completion_verification),
     }
     LOG.info(
         "copilot completion verification",

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Skyvern Agent</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Skyvern Agent</h1>
+        <div class="status" aria-live="polite">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-label">Disconnected</span>
+        </div>
+      </header>
+
+      <section class="settings" aria-label="Agent settings">
+        <div class="settings-row">
+          <label for="pairing-token">Pairing token</label>
+          <div class="token-field">
+            <input
+              id="pairing-token"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button
+              id="pairing-token-visibility"
+              class="token-visibility"
+              type="button"
+              aria-label="Show pairing token"
+              aria-pressed="false"
+            >
+              <svg
+                class="eye-icon"
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              <svg
+                class="eye-off-icon"
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                hidden
+              >
+                <path d="m3 3 18 18" />
+                <path
+                  d="M10.6 5.2A11.4 11.4 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.1 3.2"
+                />
+                <path
+                  d="M6.2 6.2C3.5 8.1 2 12 2 12s3.5 7 10 7a10.7 10.7 0 0 0 4.1-.8"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <details id="advanced-settings" class="advanced-settings">
+          <summary>Advanced settings</summary>
+          <div class="settings-row advanced-settings-row">
+            <label for="bridge-port">Port</label>
+            <input
+              id="bridge-port"
+              type="number"
+              min="1"
+              max="65535"
+              inputmode="numeric"
+            />
+          </div>
+        </details>
+        <button id="connection-button" class="primary" type="button">
+          Connect
+        </button>
+        <p id="connection-error" class="message" role="alert"></p>
+      </section>
+
+      <section aria-labelledby="current-tab-title">
+        <h2 id="current-tab-title">Current tab</h2>
+        <button id="share-button" type="button">
+          Add to Skyvern Controlled
+        </button>
+        <p id="share-reason" class="message"></p>
+      </section>
+
+      <section aria-labelledby="shared-tabs-title">
+        <h2 id="shared-tabs-title">Skyvern Controlled tabs</h2>
+        <ul id="shared-tabs"></ul>
+        <p id="empty-tabs" class="muted">No tabs in Skyvern Controlled.</p>
+        <p class="tab-group-hint">
+          Tabs in the Skyvern Controlled group can be driven by Skyvern.
+        </p>
+      </section>
+
+      <section class="coming-soon" aria-labelledby="coming-soon-title">
+        <h2 id="coming-soon-title">Coming soon</h2>
+        <ul class="coming-soon-list" aria-disabled="true">
+          <li>
+            <span aria-hidden="true">🎬</span> Record actions → create workflows
+          </li>
+          <li><span aria-hidden="true">📋</span> Record SOPs</li>
+          <li><span aria-hidden="true">👤</span> Sync browser profiles</li>
+          <li>
+            <span aria-hidden="true">🔑</span> Push credentials to Skyvern
+          </li>
+        </ul>
+      </section>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

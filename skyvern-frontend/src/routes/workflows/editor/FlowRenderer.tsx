@@ -104,9 +104,11 @@ import {
   PANE_FIT_DEBOUNCE_MS,
   paneRecenterViewport,
   paneRefitDuration,
+  relayoutDriftCorrection,
   START_ANCHOR_MIN_ZOOM,
   startAnchoredViewport,
 } from "./paneFit";
+import { useBlockerExit } from "./useBlockerExit";
 import { WorkflowScopeContext } from "./WorkflowScopeContext";
 import { FitViewControl } from "./controls/FitViewControl";
 import { FlowJumpControls } from "./controls/FlowJumpControls";
@@ -751,8 +753,7 @@ function FlowRenderer({
       nextLocation.pathname !== currentLocation.pathname
     );
   });
-  const blockerRef = useRef(blocker);
-  blockerRef.current = blocker;
+  const blockerExit = useBlockerExit(blocker);
 
   // Studio-only: list what changed inside the leave/run unsaved-changes modal.
   // Memoized on the blocked state so it runs once when the modal opens (the
@@ -778,6 +779,7 @@ function FlowRenderer({
       const layoutedElements = layout(nodes, edges, targettedBlockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
+      return layoutedElements;
     },
     [setNodes, setEdges, targettedBlockLabel],
   );
@@ -791,7 +793,42 @@ function FlowRenderer({
       }
       isLayoutingRef.current = true;
       try {
-        doLayout(tempNodes, currentEdges);
+        // A collapse/expand toggle (loop/conditional header-resized) is the
+        // caller of this debounce; Dagre recomputes every node's x from
+        // scratch on any width change (workflowEditorUtils' layoutUtil), so
+        // a container's width change shifts every node uniformly under a
+        // viewport that didn't move. Counter-translate to cancel that
+        // shift, using the always-present, never-nested start node's own x
+        // as the anchor: the union bounding box's left edge is NOT a valid
+        // signal here, since Dagre renormalizes its coordinate space fresh
+        // each layout pass and that edge lands near the same value
+        // regardless of width changes elsewhere. Skipped while an explicit
+        // fit/jump is animating so the two don't fight.
+        const startBefore = tempNodes.find((node) => node.type === "start");
+        const layoutedElements = doLayout(tempNodes, currentEdges);
+        if (startBefore && !fitViewInProgressRef.current) {
+          const startAfter = layoutedElements.nodes.find(
+            (node) => node.id === startBefore.id,
+          );
+          if (startAfter) {
+            const corrected = relayoutDriftCorrection({
+              viewport: reactFlowInstance.getViewport(),
+              xBefore: startBefore.position.x,
+              xAfter: startAfter.position.x,
+            });
+            if (corrected) {
+              // Guard like runPaneRecenter/runFitView: debug mode's
+              // constrainPan reacts to onMove and would clamp x back to the
+              // lock on the animation's first frame without this.
+              const duration = paneRefitDuration();
+              fitViewInProgressRef.current = true;
+              reactFlowInstance.setViewport(corrected, { duration });
+              window.setTimeout(() => {
+                fitViewInProgressRef.current = false;
+              }, duration + 50);
+            }
+          }
+        }
       } finally {
         // Reset the flag after a short delay to allow React to flush updates
         requestAnimationFrame(() => {
@@ -2165,10 +2202,7 @@ function FlowRenderer({
           open={blocker.state === "blocked"}
           onOpenChange={(open) => {
             if (!open) {
-              const current = blockerRef.current;
-              if (current.state === "blocked") {
-                current.reset?.();
-              }
+              blockerExit.reset();
             }
           }}
         >
@@ -2185,10 +2219,7 @@ function FlowRenderer({
               <Button
                 variant="secondary"
                 onClick={() => {
-                  const current = blockerRef.current;
-                  if (current.state === "blocked") {
-                    current.proceed?.();
-                  }
+                  blockerExit.proceed();
                 }}
               >
                 Continue without saving
@@ -2196,9 +2227,8 @@ function FlowRenderer({
               <Button
                 onClick={() => {
                   handleSave().then((ok) => {
-                    const current = blockerRef.current;
-                    if (ok && current.state === "blocked") {
-                      current.proceed?.();
+                    if (ok) {
+                      blockerExit.proceed();
                     }
                   });
                 }}

@@ -245,10 +245,14 @@ class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    smtp_host_secret_parameter_key: str
-    smtp_port_secret_parameter_key: str
-    smtp_username_secret_parameter_key: str
-    smtp_password_secret_parameter_key: str
+    smtp_host_secret_parameter_key: typing.Optional[str] = None
+    smtp_port_secret_parameter_key: typing.Optional[str] = None
+    smtp_username_secret_parameter_key: typing.Optional[str] = None
+    smtp_password_secret_parameter_key: typing.Optional[str] = None
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str
@@ -474,11 +478,11 @@ class ForLoopBlockYamlLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
-    timeout_seconds: int
-    sender: str
+    timeout_seconds: typing.Optional[int] = None
+    sender: typing.Optional[str] = None
     recipients: typing.List[str]
-    subject: str
-    body: str
+    subject: typing.Optional[str] = None
+    body: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

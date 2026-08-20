@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
 
 pytestmark = pytest.mark.asyncio
@@ -95,6 +96,50 @@ async def _get(agent_db: AgentDB, ids: dict[str, str]) -> Any:
     )
     assert workflow is not None
     return workflow
+
+
+async def test_only_explicit_completion_contract_clear_skips_repository_carry(agent_db: AgentDB) -> None:
+    org = await agent_db.organizations.create_organization(
+        organization_name="Contract Clear Org",
+        domain="contract-clear.test",
+    )
+    contract = {
+        "schema_version": 1,
+        "criteria": [{"id": "download", "kind": "registered_download", "min_count": 1}],
+    }
+    workflow = await agent_db.workflows.create_workflow(
+        title="download",
+        workflow_definition={"parameters": [], "blocks": [], "completion_contract": contract},
+        organization_id=org.organization_id,
+    )
+
+    # Ordinary builders reconstruct this model without the Copilot field. The default must keep
+    # the stored obligation because omission is not deletion authority.
+    await agent_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+    )
+    carried = await agent_db.workflows.get_workflow(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+    )
+    assert carried is not None
+    assert carried.workflow_definition.completion_contract == contract
+
+    await agent_db.workflows.update_workflow_and_reconcile_definition_params(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        preserve_completion_contract=False,
+    )
+
+    updated = await agent_db.workflows.get_workflow(
+        workflow_id=workflow.workflow_id,
+        organization_id=org.organization_id,
+    )
+    assert updated is not None
+    assert updated.workflow_definition.completion_contract is None
 
 
 async def test_update_workflow_dispatch_state_if_latest_updates_current_version(agent_db: AgentDB) -> None:

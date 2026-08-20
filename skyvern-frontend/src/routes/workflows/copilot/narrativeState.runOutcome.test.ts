@@ -20,7 +20,6 @@ const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-06-10T00:00:00Z",
 });
 
@@ -97,8 +96,30 @@ describe("applyNarrativeEvent — run_outcome", () => {
       expect(b.outcomeReason).toBe(
         "The search stayed gated by a verification challenge.",
       );
+      expect(b.outcomeRole).toBe("recorded");
       expect(isBlockOk(b)).toBe(false);
     }
+    expect(s.lastRunOutcome?.role).toBe("recorded");
+    expect(notConfirmedOutcome(s)?.verdict).toBe("not_demonstrated");
+  });
+
+  it("interim verdict stays non-green but suppresses live not-confirmed alarms", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        role: "interim_build_test",
+        reason_code: "no_meaningful_output",
+        display_reason: "The workflow still needs its extraction block.",
+      }),
+    ]);
+
+    for (const b of s.blocks) {
+      expect(b.outcomeRole).toBe("interim_build_test");
+      expect(isBlockOk(b)).toBe(false);
+    }
+    expect(s.lastRunOutcome?.role).toBe("interim_build_test");
+    expect(notConfirmedOutcome(s)).toBeNull();
   });
 
   it("evaluating hold withholds the success affordance until the final frame", () => {
@@ -247,7 +268,6 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
   const payload = (blocks: Record<string, unknown>[]) => ({
     turnId: "turn-1",
     turnIndex: 0,
-    mode: "build",
     terminal: "response",
     terminalMessage: "Done.",
     startedAt: "2026-06-10T00:00:00Z",
@@ -255,13 +275,14 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     blocks,
   });
 
-  it("round-trips outcome/outcomeReason so reload renders like the live stream", () => {
+  it("round-trips outcome/outcomeReason/outcomeRole so reload renders like the live stream", () => {
     const live = reduce([
       turnStart(),
       blockProgress({ block_label: "search_person", status: "running" }),
       blockProgress({ block_label: "search_person", status: "completed" }),
       runOutcome({
         verdict: "not_demonstrated",
+        role: "interim_build_test",
         workflow_run_block_ids: ["wrb_search_person"],
         block_labels: ["search_person"],
         reason_code: "blocker_reported",
@@ -276,6 +297,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
         payloadBlock({
           outcome: "not_demonstrated",
           outcomeReason: "The search stayed gated by a verification challenge.",
+          outcomeRole: "interim_build_test",
         }),
       ]),
     )!;
@@ -284,8 +306,22 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(hydratedRow.state).toBe(liveRow.state);
     expect(hydratedRow.outcome).toBe(liveRow.outcome);
     expect(hydratedRow.outcomeReason).toBe(liveRow.outcomeReason);
+    expect(hydratedRow.outcomeRole).toBe(liveRow.outcomeRole);
     expect(isBlockOk(hydratedRow)).toBe(false);
     expect(isBlockOk(liveRow)).toBe(false);
+  });
+
+  it("round-trips a recorded outcome role across reload", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({
+          outcome: "not_evaluated",
+          outcomeRole: "recorded",
+        }),
+      ]),
+    )!;
+
+    expect(hydrated.blocks[0]?.outcomeRole).toBe("recorded");
   });
 
   it("hydrates rows without outcome keys exactly as before", () => {
@@ -293,6 +329,7 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     const row = hydrated.blocks[0]!;
     expect(row.outcome).toBeUndefined();
     expect(row.outcomeReason).toBeUndefined();
+    expect(row.outcomeRole).toBeUndefined();
     expect(isBlockOk(row)).toBe(true);
   });
 
@@ -303,7 +340,27 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     const row = hydrated.blocks[0]!;
     expect(row.outcome).toBeUndefined();
     expect(row.outcomeReason).toBeUndefined();
+    expect(row.outcomeRole).toBeUndefined();
     expect(isBlockOk(row)).toBe(true);
+  });
+
+  it("normalizes absent and unknown persisted roles to adjudicated", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({ outcome: "not_demonstrated" }),
+        payloadBlock({
+          label: "search_person_2",
+          outcome: "not_demonstrated",
+          outcomeRole: "future_role",
+        }),
+      ]),
+    )!;
+
+    expect(hydrated.blocks.map((block) => block.outcomeRole)).toEqual([
+      "adjudicated",
+      "adjudicated",
+    ]);
+    expect(notConfirmedOutcome(hydrated)?.verdict).toBe("not_demonstrated");
   });
 
   it("hydrate sweep promotes a stuck-running row without inventing a verdict", () => {
@@ -371,7 +428,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "demonstrated",
         displayReason: null,
-        activitySeqAtVerdict: 3,
       },
     });
     expect(outcome).toEqual({
@@ -409,7 +465,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Stale pointer.",
-        activitySeqAtVerdict: 1,
       },
     });
     expect(outcome).toBeNull();
@@ -422,7 +477,6 @@ describe("notConfirmedOutcome — envelope-first", () => {
       lastRunOutcome: {
         verdict: "not_demonstrated",
         displayReason: "Legacy pointer reason.",
-        activitySeqAtVerdict: 1,
       },
     });
     expect(outcome).toEqual({

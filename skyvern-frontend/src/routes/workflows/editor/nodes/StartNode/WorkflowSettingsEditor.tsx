@@ -37,6 +37,7 @@ import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfil
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { updateWorkflowBrowserSessionReuse } from "@/store/WorkflowSettingsStore";
 
 import { BrowserProfileSettingsSection } from "./BrowserProfileSettingsSection";
 
@@ -53,6 +54,9 @@ import {
 
 const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
   "Queues new runs of this agent until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
+
+const MASK_SECRETS_TOOLTIP =
+  "Mask secret values in this workflow's runs. Secrets are hidden while they are typed (screenshots, recordings, live browser view) and redacted from stored artifacts, network logs, and LLM prompts. Turning this on can make debugging harder because secret values are hidden.";
 
 const SEQUENTIAL_KEY_TOOLTIP =
   "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";
@@ -103,6 +107,7 @@ function WorkflowSettingsEditorBody({
   // copilot_authored is lineage-derived server-side — the current version's
   // created_by/edited_by get re-stamped by user saves and are not durable.
   const copilotAuthored = workflow?.copilot_authored === true;
+  const persistBrowserSessionEnabled = data.persistBrowserSession;
 
   const [localWebhookUrl, setLocalWebhookUrl] = useState(
     data.webhookCallbackUrl,
@@ -286,6 +291,17 @@ function WorkflowSettingsEditorBody({
       <div className="flex flex-col gap-4">
         <div className="space-y-2">
           <div className="flex items-center gap-2">
+            <Label>Mask Secrets</Label>
+            <HelpTooltip content={MASK_SECRETS_TOOLTIP} />
+            <Switch
+              className="ml-auto"
+              checked={data.maskSecrets}
+              onCheckedChange={(value) => update({ maskSecrets: value })}
+            />
+          </div>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
             <Label>Prevent Overlapping Runs</Label>
             <HelpTooltip content={PREVENT_OVERLAPPING_RUNS_TOOLTIP} />
             <Switch
@@ -322,13 +338,34 @@ function WorkflowSettingsEditorBody({
         )}
       </div>
       <div className="space-y-2">
+        <div className="flex items-start gap-4">
+          <div className="flex-1 space-y-1">
+            <Label>Reuse browser session</Label>
+            <HelpTooltip content="Consecutive runs of this workflow continue in one live browser — cookies, tabs, and logged-in state carry over. If the browser dies, the next run starts a fresh one from the saved profile. Turning this on also saves the browser profile. Without credentials, a profile key, or a sequential key, all runs share one browser and its signed-in state — treat the workflow as single-account." />
+            <p className="text-xs text-muted-foreground">
+              Consecutive runs continue in the same live browser.
+            </p>
+          </div>
+          <Switch
+            className="shrink-0"
+            checked={data.reuseBrowserSession}
+            onCheckedChange={(value) =>
+              updateWorkflowBrowserSessionReuse(
+                value,
+                data.persistBrowserSession,
+                update,
+              )
+            }
+          />
+        </div>
         {!browserMemoryEnabled && (
           <div className="flex items-center gap-2">
             <Label>Save &amp; reuse browser profile</Label>
             <HelpTooltip content="Persist session information across agent runs" />
             <Switch
               className="ml-auto"
-              checked={data.persistBrowserSession}
+              checked={persistBrowserSessionEnabled}
+              disabled={data.reuseBrowserSession}
               onCheckedChange={(value) =>
                 update({
                   persistBrowserSession: value,
@@ -347,7 +384,7 @@ function WorkflowSettingsEditorBody({
             agentName={workflow?.title ?? undefined}
           />
         )}
-        {!browserMemoryEnabled && data.persistBrowserSession && (
+        {!browserMemoryEnabled && persistBrowserSessionEnabled && (
           <div className="flex flex-col gap-3 rounded-md bg-slate-elevation4 p-4 pl-4">
             <div className="flex items-center gap-2">
               <Label>Keep Same IP Across Runs</Label>
@@ -399,7 +436,7 @@ function WorkflowSettingsEditorBody({
           </div>
         )}
         {!browserMemoryEnabled &&
-          data.persistBrowserSession &&
+          persistBrowserSessionEnabled &&
           workflowPermanentId && (
             <Dialog
               open={isResetProfileDialogOpen}

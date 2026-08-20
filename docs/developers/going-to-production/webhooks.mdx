@@ -14,6 +14,8 @@ keywords:
   - failure handling
 ---
 
+import WebhookSignatureVerification from "/snippets/webhook-signature-verification.mdx";
+
 Agents and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
 
 Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish. Webhooks fire only when a run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
@@ -259,119 +261,7 @@ User-Agent: python-httpx/0.28.1
 
 ## Optional: Verify webhook signatures
 
-Skyvern signs every webhook with your API key using HMAC-SHA256, so you can verify the request actually came from Skyvern before acting on it.
-
-**Headers sent with every webhook:**
-- `x-skyvern-signature`: HMAC-SHA256 signature of the payload
-- `x-skyvern-timestamp`: Unix timestamp when the webhook was sent
-- `Content-Type: application/json`
-
-<CodeGroup>
-```python Python
-import hmac
-import hashlib
-from fastapi import Request, HTTPException
-
-async def handle_webhook(request: Request):
-    signature = request.headers.get("x-skyvern-signature")
-    payload = await request.body()
-
-    expected = hmac.new(
-        SKYVERN_API_KEY.encode("utf-8"),
-        msg=payload,
-        digestmod=hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    data = await request.json()
-    # Process the webhook...
-```
-
-```typescript TypeScript
-import crypto from "crypto";
-import express from "express";
-
-app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
-  const signature = req.headers["x-skyvern-signature"];
-  const payload = req.body;
-
-  const expected = crypto
-    .createHmac("sha256", process.env.SKYVERN_API_KEY)
-    .update(payload)
-    .digest("hex");
-
-  // Use timing-safe comparison to prevent timing attacks
-  let valid = false;
-  try {
-    crypto.timingSafeEqual(
-      Buffer.from(signature || ''),
-      Buffer.from(expected)
-    );
-    valid = true;
-  } catch (err) {
-    valid = false;
-  }
-
-  if (!valid) {
-    return res.status(401).send("Invalid signature");
-  }
-
-  const data = JSON.parse(payload);
-  // Process the webhook...
-  res.status(200).send("OK");
-});
-```
-
-```go Go
-package main
-
-import (
-    "crypto/hmac"
-    "crypto/sha256"
-    "encoding/hex"
-    "io"
-    "net/http"
-    "os"
-)
-
-func webhookHandler(w http.ResponseWriter, r *http.Request) {
-    signature := r.Header.Get("x-skyvern-signature")
-    payload, err := io.ReadAll(r.Body)
-    if err != nil {
-        http.Error(w, "Failed to read request body", http.StatusBadRequest)
-        return
-    }
-
-    mac := hmac.New(sha256.New, []byte(os.Getenv("SKYVERN_API_KEY")))
-    mac.Write(payload)
-    expected := hex.EncodeToString(mac.Sum(nil))
-
-    if !hmac.Equal([]byte(signature), []byte(expected)) {
-        http.Error(w, "Invalid signature", http.StatusUnauthorized)
-        return
-    }
-
-    // Process the webhook...
-    w.WriteHeader(http.StatusOK)
-}
-```
-</CodeGroup>
-
-
-<Note>
-**Use constant-time comparison** to prevent timing attacks:
-- Python: `hmac.compare_digest()`
-- TypeScript: `crypto.timingSafeEqual()`
-- Go: `hmac.Equal()`
-
-Never use simple equality operators (`==` or `===`) for signature comparison as they are vulnerable to timing attacks.
-</Note>
-
-<Warning>
-**Always validate against the raw request body bytes.** Skyvern normalizes JSON before signing: it removes whitespace (using compact separators) and converts whole-number floats to integers (`3.0` becomes `3`). If you parse the JSON and re-serialize it, the byte representation will differ and signature validation will fail.
-</Warning>
+<WebhookSignatureVerification />
 
 ---
 

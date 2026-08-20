@@ -82,7 +82,7 @@ IMPORTANT RULES:
        - Put the credential ID in the default_value field, NOT in the key field
        - Reference the descriptive key in parameter_keys, NOT the credential ID
 
-    - If login fails with TOTP/2FA errors (including rate limiting), ask the user for a TOTP-enabled credential (e.g., cred_123)
+    - If login fails with TOTP/2FA errors (including rate limiting), offer two options: ask the user for a TOTP-enabled credential (e.g., cred_123), or use identifier-based OTP (`await otp("<email>")` in code mode, or `totp_identifier: <email>` in standard login block mode) if the org has an active Gmail or Outlook connection for that email address
 
 Note that user usually works with UI and not aware of YAML, avoid mentioning YAML in user-facing response.
 

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   act,
   cleanup,
@@ -114,6 +115,79 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: toastFn }));
 
+// Radix Popover + cmdk misbehave in jsdom; stub them so the picker's items are clickable buttons.
+// Unlike the card unit test's always-render stub, this one honors `open` and wires the trigger —
+// WorkflowCopilotHistory also renders a Popover whose (closed) content pulls react-query, so an
+// unconditional PopoverContent would force-mount it and crash with "No QueryClient".
+vi.mock("@/components/ui/popover", async () => {
+  const React = await import("react");
+  const OpenCtx = React.createContext<{
+    open: boolean;
+    setOpen: (value: boolean) => void;
+  }>({ open: false, setOpen: () => {} });
+  return {
+    Popover: ({
+      open,
+      onOpenChange,
+      children,
+    }: {
+      open?: boolean;
+      onOpenChange?: (value: boolean) => void;
+      children?: ReactNode;
+    }) => (
+      <OpenCtx.Provider
+        value={{ open: Boolean(open), setOpen: onOpenChange ?? (() => {}) }}
+      >
+        {children}
+      </OpenCtx.Provider>
+    ),
+    PopoverTrigger: ({ children }: { children?: ReactNode }) => {
+      const { open, setOpen } = React.useContext(OpenCtx);
+      return <div onClick={() => setOpen(!open)}>{children}</div>;
+    },
+    PopoverContent: ({ children }: { children?: ReactNode }) => {
+      const { open } = React.useContext(OpenCtx);
+      return open ? <div>{children}</div> : null;
+    },
+  };
+});
+vi.mock("@/components/ui/command", () => ({
+  Command: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  CommandInput: ({ placeholder }: { placeholder?: string }) => (
+    <input placeholder={placeholder} />
+  ),
+  CommandList: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  CommandEmpty: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
+  CommandGroup: ({
+    children,
+    heading,
+  }: {
+    children?: ReactNode;
+    heading?: string;
+  }) => (
+    <div>
+      {heading ? <div>{heading}</div> : null}
+      {children}
+    </div>
+  ),
+  CommandItem: ({
+    children,
+    onSelect,
+  }: {
+    children?: ReactNode;
+    onSelect?: () => void;
+    value?: string;
+  }) => (
+    <button type="button" onClick={() => onSelect?.()}>
+      {children}
+    </button>
+  ),
+}));
+
 // The real modal pulls react-query; a stub is enough to prove the connect →
 // modal → onCredentialCreated wiring.
 vi.mock("@/routes/credentials/CredentialsModal", () => ({
@@ -151,6 +225,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
@@ -268,6 +350,29 @@ const terminalPromptResponse = (turnId = "turn-9") => ({
   },
 });
 
+// A turn that silently auto-bound a credential (no ask): carries credentialAutoBound, no prompt/pause.
+const terminalAutoBoundResponse = (turnId = "turn-9") => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Signing in with your saved credential.",
+  updated_workflow: null,
+  response_time: "2026-07-13T00:00:05Z",
+  proposal_disposition: "no_proposal",
+  turn_id: turnId,
+  narrative_payload: {
+    turnId,
+    turnIndex: 0,
+    mode: "build",
+    responseType: "REPLY",
+    terminal: "response",
+    terminalMessage: "Signing in with your saved credential.",
+    narrativeSummary: "Signing in with your saved credential.",
+    startedAt: "2026-07-13T00:00:00Z",
+    endedAt: "2026-07-13T00:00:05Z",
+    credentialAutoBound: { credentialId: "cred_work", name: "Work login" },
+  },
+});
+
 // A pause that engaged but never sent a frame — no card should render.
 const terminalDeclinedResponse = (turnId = "turn-7") => ({
   type: "response",
@@ -296,6 +401,30 @@ const errorFrame = (turnId = "turn-1") => ({
   type: "error",
   error: "The turn failed.",
   turn_id: turnId,
+});
+
+// A continuation the user cancels: a terminal response flagged cancelled, which
+// flows through handleResponse (not the error path).
+const cancelledContinuationResponse = (turnId = "turn-10") => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Canceled.",
+  updated_workflow: null,
+  cancelled: true,
+  response_time: "2026-07-13T00:00:05Z",
+  proposal_disposition: "no_proposal",
+  turn_id: turnId,
+  narrative_payload: {
+    turnId,
+    turnIndex: 1,
+    mode: "build",
+    responseType: "REPLY",
+    terminal: "response",
+    terminalMessage: "Canceled.",
+    narrativeSummary: "Canceled.",
+    startedAt: "2026-07-13T00:00:00Z",
+    endedAt: "2026-07-13T00:00:05Z",
+  },
 });
 
 function credentialResponsePosts() {
@@ -399,9 +528,10 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
       streamCalls[0]!.onMessage(turnStart());
       streamCalls[0]!.onMessage(credentialFrame());
     });
-    const useButton = await screen.findByRole("button", {
-      name: /Use 'HN Login'/,
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
     });
+    const useButton = await screen.findByRole("button", { name: "HN Login" });
     await act(async () => {
       fireEvent.click(useButton);
     });
@@ -463,6 +593,45 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
       action: "connected",
       credential_id: "new-cred-1",
     });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the full org credential list on a pause ask (not just the frame's candidates) and answers via the typed POST", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred-abc", name: "abc", tested_url: null },
+      { credential_id: "cred-spare", name: "spare-portal", tested_url: null },
+      { credential_id: "cred-other", name: "unrelated", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({ credential_refs: ["cred-abc", "cred-spare"] }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    // The copilot suggestion (credential_refs) is pinned under "Suggested"; the full org list —
+    // including the credential NOT in credential_refs — stays below to override.
+    expect(await screen.findByText("Suggested")).toBeTruthy();
+    expect(screen.getByText("All credentials")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "abc" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "spare-portal" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "unrelated" })).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "spare-portal" }));
+    });
+    // The pick answers through the typed resume POST (which origin-binds), not a chat message.
+    await waitFor(() => expect(credentialResponsePosts()).toHaveLength(1));
+    expect(credentialResponsePosts()[0]![1]).toMatchObject({
+      action: "connected",
+      credential_id: "cred-spare",
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the card actionable, toasts, and never logs the raw error (resume_token leak) when the resume POST fails", async () => {
@@ -498,7 +667,7 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     errSpy.mockRestore();
   });
 
-  it("retries the credentials fetch on a later pause after a transient failure (no poisoned cache)", async () => {
+  it("degrades a pause ask to the Connect-credential CTA when the credentials fetch fails", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     credsFail.current = true;
@@ -512,16 +681,12 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await waitFor(() =>
       expect(credentialsGets().length).toBeGreaterThanOrEqual(1),
     );
-    const afterFailure = credentialsGets().length;
-    // A later pause frame must trigger a fresh fetch — caching [] on failure
-    // would have left credentialsList non-null and blocked all retries.
-    credsFail.current = false;
-    await act(async () => {
-      streamCalls[0]!.onMessage(credentialFrame({ turn_id: "turn-b" }));
-    });
-    await waitFor(() =>
-      expect(credentialsGets().length).toBeGreaterThan(afterFailure),
-    );
+    // Failed fetch → no picker (null, not a cached []); the Connect-credential CTA remains so the
+    // user can still create one, and the pause stays answerable.
+    expect(
+      await screen.findByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Use existing…")).toBeNull();
     errSpy.mockRestore();
   });
 
@@ -601,16 +766,136 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await act(async () => {
       fireEvent.click(createBtn);
     });
-    // A fresh turn is sent (exactly one) referencing the connected credential.
+    // A fresh turn is sent (exactly one) referencing the connected credential by id (the
+    // deterministic _explicit_credential_ids path), not by name.
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
-    expect(streamCalls[1]!.body.message).toContain(
-      "I've connected the credential 'New Login'",
-    );
+    expect(streamCalls[1]!.body.message).toContain("new-cred-1");
     expect(streamCalls[1]!.body.message).toContain("continue");
     expect(credentialResponsePosts()).toHaveLength(0);
     expect(
       await screen.findByText("Continuing with 'New Login'…"),
     ).toBeTruthy();
+  });
+
+  it("fetches the org credentials on a terminal ask and offers the picker", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    // The real card fetches /credentials and surfaces the searchable picker alongside the CTA.
+    expect(await screen.findByText("Use existing…")).toBeTruthy();
+    expect(apiGet).toHaveBeenCalledWith(
+      "/credentials",
+      expect.objectContaining({
+        params: { page: 1, page_size: 100, credential_type: "password" },
+      }),
+    );
+  });
+
+  it("restores the terminal picker when the auto-continue send fails", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    // Pick an existing credential from the terminal picker → the auto-continue send fires.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
+    // The continuation stream fails.
+    await act(async () => {
+      streamCalls[1]!.onMessage(turnStart("turn-10"));
+      streamCalls[1]!.onMessage(errorFrame("turn-10"));
+      streamCalls[1]!.resolve();
+    });
+    // The optimistic "connected" receipt is rolled back and the picker returns, even though the
+    // error message is now the tail — so the user can re-pick instead of hitting a dead end.
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+    // Re-picking from the restored picker actually resumes: a fresh continuation fires even though
+    // the stranded ask is no longer the literal tail.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(3));
+  });
+
+  it("restores the terminal picker when the auto-continue is cancelled", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_hn", name: "HN login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "HN login" }));
+    });
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("Continuing with 'HN login'…")).toBeTruthy();
+    // Cancelling the continuation (a cancelled terminal, not an error) must also roll the optimistic
+    // receipt back so it doesn't strand a permanent "Continuing…" with no continuation behind it.
+    await act(async () => {
+      streamCalls[1]!.onMessage(turnStart("turn-10"));
+      streamCalls[1]!.onMessage(cancelledContinuationResponse("turn-10"));
+      streamCalls[1]!.resolve();
+    });
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+    expect(screen.queryByText("Continuing with 'HN login'…")).toBeNull();
+  });
+
+  it("hides a stale terminal ask once it is no longer the last message", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("who am I signing in as?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalPromptResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+    // A new message makes the credential ask non-tail; its actionable card must disappear — picking
+    // on a stale card would only show a misleading receipt with no backend call.
+    await submit("actually, do something else");
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Connect credential" }),
+      ).toBeNull(),
+    );
   });
 
   it("does not auto-continue while a turn is still in flight", async () => {
@@ -677,6 +962,87 @@ describe("WorkflowCopilotChat — credential card wiring (flag on)", () => {
     await screen.findByTestId("mock-create-credential");
     expect(modalDefaultTestUrl.current).toBeUndefined();
   });
+
+  it("renders the auto-bind receipt from the credentialAutoBound signal", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+  });
+
+  it("Change re-picks through the existing terminal-continue path (no third path)", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    credentialsData.current = [
+      { credential_id: "cred_work", name: "Work login", tested_url: null },
+      {
+        credential_id: "cred_personal",
+        name: "Personal login",
+        tested_url: null,
+      },
+    ];
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(
+      await screen.findByText("Using credential 'Work login'"),
+    ).toBeTruthy();
+    // Open the Change picker and pick a different credential.
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Personal login" }),
+      );
+    });
+    // A fresh turn fires referencing the picked credential by id (the deterministic continue path),
+    // and NOT a typed credential-response POST — the same path a terminal ask pick uses.
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(streamCalls[1]!.body.message).toContain("cred_personal");
+    expect(streamCalls[1]!.body.message).toContain("continue");
+    expect(credentialResponsePosts()).toHaveLength(0);
+    expect(
+      await screen.findByText("Continuing with 'Personal login'…"),
+    ).toBeTruthy();
+  });
+
+  it("defers the auto-bind receipt to a co-occurring credential ask", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await submit("sign in to both sites");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const base = terminalAutoBoundResponse("turn-9");
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage({
+        ...base,
+        narrative_payload: {
+          ...base.narrative_payload,
+          credentialPrompt: { reason: "credential_name_unresolved" },
+        },
+      });
+      streamCalls[0]!.resolve();
+    });
+    // The credential ask owns this turn's credential UI and its credentialResolutions entry; the
+    // auto-bind receipt defers so it can't adopt the ask's resolution.
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Connect credential" }),
+    ).toBeTruthy();
+  });
 });
 
 describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
@@ -692,5 +1058,143 @@ describe("WorkflowCopilotChat — credential card (flag off parity)", () => {
     expect(
       screen.queryByRole("button", { name: "Connect credential" }),
     ).toBeNull();
+  });
+
+  it("renders no auto-bind receipt with the flag off", async () => {
+    await renderChat();
+    await submit("sign in and grab my dashboard");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart("turn-9"));
+      streamCalls[0]!.onMessage(terminalAutoBoundResponse("turn-9"));
+      streamCalls[0]!.resolve();
+    });
+    expect(screen.queryByText(/Using credential/)).toBeNull();
+  });
+});
+
+describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
+  const autoBoundResponse = (
+    turnId: string,
+    turnIndex: number,
+    message: string,
+  ) => {
+    const response = terminalAutoBoundResponse(turnId);
+    return {
+      ...response,
+      message,
+      narrative_payload: {
+        ...response.narrative_payload,
+        turnIndex,
+        terminalMessage: message,
+        narrativeSummary: message,
+        credentialAutoBound: {
+          credentialId: "cred_acme_test",
+          name: "acme-test",
+        },
+      },
+    };
+  };
+
+  const historyMessage = (
+    turnId: string,
+    turnIndex: number,
+    message: string,
+  ) => {
+    const response = autoBoundResponse(turnId, turnIndex, message);
+    return {
+      sender: "ai" as const,
+      content: message,
+      created_at: response.response_time,
+      narrative_payload: response.narrative_payload,
+      turn_outcome: null,
+    };
+  };
+
+  async function completeAutoBoundTurn(
+    callIndex: number,
+    turnId: string,
+    message: string,
+  ) {
+    await submit(`prompt ${callIndex + 1}`);
+    await waitFor(() =>
+      expect(postStreaming).toHaveBeenCalledTimes(callIndex + 1),
+    );
+    await act(async () => {
+      streamCalls[callIndex]!.onMessage(turnStart(turnId));
+      streamCalls[callIndex]!.onMessage(
+        autoBoundResponse(turnId, callIndex, message),
+      );
+      streamCalls[callIndex]!.resolve();
+    });
+  }
+
+  it("keeps a repeated live receipt on the first turn", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await completeAutoBoundTurn(0, "turn-chronology-1", "First turn complete.");
+    await completeAutoBoundTurn(
+      1,
+      "turn-chronology-2",
+      "Second turn complete.",
+    );
+
+    const receipts = screen.getAllByText("Using credential 'acme-test'");
+    expect(receipts).toHaveLength(1);
+    expect(
+      screen
+        .getByText("First turn complete.")
+        .closest('[role="status"]')
+        ?.contains(receipts[0]!),
+    ).toBe(true);
+    expect(
+      screen
+        .getByText("Second turn complete.")
+        .closest('[role="status"]')
+        ?.contains(receipts[0]!),
+    ).toBe(false);
+  });
+
+  it("keeps the surviving scrollback receipt read-only", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+    await completeAutoBoundTurn(0, "turn-readonly-1", "First turn complete.");
+    expect(await screen.findByRole("button", { name: "Change" })).toBeTruthy();
+
+    await completeAutoBoundTurn(1, "turn-readonly-2", "Second turn complete.");
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Change" })).toBeNull(),
+    );
+  });
+
+  it("hydrates one receipt at the first persisted position", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    historyResponse.data.chat_history = [
+      historyMessage("turn-history-1", 0, "First persisted turn."),
+      historyMessage("turn-history-2", 1, "Second persisted turn."),
+    ];
+
+    await renderChat();
+    await waitFor(() =>
+      expect(
+        screen.queryAllByText("Using credential 'acme-test'"),
+      ).toHaveLength(1),
+    );
+
+    const receipt = screen.getByText("Using credential 'acme-test'");
+    expect(
+      screen
+        .getByText("First persisted turn.")
+        .closest('[role="status"]')
+        ?.contains(receipt),
+    ).toBe(true);
+    expect(
+      screen
+        .getByText("Second persisted turn.")
+        .closest('[role="status"]')
+        ?.contains(receipt),
+    ).toBe(false);
+    expect(screen.queryByRole("button", { name: "Change" })).toBeNull();
+    expect(credentialsGets()).toHaveLength(0);
   });
 });

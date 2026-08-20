@@ -181,6 +181,8 @@
             "pages": [
               "developers/optimization/browser-sessions",
               "developers/optimization/browser-profiles",
+              "developers/optimization/browser-tunneling",
+              "developers/optimization/chrome-extension",
               "developers/optimization/cost-control"
             ]
           },
@@ -392,7 +394,10 @@
     "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode", "mcp"]
   },
   "seo": {
-    "indexing": "navigable"
+    "indexing": "navigable",
+    "metatags": {
+      "canonical": "https://www.skyvern.com/docs"
+    }
   },
   "css": "/style.css",
   "api": {

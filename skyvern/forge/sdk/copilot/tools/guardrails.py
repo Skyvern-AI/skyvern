@@ -7,42 +7,21 @@ from typing import Any
 import structlog
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
-from skyvern.forge.sdk.copilot.blocker_signal import BlockerKind, CopilotToolBlockerSignal, RecoveryHint
-from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+from skyvern.forge.sdk.copilot.author_time_block import CREDENTIAL_SCOUT_BLOCK_ID, AuthorTimeBlock
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import (
-    composition_page_evidence_error,
-    turn_has_scout_interaction,
-    workflow_target_url,
-)
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.credential_literal_rebind import (
-    CredentialRebindResult,
-    rebind_scouted_credential_literals,
-    scouted_credential_targets,
-)
-from skyvern.forge.sdk.copilot.enforcement import _record_code_authoring_guardrail_reject
-from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyReason,
     OutputPolicyVerdict,
+    demote_author_time_steer_reasons,
     evaluate_output_policy,
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget, code_is_download_intent
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.copilot.turn_intent import (
-    NO_MUTATION_TURN_INTENT_MODES,
-    READ_CONTEXT_DENIED_MODES,
-    UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
-    TurnIntent,
-    TurnIntentMode,
-)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -51,16 +30,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
-from ._shared import (
-    ANSWER_ONLY_CONTEXT_TOOLS,
-    BLOCK_RUNNING_TOOLS,
-    CREDENTIAL_METADATA_TOOLS,
-    PAGE_SCHEMA_CONTEXT_TOOLS,
-    WORKFLOW_MUTATION_TOOLS,
-    _emit_tool_blocker_signal,
-    _workflow_yaml_blocks_by_label,
-)
-from .banned_blocks import _copilot_block_authoring_policy
+from ._shared import _emit_tool_blocker_signal
 
 LOG = structlog.get_logger()
 
@@ -87,123 +57,52 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     workflow_yaml_value = tool_arguments.get("workflow_yaml")
     workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
 
-    rebind_result = _rebind_scouted_credential_literals_in_place(tool_context, tool_arguments, workflow_yaml)
-    applied = rebind_result is not None and rebind_result.changed
-    effective_yaml = rebind_result.workflow_yaml if rebind_result is not None and applied else workflow_yaml
-    _log_credential_authoring_skips(tool_context, rebind_result)
+    effective_yaml = workflow_yaml
 
     verdict = evaluate_output_policy(
         request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
         workflow_yaml=effective_yaml,
         tool_arguments=tool_arguments or raw_arguments,
     )
-    # The credential here is the user's own, bound for the site they named, inside their own workflow,
-    # so a raw value on an authoring argument is not grounds to kill the turn. Enforcement for it lives
-    # at the log seam (`redact_registered_secrets`) and the persistence seam; final-output surfaces
-    # still hard-block on RAW_SECRET_LEAK via `_FINAL_OUTPUT_HARD_BLOCK_REASONS`.
-    verdict.remove(OutputPolicyReason.RAW_SECRET_LEAK)
+    steered_reasons = demote_author_time_steer_reasons(verdict)
     trace_data = output_policy_verdict_to_trace_data(
         verdict,
         surface="tool_input",
         tool_name=getattr(tool_context, "tool_name", None),
     )
-    residual_selectors = rebind_result.residual_selectors if rebind_result is not None else ()
-    if verdict.allowed and residual_selectors:
-        # The rebind could not bind these selectors to a parameter. That used to reject the turn; the
-        # persistence seam now redacts anything still carrying a credential, so surface it and continue.
-        trace_data = {**trace_data, "residual_raw_credential_fill_selectors": list(residual_selectors)}
-        LOG.warning("copilot output policy credential residual raw fill admitted", **trace_data)
+    if steered_reasons:
+        trace_data = {**trace_data, "steered_reason_codes": [reason.value for reason in steered_reasons]}
     if verdict.allowed:
-        if applied and rebind_result is not None:
-            trace_data = {
-                **trace_data,
-                "credential_literals_rebound": True,
-                "authored_credential_fills": [list(pair) for pair in rebind_result.authored],
-            }
-            LOG.info("copilot output policy rebound scouted credential literals", **trace_data)
-        else:
-            LOG.info("copilot output policy tool guardrail verdict", **trace_data)
+        LOG.info("copilot output policy tool guardrail verdict", **trace_data)
         return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
     LOG.info("copilot output policy tool guardrail verdict", **trace_data)
-    error = format_output_policy_tool_error(verdict)
+    block = AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=format_output_policy_tool_error(verdict))
+    trace_data = {**trace_data, "block_id": block.block_id}
     tool_name = getattr(tool_context, "tool_name", None)
-    copilot_ctx = getattr(tool_context, "context", None)
     if isinstance(tool_name, str) and tool_name:
-        record_consecutive_tool_result_boundary_for_ctx(
-            copilot_ctx,
-            tool_name,
-            {"ok": False, "error": error},
-            arguments=tool_arguments,
+        _record_output_policy_guardrail_outcome(
+            getattr(tool_context, "context", None), tool_name, effective_yaml, verdict
         )
-        _record_output_policy_guardrail_churn(copilot_ctx, tool_name, effective_yaml, verdict)
-    return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
+    return _guardrail_block(tool_context, tool_arguments, block, trace_data)
 
 
-def _rebind_scouted_credential_literals_in_place(
-    tool_context: Any, tool_arguments: dict[str, Any], workflow_yaml: str | None
-) -> CredentialRebindResult | None:
-    """Rewrite scouted credential literals to parameter access and author missing sanctioned credential
-    fills into ``tool_context.tool_call.arguments`` before the output policy runs. Returns the full result
-    (None only without an ``AgentContext``); a changed result is downgraded to ``changed=False`` when no
-    tool_call is present or the write-back fails, so the clamp fails closed while skips still surface."""
-    ctx = getattr(tool_context, "context", None)
-    if not isinstance(ctx, AgentContext):
-        return None
-    result = rebind_scouted_credential_literals(workflow_yaml, ctx.scout_trajectory)
-    if not result.changed:
-        return result
-    tool_call = getattr(tool_context, "tool_call", None)
-    if tool_call is None:
-        LOG.warning("copilot rebound credential yaml has no tool_call to persist through; failing closed")
-        return _unapplied_rebind_result(result, workflow_yaml)
-    tool_arguments["workflow_yaml"] = result.workflow_yaml
-    try:
-        rebound_arguments = json.dumps(tool_arguments)
-        tool_call.arguments = rebound_arguments
-        tool_context.tool_arguments = rebound_arguments
-    except (AttributeError, TypeError, ValueError):
-        LOG.warning("copilot rebound credential yaml could not be written back to tool arguments")
-        tool_arguments["workflow_yaml"] = workflow_yaml
-        return _unapplied_rebind_result(result, workflow_yaml)
-    return result
+def _guardrail_block(
+    tool_context: Any,
+    tool_arguments: dict[str, Any],
+    block: AuthorTimeBlock,
+    trace_data: dict[str, Any],
+) -> ToolGuardrailFunctionOutput:
+    """The tool-input half of the author-time decision point: only an ``AuthorTimeBlock``
+    turns a guardrail verdict into a rejection the model cannot author past."""
+    return ToolGuardrailFunctionOutput.reject_content(block.error, output_info=trace_data)
 
 
-def _unapplied_rebind_result(result: CredentialRebindResult, workflow_yaml: str | None) -> CredentialRebindResult:
-    return CredentialRebindResult(
-        workflow_yaml=workflow_yaml or "",
-        changed=False,
-        rebound=(),
-        skips=result.skips,
-        residual_selectors=result.residual_selectors,
-    )
-
-
-def _log_credential_authoring_skips(tool_context: Any, result: CredentialRebindResult | None) -> None:
-    if result is None or not result.skips:
-        return
-    ctx = getattr(tool_context, "context", None)
-    targets_present = (
-        len(scouted_credential_targets(ctx.scout_trajectory)) if isinstance(ctx, AgentContext) else len(result.skips)
-    )
-    tool_name = getattr(tool_context, "tool_name", None)
-    for skip in result.skips:
-        LOG.info(
-            "copilot output policy credential authoring skipped",
-            tool_name=tool_name,
-            stage=skip.stage,
-            selector=skip.selector,
-            targets_present=targets_present,
-        )
-
-
-def _record_output_policy_guardrail_churn(
+def _record_output_policy_guardrail_outcome(
     ctx: object, tool_name: str, workflow_yaml: str | None, verdict: OutputPolicyVerdict
 ) -> None:
     if not isinstance(ctx, AgentContext):
         return
     reason_code_set = frozenset(reason.value for reason in verdict.reason_codes)
-    previous_reason_codes = ctx.last_output_policy_reject_reason_codes
-    frontier_unchanged = previous_reason_codes is not None and previous_reason_codes == reason_code_set
     structural_payload = {
         "surface": "output_policy_tool_input",
         "tool": tool_name,
@@ -218,12 +117,6 @@ def _record_output_policy_guardrail_churn(
             structural_payload=structural_payload,
         ),
     )
-    _record_code_authoring_guardrail_reject(
-        ctx,
-        defer_churn_stop=True,
-        frontier_unchanged=frontier_unchanged,
-        output_policy_reason_codes=reason_code_set,
-    )
 
 
 _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
@@ -231,582 +124,70 @@ _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
     name="workflow_yaml_output_policy_guardrail",
 )
 
-_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA = {
-    "surface": "tool_pre_side_effect",
-    "tool_name": "update_and_run_blocks",
-    "reason": "composition_page_evidence",
-}
 
-
-def _update_and_run_blocks_composition_evidence_precheck(
-    copilot_ctx: Any,
-    workflow_yaml: str | None,
-    normalized_block_observation_refs: dict[str, int],
-    raw_block_observation_refs: Any,
-) -> str | None:
-    if copilot_ctx is None or workflow_yaml is None:
-        LOG.warning(
-            "update_and_run_blocks composition evidence precheck missing context or workflow yaml",
-            has_context=copilot_ctx is not None,
-            has_workflow_yaml=workflow_yaml is not None,
-        )
-        return None
-
-    evidence_error = composition_page_evidence_error(
-        copilot_ctx,
-        workflow_yaml,
-        block_observation_refs=normalized_block_observation_refs,
-        raw_block_observation_refs=raw_block_observation_refs,
-    )
-
-    if evidence_error:
-        LOG.info(
-            "copilot composition page evidence pre-side-effect rejected workflow",
-            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
-            target_url=workflow_target_url(workflow_yaml),
-            surface="tool_pre_side_effect",
-        )
-        return evidence_error
-
-    return None
-
-
-_DOWNLOAD_SCOUT_REQUIRED_STEERING = (
-    "This block downloads a file, and the terminal download step is compiled from the observed "
-    "download affordance. Scout it first: reach the page that exposes the download control and "
-    "call skyvern_evaluate to observe it (skyvern_evaluate cannot click — use the click tool to "
-    "act), then re-author the block. The terminal download step will be compiled for you from the "
-    "observed target, so you do not author the expect_download idiom yourself."
-)
-# After this many scout-act rejections in a turn, stop blocking and let the model halt honestly: a
-# download whose affordance the scout never resolves is not authorable, so looping author->scout
-# wastes turns. A genuinely scoutable download clears the gate on the first re-author.
-_DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS = 3
-_DOWNLOAD_SCOUT_UNREACHABLE_HALT = (
-    "Repeated scout-acts did not resolve a single download affordance on this page, so the download "
-    "step cannot be compiled. Tell the user you could not locate the download control and ask them to "
-    "confirm where the file downloads from; do not author a hand-rolled download block."
-)
-
-
-def _download_intent_block_labels(workflow_yaml: str | None) -> list[str]:
-    labels: list[str] = []
-    for label, block in _workflow_yaml_blocks_by_label(workflow_yaml).items():
-        if block.get("block_type") != "code":
-            continue
-        code = block.get("code")
-        if isinstance(code, str) and code_is_download_intent(code):
-            labels.append(label)
-    return labels
-
-
-def _has_reached_download_target(ctx: Any) -> bool:
-    target = getattr(ctx, "reached_download_target", None)
-    if not isinstance(target, ReachedDownloadTarget):
-        return False
-    return target.already_registered or bool(target.selector.strip())
-
-
-def _request_policy_allows_untested_code_block_draft(ctx: Any) -> bool:
-    policy = getattr(ctx, "request_policy", None)
-    return (
-        getattr(ctx, "allow_untested_workflow_draft", False) is True
-        and isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.testing_intent == "skip_test"
-        and policy.allow_missing_credentials_in_draft
-        and policy.credential_draft_deferred_explicitly
-    )
-
-
-def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) -> str | None:
-    """Reject authoring a download-intent code block until the affordance has been scout-acted
-    this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
-    synthesizer can compile the terminal download step. Active in code-only browser mode."""
-    if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if copilot_ctx is None or workflow_yaml is None:
-        return None
-    download_labels = _download_intent_block_labels(workflow_yaml)
-    if not download_labels:
-        return None
-    if _request_policy_allows_untested_code_block_draft(copilot_ctx):
-        LOG.info(
-            "copilot download scout-act gate skipped for untested credential draft",
-            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
-            download_intent_block_labels=download_labels,
-            surface="tool_pre_side_effect",
-        )
-        return None
-    if _has_reached_download_target(copilot_ctx):
-        return None
-    if turn_has_scout_interaction(copilot_ctx):
-        return None
-    prior_rejections = int(getattr(copilot_ctx, "download_scout_required_rejections", 0) or 0)
-    if prior_rejections >= _DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS:
-        LOG.info(
-            "copilot download scout-act gate exhausted retries; halting honestly",
-            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
-            download_intent_block_labels=download_labels,
-            download_scout_required_rejections=prior_rejections,
-            surface="tool_pre_side_effect",
-        )
-        return _DOWNLOAD_SCOUT_UNREACHABLE_HALT
-    if hasattr(copilot_ctx, "download_scout_required_rejections"):
-        copilot_ctx.download_scout_required_rejections = prior_rejections + 1
-    LOG.info(
-        "copilot download scout-act pre-side-effect rejected workflow",
-        workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
-        download_intent_block_labels=download_labels,
-        download_scout_required_rejections=prior_rejections + 1,
-        surface="tool_pre_side_effect",
-    )
-    return _DOWNLOAD_SCOUT_REQUIRED_STEERING
-
-
-def _submitted_code_blocks(workflow_yaml: str | None) -> list[str]:
-    codes: list[str] = []
-    for block in _workflow_yaml_blocks_by_label(workflow_yaml).values():
-        if block.get("block_type") != "code":
-            continue
-        code = block.get("code")
-        if isinstance(code, str):
-            codes.append(code)
-    return codes
-
-
-_DOWNLOAD_BINDING_REQUIRED_STEERING = (
-    "A correct scout-act reached a download affordance on the current page, but the authored block "
-    "does not fire the browser download. Author ONE terminal download code block that clicks the "
-    "captured target with the expect_download idiom; the captured selector is `{selector}`"
-    "{affordance_hint}. The terminal download step is compiled for you when you scout-act the "
-    "affordance, so re-author the block against the reached target rather than a static fetch."
-)
-_DOWNLOAD_BINDING_UNREACHABLE_HALT = (
-    "The reached download affordance could not be bound to a terminal download step after repeated "
-    "attempts. Tell the user you reached the download control but could not author the download step, "
-    "and ask them to confirm where the file downloads from; do not author a download-less block."
-)
-
-
-def _download_binding_required_error(ctx: AgentContext | None, workflow_yaml: str | None) -> str | None:
-    """Reject a code block authored after the scout reached a download affordance when that block does
-    not fire the browser download. Keyed on the typed `ctx.reached_download_target` the model cannot
-    edit, not on the submitted code form. Active in code-only browser mode."""
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        return None
-    if ctx is None or workflow_yaml is None:
-        return None
-    target = getattr(ctx, "reached_download_target", None)
-    if not isinstance(target, ReachedDownloadTarget) or target.already_registered:
-        return None
-    if any(code_is_download_intent(code) for code in _submitted_code_blocks(workflow_yaml)):
-        return None
-    # Shared per-turn download-steering budget: this gate and _download_scout_required_error draw down the
-    # same ctx.download_scout_required_rejections counter (combined cap, not 3 per gate).
-    prior_rejections = int(getattr(ctx, "download_scout_required_rejections", 0) or 0)
-    if prior_rejections >= _DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS:
-        LOG.info(
-            "copilot download binding gate exhausted retries; halting honestly",
-            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
-            reached_download_selector=target.selector,
-            download_scout_required_rejections=prior_rejections,
-            surface="tool_pre_side_effect",
-        )
-        return _DOWNLOAD_BINDING_UNREACHABLE_HALT
-    if hasattr(ctx, "download_scout_required_rejections"):
-        ctx.download_scout_required_rejections = prior_rejections + 1
-    LOG.info(
-        "copilot download binding pre-side-effect rejected workflow",
-        workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
-        reached_download_selector=target.selector,
-        download_scout_required_rejections=prior_rejections + 1,
-        surface="tool_pre_side_effect",
-    )
-    affordance_hint = f" (affordance text: {target.affordance_text})" if target.affordance_text else ""
-    return _DOWNLOAD_BINDING_REQUIRED_STEERING.format(selector=target.selector, affordance_hint=affordance_hint)
-
-
-def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
+def _credential_deferred_draft_requires_skipped_run(ctx: AgentContext) -> bool:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):
-        return None
-
-    agent_steering: str | None = None
-    user_facing: str | None = None
-    reason_code: str | None = None
-    recovery_hint: RecoveryHint = "report_blocker_to_user"
-    cleared_by: frozenset[str] = frozenset()
-
-    if tool_name == "update_workflow" and not policy.allow_update_workflow:
-        reason_code = "request_policy_blocks_update_workflow"
-        agent_steering = (
-            "Request policy blocks workflow updates for the latest user message. "
-            "Ask the user for safe stored credential metadata instead."
-        )
-        user_facing = "I need stored credential metadata before I can update this workflow."
-        recovery_hint = "ask_user_clarifying"
-    elif tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
-        if policy.testing_intent == "skip_test":
-            reason_code = "request_policy_blocks_run_blocks_skip_test"
-            agent_steering = (
-                "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
-            )
-            user_facing = "I'll save this as an untested draft because the request asked me not to run it."
-            recovery_hint = "retry_with_different_tool"
-            cleared_by = frozenset({"update_workflow"})
-        elif policy.clarification_reason == "workflow_credential_inputs_unbound":
-            reason_code = "request_policy_blocks_run_blocks_credential_unbound"
-            agent_steering = (
-                "Skipped test run: the existing workflow references credential parameters "
-                "whose keys point to workflow inputs that are not configured. REPLY to the user "
-                "with: 'I applied your requested change. I couldn't test the modified workflow "
-                "because I couldn't find the required credentials — please add them via the "
-                "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
-            )
-            user_facing = (
-                "I applied your requested change. I couldn't test the modified workflow because "
-                "the required credentials aren't set up. Add them in the Credentials UI and ask "
-                "me to test it."
-            )
-            recovery_hint = "report_blocker_to_user"
-        else:
-            reason_code = "request_policy_blocks_run_blocks_generic"
-            agent_steering = (
-                "Request policy blocks block-running tools for the latest user message. "
-                "Ask the user for the required safe credential or clarification before testing."
-            )
-            user_facing = "I need a credential or clarification from you before I can test this workflow."
-            recovery_hint = "ask_user_clarifying"
-
-    if reason_code is None or agent_steering is None or user_facing is None:
-        return None
-
-    LOG.info(
-        "copilot authority gate evaluated tool",
-        authority_gate_layer="request_policy",
-        blocked_tool=tool_name,
-        request_policy_allow_update_workflow=policy.allow_update_workflow,
-        request_policy_allow_run_blocks=policy.allow_run_blocks,
-        request_policy_testing_intent=policy.testing_intent,
-        request_policy_clarification_reason=policy.clarification_reason,
-        safe_reason_code=reason_code,
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="authority_denied",
-        agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
-        recovery_hint=recovery_hint,
-        cleared_by_tools=cleared_by,
-        internal_reason_code=reason_code,
-        blocked_tool=tool_name,
-    )
-
-
-def _request_policy_allows_credential_deferred_draft(ctx: AgentContext) -> bool:
-    policy = getattr(ctx, "request_policy", None)
-    return (
-        isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.allow_missing_credentials_in_draft
-        and policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
-    )
-
-
-def _request_policy_allows_update_and_skip_run(ctx: AgentContext, tool_name: str) -> bool:
-    return tool_name == "update_and_run_blocks" and _request_policy_allows_credential_deferred_draft(ctx)
-
-
-def _turn_intent_has_edit_target(intent: TurnIntent) -> bool:
-    # Keep this aligned with TurnIntent target kinds that make an edit specific enough to mutate safely.
-    if any(
-        intent.target_entities.get(entity_type)
-        for entity_type in (
-            "block",
-            "run",
-            "proposed_workflow",
-            "latest_assistant_proposal",
-            "proposal",
-            "workflow_change",
-        )
-    ):
+        return False
+    if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
         return True
-    return any(target != "current_workflow" for target in intent.target_entities.get("workflow", []))
-
-
-def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
-    intent = getattr(ctx, "turn_intent", None)
-    if not isinstance(intent, TurnIntent):
-        return None
-
-    authority = intent.authority
-    unresolved_refs = intent.target_entities.get(UNRESOLVED_BLOCK_REF_TARGET_ENTITY, [])
-    if intent.mode == TurnIntentMode.EDIT and tool_name in WORKFLOW_MUTATION_TOOLS and unresolved_refs:
-        reason_code = "turn_intent_unresolved_edit_target"
-        labels = sorted(_workflow_yaml_blocks_by_label(getattr(ctx, "workflow_yaml", None)))
-        label_hint = ", ".join(labels[:8]) if labels else "no labeled blocks"
-        LOG.info(
-            "copilot authority gate evaluated tool",
-            authority_gate_layer="turn_intent",
-            turn_intent_mode=intent.mode.value,
-            turn_intent_target_entity_types=sorted(intent.target_entities),
-            turn_intent_unresolved_refs=unresolved_refs,
-            blocked_tool=tool_name,
-            safe_reason_code=reason_code,
-        )
-        unresolved_str = ", ".join(unresolved_refs)
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                f"The latest user message references workflow/block identifier(s) that are not present in the "
-                f"current workflow: {unresolved_str}. Current workflow labels include: {label_hint}. Ask the user "
-                f"which current block should change before mutating or running blocks."
-            ),
-            user_facing_reason=(
-                f"I couldn't find the block(s) you mentioned ({unresolved_str}). "
-                f"Tell me which existing block to change."
-            ),
-            recovery_hint="ask_user_clarifying",
-        )
-
-    if (
-        intent.mode == TurnIntentMode.EDIT
-        and tool_name in WORKFLOW_MUTATION_TOOLS
-        and not _turn_intent_has_edit_target(intent)
-    ):
-        reason_code = "turn_intent_missing_edit_target"
-        LOG.info(
-            "copilot authority gate evaluated tool",
-            authority_gate_layer="turn_intent",
-            turn_intent_mode=intent.mode.value,
-            turn_intent_target_entity_types=sorted(intent.target_entities),
-            blocked_tool=tool_name,
-            safe_reason_code=reason_code,
-        )
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                "Could not identify a specific workflow edit target. Ask the user which workflow/block should "
-                "change before mutating."
-            ),
-            user_facing_reason="Tell me which block or workflow you'd like me to change.",
-            recovery_hint="ask_user_clarifying",
-        )
-
-    blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
-    blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
-    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and (
-        intent.mode in NO_MUTATION_TURN_INTENT_MODES or not authority.may_update_workflow
-    )
-    blocks_credential_metadata = tool_name in CREDENTIAL_METADATA_TOOLS and not (
-        authority.may_update_workflow or authority.may_run_blocks
-    )
-    # Two paths grant read access to ANSWER_ONLY_CONTEXT_TOOLS, both excluded for DOCS_ANSWER/REFUSE/CLARIFY:
-    #  (1) authority.may_read_run_context — classifier-derived (DIAGNOSE turns)
-    #  (2) pending_reconciliation_run_id — within-turn override anchored to the run-blocks watchdog
-    may_read_run_context = authority.may_read_run_context and intent.mode not in READ_CONTEXT_DENIED_MODES
-    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS and not may_read_run_context
-
-    within_turn_read_override = False
-    if blocks_context_read and intent.mode not in READ_CONTEXT_DENIED_MODES:
-        pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
-        if isinstance(pending_run_id, str) and pending_run_id:
-            blocks_context_read = False
-            within_turn_read_override = True
-        else:
-            same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None) or getattr(
-                ctx,
-                "last_run_blocks_workflow_run_id",
-                None,
-            )
-            if isinstance(same_turn_run_id, str) and same_turn_run_id:
-                blocks_context_read = False
-                within_turn_read_override = True
-
-    if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
-        return None
-    if (
-        not blocks_update
-        and not blocks_run
-        and not blocks_context_read
-        and not blocks_page_inspection
-        and not blocks_credential_metadata
-    ):
-        if within_turn_read_override:
-            LOG.info(
-                "copilot authority gate allowed tool via within-turn read override",
-                authority_gate_layer="turn_intent",
-                turn_intent_mode=intent.mode.value,
-                tool_name=tool_name,
-                turn_intent_within_turn_read_override=True,
-            )
-        return None
-
-    if intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_run:
-        reason_code = "turn_intent_no_mutation_run_blocked"
-    elif intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_update:
-        reason_code = "turn_intent_no_mutation_update_blocked"
-    elif blocks_update and blocks_run:
-        reason_code = "turn_intent_no_mutation_run_blocked"
-    elif blocks_update:
-        reason_code = "turn_intent_update_blocked"
-    elif blocks_page_inspection:
-        reason_code = "turn_intent_page_inspection_blocked"
-    elif blocks_context_read:
-        reason_code = "turn_intent_context_read_blocked"
-    elif blocks_credential_metadata:
-        reason_code = "turn_intent_credential_metadata_blocked"
-    else:
-        reason_code = "turn_intent_run_blocked"
-    LOG.info(
-        "copilot authority gate evaluated tool",
-        authority_gate_layer="turn_intent",
-        turn_intent_mode=intent.mode.value,
-        turn_intent_target_entity_types=sorted(intent.target_entities),
-        turn_intent_may_update_workflow=authority.may_update_workflow,
-        turn_intent_may_run_blocks=authority.may_run_blocks,
-        turn_intent_may_read_run_context=authority.may_read_run_context,
-        blocked_tool=tool_name,
-        safe_reason_code=reason_code,
-    )
-    action = "ask the user" if authority.requires_user_input else "answer the user"
-    detail = f" Ask: {intent.missing_context_question}" if intent.missing_context_question else ""
-
-    if blocks_run and not blocks_update and authority.may_update_workflow:
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                "Browser blocks may not run for the latest user message. Use update_workflow only and keep the "
-                f"draft unvalidated.{detail}"
-            ),
-            user_facing_reason="I'll save the change as a draft without running it.",
-            recovery_hint="retry_with_different_tool",
-            cleared_by_tools=frozenset({"update_workflow"}),
-        )
-    if blocks_context_read and not blocks_update and not blocks_run:
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                "Run context may not be read for the latest user message. Answer using the context already "
-                f"provided.{detail}"
-            ),
-            user_facing_reason="I'll answer with the information I already have.",
-            recovery_hint="report_blocker_to_user",
-        )
-    if may_read_run_context:
-        # Mutually exclusive with the blocks_context_read branch above, which requires may_read_run_context False.
-        # The allow-path returned None above, so any reaching tool is denied; deny it without terminating, keeping
-        # the turn alive to diagnose from the run evidence.
-        return _build_turn_intent_signal(
-            tool_name=tool_name,
-            classifier_mode=intent.mode.value,
-            reason_code=reason_code,
-            agent_steering_text=(
-                "You are diagnosing a past run and cannot run blocks, edit the workflow, inspect a live page, or "
-                "fetch additional context in this turn. Diagnose the failure from the run's failure evidence and "
-                "the workflow code already in context, then propose one concrete fix for the user to confirm."
-            ),
-            user_facing_reason="Let me work through what the run shows.",
-            recovery_hint="retry_with_different_tool",
-            blocker_kind="tool_error",
-            renders_final_reply=False,
-        )
-    return _build_turn_intent_signal(
-        tool_name=tool_name,
-        classifier_mode=intent.mode.value,
-        reason_code=reason_code,
-        agent_steering_text=(
-            "This tool is not allowed for the latest user message. Do not update workflow YAML or run browser "
-            "blocks, and do not fetch additional run context with tools; "
-            f"{action} using the available context instead.{detail}"
-        ),
-        user_facing_reason="I'll respond with the information I already have.",
-        recovery_hint="ask_user_clarifying" if authority.requires_user_input else "report_blocker_to_user",
+    return policy.allow_missing_credentials_in_draft and (
+        policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
     )
 
 
-def _build_turn_intent_signal(
-    *,
-    tool_name: str,
-    classifier_mode: str,
-    reason_code: str,
-    agent_steering_text: str,
-    user_facing_reason: str,
-    recovery_hint: RecoveryHint,
-    cleared_by_tools: frozenset[str] = frozenset(),
-    blocker_kind: BlockerKind = "authority_denied",
-    renders_final_reply: bool = True,
-) -> CopilotToolBlockerSignal:
-    return CopilotToolBlockerSignal(
-        blocker_kind=blocker_kind,
-        agent_steering_text=agent_steering_text,
-        user_facing_reason=user_facing_reason,
-        recovery_hint=recovery_hint,
-        cleared_by_tools=cleared_by_tools,
-        renders_final_reply=renders_final_reply,
-        internal_reason_code=reason_code,
-        blocked_tool=tool_name,
-        classifier_mode=classifier_mode,
-    )
+def _update_and_run_requires_skipped_run(ctx: AgentContext, tool_name: str) -> bool:
+    return tool_name == "update_and_run_blocks" and _credential_deferred_draft_requires_skipped_run(ctx)
 
 
 def _authority_tool_error(
     ctx: AgentContext,
     tool_name: str,
-    *,
-    ignore_request_policy_error: bool = False,
 ) -> str | None:
     if ctx.turn_origin == TurnOrigin.runtime_self_heal:
         return _emit_tool_blocker_signal(
             ctx,
-            _build_turn_intent_signal(
-                tool_name=tool_name,
+            CopilotToolBlockerSignal(
+                blocker_kind="tool_error",
+                blocked_tool=tool_name,
                 classifier_mode="runtime_self_heal",
-                reason_code="runtime_self_heal_native_tool_blocked",
+                internal_reason_code="runtime_self_heal_native_tool_blocked",
                 agent_steering_text=(
                     "Runtime self-heal allows browser MCP tools only; do not call native copilot tools."
                 ),
                 user_facing_reason="Runtime self-heal cannot use this tool.",
                 recovery_hint="stop",
-                blocker_kind="tool_error",
                 renders_final_reply=False,
             ),
         )
-    # Request-policy precedes turn-intent unless explicitly ignored.
-    turn_intent_signal = _turn_intent_tool_error(ctx, tool_name)
-    request_policy_signal = _request_policy_tool_error(ctx, tool_name)
-    if turn_intent_signal is not None and request_policy_signal is not None:
-        LOG.info(
-            "copilot authority gate blocked tool",
-            authority_gate_layer="both",
-            blocked_tool=tool_name,
+    policy = ctx.request_policy
+    if (
+        tool_name
+        in {
+            "run_blocks_and_collect_debug",
+            "discover_workflow_entrypoint",
+        }
+        and isinstance(policy, RequestPolicy)
+        and policy.raw_secret_detected
+    ):
+        return _emit_tool_blocker_signal(
+            ctx,
+            CopilotToolBlockerSignal(
+                blocker_kind="tool_error",
+                blocked_tool=tool_name,
+                classifier_mode="raw_secret_safety",
+                internal_reason_code="raw_secret_browser_action_blocked",
+                agent_steering_text=(
+                    "This turn contains a redacted raw secret. Do not use the browser; persist only the "
+                    "redacted draft and ask the user to save the secret as a credential before testing."
+                ),
+                user_facing_reason=(
+                    "I saved only a redacted draft and did not use the browser because the request contained a raw secret."
+                ),
+                recovery_hint="retry_with_different_tool",
+                renders_final_reply=False,
+            ),
         )
-    chosen = (
-        request_policy_signal
-        if (request_policy_signal is not None and not ignore_request_policy_error)
-        else turn_intent_signal
-    )
-    if chosen is not None:
-        return _emit_tool_blocker_signal(ctx, chosen)
-    phase_signal = _phase_blocker_signal(ctx, tool_name)
-    if phase_signal is not None:
-        LOG.info(
-            "copilot authority gate blocked tool",
-            authority_gate_layer="build_phase",
-            blocked_tool=tool_name,
-            build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
-        )
-        return _emit_tool_blocker_signal(ctx, phase_signal)
     return None
 
 

@@ -7,6 +7,7 @@ import {
   STUDIO_STAGE_GAP_PX,
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
+  copilotContextForSearch,
   fitPanesToWidth,
   layoutClassForSearch,
   panesFitWidth,
@@ -19,10 +20,36 @@ import {
   searchWithRunReference,
   toReadableSearch,
   togglePane,
+  withCopilotSelection,
   withPaneClosed,
   withPaneOpen,
   withPanesOpen,
 } from "./panes";
+
+describe("Copilot pane context and selection", () => {
+  test("uses one edit context and one run context", () => {
+    expect(copilotContextForSearch("?panes=copilot")).toBe("edit");
+    expect(copilotContextForSearch("?bl=block_1")).toBe("edit");
+    expect(copilotContextForSearch("?wr=wr_1")).toBe("run");
+    expect(copilotContextForSearch("?active=act_1")).toBe("run");
+    expect(copilotContextForSearch("?wr=wr_1&bl=block_1")).toBe("run");
+  });
+
+  test("applies runtime membership and preserves a remembered position", () => {
+    expect(
+      withCopilotSelection(["copilot", "editor", "browser"], {
+        open: false,
+        index: 0,
+      }),
+    ).toEqual(["editor", "browser"]);
+    expect(
+      withCopilotSelection(["editor", "browser"], {
+        open: true,
+        index: 1,
+      }),
+    ).toEqual(["editor", "copilot", "browser"]);
+  });
+});
 
 describe("parsePanesParam", () => {
   test("returns null when the param is absent", () => {
@@ -502,6 +529,27 @@ describe("layoutClassForSearch", () => {
   });
 });
 
+describe("system run focus (?wrs=)", () => {
+  test("keeps the edit layout class while the run stays inspectable", () => {
+    expect(copilotContextForSearch("?wr=wr_1&wrs=copilot")).toBe("edit");
+    expect(layoutClassForSearch("?wr=wr_1&wrs=copilot")).toBe("edit");
+  });
+
+  test("does not remap deep-link panes to the run layout", () => {
+    const learnedRun = ["overview", "browser"] as const;
+    expect(
+      resolveOpenPanes(
+        "?wr=wr_1&wrs=copilot",
+        ["editor", "browser"],
+        [...learnedRun],
+      ),
+    ).toEqual(["editor", "browser"]);
+    expect(
+      resolveOpenPanes("?wr=wr_1", ["editor", "browser"], [...learnedRun]),
+    ).toEqual([...learnedRun]);
+  });
+});
+
 describe("searchWithRunReference", () => {
   test("injects ?wr= from the path run so /runs/{wr} resolves run-class panes", () => {
     expect(searchWithRunReference("", "wr_123")).toBe("?wr=wr_123");
@@ -511,6 +559,18 @@ describe("searchWithRunReference", () => {
     expect(layoutClassForSearch(searchWithRunReference("", "wr_123"))).toBe(
       "run",
     );
+  });
+
+  test("drops a stale marker so a path run keeps its run class", () => {
+    // The marker belongs to a copilot focus that is gone; leaving it would pin
+    // a run the user opened to the edit layout.
+    expect(searchWithRunReference("?wrs=copilot", "wr_123")).toBe("?wr=wr_123");
+    expect(
+      layoutClassForSearch(searchWithRunReference("?wrs=copilot", "wr_123")),
+    ).toBe("run");
+    expect(
+      resolveOpenPanes(searchWithRunReference("?wrs=copilot", "wr_123")),
+    ).toEqual(RUN_APPEND_PANES);
   });
 
   test("keeps an explicit ?wr= and other params untouched", () => {

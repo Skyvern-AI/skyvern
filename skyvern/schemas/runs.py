@@ -5,9 +5,14 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
 from pydantic import (
     AliasChoices,
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    WebsocketUrl,
     field_serializer,
     field_validator,
     model_validator,
@@ -61,27 +66,50 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunType,
 )
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
+_BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
+BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
     TaskRunTypeField: TypeAlias = Literal[
-        "task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
+        "task_v1", "task_v2", "task_v3", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
     ]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
         RunType.task_v1,
         RunType.task_v2,
+        RunType.task_v3,
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
         RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
+
+
+def _validate_browser_address(browser_address: str | None) -> str | None:
+    if not browser_address:
+        return browser_address
+
+    try:
+        parsed = _BROWSER_ADDRESS_ADAPTER.validate_python(browser_address)
+    except ValidationError as exc:
+        raise ValueError("browser_address must be an HTTP(S) or WebSocket URL with a host") from exc
+
+    if not parsed.host:
+        raise ValueError("browser_address must include a host")
+
+    validate_browser_host(parsed.host)
+    return browser_address
+
+
+def _browser_address_is_server_assigned(info: ValidationInfo) -> bool:
+    return bool(info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY))
 
 
 class TaskRunRequest(BaseModel):
@@ -211,6 +239,11 @@ class TaskRunRequest(BaseModel):
             return url
         return validate_url(url)
 
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
+
     @field_validator("webhook_url", "totp_url")
     @classmethod
     def validate_callback_urls(cls, url: str | None) -> str | None:
@@ -303,6 +336,10 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    reuse_browser_session: bool | None = Field(
+        default=None,
+        description="Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account.",
+    )
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
@@ -378,6 +415,13 @@ class WorkflowRunRequest(BaseModel):
     def _validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
 
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
+        if _browser_address_is_server_assigned(info):
+            return browser_address
+        return _validate_browser_address(browser_address)
+
     @field_validator("webhook_url", "totp_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
@@ -418,6 +462,10 @@ class WorkflowRunRequest(BaseModel):
 
 
 class BlockRunRequest(WorkflowRunRequest):
+    webhook_url: WebhookUrl | None = Field(
+        default=None,
+        description="URL to send workflow status updates to after the run finishes.",
+    )
     block_labels: list[str] = Field(
         description="Labels of the blocks to execute",
         examples=["block_1", "block_2"],
@@ -484,6 +532,17 @@ class ScriptRunResponse(BaseModel):
 class UploadFileResponse(BaseModel):
     s3_uri: str = Field(description="S3 URI where the file was uploaded")
     presigned_url: str = Field(description="Presigned URL to access the uploaded file")
+    file_id: str | None = Field(
+        default=None,
+        description="Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file.",
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the file will be deleted, if a retention_days was supplied. "
+            "Null means the file has no expiry of its own and follows the organization's data retention policy."
+        ),
+    )
 
 
 class BaseRunResponse(BaseModel):

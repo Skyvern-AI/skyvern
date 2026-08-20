@@ -115,7 +115,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "goto_url": "Navigate directly to a URL without additional instructions",
     "download_to_s3": "Download a URL directly to S3 storage",
     "upload_to_s3": "Upload local content to S3",
-    "file_url_parser": "Parse a file (CSV/Excel/PDF/image) from a URL",
+    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
@@ -280,6 +280,17 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "file_url": "{{ source_pdf_output }}",
         "prompt": "Split this combined PDF into one file per document; name each by document type.",
         "parameter_keys": ["source_pdf_output"],
+    },
+    "human_interaction": {
+        "block_type": "human_interaction",
+        "label": "approve_order",
+        "timeout_seconds": 3600,
+        "recipients": ["ops@example.com"],
+        "subject": "Approval needed before the order is submitted",
+        "body": "A workflow run is paused and needs someone to approve the order before it is submitted.",
+        "instructions": "Review the order total and line items, then approve to submit or reject to cancel the run.",
+        "positive_descriptor": "Approve order",
+        "negative_descriptor": "Cancel",
     },
     "google_sheets_read": {
         "block_type": "google_sheets_read",
@@ -561,6 +572,11 @@ async def skyvern_block_validate(
         if block.block_type in ("task", "task_v2"):
             warnings.append(
                 f"'{block.block_type}' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
+            )
+        if raw.get("block_type") == "code" and "prompt" not in raw:
+            warnings.append(
+                "Code block omits 'prompt'. Workflow create, or workflow update when adding this code block under a "
+                'new label, will inject the missing default `prompt: ""`; existing code block labels are not migrated.'
             )
         return make_result(
             action,

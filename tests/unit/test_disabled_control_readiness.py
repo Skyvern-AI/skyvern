@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -45,11 +47,13 @@ async def test_wait_until_enabled_retries_until_live_control_is_enabled() -> Non
     element = _skyvern_element()
     element.is_disabled = AsyncMock(side_effect=[True, True, False])  # type: ignore[method-assign]
 
-    with patch("skyvern.webeye.utils.dom.asyncio.sleep", new=AsyncMock()) as sleep:
+    sleep = AsyncMock()
+    test_asyncio = SimpleNamespace(get_running_loop=asyncio.get_running_loop, sleep=sleep)
+    with patch("skyvern.webeye.utils.dom.asyncio", new=test_asyncio):
         assert await element.wait_until_enabled() is True
 
-    assert element.is_disabled.await_count == 3
-    assert sleep.await_count == 2
+    assert element.is_disabled.await_args_list == [call(dynamic=True)] * 3
+    assert sleep.await_args_list == [call(0.1)] * 2
 
 
 @pytest.mark.asyncio
@@ -115,6 +119,7 @@ async def test_input_handler_classifies_control_that_stays_disabled() -> None:
     element.get_tag_name.return_value = "input"
     element.get_frame.return_value = MagicMock()
     element.get_locator.return_value = MagicMock()
+    element.supports_text_input = AsyncMock(return_value=True)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
     frame = MagicMock()

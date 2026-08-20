@@ -1,3 +1,5 @@
+import { stringify as convertToYAML } from "yaml";
+
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
 
 import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
@@ -48,6 +50,7 @@ export function workflowVersionFromSaveData(
     extra_http_headers: headers.extraHttpHeaders,
     cdp_connect_headers: headers.cdpConnectHeaders,
     persist_browser_session: settings.persistBrowserSession,
+    reuse_browser_session: settings.reuseBrowserSession,
     pin_saved_session_ip: settings.pinSavedSessionIp,
     browser_profile_id: settings.browserProfileId,
     browser_profile_key: settings.browserProfileKey,
@@ -65,11 +68,45 @@ export function workflowVersionFromSaveData(
     ai_fallback: settings.aiFallback,
     enable_self_healing: settings.enableSelfHealing ?? false,
     adaptive_caching: workflow.adaptive_caching ?? false,
+    mask_secrets: settings.maskSecrets,
     code_version:
       settings.runWith === "code" ? (settings.codeVersion ?? 2) : null,
     run_sequentially: settings.runSequentially,
     sequential_key: settings.sequentialKey,
     folder_id: workflow.folder_id ?? null,
     import_error: workflow.import_error ?? null,
+  };
+}
+
+// A pasted "Export as YAML" document (WorkflowCreateYAMLRequest) nests the
+// definition under workflow_definition. The pane edits only the definition, so
+// unwrap it; top-level export settings are ignored, matching enterYamlMode.
+function unwrapWorkflowDefinition<T>(parsed: T): T {
+  const doc = parsed as
+    | { blocks?: unknown; workflow_definition?: unknown }
+    | null
+    | undefined;
+  const nested = doc?.workflow_definition;
+  return doc?.blocks == null &&
+    typeof nested === "object" &&
+    nested !== null &&
+    !Array.isArray(nested)
+    ? (nested as T)
+    : parsed;
+}
+
+// The pane edits the workflow definition, but a user can paste a full "Export
+// as YAML" document; a definition-only draft is POSTed as the user's raw text
+// so their formatting and comments survive the round trip.
+export function yamlCommitInputs<T>(
+  parsed: T,
+  draft: string,
+): { definition: T; definitionYaml: string } {
+  const definition = unwrapWorkflowDefinition(parsed);
+  return {
+    definition,
+    definitionYaml: Object.is(definition, parsed)
+      ? draft
+      : convertToYAML(definition),
   };
 }

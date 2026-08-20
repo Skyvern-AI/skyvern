@@ -1,3 +1,4 @@
+import { HelpTooltip } from "@/components/HelpTooltip";
 import {
   Command,
   CommandEmpty,
@@ -28,6 +29,7 @@ import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { useEffect, useMemo, useState } from "react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { updateWorkflowBrowserSessionReuse } from "@/store/WorkflowSettingsStore";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import {
@@ -576,6 +578,18 @@ function LoginBlockCredentialSelector({
     setHasChanges(true);
   };
 
+  const setReuseBrowserSession = (checked: boolean) => {
+    if (!workflowStartNode) {
+      return;
+    }
+    updateWorkflowBrowserSessionReuse(
+      checked,
+      workflowStartNode.data.persistBrowserSession,
+      (settings) => updateNodeData(workflowStartNode.id, settings),
+    );
+    setHasChanges(true);
+  };
+
   const handleCredentialChange = (
     newValue: string,
     selection: CredentialComboboxSelection,
@@ -974,24 +988,43 @@ function LoginBlockCredentialSelector({
           </div>
 
           {rotationCredentialIds.length > 1 ? (
-            <div className="flex items-start gap-2 text-xs text-muted-foreground">
-              <div className="space-y-0.5">
-                <span>Disable parallel runs</span>
-                <p className="text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
-                  Queues this workflow's runs one at a time so rotated accounts
-                  never log in simultaneously.
-                </p>
+            <div className="space-y-3">
+              <div className="flex items-start gap-2 text-xs text-muted-foreground">
+                <div className="space-y-0.5">
+                  <span>Disable parallel runs</span>
+                  <p className="text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
+                    Queues this workflow&apos;s runs one at a time so rotated
+                    accounts never log in simultaneously.
+                  </p>
+                </div>
+                <Switch
+                  className="ml-auto shrink-0"
+                  checked={
+                    workflowStartNode
+                      ? workflowStartNode.data.runSequentially
+                      : false
+                  }
+                  disabled={!editable || !workflowStartNode}
+                  onCheckedChange={setRunSequentially}
+                />
               </div>
-              <Switch
-                className="ml-auto shrink-0"
-                checked={
-                  workflowStartNode
-                    ? workflowStartNode.data.runSequentially
-                    : false
-                }
-                disabled={!editable || !workflowStartNode}
-                onCheckedChange={setRunSequentially}
-              />
+              {workflowStartNode?.data.runSequentially ? (
+                <div className="flex items-start gap-2 text-xs text-muted-foreground">
+                  <div className="space-y-0.5">
+                    <span>Reuse browser sessions</span>
+                    <HelpTooltip content="Each rotated account keeps its own live browser signed in between runs." />
+                    <p className="text-[11px] leading-4 text-muted-foreground dark:text-slate-500">
+                      Keeps each account&apos;s browser signed in between runs.
+                    </p>
+                  </div>
+                  <Switch
+                    className="ml-auto shrink-0"
+                    checked={workflowStartNode.data.reuseBrowserSession}
+                    disabled={!editable}
+                    onCheckedChange={setReuseBrowserSession}
+                  />
+                </div>
+              ) : null}
             </div>
           ) : null}
 

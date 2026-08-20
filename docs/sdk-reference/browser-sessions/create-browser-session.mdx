@@ -29,7 +29,7 @@ console.log(session.browser_session_id); // pbs_abc123
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `timeout` | `int` | No | `60` | Session timeout in minutes (5–1440). Timer starts after the session is ready. |
+| `timeout` | `int` | No | `60` | Session timeout in minutes (min 5, max 240; higher values are rejected). Timer starts after the session is ready. |
 | `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
 | `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
 | `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |

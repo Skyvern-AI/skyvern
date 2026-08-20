@@ -26,7 +26,7 @@ export function RunTab() {
   // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-  // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
+  // ?bl= marks a block-scoped run; "Retry" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
   const isBlockRun = searchParams.has("bl");
   const retryRun = () => {
@@ -56,7 +56,7 @@ export function RunTab() {
               // initialMessage), so the pane write can't race a separate
               // state-only navigation.
               openPane("copilot", {
-                state: { copilotMessage: seedMessage, copilotFixOrigin: true },
+                state: { copilotMessage: seedMessage },
               });
             }
       }

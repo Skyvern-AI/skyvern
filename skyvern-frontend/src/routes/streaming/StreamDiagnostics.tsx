@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { InfoCircledIcon } from "@radix-ui/react-icons";
+import { CheckCircledIcon, InfoCircledIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
 import { AnimatedWave } from "@/components/AnimatedWave";
 import { RotateThrough } from "@/components/RotateThrough";
@@ -10,6 +10,9 @@ type StreamDiagnostic = {
   hint?: string;
   // When true, the panel shows the whimsical "still working on it" animation.
   pending?: boolean;
+  // Success is the only state that earns colour here; everything else keeps the
+  // neutral informational treatment.
+  tone?: "success";
 };
 
 const WHIMSICAL_LOADING_MESSAGES = [
@@ -93,16 +96,22 @@ function StreamStatusPanel({
   children?: ReactNode;
   className?: string;
 }) {
+  const isSuccess = diagnostic.tone === "success";
   return (
     <div
       className={cn(
         "flex h-full w-full items-center justify-center rounded-md bg-white p-6 text-neutral-600 dark:bg-slate-900 dark:text-slate-300",
+        isSuccess && "border border-success/30",
         className,
       )}
     >
       <div className="flex max-w-md flex-col gap-2 text-sm">
         <div className="flex items-center gap-2 font-medium text-neutral-900 dark:text-slate-100">
-          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-neutral-500 dark:text-slate-400" />
+          {isSuccess ? (
+            <CheckCircledIcon className="h-4 w-4 flex-shrink-0 text-success" />
+          ) : (
+            <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-neutral-500 dark:text-slate-400" />
+          )}
           <span>{diagnostic.title}</span>
         </div>
         {diagnostic.detail && (

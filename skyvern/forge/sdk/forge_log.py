@@ -1,22 +1,26 @@
 import logging
 import random
-import re
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Callable, Iterator
+from weakref import WeakSet
 
 import structlog
-from structlog.typing import EventDict
+from structlog.typing import EventDict, Processor
 
 from skyvern._version import __version__
 from skyvern.config import settings
+from skyvern.forge.log_redaction import (
+    REDACTED,
+    is_sensitive_key,
+    redact_bearer_tokens_in_text,
+    redact_sensitive_fields,
+)
 from skyvern.forge.sdk.core import skyvern_context
-
-# Bearer JWTs occasionally leak into log messages via WebSocket connection
-# URLs that pass `?token=Bearer%20<jwt>` as a query string. Redact before
-# anything ships to Datadog. Matches both raw and URL-encoded forms.
-_BEARER_TOKEN_RE = re.compile(r"(?i)(token=)(?:Bearer(?:%20|\s+))?[A-Za-z0-9._%-]+")
 
 LOGGING_LEVEL_MAP: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -29,12 +33,241 @@ LOGGING_LEVEL_MAP: dict[str, int] = {
 # Resolved once at setup time and injected into every log event.
 _entrypoint: str = "unknown"
 
+
+class _CodeBlockLogRedactionScope:
+    __slots__ = ("parent", "processed_records", "redactor")
+
+    def __init__(
+        self,
+        redactor: Callable[[Any], Any],
+        parent: "_CodeBlockLogRedactionScope | None",
+    ) -> None:
+        self.parent = parent
+        self.processed_records: WeakSet[logging.LogRecord] = WeakSet()
+        self.redactor: Callable[[Any], Any] | None = redactor
+
+
+_codeblock_log_scope: ContextVar[_CodeBlockLogRedactionScope | None] = ContextVar(
+    "codeblock_log_redaction_scope", default=None
+)
+_STANDARD_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+
+
+def _current_codeblock_log_scope() -> _CodeBlockLogRedactionScope | None:
+    scope = _codeblock_log_scope.get()
+    while scope is not None:
+        if scope.redactor is not None:
+            return scope
+        scope = scope.parent
+    return None
+
+
+def current_codeblock_log_redactor() -> Callable[[Any], Any] | None:
+    scope = _current_codeblock_log_scope()
+    return scope.redactor if scope is not None else None
+
+
+def _install_codeblock_fastmcp_trace_guard() -> None:
+    from fastmcp import telemetry as base_telemetry
+    from fastmcp.client import telemetry as client_telemetry
+    from fastmcp.server import telemetry as server_telemetry
+    from opentelemetry.trace import NoOpTracer
+
+    noop_tracer = NoOpTracer()
+    for telemetry in (base_telemetry, client_telemetry, server_telemetry):
+        get_tracer = telemetry.get_tracer
+        if getattr(get_tracer, "_skyvern_codeblock_guard", False) is True:
+            continue
+
+        def guarded_get_tracer(version: str | None = None, *, _get_tracer: Any = get_tracer) -> Any:
+            if current_codeblock_log_redactor() is not None:
+                return noop_tracer
+            return _get_tracer(version)
+
+        guarded_get_tracer._skyvern_codeblock_guard = True  # type: ignore[attr-defined]
+        telemetry.get_tracer = guarded_get_tracer
+
+
+def _render_opaque_log_values(value: Any) -> Any:
+    if type(value) in (str, int, float, bool, type(None)):
+        return value
+    if type(value) is dict:
+        return {_render_opaque_log_values(key): _render_opaque_log_values(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_render_opaque_log_values(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_render_opaque_log_values(item) for item in value)
+    try:
+        return repr(value)
+    except BaseException:
+        return ""
+
+
+def _redact_codeblock_log_value(value: Any) -> Any:
+    redactor = current_codeblock_log_redactor()
+    if redactor is None:
+        return value
+    try:
+        return redactor(_render_opaque_log_values(value))
+    except BaseException:
+        return ""
+
+
+class _CodeBlockParameterLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        scope = _current_codeblock_log_scope()
+        if scope is None or record in scope.processed_records:
+            return True
+        try:
+            message = record.msg if isinstance(record.msg, dict) else record.getMessage()
+        except BaseException:
+            message = ""
+        extra_keys = set(record.__dict__) - _STANDARD_LOG_RECORD_FIELDS
+        metadata: dict[str, str] = {}
+        for key in _STANDARD_LOG_RECORD_FIELDS - {"msg", "args", "exc_info", "exc_text", "stack_info"}:
+            value = record.__dict__.get(key)
+            if type(value) is str:
+                metadata[key] = value
+            elif type(value) in {bool, int, float}:
+                metadata[key] = str(value)
+            elif value is not None:
+                return False
+        redacted = _redact_codeblock_log_value(
+            {
+                "message": message,
+                "extras": {key: record.__dict__[key] for key in extra_keys},
+                "metadata": metadata,
+            }
+        )
+        if type(redacted) is not dict or set(redacted) != {"message", "extras", "metadata"}:
+            return False
+        redacted_message = redacted["message"]
+        extras = redacted["extras"]
+        redacted_metadata = redacted["metadata"]
+        if type(extras) is not dict or set(extras) != extra_keys or type(redacted_metadata) is not dict:
+            return False
+        if isinstance(message, dict):
+            message_key = "event" if "event" in message else "msg" if "msg" in message else None
+            if not isinstance(redacted_message, dict) or (
+                message_key is not None and message_key not in redacted_message
+            ):
+                redacted_message = {message_key or "event": ""}
+        for key, value in metadata.items():
+            redacted_value = redacted_metadata.get(key)
+            original = record.__dict__[key]
+            if type(original) is str and type(redacted_value) is str:
+                record.__dict__[key] = redacted_value
+            elif redacted_value != value:
+                return False
+        record.msg = redacted_message if isinstance(redacted_message, (str, dict)) else ""
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        record.__dict__.update(extras)
+        scope.processed_records.add(record)
+        return True
+
+
+_CODEBLOCK_PARAMETER_LOG_FILTER = _CodeBlockParameterLogFilter()
+
+
+@contextmanager
+def codeblock_parameter_log_redaction(redactor: Callable[[Any], Any]) -> Iterator[None]:
+    parent = _codeblock_log_scope.get()
+    parent_redactor = current_codeblock_log_redactor()
+    if parent_redactor is not None:
+        nested_redactor = redactor
+
+        def redactor(value: Any) -> Any:
+            return nested_redactor(parent_redactor(value))
+
+    scope = _CodeBlockLogRedactionScope(redactor, parent)
+    token = _codeblock_log_scope.set(scope)
+    try:
+        _install_codeblock_fastmcp_trace_guard()
+        root_logger = logging.getLogger()
+        loggers = [root_logger, logging.getLogger("openai.agents")]
+        loggers.extend(
+            logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)
+        )
+        for logger in loggers:
+            for handler in logger.handlers:
+                handler.addFilter(_CODEBLOCK_PARAMETER_LOG_FILTER)
+        yield
+    finally:
+        scope.redactor = None
+        _codeblock_log_scope.reset(token)
+
+
 _DRIVER_PIPE_CLOSED_ERROR = "Connection closed while reading from the driver"
 _TARGET_CLOSED_ERROR = "Target page, context or browser has been closed"
 _ORPHANED_FUTURE_MESSAGE = "Future exception was never retrieved"
 _ORPHANED_TASK_MESSAGE = "Task exception was never retrieved"
 _TARGET_CLOSED_ERROR_TYPE = "TargetClosedError"
 _CHANNEL_COLLECTED_ERROR = "The object has been collected to prevent unbounded heap growth"
+
+# Production collection splits records at the observed 75 KiB boundary. Keep JSON
+# below that boundary so one application event remains one Datadog event.
+MAX_JSON_LOG_BYTES = 64 * 1024
+_OVERSIZED_LOG_VALUE_CHARS = 4 * 1024
+_OVERSIZED_LOG_METADATA_CHARS = 512
+_OVERSIZED_LOG_FIELDS = (
+    "msg",
+    "timestamp",
+    "level",
+    "logger",
+    "entrypoint",
+    "env",
+    "version",
+    "event_status",
+    "event_severity",
+    "event_message",
+    "event_host",
+    "event_hostname",
+    "event_service",
+    "event_source",
+    "pathname",
+    "filename",
+    "module",
+    "func_name",
+    "lineno",
+    "request_id",
+    "organization_id",
+    "organization_name",
+    "step_id",
+    "task_id",
+    "run_id",
+    "workflow_id",
+    "workflow_run_id",
+    "workflow_permanent_id",
+    "task_v2_id",
+    "browser_session_id",
+    "copilot_session_id",
+    "browser_container_ip",
+    "browser_container_task_arn",
+    "error",
+    "error_type",
+    "error_category",
+    "exception_hash",
+    "exception",
+)
+
+
+def _json_log_default(obj: Any) -> Any:
+    """Serialize what json.dumps cannot, keeping Decimal numeric.
+
+    structlog's fallback is repr(), which renders a Decimal as the string
+    "Decimal('0.004')" — valid JSON, but a string facet no query can aggregate.
+    """
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if hasattr(obj, "__structlog__"):
+        return obj.__structlog__()
+    return repr(obj)
+
+
+_JSON_RENDERER = structlog.processors.JSONRenderer(default=_json_log_default)
 
 
 class _DriverPipeNoiseFilter(logging.Filter):
@@ -113,60 +346,177 @@ def _add_entrypoint(logger: logging.Logger, method_name: str, event_dict: EventD
     return event_dict
 
 
-def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """
-    A custom processor to add key-value pairs to the 'msg' field.
-    """
+# Datadog intake preprocessing derives the log's severity/message/host/service/source from
+# these reserved attribute names, so a domain kwarg like status="completed" becomes the
+# log's severity (`c*` → critical). Renamed at the render seam only: `context.log` (the S3
+# run artifact) and the console renderer keep the authored names.
+# `severity` is here because it sits between `status` and `level` in Datadog's status-attribute
+# list, so stripping only `status` would promote it to the severity source. `msg` is
+# deliberately absent: this runs after EventRenamer has moved the real message there, so
+# renaming it would strip the message off every line.
+RESERVED_LOG_KEY_RENAMES: dict[str, str] = {
+    "status": "event_status",
+    "severity": "event_severity",
+    "message": "event_message",
+    "host": "event_host",
+    "hostname": "event_hostname",
+    "service": "event_service",
+    "source": "event_source",
+}
+
+
+def escape_reserved_log_keys(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    for key, renamed in RESERVED_LOG_KEY_RENAMES.items():
+        if key in event_dict:
+            # setdefault: an explicitly authored `event_*` kwarg wins over the rename.
+            event_dict.setdefault(renamed, event_dict.pop(key))
+    return event_dict
+
+
+# Also appended to `msg` so pasting an id (pbs_/wr_/tsk_/...) into Datadog free-text
+# search still matches — attribute JSON alone only matches `@field:value` queries.
+# Bounded to these short ids on purpose: copying arbitrary kwargs into `msg` is what
+# fragmented oversized logs (SKY-13848).
+SEARCHABLE_LOG_ID_KEYS: tuple[str, ...] = (
+    "request_id",
+    "organization_id",
+    "organization_name",
+    "step_id",
+    "task_id",
+    "run_id",
+    "workflow_id",
+    "workflow_run_id",
+    "workflow_permanent_id",
+    "task_v2_id",
+    "browser_session_id",
+    "copilot_session_id",
+    "browser_container_ip",
+    "browser_container_task_arn",
+)
+_SEARCHABLE_ID_MAX_CHARS = 256
+
+
+def add_log_context(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Add request and process context, appending only the correlation ids to ``msg``."""
     # Add context to the log
     context = skyvern_context.current()
     if context:
-        if context.request_id:
+        if getattr(context, "request_id", None):
             event_dict["request_id"] = context.request_id
-        if context.organization_id:
+        if getattr(context, "organization_id", None):
             event_dict["organization_id"] = context.organization_id
-        if context.organization_name:
+        if getattr(context, "organization_name", None):
             event_dict["organization_name"] = context.organization_name
-        if context.step_id:
+        if getattr(context, "step_id", None):
             event_dict["step_id"] = context.step_id
-        if context.task_id:
+        if getattr(context, "task_id", None):
             event_dict["task_id"] = context.task_id
-        if context.run_id:
+        if getattr(context, "run_id", None):
             event_dict["run_id"] = context.run_id
-        if context.workflow_id:
+        if getattr(context, "workflow_id", None):
             event_dict["workflow_id"] = context.workflow_id
-        if context.workflow_run_id:
+        if getattr(context, "workflow_run_id", None):
             event_dict["workflow_run_id"] = context.workflow_run_id
-        if context.workflow_permanent_id:
+        if getattr(context, "workflow_permanent_id", None):
             event_dict["workflow_permanent_id"] = context.workflow_permanent_id
-        if context.task_v2_id:
+        if getattr(context, "task_v2_id", None):
             event_dict["task_v2_id"] = context.task_v2_id
-        if context.browser_session_id:
+        if getattr(context, "browser_session_id", None):
             event_dict["browser_session_id"] = context.browser_session_id
-        if context.browser_container_ip:
+        if getattr(context, "copilot_session_id", None):
+            event_dict["copilot_session_id"] = context.copilot_session_id
+        if getattr(context, "browser_container_ip", None):
             event_dict["browser_container_ip"] = context.browser_container_ip
-        if context.browser_container_task_arn:
+        if getattr(context, "browser_container_task_arn", None):
             event_dict["browser_container_task_arn"] = context.browser_container_task_arn
 
     # Add process-level context to the log
     event_dict["env"] = settings.ENV
     event_dict["version"] = __version__
 
-    if method_name not in ["info", "warning", "error", "critical", "exception"]:
-        # Only modify the log for these log levels
-        return event_dict
-
-    # Assuming 'event' or 'msg' is the field to update
-    msg_field = event_dict.get("msg", "")
-
-    # Add key-value pairs
-    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level", "sampling"]}
-    if kv_pairs:
-        additional_info = ", ".join(f"{k}={v}" for k, v in kv_pairs.items())
-        msg_field += f" | {additional_info}"
-
-    event_dict["msg"] = msg_field
+    searchable_ids = [
+        f"{key}={value[:_SEARCHABLE_ID_MAX_CHARS]}"
+        for key in SEARCHABLE_LOG_ID_KEYS
+        if isinstance((value := event_dict.get(key)), str) and value
+    ]
+    msg = event_dict.get("msg")
+    if searchable_ids and isinstance(msg, str):
+        event_dict["msg"] = f"{msg} | {', '.join(searchable_ids)}"
 
     return event_dict
+
+
+def _truncate_log_value(value: Any, max_chars: int) -> Any:
+    if value is None or isinstance(value, (bool, float)):
+        return value
+    if isinstance(value, int):
+        value = int(value)
+    text = value if isinstance(value, str) else str(value)
+    if isinstance(value, int) and len(text) <= max_chars:
+        return value
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated]"
+
+
+def render_bounded_json(logger: logging.Logger, method_name: str, event_dict: EventDict) -> str:
+    """Render one valid JSON record below the collector's observed split boundary."""
+    rendered = _JSON_RENDERER(logger, method_name, event_dict)
+    # JSONRenderer's default serializer escapes non-ASCII characters, so character
+    # length is also the emitted UTF-8 byte length without allocating another copy.
+    original_size_bytes = len(rendered)
+    if original_size_bytes <= MAX_JSON_LOG_BYTES:
+        return rendered
+
+    bounded = {
+        key: _truncate_log_value(
+            event_dict[key],
+            _OVERSIZED_LOG_VALUE_CHARS if key in {"msg", "exception"} else _OVERSIZED_LOG_METADATA_CHARS,
+        )
+        for key in _OVERSIZED_LOG_FIELDS
+        if key in event_dict
+    }
+    omitted_fields = sorted(str(key)[:128] for key in event_dict if key not in bounded)
+    bounded.update(
+        {
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": len(omitted_fields),
+            "omitted_fields": omitted_fields[:50],
+        }
+    )
+    rendered = _JSON_RENDERER(logger, method_name, bounded)
+    if len(rendered) <= MAX_JSON_LOG_BYTES:
+        return rendered
+
+    # Unusual escaped/control-heavy metadata can expand during JSON encoding. Keep a
+    # minimal correlated record rather than emitting another line the collector splits.
+    minimal = {
+        key: _truncate_log_value(bounded[key], 256 if key == "msg" else 128)
+        for key in _OVERSIZED_LOG_FIELDS
+        if key in bounded and key != "exception"
+    }
+    minimal.update(
+        {
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": sum(1 for key in event_dict if key not in minimal),
+        }
+    )
+    rendered = _JSON_RENDERER(logger, method_name, minimal)
+    if len(rendered) <= MAX_JSON_LOG_BYTES:
+        return rendered
+    return _JSON_RENDERER(
+        logger,
+        method_name,
+        {
+            "msg": "Oversized log record",
+            "level": _truncate_log_value(event_dict.get("level"), 32),
+            "log_truncated": True,
+            "original_size_bytes": original_size_bytes,
+            "omitted_field_count": len(event_dict),
+        },
+    )
 
 
 def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -181,8 +531,7 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
         return event_dict
 
     def scrub(node: Any) -> Any:
-        # Nested values are folded into `msg` by add_kv_pairs_to_msg further down the chain, so a
-        # secret carried only inside a nested kwarg reaches the log line unless we recurse here.
+        # Structured nested values are rendered in full, so recurse before JSON serialization.
         if isinstance(node, str):
             for secret in secrets:
                 if secret in node:
@@ -201,15 +550,51 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
     return event_dict
 
 
-def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """Redact Bearer JWTs from any string value in the event dict.
+def redact_codeblock_parameters(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    del logger, method_name
+    message_key = "event" if "event" in event_dict else "msg" if "msg" in event_dict else None
+    redacted = _redact_codeblock_log_value(event_dict)
+    if not isinstance(redacted, dict) or (message_key is not None and message_key not in redacted):
+        return {message_key or "event": ""}
+    return redacted
 
-    Defense-in-depth for log lines that interpolate URLs containing
-    `?token=Bearer%20<jwt>` (e.g. WebSocket connection URLs).
+
+def redact_bearer_tokens(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Redact Bearer credentials from every top-level string value in the event dict.
+
+    Covers `?token=Bearer%20<jwt>` query strings (e.g. WebSocket connection URLs),
+    `Authorization: Bearer <token>` header values, and bare `Bearer <token>` runs in
+    exception strings. Bearer credentials nested inside structured kwargs are handled
+    by ``redact_sensitive_event_fields`` below, which recurses into their strings.
     """
     for key, value in list(event_dict.items()):
-        if isinstance(value, str) and "token=" in value:
-            event_dict[key] = _BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
+        if isinstance(value, str):
+            event_dict[key] = redact_bearer_tokens_in_text(value)
+    return event_dict
+
+
+def redact_sensitive_event_fields(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Mask sensitive-named kwargs (auth headers, tokens, credentials) before rendering.
+
+    Reuses the shared field redactor so structured kwargs such as
+    ``headers={"Authorization": ...}``, ``payload={...}``, or ``response_body={...}``
+    are masked before JSON serialization.
+    Top-level keys whose name is sensitive are masked outright; every other
+    non-string value is redacted recursively — models, tuples and sets included,
+    since the formatter renders those in full too. Plain string values are left to
+    the bearer / registered-secret redactors above.
+
+    Each kwarg is guarded independently: a caller-supplied container whose iteration
+    raises must not take down the whole log call, so it fails closed to ``REDACTED``.
+    """
+    for key, value in list(event_dict.items()):
+        try:
+            if is_sensitive_key(key):
+                event_dict[key] = REDACTED
+            elif not isinstance(value, str):
+                event_dict[key] = redact_sensitive_fields(value)
+        except Exception:
+            event_dict[key] = REDACTED
     return event_dict
 
 
@@ -372,6 +757,22 @@ def add_error_processor(logger: logging.Logger, method_name: str, event_dict: Ev
     return event_dict
 
 
+def exception_log_fields(exc: BaseException) -> dict[str, str]:
+    """The error_type/error_category/exception_hash fields add_error_processor derives from exc_info.
+
+    For callsites that want these dashboard fields on a log line that deliberately omits the
+    traceback (e.g. a warning downgraded from an exception log).
+    """
+    exc_type = type(exc)
+    fields = {
+        "error_type": f"{exc_type.__module__}.{exc_type.__name__}",
+        "error_category": _categorize_exception(exc_type, exc_type.__name__),
+    }
+    if exc.__traceback__ is not None:
+        fields["exception_hash"] = _generate_exception_hash(exc_type, exc.__traceback__)
+    return fields
+
+
 def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     """
     Generate a stable hash for an exception based on:
@@ -490,14 +891,19 @@ def setup_logger() -> None:
     _entrypoint = _get_entrypoint()
 
     # logging.config.dictConfig(logging_config)
-    renderer = structlog.processors.JSONRenderer() if settings.JSON_LOGGING else CustomConsoleRenderer()
+    renderer = render_bounded_json if settings.JSON_LOGGING else CustomConsoleRenderer()
     additional_processors = (
         [
             redact_bearer_tokens,
             redact_registered_secrets,
+            # After compaction: that pass is a log-volume control that trims Action
+            # models down to a few fields, and redaction would otherwise expand them
+            # into full dicts before it ran.
             compact_action_objects,
+            redact_sensitive_event_fields,
+            redact_codeblock_parameters,
             structlog.processors.EventRenamer("msg"),
-            add_kv_pairs_to_msg,
+            add_log_context,
             structlog.processors.CallsiteParameterAdder(
                 {
                     structlog.processors.CallsiteParameter.PATHNAME,
@@ -513,6 +919,8 @@ def setup_logger() -> None:
             redact_bearer_tokens,
             redact_registered_secrets,
             compact_action_objects,
+            redact_sensitive_event_fields,
+            redact_codeblock_parameters,
             structlog.processors.CallsiteParameterAdder(
                 {
                     structlog.processors.CallsiteParameter.FILENAME,
@@ -537,18 +945,43 @@ def setup_logger() -> None:
         + additional_processors
         + [skyvern_logs_processor, sample_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
+    # Foreign stdlib records never run the structlog chain above, so without these two a
+    # record reaches Datadog with an empty message (its remapper reads `msg`, not `event`)
+    # and no `organization_id` to group on.
+    foreign_msg_chain: list[Processor] = (
+        [structlog.processors.EventRenamer("msg"), add_log_context] if settings.JSON_LOGGING else []
+    )
+
     handler = logging.StreamHandler()
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=[
+                # Without this, `extra={...}` on a stdlib log call is silently dropped
+                # and never becomes a queryable attribute. Modules that run in images
+                # without structlog installed have no other route to structured fields.
+                structlog.stdlib.ExtraAdder(),
                 add_error_processor,
                 structlog.processors.format_exc_info,
-            ],
+            ]
+            + foreign_msg_chain,
             processors=[
                 structlog.stdlib.add_log_level,
                 structlog.stdlib.add_logger_name,
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
                 structlog.processors.TimeStamper(fmt="iso"),
+                # Every record on this handler — native structlog AND foreign stdlib (temporal,
+                # asyncio, sqlalchemy, uvicorn) — is serialized here, so this is the one seam that
+                # covers both. `format_exc_info` in `foreign_pre_chain` has already rendered
+                # exc_info to a string by now, so a secret in the exception text is reachable.
+                # These stay duplicated in the structlog chain above on purpose: that pass also
+                # guards `context.log`, which is persisted to the per-run S3 log artifact.
+                # `redact_sensitive_event_fields` is deliberately NOT duplicated here: foreign
+                # records carry only string values, and native records arrive already redacted,
+                # so it could only re-walk every structured kwarg a second time.
+                redact_bearer_tokens,
+                redact_registered_secrets,
+                redact_codeblock_parameters,
+                *([escape_reserved_log_keys] if settings.JSON_LOGGING else []),
                 renderer,
             ],
         )
@@ -559,7 +992,7 @@ def setup_logger() -> None:
     # Root at WARNING so third-party loggers (temporalio, grpc, litellm, …)
     # only surface warnings and errors.  Our packages get the configured level.
     root_logger.setLevel(logging.WARNING)
-    for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller"):
+    for name in ("skyvern", "cloud", "workers", "scripts", "browser_controller", "codeblock"):
         logging.getLogger(name).setLevel(LOG_LEVEL_VAL)
 
     # uvicorn calls logging.config.dictConfig(LOGGING_CONFIG) during its own

@@ -180,6 +180,7 @@ export type TaskApiResponse = {
   screenshot_url: string | null;
   recording_url: string | null;
   recording_archived?: boolean;
+  browser_console_log_url?: string | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
@@ -221,6 +222,8 @@ export type User = {
 export type OrganizationApiResponse = {
   created_at: string;
   modified_at: string;
+  default_llm_key?: string | null;
+  default_secondary_llm_key?: string | null;
   max_retries_per_step: number | null;
   max_steps_per_run: number | null;
   // Optional because the field is added in a backend image rollout; until
@@ -292,7 +295,11 @@ export type ClearOrganizationAuthTokenResponse = {
   success: boolean;
 };
 
-export type CustomLLMProvider = "openai_compatible" | "ollama" | "openrouter";
+export type CustomLLMProvider =
+  | "openai_compatible"
+  | "ollama"
+  | "openrouter"
+  | "gemini";
 
 export type CustomLLMConfig = {
   display_name: string;
@@ -306,6 +313,7 @@ export type CustomLLMConfig = {
   max_completion_tokens?: number | null;
   temperature?: number | null;
   reasoning_effort?: string | null;
+  extra_parameters?: Record<string, unknown> | null;
 };
 
 export type CustomLLM = {
@@ -361,6 +369,7 @@ export interface GoogleOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
+  email_address?: string | null;
   provider?: string;
   state?: string;
   scopes_requested?: string[] | string | null;
@@ -425,6 +434,7 @@ export interface MicrosoftOAuthCredential {
   id: string;
   organization_id: string;
   credential_name: string;
+  email_address?: string | null;
   state?: string;
   scopes_requested?: string[] | string | null;
   scopes_granted?: string[] | string | null;
@@ -567,6 +577,7 @@ export interface CustomCredentialServiceConfigResponse {
 // TODO complete this
 export const ActionTypes = {
   InputText: "input_text",
+  PasteText: "paste_text",
   Click: "click",
   Hover: "hover",
   SelectOption: "select_option",
@@ -596,6 +607,7 @@ export const ReadableActionTypes: {
   [key in ActionType]: string;
 } = {
   input_text: "Input Text",
+  paste_text: "Paste Text",
   click: "Click",
   hover: "Hover",
   select_option: "Select Option",
@@ -717,6 +729,12 @@ export type EvalApiResponse = Array<
   EvalWorkflow | EvalTask | EvalBrowserSession
 >;
 
+export interface EvalModelTierStat {
+  total: number;
+  perfect_count: number;
+  pass_rate: number | null;
+}
+
 export interface EvalModelSummary {
   model: string | null;
   total: number;
@@ -726,6 +744,7 @@ export interface EvalModelSummary {
   rubric_avg: number | null;
   duration_avg_s: number | null;
   last_started_at: string | null;
+  tiers?: Partial<Record<"easy" | "medium" | "hard", EvalModelTierStat>>;
 }
 
 export interface EvalSummaryResponse {
@@ -766,6 +785,10 @@ export type DebugSessionApiResponse = {
   modified_at: string;
   vnc_streaming_supported: boolean | null;
   pbs_browser_profile_id: string | null;
+};
+
+export type DebugSessionViewerStateApiResponse = {
+  active_run_session_id: string | null;
 };
 
 export type DebugLoginBlockCompatibilityResponse = {
@@ -936,6 +959,9 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
+  // fields (url, keys) do not and must not be declared here.
+  file_name?: string | null;
   // Code block recorded actions carry code_line and duration_ms here.
   output?:
     | { code_line?: number | null; duration_ms?: number | null }
@@ -1006,7 +1032,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 
@@ -1033,10 +1059,12 @@ export type CredentialApiResponse = {
   credential_type: "password" | "credit_card" | "secret";
   name: string;
   browser_profile_id?: string | null;
+  auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
+  run_sequentially?: boolean | null;
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
@@ -1078,6 +1106,7 @@ export type CreateCredentialRequest = {
   proxy_session_id?: string | null;
   rotate_proxy_session_id?: boolean;
   browser_profile_id?: string | null;
+  auto_profile_disabled?: boolean;
   pin_saved_session_ip?: boolean;
 };
 
@@ -1085,7 +1114,7 @@ export type PasswordCredential = {
   username: string;
   password: string;
   totp: string | null;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
 
@@ -1166,6 +1195,10 @@ export type PylonEmailHash = {
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;
+
+// Mirrors MIN_TIMEOUT/MAX_TIMEOUT in skyvern/schemas/browser_session_timeouts.py.
+export const BROWSER_SESSION_MIN_TIMEOUT_MINUTES = 5 as const;
+export const BROWSER_SESSION_MAX_TIMEOUT_MINUTES = 240 as const;
 
 export type TestLoginResponse = {
   credential_id: string;

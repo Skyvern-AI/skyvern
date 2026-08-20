@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 
 import structlog
+from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
 
 from skyvern.config import settings
@@ -73,6 +74,11 @@ class BrowserSessionResponse(BaseModel):
         description="Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
     )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
+    stream_transport: str | None = Field(
+        None,
+        description='Live-view transport for this session: "vnc" or "cdp". Resolved on the single-session fetch only; null elsewhere.',
+        examples=["vnc", "cdp"],
+    )
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
     downloaded_files: list[FileInfo] | None = Field(
         None, description="The list of files downloaded by the browser session"
@@ -88,13 +94,24 @@ class BrowserSessionResponse(BaseModel):
 
     @classmethod
     async def from_browser_session(
-        cls, browser_session: PersistentBrowserSession, storage: BaseStorage | None = None
+        cls,
+        browser_session: PersistentBrowserSession,
+        storage: BaseStorage | None = None,
+        *,
+        # False deliberately preserves the existing permissive timeout behavior for PATCH,
+        # active-list, and history responses; the single-session GET opts into strict lookup.
+        fail_download_lookup: bool = False,
+        # Resolving the transport costs a per-session infrastructure lookup, and the list
+        # endpoints serialize an unpaginated set concurrently. Only the single-session fetch —
+        # the one live view actually reads — pays for it.
+        include_stream_transport: bool = False,
     ) -> BrowserSessionResponse:
         """
         Creates a BrowserSessionResponse from a PersistentBrowserSession object.
 
         Args:
             browser_session: The persistent browser session to convert
+            fail_download_lookup: Raise a structured 503 when downloads cannot be listed.
 
         Returns:
             BrowserSessionResponse: The converted response object
@@ -118,6 +135,11 @@ class BrowserSessionResponse(BaseModel):
                 LOG.warning(
                     "Timeout getting downloaded files", browser_session_id=browser_session.persistent_browser_session_id
                 )
+                if fail_download_lookup:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={"code": "downloaded_files_unavailable", "retryable": True},
+                    ) from None
 
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -125,10 +147,18 @@ class BrowserSessionResponse(BaseModel):
                         organization_id=browser_session.organization_id,
                         browser_session_id=browser_session.persistent_browser_session_id,
                     )
+                    if recordings:
+                        recordings = await app.AGENT_FUNCTION.select_browser_session_recordings(
+                            organization_id=browser_session.organization_id,
+                            browser_session_id=browser_session.persistent_browser_session_id,
+                            recordings=recordings,
+                            browser_vendor=browser_session.browser_vendor,
+                        )
             except asyncio.TimeoutError:
                 LOG.warning(
                     "Timeout getting recordings", browser_session_id=browser_session.persistent_browser_session_id
                 )
+                recordings = []
 
             # Sort downloaded files by modified_at in descending order (newest first)
             # Treat None as "oldest".
@@ -144,6 +174,18 @@ class BrowserSessionResponse(BaseModel):
             upstream_cdp_url=browser_session.upstream_cdp_url,
         )
 
+        stream_transport: str | None = None
+        if include_stream_transport:
+            # The response contract admits exactly two transport words; anything else a resolver
+            # produces is withheld rather than serialized to clients.
+            stream_transport = await app.AGENT_FUNCTION.resolve_stream_transport(
+                browser_session_id=browser_session.persistent_browser_session_id,
+                organization_id=browser_session.organization_id,
+                ip_address=browser_session.ip_address,
+            )
+            if stream_transport not in ("vnc", "cdp"):
+                stream_transport = None
+
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
@@ -152,7 +194,12 @@ class BrowserSessionResponse(BaseModel):
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
             browser_address=browser_address,
-            vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address),
+            vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address)
+            and await app.AGENT_FUNCTION.supports_live_view(
+                browser_session.persistent_browser_session_id,
+                ip_address=browser_session.ip_address,
+            ),
+            stream_transport=stream_transport,
             app_url=app_url,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,

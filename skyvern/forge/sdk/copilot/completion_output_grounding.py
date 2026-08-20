@@ -43,7 +43,7 @@ _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 _MIN_CARRIER_VALUE_CHARS = 4
 _MAX_CARRIER_TEXT_CHARS = 20_000
-_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
+_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"})
 
 
 class _GroundingCtx(Protocol):
@@ -212,6 +212,40 @@ def grade_requested_output_criteria(
             continue
         if match_state == "present" and evidence_ref is not None:
             present_source = _evidence_source_for_ref(accepted_output_sources, evidence_ref)
+            present_values = _runtime_output_path_present_values(accepted_runtime_outputs, path, projection_roots)
+            emitting_label = _evidence_ref_label(evidence_ref)
+            # A registered output is keyed ``<block_label>_output`` while ``failed_block_labels`` holds
+            # the bare block label, so resolve the producer label before the failed-block check.
+            failed_block_labels = set(snapshot.failed_block_labels)
+            emitting_block_succeeded = emitting_label is not None and not (
+                emitting_label in failed_block_labels or emitting_label.removesuffix("_output") in failed_block_labels
+            )
+            independent_evidence_satisfied = (
+                effective_evidence_source != "independent_run_evidence"
+                or present_source in _INDEPENDENT_EVIDENCE_SOURCES
+            )
+            credit_by_presence = (
+                expected_shape == "value_present"
+                and not judgment_grounding_bars_self_emission
+                and emitting_block_succeeded
+                and independent_evidence_satisfied
+                and any(not _is_error_shaped_value(value) for value in present_values)
+            )
+            if credit_by_presence:
+                # value_present verifies delivery, not an exact value: a real value present at the
+                # declared path, emitted by a block that did not fail, is the verification (a missing
+                # value, failed block, error-shaped value, or unmet independent-evidence bar abstains).
+                verdicts.append(
+                    CriterionVerdict(
+                        criterion_id=criterion.id,
+                        state="satisfied",
+                        reason_code="requested_output_present",
+                        evidence_ref=evidence_ref,
+                        evidence_source=present_source,
+                        **{**trace_fields, "grounding_mode": "presence"},
+                    )
+                )
+                continue
             verdicts.append(
                 CriterionVerdict(
                     criterion_id=criterion.id,
@@ -235,7 +269,9 @@ def grade_requested_output_criteria(
             requires_independent_evidence = (
                 effective_evidence_source == "independent_run_evidence" or _is_judgment_boolean_criterion(criterion)
             )
-            if requires_independent_evidence and satisfied_source not in _INDEPENDENT_EVIDENCE_SOURCES:
+            if self_witnessed_numeric_substring(criterion, snapshot, satisfied_source) or (
+                requires_independent_evidence and satisfied_source not in _INDEPENDENT_EVIDENCE_SOURCES
+            ):
                 verdicts.append(
                     CriterionVerdict(
                         criterion_id=criterion.id,
@@ -396,7 +432,7 @@ def _carrier_confirmation(
     artifact_text = _carrier_surface_text(
         snapshot, _REGISTERED_ARTIFACT_OBSERVATION_LABEL, "registered_artifact_content"
     )
-    if artifact_text is not None and _boundary_delimited_present(value_text, artifact_text):
+    if artifact_text is not None and _value_present_in_text(value_text, artifact_text):
         return CriterionVerdict(
             criterion_id=criterion.id,
             state="satisfied",
@@ -406,11 +442,11 @@ def _carrier_confirmation(
             **trace_fields,
         )
     page_text = _carrier_surface_text(snapshot, _POST_RUN_PAGE_OBSERVATION_LABEL, "independent_page_evidence")
-    if page_text is not None and _boundary_delimited_present(value_text, page_text):
+    if page_text is not None and _value_present_in_text(value_text, page_text):
         pre_run_text = snapshot.pre_run_page_reference_text
         if pre_run_text is None:
             return None
-        if not _boundary_delimited_present(value_text, _normalized_expected_text(pre_run_text)):
+        if not _value_present_in_text(value_text, _normalized_expected_text(pre_run_text)):
             return CriterionVerdict(
                 criterion_id=criterion.id,
                 state="satisfied",
@@ -1098,6 +1134,60 @@ def _runtime_output_path_presence(
     return "missing", None
 
 
+# A block that fails to extract a value commonly returns a not-found sentinel string rather than
+# an empty value, so presence alone must not verify one for the value_present shape.
+_NOT_FOUND_SENTINELS: frozenset[str] = frozenset(
+    {
+        "n/a",
+        "n.a.",
+        "na",
+        "none",
+        "null",
+        "nil",
+        "unknown",
+        "not found",
+        "not available",
+        "not applicable",
+        "no data",
+        "no result",
+        "no results",
+        "tbd",
+        "-",
+        "--",
+    }
+)
+
+
+def _is_not_found_sentinel(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() in _NOT_FOUND_SENTINELS
+
+
+_ERROR_PAYLOAD_KEYS: frozenset[str] = frozenset({"error", "errors", "exception", "traceback"})
+
+
+def _is_error_shaped_value(value: Any) -> bool:
+    # A value_present credit must not verify a value that reports failure: a not-found sentinel, or a
+    # structured payload keyed by error/exception, is not a delivered value.
+    if _is_not_found_sentinel(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(isinstance(key, str) and key.strip().casefold() in _ERROR_PAYLOAD_KEYS for key in value)
+    return False
+
+
+def _runtime_output_path_present_values(
+    block_outputs: Mapping[str, Any], path: str, projection_roots: set[str] | None = None
+) -> list[Any]:
+    parts = _path_parts(path)
+    if not parts:
+        return []
+    for payload in block_outputs.values():
+        values, _source_path = _runtime_present_path_values(payload, parts, path, projection_roots or set())
+        if values:
+            return values
+    return []
+
+
 def _runtime_path_values(
     payload: Any, parts: list[str], path: str, projection_roots: set[str]
 ) -> tuple[list[Any], str]:
@@ -1215,6 +1305,51 @@ def _normalized_expected_text(value: Any) -> str:
 
 def _compact_expected_text(value: str) -> str:
     return "".join(char for char in value if char.isalnum())
+
+
+def self_witnessed_numeric_substring(
+    criterion: CompletionCriterion,
+    snapshot: RunEvidenceSnapshot,
+    satisfied_source: EvidenceSourceKind | None,
+) -> bool:
+    """A registered number whose own evidence text carries it only inside a different quantity.
+
+    "8" reads as present in a tile's "-8.0%" delta while the visitor count it claims to be is 8.45K,
+    so the block's assertion becomes the only proof of itself (SKY-13332). A registered value that
+    stands on its own in the evidence, or that the evidence never mentions, is not this shape.
+    """
+    if satisfied_source != "registered_output_parameter":
+        return False
+    value_text = _carrier_scalar_text(criterion.expected_output_value)
+    if value_text is None or not value_text.replace(",", "").isdigit():
+        return False
+    for payload in snapshot.block_outputs.values():
+        if not isinstance(payload, Mapping):
+            continue
+        evidence_text = payload.get("evidence_text")
+        if not isinstance(evidence_text, str) or not evidence_text.strip():
+            continue
+        normalized = _normalized_expected_text(evidence_text)
+        if _value_present_in_text(value_text, normalized) and not _standalone_number_present(value_text, normalized):
+            return True
+    return False
+
+
+def _standalone_number_present(value_text: str, text: str) -> bool:
+    """Whether the value appears as a number in its own right, not inside a larger figure."""
+    needle = value_text.replace(",", "")
+    for match in re.finditer(r"\d[\d,]*(?:\.\d+)?", text):
+        token = match.group(0)
+        trailing = text[match.end() : match.end() + 1]
+        if trailing == "%" and token.replace(",", "") == needle:
+            continue
+        if token.replace(",", "") == needle:
+            return True
+    return False
+
+
+def _value_present_in_text(value_text: str, text: str) -> bool:
+    return _boundary_delimited_present(value_text, text)
 
 
 def _normalize_output_path(path: str | None) -> str:

@@ -33,8 +33,8 @@ function CreateNewTaskFormPage() {
   }
 
   if (template === "from-prompt") {
-    const data = location.state?.data as TaskGenerationApiResponse;
-    if (!data.url) {
+    const data = location.state?.data as TaskGenerationApiResponse | undefined;
+    if (!data || !data.url) {
       return <div>Something went wrong, please try again</div>; // this should never happen
     }
     return (

@@ -40,7 +40,10 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
-import { handleVncClipboardPasteShortcut } from "@/components/browserStreamClipboard";
+import {
+  handleVncClipboardPasteShortcut,
+  type HeldMetaSides,
+} from "@/components/browserStreamClipboard";
 
 import "./browser-stream.css";
 
@@ -328,7 +331,6 @@ function BrowserStream({
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
-  const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
   const [terminalDiagnostic, setTerminalDiagnostic] =
@@ -347,6 +349,10 @@ function BrowserStream({
   const rfbRef = useRef<RFB | null>(null);
   const onActivityRef = useRef(onActivity);
   const userCanSendVncInputRef = useRef(false);
+  const heldMetaSidesRef = useRef<HeldMetaSides>({
+    left: false,
+    right: false,
+  });
   const observerRef = useRef<MutationObserver | null>(null);
   const messageReconnectAttemptsRef = useRef(0);
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -430,15 +436,6 @@ function BrowserStream({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
 
-  // effect for vnc disconnects only
-  useEffect(() => {
-    if (prevVncConnectedRef.current && !isVncConnected) {
-      setVncDisconnectedTrigger((x) => x + 1);
-      onClose?.();
-    }
-    prevVncConnectedRef.current = isVncConnected;
-  }, [isVncConnected, onClose]);
-
   // message channel reconnect policy
   useEffect(() => {
     const messageJustClosed =
@@ -506,6 +503,7 @@ function BrowserStream({
       }
 
       let cancelled = false;
+      let didDisconnect = false;
 
       async function setupVnc() {
         if (rfbRef.current && isVncConnected) {
@@ -594,9 +592,12 @@ function BrowserStream({
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
+          if (cancelled || didDisconnect) return;
+          didDisconnect = true;
           setIsVncConnected(false);
           setIsCanvasReady(false);
-          if (cancelled) return;
+          setVncDisconnectedTrigger((x) => x + 1);
+          onClose?.();
           const clean = Boolean(e.detail?.clean);
           setTerminalDiagnostic(
             (prev) =>
@@ -608,8 +609,6 @@ function BrowserStream({
                   }
                 : {
                     title: "The browser stream slipped away",
-                    detail:
-                      "The browser stream dropped before everything wrapped up.",
                     hint: "Refresh the page or switch to local browser streaming.",
                   }),
           );
@@ -927,16 +926,63 @@ function BrowserStream({
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Track only Meta keydowns noVNC's canvas receives: restoring a side noVNC never tracked would strand the modifier remotely, since noVNC drops keyups for keys it never saw down.
+      if (event.key === "Meta" && event.target instanceof HTMLCanvasElement) {
+        if (event.code === "MetaLeft") {
+          heldMetaSidesRef.current = {
+            ...heldMetaSidesRef.current,
+            left: true,
+          };
+        } else if (event.code === "MetaRight") {
+          heldMetaSidesRef.current = {
+            ...heldMetaSidesRef.current,
+            right: true,
+          };
+        }
+      }
+
       if (!userCanSendVncInputRef.current) {
         return;
       }
 
-      void handleVncClipboardPasteShortcut(event, rfbRef.current);
+      void handleVncClipboardPasteShortcut(event, rfbRef.current, {
+        getHeldMetaSides: () => heldMetaSidesRef.current,
+        onPasteError: () => {
+          toast({
+            title: "Paste failed",
+            description:
+              "Skyvern couldn't read your clipboard. Allow clipboard access for this site and try again.",
+            variant: "destructive",
+          });
+        },
+      });
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Meta" && event.code === "MetaLeft") {
+        heldMetaSidesRef.current = {
+          ...heldMetaSidesRef.current,
+          left: false,
+        };
+      } else if (event.key === "Meta" && event.code === "MetaRight") {
+        heldMetaSidesRef.current = {
+          ...heldMetaSidesRef.current,
+          right: false,
+        };
+      }
+    };
+
+    const handleBlur = () => {
+      heldMetaSidesRef.current = { left: false, right: false };
     };
 
     canvasContainer.addEventListener("keydown", handleKeyDown, true);
+    window.addEventListener("keyup", handleKeyUp, true);
+    window.addEventListener("blur", handleBlur);
     return () => {
       canvasContainer.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      window.removeEventListener("blur", handleBlur);
     };
   }, [canvasContainer]);
 

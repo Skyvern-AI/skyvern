@@ -9,16 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Awaitable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import docx
+import pandas as pd
 import pytest
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.workflow.exceptions import InvalidFileType
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
@@ -52,6 +57,34 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
         block_type=BlockType.PDF_PARSER,
         output_parameter=_make_output_parameter("test_output"),
         file_url=file_url,
+    )
+
+
+def _mock_workflow_run_context() -> MagicMock:
+    ctx = MagicMock()
+    ctx.has_parameter.return_value = False
+    ctx.has_value.return_value = False
+    ctx.register_output_parameter_value_post_execution = AsyncMock()
+    return ctx
+
+
+async def _execute_with_downloaded_file(
+    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> BlockResult:
+    workflow_run_context = _mock_workflow_run_context()
+    monkeypatch.setattr(
+        FileParserBlock,
+        "get_workflow_run_context",
+        lambda _self, _workflow_run_id: workflow_run_context,
+    )
+    monkeypatch.setattr(
+        block_module,
+        "resolve_local_or_download_file",
+        AsyncMock(return_value=str(file_path)),
+    )
+    return await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
     )
 
 
@@ -146,6 +179,60 @@ class TestValidateFileType:
         block = _make_file_parser_block("https://example.com/empty.docx", FileType.DOCX)
         with pytest.raises(InvalidFileType):
             block.validate_file_type("https://example.com/empty.docx", str(path))
+
+
+@pytest.mark.asyncio
+class TestFileParserBlockAutoDetectExecution:
+    async def test_docx_downloaded_from_extensionless_url_is_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == {"value": "Hello\nWorld"}
+
+    async def test_legacy_doc_reports_conversion_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "document.doc"
+        path.write_bytes(b"not a real legacy document")
+        block = _make_file_parser_block("https://example.com/document.doc", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "Legacy .doc format" in result.failure_reason
+        assert "convert the file to .docx" in result.failure_reason
+
+    async def test_unknown_binary_reports_auto_detect_not_csv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
+        assert "File contains binary data" in result.failure_reason
+
+    async def test_legacy_csv_default_unknown_binary_reports_auto_detect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.CSV)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
 
 
 @pytest.mark.asyncio
@@ -778,3 +865,282 @@ class TestOcrPdfPages:
 
         assert handler.await_count == 2
         assert "page A" in result and "page B" in result
+
+
+BLOCKING_PARSE_SECONDS = 0.3
+TICK_INTERVAL_SECONDS = 0.01
+
+
+async def _count_event_loop_ticks_during(awaitable: Awaitable[Any]) -> tuple[Any, int]:
+    """Await ``awaitable`` while a sibling task ticks; returns (result, tick_count).
+
+    Zero ticks means the awaited work held the event loop for its entire duration — the
+    same starvation that stops the workflow activity's heartbeat task.
+    """
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            await asyncio.sleep(TICK_INTERVAL_SECONDS)
+            ticks += 1
+
+    ticker_task = asyncio.create_task(ticker())
+    # Let the ticker reach its first await before the blocking work starts.
+    await asyncio.sleep(0)
+    try:
+        result = await awaitable
+    finally:
+        stop.set()
+        ticker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ticker_task
+    return result, ticks
+
+
+def _blocking(return_value: Any = None, seconds: float = BLOCKING_PARSE_SECONDS) -> Any:
+    def _call(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(seconds)
+        return return_value
+
+    return _call
+
+
+def _cpu_bound(return_value: Any = None, seconds: float = BLOCKING_PARSE_SECONDS) -> Any:
+    """Like _blocking, but burns CPU in pure Python so it holds the GIL.
+
+    time.sleep releases the GIL; the PDF text extractors do not. Only a busy loop shows
+    that offloading keeps the loop responsive against the real workload.
+    """
+
+    def _call(*args: Any, **kwargs: Any) -> Any:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            pass
+        return return_value
+
+    return _call
+
+
+@pytest.mark.asyncio
+class TestParsingDoesNotBlockEventLoop:
+    """A slow parse must not hold the event loop.
+
+    The workflow activity heartbeats from an asyncio task on the same loop. Parsing
+    synchronously starves that task, and Temporal reaps the whole run once the heartbeat
+    timeout elapses, so every blocking parse step has to run off the loop.
+    """
+
+    async def test_pdf_text_extraction_yields_to_event_loop(self) -> None:
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                _blocking("extracted text"),
+            )
+            text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
+        assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_gil_holding_pdf_extraction_yields_to_event_loop(self) -> None:
+        """The extractors are pure Python, so they hold the GIL for the whole parse."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                _cpu_bound("extracted text"),
+            )
+            text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
+        assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_docx_parse_yields_to_event_loop(self) -> None:
+        block = _make_file_parser_block("https://example.com/large.docx", FileType.DOCX)
+        document = MagicMock(paragraphs=[], tables=[])
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.docx.Document", _blocking(document))
+            _, ticks = await _count_event_loop_ticks_during(block._parse_docx_file("/tmp/large.docx"))
+
+        assert ticks > 0
+
+    async def test_excel_parse_yields_to_event_loop(self) -> None:
+        block = _make_file_parser_block("https://example.com/large.xlsx", FileType.EXCEL)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.pd.read_excel",
+                _blocking(pd.DataFrame([{"name": "Alice"}])),
+            )
+            rows, ticks = await _count_event_loop_ticks_during(block._parse_excel_file("/tmp/large.xlsx"))
+
+        assert rows == [{"name": "Alice"}]
+        assert ticks > 0
+
+    async def test_csv_parse_yields_to_event_loop(self, tmp_path: Path) -> None:
+        block = _make_file_parser_block("https://example.com/large.csv", FileType.CSV)
+        csv_path = tmp_path / "large.csv"
+        csv_path.write_text("name,city\nAlice,Denver\n")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "_sniff_csv_delimiter", _blocking((",", "utf-8")))
+            rows, ticks = await _count_event_loop_ticks_during(block._parse_csv_file(str(csv_path)))
+
+        assert rows == [{"name": "Alice", "city": "Denver"}]
+        assert ticks > 0
+
+    async def test_pdf_page_rendering_yields_to_event_loop(self) -> None:
+        """The scanned-PDF fallback renders every page to PNG before any LLM call."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "")
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+                _blocking([]),
+            )
+            _, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/scan.pdf"))
+
+        assert ticks > 0
+
+    async def test_execute_validation_yields_to_event_loop(self) -> None:
+        """Validation opens the document too, so it is as slow as the parse on a large file."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/large.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", _blocking(None))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "text")
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+            mp.setattr(FileParserBlock, "build_block_result", AsyncMock(return_value=MagicMock(success=True)))
+
+            result, ticks = await _count_event_loop_ticks_during(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test")
+            )
+
+        assert result.success is True
+        assert ticks > 0
+
+    async def test_deprecated_pdf_parser_block_yields_to_event_loop(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/large.pdf")
+        mock_ctx = _mock_workflow_run_context()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(PDFParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(PDFParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/large.pdf"),
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                _blocking("extracted text"),
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: AsyncMock(return_value={"extracted_information": "ok"}),
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+                MagicMock(return_value="prompt"),
+            )
+            mp.setattr(PDFParserBlock, "record_output_parameter_value", AsyncMock())
+            mp.setattr(PDFParserBlock, "build_block_result", AsyncMock(return_value=MagicMock(success=True)))
+
+            _, ticks = await _count_event_loop_ticks_during(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test")
+            )
+
+        assert ticks > 0
+
+
+@pytest.mark.asyncio
+class TestParseStepTimeout:
+    """A pathological document must fail its own block instead of consuming the whole run."""
+
+    async def test_pdf_text_extraction_times_out(self) -> None:
+        block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSE_STEP_TIMEOUT_SECONDS", 0.05)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", _blocking("never returned"))
+
+            with pytest.raises(FileParseTimeout) as exc_info:
+                await block._parse_pdf_file("/tmp/huge.pdf")
+
+        assert "huge.pdf" in str(exc_info.value)
+
+    async def test_execute_records_timeout_as_block_failure(self) -> None:
+        """The block fails with FILE_PARSER_ERROR; the run survives to its next block."""
+        block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/huge.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSE_STEP_TIMEOUT_SECONDS", 0.05)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", _blocking("never returned"))
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            result = await block.execute(
+                workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"
+            )
+
+        assert result.success is False
+        assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
+        assert "timed out" in captured["failure_reason"].lower()
+
+    async def test_validation_timeout_fails_the_block(self) -> None:
+        block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)
+        mock_ctx = _mock_workflow_run_context()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/huge.pdf"),
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSE_STEP_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "validate_file_type", _blocking(None))
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            result = await block.execute(
+                workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"
+            )
+
+        assert result.success is False
+        assert "timed out" in captured["failure_reason"].lower()
+        assert "file type validation" in captured["failure_reason"]

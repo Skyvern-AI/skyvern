@@ -16,7 +16,6 @@ import {
 type StreamBody = {
   message: string;
   workflow_run_id?: string | null;
-  fix_origin?: boolean;
 };
 type StreamCall = {
   body: StreamBody;
@@ -98,6 +97,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 

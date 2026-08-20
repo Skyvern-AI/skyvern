@@ -79,6 +79,10 @@ def _normalize_floor_rekeyed_association(marker: object, path: object) -> tuple[
     return False, None
 
 
+def _stored_requested_output_label(raw: object) -> str | None:
+    return raw.strip() or None if isinstance(raw, str) else None
+
+
 @dataclass(frozen=True)
 class StoredCriteriaSet:
     set_id: str
@@ -175,6 +179,8 @@ def criteria_to_json(criteria: tuple[CompletionCriterion, ...] | list[Completion
             "classification_output_key": criterion.classification_output_key,
             "expected_classification": criterion.expected_classification,
         }
+        if criterion.requested_output_label is not None:
+            item["requested_output_label"] = criterion.requested_output_label
         if criterion.deliverable_confirmation_criterion_id is not None:
             item["deliverable_confirmation_criterion_id"] = criterion.deliverable_confirmation_criterion_id
         if criterion.kind == "terminal_action":
@@ -379,6 +385,7 @@ def criteria_from_json(raw: Any) -> tuple[CompletionCriterion, ...]:
             method_mandated=stored_method_mandated,
             level=stored_level,  # type: ignore[arg-type]
             output_path=stored_output_path,
+            requested_output_label=_stored_requested_output_label(item.get("requested_output_label")),
             expected_output_value=stored_expected_output_value,
             expected_output_shape=stored_expected_output_shape,
             requested_output_evidence_source=cast(RequestedOutputEvidenceSource, requested_output_evidence_source),

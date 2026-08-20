@@ -1,5 +1,7 @@
 import { fetchToCurl } from "fetch-to-curl";
 
+import { getRuntimeApiKeyExpiresAt } from "@/util/env";
+
 export interface ApiCommandOptions {
   method: string;
   url: string;
@@ -60,4 +62,19 @@ function generateApiCommands(options: ApiCommandOptions): {
   return { curl, powershell };
 }
 
-export { generateApiCommands };
+// The browser holds a scoped session token rather than the organization key, so a copied command
+// stops working when that token expires. Say so at copy time — the expiry is otherwise invisible.
+function describeCopiedCommand(kind: string): string {
+  const expiresAt = getRuntimeApiKeyExpiresAt();
+  if (expiresAt === null) {
+    return `The ${kind} command has been copied to your clipboard.`;
+  }
+  const expiry = new Date(expiresAt * 1000).toLocaleTimeString();
+  return (
+    `The ${kind} command has been copied to your clipboard. It embeds a short-lived session ` +
+    `token that expires at ${expiry} — for scheduled or long-lived use, substitute an ` +
+    `organization API key from your server configuration.`
+  );
+}
+
+export { generateApiCommands, describeCopiedCommand };

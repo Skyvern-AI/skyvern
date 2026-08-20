@@ -300,6 +300,85 @@ def test_inactivity_timeout_is_not_infrastructure() -> None:
     assert "PAGE_LOAD_TIMEOUT" in categories
 
 
+def test_secure_codeblock_runner_unavailable_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert categories[0] == "INFRASTRUCTURE_ERROR"
+    assert "UNKNOWN" not in categories
+
+
+def test_secure_codeblock_runner_unavailable_carries_a_reason_code() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner is unavailable. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
+    assert len(infra) == 1
+    assert infra[0]["reason_code"] == "secure_codeblock_runner_unavailable"
+
+
+def test_ordinary_user_code_failure_is_not_infrastructure() -> None:
+    # A block that reached the sandbox and raised is a user-code fault, not a deploy fault.
+    reason = "code block failed. failure reason: CodeBlock failed while running user code."
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
+def test_secure_codeblock_runner_internal_failure_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: Secure CodeBlock runner failed before completing. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    assert result[0]["category"] == "INFRASTRUCTURE_ERROR"
+    assert result[0]["reason_code"] == "secure_codeblock_runner_internal"
+    assert "UNKNOWN" not in [entry["category"] for entry in result]
+
+
+def test_secure_codeblock_sandbox_exited_carries_its_own_reason_code() -> None:
+    reason = (
+        "code block failed. failure reason: Secure CodeBlock sandbox process exited before completing. Please retry."
+    )
+    result = _classify(reason, fallback_to_unknown=True)
+
+    infra = [entry for entry in result if entry["category"] == "INFRASTRUCTURE_ERROR"]
+    assert len(infra) == 1
+    assert infra[0]["reason_code"] == "secure_codeblock_sandbox_exited"
+
+
+def test_secure_codeblock_sandbox_exited_ranks_below_the_unambiguous_runner_arms() -> None:
+    # child_exited can also be user code self-terminating, so its confidence must stay
+    # strictly below the runner-internal arm's.
+    exited = _classify(
+        "code block failed. failure reason: Secure CodeBlock sandbox process exited before completing. Please retry.",
+        fallback_to_unknown=True,
+    )
+    internal = _classify(
+        "code block failed. failure reason: Secure CodeBlock runner failed before completing. Please retry.",
+        fallback_to_unknown=True,
+    )
+
+    assert exited[0]["confidence_float"] < internal[0]["confidence_float"]
+
+
+def test_secure_codeblock_runner_busy_classifies_as_infrastructure() -> None:
+    reason = "code block failed. failure reason: CodeBlock runner is already executing another CodeBlock. Please retry."
+    result = _classify(reason, fallback_to_unknown=True)
+
+    assert result[0]["category"] == "INFRASTRUCTURE_ERROR"
+    assert result[0]["reason_code"] == "secure_codeblock_runner_busy"
+
+
+def test_user_code_crash_mentioning_process_exit_is_not_infrastructure() -> None:
+    # User-code detail prose can echo the words of the sandbox-exit message; only the
+    # runner-authored literal may classify as infrastructure.
+    reason = (
+        "code block failed. failure reason: CodeBlock failed with RuntimeError at line 3: process exited with code 1."
+    )
+    categories = _categories_for(reason, fallback_to_unknown=True)
+
+    assert "INFRASTRUCTURE_ERROR" not in categories
+
+
 @pytest.mark.asyncio
 async def test_page_analysis_timeout_reason_ranks_page_load_timeout() -> None:
     browser_state = MagicMock()
@@ -321,3 +400,92 @@ async def test_non_timeout_scraping_reason_stays_data_extraction() -> None:
     generic_reason = await build_scraping_failed_reason(browser_state, "https://example.com/path", timed_out=False)
     assert "timeout" not in generic_reason.lower()
     assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
+
+
+def test_exception_name_classifies_when_instance_absent() -> None:
+    """A bare cause-type name classifies via exception_name — the Temporal activity-failure
+    path only carries the class name across the serialization boundary, not the instance."""
+    result = classify_from_failure_reason(None, exception_name="BitwardenVaultError", fallback_to_unknown=True)
+
+    assert result is not None
+    assert result[0]["category"] == "CREDENTIAL_ERROR"
+
+
+def test_exception_name_is_ignored_when_instance_provided() -> None:
+    result = classify_from_failure_reason(
+        "boom", exception=ElementNotFoundError(), exception_name="BitwardenVaultError"
+    )
+
+    assert result is not None
+    assert result[0]["category"] == "ELEMENT_NOT_FOUND"
+
+
+def test_exception_name_alone_returns_none_when_unrecognized() -> None:
+    assert classify_from_failure_reason(None, exception_name="ValueError") is None
+
+
+_LOCATOR_WAIT_TIMEOUT = (
+    "Failed to execute code block. Reason: TimeoutError: Locator.wait_for: Timeout 60000ms exceeded. "
+    'Call log: - waiting for locator("button[aria-label=\\"Log in\\"]")'
+)
+
+
+def test_locator_wait_timeout_is_an_element_state_failure_not_a_page_load_one() -> None:
+    categories = [result["category"] for result in _classify(_LOCATOR_WAIT_TIMEOUT)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+
+
+def test_navigation_timeout_is_still_a_page_load_failure() -> None:
+    categories = [result["category"] for result in _classify("Page.goto: Timeout 30000ms exceeded")]
+
+    assert "PAGE_LOAD_TIMEOUT" in categories
+    assert "ELEMENT_STATE_TIMEOUT" not in categories
+
+
+def test_a_selector_naming_a_password_field_is_not_an_auth_failure() -> None:
+    # The word is part of the locator the wait timed out on, not evidence that login was rejected.
+    reason = 'TimeoutError: Locator.wait_for: Timeout 10000ms exceeded. Call log: - waiting for locator("#password")'
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_genuine_auth_failure_still_classifies() -> None:
+    categories = [result["category"] for result in _classify("login failed: incorrect password")]
+
+    assert "AUTH_FAILURE" in categories
+
+
+def test_a_bare_waiting_for_locator_timeout_is_an_element_state_failure() -> None:
+    # Truncated Playwright messages drop the "Locator.method:" prefix and keep only the call log.
+    reason = "Timeout 30000ms exceeded waiting for locator('#password')"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_waiting_for_selector_timeout_is_an_element_state_failure() -> None:
+    reason = "Timeout 30000ms exceeded waiting for selector '#login-btn'"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "ELEMENT_STATE_TIMEOUT" in categories
+    assert "PAGE_LOAD_TIMEOUT" not in categories
+    assert "AUTH_FAILURE" not in categories
+
+
+def test_a_genuine_auth_failure_survives_an_appended_element_timeout() -> None:
+    # Page-derived text can carry both; the element timeout must not silence the auth signal.
+    reason = "Login failed: incorrect password; Timeout 5000ms exceeded on wait_for_selector"
+
+    categories = [result["category"] for result in _classify(reason)]
+
+    assert "AUTH_FAILURE" in categories
+    assert "ELEMENT_STATE_TIMEOUT" in categories
