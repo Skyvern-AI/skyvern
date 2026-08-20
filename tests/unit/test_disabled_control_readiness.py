@@ -120,6 +120,7 @@ async def test_input_handler_classifies_control_that_stays_disabled() -> None:
     element.get_frame.return_value = MagicMock()
     element.get_locator.return_value = MagicMock()
     element.supports_text_input = AsyncMock(return_value=True)
+    element.get_attr = AsyncMock(return_value=None)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
     frame = MagicMock()

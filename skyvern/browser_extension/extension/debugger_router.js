@@ -96,22 +96,23 @@ export class DebuggerRouter {
     return this.tabScope.runTabOperation(tabId, async () => {
       await this.tabScope.assertScoped(tabId);
       if (!this.attachedTabs.has(tabId)) {
-        throw new ProtocolError(
-          ERROR_CODES.DEBUGGER_DETACHED,
-          "The debugger is not attached to this tab.",
-        );
+        await this.tabScope.handleDebuggerDetachLocked(tabId);
+        return {};
       }
       try {
         await chrome.debugger.detach({ tabId });
       } catch {
-        throw new ProtocolError(
-          ERROR_CODES.DEBUGGER_DETACHED,
-          "The debugger is not attached to this tab.",
-        );
+        if (await this.isDebuggerStillAttached(tabId)) {
+          throw new ProtocolError(
+            ERROR_CODES.CDP_ERROR,
+            "Chrome could not detach the debugger from this tab.",
+          );
+        }
       }
       this.attachedTabs.delete(tabId);
       this.forgetChildTargets(tabId);
       this.onAttachedChange();
+      await this.tabScope.handleDebuggerDetachLocked(tabId);
       return {};
     });
   }

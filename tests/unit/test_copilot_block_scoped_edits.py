@@ -43,6 +43,42 @@ class TestAnchoredCodeEdit:
         # the untouched block survives byte-for-byte
         assert 'await page.goto("https://example.test/")' in out
 
+    def test_leaves_every_non_target_byte_identical(self) -> None:
+        replacement = '"#grand-total"'
+
+        out = apply_block_edit(_WORKFLOW, "read_total", expected_code='"#total"', replacement_code=replacement)
+
+        assert out.replace(replacement, '"#total"') == _WORKFLOW
+
+    def test_preserves_comments_parameters_metadata_and_unrelated_schema_errors(self) -> None:
+        workflow = """# retained document comment
+title: Lookup
+workflow_definition:
+  parameters:
+    - key: query
+      parameter_type: workflow
+      workflow_parameter_type: string
+  blocks:
+    - block_type: code
+      label: open_portal
+      code: |
+        await page.goto("https://example.test/")
+      unknown_future_field: keep-me # accepted by an earlier schema
+      next_block_label: read_total
+    - block_type: code
+      label: read_total
+      code: |
+        total = await page.inner_text("#total")
+        return {"total": total}
+      parameter_keys: [query]
+  code_artifact_metadata:
+    read_total: {artifact_id: artifact-1, note: keep-style}
+"""
+
+        out = apply_block_edit(workflow, "read_total", expected_code='"#total"', replacement_code='"#amount"')
+
+        assert out.replace('"#amount"', '"#total"') == workflow
+
     def test_a_stale_anchor_fails_instead_of_overwriting(self) -> None:
         """The property the whole design turns on: an edit written against a copy of the block that
         has since changed must be refused, not applied over whatever is there now."""
@@ -69,6 +105,20 @@ class TestAnchoredCodeEdit:
     def test_a_half_specified_code_edit_is_refused(self) -> None:
         with pytest.raises(BlockEditError):
             apply_block_edit(_WORKFLOW, "read_total", expected_code="total")
+
+    def test_empty_replacement_remains_valid_yaml_before_a_following_key(self) -> None:
+        out = apply_block_edit(
+            _WORKFLOW,
+            "open_portal",
+            expected_code='await page.goto("https://example.test/")\n',
+            replacement_code="",
+        )
+
+        parsed = yaml.safe_load(out)
+        first_block = parsed["workflow_definition"]["blocks"][0]
+        assert first_block["code"] == ""
+        assert first_block["next_block_label"] == "read_total"
+        assert "code: ''\n      next_block_label: read_total" in out
 
     def test_unknown_label_names_what_exists(self) -> None:
         with pytest.raises(BlockEditError) as exc:

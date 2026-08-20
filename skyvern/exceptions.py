@@ -242,6 +242,16 @@ class PhoneNumberInputMismatch(SkyvernException):
         )
 
 
+class PhoneNumberInputBrowserValidityMismatch(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input failed the browser validity check.")
+
+
+class PhoneNumberInputBrowserInteractionFailed(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input browser interaction failed.")
+
+
 class CardNumberInputMismatch(SkyvernException):
     def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
         self.expected_digit_count = expected_digit_count

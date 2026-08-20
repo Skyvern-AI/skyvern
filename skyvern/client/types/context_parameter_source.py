@@ -51,9 +51,6 @@ class ContextParameterSource_Context(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .context_parameter import ContextParameter  # noqa: E402, F401, I001
-
-
 class ContextParameterSource_AwsSecret(UniversalBaseModel):
     parameter_type: typing.Literal["aws_secret"] = "aws_secret"
     key: str
@@ -275,4 +272,10 @@ ContextParameterSource = typing.Union[
     ContextParameterSource_Output,
     ContextParameterSource_Credential,
 ]
+
+# Manual patch: Fern v4.31.1 emits this cross-import mid-file, so entering
+# context_parameter_source first sees a partially initialized context_parameter.
+# Importing after the union is defined makes both entry orders resolve.
+from .context_parameter import ContextParameter  # noqa: E402, F401, I001
+
 update_forward_refs(ContextParameterSource_Context)

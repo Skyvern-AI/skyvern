@@ -31,6 +31,7 @@ class StubRelay:
         self.fail_send_keys: dict[tuple[str | None, str], ExtensionRequestError] = {}
         self.send_started: dict[tuple[str | None, str], asyncio.Event] = {}
         self.release_send: dict[tuple[str | None, str], asyncio.Event] = {}
+        self.released_tabs: list[int] = []
 
     async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict:
         self.calls.append((op, args))
@@ -64,6 +65,10 @@ class StubRelay:
                 return {"result": {"frameTree": {"frame": {"id": frame_id}}}}
             return {"result": {"forwardedMethod": args["method"]}}
         return {}
+
+    async def release_tab(self, tab_id: int) -> None:
+        self.released_tabs.append(tab_id)
+        await self.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
 
 
 @pytest_asyncio.fixture
@@ -320,8 +325,13 @@ async def test_auto_attach_post_reply_failure_skips_failed_tab_without_second_re
             assert attached["params"]["targetInfo"]["targetId"] == "tab-31"
             with pytest.raises(TimeoutError):
                 await ws.receive_json(timeout=0.05)
+            await ws.send_json({"id": 2, "method": "Browser.close", "params": {}})
+            assert await receive_response(ws, 2) == {"id": 2, "result": {}}
+            await ws.receive(timeout=1)
     finally:
         await adapter.stop()
+
+    assert set(relay.released_tabs) == {30, 31}
 
 
 @pytest.mark.asyncio
@@ -1350,3 +1360,4 @@ async def test_browser_close_detaches_all_tabs_when_client_closes_after_reply(
 
     assert {args["tabId"] for op, args in relay.calls if op == "debugger.detach"} == {22, 23}
     assert all(op != "tabs.remove" for op, _ in relay.calls)
+    assert set(relay.released_tabs) == {22, 23}

@@ -66,6 +66,7 @@ _MAX_MODAL_DISMISS_CONTROLS = 6
 _MAX_PAGE_OBSTRUCTIONS = 5
 _MAX_VISIBLE_CONTROLS = 6
 _MAX_CLICKABLE_CONTROLS = 12
+_MAX_DISCLOSURE_CONTROL_ID_CHARS = 120
 _MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
 _MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
 _MAX_VISIBLE_TEXT_EXCERPT_CHARS = 3000
@@ -304,6 +305,40 @@ def _satisfiable_form_path(forms: Any) -> bool:
         ):
             return True
     return False
+
+
+def _collapsed_disclosure_controls(controls: Any) -> list[dict[str, Any]]:
+    if not isinstance(controls, list):
+        return []
+    return [
+        control
+        for control in controls
+        if isinstance(control, dict)
+        and control.get("expanded") is False
+        and isinstance(control.get("controls"), str)
+        and bool(control["controls"].strip())
+        and control.get("controlled_region_visible") is False
+    ]
+
+
+def has_satisfiable_collapsed_disclosure_path(evidence: dict[str, Any]) -> bool:
+    """Return whether evidence carries an enabled control for a collapsed region."""
+    if not settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+        return False
+    controls = list(evidence.get("clickable_controls") or [])
+    controls.extend(
+        control
+        for form in evidence.get("forms") or []
+        if isinstance(form, dict)
+        for control in form.get("submit_controls") or []
+        if isinstance(control, dict)
+    )
+    # This exception stops recapture, so only rendered structured evidence may establish it. Static
+    # HTML intentionally omits `visible` because stylesheets and layout are unavailable there.
+    return any(
+        _usable_control(control) and control.get("visible") is True
+        for control in _collapsed_disclosure_controls(controls)
+    )
 
 
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
@@ -1603,7 +1638,26 @@ def _selector_is_live_unique_in_soup(soup: Any, selector: str) -> bool:
         return False
 
 
-def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dict[str, Any]]:
+def _html_disclosure_facts(node: Any, controlled_region_visibility: dict[str, bool]) -> dict[str, Any]:
+    expanded = _attr_value(node, "aria-expanded").strip().lower()
+    if expanded not in {"true", "false"}:
+        return {}
+    facts: dict[str, Any] = {"expanded": expanded == "true"}
+    controls = _attr_value(node, "aria-controls").strip()
+    if not controls or len(controls) > _MAX_DISCLOSURE_CONTROL_ID_CHARS:
+        return facts
+    facts["controls"] = controls
+    controlled_ids = controls.split()
+    if controlled_ids and all(controlled_id in controlled_region_visibility for controlled_id in controlled_ids):
+        facts["controlled_region_visible"] = any(
+            controlled_region_visibility[controlled_id] for controlled_id in controlled_ids
+        )
+    return facts
+
+
+def _clickable_controls_html(
+    soup: Any, *, used_selectors: set[str], controlled_region_visibility: dict[str, bool]
+) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
@@ -1622,14 +1676,29 @@ def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dic
         text = _schema_text(_clickable_control_text(node), 120)
         selector = _clickable_control_selector(node)
         if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append({"text": text, "selector": _bounded_selector(selector), "tag": tag_name})
+            controls.append(
+                {
+                    "text": text,
+                    "selector": _bounded_selector(selector),
+                    "tag": tag_name,
+                    **({"disabled": True} if _control_disabled(node) else {}),
+                    **_html_disclosure_facts(node, controlled_region_visibility),
+                }
+            )
             seen_selectors.add(selector)
             if text:
                 seen_text.add(text)
             continue
         if not text or text in seen_text:
             continue
-        controls.append({"text": text, "tag": tag_name})
+        controls.append(
+            {
+                "text": text,
+                "tag": tag_name,
+                **({"disabled": True} if _control_disabled(node) else {}),
+                **_html_disclosure_facts(node, controlled_region_visibility),
+            }
+        )
         seen_text.add(text)
     return controls
 
@@ -2533,6 +2602,12 @@ def parse_composition_html(
     page_title = _page_title(soup)
     challenge_controls = _challenge_controls(soup)
     anti_bot_indicators = _anti_bot_indicators(html or "", page_title)
+    controlled_region_visibility: dict[str, bool] = {}
+    for control in soup.select("[aria-expanded][aria-controls]"):
+        for controlled_id in _attr_value(control, "aria-controls").split():
+            controlled_region = soup.find(id=controlled_id)
+            if controlled_region is not None:
+                controlled_region_visibility[controlled_id] = not _is_hidden_modal_candidate(controlled_region)
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
@@ -2573,6 +2648,7 @@ def parse_composition_html(
                         "type": field_type[:40],
                         "disabled": _control_disabled(node),
                         "selector": _bounded_selector(_selector_for(node)),
+                        **_html_disclosure_facts(node, controlled_region_visibility),
                     }
                 )
                 continue
@@ -2664,7 +2740,11 @@ def parse_composition_html(
         selector = target.get("selector")
         if isinstance(selector, str) and selector:
             used_selectors.add(selector)
-    clickable_controls = _clickable_controls_html(soup, used_selectors=used_selectors)
+    clickable_controls = _clickable_controls_html(
+        soup,
+        used_selectors=used_selectors,
+        controlled_region_visibility=controlled_region_visibility,
+    )
 
     field_count = sum(len(form.get("fields") or []) for form in forms)
     control_count = sum(len(form.get("submit_controls") or []) for form in forms)
@@ -2792,6 +2872,20 @@ def _attach_node_evidence(entry: dict[str, Any], node: dict[str, Any]) -> dict[s
     return entry
 
 
+def _attach_structured_disclosure_facts(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    expanded = node.get("expanded")
+    if not isinstance(expanded, bool):
+        return entry
+    entry["expanded"] = expanded
+    controlled_id = _structured_str(node.get("controls")).strip()
+    if not controlled_id or len(controlled_id) > _MAX_DISCLOSURE_CONTROL_ID_CHARS:
+        return entry
+    entry["controls"] = controlled_id
+    if isinstance(node.get("controlled_region_visible"), bool):
+        entry["controlled_region_visible"] = node["controlled_region_visible"]
+    return entry
+
+
 def _structured_form(form: Any) -> dict[str, Any] | None:
     if not isinstance(form, dict):
         return None
@@ -2835,7 +2929,9 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         }
         if isinstance(control.get("visible"), bool):
             submit_control["visible"] = control["visible"]
-        submit_controls.append(_attach_node_evidence(submit_control, control))
+        submit_controls.append(
+            _attach_structured_disclosure_facts(_attach_node_evidence(submit_control, control), control)
+        )
     return {
         "id": _structured_str(form.get("id"))[:120],
         "name": _structured_str(form.get("name"))[:120],
@@ -3057,8 +3153,12 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
         tag = (_structured_str(item.get("tag")) or "").lower()[:40]
         if tag:
             entry["tag"] = tag
+        if item.get("disabled") is True:
+            entry["disabled"] = True
+        if isinstance(item.get("visible"), bool):
+            entry["visible"] = item["visible"]
         if entry.get("selector") or entry.get("text"):
-            controls.append(_attach_node_evidence(entry, item))
+            controls.append(_attach_structured_disclosure_facts(_attach_node_evidence(entry, item), item))
     return controls
 
 

@@ -380,6 +380,111 @@ async def edit_block_tool(
     return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
 
 
+@function_tool(
+    name_override="edit_block_and_run",
+    timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
+    strict_mode=False,
+)
+async def edit_block_and_run_tool(
+    ctx: RunContextWrapper,
+    label: str,
+    expected_code: str,
+    replacement_code: str,
+    block_labels: list[str] | None = None,
+    parameters: dict[str, Any] | None = None,
+) -> str:
+    """Apply one anchored code edit and immediately test the affected frontier.
+
+    Use this for a repair to an existing code block. ``label`` must name exactly one existing block,
+    and ``expected_code`` must occur exactly once in its current stored code. The tool changes only
+    that code span, persists the reversible draft through the normal author-time safety boundary,
+    then runs ``block_labels`` (or just ``label`` when omitted).
+
+    This is one model-invoked edit and one run. It does not choose an edit, create a block, retry, or
+    decide whether the result achieved the user's goal. Its response is the same sanitized run/debug
+    evidence returned by ``run_blocks_and_collect_debug``; a failed run still leaves the edited draft
+    and recorded workflow run available for the next turn.
+
+    Pass current non-secret values for runtime workflow parameters in ``parameters``. For sensitive
+    values (password, secret, token, api_key, credential, totp, otp, one_time_code, private_key,
+    auth), do NOT pass an inline value; follow the CREDENTIAL HANDLING refusal rule in the system
+    prompt and bind an approved saved credential instead.
+    """
+    copilot_ctx = ctx.context
+    copilot_ctx.completion_verification_result = None
+    handler_start = time.monotonic()
+    requested_labels = list(block_labels) if block_labels else [label]
+    runtime_parameters = parameters or {}
+    arguments = {
+        "label": label,
+        "block_labels": requested_labels,
+        "parameters": runtime_parameters,
+        "has_code_edit": True,
+    }
+    skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "edit_block_and_run")
+    copilot_ctx.last_run_skipped_unbound_credentials = False
+    if label not in requested_labels:
+        result = {
+            "ok": False,
+            "error": f"block_labels must include the edited block {label!r} so this call tests the persisted repair.",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
+        return json.dumps(result)
+    authority_error = _authority_tool_error(copilot_ctx, "edit_block_and_run")
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "edit_block_and_run", authority_error)
+
+    _clear_pending_browser_interaction_observation(copilot_ctx)
+    try:
+        workflow_yaml = apply_block_edit(
+            _stored_workflow_yaml(copilot_ctx),
+            label,
+            expected_code=expected_code,
+            replacement_code=replacement_code,
+        )
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
+        _record_diagnosis_repair_contract(copilot_ctx, source_tool="edit_block_and_run", result=result)
+        return json.dumps(result)
+
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
+        update_result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml},
+            copilot_ctx,
+            allow_missing_credentials=skip_run_after_update,
+        )
+        _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
+    if not update_result.get("ok"):
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=update_result,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("update_workflow", update_result))
+
+    if skip_run_after_update:
+        return _credential_deferred_combined_tool_result(
+            copilot_ctx,
+            tool_name="edit_block_and_run",
+            arguments=arguments,
+            update_result=update_result,
+        )
+
+    return await _run_updated_workflow_blocks(
+        copilot_ctx,
+        tool_name="edit_block_and_run",
+        arguments=arguments,
+        update_result=update_result,
+        prior_definition=prior_definition,
+        block_labels=requested_labels,
+        parameters=runtime_parameters,
+        handler_start=handler_start,
+    )
+
+
 @function_tool(name_override="add_block", strict_mode=False)
 async def add_block_tool(
     ctx: RunContextWrapper,
@@ -839,33 +944,72 @@ async def update_and_run_blocks_tool(
         return json.dumps(sanitized)
 
     if skip_run_after_update:
-        copilot_ctx.last_run_skipped_unbound_credentials = True
-        skip_message = "Skipped test run: required credentials are not configured."
-        skip_result = {
-            "ok": True,
-            "message": skip_message,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "skipped_run": True,
-                "skip_reason": "workflow_credential_inputs_unbound",
-            },
-        }
-        carry_author_time_findings(update_result, skip_result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
-        _record_diagnosis_repair_contract(
+        return _credential_deferred_combined_tool_result(
             copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=skip_result,
-            workflow_updated=True,
+            tool_name="update_and_run_blocks",
+            arguments=arguments,
+            update_result=update_result,
         )
-        LOG.info(
-            "update_and_run_blocks skipped run on unbound credential workflow inputs",
-            workflow_permanent_id=copilot_ctx.workflow_permanent_id,
-        )
-        return json.dumps(skip_result)
 
-    # Step 2: Compute frontier and run the blocks.
+    return await _run_updated_workflow_blocks(
+        copilot_ctx,
+        tool_name="update_and_run_blocks",
+        arguments=arguments,
+        update_result=update_result,
+        prior_definition=prior_definition,
+        block_labels=block_labels,
+        parameters=parameters or {},
+        handler_start=handler_start,
+    )
+
+
+def _credential_deferred_combined_tool_result(
+    copilot_ctx: CopilotContext,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    update_result: dict[str, Any],
+) -> str:
+    """Record a persisted draft when a combined edit/update cannot safely run yet."""
+    copilot_ctx.last_run_skipped_unbound_credentials = True
+    skip_result = {
+        "ok": True,
+        "message": "Skipped test run: required credentials are not configured.",
+        "data": {
+            "block_count": copilot_ctx.last_update_block_count,
+            "workflow_updated": True,
+            "skipped_run": True,
+            "skip_reason": "workflow_credential_inputs_unbound",
+        },
+    }
+    carry_author_time_findings(update_result, skip_result)
+    record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
+    _record_diagnosis_repair_contract(
+        copilot_ctx,
+        source_tool=tool_name,
+        result=skip_result,
+        workflow_updated=True,
+    )
+    LOG.info(
+        "combined workflow tool skipped run on unbound credential workflow inputs",
+        tool_name=tool_name,
+        workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+    )
+    return json.dumps(skip_result)
+
+
+async def _run_updated_workflow_blocks(
+    copilot_ctx: CopilotContext,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    update_result: dict[str, Any],
+    prior_definition: object | None,
+    block_labels: list[str],
+    parameters: dict[str, Any],
+    handler_start: float,
+) -> str:
+    """Run a just-persisted definition through the shared frontier and debug-evidence seam."""
     new_definition = None
     if copilot_ctx.last_workflow is not None:
         new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
@@ -888,7 +1032,7 @@ async def update_and_run_blocks_tool(
         ),
     ):
         run_result = await _run_blocks_and_collect_debug(
-            {"block_labels": block_labels, "parameters": parameters or {}},
+            {"block_labels": block_labels, "parameters": parameters},
             copilot_ctx,
             labels_to_execute=labels_to_execute,
             block_outputs_to_seed=block_outputs_to_seed,
@@ -896,10 +1040,10 @@ async def update_and_run_blocks_tool(
         )
         await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
+        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
-            source_tool="update_and_run_blocks",
+            source_tool=tool_name,
             result=run_result,
             workflow_updated=True,
         )
@@ -1061,6 +1205,7 @@ async def fill_credential_field_tool(
 NATIVE_TOOLS = [
     update_workflow_tool,
     edit_block_tool,
+    edit_block_and_run_tool,
     add_block_tool,
     delete_block_tool,
     list_credentials_tool,

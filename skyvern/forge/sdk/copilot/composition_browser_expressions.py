@@ -9,6 +9,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _ANTI_BOT_SCAN_BYTES,
     _MAX_CHALLENGE_CONTROLS,
     _MAX_CLICKABLE_CONTROLS,
+    _MAX_DISCLOSURE_CONTROL_ID_CHARS,
     _MAX_FIELDS_PER_FORM,
     _MAX_FORMS,
     _MAX_KEY_VALUE_RELATIONS,
@@ -334,6 +335,7 @@ _STRUCTURED_CONST_HEADER = (
     f"const MAX_SELECT_OPTIONS={int(_MAX_SELECT_OPTIONS)};"
     f"const MAX_CHALLENGE_CONTROLS={int(_MAX_CHALLENGE_CONTROLS)};"
     f"const MAX_CLICKABLE_CONTROLS={int(_MAX_CLICKABLE_CONTROLS)};"
+    f"const MAX_DISCLOSURE_CONTROL_ID_CHARS={int(_MAX_DISCLOSURE_CONTROL_ID_CHARS)};"
     f"const MAX_MODAL_OVERLAYS={int(_MAX_MODAL_OVERLAYS)};"
     f"const MAX_MODAL_DISMISS_CONTROLS={int(_MAX_MODAL_DISMISS_CONTROLS)};"
     f"const MAX_PAGE_OBSTRUCTIONS={int(_MAX_PAGE_OBSTRUCTIONS)};"
@@ -761,6 +763,20 @@ const controlVisible = (node) => {
   // Match Playwright for form-control readiness: opacity alone does not make a control hidden.
   return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 };
+const disclosureFacts = (el) => {
+  const expanded = lower(attr(el, 'aria-expanded')).trim();
+  if (expanded !== 'true' && expanded !== 'false') return {};
+  const controls = attr(el, 'aria-controls').trim();
+  const facts = { expanded: expanded === 'true' };
+  if (!controls || controls.length > MAX_DISCLOSURE_CONTROL_ID_CHARS) return facts;
+  facts.controls = controls;
+  const controlledIds = controls.split(/\s+/).filter(Boolean);
+  const regions = controlledIds.map((id) => document.getElementById(id));
+  if (regions.length && regions.every(Boolean)) {
+    facts.controlled_region_visible = regions.some((region) => controlVisible(region));
+  }
+  return facts;
+};
 const modalDismissControls = (node) => {
   const out = [];
   const seen = new Set();
@@ -794,7 +810,7 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
+      submitControls.push(Object.assign({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) }, disclosureFacts(node)));
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
@@ -889,7 +905,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   let unique = false;
   if (selector) { try { unique = document.querySelectorAll(selector).length === 1; } catch (e) { unique = false; } }
   if (selector && unique && !usedClickableSelectors.has(selector)) {
-    clickableControls.push({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), tag: tag });
+    clickableControls.push(Object.assign({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), tag: tag, disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
     usedClickableSelectors.add(selector);
     if (text) seenClickableText.add(text);
     continue;
@@ -897,7 +913,7 @@ for (const el of document.querySelectorAll('button,[role="button"],[data-action]
   if (!text || seenClickableText.has(text)) continue;
   // No CSS selector singles this control out, which is the case the text rung exists for: reporting
   // the control with its text alone leaves the model nothing to address it by.
-  clickableControls.push({ text: text, tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el) });
+  clickableControls.push(Object.assign({ text: text, tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
   seenClickableText.add(text);
 }
 

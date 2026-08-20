@@ -591,8 +591,10 @@ async def test_execute_task_v3_extraction_redaction_respects_word_boundaries(
 # ---------------------------------------------------------------------------
 
 
-def _v3_task(llm_key: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(llm_key=llm_key, task_id="tsk_x", organization_id="o_test")
+def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        llm_key=llm_key, task_id="tsk_x", organization_id="o_test", workflow_permanent_id=workflow_permanent_id
+    )
 
 
 @pytest.mark.asyncio
@@ -614,6 +616,41 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "OPENAI_GPT5_6_LUNA"
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.MonkeyPatch) -> None:
+    # wpid-scoped PostHog conditions need workflow_permanent_id in properties; non-workflow
+    # tasks send the "not_workflow" sentinel (same convention as the workflow-block-engine flag).
+    reader = AsyncMock(return_value="OPENAI_GPT5_6_LUNA_HIGH")
+    monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+    monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
+
+    resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
+    assert resolved == "OPENAI_GPT5_6_LUNA_HIGH"
+    assert reader.call_args.kwargs["properties"] == {
+        "organization_id": "o_test",
+        "workflow_permanent_id": "wpid_123",
+    }
+
+    await agent_module._resolve_task_v3_llm_key(_v3_task())
+    assert reader.call_args.kwargs["properties"] == {
+        "organization_id": "o_test",
+        "workflow_permanent_id": "not_workflow",
+    }
+
+    # The Task row itself never carries the wpid on the execution path (get_task builds it
+    # without one); the run context is the reliable source, mirroring the extraction-cache path.
+    skyvern_context.set(SkyvernContext(workflow_permanent_id="wpid_from_ctx"))
+    try:
+        await agent_module._resolve_task_v3_llm_key(_v3_task())
+    finally:
+        skyvern_context.reset()
+    assert reader.call_args.kwargs["properties"] == {
+        "organization_id": "o_test",
+        "workflow_permanent_id": "wpid_from_ctx",
+    }
 
 
 @pytest.mark.asyncio

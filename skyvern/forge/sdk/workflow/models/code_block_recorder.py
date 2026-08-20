@@ -24,7 +24,7 @@ CODE_BLOCK_FILENAME = "<code_block>"
 # full_code = "\nasync def wrapper(...):\n<user code from line 3>"; user line = frame line - 2
 CODE_LINE_OFFSET = 2
 MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
-PENDING_NAVIGATION_DELAY_SECONDS = 20.0
+PENDING_CALL_DELAY_SECONDS = 20.0
 
 _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "goto": ActionType.GOTO_URL,
@@ -93,11 +93,11 @@ OnAction = Callable[[Action], Awaitable[None]]
 
 @dataclass(frozen=True, slots=True)
 class PendingAction:
-    action_type: ActionType
-    action_order: int
-    code_line: int | None
     call_name: str
     threshold_seconds: float
+    code_line: int | None = None
+    action_type: ActionType | None = None
+    action_order: int | None = None
 
 
 OnPendingAction = Callable[[PendingAction], Awaitable[None]]
@@ -317,6 +317,47 @@ class _Recorder:
                 call_name=pending_action.call_name,
             )
 
+    def _arm_pending(self, pending_action: PendingAction) -> asyncio.Task[None] | None:
+        if self._on_pending_action is None:
+            return None
+        return asyncio.create_task(self._emit_pending_action(pending_action), name="code-block-call-pending")
+
+    async def _retire_pending(self, pending_task: asyncio.Task[None]) -> bool:
+        """Cancel and drain the pending timer, reporting whether the caller itself was cancelled."""
+        current_task = asyncio.current_task()
+        cancellation_count = current_task.cancelling() if current_task is not None else 0
+        cleanup_cancelled = False
+        pending_task.cancel()
+        while not pending_task.done():
+            try:
+                await asyncio.shield(pending_task)
+            except asyncio.CancelledError:
+                if current_task is not None and current_task.cancelling() > cancellation_count:
+                    cleanup_cancelled = True
+        if pending_task.cancelled():
+            cleanup_cancelled = cleanup_cancelled or (
+                current_task is not None and current_task.cancelling() > cancellation_count
+            )
+        return cleanup_cancelled
+
+    async def await_pending_aware(self, awaitable: Awaitable[Any], call_name: str) -> Any:
+        if self._on_pending_action is None:
+            return await awaitable
+        pending_task = self._arm_pending(
+            PendingAction(
+                call_name=call_name,
+                threshold_seconds=PENDING_CALL_DELAY_SECONDS,
+                code_line=_frame_user_line(),
+            )
+        )
+        if pending_task is None:
+            return await awaitable
+        try:
+            return await awaitable
+        finally:
+            if await self._retire_pending(pending_task):
+                raise asyncio.CancelledError
+
     async def enforce_credential_release(
         self,
         target: Any,
@@ -360,21 +401,16 @@ class _Recorder:
             {**common_fields, **_recorded_action_fields(action_type, name, target, args, kwargs)},
             warning="Failed to instantiate recorded action subclass, falling back to base Action",
         )
-        pending_task: asyncio.Task[None] | None = None
         cleanup_cancelled = False
-        if name == "page.goto" and self._on_pending_action is not None:
-            pending_task = asyncio.create_task(
-                self._emit_pending_action(
-                    PendingAction(
-                        action_type=action_type,
-                        action_order=action_order,
-                        code_line=code_line,
-                        call_name=name,
-                        threshold_seconds=PENDING_NAVIGATION_DELAY_SECONDS,
-                    )
-                ),
-                name="code-block-navigation-pending",
+        pending_task = self._arm_pending(
+            PendingAction(
+                call_name=name,
+                threshold_seconds=PENDING_CALL_DELAY_SECONDS,
+                code_line=code_line,
+                action_type=action_type,
+                action_order=action_order,
             )
+        )
         try:
             result = await call()
         except BaseException as exc:
@@ -384,19 +420,7 @@ class _Recorder:
             raise
         finally:
             if pending_task is not None:
-                current_task = asyncio.current_task()
-                cancellation_count = current_task.cancelling() if current_task is not None else 0
-                pending_task.cancel()
-                while not pending_task.done():
-                    try:
-                        await asyncio.shield(pending_task)
-                    except asyncio.CancelledError:
-                        if current_task is not None and current_task.cancelling() > cancellation_count:
-                            cleanup_cancelled = True
-                if pending_task.cancelled():
-                    cleanup_cancelled = cleanup_cancelled or (
-                        current_task is not None and current_task.cancelling() > cancellation_count
-                    )
+                cleanup_cancelled = await self._retire_pending(pending_task)
             duration_ms = int((time.monotonic() - started) * 1000)
             action.started_at = started_wall
             action.finished_at = naive_utc_now()
@@ -421,11 +445,11 @@ def _wrap_recording_result(value: Any, recorder: _Recorder, selector: str | None
     return value
 
 
-def _wrap_call_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+def _wrap_call_result(value: Any, recorder: _Recorder, selector: str | None, call_name: str) -> Any:
     if inspect.isawaitable(value):
 
         async def resolve() -> Any:
-            return _wrap_recording_result(await value, recorder, selector)
+            return _wrap_recording_result(await recorder.await_pending_aware(value, call_name), recorder, selector)
 
         return resolve()
     return _wrap_recording_result(value, recorder, selector)
@@ -472,7 +496,7 @@ class RecordingLocator:
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
-                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector)
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector, f"locator.{name}")
 
             return forwarded
 
@@ -499,12 +523,19 @@ class RecordingKeyboard:
         if name in ("type", "insert_text"):
 
             async def guarded(*args: Any, **kwargs: Any) -> Any:
-                await self.__recorder.enforce_credential_release(self.__page, f"keyboard.{name}", args, kwargs)
-                return await attr(*args, **kwargs)
+                async def call() -> Any:
+                    await self.__recorder.enforce_credential_release(self.__page, f"keyboard.{name}", args, kwargs)
+                    return await attr(*args, **kwargs)
+
+                return await self.__recorder.await_pending_aware(call(), f"keyboard.{name}")
 
             return guarded
         if name != "press":
-            return attr
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, None, f"keyboard.{name}")
+
+            return forwarded
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
             return await self.__recorder.record(
@@ -561,7 +592,9 @@ class RecordingPage:
         if action_type is None:
 
             def forwarded(*args: Any, **kwargs: Any) -> Any:
-                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
+                return _wrap_call_result(
+                    attr(*args, **kwargs), self.__recorder, _factory_selector(name, args), f"page.{name}"
+                )
 
             return forwarded
         record_prompt = name in _PROMPT_METHODS

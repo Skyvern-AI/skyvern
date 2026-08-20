@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import http.client
+import json
 import os
 import socket
 import stat
@@ -61,7 +63,7 @@ from skyvern.browser_extension.errors import (
 
 
 class BrokerClient:
-    """Relay-compatible M1 client; credentials remain process-memory-only per spec-v3.md lines 57-63."""
+    """Relay-compatible broker client; credentials remain process-memory-only per spec-v3.md lines 57-63."""
 
     def __init__(
         self,
@@ -127,6 +129,11 @@ class BrokerClient:
                     raise BrowserExtensionNotConnectedError("Browser-extension broker is not running") from None
                 await asyncio.to_thread(self._spawn_broker_process)
                 await self._connect_with_retry()
+            else:
+                # A reachable daemon invalidates any cached startup failure (e.g. a
+                # BROKER_ALREADY_RUNNING election race recorded by an older build).
+                with suppress(Exception):
+                    clear_startup_failure(self.paths)
 
     async def stop(self) -> None:
         self._closed = True
@@ -168,10 +175,40 @@ class BrokerClient:
         return result
 
     async def ensure_root_lease(self) -> dict[str, Any] | None:
-        """M1 parity has one exclusive client, so the filtered relay snapshot is already exclusive."""
-        if not self.scoped_tabs:
+        """Ensure this client owns at least one tab and return its snapshot.
+
+        A multi-client broker grants a tab lease: it adopts a free user-shared tab or
+        creates a scoped about:blank tab. An M1 exclusive broker does not know the
+        operation; fall back to its behavior, where the filtered snapshot is already
+        exclusive to this client.
+        """
+        if self.scoped_tabs:
+            return dict(self.scoped_tabs[0])
+        await self.start()
+        try:
+            result = await self._control_request("lease.acquire_default", {}, 20.0)
+        except BrowserExtensionBrokerError as exc:
+            if exc.code == "OP_NOT_ALLOWED":
+                return None
+            raise
+        snapshot = _tab_snapshot(result.get("tab"))
+        if snapshot is None:
             return None
-        return dict(self.scoped_tabs[0])
+        self.scoped_tabs = [tab for tab in self.scoped_tabs if tab["tabId"] != snapshot["tabId"]]
+        self.scoped_tabs.append(snapshot)
+        return dict(snapshot)
+
+    async def release_tab(self, tab_id: int) -> None:
+        """Release one leased tab according to the broker's authoritative origin."""
+        await self.start()
+        try:
+            await self._control_request("lease.release", {"tabId": tab_id}, 5.0)
+        except BrowserExtensionBrokerError as exc:
+            if exc.code != "OP_NOT_ALLOWED":
+                raise
+            # M1 brokers predate lease origins and retain their exclusive-client behavior.
+            await self.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
+        self.scoped_tabs = [tab for tab in self.scoped_tabs if tab["tabId"] != tab_id]
 
     async def broker_status(self) -> dict[str, Any]:
         await self.start()
@@ -551,6 +588,9 @@ def _ensure_broker_process(port: int, paths: BrokerPaths) -> subprocess.Popen[by
         if _broker_is_reachable(paths):
             clear_startup_failure(paths)
             return None
+        if _recorded_daemon_is_dead(paths):
+            # The recorded daemon died; a failure cached against its state is stale.
+            clear_startup_failure(paths)
         observed = state_fingerprint(paths)
         cached = matching_startup_failure(paths, observed_state_fingerprint=observed)
         if cached is not None:
@@ -635,23 +675,106 @@ def _ensure_broker_process(port: int, paths: BrokerPaths) -> subprocess.Popen[by
         if readiness["status"] == "ERROR":
             _terminate_spawned_process(process)
             log_thread.join(timeout=1.0)
-            failed_observed = state_fingerprint(paths)
             code_value = readiness.get("code")
             code = code_value if isinstance(code_value, str) else "STARTUP_FAILED"
+            if code == "BROKER_ALREADY_RUNNING":
+                # Election loss, not a failure: another daemon holds daemon.lock. Give a
+                # mid-startup winner a moment to publish readiness, then attach to it.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if _broker_is_reachable(paths):
+                        clear_startup_failure(paths)
+                        return None
+                    time.sleep(0.1)
+                failure = record_startup_failure(
+                    paths,
+                    code="BROKER_UNRESPONSIVE",
+                    port=port,
+                    observed_state_fingerprint=state_fingerprint(paths),
+                )
+                raise BrowserExtensionBrokerError(
+                    failure.code,
+                    _unresponsive_broker_message(paths),
+                    retry_after=failure.retryAfter - time.time(),
+                )
+            failed_observed = state_fingerprint(paths)
             failure = record_startup_failure(
                 paths,
                 code=code,
                 port=port,
                 observed_state_fingerprint=failed_observed,
             )
+            message = _startup_error_message(code)
+            if code == "PORT_IN_USE":
+                message = f"{message}: {_describe_port_owner(port)}"
             raise BrowserExtensionBrokerError(
                 failure.code,
-                _startup_error_message(code),
+                message,
                 retry_after=failure.retryAfter - time.time(),
             )
         log_thread.join(timeout=1.0)
         clear_startup_failure(paths)
         return process
+
+
+def _recorded_daemon_is_dead(paths: BrokerPaths) -> bool:
+    try:
+        state = read_broker_state(paths)
+    except BrowserExtensionBrokerError:
+        return False
+    if state is None or state.lifecycle != "ready":
+        return False
+    return not process_identity_matches(state.pid, state.processStart)
+
+
+def _unresponsive_broker_message(paths: BrokerPaths) -> str:
+    pid_hint = ""
+    try:
+        state = read_broker_state(paths)
+    except BrowserExtensionBrokerError:
+        state = None
+    if state is not None and process_identity_matches(state.pid, state.processStart):
+        pid_hint = f" (pid {state.pid})"
+    return (
+        f"A browser-extension broker process{pid_hint} holds the daemon lock but is not "
+        "accepting control connections; run 'skyvern browser extension-broker-stop' or stop "
+        "that process, then retry"
+    )
+
+
+def _describe_port_owner(port: int) -> str:
+    owner = _probe_relay_health(port)
+    if owner == "relay":
+        return (
+            f"port {port} is served by a live Skyvern extension relay that is not this broker "
+            "(a legacy embedded relay from another MCP session, or a broker from another checkout); "
+            "stop that session or set SKYVERN_BROWSER_EXTENSION_PORT to a free port"
+        )
+    return f"port {port} is owned by a non-Skyvern process; free it or set SKYVERN_BROWSER_EXTENSION_PORT"
+
+
+def _probe_relay_health(port: int) -> str:
+    """Classify the loopback port owner: 'relay' (Skyvern extension relay), 'foreign', or 'none'."""
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+        try:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            payload = response.read(4096)
+            status = response.status
+        finally:
+            connection.close()
+    except Exception:
+        return "none"
+    if status != 200:
+        return "foreign"
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return "foreign"
+    if isinstance(parsed, dict) and parsed.get("service") == "skyvern-browser-extension-relay":
+        return "relay"
+    return "foreign"
 
 
 def _daemon_environment(ready_fd: int, spawn_lock_fd: int) -> dict[str, str]:

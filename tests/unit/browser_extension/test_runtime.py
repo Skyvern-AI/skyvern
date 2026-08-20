@@ -5,12 +5,13 @@ import errno
 import subprocess
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
 import skyvern.browser_extension.runtime as runtime_module
+from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 
@@ -155,6 +156,53 @@ async def test_open_pairing_page_uses_relay_nonce_without_exposing_token(monkeyp
     opener.assert_called_with("http://127.0.0.1:21003/pair#runtime-pairing-nonce")
     assert opener.call_count == 2
     assert "runtime-test-token" not in opener.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_busy_pairing_waits_then_opens_this_clients_offer(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    begin_pairing = AsyncMock(
+        side_effect=[
+            BrowserExtensionBrokerError("PAIRING_BUSY", "Another client is pairing"),
+            {"active": True, "opened": True, "expiresIn": 120.0},
+        ]
+    )
+    pairing_status = AsyncMock(return_value={"active": False, "owned": False})
+    monkeypatch.setattr(relay, "begin_pairing", begin_pairing)
+    monkeypatch.setattr(relay, "pairing_status", pairing_status)
+    monkeypatch.setattr(runtime_module.asyncio, "sleep", AsyncMock())
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+
+    assert await runtime.begin_pairing()
+    assert begin_pairing.await_count == 2
+    pairing_status.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_pairing_surfaces_extension_upgrade_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    monkeypatch.setattr(
+        relay,
+        "begin_pairing",
+        AsyncMock(
+            side_effect=BrowserExtensionBrokerError(
+                "EXTENSION_UPGRADE_REQUIRED",
+                "Reload the current Skyvern Agent extension",
+            )
+        ),
+    )
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+
+    with pytest.raises(BrowserExtensionBrokerError) as error_info:
+        await runtime.begin_pairing()
+
+    assert error_info.value.code == "EXTENSION_UPGRADE_REQUIRED"
 
 
 def test_open_extension_url_targets_google_chrome_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:

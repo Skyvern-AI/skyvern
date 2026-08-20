@@ -787,6 +787,7 @@ class _StrippedHtmlServer:
             if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
                 return {"ok": True, "data": {"result": {"page_title": "Loading", "forms": []}}}
             if expression == COMPOSITION_STRIPPED_HTML_EXPRESSION:
+                assert arguments["verbosity"] == "full"
                 return {"ok": True, "data": {"result": self._stripped}}
             assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
             return {"ok": True, "data": {"result": []}}

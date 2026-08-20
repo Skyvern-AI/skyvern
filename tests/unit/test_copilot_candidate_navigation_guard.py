@@ -207,7 +207,7 @@ async def test_candidate_guard_isolates_non_pristine_attached_cdp_context(
         prefer_context_newest_when_unpinned=True,
     )
 
-    async def ensure(_ctx):
+    async def ensure(_ctx, **_kwargs):
         return None
 
     async def resolve(_ctx):
@@ -244,7 +244,7 @@ async def test_candidate_guard_supports_persistent_context_without_browser(
         pw=SimpleNamespace(chromium=chromium),
     )
 
-    async def ensure(_ctx):
+    async def ensure(_ctx, **_kwargs):
         return None
 
     async def resolve(_ctx):
@@ -529,12 +529,16 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
     browser_context = _BrowserContext()
     agent_function = _AgentFunction()
     server = _server()
-    server._context_provider = lambda: SimpleNamespace(browser_session_id="session", organization_id="org")
+    server._context_provider = lambda: SimpleNamespace(
+        browser_session_id="session",
+        organization_id="org",
+        turn_origin=mcp_adapter.TurnOrigin.interactive,
+    )
     server._client = SimpleNamespace(
         call_tool=AsyncMock(return_value=SimpleNamespace(structured_content={"ok": True}, is_error=False, content=[]))
     )
 
-    async def ensure(_ctx):
+    async def ensure(_ctx, **_kwargs):
         return None
 
     async def resolve(_ctx):

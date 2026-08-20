@@ -30,6 +30,25 @@ class ActionStatus(StrEnum):
     completed = "completed"
 
 
+class TelInputStrategy(StrEnum):
+    legacy_sequential = "legacy_sequential"
+    formatted_sequential = "formatted_sequential"
+    sequential_national = "sequential_national"
+    atomic_national = "atomic_national"
+    atomic_e164 = "atomic_e164"
+
+
+class TelInputOutcome(BaseModel):
+    flag_enabled: bool
+    final_element_id: str
+    strategy: TelInputStrategy
+    expected_digit_count: int
+    actual_digit_count: int | None = None
+    browser_valid: bool | None = None
+    attempt_count: int
+    retargeted: bool
+
+
 class SelectOption(BaseModel):
     label: str | None = None
     value: str | None = None
@@ -174,6 +193,8 @@ class Action(BaseModel):
     # combobox. Lives on the base Action (like the flags above) because handle_input_text_action runs with
     # hydrated/replayed base Action objects, not only InputTextAction — reading it must never raise.
     prefilter_typeahead: bool = Field(default=False, exclude=True)
+
+    tel_input_outcome: TelInputOutcome | None = Field(default=None, exclude=True)
 
     # Transient (never serialized): the observation epoch this action was planned under (SKY-12874).
     # It must not reach the database — an epoch is run-local, so a value read back from a stored row

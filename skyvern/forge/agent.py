@@ -225,6 +225,13 @@ RECOVERABLE_BLANK_WORKFLOW_TASK_URLS = {":"}
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 DECISIVE_CRITERION_VALIDATE_TEMPLATE = "decisive-criterion-validate"
 
+CUA_EXECUTE_ACTIONS_DIRECTIVE = (
+    "Now perform the required interaction yourself using computer actions on the current screenshot, "
+    "working toward the goal. Do not merely describe the steps or ask the human to perform them. "
+    "If the current screenshot does not give you enough information to act, or the required action is "
+    "not supported, ask one specific clarifying question instead of guessing."
+)
+
 
 async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
     working_page = await browser_state.get_working_page()
@@ -306,6 +313,21 @@ def _require_actions_payload(json_response: dict[str, Any]) -> list[Any]:
     if not isinstance(actions_payload, list):
         raise LLMResponseMissingActionsError(list(json_response.keys()))
     return actions_payload
+
+
+def _model_is_abandoning_verification(json_response: dict[str, Any]) -> bool:
+    """True when the actions that will actually execute are a pure give-up (TERMINATE or WAIT).
+
+    Classifies on the executed batch, dropping WAIT from a mixed batch exactly as
+    _execute_step_actions does, so [WAIT, TERMINATE] is abandonment while [WAIT, CLICK] is not.
+    """
+    raw_actions = json_response.get("actions")
+    if not isinstance(raw_actions, list) or not raw_actions:
+        return False
+    action_types = {str(action.get("action_type") or "").upper() for action in raw_actions if isinstance(action, dict)}
+    # Drop WAIT exactly as the executor does for a mixed batch; keep it for an all-WAIT batch.
+    effective = (action_types - {ActionType.WAIT.name}) or action_types
+    return effective == {ActionType.TERMINATE.name} or effective == {ActionType.WAIT.name}
 
 
 # Phrases the verifier / validator LLMs use when they rely on exact-string
@@ -562,7 +584,9 @@ class StepPromptResult:
     without_page_information: bool
 
 
-async def _read_task_v3_llm_name_override(task_id: str, organization_id: str) -> str | None:
+async def _read_task_v3_llm_name_override(
+    task_id: str, organization_id: str, workflow_permanent_id: str | None
+) -> str | None:
     """Return the registered llm_key named by the TASK_V3_LLM_NAME PostHog flag, or None.
 
     The multivariate value is validated against the registry per task. An unset, invalid, or
@@ -570,7 +594,12 @@ async def _read_task_v3_llm_name_override(task_id: str, organization_id: str) ->
     """
     try:
         variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-            "TASK_V3_LLM_NAME", task_id, properties={"organization_id": organization_id}
+            "TASK_V3_LLM_NAME",
+            task_id,
+            properties={
+                "organization_id": organization_id,
+                "workflow_permanent_id": workflow_permanent_id or "not_workflow",
+            },
         )
     except Exception:
         LOG.warning("Failed to read TASK_V3_LLM_NAME; using configured v3 model", exc_info=True)
@@ -594,7 +623,10 @@ async def _resolve_task_v3_llm_key(task: Task) -> str:
     """
     if task.llm_key:
         return task.llm_key
-    override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id)
+    # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
+    context = skyvern_context.current()
+    workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
+    override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
     return override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
 
 
@@ -3353,6 +3385,8 @@ class ForgeAgent:
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
+                else:
+                    resp_content = f"{resp_content}\n\n{CUA_EXECUTE_ACTIONS_DIRECTIVE}"
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model=cua_model,
                 previous_response_id=previous_response.id,
@@ -7490,6 +7524,24 @@ class ForgeAgent:
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
         should_enter_verification_code = json_response.get("should_enter_verification_code")
 
+        # On a verification page with a configured OTP source, route a pure give-up into the
+        # deterministic resolver so the 15-minute poll budget is reachable instead of being skipped.
+        # Yields to magic-link verification: the fallback only forces the verification-code resolver
+        # when magic-link verification is not requested.
+        model_abandoning_verification = _model_is_abandoning_verification(json_response)
+        should_resolve_verification_code = bool(place_to_enter_verification_code) and (
+            bool(should_enter_verification_code) or (model_abandoning_verification and not should_verify_by_magic_link)
+        )
+        LOG.info(
+            "OTP action gating",
+            task_id=task.task_id,
+            place_to_enter_verification_code=bool(place_to_enter_verification_code),
+            should_enter_verification_code=bool(should_enter_verification_code),
+            should_verify_by_magic_link=bool(should_verify_by_magic_link),
+            model_abandoning_verification=model_abandoning_verification,
+            resolving_verification_code=should_resolve_verification_code,
+        )
+
         # If no OTP verification needed, return early to avoid unnecessary processing
         if (
             not should_verify_by_magic_link
@@ -7498,7 +7550,7 @@ class ForgeAgent:
         ):
             return json_response, []
 
-        if place_to_enter_verification_code and should_enter_verification_code:
+        if should_resolve_verification_code:
             json_response = await self.handle_potential_verification_code(
                 task, step, scraped_page, browser_state, json_response
             )
@@ -7569,9 +7621,9 @@ class ForgeAgent:
         browser_state: BrowserState,
         json_response: dict[str, Any],
     ) -> dict[str, Any]:
+        # The caller decides when to resolve; place_to_enter_verification_code alone is sufficient.
         place_to_enter_verification_code = json_response.get("place_to_enter_verification_code")
-        should_enter_verification_code = json_response.get("should_enter_verification_code")
-        if not (place_to_enter_verification_code and should_enter_verification_code):
+        if not place_to_enter_verification_code:
             return json_response
 
         LOG.info("Need verification code")

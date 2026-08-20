@@ -26,7 +26,9 @@ from skyvern.forge.sdk.copilot.blocker_signal import maybe_clear_blocker_signal_
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
 LOOP_DETECTED_MARKER = "LOOP DETECTED:"
-ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset(
+    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}
+)
 ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES = frozenset({"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"})
 
 

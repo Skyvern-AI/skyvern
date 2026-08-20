@@ -9,6 +9,7 @@ or the agent follows whichever it weights higher.
 """
 
 from skyvern.forge.sdk.copilot.tools import (
+    edit_block_and_run_tool,
     run_blocks_tool,
     update_and_run_blocks_tool,
 )
@@ -114,7 +115,7 @@ class TestToolDocstringsRefusalClause:
     """Tool docstrings reach the agent via FunctionTool.description — they must agree with the prompt."""
 
     def _tools(self) -> list[object]:
-        return [run_blocks_tool, update_and_run_blocks_tool]
+        return [run_blocks_tool, update_and_run_blocks_tool, edit_block_and_run_tool]
 
     def test_old_permissive_clause_gone_from_tools(self) -> None:
         """The clause that told the agent inline secrets were fine via `parameters` is removed."""

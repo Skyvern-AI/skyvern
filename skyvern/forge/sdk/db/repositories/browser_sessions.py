@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import cast
 
 import structlog
-from sqlalchemy import and_, case, desc, exists, func, or_, select, update
+from sqlalchemy import and_, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, StatementError
 
 from skyvern.config import settings
@@ -20,7 +20,6 @@ from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
     CredentialModel,
     PersistentBrowserSessionModel,
-    TaskModel,
     WorkflowModel,
     WorkflowRunModel,
 )
@@ -39,7 +38,6 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -802,54 +800,6 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
-
-    @db_operation("has_unfinished_run")
-    async def has_unfinished_run(self, session_id: str) -> bool:
-        """Whether any run still owns this session, across both run models and the session lease.
-
-        Workflow runs and legacy V1 tasks each carry their own ``browser_session_id``, and a V1
-        task executes without a workflow-run row -- so checking workflow runs alone would call a
-        session with a queued V1 task unowned and reclaim it out from under that task.
-
-        A standalone script owns its session only through the lease on this row
-        (``runnable_type == "script"``, stamped by ``get_or_create_for_script``); it writes no
-        workflow-run or task row, so the two run-model checks miss it. Consult the lease directly,
-        but gate it on the session itself not being final: a crashed script never releases its
-        lease, so keying solely on a non-null ``runnable_id`` would pin the row forever. The
-        session's own timeout still drives its status to a ``FINAL_STATUSES`` value, and once there
-        the stale lease no longer counts as owned. An unknown (NULL) status is held, fail-closed.
-
-        Unscoped by organization like :meth:`touch_last_activity`: the caller is the session's
-        own pod, which knows only the server-assigned session id. Non-final covers ``paused``
-        too -- a paused run still owns its browser and must not have it reclaimed.
-        """
-        unfinished_runs = [status for status in WorkflowRunStatus if not status.is_final()]
-        unfinished_tasks = [status for status in TaskStatus if not status.is_final()]
-        async with self.Session() as session:
-            return (
-                await session.scalar(
-                    select(
-                        exists().where(
-                            WorkflowRunModel.browser_session_id == session_id,
-                            WorkflowRunModel.status.in_(unfinished_runs),
-                        )
-                        | exists().where(
-                            TaskModel.browser_session_id == session_id,
-                            TaskModel.status.in_(unfinished_tasks),
-                        )
-                        | exists().where(
-                            PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
-                            PersistentBrowserSessionModel.runnable_type == "script",
-                            PersistentBrowserSessionModel.runnable_id.isnot(None),
-                            PersistentBrowserSessionModel.deleted_at.is_(None),
-                            or_(
-                                PersistentBrowserSessionModel.status.is_(None),
-                                PersistentBrowserSessionModel.status.not_in(FINAL_STATUSES),
-                            ),
-                        )
-                    )
-                )
-            ) or False
 
     @db_operation("touch_last_activity")
     async def touch_last_activity(self, session_id: str, last_activity_at: datetime | None = None) -> None:

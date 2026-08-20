@@ -606,9 +606,8 @@ def extension_install() -> None:
     console.print("2. Click Load unpacked.")
     console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
     if bridge_listening and port is not None:
-        console.print("4. Click Approve in the pairing page.")
-        console.print("5. Approve the pairing in the Skyvern Agent confirmation tab.")
-        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        console.print("4. Approve pairing in the Skyvern Agent confirmation tab (one click).")
+        console.print('5. Add tabs to the "Skyvern Controlled" group.')
         try:
             _launch_extension_pairing(port)
         except BrowserExtensionError:
