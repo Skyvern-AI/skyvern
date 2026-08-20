@@ -17,10 +17,24 @@ _REVIEW_PROPOSAL_DISPOSITIONS = frozenset({"review_untested", "review_tested"})
 _SHADOW_REASON_TRAILING_PUNCTUATION = ".,;:!?"
 
 INTERRUPTED_TERMINAL_REASON = "interrupted"
-INTERRUPTED_TERMINAL_MESSAGE = (
-    "This turn was interrupted before it could finish — the server stopped part-way through it. "
-    "Send your message again to retry."
-)
+INTERRUPTED_TERMINAL_HEADLINE = "This turn was interrupted before it could finish."
+INTERRUPTED_TERMINAL_RETRY = "Send your message again to retry."
+INTERRUPTED_TERMINAL_MESSAGE = f"{INTERRUPTED_TERMINAL_HEADLINE} {INTERRUPTED_TERMINAL_RETRY}"
+
+
+class InterruptedTurnFacts(BaseModel):
+    """What is known about a turn that stopped before it finished.
+
+    Every member is optional because each path that records an interruption knows a
+    different subset, and a guessed value would read as a claim about the turn.
+    """
+
+    recorded_at: str | None = None
+    iteration: int | None = None
+    workflow_permanent_id: str | None = None
+    workflow_version: int | None = None
+    authored_edits_saved: bool | None = None
+    last_recorded_build_test_phase: str | None = None
 
 
 class TerminalOutcomeEnvelope(BaseModel):
@@ -36,6 +50,7 @@ class TerminalOutcomeEnvelope(BaseModel):
     attempted: str | None = None
     response_kind: TerminalResponseKind
     terminal_cause: TerminalCause | None = None
+    interruption: InterruptedTurnFacts | None = None
     rendered_from_envelope: bool = False
     envelope_version: int = 1
 
@@ -113,14 +128,39 @@ def finalize_applied_state(
     )
 
 
-def interrupted_terminal_envelope() -> TerminalOutcomeEnvelope:
-    """Envelope for a turn whose process died mid-run — stopped, but never user-cancelled."""
+def interrupted_terminal_envelope(facts: InterruptedTurnFacts | None = None) -> TerminalOutcomeEnvelope:
+    """Envelope for a turn that stopped before it finished — stopped, but never user-cancelled."""
     return TerminalOutcomeEnvelope(
         next_state="stopped",
         verified=False,
+        workflow_applied=facts is not None and facts.authored_edits_saved is True,
         response_kind="stopped",
         halt_kind=INTERRUPTED_TERMINAL_REASON,
+        interruption=facts,
     )
+
+
+def render_interrupted_message(facts: InterruptedTurnFacts | None = None) -> str:
+    """User-facing copy for an interrupted turn: what is known, and never why it stopped."""
+    message = INTERRUPTED_TERMINAL_HEADLINE
+    if facts is not None:
+        if facts.recorded_at:
+            message = _append_sentence(message, f"Recorded at {facts.recorded_at}.")
+        if facts.iteration is not None:
+            message = _append_sentence(message, f"It reached iteration {facts.iteration}.")
+        if facts.workflow_permanent_id:
+            workflow = f"Workflow {facts.workflow_permanent_id}"
+            if facts.workflow_version is not None:
+                workflow += f", version {facts.workflow_version}"
+            message = _append_sentence(message, f"{workflow}.")
+        if facts.authored_edits_saved is not None:
+            saved = "were saved to" if facts.authored_edits_saved else "were not saved to"
+            message = _append_sentence(message, f"Your edits from this turn {saved} the workflow.")
+        if facts.last_recorded_build_test_phase:
+            message = _append_sentence(
+                message, f"Last recorded build-test phase: {facts.last_recorded_build_test_phase}."
+            )
+    return _append_sentence(message, INTERRUPTED_TERMINAL_RETRY)
 
 
 def render_terminal_message(envelope: TerminalOutcomeEnvelope, agent_message: str, cancelled: bool) -> tuple[str, bool]:

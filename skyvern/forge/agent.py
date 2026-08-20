@@ -1003,6 +1003,7 @@ class ForgeAgent:
             validate_and_fill_extraction_result,
         )
         from skyvern.forge.taskv3.auth_tools import build_auth_tools
+        from skyvern.forge.taskv3.captcha_tools import build_captcha_tools
         from skyvern.forge.taskv3.engine import (
             MIN_ACTION_STEPS,
             coerce_v3_parameters,
@@ -1152,10 +1153,27 @@ class ForgeAgent:
             or organization.max_steps_per_run
             or settings.MAX_STEPS_PER_RUN
         )
-        if task_block is None:
-            # Floor to the v3 minimum: a step-engine-tuned cap can starve the less round-efficient v3
-            # loop. A block task keeps its configured budget as-is (workflow authors size it deliberately).
-            step_cap = max(step_cap, MIN_ACTION_STEPS)
+        # An action or validation block owns its small budget deliberately; every other cap is sized in
+        # step-engine steps, which starves the less round-efficient v3 loop. Either signal alone marks
+        # the budget as owned — the block class settles it when task_type was left at its `general`
+        # default, which would otherwise floor an action block to many times its intended rounds.
+        atomic_block_budget = task_block is not None and (
+            isinstance(task_block, (ActionBlock, ValidationBlock))
+            or (task.task_type or TaskType.general) != TaskType.general
+        )
+        if not atomic_block_budget:
+            floored_step_cap = max(step_cap, MIN_ACTION_STEPS)
+            if floored_step_cap != step_cap and task_block is not None:
+                LOG.info(
+                    "task_v3 raised a block's action-step budget to the v3 floor",
+                    log_code="taskv3_action_budget_floored",
+                    task_id=task.task_id,
+                    block_label=task_block.label,
+                    block_type=task_block.block_type,
+                    configured_step_cap=step_cap,
+                    floored_step_cap=floored_step_cap,
+                )
+            step_cap = floored_step_cap
         if task_block is not None:
             # The org's workflow-run-wide step ceiling binds v3 blocks too: an action round is the
             # budget unit (round-stamped action rows make prior v3 rounds count exactly).
@@ -1204,6 +1222,7 @@ class ForgeAgent:
             "navigate": ActionType.GOTO_URL,
             "scroll": ActionType.SCROLL,
             "wait": ActionType.WAIT,
+            "solve_captcha": ActionType.SOLVE_CAPTCHA,
         }
         _billable_tool_names = frozenset(
             {"click", "hover", "type", "select_option", "select_combobox", "press_key", "file_upload"}
@@ -1258,29 +1277,25 @@ class ForgeAgent:
             if len(login_credential_keys) == 1:
                 credential_parameter_key = login_credential_keys[0]
 
-        _settle_probe = None
+        _page_fingerprint = None
         if task_block is not None:
-            # Two cheap DOM-shape samples: unequal means the page is mid-render (a delayed data
-            # load) and a completion verdict would judge a transient shell. Shape (length+count)
-            # misses same-shape content swaps — fine for the delayed-population class. Peeks with the
+            # One cheap DOM sample per call: a content hash plus length and element count, so a swap
+            # that preserves the page's shape still changes the fingerprint. Peeks with the
             # NON-recovering accessor — recovery at finish time could navigate and induce duplicate
-            # actions; a lost page settles (accept the verdict as-is). Total: errors settle.
+            # actions; a lost page returns None (nothing to verify; accept the verdict as-is).
+            # Errors propagate: the finish gate treats them as unknown, never as settled. Timing and
+            # its deadline/cancellation bounds live with the gate, not here.
             # Fenced to block tasks so the live bare-task arm's finish path is unchanged.
-            async def _settle_probe() -> bool:
-                try:
-                    peek = await browser_state.get_working_page()
-                    if peek is None:
-                        return True
-                    probe_js = (
-                        "() => document.body ? document.body.innerHTML.length + ':' + "
-                        "document.querySelectorAll('*').length : '0'"
-                    )
-                    first = await peek.evaluate(probe_js)
-                    await asyncio.sleep(0.7)
-                    second = await peek.evaluate(probe_js)
-                    return first == second
-                except Exception:
-                    return True
+            async def _page_fingerprint() -> str | None:
+                peek = await browser_state.get_working_page()
+                if peek is None:
+                    return None
+                probe_js = (
+                    "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
+                    " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
+                    " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+                )
+                return await peek.evaluate(probe_js)
 
         resolve_typed_text = None
         if task_block is not None:
@@ -1298,11 +1313,21 @@ class ForgeAgent:
             # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context hides get_verification_code.
             auth_tools, auth_guidance = build_auth_tools(task)
+            # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
+            # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
+            # Withheld in page-free mode: like browser_tools, a page-operating tool must not be offered
+            # when the run structurally never touches the live DOM.
+            captcha_tools: list[Any] = []
+            captcha_guidance = ""
+            if not page_free_validation:
+                captcha_tools, captcha_guidance = build_captcha_tools(
+                    task, _page_provider, organization_id=organization.organization_id
+                )
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
-                settle_probe=_settle_probe,
+                page_fingerprint=_page_fingerprint,
                 llm_caller=llm_caller,
                 goal=goal,
                 parameters=parameters,
@@ -1315,9 +1340,9 @@ class ForgeAgent:
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
-                extra_tools=auth_tools,
+                extra_tools=auth_tools + captcha_tools,
                 extra_system_guidance="\n\n".join(
-                    part for part in (auth_guidance, task.workflow_system_prompt) if part
+                    part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
                 ),
             )
         finally:

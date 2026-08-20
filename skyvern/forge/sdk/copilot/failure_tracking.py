@@ -261,3 +261,33 @@ def _canonical_block_config(block: Any) -> dict[str, Any]:
         return {"repr": repr(block)}
     cfg.pop("output_parameter", None)
     return cfg
+
+
+def _blocks_by_label(workflow_definition: object | None) -> dict[str, object]:
+    # ponytail: top-level attribute-shaped blocks only, so a loop child or a Mapping-shaped definition
+    # resolves to nothing; callers render that as an explicit unavailable binding rather than a match.
+    # Walk nested block containers if loop children ever need their own binding.
+    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
+    by_label: dict[str, object] = {}
+    if not blocks:
+        return by_label
+    for block in blocks:
+        label = getattr(block, "label", None)
+        if isinstance(label, str):
+            by_label[label] = block
+    return by_label
+
+
+def block_shape_hashes_by_label(labels: Sequence[str], workflow_definition: object | None) -> dict[str, str]:
+    """Shape hash per label that resolves to a top-level block; unresolvable labels are omitted."""
+    by_label = _blocks_by_label(workflow_definition)
+    hashes: dict[str, str] = {}
+    for label in labels:
+        block = by_label.get(label)
+        if block is None:
+            continue
+        shape = _canonical_block_config(block)
+        shape.pop("label", None)
+        serialized = json.dumps(shape, sort_keys=True, default=str, separators=(",", ":"))
+        hashes[label] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return hashes

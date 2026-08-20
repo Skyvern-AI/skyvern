@@ -561,6 +561,26 @@ def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteratio
         _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
 
 
+def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
+    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+
+    Synchronous and never raising, so the caller's ``raise`` re-raises the original
+    cancellation neither masked nor delayed.
+    """
+    try:
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+        ctx.copilot_turn_cancelled_iteration = iteration
+        LOG.warning(
+            "copilot_turn_cancelled",
+            elapsed_seconds=round(elapsed, 3),
+            iteration=iteration,
+            deadline_exceeded=ctx.copilot_total_timeout_exceeded is True,
+        )
+    except Exception:
+        LOG.exception("Failed to record a copilot turn cancellation", iteration=iteration)
+
+
 class CopilotNonRetriableNavError(Exception):
     """Raised from run_with_enforcement when the copilot's most recent run
     hit a permanent navigation error (DNS / cert / SSL / invalid URL) and
@@ -1008,6 +1028,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     if not items:
         return items
 
+    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
     tail: list[Any] = []
     for item in reversed(items[1:]):
         if is_screenshot_message(item):
@@ -1040,7 +1061,12 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         retained_tail=[_item_field(item, "type") for item in retained_tail],
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    return [opening, *retained_tail]
+    retained_items = [opening, *retained_tail]
+    screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
+    signal_content = _item_field(screenshot_dropped_signal[0], "content")
+    if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):
+        screenshot_dropped_signal = []
+    return [*retained_items, *screenshot_dropped_signal]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
@@ -1774,7 +1800,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -1796,7 +1822,7 @@ async def run_with_enforcement(
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
                 # Unconditional: the staged frame never reaches current_input, so images_stripped
                 # cannot see it, and the filter would re-append it to the retry we just shrank.
@@ -1818,7 +1844,7 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a

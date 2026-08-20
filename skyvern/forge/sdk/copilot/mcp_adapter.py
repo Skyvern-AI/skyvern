@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_browser_context,
     mcp_to_copilot,
     resolve_browser_state_for_context,
+    retire_browser_session_id,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
@@ -390,9 +391,11 @@ class SkyvernOverlayMCPServer(MCPServer):
         session_error = await ensure_browser_session(ctx)
         if session_error is not None:
             raise RuntimeError(str(session_error.get("error", "Evidence-candidate browser session unavailable")))
+        examined_session_id = ctx.browser_session_id
         try:
             browser_state = await resolve_browser_state_for_context(ctx)
             if browser_state is None:
+                retire_browser_session_id(ctx, examined_session_id)
                 raise RuntimeError("Evidence-candidate navigation guard requires a browser context")
             async with _service_worker_blocked_context(
                 browser_state,

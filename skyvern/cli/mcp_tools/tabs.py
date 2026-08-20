@@ -104,8 +104,8 @@ async def skyvern_tab_list(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_tab_list", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_tab_list", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser
@@ -143,8 +143,8 @@ async def skyvern_tab_new(
     """
     try:
         _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_tab_new", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_tab_new", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser
@@ -273,8 +273,8 @@ async def skyvern_open_tabs(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_open_tabs", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_open_tabs", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser
@@ -403,8 +403,8 @@ async def skyvern_tab_switch(
 
     try:
         _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_tab_switch", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_tab_switch", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser
@@ -469,8 +469,8 @@ async def skyvern_tab_close(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_tab_close", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser
@@ -557,8 +557,8 @@ async def skyvern_tab_wait_for_new(
 
     try:
         _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_tab_wait_for_new", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_tab_wait_for_new", ok=False, error=no_browser_error(exc))
 
     state = get_current_session()
     browser = state.browser

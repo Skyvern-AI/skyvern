@@ -17,6 +17,15 @@ MAX_TIMEOUT_EXCEEDED_MESSAGE = (
 )
 
 
+def max_timeout_exceeded_warning(requested_timeout_minutes: int) -> str:
+    """Warning returned when a create request asked for more than the cap allows."""
+    return (
+        f"Requested timeout of {requested_timeout_minutes} minutes exceeds the maximum of "
+        f"{MAX_TIMEOUT} minutes ({MAX_TIMEOUT // 60} hours); this session was capped at "
+        f"{MAX_TIMEOUT} minutes. {MAX_TIMEOUT_EXCEEDED_MESSAGE}"
+    )
+
+
 def seconds_until_expiry(
     *,
     seconds_since_start: float,

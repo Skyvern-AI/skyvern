@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
+from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -1087,6 +1088,7 @@ class AgentFunction:
         organization_id: str | None,
         block_label: str | None,
         browser_session_id: str | None,
+        code: str | None = None,
     ) -> bool:
         """Whether a workflow CodeBlock run should execute in the secure runner.
 
@@ -1191,6 +1193,22 @@ class AgentFunction:
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
+
+    async def scan_code_block_source(
+        self,
+        code: str,
+        *,
+        organization_id: str | None = None,
+        timeout_seconds: float = 3.0,
+    ) -> list[CodeBlockScanFinding]:
+        """Advisory code-scanner findings for author-time surfaces (copilot diagnostics, MCP lint).
+
+        Findings are warnings, never refusals, and finding text must come from scanner rule
+        metadata only — never the matched snippet. Implementations must never raise: fail open
+        to an empty list on scanner error, timeout, or unavailability. OSS has no scanner and
+        returns no findings; cloud overrides with its bounded, cached advisory scan.
+        """
+        return []
 
     def allow_copilot_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is

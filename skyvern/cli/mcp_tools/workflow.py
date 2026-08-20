@@ -345,6 +345,10 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         "output_summary": output_summary,
     }
 
+    parent_run_id = _get_value(run, "parent_workflow_run_id")
+    if parent_run_id:
+        summary["parent_run_id"] = parent_run_id
+
     failure_reason = _get_value(run, "failure_reason")
     if failure_reason:
         summary["failure_reason"] = failure_reason
@@ -1616,9 +1620,20 @@ async def skyvern_workflow_run_list(
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
     search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
+    include_child_runs: Annotated[
+        bool,
+        Field(
+            description=(
+                "Include child runs — runs of this workflow started from inside another workflow run. "
+                "False by default, so only top-level runs are listed."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """List runs for a specific workflow. Use this when you have a workflow permanent ID
-    and need to browse its run history with pagination and optional filters."""
+    and need to browse its run history with pagination and optional filters.
+    Child runs — runs started by another workflow — are excluded by default, so the count here can be
+    far lower than the workflow's total run history; pass include_child_runs=true to list them too."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_run_list"):
         return err
 
@@ -1632,6 +1647,7 @@ async def skyvern_workflow_run_list(
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
+                include_child_runs=include_child_runs,
             )
             timer.mark("sdk")
         except NotFoundError:
@@ -1665,9 +1681,14 @@ async def skyvern_workflow_run_list(
             "page_size": page_size,
             "count": len(runs),
             "has_more": has_more,
+            "include_child_runs": include_child_runs,
             "sdk_equivalent": (
-                f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
-                f"page={page}, page_size={page_size})"
+                f"# No SDK argument yet — GET /v1/workflows/{workflow_id}/runs?include_child_runs=true"
+                if include_child_runs
+                else (
+                    f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
+                    f"page={page}, page_size={page_size})"
+                )
             ),
         },
         timing_ms=timer.timing_ms,

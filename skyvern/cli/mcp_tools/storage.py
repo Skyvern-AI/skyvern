@@ -29,8 +29,8 @@ async def skyvern_get_session_storage(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("get_session_storage", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("get_session_storage", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
@@ -71,8 +71,8 @@ async def skyvern_set_session_storage(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("set_session_storage", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("set_session_storage", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
@@ -107,8 +107,8 @@ async def skyvern_clear_session_storage(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("clear_session_storage", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("clear_session_storage", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
@@ -143,8 +143,8 @@ async def skyvern_clear_local_storage(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("clear_local_storage", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("clear_local_storage", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:

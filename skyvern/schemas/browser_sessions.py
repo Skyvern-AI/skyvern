@@ -24,8 +24,8 @@ class CreateBrowserSessionRequest(BaseModel):
             return value
         return validate_url(value)
 
-    # No le bound: the route rejects values above MAX_TIMEOUT with a 400 and an
-    # enterprise-contact message instead of pydantic's 422.
+    # No le bound: the route caps values above MAX_TIMEOUT and returns a warning on the
+    # response instead of failing the request with pydantic's 422.
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
         description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",

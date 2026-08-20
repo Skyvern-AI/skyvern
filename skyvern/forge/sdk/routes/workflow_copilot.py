@@ -54,12 +54,13 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
 )
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.terminal_envelope import (
-    INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
+    InterruptedTurnFacts,
     TerminalOutcomeEnvelope,
     finalize_applied_state,
     interrupted_terminal_envelope,
     reason_in_reply_shadow,
+    render_interrupted_message,
     render_terminal_message,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
@@ -831,6 +832,86 @@ async def _persist_turn_messages(
     return assistant_message
 
 
+def _interruption_facts(
+    chat: WorkflowCopilotChat,
+    workflow: Workflow | None,
+    agent_result: AgentResult | None,
+    *,
+    authored_edits_saved: bool | None,
+) -> InterruptedTurnFacts:
+    return InterruptedTurnFacts(
+        recorded_at=datetime.now(timezone.utc).isoformat(),
+        iteration=agent_result.cancellation_iteration if agent_result is not None else None,
+        workflow_permanent_id=chat.workflow_permanent_id,
+        workflow_version=workflow.version if workflow is not None else None,
+        authored_edits_saved=authored_edits_saved,
+        last_recorded_build_test_phase=(
+            agent_result.cancellation_last_recorded_phase if agent_result is not None else None
+        ),
+    )
+
+
+def _interrupted_turn_outcome(
+    turn_id: str | None,
+    *,
+    idempotency_digest: str | None,
+    prior_turn_outcome: TurnOutcome | None,
+) -> TurnOutcome:
+    return TurnOutcome(
+        response_kind=ResponseKind.RECOVER,
+        reason_code=INTERRUPTED_TERMINAL_REASON,
+        terminal_reason=INTERRUPTED_TERMINAL_REASON,
+        copilot_turn_id=turn_id,
+        idempotency_digest=idempotency_digest,
+        connected_account_choices=(
+            prior_turn_outcome.connected_account_choices if prior_turn_outcome is not None else None
+        ),
+    )
+
+
+async def _persist_interrupted_turn(
+    chat: WorkflowCopilotChat,
+    turn_id: str,
+    *,
+    facts: InterruptedTurnFacts | None,
+    idempotency_digest: str | None = None,
+    user_message: str = "",
+    user_row_already_persisted: bool = True,
+) -> None:
+    """Write the assistant row for a turn that stopped before it finished.
+
+    Idempotent per ``turn_id`` through ``_persist_turn_messages``, so the live cancel
+    exits and a later reconcile pass over the same turn cannot both leave a row.
+    """
+    chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    message = render_interrupted_message(facts)
+    narrative_payload = _with_terminal_narrative_metadata(
+        _make_error_narrative_payload(turn_id, None, message),
+        # An interrupted turn halted; it did not fail. The FE reads this flag to
+        # keep the row out of failure treatment (computeTurnSummary, narrativeState.ts).
+        cancelled=True,
+        proposal_disposition=_proposal_disposition(None),
+        terminal_envelope=interrupted_terminal_envelope(facts).model_dump(mode="json"),
+    )
+    await _persist_turn_messages(
+        chat=chat,
+        turn_id=turn_id,
+        user_message=user_message,
+        audio_artifact_id=None,
+        user_row_already_persisted=user_row_already_persisted,
+        assistant_content=message,
+        global_llm_context=None,
+        turn_outcome=_interrupted_turn_outcome(
+            turn_id,
+            idempotency_digest=idempotency_digest,
+            prior_turn_outcome=_latest_assistant_turn_outcome(chat_messages),
+        ),
+        narrative_payload=narrative_payload,
+    )
+
+
 async def _persist_cancel_turn(
     stream: EventSourceStream,
     chat: WorkflowCopilotChat,
@@ -843,6 +924,7 @@ async def _persist_cancel_turn(
     keep_pending_proposal: bool = False,
     prior_global_llm_context: str | None = None,
     user_row_already_persisted: bool = False,
+    record_as_interrupted: bool = False,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -850,9 +932,13 @@ async def _persist_cancel_turn(
     rollback uses the same ``workflow_was_persisted`` source of truth as
     the success path; pass ``None`` for pre-agent cancels. A pre-agent cancel
     carries ``prior_global_llm_context`` forward so durable state survives.
+
+    ``record_as_interrupted`` keeps the rollback and proposal handling but records the
+    turn as interrupted, for a cancellation no user asked for.
     """
     turn_outcome: TurnOutcome | None
     workflow_applied = False
+    canonical_rolled_back = False
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
@@ -885,6 +971,7 @@ async def _persist_cancel_turn(
                     exc_info=True,
                 )
                 restore_failed = True
+        canonical_rolled_back = restored and not restore_failed
         # A failed rollback means canonical may still hold the mid-turn write — don't
         # honor keep_pending_proposal against an unverified "nothing changed" state.
         effective_keep_pending_proposal = keep_pending_proposal and not restore_failed
@@ -931,6 +1018,26 @@ async def _persist_cancel_turn(
                 terminal_envelope = terminal_envelope_model.model_copy(
                     update={"rendered_from_envelope": True}
                 ).model_dump(mode="json")
+
+    if record_as_interrupted:
+        facts = _interruption_facts(
+            chat,
+            original_workflow,
+            agent_result,
+            authored_edits_saved=False if canonical_rolled_back else None,
+        )
+        user_response = render_interrupted_message(facts)
+        turn_outcome = _interrupted_turn_outcome(
+            turn_id or response_turn_id,
+            idempotency_digest=turn_outcome.idempotency_digest if turn_outcome is not None else None,
+            prior_turn_outcome=turn_outcome,
+        )
+        terminal_envelope = interrupted_terminal_envelope(facts).model_dump(mode="json")
+        narrative_payload = (
+            {**narrative_payload, "terminalMessage": user_response}
+            if narrative_payload is not None
+            else _make_error_narrative_payload(turn_id or response_turn_id, None, user_response)
+        )
 
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
@@ -1787,6 +1894,11 @@ async def _new_copilot_chat_post(
         agent_result: AgentResult | None = None
         global_llm_context: str | None = None
         terminal_frame_emitted = False
+        # Set before the shielded _finalise_normal_turn. A cancel arriving mid-write
+        # raises at that await while the shielded write continues, so without this the
+        # cancel handler would insert a second row for the same turn concurrently --
+        # the read-then-create idempotency has no unique constraint to catch it.
+        finalise_started = False
         cancel_watcher: asyncio.Task[None] | None = None
         current_code_available = False
         turn_index = 0
@@ -2167,6 +2279,8 @@ async def _new_copilot_chat_post(
             if getattr(agent_result, "cancelled", False):
                 # The agent absorbed the CancelledError and returned a result
                 # carrying ``workflow_was_persisted`` so rollback proceeds normally.
+                # Nobody pressed Stop on a cancellation the user never asked for, so
+                # that turn is recorded as interrupted rather than as their intent.
                 await _persist_cancel_turn(
                     stream=stream,
                     chat=chat,
@@ -2178,18 +2292,21 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     keep_pending_proposal=chat_request.keep_pending_proposal,
                     user_row_already_persisted=turn_started,
+                    record_as_interrupted=not user_cancel_observed[0],
                 )
                 terminal_frame_emitted = True
                 capture_code_mode_opt_out_after_persist()
                 LOG.info(
-                    "Workflow copilot v2 cancelled by user",
+                    "Workflow copilot v2 turn cancelled",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                    user_cancel_observed=user_cancel_observed[0],
                 )
                 return
 
             # Atomic finalisation — a late cancel that fires here cannot tear
             # the success-path writes apart mid-way (no half-written turn,
             # no duplicate user/AI rows).
+            finalise_started = True
             await asyncio.shield(
                 _finalise_normal_turn(
                     stream=stream,
@@ -2267,16 +2384,34 @@ async def _new_copilot_chat_post(
                 )
                 return
             else:
-                # Operational cancel (worker shutdown, deploy drain) or a
-                # cancel that arrived after _finalise_normal_turn started
-                # its shielded write. Don't manufacture a "Cancelled by
-                # user." chat row — chat history should not record an
-                # operational cancel as user intent.
+                # Operational cancel (worker shutdown, deploy drain). Don't manufacture
+                # a "Cancelled by user." chat row — chat history should not record an
+                # operational cancel as user intent. When finalisation already started,
+                # its shielded write owns this turn's row and wins; if it dies before
+                # committing, the pending turn is left for reconcile-on-read to recover.
                 LOG.info(
                     "Workflow copilot v2 task cancelled (operational or post-finalisation)",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
                     user_cancel_observed=user_cancel_observed[0],
+                    finalise_started=finalise_started,
                 )
+                if chat is not None and turn_started and not finalise_started:
+                    # Shielded so the row lands even though this await re-raises the
+                    # cancellation immediately; nothing may follow it in this branch.
+                    await asyncio.shield(
+                        _persist_interrupted_turn(
+                            chat,
+                            turn_id,
+                            facts=_interruption_facts(
+                                chat,
+                                original_workflow,
+                                agent_result,
+                                authored_edits_saved=None,
+                            ),
+                            user_message=chat_request.message,
+                            user_row_already_persisted=turn_started,
+                        )
+                    )
                 raise
         except Exception as exc:
             await _recover_from_route_exception(
@@ -2662,22 +2797,23 @@ async def _restore_canonical_after_interrupted_turn(
     chat: WorkflowCopilotChat,
     organization_id: str,
     entry: CopilotPendingTurn,
-) -> None:
+) -> bool:
     """Undo an interrupted turn's canonical write, stashing the displaced draft as the proposal.
 
     Only fires while canonical still carries the fingerprint this turn recorded when it wrote.
     Anyone writing after it — another chat, a manual edit, a later turn — forfeits the rollback.
+    Returns whether the rollback fired.
     """
     if entry.pre_turn_workflow is None or entry.canonical_write_fingerprint is None:
-        return
+        return False
     current = await app.DATABASE.workflows.get_workflow_by_permanent_id(
         workflow_permanent_id=chat.workflow_permanent_id,
         organization_id=organization_id,
     )
     if current is None:
-        return
+        return False
     if workflow_content_fingerprint(current.model_dump(mode="json")) != entry.canonical_write_fingerprint:
-        return
+        return False
 
     if not (entry.keep_pending_proposal and entry.pre_turn_proposed_workflow is not None):
         stashed_draft = current.model_dump(mode="json")
@@ -2695,6 +2831,7 @@ async def _restore_canonical_after_interrupted_turn(
         pre_turn_workflow.cdp_connect_headers, current.cdp_connect_headers
     )
     await _restore_workflow_definition(pre_turn_workflow, organization_id)
+    return True
 
 
 async def _recover_interrupted_copilot_turn(
@@ -2707,7 +2844,7 @@ async def _recover_interrupted_copilot_turn(
         return
 
     try:
-        await _restore_canonical_after_interrupted_turn(chat, organization_id, entry)
+        canonical_rolled_back = await _restore_canonical_after_interrupted_turn(chat, organization_id, entry)
     except Exception:
         # Answering the turn here would strand canonical on the half-written draft
         # while history claims it was recovered; leave the marker for a later read.
@@ -2719,36 +2856,17 @@ async def _recover_interrupted_copilot_turn(
         )
         return
 
-    chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-    )
-    prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
-    turn_outcome = TurnOutcome(
-        response_kind=ResponseKind.RECOVER,
-        reason_code=INTERRUPTED_TERMINAL_REASON,
-        terminal_reason=INTERRUPTED_TERMINAL_REASON,
-        copilot_turn_id=entry.turn_id,
-        idempotency_digest=entry.idempotency_digest,
-        connected_account_choices=(
-            prior_turn_outcome.connected_account_choices if prior_turn_outcome is not None else None
+    pre_turn_version = (entry.pre_turn_workflow or {}).get("version")
+    await _persist_interrupted_turn(
+        chat,
+        entry.turn_id,
+        facts=InterruptedTurnFacts(
+            recorded_at=datetime.now(timezone.utc).isoformat(),
+            workflow_permanent_id=chat.workflow_permanent_id,
+            workflow_version=pre_turn_version if isinstance(pre_turn_version, int) else None,
+            authored_edits_saved=False if canonical_rolled_back else None,
         ),
-    )
-    narrative_payload = _with_terminal_narrative_metadata(
-        _make_error_narrative_payload(entry.turn_id, None, INTERRUPTED_TERMINAL_MESSAGE),
-        cancelled=False,
-        proposal_disposition=_proposal_disposition(None),
-        terminal_envelope=interrupted_terminal_envelope().model_dump(mode="json"),
-    )
-    await _persist_turn_messages(
-        chat=chat,
-        turn_id=entry.turn_id,
-        user_message="",
-        audio_artifact_id=None,
-        user_row_already_persisted=True,
-        assistant_content=INTERRUPTED_TERMINAL_MESSAGE,
-        global_llm_context=None,
-        turn_outcome=turn_outcome,
-        narrative_payload=narrative_payload,
+        idempotency_digest=entry.idempotency_digest,
     )
     LOG.info(
         "Recovered an interrupted copilot turn on read",
