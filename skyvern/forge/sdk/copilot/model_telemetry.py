@@ -44,6 +44,7 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
 )
+from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
@@ -181,7 +182,8 @@ def model_call_telemetry_scope(
     telemetry = CopilotModelCallTelemetry(model_call_index=model_call_index)
     token = _current_model_call_telemetry.set(telemetry)
     try:
-        yield telemetry
+        with pending_operation(f"model.call:{model}" if model else "model.call"):
+            yield telemetry
     finally:
         try:
             if model is not None:
