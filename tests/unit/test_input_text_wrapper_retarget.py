@@ -66,6 +66,7 @@ def _mock_nested_input(*, element_id: str, supports_text: bool, disabled: bool =
     el.is_disabled = AsyncMock(return_value=disabled)
     el.has_hidden_attr = AsyncMock(return_value=False)
     el.is_visible = AsyncMock(return_value=True)
+    el.get_attr = AsyncMock(return_value=None)
     locator = MagicMock()
     locator.focus = AsyncMock()
     el.get_locator.return_value = locator

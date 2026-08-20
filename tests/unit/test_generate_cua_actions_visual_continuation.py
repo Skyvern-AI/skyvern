@@ -54,7 +54,9 @@ def _flatten_input_message(create_input: list[dict[str, Any]]) -> tuple[list[str
     return texts, image_urls
 
 
-async def _invoke_no_call_continuation(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+async def _invoke_no_call_continuation(
+    monkeypatch: pytest.MonkeyPatch, helper_answer: str | None = HELPER_ANSWER
+) -> AsyncMock:
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -87,7 +89,7 @@ async def _invoke_no_call_continuation(monkeypatch: pytest.MonkeyPatch) -> Async
     monkeypatch.setattr(
         agent_module,
         "get_org_aware_primary_llm_api_handler",
-        lambda default=None: AsyncMock(return_value={"answer": HELPER_ANSWER}),
+        lambda default=None: AsyncMock(return_value={"answer": helper_answer}),
     )
     monkeypatch.setattr(agent_module, "parse_cua_actions", AsyncMock(return_value=[]))
 
@@ -107,10 +109,32 @@ async def test_no_computer_call_continuation_includes_answer_and_screenshot(
     create_input = create_mock.await_args.kwargs["input"]
     texts, image_urls = _flatten_input_message(create_input)
 
-    assert HELPER_ANSWER in texts
+    assert any(HELPER_ANSWER in text for text in texts)
 
     expected_data_url = f"data:image/png;base64,{base64.b64encode(SCREENSHOT_BYTES).decode('utf-8')}"
     assert expected_data_url in image_urls
+
+
+@pytest.mark.asyncio
+async def test_truthy_answer_appends_execute_directive(monkeypatch: pytest.MonkeyPatch) -> None:
+    create_mock = await _invoke_no_call_continuation(monkeypatch)
+
+    create_input = create_mock.await_args.kwargs["input"]
+    texts, _ = _flatten_input_message(create_input)
+
+    combined = next(text for text in texts if HELPER_ANSWER in text)
+    assert agent_module.CUA_EXECUTE_ACTIONS_DIRECTIVE in combined
+
+
+@pytest.mark.asyncio
+async def test_no_answer_default_question_omits_directive(monkeypatch: pytest.MonkeyPatch) -> None:
+    create_mock = await _invoke_no_call_continuation(monkeypatch, helper_answer="")
+
+    create_input = create_mock.await_args.kwargs["input"]
+    texts, _ = _flatten_input_message(create_input)
+
+    assert any("I don't know." in text for text in texts)
+    assert all(agent_module.CUA_EXECUTE_ACTIONS_DIRECTIVE not in text for text in texts)
 
 
 @pytest.mark.asyncio

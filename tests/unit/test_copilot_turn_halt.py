@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
+    CopilotToolBlockerSignal,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     merge_visual_composition_evidence,
     parse_composition_html,
@@ -62,6 +65,21 @@ def test_device_approval_challenge_stashes_local_halt() -> None:
 
     assert halt is not None
     assert halt.kind is TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    with pytest.raises(CopilotTurnHalt):
+        raise_if_turn_halt(ctx)
+
+
+def test_failed_browser_session_recovery_stashes_session_loss_halt() -> None:
+    ctx = SimpleNamespace(turn_halt=None)
+
+    halt = stash_turn_halt_from_blocker_signal(
+        ctx,
+        _signal(BROWSER_SESSION_LOST_BLOCKER_REASON_CODE),
+        source="test",
+    )
+
+    assert halt is not None
+    assert halt.kind is TurnHaltKind.BROWSER_SESSION_LOST
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx)
 

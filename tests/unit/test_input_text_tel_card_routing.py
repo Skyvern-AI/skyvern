@@ -1,15 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import InvalidElementForTextInput, PhoneNumberInputMismatch
+from skyvern.exceptions import (
+    CaptchaSolveError,
+    ImaginarySecretValue,
+    InvalidElementForTextInput,
+    MissingElement,
+    MultipleElementsFound,
+    PhoneNumberInputBrowserInteractionFailed,
+    PhoneNumberInputBrowserValidityMismatch,
+    PhoneNumberInputMismatch,
+)
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
-from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
-from skyvern.webeye.actions.handler import handle_input_text_action
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionType,
+    InputOrSelectContext,
+    InputTextAction,
+    TelInputOutcome,
+    TelInputStrategy,
+)
+from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action_direct
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
@@ -34,10 +52,11 @@ async def _run_input_text(
     *,
     resolved: str | None = None,
     tel_fix_enabled: bool = True,
-    tel_verify_side_effect: list[Exception | None] | None = None,
+    tel_verify_side_effect: list[Exception | int] | None = None,
     tag_name: str = "input",
     blocker: MagicMock | None = None,
     input_or_select_context: InputOrSelectContext | None = None,
+    current_value: str = "",
 ) -> tuple[list, AsyncMock, AsyncMock, AsyncMock, MagicMock, AsyncMock]:
     # Production always parses a real InputOrSelectContext (the parse never returns None), so default to an
     # ordinary all-unset context here -- a None default would exercise a branch that cannot occur in prod.
@@ -60,7 +79,9 @@ async def _run_input_text(
     scraped_page.id_to_element_dict = {"AADC": {"tagName": tag_name}}
 
     card_readback = AsyncMock(return_value=None)
-    tel_verify = AsyncMock(side_effect=tel_verify_side_effect)
+    tel_verify = (
+        AsyncMock(return_value=10) if tel_verify_side_effect is None else AsyncMock(side_effect=tel_verify_side_effect)
+    )
     phone_format = AsyncMock(return_value=text)
     warning_log = MagicMock()
     secret_readback = AsyncMock(return_value=None)
@@ -71,7 +92,7 @@ async def _run_input_text(
         patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
         patch("skyvern.webeye.actions.handler.SkyvernFrame.create_instance", new=AsyncMock(return_value=skyvern_frame)),
         patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
-        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="")),
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value=current_value)),
         patch(
             "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
             return_value=secret_return,
@@ -87,7 +108,7 @@ async def _run_input_text(
         patch("skyvern.webeye.actions.handler._verify_tel_input_after_fill", new=tel_verify),
         patch("skyvern.webeye.actions.handler.LOG.warning", new=warning_log),
     ):
-        results = await handle_input_text_action(
+        results = await handle_input_text_action_direct(
             action=InputTextAction(element_id="AADC", text=text, reasoning="fill field"),
             page=MagicMock(),
             scraped_page=scraped_page,
@@ -96,6 +117,360 @@ async def _run_input_text(
         )
 
     return results, card_readback, tel_verify, phone_format, warning_log, secret_readback
+
+
+def test_tel_input_outcome_is_excluded_from_action_serialization() -> None:
+    action = Action(action_type=ActionType.INPUT_TEXT)
+    action.tel_input_outcome = TelInputOutcome(
+        flag_enabled=True,
+        final_element_id="AADC",
+        strategy=TelInputStrategy.sequential_national,
+        expected_digit_count=10,
+        actual_digit_count=10,
+        browser_valid=True,
+        attempt_count=1,
+        retargeted=False,
+    )
+
+    assert "tel_input_outcome" not in action.model_dump()
+    assert "tel_input_outcome" not in action.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_action_handler_logs_tel_outcome_once_without_phone_value() -> None:
+    synthetic_phone = "2245550199"
+    action = InputTextAction(element_id="AADC", text=synthetic_phone, reasoning="fill phone")
+    outcome = TelInputOutcome(
+        flag_enabled=True,
+        final_element_id="AADC",
+        strategy=TelInputStrategy.sequential_national,
+        expected_digit_count=10,
+        actual_digit_count=10,
+        browser_valid=True,
+        attempt_count=1,
+        retargeted=False,
+    )
+
+    async def patched_input_handler(action: InputTextAction, **_kwargs: object) -> list[ActionSuccess]:
+        action.tel_input_outcome = outcome
+        return [ActionSuccess()]
+
+    with (
+        patch("skyvern.webeye.actions.handler._handle_input_text_action", new=patched_input_handler),
+        patch("skyvern.webeye.actions.handler.LOG.info") as log_info,
+    ):
+        results = await handle_input_text_action_direct(
+            action=action,
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            task=_TASK,
+            step=_STEP,
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    assert action.tel_input_outcome is None
+    terminal_logs = [call for call in log_info.call_args_list if call.args and call.args[0] == "tel_input_outcome"]
+    assert len(terminal_logs) == 1
+    terminal_kwargs = terminal_logs[0].kwargs
+    assert terminal_kwargs["sampling"] is False
+    assert terminal_kwargs["terminal_result"] == "completed"
+    assert terminal_kwargs["exception_type"] is None
+    assert synthetic_phone not in str(terminal_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_logs_final_failure_after_successful_tel_fill() -> None:
+    action = InputTextAction(element_id="AADC", text="224-555-0199", reasoning="fill phone")
+    outcome = TelInputOutcome(
+        flag_enabled=True,
+        final_element_id="AADC",
+        strategy=TelInputStrategy.sequential_national,
+        expected_digit_count=10,
+        actual_digit_count=10,
+        browser_valid=True,
+        attempt_count=1,
+        retargeted=False,
+    )
+
+    async def successful_input_handler(action: InputTextAction, *_args: object) -> list[ActionSuccess]:
+        action.tel_input_outcome = outcome
+        return [ActionSuccess()]
+
+    app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock(
+        side_effect=[None, RuntimeError("post-handler failure")]
+    )
+    with (
+        patch("skyvern.webeye.actions.handler.app", app_mock),
+        patch("skyvern.webeye.actions.handler.check_for_invalid_web_action", return_value=None),
+        patch.dict(ActionHandler._handled_action_types, {ActionType.INPUT_TEXT: successful_input_handler}, clear=True),
+        patch.dict(ActionHandler._setup_action_types, {}, clear=True),
+        patch.dict(ActionHandler._teardown_action_types, {}, clear=True),
+        patch("skyvern.webeye.actions.handler.LLMCallerManager.get_llm_caller", return_value=None),
+        patch("skyvern.webeye.actions.handler.LOG.info") as log_info,
+    ):
+        results = await ActionHandler._handle_action(
+            scraped_page=MagicMock(),
+            task=_TASK,
+            step=_STEP,
+            page=MagicMock(),
+            action=action,
+        )
+
+    assert isinstance(results[-1], ActionFailure)
+    terminal_logs = [call for call in log_info.call_args_list if call.args and call.args[0] == "tel_input_outcome"]
+    assert len(terminal_logs) == 1
+    assert terminal_logs[0].kwargs["terminal_result"] == "failed"
+    assert terminal_logs[0].kwargs["exception_type"] == "RuntimeError"
+    assert action.tel_input_outcome is None
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_tel_outcome_emission_failure_preserves_success() -> None:
+    action = InputTextAction(element_id="AADC", text="224-555-0199", reasoning="fill phone")
+    outcome = TelInputOutcome(
+        flag_enabled=True,
+        final_element_id="AADC",
+        strategy=TelInputStrategy.sequential_national,
+        expected_digit_count=10,
+        actual_digit_count=10,
+        browser_valid=True,
+        attempt_count=1,
+        retargeted=False,
+    )
+    decided_result = ActionSuccess()
+
+    async def successful_input_handler(action: InputTextAction, *_args: object) -> list[ActionSuccess]:
+        action.tel_input_outcome = outcome
+        return [decided_result]
+
+    def fail_terminal_log(event: object, *_args: object, **_kwargs: object) -> None:
+        if event == "tel_input_outcome":
+            raise RuntimeError("synthetic telemetry failure")
+
+    app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock(return_value=None)
+    with (
+        patch("skyvern.webeye.actions.handler.app", app_mock),
+        patch("skyvern.webeye.actions.handler.check_for_invalid_web_action", return_value=None),
+        patch.dict(ActionHandler._handled_action_types, {ActionType.INPUT_TEXT: successful_input_handler}, clear=True),
+        patch.dict(ActionHandler._setup_action_types, {}, clear=True),
+        patch.dict(ActionHandler._teardown_action_types, {}, clear=True),
+        patch("skyvern.webeye.actions.handler.LLMCallerManager.get_llm_caller", return_value=None),
+        patch("skyvern.webeye.actions.handler.LOG.info", side_effect=fail_terminal_log),
+    ):
+        results = await ActionHandler._handle_action(
+            scraped_page=MagicMock(),
+            task=_TASK,
+            step=_STEP,
+            page=MagicMock(),
+            action=action,
+        )
+
+    assert len(results) == 1
+    assert results[0] is decided_result
+    assert action.status.value == "completed"
+    assert action.tel_input_outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["log_info", "model_dump"])
+async def test_direct_tel_outcome_emission_fails_open(failure_mode: str) -> None:
+    action = InputTextAction(element_id="AADC", text="224-555-0199", reasoning="fill phone")
+    outcome = TelInputOutcome(
+        flag_enabled=True,
+        final_element_id="AADC",
+        strategy=TelInputStrategy.sequential_national,
+        expected_digit_count=10,
+        actual_digit_count=10,
+        browser_valid=True,
+        attempt_count=1,
+        retargeted=False,
+    )
+    decided_result = ActionSuccess()
+    original_exception = RuntimeError("synthetic direct failure")
+
+    if failure_mode == "log_info":
+
+        async def patched_input_handler(action: InputTextAction, **_kwargs: object) -> list[ActionSuccess]:
+            action.tel_input_outcome = outcome
+            return [decided_result]
+
+        def fail_terminal_log(event: object, *_args: object, **_kwargs: object) -> None:
+            if event == "tel_input_outcome":
+                raise RuntimeError("synthetic telemetry failure")
+
+        with (
+            patch("skyvern.webeye.actions.handler._handle_input_text_action", new=patched_input_handler),
+            patch("skyvern.webeye.actions.handler.LOG.info", side_effect=fail_terminal_log),
+        ):
+            results = await handle_input_text_action_direct(
+                action=action,
+                page=MagicMock(),
+                scraped_page=MagicMock(),
+                task=_TASK,
+                step=_STEP,
+            )
+
+        assert len(results) == 1
+        assert results[0] is decided_result
+    else:
+        serialized_outcome = MagicMock()
+        serialized_outcome.model_dump.side_effect = RuntimeError("synthetic serialization failure")
+
+        async def patched_input_handler(action: InputTextAction, **_kwargs: object) -> list[ActionSuccess]:
+            action.tel_input_outcome = serialized_outcome
+            raise original_exception
+
+        with patch("skyvern.webeye.actions.handler._handle_input_text_action", new=patched_input_handler):
+            with pytest.raises(RuntimeError) as raised:
+                await handle_input_text_action_direct(
+                    action=action,
+                    page=MagicMock(),
+                    scraped_page=MagicMock(),
+                    task=_TASK,
+                    step=_STEP,
+                )
+
+        assert raised.value is original_exception
+
+    assert action.tel_input_outcome is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocker_attrs", "value", "blocker_id"),
+    [
+        pytest.param(
+            {"type": "text", "autocomplete": None, "name": "plain"},
+            "synthetic text",
+            "TEXT-BLOCKER",
+            id="tel-to-text",
+        ),
+        pytest.param(
+            {"type": "tel", "autocomplete": "cc-number", "name": "card.number"},
+            VISA_16,
+            "CARD-BLOCKER",
+            id="tel-to-card",
+        ),
+    ],
+)
+async def test_tel_retarget_does_not_relabel_non_phone_error(
+    blocker_attrs: dict[str, str | None],
+    value: str,
+    blocker_id: str,
+) -> None:
+    original = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    blocker = _mock_input(blocker_attrs)
+    blocker.get_id.return_value = blocker_id
+    browser_error = RuntimeError("synthetic post-retarget browser error")
+    blocker.is_auto_completion_input = AsyncMock(side_effect=browser_error)
+
+    with pytest.raises(RuntimeError) as raised:
+        await _run_input_text(original, value, blocker=blocker)
+
+    assert raised.value is browser_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_error",
+    [
+        pytest.param(MissingElement(element_id="synthetic"), id="missing-element"),
+        pytest.param(MultipleElementsFound(2, element_id="synthetic"), id="multiple-elements"),
+        pytest.param(LLMProviderError("synthetic-provider"), id="llm-provider"),
+        pytest.param(ImaginarySecretValue("synthetic-secret"), id="imaginary-secret"),
+        pytest.param(CaptchaSolveError(), id="captcha-solve"),
+        pytest.param(asyncio.TimeoutError("synthetic-timeout"), id="asyncio-timeout"),
+        pytest.param(RuntimeError("synthetic-browser-error"), id="generic"),
+    ],
+)
+async def test_phone_final_catch_preserves_typed_errors_and_wraps_generic(final_error: Exception) -> None:
+    el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    el.is_auto_completion_input = AsyncMock(side_effect=final_error)
+
+    if type(final_error) is RuntimeError:
+        results, *_ = await _run_input_text(el, "224-555-0199")
+        assert len(results) == 1 and isinstance(results[0], ActionFailure)
+        assert results[0].exception_type == PhoneNumberInputBrowserInteractionFailed.__name__
+    else:
+        with pytest.raises(type(final_error)) as raised:
+            await _run_input_text(el, "224-555-0199")
+        assert raised.value is final_error
+
+
+@pytest.mark.asyncio
+async def test_already_filled_invalid_treatment_tel_fails_closed() -> None:
+    el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    with patch("skyvern.webeye.actions.handler._probe_tel_browser_validity", new=AsyncMock(return_value=False)):
+        results, _, _, _, _, _ = await _run_input_text(
+            el,
+            "224-555-0199",
+            current_value="224-555-0199",
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == PhoneNumberInputBrowserValidityMismatch.__name__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "tel_fix_enabled"),
+    [
+        ("+44 20 7946 0958", True),
+        ("224-555-0199", False),
+    ],
+)
+async def test_already_filled_invalid_ineligible_or_control_tel_preserves_success(
+    text: str,
+    tel_fix_enabled: bool,
+) -> None:
+    el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    with patch("skyvern.webeye.actions.handler._probe_tel_browser_validity", new=AsyncMock(return_value=False)):
+        results, _, _, _, _, _ = await _run_input_text(
+            el,
+            text,
+            current_value=text,
+            tel_fix_enabled=tel_fix_enabled,
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_non_tel_wrapper_to_tel_blocker_evaluates_and_plans_treatment() -> None:
+    original = _mock_input({"type": "text", "autocomplete": None, "name": "phone-wrapper"})
+    blocker = _mock_input({"type": "tel", "autocomplete": None, "name": "phone"})
+    blocker.get_id.return_value = "BLOCKING"
+
+    with patch("skyvern.webeye.actions.handler.LOG.info") as log_info:
+        results, _, tel_verify, _, _, _ = await _run_input_text(
+            original,
+            "224-555-0199",
+            blocker=blocker,
+        )
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    blocker.input_sequentially.assert_awaited_once_with(text="2245550199")
+    tel_verify.assert_awaited_once()
+    terminal_logs = [call for call in log_info.call_args_list if call.args and call.args[0] == "tel_input_outcome"]
+    assert len(terminal_logs) == 1
+    terminal_kwargs = terminal_logs[0].kwargs
+    assert terminal_kwargs["flag_enabled"] is True
+    assert terminal_kwargs["final_element_id"] == "BLOCKING"
+    assert terminal_kwargs["strategy"] == TelInputStrategy.sequential_national.value
+    assert terminal_kwargs["retargeted"] is True
+
+
+@pytest.mark.asyncio
+async def test_blinking_cursor_tel_treatment_enforces_browser_validity() -> None:
+    el = _mock_input({"type": "tel", "autocomplete": None, "name": "phone", "class": "blinking-cursor"})
+    with patch("skyvern.webeye.actions.handler._probe_tel_browser_validity", new=AsyncMock(return_value=False)):
+        results, _, tel_verify, _, _, _ = await _run_input_text(el, "224-555-0199")
+    assert len(results) == 1 and isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == PhoneNumberInputBrowserValidityMismatch.__name__
+    assert tel_verify.await_count == 2
+    el.press_fill.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -198,7 +573,7 @@ async def test_explicit_nanp_tel_keeps_constraint_safe_e164_fallback() -> None:
     mismatches_then_success = [
         PhoneNumberInputMismatch(expected_digit_count=10, actual_digit_count=12),
         PhoneNumberInputMismatch(expected_digit_count=10, actual_digit_count=12),
-        None,
+        10,
     ]
 
     results, _, tel_verify, _, _, _ = await _run_input_text(

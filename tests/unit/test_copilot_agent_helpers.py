@@ -1754,6 +1754,168 @@ workflow_definition:
         assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
+class TestEditBlockAndRun:
+    @pytest.mark.asyncio
+    async def test_rejects_a_frontier_that_omits_the_edited_block(self, monkeypatch) -> None:
+        monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *args, **kwargs: None)
+        ctx = _ctx(workflow_yaml="workflow_definition:\n  blocks: []\n")
+
+        result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
+            json.dumps(
+                {
+                    "label": "repair_me",
+                    "expected_code": "old",
+                    "replacement_code": "new",
+                    "block_labels": ["unrelated"],
+                }
+            ),
+        )
+
+        assert json.loads(result) == {
+            "ok": False,
+            "error": "block_labels must include the edited block 'repair_me' so this call tests the persisted repair.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_one_call_persists_the_scoped_edit_then_returns_run_debug_evidence(self, monkeypatch) -> None:
+        workflow_yaml = """title: Test workflow
+workflow_definition:
+  blocks:
+    - block_type: code
+      label: open_page
+      code: |
+        await page.goto("https://example.test/")
+      next_block_label: read_total
+    - block_type: code
+      label: read_total
+      code: |
+        return {"total": await page.inner_text("#total")}
+"""
+        captured: dict[str, object] = {"update_calls": 0, "run_calls": 0}
+        run_result = {
+            "ok": False,
+            "error": "induced execution failure",
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "failed",
+                "blocks": [{"label": "read_total", "status": "failed", "failure_reason": "induced failure"}],
+                "final_url": "https://example.test/results",
+                "screenshot_base64": "frame-bytes",
+            },
+        }
+
+        async def fake_update_workflow(payload, ctx, **_kwargs):
+            captured["update_calls"] = int(captured["update_calls"]) + 1
+            captured["persisted_yaml"] = payload["workflow_yaml"]
+            ctx.workflow_yaml = payload["workflow_yaml"]
+            ctx.last_workflow_yaml = payload["workflow_yaml"]
+            ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
+            return {"ok": True, "data": {"block_count": 2}}
+
+        async def fake_run_blocks(params, _ctx, **kwargs):
+            captured["run_calls"] = int(captured["run_calls"]) + 1
+            captured["run_params"] = params
+            captured["run_kwargs"] = kwargs
+            return run_result
+
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total"))
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock())
+        monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_clear_pending_browser_interaction_observation", lambda *args: None)
+
+        ctx = _ctx(workflow_yaml=workflow_yaml, last_workflow_yaml=workflow_yaml)
+        result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
+            json.dumps(
+                {
+                    "label": "read_total",
+                    "expected_code": '"#total"',
+                    "replacement_code": '"#amount"',
+                    "block_labels": ["read_total"],
+                    "parameters": {},
+                }
+            ),
+        )
+
+        expected = tools_module.sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
+        assert json.loads(result) == expected
+        assert captured["update_calls"] == 1
+        assert captured["run_calls"] == 1
+        assert isinstance(captured["persisted_yaml"], str)
+        assert captured["persisted_yaml"].replace('"#amount"', '"#total"') == workflow_yaml
+        assert ctx.workflow_yaml == captured["persisted_yaml"], "a failed run must retain the edited draft"
+        assert captured["run_params"] == {"block_labels": ["read_total"], "parameters": {}}
+
+    @pytest.mark.asyncio
+    async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:
+        workflow_yaml = """title: Test workflow
+workflow_definition:
+  blocks:
+    - block_type: code
+      label: sign_in
+      code: |
+        return credential.username
+"""
+        captured: dict[str, object] = {}
+
+        async def fake_update_workflow(payload, ctx, *, allow_missing_credentials=False):
+            captured["persisted_yaml"] = payload["workflow_yaml"]
+            captured["allow_missing_credentials"] = allow_missing_credentials
+            ctx.last_update_block_count = 1
+            return {"ok": True, "data": {"block_count": 1}}
+
+        run_blocks = AsyncMock()
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", run_blocks)
+        monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_clear_pending_browser_interaction_observation", lambda *args: None)
+
+        ctx = _ctx(
+            workflow_yaml=workflow_yaml,
+            last_workflow_yaml=workflow_yaml,
+            request_policy=RequestPolicy(
+                allow_missing_credentials_in_draft=True,
+                clarification_reason="workflow_credential_inputs_unbound",
+            ),
+        )
+        result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
+            json.dumps(
+                {
+                    "label": "sign_in",
+                    "expected_code": "credential.username",
+                    "replacement_code": "credential.password",
+                }
+            ),
+        )
+
+        parsed = json.loads(result)
+        assert parsed["ok"] is True
+        assert parsed["data"] == {
+            "block_count": 1,
+            "workflow_updated": True,
+            "skipped_run": True,
+            "skip_reason": "workflow_credential_inputs_unbound",
+        }
+        assert captured["allow_missing_credentials"] is True
+        assert "credential.password" in str(captured["persisted_yaml"])
+        assert ctx.last_run_skipped_unbound_credentials is True
+        run_blocks.assert_not_awaited()
+
+
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 
@@ -3090,7 +3252,7 @@ class TestCredentialRefusalReachesAgent:
 
         from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 
-        targets = {"run_blocks_and_collect_debug", "update_and_run_blocks"}
+        targets = {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}
         matched = {tool.name for tool in NATIVE_TOOLS if tool.name in targets}
         assert matched == targets, f"missing tools in NATIVE_TOOLS: {targets - matched}"
 

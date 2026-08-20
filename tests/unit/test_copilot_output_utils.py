@@ -164,6 +164,31 @@ def test_sanitize_run_blocks_debug_preserves_post_run_page_evidence() -> None:
     assert sanitized["data"]["post_run_page_evidence"] == evidence
 
 
+def test_sanitize_edit_block_and_run_matches_run_blocks_debug_evidence() -> None:
+    result = {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_123",
+            "overall_status": "failed",
+            "blocks": [
+                {
+                    "label": "submit_form",
+                    "status": "failed",
+                    "failure_reason": "element not found",
+                    "screenshot_b64": "raw_base64_bytes",
+                    "final_url": "https://example.com/form",
+                }
+            ],
+            "post_run_page_evidence": {"observed_after_workflow_run": True},
+        },
+    }
+
+    composite_result = sanitize_tool_result_for_llm("edit_block_and_run", result)
+    run_result = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+
+    assert composite_result == run_result
+
+
 def test_sanitize_unrelated_tools_do_not_touch_block_screenshot_b64() -> None:
     # The strip is scoped to the two tools that carry failed-block payloads.
     result = {
@@ -495,6 +520,13 @@ class TestSummarizeToolResult:
     def test_update_and_run_blocks_skipped_run_still_reported(self) -> None:
         summary = self._summarize(
             "update_and_run_blocks",
+            {"ok": True, "data": {"block_count": 3, "skipped_run": True}},
+        )
+        assert summary == "Workflow updated (3 blocks); browser run skipped"
+
+    def test_edit_block_and_run_skipped_run_still_reported(self) -> None:
+        summary = self._summarize(
+            "edit_block_and_run",
             {"ok": True, "data": {"block_count": 3, "skipped_run": True}},
         )
         assert summary == "Workflow updated (3 blocks); browser run skipped"

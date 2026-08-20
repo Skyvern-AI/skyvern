@@ -9,6 +9,7 @@ alongside the tools and enforcement helpers they exercise end-to-end.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -48,12 +49,12 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom", "hint": "retry later"}},
-            {"ok": False, "error": "boom. retry later"},
+            {"ok": False, "error": "boom. retry later", "error_code": "E1"},
             id="error_with_hint_joins_message_and_hint",
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1", "message": "boom"}},
-            {"ok": False, "error": "boom"},
+            {"ok": False, "error": "boom", "error_code": "E1"},
             id="error_without_hint_uses_message_only",
         ),
         pytest.param(
@@ -63,7 +64,7 @@ class _FakeBrowserContext:
         ),
         pytest.param(
             {"ok": False, "error": {"code": "E1"}},
-            {"ok": False, "error": "Unknown error"},
+            {"ok": False, "error": "Unknown error", "error_code": "E1"},
             id="error_dict_without_message_uses_default",
         ),
         pytest.param(
@@ -283,6 +284,35 @@ async def test_ensure_browser_session_times_out_and_cleans_up(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_cancelled_browser_boot_closes_the_partially_created_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_cancelled_boot"
+    boot_polled = asyncio.Event()
+
+    async def _never_boots(*_args: Any, **_kwargs: Any) -> None:
+        boot_polled.set()
+        await asyncio.Event().wait()
+
+    mock_manager = MagicMock()
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_manager.get_browser_state = AsyncMock(side_effect=_never_boots)
+    mock_manager.close_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+
+    ctx = _make_ctx()
+    task = asyncio.create_task(ensure_browser_session(ctx))
+    await boot_polled.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ctx.browser_session_id is None
+    mock_manager.close_session.assert_awaited_once_with("org_1", "bs_cancelled_boot")
+
+
+@pytest.mark.asyncio
 async def test_mcp_browser_context_rejects_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Silently skipping set_api_key_override when ctx.api_key is None would
     let get_active_api_key() fall back to settings.SKYVERN_API_KEY — the
@@ -382,6 +412,30 @@ async def test_probe_classifies_failed_lookup_as_undetermined(monkeypatch: pytes
     assert outcome == runtime.BrowserProbeOutcome.could_not_determine
     assert outcome != runtime.BrowserProbeOutcome.positively_unreachable
     health_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_probe_deadline_is_uncertainty_not_session_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _never_answers(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(side_effect=_never_answers)
+    mock_manager.create_session = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.DATABASE.browser_sessions.get_persistent_browser_session = MagicMock(return_value=None)
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_PROBE_WAIT_SECONDS", 0.01)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_slow_but_unknown"
+
+    result = await ensure_browser_session(ctx, require_verified_session=True)
+
+    assert result == {"ok": False, "error": "Could not verify the browser session; please retry"}
+    assert ctx.browser_session_id == "bs_slow_but_unknown"
+    mock_manager.create_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -558,11 +612,12 @@ async def test_attach_keeps_session_when_health_signal_is_unavailable(
     ctx = _make_ctx()
     ctx.browser_session_id = "bs_live"
 
-    with pytest.raises(RuntimeError, match="No browser context"):
+    with pytest.raises(RuntimeError, match="No browser context") as exc_info:
         async with mcp_browser_context(ctx):
             pass
 
     assert ctx.browser_session_id == "bs_live"
+    assert not isinstance(exc_info.value, runtime.CopilotBrowserSessionUnavailable)
 
 
 @pytest.mark.asyncio

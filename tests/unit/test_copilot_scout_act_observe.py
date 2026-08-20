@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
@@ -20,6 +24,9 @@ from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeEvidenceSource,
     composition_challenge_carrier,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
@@ -413,6 +420,194 @@ class TestActObserveSuccess:
         assert page["challenge_detected"] is False
         assert page["modal_dismiss_controls"] == ["Accept"]
         assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
+
+    @pytest.mark.asyncio
+    async def test_result_summary_carries_disclosure_controls_to_the_authoring_model(self) -> None:
+        payload = _bounded_extractor_payload()
+        payload["clickable_controls"] = [
+            {
+                "text": "More options",
+                "selector": "#more",
+                "tag": "button",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+                "disabled": True,
+                "visible": False,
+            }
+        ]
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["disclosure_controls"] == [
+            {
+                "text": "More options",
+                "selector": "#more",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+                "disabled": True,
+                "visible": False,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_result_summary_carries_in_form_disclosure_controls_to_the_authoring_model(self) -> None:
+        payload = _bounded_extractor_payload()
+        payload["forms"][0]["submit_controls"].append(
+            {
+                "text": "More options",
+                "selector": "#more",
+                "tag": "button",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+            }
+        )
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["disclosure_controls"] == [
+            {
+                "text": "More options",
+                "selector": "#more",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_result_summary_does_not_widen_to_unrelated_clickable_controls(self) -> None:
+        payload = _bounded_extractor_payload()
+        payload["clickable_controls"] = [{"text": "Refresh", "selector": "#refresh", "tag": "button"}]
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["disclosure_controls"] == []
+
+    @pytest.mark.asyncio
+    async def test_result_summary_omits_in_form_disclosures_when_channel_is_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
+        payload = _bounded_extractor_payload()
+        payload["forms"][0]["submit_controls"].append(
+            {
+                "text": "More options",
+                "selector": "#more",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+            }
+        )
+        ctx = _ctx(server=_server_returning(payload))
+
+        result = await _run_click(ctx)
+
+        assert result["data"]["page"]["disclosure_controls"] == []
+
+    @pytest.mark.asyncio
+    async def test_browser_disclosure_reaches_the_authoring_model_through_the_production_pipeline(self) -> None:
+        async with async_playwright() as playwright:
+            try:
+                browser = await playwright.chromium.launch(headless=True)
+            except PlaywrightError:
+                pytest.skip("Requires Playwright Chromium (run: playwright install chromium)")
+            page = await browser.new_page()
+            await page.set_content(
+                """
+                <html><head><title>Two-factor authentication</title>
+                  <style>#alternatives { display: none; }</style>
+                </head><body>
+                  <form><label for="otp">One-time code</label><input id="otp" name="otp"></form>
+                  <button id="more" aria-expanded="false" aria-controls="alternatives">More options</button>
+                  <button id="refresh">Refresh</button>
+                  <div id="alternatives"><button>Authenticator app</button></div>
+                </body></html>
+                """
+            )
+
+            async def evaluate_live_dom(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                assert tool_name == "skyvern_evaluate"
+                return {"ok": True, "data": {"result": await page.evaluate(arguments["expression"])}}
+
+            ctx = _ctx(server=SimpleNamespace(call_internal_tool=evaluate_live_dom))
+            try:
+                result = await _run_click(ctx)
+            finally:
+                await browser.close()
+
+        assert "page" in result["data"]
+        assert result["data"]["page"]["disclosure_controls"] == [
+            {
+                "text": "More options",
+                "selector": "#more",
+                "expanded": False,
+                "controls": "alternatives",
+                "controlled_region_visible": False,
+            }
+        ]
+        parsed_controls = ctx.flow_evidence[0]["evidence"]["clickable_controls"]
+        parsed_disclosure = next(control for control in parsed_controls if control["selector"] == "#more")
+        assert parsed_disclosure["expanded"] is False
+        assert parsed_disclosure["controls"] == "alternatives"
+        assert parsed_disclosure["controlled_region_visible"] is False
+        assert any(control.get("selector") == "#refresh" for control in parsed_controls)
+        assert all(control.get("selector") != "#refresh" for control in result["data"]["page"]["disclosure_controls"])
+
+    def test_captured_code_host_disclosure_replays_to_the_authoring_model_without_a_browser(self) -> None:
+        capture_path = Path(__file__).parent / "fixtures/copilot/sky_14419_code_host_collapsed_2fa_structured.json"
+        capture = json.loads(capture_path.read_text())
+        contract = capture["capture_contract"]
+        raw_packet = capture["raw_structured_packet"]
+
+        repo_root = Path(__file__).parents[2]
+        fixture_bytes = (repo_root / contract["fixture"]).read_bytes()
+        assert hashlib.sha256(fixture_bytes).hexdigest() == contract["fixture_sha256"]
+        serialized = json.dumps(raw_packet, ensure_ascii=False, separators=(",", ":"))
+        assert len(serialized) <= COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS
+
+        raw_controls = raw_packet["clickable_controls"]
+        raw_disclosure = next(control for control in raw_controls if control["text"].startswith("More options"))
+        assert raw_disclosure["selector"] == "button.secondary"
+        assert raw_disclosure["expanded"] is False
+        assert raw_disclosure["controls"] == "two-factor-alternatives-body"
+        assert raw_disclosure["controlled_region_visible"] is False
+
+        parsed = parse_composition_structured(
+            raw_packet,
+            inspected_url=contract["fixture_url"],
+            current_url=contract["fixture_url"],
+        )
+        assert parsed is not None
+        parsed_controls = parsed["clickable_controls"]
+        parsed_disclosure = next(control for control in parsed_controls if control["text"].startswith("More options"))
+        assert parsed_disclosure["selector"] == raw_disclosure["selector"]
+        assert parsed_disclosure["expanded"] is False
+        assert parsed_disclosure["controls"] == "two-factor-alternatives-body"
+        assert parsed_disclosure["controlled_region_visible"] is False
+        assert any(control.get("selector") == "button.primary" for control in parsed_controls)
+
+        model_facing_result: dict[str, Any] = {"ok": True, "data": {}}
+        scouting_module._attach_scout_page_summary(model_facing_result, parsed)
+
+        assert model_facing_result["data"]["page"]["disclosure_controls"] == [
+            {
+                "text": "More options ▾",
+                "selector": "button.secondary",
+                "expanded": False,
+                "controls": "two-factor-alternatives-body",
+                "controlled_region_visible": False,
+            }
+        ]
+        assert all(
+            control.get("selector") != "button.primary"
+            for control in model_facing_result["data"]["page"]["disclosure_controls"]
+        )
 
     @pytest.mark.asyncio
     async def test_content_witnessed_kv_reveal_admitted_without_bounded_schema(self) -> None:
@@ -1250,6 +1445,7 @@ class TestActObserveToolGate:
             if call.args and call.args[0] == "skyvern_evaluate" and "readonly" in call.args[1]["expression"]
         ]
         assert len(probed) == 1
+        assert probed[0].args[1]["verbosity"] == "full"
 
 
 def _np_ctx(*, server: Any = None) -> SimpleNamespace:

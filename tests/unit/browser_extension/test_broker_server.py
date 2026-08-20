@@ -127,6 +127,7 @@ class FakeExtensionWebSocket:
                     "params": {
                         "protocolVersion": 2,
                         "extensionVersion": "test",
+                        "scopeEventOrigins": True,
                         "scopedTabs": list(self.extension.scoped_tabs),
                     },
                 }
@@ -161,11 +162,13 @@ class FakeRelay:
         self.stopped = False
         self.nonce = "pairing-nonce-sentinel"
         self.pending_request_count = 0
+        self.requests: list[tuple[str, dict]] = []
         self.connection_cycles = 0
         self.extension_protocol_version: int | None = self.extension.protocol_version
         self.extension_connection_generation = 1
         self.reset_frames: list[dict] = []
         self.reset_tasks: set[asyncio.Task[None]] = set()
+        self.sent_events: list[tuple[str, dict]] = []
 
     @property
     def scoped_tabs(self) -> list[dict]:
@@ -211,6 +214,10 @@ class FakeRelay:
         task.add_done_callback(self.reset_tasks.discard)
         return self.connected
 
+    async def send_event(self, event: str, params: dict) -> bool:
+        self.sent_events.append((event, dict(params)))
+        return self.connected
+
     async def hello(self) -> None:
         self.connected = True
         self.extension_protocol_version = self.extension.protocol_version
@@ -220,6 +227,7 @@ class FakeRelay:
             {
                 "protocolVersion": self.extension_protocol_version,
                 "extensionVersion": "test",
+                "scopeEventOrigins": True,
                 "scopedTabs": list(self._scoped_tabs),
             },
         )
@@ -252,8 +260,14 @@ class FakeRelay:
         on_registered: Callable[[], None] | None = None,
         on_terminal: Callable[[], None] | None = None,
     ) -> dict:
+        self.requests.append((op, dict(args)))
         if on_registered is not None:
             on_registered()
+        if op == "debugger.detach":
+            tab_id = args.get("tabId")
+            if type(tab_id) is int:
+                self.scoped_tabs = [tab for tab in self.scoped_tabs if tab.get("tabId") != tab_id]
+                await self.on_event("scope.tabRemoved", {"tabId": tab_id, "reason": "detached"})
         if on_terminal is not None:
             on_terminal()
         return {"op": op, "args": args, "timeout": timeout}
@@ -290,6 +304,7 @@ class BlockingRelay(FakeRelay):
         on_registered: Callable[[], None] | None = None,
         on_terminal: Callable[[], None] | None = None,
     ) -> dict:
+        self.requests.append((op, dict(args)))
         if on_registered is not None:
             on_registered()
         self.request_started.set()
@@ -387,32 +402,58 @@ async def test_fake_extension_reexecutes_failed_identity_and_reacks_success() ->
 
 
 @pytest.mark.asyncio
-async def test_server_allows_one_client_and_never_returns_pairing_material() -> None:
+async def test_server_allows_multiple_clients_without_exposing_pairing_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(broker_server_module, "MAX_AUTHENTICATED_CLIENTS", 2)
+    monkeypatch.setattr(broker_server_module, "MAX_PENDING_CONNECTIONS", 1)
     opened: list[str] = []
+    extension_secret = "extension-secret-sentinel"
     server = BrowserExtensionBrokerServer(
         19777,
         pairing_opener=lambda url: not opened.append(url),
     )
-    relay = FakeRelay("extension-secret-sentinel", 19777, server._handle_extension_event, server._handle_disconnect)
+    relay = FakeRelay(extension_secret, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    third = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
+    await _eventually(lambda: server._pending_connections == 0)
+    second_server_task = await _connect_over_socketpair(server, second)
+    await _eventually(lambda: server._pending_connections == 0)
     try:
-        with pytest.raises(BrowserExtensionBrokerError, match="BROKER_BUSY"):
-            await _connect_over_socketpair(server, second)
+        relay.scoped_tabs = [{"tabId": 7}, {"tabId": 8}]
+        await relay.hello()
+        first_status = await first.broker_status()
+        second_status = await second.broker_status()
+        pairing_result = await first.begin_pairing()
+        first_response = await first.request("tabs.activate", {"tabId": 7})
+        second_response = await second.request("tabs.activate", {"tabId": 8})
 
-        result = await first.begin_pairing()
-        assert result["opened"] is True
-        assert "nonce" not in repr(result).lower()
-        assert "url" not in repr(result).lower()
+        assert first_status["clientCount"] == 2
+        assert second_status["clientCount"] == 2
+        assert first._client_id is not None
+        assert second._client_id is not None
+        assert first._client_id != second._client_id
+        assert pairing_result["opened"] is True
         assert opened == ["http://127.0.0.1:19777/pair#pairing-nonce-sentinel"]
+        assert first_response == {"op": "tabs.activate", "args": {"tabId": 7}, "timeout": 30.0}
+        assert second_response == {"op": "tabs.activate", "args": {"tabId": 8}, "timeout": 30.0}
+        response_payloads = [first_status, second_status, pairing_result, first_response, second_response]
+        payload_repr = repr(response_payloads)
+        assert extension_secret not in payload_repr
+        assert "pairing-nonce-sentinel" not in payload_repr
+        assert "pairingUrl" not in payload_repr
 
-        forwarded = await first.request("tabs.activate", {"tabId": 7})
-        assert forwarded == {"op": "tabs.activate", "args": {"tabId": 7}, "timeout": 30.0}
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await _connect_over_socketpair(server, third)
+        assert error_info.value.code == "BROKER_BUSY"
     finally:
+        await third.stop()
         await second.stop()
         await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
         await asyncio.wait_for(first_server_task, 1.0)
         await server.stop()
 
@@ -502,6 +543,10 @@ async def test_cached_client_reenrolls_after_broker_restart(
     try:
         await restarted_relay.hello()
         await _eventually(lambda: not restarted_server._extension_reset_quarantined)
+        restarted_relay.scoped_tabs = [{"tabId": 7}]
+        await restarted_relay.hello()
+        await client.start()
+        await restarted_server._approve_client(client._client_id)
         result = await client.request("tabs.activate", {"tabId": 7})
 
         assert result == {"op": "tabs.activate", "args": {"tabId": 7}, "timeout": 30.0}
@@ -516,9 +561,10 @@ async def test_cached_client_reenrolls_after_broker_restart(
 
 
 @pytest.mark.asyncio
-async def test_cached_client_surfaces_structured_error_when_reenrollment_is_denied(
+async def test_cached_client_surfaces_broker_busy_when_fresh_enrollment_hits_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(broker_server_module, "MAX_AUTHENTICATED_CLIENTS", 1)
     server = BrowserExtensionBrokerServer(19777)
     server._relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     active_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
@@ -559,6 +605,7 @@ async def test_cached_client_surfaces_structured_error_when_reenrollment_is_deni
         assert len(attempted_connections) == 2
         assert stale_client._client_id is None
         assert stale_client._recovery_secret is None
+        assert active_client.broker_connected
     finally:
         await stale_client.stop()
         await active_client.stop()
@@ -659,6 +706,8 @@ async def test_operator_status_does_not_expose_active_mcp_tabs() -> None:
     mcp_server_task = await _connect_over_socketpair(server, mcp)
     relay.scoped_tabs = [{"tabId": 17}, {"tabId": 23}]
     await relay.hello()
+    await mcp.request("debugger.attach", {"tabId": 17})
+    await mcp.request("debugger.attach", {"tabId": 23})
     operator_server_task = await _connect_over_socketpair(server, operator)
     try:
         assert (await mcp.broker_status())["tabIds"] == [17, 23]
@@ -698,7 +747,7 @@ async def test_fresh_operator_connection_retrieves_pending_pairing_flow() -> Non
 
 
 @pytest.mark.asyncio
-async def test_pairing_completion_clears_flow_but_preserves_operator_rate_limit() -> None:
+async def test_pairing_approval_clears_flow_but_preserves_operator_rate_limit() -> None:
     server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
     relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
@@ -706,7 +755,10 @@ async def test_pairing_completion_clears_flow_but_preserves_operator_rate_limit(
     second = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
     first_server_task = await _connect_over_socketpair(server, first)
     await first.begin_pairing()
-    await server._handle_pairing_complete()
+    offer = await server._handle_pairing_complete()
+    assert offer is not None
+    assert server._pairing_owner == "operator"
+    await relay.emit_event("pairing.approved", {"approvalNonce": offer["approvalNonce"]})
     assert server._pairing_owner is None
     await first.stop()
     await asyncio.wait_for(first_server_task, 1.0)
@@ -723,34 +775,194 @@ async def test_pairing_completion_clears_flow_but_preserves_operator_rate_limit(
 
 
 @pytest.mark.asyncio
-async def test_outstanding_extension_request_blocks_reenrollment_until_terminal() -> None:
+async def test_each_client_requires_its_own_one_click_approval() -> None:
+    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first, auto_approve=False)
+    second_server_task = await _connect_over_socketpair(server, second, auto_approve=False)
+    try:
+        assert (await first.broker_status())["approved"] is False
+        assert (await second.broker_status())["approved"] is False
+        assert await first.wait_connected(0.0) is False
+
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await first.request("tabs.create", {"url": "about:blank"})
+        assert error_info.value.code == "APPROVAL_REQUIRED"
+
+        await first.begin_pairing()
+        first_offer = await server._handle_pairing_complete()
+        assert first_offer is not None
+        assert first_offer["requestFingerprint"] == server._client_fingerprint(first._client_id)
+        wait_task = asyncio.create_task(first.wait_connected(1.0))
+        await asyncio.sleep(0)
+        assert not wait_task.done()
+        await relay.emit_event(
+            "pairing.approved",
+            {"approvalNonce": first_offer["approvalNonce"]},
+        )
+        assert await wait_task is True
+        await relay.emit_event(
+            "pairing.approved",
+            {"approvalNonce": first_offer["approvalNonce"]},
+        )
+
+        assert (await first.broker_status())["approved"] is True
+        assert (await second.broker_status())["approved"] is False
+        first_response = await first.request("tabs.create", {"url": "about:blank"})
+        assert first_response["op"] == "tabs.create"
+        assert first_response["args"] == {"url": "about:blank"}
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await second.request("tabs.create", {"url": "about:blank"})
+        assert error_info.value.code == "APPROVAL_REQUIRED"
+        assert relay.sent_events[-2:] == [
+            (
+                "pairing.approved_ack",
+                {"approvalNonce": first_offer["approvalNonce"], "approved": True},
+            ),
+            (
+                "pairing.approved_ack",
+                {"approvalNonce": first_offer["approvalNonce"], "approved": True},
+            ),
+        ]
+    finally:
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_client_approval_expires_when_its_broker_session_disconnects() -> None:
+    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, client, auto_approve=False)
+    await client.begin_pairing()
+    offer = await server._handle_pairing_complete()
+    assert offer is not None
+    await relay.emit_event("pairing.approved", {"approvalNonce": offer["approvalNonce"]})
+    assert (await client.broker_status())["approved"] is True
+    await client.stop()
+    await asyncio.wait_for(first_server_task, 1.0)
+
+    second_server_task = await _connect_over_socketpair(server, client, auto_approve=False)
+    try:
+        assert (await client.broker_status())["approved"] is False
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await client.request("tabs.create", {"url": "about:blank"})
+        assert error_info.value.code == "APPROVAL_REQUIRED"
+        assert (await client.begin_pairing())["active"] is True
+    finally:
+        await client.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_client_pairing_requires_current_extension_protocol() -> None:
+    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    extension = FakeExtension()
+    extension.protocol_version = 1
+    relay = FakeRelay(
+        "extension-secret",
+        19777,
+        server._handle_extension_event,
+        server._handle_disconnect,
+        extension=extension,
+    )
+    relay.connected = True
+    server._extension_reset_quarantined = False
+    server._extension_reset_error = None
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client, auto_approve=False)
+    try:
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await client.begin_pairing()
+
+        assert error_info.value.code == "EXTENSION_UPGRADE_REQUIRED"
+    finally:
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_client_auth_names_outdated_extension_before_reset_recovery() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    extension = FakeExtension()
+    extension.protocol_version = 1
+    relay = FakeRelay(
+        "extension-secret",
+        19777,
+        server._handle_extension_event,
+        server._handle_disconnect,
+        extension=extension,
+    )
+    relay.connected = True
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    try:
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await _connect_over_socketpair(server, client, auto_approve=False)
+
+        assert error_info.value.code == "EXTENSION_UPGRADE_REQUIRED"
+    finally:
+        await client.stop()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_other_clients_pending_request_survives_release_and_does_not_block_enrollment() -> None:
     server = BrowserExtensionBrokerServer(19777)
     relay = BlockingRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    third = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
-    request_task = asyncio.create_task(first.request("tabs.activate", {"tabId": 7}))
-    await asyncio.wait_for(relay.request_started.wait(), 1.0)
-    await first.stop()
-    await asyncio.wait_for(first_server_task, 1.0)
-
-    with pytest.raises(BrowserExtensionBrokerError, match="BROKER_BUSY"):
-        await _connect_over_socketpair(server, second)
-
-    relay.release_request.set()
-    with suppress(BrowserExtensionNotConnectedError):
-        await request_task
-    await _eventually(lambda: not server._forwarded_tasks)
     second_server_task = await _connect_over_socketpair(server, second)
-    await second.stop()
-    await asyncio.wait_for(second_server_task, 1.0)
-    await server.stop()
+    third_server_task: asyncio.Task[None] | None = None
+    relay.scoped_tabs = [{"tabId": 7}]
+    request_task = asyncio.create_task(first.request("tabs.activate", {"tabId": 7}))
+    try:
+        await asyncio.wait_for(relay.request_started.wait(), 1.0)
+        reset_count = len(relay.reset_frames)
+
+        await second.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        assert not request_task.done()
+
+        third_server_task = await _connect_over_socketpair(server, third)
+        assert third.broker_connected
+        assert not request_task.done()
+        assert len(relay.reset_frames) == reset_count
+
+        relay.release_request.set()
+        assert await request_task == {"op": "tabs.activate", "args": {"tabId": 7}, "timeout": 30.0}
+        await _eventually(lambda: not server._forwarded_tasks)
+    finally:
+        relay.release_request.set()
+        with suppress(BrowserExtensionNotConnectedError):
+            await request_task
+        await third.stop()
+        await second.stop()
+        await first.stop()
+        if third_server_task is not None:
+            await asyncio.wait_for(third_server_task, 1.0)
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("release_path", ["abrupt_eof", "clean_stop", "cancelled_flow"])
-async def test_client_release_resets_extension_before_successor_enrollment(release_path: str) -> None:
+async def test_client_release_frees_leases_without_extension_reset(release_path: str) -> None:
     server = BrowserExtensionBrokerServer(19777)
     relay = ControlledResetRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
@@ -758,16 +970,13 @@ async def test_client_release_resets_extension_before_successor_enrollment(relea
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
     second_server_task: asyncio.Task[None] | None = None
-    second_connect_task: asyncio.Task[asyncio.Task[None]] | None = None
+    assert first._client_id is not None
+    await server._grant_lease(71, first._client_id, origin="created")
+    await server._grant_lease(72, first._client_id, origin="shared")
+    await server._grant_lease(73, first._client_id, origin="claimed")
+    reset_count = len(relay.reset_frames)
+    sweep_count = relay.extension.reset_sweep_count
     try:
-        relay.scoped_tabs = [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
-        relay.attached_tabs = {71}
-        await relay.hello()
-        await _eventually(
-            lambda: first.scoped_tabs == [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
-        )
-        relay.extension.reset_started.clear()
-        relay.extension.reset_gate.clear()
         if release_path == "clean_stop":
             await first.stop()
         elif release_path == "abrupt_eof":
@@ -775,27 +984,21 @@ async def test_client_release_resets_extension_before_successor_enrollment(relea
             first._writer.transport.abort()
         else:
             first_server_task.cancel()
+        await asyncio.wait_for(first_server_task, 1.0)
 
-        await asyncio.wait_for(relay.extension.reset_started.wait(), 1.0)
-        second_connect_task = asyncio.create_task(_connect_over_socketpair(server, second))
-        await asyncio.sleep(0.05)
-        assert not second_connect_task.done()
+        second_server_task = await asyncio.wait_for(_connect_over_socketpair(server, second), 1.0)
+        await _eventually(lambda: len(relay.requests) == 3)
 
-        await relay.hello()
-        assert relay.reset_frames[-1]["generation"] == 1
-        assert not second_connect_task.done()
-        relay.extension.reset_gate.set()
-        second_server_task = await asyncio.wait_for(second_connect_task, 1.0)
-        await _eventually(lambda: second.broker_connected)
-        assert second.scoped_tabs == []
-        with pytest.raises(ExtensionRequestError, match="DEBUGGER_DETACHED"):
-            await second.request("debugger.send", {"tabId": 71, "method": "Runtime.enable"})
-        assert relay.connection_cycles == 0
+        assert second.broker_connected
+        assert server._leases == {}
+        assert relay.requests == [
+            ("tabs.remove", {"tabId": 71}),
+            ("debugger.detach", {"tabId": 72}),
+            ("debugger.detach", {"tabId": 73}),
+        ]
+        assert len(relay.reset_frames) == reset_count
+        assert relay.extension.reset_sweep_count == sweep_count
     finally:
-        if second_connect_task is not None and not second_connect_task.done():
-            second_connect_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await second_connect_task
         await second.stop()
         await first.stop()
         if second_server_task is not None:
@@ -823,9 +1026,15 @@ async def test_restarted_daemon_resets_surviving_extension_snapshot_before_expos
     original_relay.scoped_tabs = [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
     original_relay.attached_tabs = {71}
     await original_relay.hello()
-    await _eventually(lambda: original_client.scoped_tabs != [])
+    await original_client.request("tabs.activate", {"tabId": 71})
+    await _eventually(
+        lambda: original_client.scoped_tabs == [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
+    )
+    prior_sweep_count = extension.reset_sweep_count
     await original_server.stop()
     await asyncio.wait_for(original_server_task, 1.0)
+    assert extension.scoped_tabs
+    assert extension.attached_tabs == {71}
 
     restarted_server = BrowserExtensionBrokerServer(19777)
     restarted_relay = ControlledResetRelay(
@@ -844,6 +1053,9 @@ async def test_restarted_daemon_resets_surviving_extension_snapshot_before_expos
     await restarted_relay.hello()
     assert await ready_task
     assert restarted_client.scoped_tabs == []
+    assert extension.scoped_tabs == []
+    assert extension.attached_tabs == set()
+    assert extension.reset_sweep_count == prior_sweep_count + 1
     assert restarted_relay.reset_frames[0]["generation"] == original_reset["generation"]
     assert restarted_relay.reset_frames[0]["epoch"] != original_reset["epoch"]
 
@@ -866,10 +1078,15 @@ async def test_new_daemon_epoch_executes_reset_when_generation_restarts_below_pr
     original_server._relay = original_relay
     original_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
     original_server_task = await _connect_over_socketpair(original_server, original_client)
-    await original_client.stop()
-    await asyncio.wait_for(original_server_task, 1.0)
+
+    original_relay.connected = False
+    await original_server._handle_disconnect()
+    await original_relay.hello()
     await _eventually(lambda: not original_server._extension_reset_quarantined)
     prior_reset = original_relay.reset_frames[-1]
+    assert prior_reset["generation"] > 0
+    await original_client.stop()
+    await asyncio.wait_for(original_server_task, 1.0)
     await original_server.stop()
 
     extension.scoped_tabs = [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
@@ -892,6 +1109,8 @@ async def test_new_daemon_epoch_executes_reset_when_generation_restarts_below_pr
     assert restarted_client.scoped_tabs == []
     assert restarted_relay.reset_frames[0]["generation"] < prior_reset["generation"]
     assert restarted_relay.reset_frames[0]["epoch"] != prior_reset["epoch"]
+    assert extension.scoped_tabs == []
+    assert extension.attached_tabs == set()
 
     await restarted_client.stop()
     await asyncio.wait_for(restarted_server_task, 1.0)
@@ -936,10 +1155,16 @@ async def test_quarantine_suppresses_extension_events_until_reset_ack() -> None:
 
     relay.extension.reset_gate.set()
     assert await client.wait_connected(1.0)
+    await _eventually(lambda: received == [("extension.hello", {"scopedTabs": []})])
+    assert "private" not in repr(received)
+
+    relay.scoped_tabs = [{"tabId": 72}]
+    await client.request("tabs.activate", {"tabId": 72})
+    await _eventually(lambda: any(event == "scope.tabAdded" for event, _params in received))
+    received.clear()
     await relay.emit_event("debugger.event", {"tabId": 72, "method": "Runtime.executionContextCreated", "params": {}})
-    await _eventually(lambda: len(received) == 2)
-    assert received[0] == ("extension.hello", {"scopedTabs": []})
-    assert received[1][0] == "debugger.event"
+    await _eventually(lambda: len(received) == 1)
+    assert received[0][0] == "debugger.event"
 
     await client.stop()
     await asyncio.wait_for(server_task, 1.0)
@@ -961,7 +1186,8 @@ async def test_relay_reconnect_resets_before_active_client_sees_new_traffic() ->
     relay.scoped_tabs = [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
     relay.attached_tabs = {71}
     await relay.hello()
-    await _eventually(lambda: client.scoped_tabs != [])
+    await client.request("tabs.activate", {"tabId": 71})
+    await _eventually(lambda: client.scoped_tabs == [{"tabId": 71, "url": "https://private.test", "title": "Private"}])
 
     relay.connected = False
     await server._handle_disconnect()
@@ -979,6 +1205,7 @@ async def test_relay_reconnect_resets_before_active_client_sees_new_traffic() ->
     relay.extension.reset_gate.set()
     assert await client.wait_connected(1.0)
     assert client.scoped_tabs == []
+    assert relay.extension.attached_tabs == set()
     await client.stop()
     await asyncio.wait_for(server_task, 1.0)
     await server.stop()
@@ -1043,30 +1270,42 @@ async def test_successor_enrollment_proceeds_when_owner_releases_without_extensi
 
 
 @pytest.mark.asyncio
-async def test_successor_enrollment_proceeds_when_extension_disconnects_during_reset() -> None:
+async def test_client_enrollment_proceeds_when_extension_disconnects_during_reset() -> None:
     server = BrowserExtensionBrokerServer(19777)
     relay = ControlledResetRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task: asyncio.Task[None] | None = None
 
+    relay.connected = False
+    await server._handle_disconnect()
     relay.extension.reset_started.clear()
     relay.extension.reset_gate.clear()
-    await first.stop()
+    await relay.hello()
     await asyncio.wait_for(relay.extension.reset_started.wait(), 1.0)
+    reset_identity = (server._extension_reset_epoch, server._extension_reset_generation)
+
     relay.connected = False
     relay.extension_protocol_version = None
     await server._handle_disconnect()
-    await asyncio.wait_for(first_server_task, 1.0)
     relay.auto_connect = False
-    second_server_task = await _connect_over_socketpair(server, second)
+    try:
+        second_server_task = await asyncio.wait_for(_connect_over_socketpair(server, second), 1.0)
 
-    assert second.broker_connected
-    assert not second.connected
-    await server.stop()
-    await second.stop()
-    await asyncio.wait_for(second_server_task, 1.0)
+        assert second.broker_connected
+        assert not second.connected
+        assert first.broker_connected
+        assert (server._extension_reset_epoch, server._extension_reset_generation) == reset_identity
+        assert server._extension_reset_quarantined
+    finally:
+        await second.stop()
+        await first.stop()
+        if second_server_task is not None:
+            await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
 
 
 @pytest.mark.asyncio
@@ -1161,30 +1400,34 @@ async def test_v1_extension_warns_and_uses_cycle_only_fallback(monkeypatch: pyte
     relay.extension.protocol_version = 1
     relay.extension_protocol_version = 1
     server._relay = relay
-    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    first_server_task = await _connect_over_socketpair(server, first)
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
     initial_connection_cycles = relay.connection_cycles
     warnings.clear()
+
     relay.scoped_tabs = [{"tabId": 71}]
     relay.attached_tabs = {71}
+    relay.connected = False
+    await server._handle_disconnect()
     await relay.hello()
-
-    await first.stop()
-    await asyncio.wait_for(first_server_task, 1.0)
-    second_server_task = await _connect_over_socketpair(server, second)
+    await _eventually(lambda: not server._extension_reset_quarantined)
 
     assert relay.connection_cycles == initial_connection_cycles + 1
     assert relay.reset_frames == []
-    assert second.scoped_tabs == []
+    assert client.scoped_tabs == []
     assert warnings == [
         (
             "browser_extension_protocol_skew",
             {"extension_protocol": 1, "broker_protocol": 2, "fallback": "cycle_only"},
         )
     ]
-    await second.stop()
-    await asyncio.wait_for(second_server_task, 1.0)
+    relay.connected = True
+    assert (await client.broker_status())["extensionConnected"] is False
+    with pytest.raises(BrowserExtensionBrokerError) as error_info:
+        await client.request("tabs.create", {"url": "about:blank"})
+    assert error_info.value.code == "EXTENSION_UPGRADE_REQUIRED"
+    await client.stop()
+    await asyncio.wait_for(server_task, 1.0)
     await server.stop()
 
 
@@ -1197,31 +1440,35 @@ async def test_v2_replacement_during_v1_cycle_still_requires_reset_ack() -> None
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
     initial_connection_cycles = relay.connection_cycles
-    relay.extension.protocol_version = 1
-    relay.extension_protocol_version = 1
-    relay.scoped_tabs = [{"tabId": 71}]
-    relay.attached_tabs = {71}
-    await relay.hello()
-    relay.extension.reset_started.clear()
-    relay.extension.reset_gate.clear()
-    second_connect_task: asyncio.Task[asyncio.Task[None]] | None = None
+    initial_reset_count = len(relay.reset_frames)
     second_server_task: asyncio.Task[None] | None = None
     try:
-        await first.stop()
+        relay.extension.protocol_version = 1
+        relay.extension_protocol_version = 1
+        relay.scoped_tabs = [{"tabId": 71}]
+        relay.attached_tabs = {71}
+        relay.connected = False
+        await server._handle_disconnect()
+        relay.extension.reset_started.clear()
+        relay.extension.reset_gate.clear()
+        await relay.hello()
         await asyncio.wait_for(relay.extension.reset_started.wait(), 1.0)
-        second_connect_task = asyncio.create_task(_connect_over_socketpair(server, second))
-        await asyncio.sleep(0.05)
-        assert not second_connect_task.done()
-        relay.extension.reset_gate.set()
-        second_server_task = await asyncio.wait_for(second_connect_task, 1.0)
-        assert second.scoped_tabs == []
+
         assert relay.connection_cycles == initial_connection_cycles + 1
-        assert relay.reset_frames
+        assert len(relay.reset_frames) == initial_reset_count + 1
+        assert server._extension_reset_quarantined
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await first.request("debugger.send", {"tabId": 71, "method": "Runtime.enable"})
+        assert error_info.value.code == "EXTENSION_RESET_IN_PROGRESS"
+
+        relay.extension.reset_gate.set()
+        assert await first.wait_connected(1.0)
+        second_server_task = await _connect_over_socketpair(server, second)
+        assert second.broker_connected
+        assert second.scoped_tabs == []
+        assert not server._extension_reset_quarantined
     finally:
-        if second_connect_task is not None and not second_connect_task.done():
-            second_connect_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await second_connect_task
+        relay.extension.reset_gate.set()
         await second.stop()
         await first.stop()
         if second_server_task is not None:
@@ -1241,52 +1488,54 @@ async def test_reset_reack_after_socket_drop_unblocks_successor_without_second_s
         control_pairing_only=True,
     )
     extension = FakeExtension()
-    first_websocket = FakeExtensionWebSocket(relay, extension)
-    relay._websocket = first_websocket  # type: ignore[assignment]
+    initial_websocket = FakeExtensionWebSocket(relay, extension)
+    relay._websocket = initial_websocket  # type: ignore[assignment]
     relay.extension_protocol_version = 2
     server._relay = relay
 
-    await first_websocket.send_hello()
+    await initial_websocket.send_hello()
     await _eventually(lambda: not server._extension_reset_quarantined)
     initial_sweep_count = extension.reset_sweep_count
-    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    first_server_task = await _connect_over_socketpair(server, first)
-
     extension.scoped_tabs = [{"tabId": 71, "url": "https://private.test", "title": "Private"}]
     extension.attached_tabs = {71}
     relay.scoped_tabs = list(extension.scoped_tabs)
     extension.reset_started.clear()
     extension.reset_gate.clear()
-    await first.stop()
+
+    await initial_websocket.close(code=1001, message=b"transport lost")
+    await relay._handle_disconnect(initial_websocket)  # type: ignore[arg-type]
+    recovery_websocket = FakeExtensionWebSocket(relay, extension)
+    await relay._activate_connection(recovery_websocket, 2)  # type: ignore[arg-type]
+    await recovery_websocket.send_hello()
     await asyncio.wait_for(extension.reset_started.wait(), 1.0)
     reset_identity = (server._extension_reset_epoch, server._extension_reset_generation)
 
-    await first_websocket.close(code=1001, message=b"transport lost")
-    await relay._handle_disconnect(first_websocket)  # type: ignore[arg-type]
+    await recovery_websocket.close(code=1001, message=b"transport lost")
+    await relay._handle_disconnect(recovery_websocket)  # type: ignore[arg-type]
     extension.reset_gate.set()
     await _eventually(lambda: extension.reset_sweep_count == initial_sweep_count + 1)
-    await _eventually(lambda: not first_websocket.reset_tasks)
-    await asyncio.wait_for(first_server_task, 1.0)
+    await _eventually(lambda: not recovery_websocket.reset_tasks)
 
     assert (extension.last_reset_epoch, extension.last_reset_generation) == reset_identity
     assert extension.last_reset_ok is True
     assert server._extension_reset_quarantined
+    assert (server._extension_reset_epoch, server._extension_reset_generation) == reset_identity
 
-    second_websocket = FakeExtensionWebSocket(relay, extension)
-    await relay._activate_connection(second_websocket, 2)  # type: ignore[arg-type]
-    await second_websocket.send_hello()
+    successor_websocket = FakeExtensionWebSocket(relay, extension)
+    await relay._activate_connection(successor_websocket, 2)  # type: ignore[arg-type]
+    await successor_websocket.send_hello()
     await _eventually(lambda: not server._extension_reset_quarantined)
 
-    replayed_resets = [frame for frame in second_websocket.frames if frame.get("type") == "extension.reset"]
+    replayed_resets = [frame for frame in successor_websocket.frames if frame.get("type") == "extension.reset"]
     assert [(frame["epoch"], frame["generation"]) for frame in replayed_resets] == [reset_identity]
     assert extension.reset_sweep_count == initial_sweep_count + 1
 
-    second_server_task = await _connect_over_socketpair(server, second)
-    assert second.broker_connected
-    assert second.scoped_tabs == []
-    await second.stop()
-    await asyncio.wait_for(second_server_task, 1.0)
+    successor = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    successor_server_task = await _connect_over_socketpair(server, successor)
+    assert successor.broker_connected
+    assert successor.scoped_tabs == []
+    await successor.stop()
+    await asyncio.wait_for(successor_server_task, 1.0)
     await server.stop()
 
 
@@ -1310,22 +1559,27 @@ async def test_reset_send_deadline_surfaces_structured_timeout(
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
 
-    await first.stop()
+    relay.connected = False
+    await server._handle_disconnect()
+    relay.connected = True
+    await relay.hello()
     await asyncio.wait_for(relay.reset_send_started.wait(), 0.2)
-    await asyncio.wait_for(first_server_task, 0.2)
+    await _eventually(lambda: server._extension_reset_error == "EXTENSION_RESET_TIMEOUT")
 
     assert relay.reset_send_cancelled.is_set()
-    assert server._extension_reset_error == "EXTENSION_RESET_TIMEOUT"
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
     with pytest.raises(BrowserExtensionBrokerError) as error_info:
         await _connect_over_socketpair(server, second)
     assert error_info.value.code == "EXTENSION_RESET_TIMEOUT"
+    assert first.broker_connected
     await second.stop()
+    await first.stop()
+    await asyncio.wait_for(first_server_task, 1.0)
     await server.stop()
 
 
 @pytest.mark.asyncio
-async def test_owner_release_resets_timed_out_extension_request_before_reenrollment() -> None:
+async def test_owner_release_allows_reenrollment_while_timed_out_request_awaits_terminal() -> None:
     server = BrowserExtensionBrokerServer(19777)
     relay = ExtensionRelayServer(
         "extension-secret",
@@ -1342,19 +1596,675 @@ async def test_owner_release_resets_timed_out_extension_request_before_reenrollm
     server._relay = relay
     await websocket.send_hello()
     await _eventually(lambda: not server._extension_reset_quarantined)
+    relay.scoped_tabs = [{"tabId": 7}]
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
     second = BrokerClient(19777, _ignore_event, auto_spawn=False)
     first_server_task = await _connect_over_socketpair(server, first)
+    sweep_count = extension.reset_sweep_count
+
     with pytest.raises(ExtensionRequestError, match="timed out"):
         await first.request("tabs.activate", {"tabId": 7}, timeout=0.01)
     assert relay.pending_request_count == 1
     await first.stop()
     await asyncio.wait_for(first_server_task, 1.0)
-    assert relay.pending_request_count == 0
-    second_server_task = await _connect_over_socketpair(server, second)
+
+    second_server_task = await asyncio.wait_for(_connect_over_socketpair(server, second), 1.0)
+    assert second.broker_connected
     assert second.scoped_tabs == []
+    # The released tab stays fenced while the departed owner's request awaits terminal:
+    # no cleanup frame has been sent and a successor cannot claim it yet.
+    request_frames = [frame for frame in websocket.frames if frame.get("type") == "request"]
+    assert [frame["op"] for frame in request_frames] == ["tabs.activate"]
+    with pytest.raises(BrowserExtensionBrokerError) as claim_error:
+        await second.request("debugger.send", {"tabId": 7, "method": "Runtime.evaluate"}, timeout=1.0)
+    assert claim_error.value.code == "LEASE_HELD"
+    assert extension.reset_sweep_count == sweep_count
+
+    # The extension answers the stale request; only then does the drain send cleanup.
+    await websocket._send_to_relay(
+        {"v": 2, "type": "response", "id": request_frames[0]["id"], "ok": True, "result": {}}
+    )
+    await _eventually(lambda: len([frame for frame in websocket.frames if frame.get("type") == "request"]) == 2)
+    request_frames = [frame for frame in websocket.frames if frame.get("type") == "request"]
+    assert [frame["op"] for frame in request_frames] == ["tabs.activate", "debugger.detach"]
+    await websocket._send_to_relay(
+        {
+            "v": 2,
+            "type": "event",
+            "event": "scope.tabRemoved",
+            "params": {"tabId": 7, "reason": "detached"},
+        }
+    )
+    await websocket._send_to_relay(
+        {"v": 2, "type": "response", "id": request_frames[1]["id"], "ok": True, "result": {}}
+    )
+    await _eventually(lambda: relay.pending_request_count == 0)
+    await _eventually(lambda: 7 not in server._leases)
+
+    relay.scoped_tabs = [{"tabId": 7}]
+    await websocket._send_to_relay(
+        {
+            "v": 2,
+            "type": "event",
+            "event": "scope.tabAdded",
+            "params": {"tabId": 7, "url": "https://example.test", "origin": "shared"},
+        }
+    )
+    # With the drain complete the successor can claim the freed tab.
+    claim_task = asyncio.create_task(second.request("tabs.activate", {"tabId": 7}, timeout=1.0))
+    await _eventually(lambda: len([frame for frame in websocket.frames if frame.get("type") == "request"]) == 3)
+    request_frames = [frame for frame in websocket.frames if frame.get("type") == "request"]
+    assert request_frames[2]["op"] == "tabs.activate"
+    await websocket._send_to_relay(
+        {"v": 2, "type": "response", "id": request_frames[2]["id"], "ok": True, "result": {}}
+    )
+    assert await asyncio.wait_for(claim_task, 1.0) == {}
+
     await second.stop()
     await asyncio.wait_for(second_server_task, 1.0)
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_release_cleanup_keeps_tab_fenced() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+
+    async def request_with_failed_cleanup(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "debugger.detach":
+            relay.requests.append((op, dict(args)))
+            raise ExtensionRequestError("CDP_ERROR", "cleanup failed")
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = request_with_failed_cleanup  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    relay.scoped_tabs = [{"tabId": 7}]
+
+    await first.request("tabs.activate", {"tabId": 7})
+    await first.stop()
+    await asyncio.wait_for(first_server_task, 1.0)
+    await _eventually(lambda: not server._cleanup_tasks)
+
+    lease = server._leases[7]
+    assert lease.draining
+    assert ("debugger.detach", {"tabId": 7}) in relay.requests
+
+    second_server_task = await _connect_over_socketpair(server, second)
+    with pytest.raises(BrowserExtensionBrokerError) as claim_error:
+        await second.request("tabs.activate", {"tabId": 7})
+    assert claim_error.value.code == "LEASE_HELD"
+
+    await second.stop()
+    await asyncio.wait_for(second_server_task, 1.0)
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_already_detached_shared_cleanup_frees_tab_for_next_client() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+
+    async def request_with_idempotent_detach(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "debugger.detach":
+            relay.requests.append((op, dict(args)))
+            raise ExtensionRequestError("DEBUGGER_DETACHED", "The debugger is not attached to this tab.")
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = request_with_idempotent_detach  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second_server_task: asyncio.Task[None] | None = None
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    relay.scoped_tabs = [{"tabId": 7}]
+    try:
+        await first.request("tabs.activate", {"tabId": 7})
+        await first.stop()
+        await asyncio.wait_for(first_server_task, 1.0)
+        await _eventually(lambda: not server._cleanup_tasks)
+
+        assert 7 not in server._leases
+        assert ("debugger.detach", {"tabId": 7}) in relay.requests
+
+        second_server_task = await _connect_over_socketpair(server, second)
+        result = await second.request("tabs.activate", {"tabId": 7})
+        assert result["op"] == "tabs.activate"
+    finally:
+        await second.stop()
+        await first.stop()
+        if second_server_task is not None:
+            await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_successful_shared_detach_waits_for_scope_removal() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+
+    async def request_without_scope_removal(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "debugger.detach":
+            relay.requests.append((op, dict(args)))
+            return {"op": op, "args": args, "timeout": timeout}
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = request_without_scope_removal  # type: ignore[method-assign]
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 7}]
+    try:
+        await client.request("tabs.activate", {"tabId": 7})
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await _eventually(lambda: not server._cleanup_tasks)
+
+        assert server._leases[7].draining
+        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "detached"})
+        assert 7 not in server._leases
+    finally:
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_scope_removal_stays_fenced_until_old_request_is_terminal() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+    request_started = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def request_with_blocked_command(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "debugger.send":
+            relay.requests.append((op, dict(args)))
+            if on_registered is not None:
+                on_registered()
+            request_started.set()
+            try:
+                await finish_request.wait()
+            finally:
+                if on_terminal is not None:
+                    on_terminal()
+            return {"op": op, "args": args, "timeout": timeout}
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = request_with_blocked_command  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task = await _connect_over_socketpair(server, second)
+    relay.scoped_tabs = [{"tabId": 7, "url": "https://shared.example.test"}]
+    pending_request: asyncio.Task[dict] | None = None
+    try:
+        await first.request("tabs.activate", {"tabId": 7})
+        pending_request = asyncio.create_task(
+            first.request("debugger.send", {"tabId": 7, "method": "Runtime.evaluate"}, timeout=2.0)
+        )
+        await asyncio.wait_for(request_started.wait(), 1.0)
+
+        relay.scoped_tabs = []
+        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "unshared"})
+        assert server._leases[7].draining
+        assert server._tab_request_counts == {7: 1}
+
+        relay.scoped_tabs = [{"tabId": 7, "url": "https://shared.example.test"}]
+        await server._handle_extension_event(
+            "scope.tabAdded",
+            {"tabId": 7, "url": "https://shared.example.test", "origin": "shared"},
+        )
+        with pytest.raises(BrowserExtensionBrokerError) as claim_error:
+            await second.request("tabs.activate", {"tabId": 7})
+        assert claim_error.value.code == "LEASE_HELD"
+
+        finish_request.set()
+        await asyncio.wait_for(pending_request, 1.0)
+        await _eventually(lambda: 7 not in server._leases)
+        result = await second.request("tabs.activate", {"tabId": 7})
+        assert result["op"] == "tabs.activate"
+    finally:
+        finish_request.set()
+        if pending_request is not None:
+            await asyncio.gather(pending_request, return_exceptions=True)
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_created_scope_removal_closes_tab_after_old_request_is_terminal() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+    request_started = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def request_with_blocked_command(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "debugger.send":
+            relay.requests.append((op, dict(args)))
+            if on_registered is not None:
+                on_registered()
+            request_started.set()
+            try:
+                await finish_request.wait()
+            finally:
+                if on_terminal is not None:
+                    on_terminal()
+            return {"op": op, "args": args, "timeout": timeout}
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = request_with_blocked_command  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    relay.scoped_tabs = [{"tabId": 7, "url": "https://created.example.test"}]
+    assert first._client_id is not None
+    await server._grant_lease(7, first._client_id, origin="created")
+    pending_request: asyncio.Task[dict] | None = None
+    try:
+        pending_request = asyncio.create_task(
+            first.request("debugger.send", {"tabId": 7, "method": "Runtime.evaluate"}, timeout=2.0)
+        )
+        await asyncio.wait_for(request_started.wait(), 1.0)
+
+        relay.scoped_tabs = []
+        await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "detached"})
+        assert server._leases[7].draining
+        assert ("tabs.remove", {"tabId": 7}) not in relay.requests
+
+        finish_request.set()
+        await asyncio.wait_for(pending_request, 1.0)
+        await _eventually(lambda: 7 not in server._leases)
+        assert ("tabs.remove", {"tabId": 7}) in relay.requests
+    finally:
+        finish_request.set()
+        if pending_request is not None:
+            await asyncio.gather(pending_request, return_exceptions=True)
+        await first.stop()
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_tab_create_stays_fenced_without_blocking_popup_routing() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+    create_started = asyncio.Event()
+    emit_late_tab = asyncio.Event()
+    tab_added = asyncio.Event()
+    finish_create = asyncio.Event()
+    tab_removed = asyncio.Event()
+
+    async def delayed_create(
+        op: str,
+        args: dict,
+        timeout: float | None = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "tabs.create":
+            assert timeout is None
+            relay.requests.append((op, dict(args)))
+            if on_registered is not None:
+                on_registered()
+            create_started.set()
+            await emit_late_tab.wait()
+            relay.scoped_tabs = [*relay.scoped_tabs, {"tabId": 91, "url": "about:blank", "title": ""}]
+            await server._handle_extension_event(
+                "scope.tabAdded",
+                {"tabId": 91, "url": "about:blank", "title": "", "origin": "created"},
+            )
+            tab_added.set()
+            await finish_create.wait()
+            if on_terminal is not None:
+                on_terminal()
+            return {"tabId": 91}
+        if op == "tabs.remove":
+            relay.requests.append((op, dict(args)))
+            removed_tab_id = args.get("tabId")
+            relay.scoped_tabs = [tab for tab in relay.scoped_tabs if tab.get("tabId") != removed_tab_id]
+            await server._handle_extension_event(
+                "scope.tabRemoved",
+                {"tabId": removed_tab_id, "reason": "closed"},
+            )
+            if removed_tab_id == 91:
+                tab_removed.set()
+            return {}
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = delayed_create  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task = await _connect_over_socketpair(server, second)
+    relay.scoped_tabs = [{"tabId": 7, "url": "https://opener.example.test", "title": "Opener"}]
+    await first.request("tabs.activate", {"tabId": 7})
+    first_client_id = first._client_id
+    assert first_client_id is not None
+    try:
+        with pytest.raises(ExtensionRequestError, match="timed out"):
+            await first.request("tabs.create", {"url": "about:blank"}, timeout=0.01)
+        assert create_started.is_set()
+        assert server._pending_create_count == 1
+
+        relay.scoped_tabs = [
+            *relay.scoped_tabs,
+            {"tabId": 93, "url": "https://shared.example.test", "title": "Shared"},
+        ]
+        await server._handle_extension_event(
+            "scope.tabAdded",
+            {"tabId": 93, "url": "https://shared.example.test", "title": "Shared", "origin": "shared"},
+        )
+        shared_lease = await second.ensure_root_lease()
+        assert shared_lease is not None and shared_lease["tabId"] == 93
+        assert 93 not in server._pending_tab_events
+        relay.scoped_tabs = [
+            *relay.scoped_tabs,
+            {"tabId": 92, "url": "https://popup.example.test", "title": "Popup"},
+        ]
+        await server._handle_extension_event(
+            "tabs.created",
+            {"tabId": 92, "openerTabId": 7, "url": "https://popup.example.test"},
+        )
+        assert server._leases[92].client_id == first_client_id
+        assert 92 not in server._pending_tab_events
+
+        emit_late_tab.set()
+        await asyncio.wait_for(tab_added.wait(), 1.0)
+        with pytest.raises(BrowserExtensionBrokerError) as claim_error:
+            await second.request("tabs.activate", {"tabId": 91})
+        assert claim_error.value.code == "LEASE_HELD"
+
+        finish_create.set()
+        await asyncio.wait_for(tab_removed.wait(), 1.0)
+        await _eventually(lambda: 91 not in server._leases and server._pending_create_count == 0)
+        assert ("tabs.remove", {"tabId": 91}) in relay.requests
+        assert 91 not in server._pending_tab_events
+    finally:
+        emit_late_tab.set()
+        finish_create.set()
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_tab_create_rejects_before_forwarding_when_correlation_capacity_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(broker_server_module, "MAX_PENDING_TAB_EVENT_TABS", 2)
+    server = BrowserExtensionBrokerServer(19777)
+    relay = BlockingRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    server._extension_supports_scope_origins = True
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task = await _connect_over_socketpair(server, second)
+    first_create: asyncio.Task[dict] | None = None
+    try:
+        first_create = asyncio.create_task(first.request("tabs.create", {"url": "about:blank"}, timeout=2.0))
+        await asyncio.wait_for(relay.request_started.wait(), 1.0)
+        relay.scoped_tabs = [{"tabId": 91, "url": "about:blank", "title": ""}]
+        await server._handle_extension_event(
+            "scope.tabAdded",
+            {"tabId": 91, "url": "about:blank", "title": "", "origin": "created"},
+        )
+        assert server._pending_create_count == 1
+        assert 91 in server._pending_tab_events
+
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await second.request("tabs.create", {"url": "about:blank"}, timeout=1.0)
+
+        assert error_info.value.code == "RESOURCE_LIMIT"
+        assert server._pending_create_count == 1
+        assert [op for op, _args in relay.requests].count("tabs.create") == 1
+    finally:
+        relay.release_request.set()
+        if first_create is not None:
+            await asyncio.gather(first_create, return_exceptions=True)
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_legacy_scope_additions_stay_globally_fenced_while_create_is_pending() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = BlockingRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task = await _connect_over_socketpair(server, second)
+    first_create: asyncio.Task[dict] | None = None
+    try:
+        first_create = asyncio.create_task(first.request("tabs.create", {"url": "about:blank"}, timeout=2.0))
+        await asyncio.wait_for(relay.request_started.wait(), 1.0)
+        relay.scoped_tabs = [{"tabId": 91, "url": "https://shared.example.test", "title": "Shared"}]
+        server._extension_supports_scope_origins = False
+        await server._handle_extension_event(
+            "scope.tabAdded",
+            {"tabId": 91, "url": "https://shared.example.test", "title": "Shared"},
+        )
+
+        assert 91 not in server._pending_tab_events
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            await second.request("tabs.activate", {"tabId": 91}, timeout=0.1)
+        assert error_info.value.code == "LEASE_HELD"
+        assert relay.requests == [("tabs.create", {"url": "about:blank"})]
+
+        relay.release_request.set()
+        if first_create is not None:
+            await first_create
+            first_create = None
+        await second.request("tabs.activate", {"tabId": 91})
+        assert server._leases[91].client_id == second._client_id
+    finally:
+        relay.release_request.set()
+        if first_create is not None:
+            await asyncio.gather(first_create, return_exceptions=True)
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_popup_from_draining_opener_stays_fenced_until_closed() -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+    remove_started = asyncio.Event()
+    finish_remove = asyncio.Event()
+
+    async def controlled_cleanup(
+        op: str,
+        args: dict,
+        timeout: float | None = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op == "tabs.remove" and args.get("tabId") == 8:
+            relay.requests.append((op, dict(args)))
+            remove_started.set()
+            await finish_remove.wait()
+            relay.scoped_tabs = [tab for tab in relay.scoped_tabs if tab.get("tabId") != 8]
+            await server._handle_extension_event("scope.tabRemoved", {"tabId": 8, "reason": "closed"})
+            return {}
+        return await original_request(
+            op,
+            args,
+            timeout,
+            retain_until_terminal=retain_until_terminal,
+            on_registered=on_registered,
+            on_terminal=on_terminal,
+        )
+
+    relay.request = controlled_cleanup  # type: ignore[method-assign]
+    server._relay = relay
+    first = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    second = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    first_server_task = await _connect_over_socketpair(server, first)
+    second_server_task = await _connect_over_socketpair(server, second)
+    first_client_id = first._client_id
+    assert first_client_id is not None
+    relay.scoped_tabs = [
+        {"tabId": 7, "url": "https://opener.example.test", "title": "Opener"},
+        {"tabId": 8, "url": "https://popup.example.test", "title": "Popup"},
+    ]
+    opener = await server._grant_lease(7, first_client_id, origin="created")
+    opener.draining = True
+    try:
+        await server._handle_extension_event(
+            "tabs.created",
+            {"tabId": 8, "openerTabId": 7, "url": "https://popup.example.test"},
+        )
+        await asyncio.wait_for(remove_started.wait(), 1.0)
+
+        popup = server._leases[8]
+        assert popup.client_id == first_client_id
+        assert popup.origin == "created"
+        assert popup.draining
+        with pytest.raises(BrowserExtensionBrokerError) as claim_error:
+            await second.request("tabs.activate", {"tabId": 8})
+        assert claim_error.value.code == "LEASE_HELD"
+
+        finish_remove.set()
+        await _eventually(lambda: 8 not in server._leases)
+        assert ("tabs.remove", {"tabId": 8}) in relay.requests
+    finally:
+        finish_remove.set()
+        await server._free_lease(7)
+        await second.stop()
+        await first.stop()
+        await asyncio.wait_for(second_server_task, 1.0)
+        await asyncio.wait_for(first_server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("origin", "cleanup_op"), [("created", "tabs.remove"), ("shared", "debugger.detach")])
+async def test_explicit_lease_release_uses_authoritative_origin(origin: str, cleanup_op: str) -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    client_id = client._client_id
+    assert client_id is not None
+    await server._grant_lease(7, client_id, origin=origin)
+
+    await client.release_tab(7)
+    await _eventually(lambda: 7 not in server._leases)
+
+    assert (cleanup_op, {"tabId": 7}) in relay.requests
+    await client.stop()
+    await asyncio.wait_for(server_task, 1.0)
     await server.stop()
 
 
@@ -1389,16 +2299,18 @@ async def test_retained_timed_out_extension_requests_remain_bounded(
     websocket = WebSocket()
     relay._websocket = websocket  # type: ignore[assignment]
     relay._connected_event.set()
+    relay.extension_protocol_version = 2
     server._relay = relay
     server._extension_reset_quarantined = False
     client = BrokerClient(19777, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 7}, {"tabId": 8}, {"tabId": 9}]
     try:
         with pytest.raises(ExtensionRequestError, match="timed out"):
             await client.request("tabs.activate", {"tabId": 7}, timeout=0.01)
         assert relay.pending_request_count == 1
-        active = server._active_client
-        assert active is not None
+        assert client._client_id is not None
+        active = server._clients[client._client_id]
         assert len(active.request_ids) == 1
         assert server._global_requests == 1
 
@@ -1408,7 +2320,7 @@ async def test_retained_timed_out_extension_requests_remain_bounded(
 
         await relay._handle_text_frame(
             relay._websocket,
-            json.dumps({"v": 1, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
+            json.dumps({"v": 2, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
         )
         await _eventually(lambda: relay.pending_request_count == 0)
         await _eventually(lambda: not active.request_ids and server._global_requests == 0)
@@ -1451,27 +2363,29 @@ async def test_retained_timed_out_request_holds_inbound_bytes_until_terminal(
     websocket = WebSocket()
     relay._websocket = websocket  # type: ignore[assignment]
     relay._connected_event.set()
+    relay.extension_protocol_version = 2
     server._relay = relay
     server._extension_reset_quarantined = False
     client = BrokerClient(19777, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 7}]
     try:
         with pytest.raises(ExtensionRequestError, match="timed out"):
             await client.request("debugger.send", {"tabId": 7, "params": {"padding": "x" * 4096}}, timeout=0.01)
-        active = server._active_client
-        assert active is not None
+        assert client._client_id is not None
+        active = server._clients[client._client_id]
         assert active.inbound_bytes > 4096
         assert server._global_inbound_bytes == active.inbound_bytes
 
         monkeypatch.setattr(broker_server_module, "MAX_CLIENT_INBOUND_BYTES", active.inbound_bytes)
         with pytest.raises(BrowserExtensionNotConnectedError):
             await client.request("debugger.send", {"tabId": 7, "params": {"padding": "y" * 4096}}, timeout=0.01)
-        assert len(websocket.requests) == 1
+        assert [request["op"] for request in websocket.requests].count("debugger.send") == 1
         await asyncio.wait_for(server_task, 1.0)
 
         await relay._handle_text_frame(
             relay._websocket,
-            json.dumps({"v": 1, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
+            json.dumps({"v": 2, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
         )
         await _eventually(lambda: active.inbound_bytes == 0 and server._global_inbound_bytes == 0)
     finally:
@@ -1511,10 +2425,12 @@ async def test_retained_timed_out_requests_enforce_per_tab_limit_until_terminal(
     websocket = WebSocket()
     relay._websocket = websocket  # type: ignore[assignment]
     relay._connected_event.set()
+    relay.extension_protocol_version = 2
     server._relay = relay
     server._extension_reset_quarantined = False
     client = BrokerClient(19777, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 7}, {"tabId": 8}]
     try:
         with pytest.raises(ExtensionRequestError, match="timed out"):
             await client.request("tabs.activate", {"tabId": 7}, timeout=0.01)
@@ -1530,7 +2446,7 @@ async def test_retained_timed_out_requests_enforce_per_tab_limit_until_terminal(
 
         await relay._handle_text_frame(
             relay._websocket,
-            json.dumps({"v": 1, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
+            json.dumps({"v": 2, "type": "response", "id": websocket.requests[0]["id"], "ok": True, "result": {}}),
         )
         await _eventually(lambda: server._tab_request_counts == {8: 1})
 
@@ -1558,8 +2474,9 @@ async def test_integer_like_tab_ids_enforce_per_tab_limit(
     server._relay = relay
     client = BrokerClient(19777, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
-    connection = server._active_client
-    assert connection is not None
+    relay.scoped_tabs = [{"tabId": 5}]
+    assert client._client_id is not None
+    connection = server._clients[client._client_id]
     request = {"op": "tabs.activate", "args": {"tabId": tab_id}, "timeout": 30.0}
     first = asyncio.create_task(server._dispatch(connection, "extension.request", request))
     try:
@@ -1616,13 +2533,15 @@ async def test_oversized_control_heartbeat_is_rejected(frame_type: str) -> None:
     client_reader, client_writer = await asyncio.open_connection(sock=client_socket)
     server_task = asyncio.create_task(server._handle_connection(server_reader, server_writer))
     await client._authenticate(client_reader, client_writer)
+    client_id = client._client_id
+    assert client_id is not None
     try:
         await write_frame(
             client_writer,
             {"v": 1, "type": frame_type, "padding": "x" * CONTROL_FRAME_LIMIT},
         )
         await asyncio.wait_for(server_task, 1.0)
-        assert server._active_client is None
+        assert client_id not in server._clients
     finally:
         client_writer.close()
         with suppress(BrokenPipeError):
@@ -1640,11 +2559,13 @@ async def test_oversized_control_prefix_is_rejected_without_waiting_for_declared
     client_reader, client_writer = await asyncio.open_connection(sock=client_socket)
     server_task = asyncio.create_task(server._handle_connection(server_reader, server_writer))
     await client._authenticate(client_reader, client_writer)
+    client_id = client._client_id
+    assert client_id is not None
     try:
         client_writer.write((1024 * 1024).to_bytes(4, "big") + b'{"v":1,"type":"pong","padding":')
         await client_writer.drain()
         await asyncio.wait_for(server_task, 1.0)
-        assert server._active_client is None
+        assert client_id not in server._clients
     finally:
         client_writer.close()
         await client_writer.wait_closed()
@@ -1662,13 +2583,13 @@ async def test_failed_sender_does_not_leak_active_client_slot(monkeypatch: pytes
         raise BrokenPipeError
 
     monkeypatch.setattr(server, "_write_encoded", fail_write)
-    active = server._active_client
-    assert active is not None
+    assert client._client_id is not None
+    active = server._clients[client._client_id]
     await server._send_event(active, "extension.disconnected", {})
     await _eventually(lambda: active.sender_task is not None and active.sender_task.done())
     await client.stop()
     await asyncio.wait_for(server_task, 1.0)
-    assert server._active_client is None
+    assert active.client_id not in server._clients
     await server.stop()
 
 
@@ -1698,7 +2619,8 @@ async def test_failed_enrollment_response_never_publishes_slot_or_hangs_stop(
         with pytest.raises(EOFError):
             await client._authenticate(client_reader, client_writer)
         await asyncio.wait_for(server_task, 1.0)
-        assert server._active_client is None
+        assert server._clients == {}
+        assert server._credentials == {}
         monkeypatch.setattr(broker_server_module, "write_frame", original_write_frame)
         replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
         replacement_server_task = await _connect_over_socketpair(server, replacement)
@@ -1708,6 +2630,55 @@ async def test_failed_enrollment_response_never_publishes_slot_or_hangs_stop(
     finally:
         client_writer.close()
         await client_writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_response_leaves_old_client_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = BrowserExtensionBrokerServer(19777)
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    active = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    active_server_task = await _connect_over_socketpair(server, active)
+    relay.scoped_tabs = [{"tabId": 7}]
+    await active.request("tabs.activate", {"tabId": 7})
+    client_id = active._client_id
+    assert client_id is not None
+    active_connection = server._clients[client_id]
+
+    replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    replacement._client_id = client_id
+    replacement._recovery_secret = active._recovery_secret
+    original_write_frame = broker_server_module.write_frame
+    writes = 0
+
+    async def fail_reconnect_response(*args: object, **kwargs: object) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise BrokenPipeError
+        return await original_write_frame(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(broker_server_module, "write_frame", fail_reconnect_response)
+    with pytest.raises(EOFError):
+        await _connect_over_socketpair(server, replacement)
+
+    assert server._clients[client_id] is active_connection
+    assert not active_connection.closed
+    assert server._leases[7].client_id == client_id
+    assert not server._leases[7].draining
+    monkeypatch.setattr(broker_server_module, "write_frame", original_write_frame)
+    assert await active.request("tabs.activate", {"tabId": 7}) == {
+        "op": "tabs.activate",
+        "args": {"tabId": 7},
+        "timeout": 30.0,
+    }
+
+    await replacement.stop()
+    await active.stop()
+    await asyncio.wait_for(active_server_task, 1.0)
+    await server.stop()
 
 
 @pytest.mark.asyncio
@@ -1793,8 +2764,8 @@ async def test_completed_request_ids_are_released() -> None:
     try:
         for _ in range(3):
             await client.broker_status()
-        active = server._active_client
-        assert active is not None
+        assert client._client_id is not None
+        active = server._clients[client._client_id]
         await _eventually(lambda: not active.request_ids)
     finally:
         await client.stop()
@@ -2025,6 +2996,8 @@ async def _eventually(predicate: Callable[[], bool]) -> None:
 async def _connect_over_socketpair(
     server: BrowserExtensionBrokerServer,
     client: BrokerClient,
+    *,
+    auto_approve: bool = True,
 ) -> asyncio.Task[None]:
     relay = server.relay
     if isinstance(relay, FakeRelay) and relay.auto_connect and not relay.connected:
@@ -2053,4 +3026,6 @@ async def _connect_over_socketpair(
     client._reader_task = asyncio.create_task(
         client._read_loop(client_reader, client_writer, client._transport_generation)
     )
+    if auto_approve and not client._operator:
+        await server._approve_client(client._client_id)
     return server_task
