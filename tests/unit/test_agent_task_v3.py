@@ -982,20 +982,195 @@ async def test_execute_step_bare_task_dispatch_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_block_task_step_cap_not_floored(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A block task's configured cap is used as-is, not floored to MIN_ACTION_STEPS: a workflow
-    # author already sizes this budget deliberately, same as they do for the step engine.
+async def test_execute_task_v3_action_block_step_cap_not_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An action block's budget is its contract — one action round — not a step-engine-sized number
+    # to translate, so the floor leaves it alone. (A round is not a single tool call: the cap bounds
+    # rounds, and one round can dispatch a batch.)
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
     block = _make_block(ActionBlock)
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
         task_block=block,
+        task_type=TaskType.action,
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_action_block_not_floored_when_task_type_left_at_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task_type is a defaulted field, so a block that reaches execution without it set would look
+    # general. The block class settles it: an action block keeps its budget either way, because
+    # over-flooring multiplies what one block may spend and under-flooring only costs rounds.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(ActionBlock)
+    assert block.task_type == TaskType.general
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=1,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_validation_block_step_cap_not_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same for a validation block's deliberate 1-attempt-plus-retry budget.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    block = _make_block(ValidationBlock)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.validation,
         max_steps_per_run=2,
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_null_task_type_still_floors_a_general_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # task_type is nullable on the task row, and `None != TaskType.general` is true — so a naive
+    # comparison would read NULL as "owns its budget" and skip the floor for every block class.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=None,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_non_general_task_type_alone_skips_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The task_type signal stands on its own, so a block class that isn't Action/Validation but
+    # declares an atomic task_type keeps its budget. Nothing produces this pairing today; it is
+    # here so the semantic signal keeps working if a future block type adopts one.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        task_type=TaskType.action,
+        max_steps_per_run=3,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_general_block_step_cap_floored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The regression this floor exists for: a navigation block carrying a step-engine-sized cap ran
+    # out of action rounds mid-form. A general-purpose block now gets the same translation a bare
+    # task gets, because the same unit mismatch applies to it.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+def test_min_action_steps_is_pinned() -> None:
+    # The constant is this change's headline risk, and every other assertion here is written against
+    # the symbol — so without this line it could be retuned to anything and the suite would stay green.
+    # Moving it is fine; moving it without a deliberate edit here is not.
+    assert MIN_ACTION_STEPS == 24
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block_cls", "block_kwargs"),
+    [
+        (TaskBlock, {}),
+        (NavigationBlock, {"navigation_goal": "Apply to the job"}),
+        (LoginBlock, {}),
+        (ExtractionBlock, {"data_extraction_goal": "Grab the confirmation number"}),
+    ],
+)
+async def test_execute_task_v3_every_general_block_type_is_floored(
+    monkeypatch: pytest.MonkeyPatch, block_cls: type[BaseTaskBlock], block_kwargs: dict[str, Any]
+) -> None:
+    # All four carry a general-purpose budget sized in step-engine steps, so all four get translated.
+    # Extraction is included deliberately: it reads rather than acts, but it holds the full browser
+    # tool set, so its cap can bind like any other.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(block_cls, **block_kwargs)
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_general_block_generous_cap_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The floor only ever raises: a block budgeted above it keeps exactly what its author wrote.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        max_steps_per_run=40,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 40
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_workflow_run_ceiling_still_beats_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The org's workflow-run-wide ceiling is a cost control, not a step-engine artifact, so it is
+    # applied after the floor and wins. The remaining budget is chosen to sit strictly between the
+    # authored cap and the floor: 10 can only be the answer if the floor ran first and the ceiling
+    # then cut it back. Clamping before flooring would return the floor instead.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    block = _make_block(NavigationBlock, navigation_goal="Apply to the job")
+    monkeypatch.setattr(ForgeAgent, "_check_workflow_run_step_budget", AsyncMock(return_value=(41, 50)))
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=block,
+        workflow_run_id="wr_ceiling",
+        max_steps_per_run=7,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert 7 < 10 < MIN_ACTION_STEPS
+    assert loop_mock.await_args.kwargs["max_action_steps"] == 10
 
 
 @pytest.mark.asyncio
@@ -1764,27 +1939,27 @@ async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, task_block=block, data_extraction_goal=None, extracted_information_schema=None
     )
-    probe = loop_mock.await_args.kwargs["settle_probe"]
-    assert probe is not None
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    assert fingerprint is not None
 
     _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
-    assert bare_loop_mock.await_args.kwargs["settle_probe"] is None
+    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is None
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_settle_probe_peeks_without_recovery(
+async def test_execute_task_v3_page_fingerprint_peeks_without_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The probe peeks with the NON-recovering accessor: a lost page settles (accept the verdict)
-    # rather than triggering recovery navigation at finish time; a mid-render page defers.
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", AsyncMock(return_value=None))
+    # The sampler peeks with the NON-recovering accessor: a lost page yields None (accept the
+    # verdict) rather than triggering recovery navigation at finish time. A sampling error
+    # propagates — the finish gate fails closed on it instead of reading it as settled.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     block = _make_block(NavigationBlock, navigation_goal="Open the panel")
 
     page = MagicMock()
-    page.evaluate = AsyncMock(side_effect=["100:10", "180:14", "180:14", "180:14"])
+    page.evaluate = AsyncMock(side_effect=["hash-a:100:10", "hash-b:100:10"])
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
         outcome,
@@ -1793,20 +1968,17 @@ async def test_execute_task_v3_settle_probe_peeks_without_recovery(
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
-    probe = loop_mock.await_args.kwargs["settle_probe"]
-    assert await probe() is False
-    assert await probe() is True
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    assert await fingerprint() == "hash-a:100:10"
+    assert await fingerprint() == "hash-b:100:10"
     loop_mock.browser_state.get_working_page.assert_awaited()
 
-    lost_state_probe_mock = AsyncMock(return_value=None)
-    _step, _task, loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        task_block=block,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
-    loop_mock.browser_state.get_working_page = lost_state_probe_mock
-    probe = loop_mock.await_args.kwargs["settle_probe"]
-    assert await probe() is True
-    lost_state_probe_mock.assert_awaited_once()
+    page.evaluate = AsyncMock(side_effect=RuntimeError("execution context was destroyed"))
+    loop_mock.browser_state.get_working_page = AsyncMock(return_value=page)
+    with pytest.raises(RuntimeError):
+        await fingerprint()
+
+    lost_page_peek = AsyncMock(return_value=None)
+    loop_mock.browser_state.get_working_page = lost_page_peek
+    assert await fingerprint() is None
+    lost_page_peek.assert_awaited_once()

@@ -126,10 +126,28 @@ async def test_workflow_run_list_fetches_extra_row_for_has_more(monkeypatch: pyt
         status=None,
         search_key=None,
         error_code=None,
+        include_child_runs=False,
     )
     assert result["data"]["count"] == 2
     assert result["data"]["has_more"] is True
     assert [run["run_id"] for run in result["data"]["runs"]] == ["wr_1", "wr_2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("include_child_runs", "expected_param"), [(False, None), (True, True)])
+async def test_workflow_run_list_sends_include_child_runs_only_when_opted_in(
+    capture_request: MagicMock,
+    include_child_runs: bool,
+    expected_param: bool | None,
+) -> None:
+    """The public route hides child runs unless asked, so the opt-in has to survive the whole
+    tool -> raw-helper -> query-string path."""
+    capture_request.return_value.json.return_value = []
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", include_child_runs=include_child_runs)
+
+    assert result["ok"] is True
+    assert capture_request.call_args.kwargs["params"].get("include_child_runs") == expected_param
 
 
 @pytest.mark.asyncio

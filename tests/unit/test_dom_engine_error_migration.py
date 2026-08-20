@@ -169,6 +169,70 @@ async def test_safe_match_count_propagates_foreign_engine_error() -> None:
         await element._safe_match_count(locator)
 
 
+# A Locator op can still surface "not attached to the DOM" if the node keeps getting replaced
+# under the same selector across the whole wait window, so the detached-error guard stays needed.
+def _scroll_into_view_element(
+    monkeypatch: pytest.MonkeyPatch,
+    locator: MagicMock,
+    *,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> SkyvernElement:
+    from skyvern.webeye.utils import page as page_module
+
+    fake_frame = MagicMock()
+    fake_frame.scroll_into_view = AsyncMock(side_effect=Exception("native scrollIntoView unavailable in test"))
+    fake_frame.get_element_visible = AsyncMock(return_value=True)
+    fake_frame.safe_scroll_to_x_y = AsyncMock()
+
+    monkeypatch.setattr(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame))
+    monkeypatch.setattr(page_module.SkyvernFrame, "evaluate", AsyncMock(return_value=None))
+
+    locator.count = AsyncMock(return_value=1)
+    locator.element_handle = AsyncMock(return_value=MagicMock())
+    locator.bounding_box = AsyncMock(return_value=None)
+    locator.evaluate = AsyncMock(return_value=True)
+    locator.focus = AsyncMock()
+
+    return _element("select", locator, engine_selection=engine_selection)
+
+
+@pytest.mark.asyncio
+async def test_scroll_into_view_swallows_stock_detached_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.scroll_into_view_if_needed = AsyncMock(side_effect=PlaywrightError(_DETACHED))
+    element = _scroll_into_view_element(monkeypatch, locator)
+
+    await element.scroll_into_view()  # must not raise
+
+    locator.scroll_into_view_if_needed.assert_awaited_once()
+    locator.focus.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scroll_into_view_swallows_selected_engine_detached_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator = MagicMock()
+    locator.scroll_into_view_if_needed = AsyncMock(side_effect=_EngineError(_DETACHED))
+    element = _scroll_into_view_element(monkeypatch, locator, engine_selection=_selection())
+
+    await element.scroll_into_view()  # must not raise
+
+    locator.focus.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scroll_into_view_reraises_unrelated_confirmation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    locator = MagicMock()
+    locator.scroll_into_view_if_needed = AsyncMock(side_effect=PlaywrightError("Some other actionability failure"))
+    element = _scroll_into_view_element(monkeypatch, locator)
+
+    with pytest.raises(PlaywrightError):
+        await element.scroll_into_view()
+
+    locator.focus.assert_not_awaited()
+
+
 # --- input_sequentially: typing-timeout classification ---
 
 

@@ -9,6 +9,7 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
+from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 
 
 class FakeLocator:
@@ -468,7 +469,7 @@ async def test_real_sandbox_solve_captcha_bounds_unresponsive_anchor_arm(
         },
     )()
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-    monkeypatch.setattr(block_module, "_CODE_BLOCK_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(captcha_solver_module, "_RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS", 0.01)
 
     async def hang() -> None:
         await asyncio.sleep(60)
@@ -571,7 +572,7 @@ async def test_extension_arm_is_bounded_and_falls_through_on_hang(
         },
     )()
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-    monkeypatch.setattr(block_module, "_CODE_BLOCK_EXTENSION_ARM_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.01)
     page = FakePage(recaptcha=True)
     block = CodeBlock.model_construct(code="await solve_captcha(page)", label="captcha_ext_hang")
 

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
-from skyvern.cli.core import browser_ops
+from skyvern.cli.core import browser_ops, session_manager
 from skyvern.cli.core.browser_ops import (
     CustomSelectClassifyError,
     CustomSelectMatchError,
@@ -2905,7 +2905,11 @@ async def test_navigating_paired_tools_invalidate_refs_even_when_navigation_fail
 async def test_navigate_and_screenshot_returns_session_expired_result_for_cdp_4408(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expired_error = RuntimeError(
+    # session_manager.get_page() (SKY-14282/14283/14307/14279 fix) now always wraps a
+    # connect/session-lifecycle failure in BrowserSessionConnectionError before it reaches a
+    # caller -- mock at that same shape rather than a bare RuntimeError so this test still
+    # reflects what get_page() can actually raise.
+    expired_error = session_manager.BrowserSessionConnectionError(
         "BrowserType.connect_over_cdp: Target page, context or browser has been closed\n"
         "Browser logs: session expired\n"
         "Call log: <ws disconnected> code=4408 reason=session expired"
@@ -2917,20 +2921,136 @@ async def test_navigate_and_screenshot_returns_session_expired_result_for_cdp_44
 
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.SESSION_EXPIRED
-    assert result["error"]["message"] == "Browser session expired."
+    assert result["error"]["message"] == "Browser session expired or closed."
     assert "new browser session" in result["error"]["hint"]
     get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
 
 
 @pytest.mark.asyncio
-async def test_navigate_and_screenshot_bubbles_non_4408_cdp_close(
+async def test_navigate_and_screenshot_returns_sdk_error_result_for_unclassified_connect_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    other_close = RuntimeError("Call log: <ws disconnected> code=4401 reason=session expired")
+    # Before the fix, a connection failure that didn't match the narrow 4408 signature
+    # bubbled out of _run_paired_capture as a raw exception -- past every MCP tool's
+    # `except BrowserNotAvailableError` guard and out to the client as an unsanitized
+    # fastmcp ToolError (SKY-14283/SKY-14279), including the raw session-router hostname and
+    # nginx response body for 14283. It must now degrade to a structured envelope, never raise.
+    # This shape (no target-closed marker) isn't a dead session -- SESSION_EXPIRED would be
+    # misleading, and so would the generic "no browser" hint to pass session_id, since one was
+    # already given -- so it gets a distinct SDK_ERROR with a fully sanitized detail.
+    other_close = session_manager.BrowserSessionConnectionError(
+        "BrowserType.connect_over_cdp: WebSocket error: wss://sessions.skyvern.com/pbs_123/tok "
+        "401 Unauthorized <html><body>nginx</body></html> "
+        "Call log: <ws disconnected> code=4401 reason=unauthorized"
+    )
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=other_close))
 
-    with pytest.raises(RuntimeError, match="code=4401"):
-        await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SDK_ERROR
+    assert "sessions.skyvern.com" not in result["error"]["message"]
+    assert "wss://" not in result["error"]["message"]
+    assert "nginx" not in result["error"]["message"]
+    assert "code=4401" not in result["error"]["message"]
+    assert "transient" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_sdk_error_with_type_name_for_empty_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-14279: the underlying failure can be an exception with an empty str() (e.g. an
+    # httpx.ReadError on the loopback call that fetches the session row, before any CDP connect
+    # is even attempted). The tool must still report something identifiable, not a blank message.
+    class ReadError(Exception):
+        pass
+
+    blank_error = session_manager._wrap_browser_connection_failure(ReadError())
+    assert blank_error.raw_detail == "ReadError"
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=blank_error))
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SDK_ERROR
+    assert "ReadError" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "call_kwargs", "raw_detail", "expected_code"),
+    [
+        # SKY-14307: skyvern_navigate, driver connection severed -- target-closed family.
+        pytest.param(
+            "skyvern_navigate",
+            {"url": "https://example.test"},
+            "BrowserType.connect_over_cdp: Connection closed while reading from the driver",
+            "SESSION_EXPIRED",
+            id="sky-14307-navigate-driver-closed",
+        ),
+        # SKY-14283: skyvern_screenshot, session-router rejected a stale cdp_url with a raw
+        # nginx 401 body -- not a target-closed marker, so it's the sanitized SDK_ERROR bucket.
+        pytest.param(
+            "skyvern_screenshot",
+            {},
+            (
+                "BrowserType.connect_over_cdp: WebSocket error: "
+                "wss://sessions.skyvern.com/pbs_563919350820380452/MTAuMC4zNy4xNjg6cGJz.659ded3d7b0cfbb0/"
+                "devtools/browser/04d5140b-cf5d-4b7e-864b-3b3d9b6cb015 401 Unauthorized "
+                "<html><head><title>401 Authorization Required</title></head>"
+                "<body><center><h1>401 Authorization Required</h1></center>"
+                "<hr><center>nginx</center></body></html>"
+            ),
+            "SDK_ERROR",
+            id="sky-14283-screenshot-nginx-401",
+        ),
+        # SKY-14279: skyvern_click, the underlying failure had no message at all.
+        pytest.param(
+            "skyvern_click",
+            {"selector": "#submit"},
+            "",
+            "SDK_ERROR",
+            id="sky-14279-click-empty-message",
+        ),
+        # SKY-14282: skyvern_navigate_extract_and_screenshot, the composite/paired-capture path.
+        pytest.param(
+            "skyvern_navigate_extract_and_screenshot",
+            {"url": "https://example.test", "prompt": "get the title"},
+            "BrowserContext.new_page: Target page, context or browser has been closed",
+            "SESSION_EXPIRED",
+            id="sky-14282-navigate-extract-and-screenshot-target-closed",
+        ),
+    ],
+)
+async def test_atomic_browser_tools_never_leak_raw_connect_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    call_kwargs: dict[str, object],
+    raw_detail: str,
+    expected_code: str,
+) -> None:
+    # Reproduces SKY-14307/14283/14279 end to end on the exact atomic tools they were filed
+    # against: before the fix, get_page() let the raw driver/CDP exception escape uncaught past
+    # this tool's `except BrowserNotAvailableError` guard, and fastmcp surfaced it to the MCP
+    # client as an unsanitized ToolError carrying the raw text (including, for 14283, the
+    # session-router hostname and a raw nginx response body).
+    error = (
+        session_manager.BrowserSessionConnectionError(raw_detail)
+        if raw_detail
+        else (session_manager._wrap_browser_connection_failure(Exception()))
+    )
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=error))
+
+    tool = getattr(mcp_browser, tool_name)
+    result = await tool(**call_kwargs)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == getattr(mcp_browser.ErrorCode, expected_code)
+    assert "sessions.skyvern.com" not in result["error"]["message"]
+    assert "wss://" not in result["error"]["message"]
+    assert "nginx" not in result["error"]["message"]
+    assert "401 Authorization Required" not in result["error"]["message"]
 
 
 @pytest.mark.asyncio

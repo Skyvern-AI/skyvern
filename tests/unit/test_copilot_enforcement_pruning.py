@@ -22,11 +22,13 @@ from skyvern.config import Settings, settings
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import (
+    SCREENSHOT_DROPPED_NUDGE,
     CopilotConfig,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     KEEP_RECENT_TOOL_OUTPUTS,
+    NUDGE_SENTINEL,
     TOTAL_TIMEOUT_SECONDS,
     _mark_copilot_total_timeout,
     _mark_copilot_total_timeout_if_elapsed,
@@ -35,6 +37,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_output,
     aggressive_prune,
     enforcement_decision,
+    is_screenshot_message,
 )
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
@@ -578,14 +581,14 @@ def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_tim
     ctx = _fresh_ctx_for_record()
     result = {
         "ok": False,
-        "error": "Run ID: wr_stagnation. Stuck.",
+        "error": "The run stalled.",
         _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY: True,
     }
 
     _record_run_blocks_result(ctx, result)
 
     assert ctx.last_test_ok is False
-    assert ctx.last_test_failure_reason == "Run ID: wr_stagnation. Stuck."
+    assert ctx.last_test_failure_reason == "The run stalled."
 
 
 def test_record_run_blocks_result_sets_last_test_ok_none_on_watchdog_cancel_at_timeout() -> None:
@@ -593,14 +596,14 @@ def test_record_run_blocks_result_sets_last_test_ok_none_on_watchdog_cancel_at_t
     ctx.copilot_total_timeout_exceeded = True
     result = {
         "ok": False,
-        "error": "Run ID: wr_timeout. Outcome is uncertain.",
+        "error": "Outcome is uncertain.",
         _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY: True,
     }
 
     _record_run_blocks_result(ctx, result)
 
     assert ctx.last_test_ok is None
-    assert ctx.last_test_failure_reason == "Run ID: wr_timeout. Outcome is uncertain."
+    assert ctx.last_test_failure_reason == "Outcome is uncertain."
 
 
 # ---------------------------------------------------------------------------
@@ -670,12 +673,59 @@ def _call_ids(items: list[Any], item_type: str) -> list[str]:
     ]
 
 
+def _screenshot_dropped_signals(items: list[Any]) -> list[Any]:
+    expected_content = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
+    return [item for item in items if _history_field(item, "content") == expected_content]
+
+
 def test_aggressive_prune_drops_orphan_from_eight_pair_repro() -> None:
     pruned = aggressive_prune(_tool_history(8))
 
     assert _orphaned_tool_result_ids(pruned) == []
     assert _call_ids(pruned, "function_call") == ["call_5", "call_6", "call_7"]
     assert _call_ids(pruned, "function_call_output") == ["call_5", "call_6", "call_7"]
+
+
+def test_aggressive_prune_emits_one_signal_when_screenshots_are_dropped() -> None:
+    opening = {"role": "user", "content": "goal"}
+    call = _fc("call_navigate")
+    output = _fco("call_navigate", "Navigation complete. A screenshot is attached.")
+    screenshots = [
+        {"role": "user", "content": "[copilot:screenshot] frame one"},
+        {"role": "user", "content": "[copilot:screenshot] frame two"},
+    ]
+
+    pruned = aggressive_prune([opening, call, output, *screenshots])
+
+    assert output in pruned
+    assert all(not is_screenshot_message(item) for item in pruned)
+    assert len(_screenshot_dropped_signals(pruned)) == 1
+
+
+def test_aggressive_prune_emits_no_signal_without_screenshot_drop() -> None:
+    history = _tool_history(3)
+
+    pruned = aggressive_prune(history)
+
+    assert _screenshot_dropped_signals(pruned) == []
+
+
+def test_aggressive_prune_does_not_duplicate_retained_screenshot_drop_signal() -> None:
+    existing_signal = {
+        "role": "user",
+        "content": NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE,
+    }
+    history = [
+        {"role": "user", "content": "goal"},
+        _fc("call_navigate"),
+        _fco("call_navigate", "Navigation complete. A screenshot is attached."),
+        existing_signal,
+        {"role": "user", "content": "[copilot:screenshot] frame"},
+    ]
+
+    pruned = aggressive_prune(history)
+
+    assert _screenshot_dropped_signals(pruned) == [existing_signal]
 
 
 # tail_size samples the boundaries that change behaviour: below one pair, exactly one
@@ -706,8 +756,11 @@ def test_aggressive_prune_never_keeps_orphaned_tool_results(
     assert history == original
     assert pruned[0] is history[0]
     assert all(not str(_history_field(item, "content") or "").startswith("[copilot:screenshot]") for item in pruned)
+    assert len(_screenshot_dropped_signals(pruned)) == int(interleave_screenshots)
+    retained_original_items = [item for item in pruned if not _screenshot_dropped_signals([item])]
     retained_indexes = [
-        next(index for index, original_item in enumerate(history) if original_item is item) for item in pruned
+        next(index for index, original_item in enumerate(history) if original_item is item)
+        for item in retained_original_items
     ]
     assert retained_indexes == sorted(retained_indexes)
 

@@ -8,10 +8,13 @@ and error handling — without any real LLM or browser.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
@@ -763,17 +766,18 @@ async def test_loop_verbose_error_never_shadows_real_snapshot() -> None:
 async def test_finish_completed_defers_until_page_settles() -> None:
     # A finish(completed) on a still-rendering page (delayed data load) is deferred so the model
     # re-verifies against the settled state; the deferral is an ordinary tool error, and the
-    # follow-up finish on the settled page is terminal.
-    probe_results = iter([False, True])
+    # follow-up finish on the settled page is terminal. The fingerprints model a same-shape content
+    # swap: equal-length samples still differ, so the swap cannot read as settled.
+    samples = iter(["fp-a", "fp-b", "fp-b", "fp-b"])
 
-    async def probe() -> bool:
-        return next(probe_results)
+    async def fingerprint() -> str | None:
+        return next(samples)
 
     script = [
         [("finish", {"status": "completed", "reason": "looks done"})],
         [("finish", {"status": "completed", "reason": "confirmed on settled page"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(settle_probe=probe)])
+    outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0)])
     assert outcome.status == "completed"
     assert outcome.reason == "confirmed on settled page"
     deferral_messages = [
@@ -784,44 +788,102 @@ async def test_finish_completed_defers_until_page_settles() -> None:
 
 @pytest.mark.asyncio
 async def test_finish_settle_deferrals_are_bounded_and_scoped_to_completed() -> None:
-    # A permanently-unsettled probe cannot livelock the run: after the deferral cap the verdict is
-    # accepted. terminated/failed finishes never consult the probe.
-    async def never_settled() -> bool:
-        return False
+    # A permanently-unsettled page cannot livelock the run: after the deferral cap the verdict is
+    # accepted. terminated/failed finishes never consult the page.
+    counter = iter(range(1000))
+
+    async def never_settled() -> str | None:
+        return f"fp-{next(counter)}"
 
     script = [
         [("finish", {"status": "completed", "reason": "try 1"})],
         [("finish", {"status": "completed", "reason": "try 2"})],
         [("finish", {"status": "completed", "reason": "try 3"})],
     ]
-    outcome, _ = await _run(script, [make_finish_tool(settle_probe=never_settled, max_settle_deferrals=2)])
+    outcome, _ = await _run(
+        script,
+        [make_finish_tool(page_fingerprint=never_settled, max_settle_deferrals=2, settle_wait_seconds=0.0)],
+    )
     assert outcome.status == "completed"
     assert outcome.reason == "try 3"
 
-    probe_calls = 0
+    sample_calls = 0
 
-    async def counting_probe() -> bool:
-        nonlocal probe_calls
-        probe_calls += 1
-        return False
+    async def counting_fingerprint() -> str | None:
+        nonlocal sample_calls
+        sample_calls += 1
+        return "fp"
 
     script = [[("finish", {"status": "terminated", "reason": "blocked"})]]
-    outcome, _ = await _run(script, [make_finish_tool(settle_probe=counting_probe)])
+    outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=counting_fingerprint, settle_wait_seconds=0.0)])
     assert outcome.status == "terminated"
-    assert probe_calls == 0
+    assert sample_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_finish_settle_probe_error_counts_as_settled() -> None:
-    # A raising probe (e.g. execution context destroyed mid-navigation) must never block a
-    # legitimate completion: the verdict is accepted immediately.
-    async def exploding_probe() -> bool:
+async def test_finish_settle_probe_error_fails_closed_and_defers() -> None:
+    # A raising probe (e.g. execution context destroyed mid-navigation) is evidence of nothing, not
+    # of stability: the verdict is deferred for re-verification, still bounded by the deferral cap
+    # so a permanently-broken probe cannot livelock the run.
+    async def exploding_fingerprint() -> str | None:
         raise RuntimeError("execution context was destroyed")
 
-    script = [[("finish", {"status": "completed", "reason": "done"})]]
-    outcome, _ = await _run(script, [make_finish_tool(settle_probe=exploding_probe)])
+    script = [
+        [("finish", {"status": "completed", "reason": "try 1"})],
+        [("finish", {"status": "completed", "reason": "try 2"})],
+        [("finish", {"status": "completed", "reason": "try 3"})],
+    ]
+    outcome, _ = await _run(script, [make_finish_tool(page_fingerprint=exploding_fingerprint, settle_wait_seconds=0.0)])
     assert outcome.status == "completed"
-    assert outcome.reason == "done"
+    assert outcome.reason == "try 3"
+    deferral_messages = [
+        m for m in outcome.messages if m.get("role") == "tool" and "verified as settled" in str(m.get("content"))
+    ]
+    assert len(deferral_messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_finish_settle_wait_aborts_on_cancellation() -> None:
+    # A cancellation arriving while the probe waits between samples abandons the probe: the second
+    # sample is never taken, the verdict defers, and the loop ends the run as canceled instead of
+    # letting a completion land after cancellation was requested.
+    canceled = False
+    sample_calls = 0
+
+    async def fingerprint() -> str | None:
+        nonlocal canceled, sample_calls
+        sample_calls += 1
+        canceled = True
+        return "stable"
+
+    async def should_cancel() -> bool:
+        return canceled
+
+    script = [[("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(
+        script,
+        [make_finish_tool(page_fingerprint=fingerprint, should_cancel=should_cancel, settle_wait_seconds=0.0)],
+        should_cancel=should_cancel,
+    )
+    assert outcome.status == "canceled"
+    assert sample_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_finish_settle_wait_is_capped_by_the_deadline() -> None:
+    # The wait between samples cannot overrun the loop deadline: with the deadline already past, the
+    # probe resamples without sleeping instead of blocking for settle_wait_seconds.
+    async def fingerprint() -> str | None:
+        return "stable"
+
+    script = [[("finish", {"status": "completed", "reason": "done"})]]
+    started = time.monotonic()
+    outcome, _ = await _run(
+        script,
+        [make_finish_tool(page_fingerprint=fingerprint, deadline_at=started - 1.0, settle_wait_seconds=30.0)],
+    )
+    assert outcome.status == "completed"
+    assert time.monotonic() - started < 5.0
 
 
 @pytest.mark.asyncio
@@ -896,3 +958,188 @@ async def test_loop_does_not_blame_tool_choice_for_a_context_window_overflow() -
 
     assert outcome.status == "loop_error"
     assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_every_executed_tool_call_emits_one_timing_record() -> None:
+    # Tool execution is the largest unmeasured block of a v3 run's wall-clock, so the guarantee
+    # this asserts is coverage: one record per call that actually ran, none for calls skipped
+    # after a failure, and a duration that tracks real handler time.
+    async def slow_handler(args: dict[str, Any]) -> ToolResult:
+        await asyncio.sleep(0.02)
+        return ToolResult.ok("observe done")
+
+    async def raising_handler(args: dict[str, Any]) -> ToolResult:
+        raise RuntimeError("boom")
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        ToolSpec(name="observe", description="o", parameters={}, handler=slow_handler, compactable=True),
+        _recording_tool("click", click_calls),
+        ToolSpec(name="boom", description="b", parameters={}, handler=raising_handler, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        # A null selector is the case that matters: the tools fall back to scanning the whole page,
+        # so it must read as absent even though the key is present.
+        [("observe", {"selector": "sel"}), ("click", {"selector": None})],
+        [("boom", {}), ("click", {})],  # boom fails, so the trailing click is skipped, not executed
+        [("nope", {})],  # unknown tool
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools)
+
+    records = [entry for entry in logs if entry["event"] == "taskv3 tool call finished"]
+
+    assert outcome.status == "completed"
+    # observe, click, boom, unknown, finish — the click skipped behind boom's failure is absent.
+    # The hallucinated name "nope" is reported as the sentinel, keeping the field's values bounded
+    # to the registered tools however the model misbehaves.
+    assert [entry["tool"] for entry in records] == ["observe", "click", "boom", "unknown_tool", "finish"]
+    assert [entry["tool_status"] for entry in records] == ["ok", "ok", "error", "error", "ok"]
+    assert [entry["batch_size"] for entry in records] == [2, 2, 2, 1, 1]
+    assert [entry["batch_index"] for entry in records] == [0, 1, 0, 0, 0]
+    assert [entry["selector_present"] for entry in records] == [True, False, False, False, False]
+    assert [entry["billable"] for entry in records] == [False, False, True, False, False]
+    assert [entry["turn"] for entry in records] == [1, 1, 2, 3, 4]
+
+    observe_record = records[0]
+    assert observe_record["result_chars"] == len("observe done")
+    assert observe_record["duration_seconds"] >= 0.02
+    assert records[2]["result_chars"] > 0  # the error text the model is handed back
+    assert outcome.tool_seconds >= observe_record["duration_seconds"]
+
+
+def _perception_tool(name: str, contents: str | list[str]) -> ToolSpec:
+    """Compactable perception fake: returns contents[i] per call (last one repeats)."""
+    seq = [contents] if isinstance(contents, str) else contents
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        content = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return ToolResult.ok(content)
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_terminates_with_bounded_verdict() -> None:
+    # The production failure signature: a page frozen behind a gate the agent cannot perceive
+    # produced ~90 byte-identical observes over ~30 minutes until the budget died, with no usable
+    # reason. N identical snapshots of an unchanging page must instead end the run with a bounded
+    # verdict carrying the real situation.
+    script = [[("observe", {})] for _ in range(90)]
+    tools = [_perception_tool("observe", "url=x (0 elements)"), make_finish_tool()]
+    outcome, caller = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert "identical" in outcome.reason and "observe" in outcome.reason
+    assert caller.calls <= 20  # bounded well below the 90-observe runaway
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_nudges_before_terminating() -> None:
+    # Before the loop takes the verdict out of the model's hands it warns once, so a model that can
+    # act on the information (finish with the real reason, or change approach) gets the chance.
+    script = [[("observe", {})] for _ in range(90)]
+    tools = [_perception_tool("observe", "url=x (0 elements)"), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "not changing" in str(m.get("content"))]
+    assert len(nudges) == 1
+    terminate_idx = len(outcome.messages) - 1
+    assert outcome.messages.index(nudges[0]) < terminate_idx  # warned before the verdict
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_resets_when_content_changes() -> None:
+    # A progressing run (each action changes the page, so each observe differs) must never trip the
+    # stall policy, however long it runs.
+    contents = [f"url=x step={i}" for i in range(30)]
+    script = [[("observe", {})] for _ in range(30)] + [[("finish", {"status": "completed", "reason": "done"})]]
+    tools = [_perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_identical_results_from_non_perception_tools_never_trip_the_stall_policy() -> None:
+    # wait/click legitimately return the same string every call ("waited", "clicked #x — now at
+    # url"); only perception snapshots (compactable tools) can witness "the page is not changing".
+    script = [[("wait", {})] for _ in range(40)] + [[("finish", {"status": "completed", "reason": "done"})]]
+    waits: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("wait", waits), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(waits) == 40
+
+
+@pytest.mark.asyncio
+async def test_stall_nudge_names_available_unblockers_and_all_stalled_tools() -> None:
+    # The models that stall are the ones that cannot see the gate — a generic "you appear stuck"
+    # leaves solve_captcha undiscovered. The single warning must name every stalled perception tool
+    # and the unblockers this run actually offers.
+    script = [[("observe", {}), ("get_html", {})] for _ in range(8)]
+    solve_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _perception_tool("observe", "url=x frozen"),
+        _perception_tool("get_html", "<div>frozen</div>"),
+        _recording_tool("solve_captcha", solve_calls),
+        make_finish_tool(),
+    ]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "not changing" in str(m.get("content"))]
+    assert len(nudges) == 1  # both tools stall in the same turn: one combined warning, not zero, not two
+    content = str(nudges[0]["content"])
+    assert "observe" in content and "get_html" in content
+    assert "solve_captcha" in content  # offered tool is named as an unblocker
+    assert "finish" in content
+
+
+@pytest.mark.asyncio
+async def test_stall_nudge_omits_solve_captcha_when_not_offered() -> None:
+    script = [[("observe", {})] for _ in range(7)]
+    tools = [_perception_tool("observe", "url=x frozen"), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    nudges = [m for m in outcome.messages if m.get("role") == "user" and "not changing" in str(m.get("content"))]
+    assert len(nudges) == 1
+    assert "solve_captcha" not in str(nudges[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_completed_static_page_with_confirmatory_reobserves_is_not_misclassified() -> None:
+    # After an async submit swaps the form for a static confirmation banner, a careful model may
+    # re-observe the unchanged page several times before finishing. That must stay a completed
+    # verdict — the stall policy exists for runs that never finish, not for double-checking.
+    script = [[("observe", {})] for _ in range(10)] + [
+        [("finish", {"status": "completed", "reason": "confirmation banner present"})]
+    ]
+    tools = [_perception_tool("observe", "url=x text: 'Success — application received'"), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_counter_resets_and_reclimbs_without_tripping() -> None:
+    # Exercise the actual reset transition: 10 identical, a change, 10 identical again — neither
+    # streak reaches the threshold, so the run must complete normally.
+    contents = ["url=x page1"] * 10 + ["url=x page2"] * 10
+    script = [[("observe", {})] for _ in range(20)] + [[("finish", {"status": "completed", "reason": "done"})]]
+    tools = [_perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_perception_stall_verdict_reason_carries_facetable_prefix() -> None:
+    # Telemetry counts policy firings by this prefix; a bounded verdict nobody can query is a
+    # silent policy.
+    from skyvern.forge.taskv3.loop import PERCEPTION_STALL_REASON_PREFIX
+
+    script = [[("observe", {})] for _ in range(20)]
+    tools = [_perception_tool("observe", "url=x frozen"), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)

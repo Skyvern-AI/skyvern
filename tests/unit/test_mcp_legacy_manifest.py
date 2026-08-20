@@ -128,7 +128,9 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
     "skyvern_workflow_retry": "da8782d457ba3bcc8b87fffb90ce9dbc287943f28260816d699233a7427b6978",
     "skyvern_workflow_run": "215941b714c8d64fdbd2e4e58e353d3650c50501a484fb37f4749404184f0fd4",
-    "skyvern_workflow_run_list": "23271543f4b55999bd7b4747b0f304054720c58c6b44ac35670928fa18764ba7",
+    # Re-frozen for SKY-14441: adds the optional `include_child_runs` param (default false, preserving the
+    # existing result set) and says in the description that child runs are excluded by default.
+    "skyvern_workflow_run_list": "5ed785968941b6b3ae3421d6d67ef15af365a2b59a9a1bd21c7bc54dff67e205",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
     "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",

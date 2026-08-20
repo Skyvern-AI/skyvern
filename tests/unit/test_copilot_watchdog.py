@@ -37,12 +37,16 @@ import pytest
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
-from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    assert_clean_user_facing_text,
+    contains_internal_machinery_leak,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.tools import (
     PER_TOOL_CALL_BUDGET_SECONDS,
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
+    WatchdogExitReason,
     _any_quiet_block_requested,
     _fallback_page_info,
     _progress_marker,
@@ -52,9 +56,7 @@ from skyvern.forge.sdk.copilot.tools import (
     run_execution,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
-    WatchdogExitReason,
     _watchdog_user_facing_summary,
-    _watchdog_user_failure_reason,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
@@ -428,26 +430,50 @@ async def test_non_paused_error_messages_keep_the_run_id_for_the_model() -> None
         assert "tell the user" not in msg.lower()
 
 
-def test_paused_user_relayed_text_carries_no_run_id() -> None:
-    """Both user-relayed arms of the paused exit: the person reading chat gets told what the run is
-    waiting for, never an internal ``wr_`` identifier."""
-    reason = _watchdog_user_failure_reason("paused", "wr_test", 240, _fake_run(status="paused"))
-    summary = _watchdog_user_facing_summary("paused", 240, _fake_run(status="paused"))
+@pytest.mark.parametrize(
+    ("exit_reason", "run", "expected"),
+    [
+        (
+            "paused",
+            _fake_run(status="paused"),
+            "The run is paused, waiting for a person to approve or reject it.",
+        ),
+        (
+            "stagnation",
+            _fake_run(),
+            f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s.",
+        ),
+        (
+            "per_tool_budget",
+            _fake_run(),
+            f"The run was still making progress but ran longer than the {PER_TOOL_CALL_BUDGET_SECONDS}s "
+            "allowed for a single step, so it was stopped.",
+        ),
+        (
+            "ceiling",
+            _fake_run(),
+            f"The run exceeded the {PER_TOOL_CALL_BUDGET_SECONDS}s absolute ceiling while still showing progress.",
+        ),
+        (
+            "task_exit_unfinalized",
+            _fake_run(status="running"),
+            "The run ended before recording a trustworthy terminal status. Last observed status: running.",
+        ),
+        (
+            "task_exit_unfinalized",
+            None,
+            "The run ended before recording a trustworthy terminal status.",
+        ),
+    ],
+)
+def test_watchdog_user_relayed_text_is_id_free_and_clears_the_output_guard(
+    exit_reason: WatchdogExitReason, run: SimpleNamespace | None, expected: str
+) -> None:
+    reason = _watchdog_user_facing_summary(exit_reason, PER_TOOL_CALL_BUDGET_SECONDS, run)
 
-    for text in (reason, summary):
-        assert "paused" in text.lower()
-        assert "approve or reject" in text.lower()
-        assert "wr_" not in text
-        assert "uncertain" not in text.lower()
-        assert contains_internal_machinery_leak(text) is False
-
-
-def test_per_tool_budget_user_relayed_text_still_carries_the_run_id() -> None:
-    """The run id strip is scoped to the pause: the budget arm keeps it, because that run was
-    cancelled and the id is how the follow-up finds what it completed."""
-    reason = _watchdog_user_failure_reason("per_tool_budget", "wr_test", 240, None)
-
-    assert "Run ID: wr_test" in reason
+    assert reason == expected
+    assert contains_internal_machinery_leak(reason) is False
+    assert_clean_user_facing_text(reason)
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +797,16 @@ async def test_non_paused_watchdog_exit_still_cancels_and_clears(monkeypatch: py
     harness["cancel_run_task"].assert_awaited_once()
     harness["clear"].assert_awaited_once()
     assert _adopted_detached_tasks(before) == []
+
+    for relayed in (
+        result["data"]["failure_reason"],
+        result["data"]["user_facing_summary"],
+        result["data"]["control_signal"]["user_facing_summary"],
+    ):
+        assert relayed
+        assert contains_internal_machinery_leak(relayed) is False
+        assert_clean_user_facing_text(relayed)
+    assert "Run ID:" in result["error"]
 
 
 def test_paused_result_records_last_test_ok_as_none() -> None:

@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import base64
+import io
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from PIL import Image
 
 from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    COPILOT_SCREENSHOT_MAX_HEIGHT,
+    COPILOT_SCREENSHOT_MAX_WIDTH,
+    ScreenshotEntry,
+    stage_screenshot_from_artifact,
+)
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
 from tests.unit.copilot_test_helpers import make_model_input_data
 
 
@@ -125,6 +134,113 @@ class TestEnqueueScreenshot:
 
         assert len(ctx.pending_screenshots) == 1
         assert ctx.pending_screenshots[0] is not first_entry
+
+
+class TestStageScreenshotFromArtifact:
+    """The non-inline screenshot tool returns a local artifact path, not image bytes."""
+
+    @staticmethod
+    def _png(path: Path, size: tuple[int, int]) -> str:
+        Image.new("RGB", size, (10, 120, 200)).save(path, format="PNG")
+        return str(path)
+
+    @staticmethod
+    def _ctx() -> SimpleNamespace:
+        return SimpleNamespace(supports_vision=True, pending_screenshots=[])
+
+    def test_stages_the_artifact_the_path_names(self, tmp_path: Path) -> None:
+        ctx = self._ctx()
+        result = {"ok": True, "data": {"path": self._png(tmp_path / "frame.png", (400, 300))}}
+
+        assert stage_screenshot_from_artifact(ctx, result) is True
+        assert len(ctx.pending_screenshots) == 1
+        assert ctx.pending_screenshots[0].mime == "image/jpeg"
+
+    def test_staged_frame_is_bounded_to_the_copilot_maximum(self, tmp_path: Path) -> None:
+        ctx = self._ctx()
+        result = {"ok": True, "data": {"path": self._png(tmp_path / "big.png", (2400, 1800))}}
+
+        assert stage_screenshot_from_artifact(ctx, result) is True
+        width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
+        assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
+        assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="no_path"),
+            pytest.param({"path": ""}, id="empty_path"),
+            pytest.param({"path": "/nonexistent/frame.png"}, id="missing_file"),
+        ],
+    )
+    def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
+        ctx = self._ctx()
+
+        assert stage_screenshot_from_artifact(ctx, {"ok": True, "data": data}) is False
+        assert ctx.pending_screenshots == []
+
+    def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
+        """A queue-length check would call this staged: the earlier frame is still pending."""
+        stale = ScreenshotEntry(b64="stale", mime="image/jpeg")
+        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[stale])
+        corrupt = tmp_path / "corrupt.png"
+        corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
+
+        assert stage_screenshot_from_artifact(ctx, {"ok": True, "data": {"path": str(corrupt)}}) is False
+        assert ctx.pending_screenshots == [stale]
+
+
+class TestCapturePostInteractionScreenshot:
+    @staticmethod
+    def _server(result: dict[str, Any]) -> SimpleNamespace:
+        async def call_internal_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert arguments == {}, "the copilot capture path must not request an inline frame"
+            return result
+
+        return SimpleNamespace(call_internal_tool=call_internal_tool)
+
+    def _ctx(self, result: dict[str, Any], **overrides: Any) -> SimpleNamespace:
+        base: dict[str, Any] = {
+            "codeblock_redaction_parameters": None,
+            "supports_vision": True,
+            "pending_screenshots": [],
+            "discovery_mcp_server": self._server(result),
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    @pytest.mark.asyncio
+    async def test_captures_through_the_artifact_path(self, tmp_path: Path) -> None:
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (300, 200), (0, 0, 0)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame)}})
+
+        assert await _capture_post_interaction_screenshot(ctx) is True
+        assert len(ctx.pending_screenshots) == 1
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"supports_vision": False}, id="no_vision"),
+            pytest.param({"codeblock_redaction_parameters": {"password": "x"}}, id="redaction_parameters"),
+            pytest.param({"discovery_mcp_server": None}, id="no_discovery_server"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_skip_cases_stage_nothing(self, tmp_path: Path, overrides: dict[str, Any]) -> None:
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (300, 200), (0, 0, 0)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame)}}, **overrides)
+
+        assert await _capture_post_interaction_screenshot(ctx) is False
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_failed_tool_call_stages_nothing(self) -> None:
+        ctx = self._ctx({"ok": False, "error": "no page"})
+
+        assert await _capture_post_interaction_screenshot(ctx) is False
+        assert ctx.pending_screenshots == []
 
 
 class TestConsumePendingScreenshots:

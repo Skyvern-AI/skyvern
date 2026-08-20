@@ -875,6 +875,28 @@ def test_parse_switch_tab_action_non_integer_index_returns_null() -> None:
     assert isinstance(action, NullAction)
 
 
+def test_parse_action_input_text_missing_text_never_types_the_prose_user_detail_answer() -> None:
+    # user_detail_answer is prose ("The user's full name is X"), not the bare literal value the
+    # field expects — falling back to it would enter the whole sentence into the form field.
+    prose_answer = "The user's full name is gHVRNk LZlM."
+    action = {
+        "action_type": "INPUT_TEXT",
+        "id": "AAAX",
+        "reasoning": "The 'Full name' field is a required text input.",
+        "user_detail_query": "What is the user's full name?",
+        "user_detail_answer": prose_answer,
+        "confidence_float": 1,
+    }
+    try:
+        result = parse_action(action=action, scraped_page=_mock_scraped_page())
+    except (KeyError, ValidationError):
+        # Both rejections keep the prose out of the field: KeyError from the historical
+        # action["text"] lookup, ValidationError since #15554 passes action.get("text")=None
+        # into the non-optional model field.
+        return
+    assert not (isinstance(result, InputTextAction) and result.text == prose_answer)
+
+
 def test_parse_actions_skips_non_object_entries_and_keeps_real_actions() -> None:
     # A planner refusal repaired into the actions array arrives as prose fragments. They must
     # be dropped without crashing, and the real action dicts alongside them must still parse.
