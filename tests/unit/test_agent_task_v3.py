@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -41,8 +42,18 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, Out
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
-from skyvern.webeye.actions.actions import ActionStatus, ActionType
-from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from skyvern.webeye.actions.actions import (
+    ActionStatus,
+    ActionType,
+    ClickAction,
+    HoverAction,
+    InputTextAction,
+    KeypressAction,
+    SelectOptionAction,
+    SolveCaptchaAction,
+    UploadFileAction,
+)
+from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 
 
 async def _run_execute_task_v3(
@@ -2019,3 +2030,88 @@ async def test_execute_task_v3_page_fingerprint_peeks_without_recovery(
     loop_mock.browser_state.get_working_page = lost_page_peek
     assert await fingerprint() is None
     lost_page_peek.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_typed_actions_that_hydrate_as_their_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A row carrying only a description fails typed-subclass validation on every read and falls back
+    # to base Action with a warning; the persisted action must carry the tool call's typed fields so
+    # hydrate_action returns the subclass its action_type names (SKY-14494).
+    from skyvern.forge import agent as agent_mod
+
+    rounds = [
+        [
+            ("click", {"selector": "#go"}, True),
+            ("hover", {"selector": "#menu"}, True),
+            ("type", {"selector": "#q", "text": "hello"}, True),
+            ("select_option", {"selector": "#plan", "label": "Pro"}, True),
+            ("select_combobox", {"selector": "#city", "value": "Lisbon"}, True),
+            ("press_key", {"key": "Enter"}, True),
+            ("file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True),
+            ("solve_captcha", {}, True),
+        ]
+    ]
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        workflow_run_id="wr_v3test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [a.description for a in persisted[:2]] == ["task_v3 click #go", "task_v3 hover #menu"]
+    click, hover, typed, selected, combobox, keypress, upload, captcha = (
+        hydrate_action(make_action_row(action_type=a.action_type, element_id=a.element_id, action_json=a.model_dump()))
+        for a in persisted
+    )
+    assert isinstance(click, ClickAction) and click.element_id == "#go"
+    assert isinstance(hover, HoverAction) and hover.element_id == "#menu"
+    assert isinstance(typed, InputTextAction) and (typed.element_id, typed.text) == ("#q", "hello")
+    assert isinstance(selected, SelectOptionAction) and (selected.element_id, selected.option.label) == ("#plan", "Pro")
+    assert isinstance(combobox, SelectOptionAction) and (combobox.element_id, combobox.option.value) == (
+        "#city",
+        "Lisbon",
+    )
+    assert isinstance(keypress, KeypressAction) and keypress.keys == ["Enter"]
+    assert isinstance(upload, UploadFileAction) and (upload.element_id, upload.file_url) == (
+        "#cv",
+        "https://files.example/cv.pdf",
+    )
+    assert isinstance(captcha, SolveCaptchaAction)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed_code", ["482913", 482913, ["482913"]])
+async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_fields(
+    monkeypatch: pytest.MonkeyPatch, typed_code: str | int | list[str]
+) -> None:
+    # A verification code the model typed is a registered secret; persisting the typed field must
+    # scrub it under the same redaction gate the v3 path applies to extracted output - also when the
+    # model emits the code as a JSON number, since nothing coerces tool args to the declared schema.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: {"482913"}
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("type", {"selector": "#otp", "text": typed_code}, True)]],
+        workflow_run_id="wr_v3test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert isinstance(persisted, InputTextAction)
+    assert persisted.element_id == "#otp"
+    assert "482913" not in persisted.model_dump_json()

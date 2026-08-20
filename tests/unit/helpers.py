@@ -19,6 +19,7 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.webeye.actions.actions import ActionStatus, ActionType
 
 
 class FakeLLMResponse:
@@ -308,3 +309,34 @@ def setup_parallel_verification_mocks(
 
 def make_browser_state() -> tuple[MagicMock, MagicMock, MagicMock]:
     return MagicMock(), MagicMock(), MagicMock()
+
+
+def make_action_row(**overrides: Any) -> SimpleNamespace:
+    """Build a minimal duck-typed stand-in for ActionModel."""
+    base: dict[str, Any] = {
+        "action_id": "act_test",
+        "action_type": ActionType.MOVE,
+        "status": ActionStatus.completed,
+        "source_action_id": None,
+        "organization_id": "o_test",
+        "workflow_run_id": "wr_test",
+        "task_id": "tsk_test",
+        "step_id": "stp_test",
+        "step_order": 0,
+        "action_order": 0,
+        "confidence_float": None,
+        "reasoning": None,
+        "intention": None,
+        "response": None,
+        "element_id": None,
+        "skyvern_element_hash": None,
+        "skyvern_element_data": None,
+        "screenshot_artifact_id": None,
+        "started_at": None,
+        "finished_at": None,
+        "created_at": datetime(2026, 5, 6, 0, 0, 0),
+        "modified_at": datetime(2026, 5, 6, 0, 0, 0),
+        "action_json": None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
