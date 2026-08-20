@@ -114,8 +114,7 @@ server = [
     "pillow>=12.3.0",
     "starlette-context>=0.3.6,<0.6",
     "fastapi>=0.136.1,<0.137",
-    "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
-    "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13'",
+    "psycopg[binary, pool]>=3.2.10,<3.3.0",
     "alembic>=1.12.1,<2",
     "PyJWT[crypto]>=2.13.0,<3",
     "aioboto3>=14.3.0,<15",
@@ -201,6 +200,7 @@ cloud = [
     "opentelemetry-instrumentation-grpc>=0.60b1,<1",
     "opentelemetry-instrumentation-requests>=0.60b1,<1",
     "opentelemetry-instrumentation-urllib3>=0.60b1,<1",
+    "guarddog>=3.0.2,<4",
 ]
 dev = [
     "grpcio-tools==1.80.0",
