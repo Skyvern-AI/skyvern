@@ -280,7 +280,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     ),
                 }
         data.pop("sdk_equivalent", None)
-        if tool_name == "run_blocks_and_collect_debug":
+        if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
@@ -289,7 +289,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name in {"get_run_results", "run_blocks_and_collect_debug"}:
+        if tool_name in {"get_run_results", "run_blocks_and_collect_debug", "edit_block_and_run"}:
             # _attach_failed_block_screenshots puts base64 bytes on each failed block. They would
             # otherwise flow straight into the LLM context as raw image data — strip them while
             # preserving the existence signal. The image itself reaches the model through
@@ -564,7 +564,7 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
-    if tool_name == "update_and_run_blocks":
+    if tool_name == "update_and_run_blocks" or (tool_name == "edit_block_and_run" and data.get("skipped_run")):
         if not isinstance(raw_data, dict):
             return "OK"
         if data.get("skipped_run"):
@@ -595,7 +595,7 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if data.get("valid"):
             return f"Block '{block_label(data.get('label', '?'))}' is valid"
         return "Block validation failed"
-    if tool_name == "run_blocks_and_collect_debug":
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
         if not isinstance(raw_data, dict):
             return "Run debug completed"
         raw_executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]

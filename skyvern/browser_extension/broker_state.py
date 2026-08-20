@@ -9,6 +9,7 @@ import stat
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ LEASES_SCHEMA_VERSION = 1
 READINESS_LIMIT = 8 * 1024
 STARTUP_LOG_LIMIT = 64 * 1024
 STARTUP_TIMEOUT_SECONDS = 15.0
-BROKER_BUILD_FINGERPRINT = "browser-extension-broker-m1"
+BROKER_BUILD_FINGERPRINT = "browser-extension-broker-m2"
 _BACKOFF_SECONDS = (1, 2, 4, 8, 16, 30)
 
 
@@ -39,6 +40,7 @@ class BrokerPaths:
     daemon_lock: Path
     state: Path
     leases: Path
+    leases_stale: Path
     startup_failure: Path
     extension_secret: Path
     control_socket: Path
@@ -170,6 +172,7 @@ def broker_paths(port: int, *, base_dir: Path | None = None) -> BrokerPaths:
         daemon_lock=run_dir / "daemon.lock",
         state=run_dir / "state.json",
         leases=run_dir / "leases.json",
+        leases_stale=run_dir / "leases.stale.json",
         startup_failure=run_dir / "startup-failure.json",
         extension_secret=run_dir / "extension.secret",
         control_socket=control_socket,
@@ -263,18 +266,53 @@ def run_directory_identity(paths: BrokerPaths) -> tuple[int, int]:
     return run_stat.st_dev, run_stat.st_ino
 
 
-def initialize_empty_journal(paths: BrokerPaths) -> None:
+def _read_lease_journal(paths: BrokerPaths) -> list[Any]:
+    journal = read_owner_json(paths.leases)
+    if not isinstance(journal, dict) or type(journal.get("schemaVersion")) is not int:
+        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal is invalid")
+    if journal["schemaVersion"] != LEASES_SCHEMA_VERSION:
+        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal has an unsupported schema")
+    leases = journal.get("leases")
+    if not isinstance(leases, list):
+        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal is invalid")
+    return leases
+
+
+def validate_lease_journal(paths: BrokerPaths) -> None:
+    """Create a missing journal and fail closed on unreadable schemas without touching live entries."""
     if not paths.leases.exists():
         atomic_write_json(paths.leases, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": []})
         return
-    journal = read_owner_json(paths.leases)
-    leases = journal.get("leases") if isinstance(journal, dict) else None
-    if type(journal.get("schemaVersion")) is not int or journal["schemaVersion"] != LEASES_SCHEMA_VERSION:
-        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal has an unsupported schema")
-    if not isinstance(leases, list):
-        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease journal is invalid")
+    _read_lease_journal(paths)
+
+
+def reset_lease_journal(paths: BrokerPaths) -> int:
+    """Start a daemon lifetime with an empty journal; archive crash residue instead of failing closed.
+
+    Safe only while holding daemon.lock: every daemon lifetime begins with a full extension
+    reset, so surviving lease entries describe browser state that no longer exists. The
+    residue is archived to leases.stale.json for the operator and the count is returned.
+    """
+    if not paths.leases.exists():
+        atomic_write_json(paths.leases, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": []})
+        return 0
+    try:
+        leases = _read_lease_journal(paths)
+    except BrowserExtensionBrokerError:
+        # A torn or foreign journal must not brick daemon startup; move it aside
+        # for the operator and start clean.
+        with suppress(OSError):
+            os.replace(paths.leases, paths.leases_stale.with_suffix(".corrupt"))
+        atomic_write_json(paths.leases, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": []})
+        return 0
     if leases:
-        raise BrowserExtensionBrokerError("UNSAFE_STATE", "Broker lease recovery is not available in milestone 1")
+        atomic_write_json(paths.leases_stale, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": leases})
+        atomic_write_json(paths.leases, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": []})
+    return len(leases)
+
+
+def write_lease_journal(paths: BrokerPaths, leases: list[dict[str, Any]]) -> None:
+    atomic_write_json(paths.leases, {"schemaVersion": LEASES_SCHEMA_VERSION, "leases": leases})
 
 
 def read_broker_state(paths: BrokerPaths) -> BrokerState | None:
@@ -483,7 +521,7 @@ def enable_broker_state_locked(paths: BrokerPaths) -> tuple[BrokerPaths, str]:
             "BROKER_ENV_SECRET_REJECTED",
             "Unset SKYVERN_BROWSER_EXTENSION_TOKEN before enabling broker mode",
         )
-    initialize_empty_journal(paths)
+    validate_lease_journal(paths)
     legacy_path = _legacy_credential_path()
     try:
         extension_secret = read_extension_secret(paths)

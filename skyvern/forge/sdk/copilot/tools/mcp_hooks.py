@@ -801,7 +801,10 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
         return None, None
     try:
         result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_evaluate", {"expression": scout_control_state_expression(selector)}),
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": scout_control_state_expression(selector), "verbosity": "full"},
+            ),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:

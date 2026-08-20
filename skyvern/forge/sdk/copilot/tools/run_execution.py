@@ -3347,6 +3347,11 @@ async def _send_run_outcome_update(
         return
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    browser_session_id = data.get("browser_session_id") if isinstance(data, dict) else None
+    overall_status = data.get("overall_status") if isinstance(data, dict) else None
+    control_signal = data.get("control_signal") if isinstance(data, dict) else None
+    control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
+    terminal_disposition = control_kind if isinstance(control_kind, str) else overall_status
     narrator_state = getattr(copilot_ctx, "narrator_state", None)
     iteration = narrator_state.current_iteration if narrator_state is not None else 0
     try:
@@ -3360,6 +3365,12 @@ async def _send_run_outcome_update(
                 role=role,
                 reason_code=reason_code,
                 display_reason=display_reason,
+                browser_session_id=browser_session_id if isinstance(browser_session_id, str) else None,
+                workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+                turn_id=copilot_ctx.turn_id,
+                workflow_copilot_chat_id=copilot_ctx.workflow_copilot_chat_id,
+                continuity_source="workflow_run",
+                terminal_disposition=terminal_disposition if isinstance(terminal_disposition, str) else None,
                 iteration=iteration,
                 timestamp=datetime.now(timezone.utc),
             )

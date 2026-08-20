@@ -59,6 +59,10 @@ class _ExtensionRelay(Protocol):
 
     async def request(self, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]: ...
 
+    async def ensure_root_lease(self) -> dict[str, Any] | None: ...
+
+    async def release_tab(self, tab_id: int) -> None: ...
+
 
 class ExtensionCdpAdapter:
     def __init__(self, registry: VirtualTargetRegistry, relay: _ExtensionRelay) -> None:
@@ -350,6 +354,20 @@ class ExtensionCdpAdapter:
         if not self._auto_attach:
             return
         tabs = [tab for tab in self._relay.scoped_tabs if isinstance(tab, dict)]
+        if not tabs:
+            # Acquire a root tab through the transport: a multi-client broker grants a
+            # lease (free user-shared tab or a new scoped tab); the embedded relay
+            # returns its first scoped tab or None.
+            try:
+                root = await self._relay.ensure_root_lease()
+            except Exception as exc:
+                LOG.debug(
+                    "browser_extension_root_lease_failed",
+                    error_type=type(exc).__name__,
+                )
+                root = None
+            if root is not None and type(root.get("tabId")) is int:
+                tabs = [root]
         if not tabs:
             try:
                 created = await self._relay.request("tabs.create", {"url": "about:blank"})
@@ -934,14 +952,13 @@ class ExtensionCdpAdapter:
         self._registry.update_tab(tab_id, url, title)
 
     async def _detach_all_tabs(self) -> None:
-        tab_ids = [self._registry.tab_for_target(info["targetId"]) for info in self._registry.list_page_targets()]
-        for tab_id in tab_ids:
+        tab_ids = {self._registry.tab_for_target(info["targetId"]) for info in self._registry.list_page_targets()}
+        tab_ids.update(tab["tabId"] for tab in self._relay.scoped_tabs if type(tab.get("tabId")) is int)
+        for tab_id in sorted(tab_ids):
             try:
-                await self._relay.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
+                await self._relay.release_tab(tab_id)
             except Exception as exc:
-                LOG.debug(
-                    "browser_extension_debugger_detach_failed", method="debugger.detach", error_type=type(exc).__name__
-                )
+                LOG.debug("browser_extension_tab_release_failed", method="lease.release", error_type=type(exc).__name__)
 
     async def _shutdown_client(self, ws: web.WebSocketResponse) -> None:
         await self._detach_all_tabs()

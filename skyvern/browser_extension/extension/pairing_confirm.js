@@ -28,6 +28,15 @@ async function sendMessage(message) {
 }
 
 function isPendingOffer(offer) {
+  const approvalFieldsPresent =
+    offer?.approvalNonce !== undefined ||
+    offer?.requestFingerprint !== undefined;
+  const validApproval =
+    !approvalFieldsPresent ||
+    (typeof offer.approvalNonce === "string" &&
+      offer.approvalNonce.length > 0 &&
+      typeof offer.requestFingerprint === "string" &&
+      offer.requestFingerprint.length > 0);
   return (
     offer !== null &&
     typeof offer === "object" &&
@@ -36,7 +45,8 @@ function isPendingOffer(offer) {
     offer.port >= 1 &&
     offer.port <= 65_535 &&
     typeof offer.token === "string" &&
-    offer.token.length > 0
+    offer.token.length > 0 &&
+    validApproval
   );
 }
 
@@ -96,14 +106,19 @@ async function renderPendingOffer() {
     });
     return;
   }
-  const tokenFingerprint = await fingerprint(offer.token);
+  const requestFingerprint =
+    typeof offer.requestFingerprint === "string"
+      ? offer.requestFingerprint
+      : await fingerprint(offer.token);
   if (generation !== renderGeneration) {
     return;
   }
   elements.question.textContent =
-    "Skyvern on this computer wants to drive Chrome through this extension.";
+    typeof offer.requestFingerprint === "string"
+      ? `Agent request ${requestFingerprint} wants to drive Chrome through this extension.`
+      : "Skyvern on this computer wants to drive Chrome through this extension.";
   elements.port.textContent = `127.0.0.1:${offer.port}`;
-  elements.fingerprint.textContent = tokenFingerprint;
+  elements.fingerprint.textContent = requestFingerprint;
   elements.approveButton.disabled = false;
   elements.cancelButton.disabled = false;
   clearResult();
@@ -133,7 +148,7 @@ elements.approveButton.addEventListener("click", () => {
         state: "success",
         title: "Connected",
         message:
-          "Skyvern Agent is now paired with your local MCP server. You can close this tab.",
+          "This agent can now use its own approved Chrome tabs. You can close this tab.",
         terminal: true,
       });
     })
@@ -175,13 +190,15 @@ elements.cancelButton.addEventListener("click", () => {
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (
-    !operationInProgress &&
-    areaName === "session" &&
-    PENDING_PAIRING_STORAGE_KEY in changes
-  ) {
-    void renderPendingOffer();
+  if (areaName !== "session" || !(PENDING_PAIRING_STORAGE_KEY in changes)) {
+    return;
   }
+  const newOffer = changes[PENDING_PAIRING_STORAGE_KEY].newValue;
+  if (operationInProgress && (newOffer === undefined || newOffer === null)) {
+    return;
+  }
+  operationInProgress = false;
+  void renderPendingOffer();
 });
 
 await renderPendingOffer();

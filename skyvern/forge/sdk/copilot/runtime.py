@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
+_BROWSER_PROBE_WAIT_SECONDS = 5.0
 # Browser contexts can lag the persistent-session row under load; this keeps
 # Copilot from handing a not-yet-attachable session to the next MCP tool.
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
@@ -75,6 +76,12 @@ CodeArtifactMetadataValue: TypeAlias = (
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
 SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
+
+
+class CopilotBrowserSessionUnavailable(RuntimeError):
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__("No browser context for copilot session")
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -292,6 +299,12 @@ class AgentContext:
     sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
         default_factory=dict
     )
+    browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    browser_session_replacements: dict[str, str | None] = field(default_factory=dict)
+    # Calls capture this before waiting for the recovery lock. A continuity recovery increments it
+    # under that lock so every sibling queued against stale page state is suppressed.
+    browser_session_continuity_generation: int = 0
+    browser_session_continuity_disposition: str | None = None
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -538,6 +551,9 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
             msg = error.get("message", "Unknown error")
             hint = error.get("hint", "")
             result["error"] = f"{msg}. {hint}".strip() if hint else msg
+            error_code = error.get("code")
+            if isinstance(error_code, str) and error_code:
+                result["error_code"] = error_code
         else:
             result["error"] = str(error)
 
@@ -655,7 +671,7 @@ async def resolve_browser_state_for_context(
     )
 
 
-async def _close_browser_session_quietly(organization_id: str, session_id: str) -> None:
+async def close_browser_session_quietly(organization_id: str, session_id: str) -> None:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
     unbounded close could hang the request."""
     try:
@@ -734,6 +750,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             # connectivity signal is not that evidence, so the call fails but the id survives.
             if retiring:
                 retire_browser_session_id(ctx, browser_session_id)
+                raise CopilotBrowserSessionUnavailable(browser_session_id)
             raise RuntimeError("No browser context for copilot session")
 
     override_token = set_api_key_override(ctx.api_key)
@@ -793,10 +810,11 @@ async def _probe_browser_session(ctx: AgentContext, session_id: str) -> BrowserP
     needs both a lookup that returned and a health signal that answered; either failing to
     complete is undetermined, since neither is evidence about the browser."""
     try:
-        state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+        async with asyncio.timeout(_BROWSER_PROBE_WAIT_SECONDS):
+            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                session_id=session_id,
+                organization_id=ctx.organization_id,
+            )
         if state is None:
             return BrowserProbeOutcome.positively_unreachable
         attachability = _browser_context_attachability(state.browser_context)
@@ -896,7 +914,7 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
                 installed_session_id=ctx.browser_session_id,
                 organization_id=ctx.organization_id,
             )
-            await _close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+            await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
             session = None
         else:
             ctx.browser_session_id = session.persistent_browser_session_id
@@ -924,6 +942,11 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
             session_id=ctx.browser_session_id,
         )
         return None
+    except asyncio.CancelledError:
+        if session is not None:
+            await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+        retire_browser_session_id(ctx, installed_session_id)
+        raise
     except Exception as e:
         LOG.warning("Failed to auto-create browser session", error=str(e), exc_info=True)
         # Cleanup keys off the local `session`, not ctx.browser_session_id --
@@ -933,7 +956,7 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
         # degraded session-manager backend, and close_session hitting the
         # same backend could hang the whole request if left unbounded.
         if session is not None:
-            await _close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
+            await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
         # Only clear an id this call installed; a sibling's session is not ours to drop.
         retire_browser_session_id(ctx, installed_session_id)
         # Detail stays in the log above (exc_info=True). The returned string

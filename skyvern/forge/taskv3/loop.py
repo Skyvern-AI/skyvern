@@ -15,6 +15,7 @@ core can be unit-tested with scripted fakes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -158,11 +159,21 @@ PERCEPTION_STALL_TERMINATE_AFTER = 15
 # how often the policy fires; change it only with the dashboards that read it.
 PERCEPTION_STALL_REASON_PREFIX = "perception_stall:"
 
+# Action-loop policy: N repeated executions of the same billable action (same tool + same args)
+# with no new evidence the page changed mean the run is re-trying against an unchanged outcome —
+# the live shape is re-submitting into the same rejection banner, which the stall policy cannot
+# see because interleaved actions and varied probes keep the perception stream changing while the
+# SITUATION stays the same. Evidence of change is a REPEATED probe (same tool + same args)
+# returning different content, or a download landing; a first-time probe has no baseline and is
+# evidence of nothing, so varied-selector probing cannot launder repetition into "progress".
+ACTION_LOOP_NUDGE_AFTER = 3
+ACTION_LOOP_TERMINATE_AFTER = 6
 
-def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str]) -> str:
-    """One warning naming every stalled perception tool and the unblockers this run actually has —
-    a model that cannot see the gate won't reach for solve_captcha unless the symptom names it."""
-    symptoms = "; ".join(f"{name} has returned byte-identical output {count} times in a row" for name, count in stalled)
+# Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
+ACTION_LOOP_REASON_PREFIX = "action_loop:"
+
+
+def _unblocker_options(available_tools: set[str]) -> list[str]:
     options = []
     if "solve_captcha" in available_tools:
         options.append("if the page may be waiting on a verification widget, call solve_captcha")
@@ -170,9 +181,35 @@ def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str])
         options.append("take ONE targeted get_html look at the region that should be changing")
     options.append("if the goal is already met, call finish(status=completed)")
     options.append("if genuinely blocked, call finish(status=terminated) naming the blocker as the reason")
+    return options
+
+
+def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str]) -> str:
+    """One warning naming every stalled perception tool and the unblockers this run actually has —
+    a model that cannot see the gate won't reach for solve_captcha unless the symptom names it."""
+    symptoms = "; ".join(f"{name} has returned byte-identical output {count} times in a row" for name, count in stalled)
     return (
         f"The page is not changing: {symptoms}, despite your actions. Do not keep re-observing, "
-        "waiting, or repeating the same action. Your options: " + "; ".join(options) + "."
+        "waiting, or repeating the same action. Your options: " + "; ".join(_unblocker_options(available_tools)) + "."
+    )
+
+
+def _action_target(args: dict[str, Any]) -> str:
+    return str(args.get("selector") or args.get("url") or args.get("key") or "the same target")
+
+
+def _action_nudge_text(repeats: list[tuple[str, dict[str, Any], int]], available_tools: set[str]) -> str:
+    """The transcript cannot show the model its own repetition (superseded snapshots are compacted
+    away), so the warning carries that memory: which action, how many times, and that the observed
+    state did not change."""
+    symptoms = "; ".join(
+        f"you have called {name} on {_action_target(args)} {count} times" for name, args, count in repeats
+    )
+    return (
+        f"You are repeating the same action without effect: {symptoms}, and the page state you "
+        "last observed is unchanged since before the first attempt. A message inviting you to "
+        "retry (e.g. 'please submit again') is not an instruction to loop — at most one retry, "
+        "then report the outcome honestly. Your options: " + "; ".join(_unblocker_options(available_tools)) + "."
     )
 
 
@@ -328,6 +365,8 @@ async def run_agent_tool_loop(
     call_retry_base_delay: float = 1.0,
     stall_nudge_after: int | None = PERCEPTION_STALL_NUDGE_AFTER,
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
+    action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
+    action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     openai_tools = [tool.to_openai_tool() for tool in tools]
@@ -345,6 +384,24 @@ async def run_agent_tool_loop(
     # Per perception tool: (last successful content, consecutive identical count). One previous
     # content is held per tool, so memory stays bounded by the tool set.
     stall_counts: dict[str, tuple[str, int]] = {}
+    # Evidence memory for the action-loop guard, keyed by (tool name, canonical args): a digest of
+    # each probe's last successful content. A REPEATED probe returning different content is the
+    # in-loop evidence that the page changed; a first-time probe has no baseline and proves
+    # nothing, which is what keeps varied-selector probing from laundering repetition into
+    # progress. Digests, not contents, so a probe-heavy run's memory stays small. Deliberately
+    # separate from stall_counts: the stall policy is shipped and dashboarded, and this memory
+    # must never alter its firing behavior.
+    probe_baselines: dict[tuple[str, str], str] = {}
+    # The action-loop counter: (repeat count, first turn of the streak) per billable action
+    # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
+    # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
+    # the warning (and a chance to self-correct) at least one turn before the verdict.
+    action_counts: dict[tuple[str, str], tuple[int, int]] = {}
+    action_warned: set[tuple[str, str]] = set()
+
+    def _clear_action_state() -> None:
+        action_counts.clear()
+        action_warned.clear()
 
     outcome: LoopOutcome | None = None
     # Mutable for the run: a provider that rejects tool_choice rejects it every turn, so a drop
@@ -467,6 +524,7 @@ async def run_agent_tool_loop(
 
         turn_did_action = False
         stall_nudges_due: list[tuple[str, int]] = []
+        action_nudges_due: list[tuple[str, dict[str, Any], int]] = []
         round_actions: list[tuple[str, dict[str, Any], bool]] = []
         for idx, (tool_call_id, tool_name, args) in enumerate(tool_calls):
             # Enforce the cap per tool call so one batched turn cannot overrun it, and honor a
@@ -529,7 +587,22 @@ async def run_agent_tool_loop(
             messages.append(
                 {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result.content}
             )
+            action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
+            result_data = result.data or {}
+            if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
+                # A download landing or a navigation is progress no matter which tool witnessed it
+                # or whether that call itself errored: re-clicking the button that produces a file
+                # (a "download next" flow), or re-trying after navigating to a fresh page, is a
+                # healthy loop, not a stuck one.
+                _clear_action_state()
             if spec is not None and spec.compactable and result.status == "ok":
+                content_digest = hashlib.sha256(result.content.encode()).hexdigest()
+                baseline = probe_baselines.get(action_key)
+                if baseline is not None and baseline != content_digest:
+                    # This probe saw the page change since it last looked — fresh evidence of
+                    # progress, so repeat counts for actions taken against the old state are stale.
+                    _clear_action_state()
+                probe_baselines[action_key] = content_digest
                 prev = stall_counts.get(tool_name)
                 identical_count = prev[1] + 1 if prev is not None and prev[0] == result.content else 1
                 stall_counts[tool_name] = (result.content, identical_count)
@@ -548,6 +621,38 @@ async def run_agent_tool_loop(
                     break
                 if stall_nudge_after is not None and identical_count == stall_nudge_after:
                     stall_nudges_due.append((tool_name, identical_count))
+            if spec is not None and spec.billable:
+                # Errored dispatches count too: a failed attempt consumed a step (see the action-step
+                # accounting above) and a repeat-failing action is the same no-progress pathology.
+                repeat_count, first_turn = action_counts.get(action_key, (0, turns))
+                repeat_count += 1
+                action_counts[action_key] = (repeat_count, first_turn)
+                # Terminate only when the streak spans more than one turn AND its warning was
+                # delivered: the system prompt commands batching identical clicks (steppers,
+                # arrows), so a single-batch streak has had no chance to see feedback yet, and a
+                # verdict must never arrive before the model saw the warning it could have acted on.
+                if (
+                    action_terminate_after is not None
+                    and repeat_count >= action_terminate_after
+                    and first_turn < turns
+                    and (action_nudge_after is None or action_key in action_warned)
+                ):
+                    LOG.info("taskv3 loop action repeated", tool=tool_name, repeat_count=repeat_count, turn=turns)
+                    outcome = LoopOutcome(
+                        "terminated",
+                        f"{ACTION_LOOP_REASON_PREFIX} {repeat_count} repeated {tool_name} attempts on "
+                        f"{_action_target(args)} with no observed page change between attempts — the same "
+                        "action against an unchanged outcome (commonly re-submitting into the same "
+                        "rejection banner) cannot progress the goal",
+                    )
+                    _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "action loop")
+                    break
+                if (
+                    action_nudge_after is not None
+                    and repeat_count >= action_nudge_after
+                    and action_key not in action_warned
+                ):
+                    action_nudges_due.append((tool_name, args, repeat_count))
             if spec is not None and (spec.billable or spec.recordable):
                 # Dispatched page actions enter the round with their outcome: a failed billable round
                 # still consumed budget and must persist (else later blocks undercount the run
@@ -576,6 +681,25 @@ async def run_agent_tool_loop(
         # turn's tool results, and the model reads it with the snapshot that tripped it.
         if outcome is None and stall_nudges_due:
             messages.append({"role": "user", "content": _stall_nudge_text(stall_nudges_due, set(tool_by_name))})
+        if outcome is None and action_nudges_due:
+            # Deliver only warnings whose streak survived the batch AND spans turns: a later call in
+            # the same batch (an observe showing the page changed, a download) may have cleared it,
+            # and a streak born entirely this turn has had no feedback yet — the message's "the
+            # state you last observed is unchanged" would be false for it. An undelivered warning
+            # stays unmarked, so it re-queues (and termination stays blocked) until the model has
+            # actually seen it. Counts read live, not the threshold-crossing snapshot, and logged
+            # here so the warn-then-recovered metric counts only warnings the model saw.
+            still_stuck = []
+            for name, warn_args, _count in action_nudges_due:
+                key = (name, json.dumps(warn_args, sort_keys=True, default=str))
+                entry = action_counts.get(key)
+                if entry is not None and entry[1] < turns and key not in action_warned:
+                    action_warned.add(key)
+                    still_stuck.append((name, warn_args, entry[0]))
+            if still_stuck:
+                for name, _warn_args, count in still_stuck:
+                    LOG.info("taskv3 loop action repeat nudged", tool=name, repeat_count=count, turn=turns)
+                messages.append({"role": "user", "content": _action_nudge_text(still_stuck, set(tool_by_name))})
         # A "step" is one action round: a turn that ran >=1 page-mutating action. Perception-only
         # turns (observe/get_html) don't consume the caller's step budget — the step engine bundles
         # perception into each step, so counting v3's perception rounds against the same budget

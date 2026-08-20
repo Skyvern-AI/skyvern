@@ -562,6 +562,10 @@ async def skyvern_network_requests(
         bool,
         Field(description="Clear the buffer after reading. Default false."),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Return a representative summary or all available compact list metadata."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Read captured network requests/responses. Use request_id with skyvern_network_request_detail for headers and body."""
     # Inline import: session_manager → inspection (ensure_hooks_on_all_pages) creates a
@@ -783,6 +787,10 @@ async def skyvern_har_start(
 async def skyvern_har_stop(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Return a representative HAR summary or the full captured HAR."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Stop HAR recording and return captured traffic as HAR 1.2 JSON."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode
@@ -1056,6 +1064,10 @@ async def skyvern_network_request_detail(
     request_id: Annotated[int, Field(description="The request_id from skyvern_network_requests output.")],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Compact structured response bodies or return the full sanitized detail."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Get full details for a network request by request_id: response headers and captured body."""
     from skyvern.cli.core.session_manager import is_stateless_http_mode

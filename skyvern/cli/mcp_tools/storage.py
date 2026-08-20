@@ -6,7 +6,7 @@ Inline pattern — trivial page.evaluate wrappers, no do_* functions.
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from pydantic import Field
@@ -21,10 +21,15 @@ async def skyvern_get_session_storage(
     keys: Annotated[list[str] | None, Field(description="Specific keys to retrieve. Omit to get all.")] = None,
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...).")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL.")] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="`summary` allows compact values. `full` requests raw values up to the response cap."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Read sessionStorage values from the current page.
 
-    Returns all key-value pairs, or specific keys if provided.
+    Returns all key-value pairs, or specific keys if provided. Use ``verbosity="full"``
+    to recover raw values up to the mandatory response-size cap.
     Useful for reading auth tokens, user preferences, or temporary state stored by web apps.
     """
     try:
