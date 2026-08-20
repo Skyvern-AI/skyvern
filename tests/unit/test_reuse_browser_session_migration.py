@@ -12,6 +12,7 @@ from sqlalchemy.engine import Connection, make_url
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.sequential_key import resolve_reuse_bound_key
 
+
 def _resolve_migration_path() -> Path:
     # Matched by suffix, not by full filename: the open-source mirror regenerates this
     # migration under its own date and revision id, so a hardcoded name resolves in only
