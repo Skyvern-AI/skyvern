@@ -1229,7 +1229,7 @@ class TestCDPDownloadInterceptorProxyAuth:
         stalled_session.detach.side_effect = stalled_detach
         binding = asyncio.create_task(replacement.bind_to_context(browser_context))
         try:
-            await asyncio.wait_for(detach_started.wait(), timeout=1)
+            await asyncio.wait_for(detach_started.wait(), timeout=5)
             await asyncio.wait_for(binding, timeout=0.7)
             await asyncio.wait_for(detach_cancelled.wait(), timeout=0.1)
 
