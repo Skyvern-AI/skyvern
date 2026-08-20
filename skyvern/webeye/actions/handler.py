@@ -198,6 +198,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    is_element_detached_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
@@ -9923,10 +9924,19 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     Native ``<select>`` options live on the element's ``options`` field
     (``[{text, value, optionIndex}, ...]``); the scraper skips their child
     ``<option>`` nodes, so this walker must inspect that field directly.
+    Radio/checkbox-based custom selects (e.g. ``role="radiogroup"``) have no
+    ``<option>``/``<li>`` nodes either; they're recognized the same way
+    ``_custom_select_candidates_from_elements`` recognizes them so a
+    radio-group miss doesn't misreport zero observed options.
     """
     queue: deque[dict] = deque(elements)
     seen: set[str] = set()
     out: list[str] = []
+    # Mirrors _custom_select_candidates_from_elements' covered_choice_input_ids: a <label>
+    # wrapping a radio/checkbox is recorded once via its own label text, so the descendant
+    # input(s) it already covers must be skipped when the BFS reaches them directly — otherwise
+    # a labelled radio's raw `value` attribute is recorded again as an unrelated second entry.
+    covered_choice_input_ids: set[str] = set()
 
     def _record(text: str) -> None:
         if text and text not in seen:
@@ -9940,8 +9950,22 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
         attrs = node.get("attributes") or {}
         role = str(attrs.get("role") or "").lower()
         tag = str(node.get("tagName") or "").lower()
+        input_type = str(attrs.get("type") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
+        # Only compute the descendant walk for <label> nodes (its one consumer below) — calling
+        # it unconditionally for every queued node makes this walker quadratic on large DOMs.
         if role == "option" or tag in ("li", "option"):
             _record(str(node.get("text") or "").strip())
+        elif is_choice_input and element_id in covered_choice_input_ids:
+            pass
+        elif is_choice_input or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES:
+            _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+        elif tag == "label":
+            choice_input_ids, contains_choice_input = _custom_select_descendant_choice_inputs(node)
+            if contains_choice_input:
+                _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+                covered_choice_input_ids.update(choice_input_ids)
         for option in node.get("options") or []:
             if not isinstance(option, dict):
                 continue
@@ -11970,7 +11994,21 @@ async def scroll_down_to_load_all_options(
         LOG.info("element handle is None, using focus to move the cursor", element_id=scrollable_element.get_id())
         await scrollable_element.get_locator().focus(timeout=timeout)
     else:
-        await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        try:
+            await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        except Exception as exc:
+            if not _is_selected_engine_timeout(exc, skyvern_frame.engine_selection) and not is_element_detached_error(
+                exc
+            ):
+                raise
+            # A detached handle can't be reused below either, so null it out to take the
+            # existing None-handle fallback path for the rest of this function.
+            LOG.info(
+                "Dropdown-menu element detached mid-scroll, falling back to focus",
+                element_id=scrollable_element.get_id(),
+            )
+            await scrollable_element.get_locator().focus(timeout=timeout)
+            dropdown_menu_element_handle = None
 
     await scrollable_element.move_mouse_to_safe(page=page)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import Counter
@@ -23,7 +22,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcom
 from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    _blocks_by_label,
     _canonical_block_config,
+    block_shape_hashes_by_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import (
@@ -84,18 +85,6 @@ _TEMPLATE_BUILTIN_ROOTS = (
 # Keep this to grammatical glue only. Workflow/action words are intentionally
 # not filtered; the two-token stale threshold is the conservative guardrail.
 _BLOCK_METADATA_STOPWORDS = frozenset({"and", "for", "the", "with"})
-
-
-def _blocks_by_label(workflow_definition: object | None) -> dict[str, object]:
-    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
-    by_label: dict[str, object] = {}
-    if not blocks:
-        return by_label
-    for block in blocks:
-        label = getattr(block, "label", None)
-        if isinstance(label, str):
-            by_label[label] = block
-    return by_label
 
 
 # Minimum length to apply the trailing-``s`` plural strip; below this we
@@ -1013,17 +1002,8 @@ def _first_unverified_requested_label(requested_labels: list[str], verified_pref
 
 
 def _frontier_label_shape_hashes(labels: list[str], workflow_definition: object | None) -> dict[str, str] | None:
-    by_label = _blocks_by_label(workflow_definition)
-    hashes: dict[str, str] = {}
-    for label in labels:
-        block = by_label.get(label)
-        if block is None:
-            return None
-        shape = _canonical_block_config(block)
-        shape.pop("label", None)
-        serialized = json.dumps(shape, sort_keys=True, default=str, separators=(",", ":"))
-        hashes[label] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return hashes
+    hashes = block_shape_hashes_by_label(labels, workflow_definition)
+    return hashes if len(hashes) == len(set(labels)) else None
 
 
 def _recorded_failed_attempted_label(ctx: AgentContext) -> str | None:

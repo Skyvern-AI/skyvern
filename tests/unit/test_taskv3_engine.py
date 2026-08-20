@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -208,17 +209,16 @@ async def test_page_free_mode_has_no_browser_tools_and_page_free_prompt() -> Non
 
 
 @pytest.mark.asyncio
-async def test_engine_defers_completion_while_delayed_render_settles() -> None:
+async def test_engine_defers_completion_while_delayed_render_settles(monkeypatch: pytest.MonkeyPatch) -> None:
     # Regression for the fixture's delayed-states pattern: a panel's data loads AFTER a delay, and
     # a completion verdict issued mid-render must be deferred until two DOM samples match. The fake
-    # page mutates its DOM signature once (the delayed load landing), like the fixture's
+    # page mutates its fingerprint once (the delayed load landing), like the fixture's
     # loading -> loaded transition.
-    settle_results = iter([False, True])
+    monkeypatch.setattr("skyvern.forge.taskv3.loop.asyncio.sleep", AsyncMock(return_value=None))
+    samples = iter(["loading-shell", "loaded-panel", "loaded-panel", "loaded-panel"])
 
-    async def settle_probe() -> bool:
-        # Models the fixture's delayed load: the first sample pair differs (mid-render), the
-        # second matches (loaded panel).
-        return next(settle_results, True)
+    async def page_fingerprint() -> str | None:
+        return next(samples, "loaded-panel")
 
     async def provider() -> Any:
         return object()
@@ -232,7 +232,7 @@ async def test_engine_defers_completion_while_delayed_render_settles() -> None:
         page_provider=provider,
         llm_caller=caller,
         goal="open the panel",
-        settle_probe=settle_probe,
+        page_fingerprint=page_fingerprint,
         max_action_steps=2,
         max_turns=8,
     )
@@ -262,14 +262,14 @@ async def test_page_free_mode_finishes_without_settle_probe() -> None:
 
 @pytest.mark.asyncio
 async def test_bare_run_finishes_without_settle_probe() -> None:
-    # Fenced: without a settle_probe (the bare-task default) finish(completed) never consults
-    # the page, preserving the live bare-task arm's finish path.
-    probe_calls = 0
+    # Fenced: without a page_fingerprint sampler (the bare-task default) finish(completed) never
+    # consults the page, preserving the live bare-task arm's finish path.
+    sample_calls = 0
 
-    async def counting_probe() -> bool:
-        nonlocal probe_calls
-        probe_calls += 1
-        return False
+    async def counting_fingerprint() -> str | None:
+        nonlocal sample_calls
+        sample_calls += 1
+        return "fp"
 
     async def provider() -> Any:
         return object()
@@ -280,7 +280,7 @@ async def test_bare_run_finishes_without_settle_probe() -> None:
         page_provider=provider, llm_caller=caller, goal="g", max_action_steps=2, max_turns=4
     )
     assert outcome.status == "completed"
-    assert probe_calls == 0
+    assert sample_calls == 0
 
 
 @pytest.mark.asyncio

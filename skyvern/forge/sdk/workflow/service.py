@@ -1333,6 +1333,10 @@ async def _load_user_script_module(
     check would never supersede it. Only a markerless pin (a generated script)
     executes its stored body.
     """
+    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
+    if loaded_script_module is not None:
+        return loaded_script_module
+
     await script_service.ensure_in_process_script_execution_allowed(
         seam="workflow.cached_script_module_load",
         organization_id=organization_id,
@@ -1343,9 +1347,6 @@ async def _load_user_script_module(
         script_revision_id=script_revision_id,
     )
 
-    loaded_script_module = app.AGENT_FUNCTION.try_import_static_script(script_path)
-    if loaded_script_module is not None:
-        return loaded_script_module
     if _script_has_static_module_marker(script_path):
         LOG.warning(
             "Static pin's live module import failed; refusing to exec the stale stored body",
@@ -4804,11 +4805,34 @@ class WorkflowService:
         # latest published version, so a publish between run creation and execution does not change
         # what executes.
         workflow = workflow_override or await self.get_workflow(workflow_id=workflow_run.workflow_id)
-        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         browser_session_id = browser_session_id or workflow_run.browser_session_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
 
+        if not workflow.workflow_definition.blocks:
+            failure_reason = "Workflow has no executable blocks."
+            LOG.warning(
+                "Workflow has no executable blocks",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow.workflow_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            workflow_run = await self.mark_workflow_run_as_failed(
+                workflow_run_id=workflow_run_id,
+                failure_reason=failure_reason,
+            )
+            await self.clean_up_workflow(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                api_key=api_key,
+                browser_session_id=browser_session_id,
+                close_browser_on_completion=close_browser_on_completion,
+                need_call_webhook=need_call_webhook,
+            )
+            return workflow_run
+
+        has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
         if enterprise_gated_features:
             try:
@@ -5649,6 +5673,7 @@ class WorkflowService:
         script_blocks_by_label: dict[str, Any] = {}
         loaded_script_module = None
         blocks_to_update: set[str] = set()
+        in_process_script_execution_denied = False
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
@@ -5807,6 +5832,7 @@ class WorkflowService:
                 # full run identity, and one line per denial is what the denial monitor counts.
                 script_blocks_by_label = {}
                 loaded_script_module = None
+                in_process_script_execution_denied = True
             except Exception as e:
                 LOG.warning(
                     "Failed to load script blocks, will fallback to normal execution",
@@ -5859,6 +5885,12 @@ class WorkflowService:
                     LOG.info("No static script available for this workflow")
             except Exception:
                 LOG.error("Failed to load static script", exc_info=True)
+
+        # A degradable tenant-module denial with no trusted static module recovered above must
+        # not fall through to code_generation mode below (SKY-14323): that would regenerate a
+        # cached revision the next run would deny again. Route the whole run to the agent instead.
+        if in_process_script_execution_denied and (not script_blocks_by_label or loaded_script_module is None):
+            is_script_run = False
 
         # Mark workflow as running, preserving the user's original run_with intent.
         # The run_with field records what the user requested (e.g. "code"),
@@ -5922,6 +5954,14 @@ class WorkflowService:
             script_block_count=len(script_blocks_by_label),
             empty_blocks_detected=script is not None and is_script_run and not script_blocks_by_label,
         )
+
+        if in_process_script_execution_denied and not script_mode_active:
+            await self._mark_script_fallback_triggered(
+                workflow_run_id=workflow_run_id,
+                valid_to_run_code=True,
+                block_executed_with_code=False,
+                block_label=None,
+            )
 
         if script_mode_active and script is not None:
             # Regression-locked by tests/unit/workflow/test_mark_script_run_loaded.py
@@ -6650,7 +6690,11 @@ class WorkflowService:
         workflow_run_block_result: BlockResult | None = None
         block_executed_with_code = False
         valid_to_run_code = (
-            is_script_run and block.label and block.label in script_blocks_by_label and not block.disable_cache
+            is_script_run
+            and loaded_script_module is not None
+            and block.label
+            and block.label in script_blocks_by_label
+            and not block.disable_cache
         )
         # requires_agent blocks must execute via agent, not code — skip code path
         block_requires_agent = False

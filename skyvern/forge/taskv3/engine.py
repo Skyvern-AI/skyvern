@@ -22,6 +22,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Awaitable, Callable
 
 import structlog
@@ -50,7 +51,9 @@ MAX_TOOL_CALLS_PER_ACTION_STEP = 25
 # loop makes comparable progress per action round but is less round-efficient, so a low cap starves it
 # before it can finish an ordinary multi-field form. Floor the action-step budget so a step-engine-tuned
 # cap can't cut a productive run short; this only raises a low cap and never lowers a generous one.
-MIN_ACTION_STEPS = 20
+# 24 is the lowest cap with a measured success rate, and it clears the p95 of rounds that successful
+# runs actually consume (15-18) with margin for the runs a lower cap silently suppressed.
+MIN_ACTION_STEPS = 24
 
 PAGE_FREE_SYSTEM_PROMPT = """You are completing a data-only assessment. You have NO browser tools: do not attempt to observe or interact with any page. Judge strictly from the goal, criteria, and data provided, then call `finish(status, reason, extracted_output)` — status=completed when the completion criterion holds, status=terminated when the termination criterion holds, status=failed only if the provided information is insufficient to decide."""
 
@@ -158,15 +161,16 @@ async def run_task_v3_agent_loop(
     deadline_seconds: float | None = DEFAULT_DEADLINE_SECONDS,
     resolve_typed_text: Callable[[str], Any] | None = None,
     page_free: bool = False,
-    settle_probe: Callable[[], Awaitable[bool]] | None = None,
+    page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
     `step` is threaded into every LLMCaller.call so the run's cost/tokens/model and LLM
     artifacts attribute to it. `should_cancel` is polled between turns and mid-batch; token
     and wall-clock budgets bound cost beyond the turn/tool-call caps. When a
-    `settle_probe` is provided, a finish(completed) on an unsettled page IS forced back for a
-    bounded re-verification turn; without one, pre-finish re-verification is prompt guidance only."""
+    `page_fingerprint` sampler is provided, a finish(completed) on an unsettled page IS forced back
+    for a bounded re-verification turn; without one, pre-finish re-verification is prompt guidance
+    only."""
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     browser_tools = (
@@ -180,9 +184,14 @@ async def run_task_v3_agent_loop(
         )
     )
 
-    # The probe is caller-built (browser semantics live with the dispatcher, e.g. peeking without
-    # page recovery); page-free runs never probe.
-    finish_tool = make_finish_tool(settle_probe=None if page_free else settle_probe)
+    # The fingerprint sampler is caller-built (browser semantics — e.g. peeking without page
+    # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this
+    # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
+    finish_tool = make_finish_tool(
+        page_fingerprint=None if page_free else page_fingerprint,
+        should_cancel=should_cancel,
+        deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
+    )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
     outcome = await run_agent_tool_loop(
@@ -208,6 +217,7 @@ async def run_task_v3_agent_loop(
         status=outcome.status,
         turns=outcome.turns,
         tool_calls=outcome.tool_calls,
+        tool_seconds=outcome.tool_seconds,
         action_steps=outcome.action_steps,
         no_tool_call_turns=outcome.no_tool_call_turns,
         tool_choice_requested=settings.TASK_V3_TOOL_CHOICE_REQUIRED,

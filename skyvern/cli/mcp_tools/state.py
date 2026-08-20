@@ -79,8 +79,8 @@ async def skyvern_state_save(
     """Save browser auth state (cookies + localStorage + sessionStorage) to a JSON file for later restore via state_load."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("state_save", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("state_save", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
@@ -145,8 +145,8 @@ async def skyvern_state_load(
     """Restore browser auth state from a JSON file. Navigate to the target site BEFORE loading so cookie domain filtering works."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("state_load", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("state_load", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:

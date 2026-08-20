@@ -5,13 +5,14 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 import pytest
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from skyvern.config import settings
-from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.exceptions import DownloadFileMaxSizeExceeded, GoogleDriveFileNotAccessible
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
@@ -262,6 +263,157 @@ async def test_download_file_raises_http_error_without_aiohttp_auto_raise(
     assert captured_session_kwargs.get("raise_for_status") is not True
     assert not response.body_read
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Google Drive HTML interstitial handling (SKY-13641)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSequencedDownloadSession:
+    """Serves one prepared response per GET, recording each requested URL."""
+
+    def __init__(self, responses: list[_FakeDownloadResponse]) -> None:
+        self._responses = list(responses)
+        self.requested_urls: list[str] = []
+
+    def get(
+        self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
+    ) -> _FakeDownloadResponse:
+        self.requested_urls.append(str(url))
+        return self._responses.pop(0)
+
+    async def __aenter__(self) -> _FakeSequencedDownloadSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _patch_sequenced_download_session(
+    monkeypatch: pytest.MonkeyPatch, responses: list[_FakeDownloadResponse]
+) -> _FakeSequencedDownloadSession:
+    """Patch the download session and skip DNS pinning so tests stay hermetic."""
+    session = _FakeSequencedDownloadSession(responses)
+    monkeypatch.setattr(files.aiohttp, "ClientSession", lambda **kwargs: session)
+
+    async def fake_validate_fetch(url: str, resolver: object) -> str:
+        return url
+
+    async def fake_validate_redirect(url: str, location: str, resolver: object) -> str:
+        return urljoin(url, location)
+
+    monkeypatch.setattr(files, "validate_and_pin_fetch_url", fake_validate_fetch)
+    monkeypatch.setattr(files, "validate_and_pin_redirect_url", fake_validate_redirect)
+    return session
+
+
+_DRIVE_INTERSTITIAL_HTML = """<!DOCTYPE html><html><head><title>Download anyway</title></head><body>
+<form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+<input type="submit" value="Download anyway"/>
+<input type="hidden" name="id" value="FILE123"/>
+<input type="hidden" name="export" value="download"/>
+<input type="hidden" name="confirm" value="t"/>
+<input type="hidden" name="uuid" value="abc-uuid"/>
+</form></body></html>"""
+
+_DRIVE_SIGNIN_HTML = """<!DOCTYPE html><html><head><title>Sign in</title></head><body>
+<form action="https://accounts.google.com/signin/challenge" method="post">
+<input type="email" name="identifier"/>
+</form></body></html>"""
+
+
+@pytest.mark.asyncio
+async def test_download_google_drive_interstitial_follows_confirm_form(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _patch_sequenced_download_session(
+        monkeypatch,
+        [
+            _FakeDownloadResponse(
+                _DRIVE_INTERSTITIAL_HTML.encode(), headers={"Content-Type": "text/html; charset=utf-8"}
+            ),
+            _FakeDownloadResponse(
+                b"%PDF-1.5 real drive bytes",
+                headers={"Content-Disposition": 'attachment; filename="report.pdf"'},
+            ),
+        ],
+    )
+
+    result = await files.download_file("https://drive.google.com/file/d/FILE123/view", output_dir=str(tmp_path))
+
+    assert Path(result).read_bytes() == b"%PDF-1.5 real drive bytes"
+    assert Path(result).name == "report.pdf"
+    assert len(session.requested_urls) == 2
+    followed = urlparse(session.requested_urls[1])
+    assert followed.hostname == "drive.usercontent.google.com"
+    assert followed.path == "/download"
+    query = parse_qs(followed.query)
+    assert query["id"] == ["FILE123"]
+    assert query["confirm"] == ["t"]
+    assert query["uuid"] == ["abc-uuid"]
+
+
+@pytest.mark.asyncio
+async def test_download_google_drive_permission_page_raises_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_sequenced_download_session(
+        monkeypatch,
+        [_FakeDownloadResponse(_DRIVE_SIGNIN_HTML.encode(), headers={"Content-Type": "text/html; charset=utf-8"})],
+    )
+
+    with pytest.raises(GoogleDriveFileNotAccessible, match="not publicly accessible"):
+        await files.download_file("https://drive.google.com/file/d/FILE123/view", output_dir=str(tmp_path))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_google_drive_html_after_confirm_raises_instead_of_saving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_sequenced_download_session(
+        monkeypatch,
+        [
+            _FakeDownloadResponse(
+                _DRIVE_INTERSTITIAL_HTML.encode(), headers={"Content-Type": "text/html; charset=utf-8"}
+            ),
+            _FakeDownloadResponse(_DRIVE_SIGNIN_HTML.encode(), headers={"Content-Type": "text/html; charset=utf-8"}),
+        ],
+    )
+
+    with pytest.raises(GoogleDriveFileNotAccessible):
+        await files.download_file("https://drive.google.com/file/d/FILE123/view", output_dir=str(tmp_path))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_non_drive_html_is_still_saved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_sequenced_download_session(
+        monkeypatch,
+        [_FakeDownloadResponse(b"<html>a real html file</html>", headers={"Content-Type": "text/html"})],
+    )
+
+    result = await files.download_file("https://example.com/files/page.html", output_dir=str(tmp_path))
+
+    assert Path(result).read_bytes() == b"<html>a real html file</html>"
+
+
+@pytest.mark.asyncio
+async def test_download_google_drive_non_html_downloads_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _patch_sequenced_download_session(
+        monkeypatch,
+        [_FakeDownloadResponse(b"csv,data\n1,2", headers={"Content-Type": "text/csv"})],
+    )
+
+    result = await files.download_file("https://drive.google.com/file/d/FILE123/view", output_dir=str(tmp_path))
+
+    assert Path(result).read_bytes() == b"csv,data\n1,2"
+    assert len(session.requested_urls) == 1
 
 
 # ---------------------------------------------------------------------------

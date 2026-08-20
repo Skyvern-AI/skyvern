@@ -39,7 +39,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_author_time_reject,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
-from skyvern.forge.sdk.copilot.code_block_preflight import advisory_code_block_diagnostics
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    advisory_code_block_diagnostics,
+    scanner_advisory_diagnostics,
+)
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
@@ -741,6 +744,20 @@ def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[
     labels_by_message: dict[str, list[str]] = {}
     for label, code in sorted(changed_code_blocks.items()):
         for diagnostic in advisory_code_block_diagnostics(code):
+            labels = labels_by_message.setdefault(diagnostic.message, [])
+            if label not in labels:
+                labels.append(label)
+    return labels_by_message
+
+
+async def _scanner_advisory_labels_by_message(
+    changed_code_blocks: Mapping[str, str], organization_id: str | None
+) -> dict[str, list[str]]:
+    """Labels per scanner-advisory message; each scan is bounded and fail-open inside
+    ``scanner_advisory_diagnostics``, so this never delays or fails the update."""
+    labels_by_message: dict[str, list[str]] = {}
+    for label, code in sorted(changed_code_blocks.items()):
+        for diagnostic in await scanner_advisory_diagnostics(code, organization_id=organization_id):
             labels = labels_by_message.setdefault(diagnostic.message, [])
             if label not in labels:
                 labels.append(label)
@@ -3767,6 +3784,7 @@ def _author_time_findings(
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
     code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
     test-run would not surface it; anything a run reveals belongs in the run, not here."""
@@ -3799,6 +3817,18 @@ def _author_time_findings(
                 "summary": "\n".join(
                     f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
                     for message, labels in code_block_diagnostics.items()
+                ),
+            }
+        )
+    # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
+    # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
+    if scanner_diagnostics:
+        findings.append(
+            {
+                "reason_code": "code_block_scanner_advisory",
+                "summary": "\n".join(
+                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
+                    for message, labels in scanner_diagnostics.items()
                 ),
             }
         )
@@ -4179,10 +4209,16 @@ async def _update_workflow(
         except Exception as advisory_err:
             LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
             advisory_labels = {}
+        try:
+            scanner_labels = await _scanner_advisory_labels_by_message(changed_code_blocks, ctx.organization_id)
+        except Exception as scanner_err:
+            LOG.warning("copilot_scanner_advisory_diagnostics_failed", error=str(scanner_err))
+            scanner_labels = {}
         findings = _author_time_findings(
             schema_incompatibility=schema_incompatibility_finding,
             metadata_violations=normalization.violations,
             code_block_diagnostics=advisory_labels,
+            scanner_diagnostics=scanner_labels,
         )
         if findings:
             data["findings"] = findings

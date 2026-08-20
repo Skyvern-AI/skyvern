@@ -550,6 +550,108 @@ async def test_resolve_browser_raises_for_invalid_matching_state(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_resolve_browser_wraps_connect_failure_without_leaking_raw_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-14283/SKY-14307/SKY-14279: an uncaught connect_over_cdp/httpx failure here used to
+    # propagate verbatim out of resolve_browser, past every MCP tool's
+    # `except BrowserNotAvailableError` guard, and reach the MCP client as a raw
+    # fastmcp.exceptions.ToolError carrying the session-router hostname, the session's CDP
+    # URL/token, and the proxy's raw response body.
+    raw_detail = (
+        "BrowserType.connect_over_cdp: WebSocket error: "
+        "wss://sessions.skyvern.com/pbs_563919350820380452/MTAuMC4zNy4xNjg6cGJz.659ded3d7b0cfbb0/"
+        "devtools/browser/04d5140b-cf5d-4b7e-864b-3b3d9b6cb015 401 Unauthorized "
+        "<html><head><title>401 Authorization Required</title></head>"
+        "<body><center><h1>401 Authorization Required</h1></center>"
+        "<hr><center>nginx</center></body></html>"
+    )
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(side_effect=Exception(raw_detail))
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    with pytest.raises(session_manager.BrowserNotAvailableError) as exc_info:
+        await session_manager.resolve_browser(session_id="pbs_563919350820380452")
+
+    message = str(exc_info.value)
+    assert "sessions.skyvern.com" not in message
+    assert "401" not in message
+    assert "nginx" not in message
+    # A server-side classifier (e.g. _is_expired_browser_session_error) still needs the
+    # original text; it just must never reach the MCP client.
+    assert exc_info.value.raw_detail == raw_detail
+
+
+@pytest.mark.asyncio
+async def test_get_page_wraps_target_closed_failure_without_leaking_raw_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-14282: connect_over_cdp can succeed (resolve_browser returns fine) and the session
+    # can still die before the next command -- browser.get_working_page() -> new_page() then
+    # raises TargetClosedError, which used to escape get_page() uncaught.
+    raw_detail = "BrowserContext.new_page: Target page, context or browser has been closed"
+    fake_browser = MagicMock()
+    fake_browser.get_working_page = AsyncMock(side_effect=Exception(raw_detail))
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            browser=fake_browser,
+            context=BrowserContext(mode="cloud_session", session_id="pbs_123"),
+            api_key_hash=session_manager._api_key_hash(client_mod.get_active_api_key()),
+        )
+    )
+
+    with pytest.raises(session_manager.BrowserNotAvailableError) as exc_info:
+        await session_manager.get_page(session_id="pbs_123")
+
+    assert "Target page, context or browser has been closed" not in str(exc_info.value)
+    assert exc_info.value.raw_detail == raw_detail
+
+
+def test_browser_session_connection_error_classifies_the_real_sky_13877_production_text() -> None:
+    # Verbatim text pulled from Datadog error-tracking issue 78918c44-94c5-11f1-82f1-da7ad0900000
+    # (env:production, first/last seen 2026-08-10T14:12:02Z) -- the actual occurrence PR #14925
+    # (SKY-13877) was written against, not a reconstruction. It happens to carry
+    # is_target_closed_message's "target page, context or browser has been closed" marker in
+    # addition to code=4408/reason=session expired, so this alone doesn't prove the marker-based
+    # classifier subsumes the code+reason contract in general -- see the next test.
+    real_production_text = (
+        "Error calling tool 'skyvern_navigate_and_screenshot': BrowserType.connect_over_cdp: "
+        "Target page, context or browser has been closed\n"
+        "Browser logs:\n\n"
+        "session expired\n\n"
+        "Call log:\n"
+        "<ws connecting> wss://session-router.skyvern.com/pbs_561295068093619918\n"
+        "  - <ws connected> wss://session-router.skyvern.com/pbs_561295068093619918\n"
+        "  - <ws disconnected> wss://session-router.skyvern.com/pbs_561295068093619918 "
+        "code=4408 reason=session expired"
+    )
+    error = session_manager.BrowserSessionConnectionError(real_production_text)
+    assert error.session_gone is True
+
+
+def test_browser_session_connection_error_classifies_code_4408_session_expired_without_a_target_closed_marker() -> None:
+    # The session-router can in principle close with code=4408/reason=session expired via a
+    # message shape that carries no is_target_closed_message marker -- Playwright's own message
+    # shape for a websocket close varies independently of the close code (compare the real
+    # SKY-13877 text above, which says "Target page, context or browser has been closed", against
+    # tests/unit/test_exception_messages.py::test_session_closed_requires_reason_text_not_bare_close_code,
+    # a real code=4410 case that arrives as "WebSocket error: ..." with no such marker at all).
+    # code=4408 is also reused by an unrelated subsystem (cdp_input.py's live-view stream,
+    # reason="browser_state_timeout", confirmed in Datadog) -- pairing the literal reason text
+    # with the code, as the deleted _is_expired_browser_session_error did, is what keeps this
+    # specific. This was RED before the explicit code=4408/reason=session-expired OR-branch was
+    # restored in BrowserSessionConnectionError.__init__ (the is_target_closed_message /
+    # is_context_lost_message markers alone do not match any of these three messages).
+    for message in (
+        "code=4408 reason=session expired",
+        "Browser session error: code=4408 reason=session expired",
+        "WebSocket closed: code=4408 reason=session expired",
+    ):
+        error = session_manager.BrowserSessionConnectionError(message)
+        assert error.session_gone is True, message
+
+
+@pytest.mark.asyncio
 async def test_session_close_with_matching_session_id_closes_browser_handle(monkeypatch: pytest.MonkeyPatch) -> None:
     current_browser = MagicMock()
     current_browser.close = AsyncMock()

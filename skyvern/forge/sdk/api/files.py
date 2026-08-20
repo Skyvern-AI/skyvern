@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import mimetypes
 import os
 import re
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
-from urllib.parse import parse_qsl, unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 import aiohttp
 import filetype
@@ -24,6 +25,7 @@ from skyvern.exceptions import (
     BlockedHost,
     DownloadFileMaxSizeExceeded,
     DownloadFileMaxWaitingTime,
+    GoogleDriveFileNotAccessible,
     HttpException,
     SkyvernHTTPException,
 )
@@ -85,6 +87,57 @@ def extract_google_drive_file_id(url: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+_GOOGLE_DRIVE_DOWNLOAD_HOSTS = ("drive.google.com", "drive.usercontent.google.com")
+_GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES = 1024 * 1024
+_GOOGLE_DRIVE_FORM_RE = re.compile(r'<form[^>]*\baction="([^"]+)"[^>]*>(.*?)</form>', re.IGNORECASE | re.DOTALL)
+_GOOGLE_DRIVE_INPUT_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+
+
+def _is_google_drive_download_url(url: str) -> bool:
+    return (urlparse(url).hostname or "").lower() in _GOOGLE_DRIVE_DOWNLOAD_HOSTS
+
+
+def _extract_google_drive_interstitial_url(body: str) -> str | None:
+    """Continuation URL from Drive's large-file/virus-scan interstitial form, or None when the
+    HTML is a sign-in / permission-denied page carrying no download form."""
+    for form_match in _GOOGLE_DRIVE_FORM_RE.finditer(body):
+        action = html.unescape(form_match.group(1))
+        params: dict[str, str] = {}
+        for input_tag in _GOOGLE_DRIVE_INPUT_RE.findall(form_match.group(2)):
+            name_match = re.search(r'\bname="([^"]*)"', input_tag, re.IGNORECASE)
+            if not name_match:
+                continue
+            value_match = re.search(r'\bvalue="([^"]*)"', input_tag, re.IGNORECASE)
+            params[html.unescape(name_match.group(1))] = html.unescape(value_match.group(1)) if value_match else ""
+        # The confirm token distinguishes the download form from unrelated forms (e.g. sign-in).
+        if "confirm" not in params:
+            continue
+        query = urlencode(params)
+        if not query:
+            return action
+        return f"{action}&{query}" if "?" in action else f"{action}?{query}"
+
+    link_match = re.search(r'href="([^"]*/uc\?[^"]*\bconfirm=[^"]*)"', body, re.IGNORECASE)
+    if link_match:
+        return html.unescape(link_match.group(1))
+    return None
+
+
+def _is_html_content_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    return content_type.split(";")[0].strip().lower() == "text/html"
+
+
+async def _read_bounded_response_text(response: aiohttp.ClientResponse, max_bytes: int) -> str:
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(1024):
+        body.extend(chunk)
+        if len(body) >= max_bytes:
+            break
+    return bytes(body).decode("utf-8", errors="replace")
 
 
 def is_valid_mime_type(file_path: str) -> bool:
@@ -340,6 +393,7 @@ async def download_file(
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
 
+    requested_url = url
     try:
         # Check if URL is a Google Drive link
         if "drive.google.com" in url:
@@ -348,6 +402,7 @@ async def download_file(
                 # Convert to direct download URL
                 url = f"https://drive.google.com/uc?export=download&id={file_id}"
                 LOG.info("Converting Google Drive link to direct download", url=url)
+        is_google_drive_download = _is_google_drive_download_url(url)
 
         # Check if URL is a cloud storage URI handled by the configured storage backend.
         parsed = urlparse(url)
@@ -402,6 +457,18 @@ async def download_file(
                             return GuardedFileRedirect(location=location)
 
                         _raise_download_response_for_status(response)
+                        if is_google_drive_download and _is_html_content_type(response.headers.get("Content-Type")):
+                            # Drive quirk: uc?export=download answers with an HTML interstitial — a
+                            # virus-scan confirm form for large files, a sign-in page for
+                            # inaccessible ones — so an HTML body is never the requested file.
+                            interstitial_body = await _read_bounded_response_text(
+                                response, _GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES
+                            )
+                            continuation_url = _extract_google_drive_interstitial_url(interstitial_body)
+                            if continuation_url is None:
+                                raise GoogleDriveFileNotAccessible(url=requested_url)
+                            LOG.info("Following Google Drive download interstitial", url=current_url)
+                            return GuardedFileRedirect(location=continuation_url)
                         if (
                             max_size_mb
                             and response.content_length
@@ -488,6 +555,10 @@ async def download_file(
         raise
     except DownloadFileMaxSizeExceeded as e:
         LOG.warning(f"Failed to download file, max size exceeded: {e.max_size}", exc_info=True)
+        raise
+    except GoogleDriveFileNotAccessible:
+        # User-actionable sharing problem on the customer's file, not a platform fault.
+        LOG.warning("Google Drive download returned an HTML page instead of file content", url=requested_url)
         raise
     except PermissionError as e:
         LOG.warning(

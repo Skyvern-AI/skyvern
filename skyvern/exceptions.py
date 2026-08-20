@@ -950,6 +950,16 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
 
 
+class GoogleDriveFileNotAccessible(SkyvernException):
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(
+            f"Google Drive returned a sign-in or permission page instead of the file content for {url}. "
+            "The file is not publicly accessible. Share it so anyone with the link can view it, "
+            "or use a direct-download link."
+        )
+
+
 class UploadFileMaxSizeExceeded(SkyvernException):
     def __init__(self, file_size_bytes: int, max_size_bytes: int) -> None:
         self.file_size_bytes = file_size_bytes

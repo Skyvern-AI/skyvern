@@ -211,10 +211,72 @@ _OBSERVE_JS = (
         if (gt && gt.length > label.length && gt !== lastGroup) { rec.group = gt; lastGroup = gt; }
       }
     }
+    const pressed = el.getAttribute('aria-pressed');
+    if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     out.push(rec);
     if (++i > 250) break;
   }
-  return JSON.stringify({ url: location.href, title: document.title, elements: out });
+  // Page-text digest: outcome states (submission confirmations, rejection banners, validation
+  // summaries) live in non-interactive nodes the element list can never carry. Sources are
+  // structural only — ARIA status channels first, then headings — never a body-text dump, so the
+  // digest stays bounded and can't regrow the context that transcript compaction bounds.
+  const texts = [];
+  let textTotal = 0;
+  let textFull = false;
+  const pushText = (t) => {
+    t = (t || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!t) return;
+    // Containment dedupe, richer message wins: an alert's text re-surfaces inside its heading's
+    // parent text, and a terse early entry ("Saved") must not suppress a later superset
+    // ("Saved — confirmation #A1B2") — supersets REPLACE their contained entries.
+    if (texts.some((s) => s.includes(t))) return;
+    const kept = texts.filter((s) => !t.includes(s));
+    const keptTotal = kept.reduce((total, s) => total + s.length, 0);
+    if (keptTotal + t.length > 900) { textFull = true; return; }
+    texts.length = 0; texts.push(...kept, t); textTotal = keptTotal + t.length;
+  };
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // Isolated: a hostile page's throwing accessor (fingerprinting scripts poison innerText and
+  // friends) must degrade to "no digest", never take element perception down with it.
+  try {
+    // ~= matches ARIA fallback role lists like role="alert status"; = would silently skip them.
+    for (const el of document.querySelectorAll('[role~=alert],[role~=status],[aria-live=polite],[aria-live=assertive],output')) {
+      if (textFull) break;
+      if (visible(el)) pushText(el.innerText);
+    }
+    for (const h of document.querySelectorAll('h1,h2,h3')) {
+      if (textFull) break;
+      if (!visible(h)) continue;
+      // A short parent is a banner/panel whose body text carries the message; a large parent would
+      // drag in unrelated content, so the heading stands alone.
+      const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
+      pushText(pt && pt.length <= 300 ? pt : h.innerText);
+    }
+  } catch (e) { texts.length = 0; }
+  // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
+  // perception can never list its contents — record host + signature so the model can see the gate
+  // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
+  // and rejected: presence is the contract here, not cross-frame reach). Same visibility rule as
+  // elements, so hidden tracking pixels stay out. Isolated like the digest above.
+  const iframeInfo = { total: 0, entries: [] };
+  try {
+    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    for (const f of document.querySelectorAll('iframe')) {
+      const r = f.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
+      if (f.hasAttribute('srcdoc')) continue;
+      const src = f.getAttribute('src') || '';
+      let u;
+      try { u = new URL(src, location.href); } catch (e) { continue; }
+      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
+      iframeInfo.total++;
+      if (iframeInfo.entries.length >= 8) continue;
+      const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
+    }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, elements: out });
 }
 """
 )
@@ -281,6 +343,23 @@ def build_browser_tools(
         elements = data.get("elements", [])
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         lines = [f"url={data.get('url')} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        for t in data.get("text") or []:
+            lines.append(f"text: {t!r}")
+        iframe_info = data.get("iframes") or {}
+        iframe_entries = iframe_info.get("entries") or []
+        if iframe_entries:
+            total = iframe_info.get("total", len(iframe_entries))
+            parts = []
+            for f in iframe_entries:
+                flag = "[captcha] " if f.get("captcha") else ""
+                title = f" {f['title']!r}" if f.get("title") else ""
+                parts.append(f"{flag}{f.get('host', '?')}{title}")
+            overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
+            lines.append(
+                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector): "
+                + "; ".join(parts)
+                + overflow
+            )
         for e in elements:
             extra = ""
             if e.get("value"):
@@ -289,6 +368,8 @@ def build_browser_tools(
                 extra += f" options={e['options']}"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
+            if e.get("pressed") is not None:
+                extra += f" pressed={e['pressed']}"
             if e.get("required"):
                 extra += " *required"
             if e.get("autocomplete"):
@@ -310,9 +391,19 @@ def build_browser_tools(
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}")
             html = await el.inner_html()
+            if not html:
+                # Void/leaf elements have no inner HTML; their own tag+attributes are the answer,
+                # not an empty string the model can't distinguish from a missing element. Best
+                # effort: a navigation between the two reads must not turn "" into a tool error.
+                try:
+                    html = await el.evaluate("el => el.outerHTML")
+                except Exception:
+                    html = ""
         else:
             html = await page.content()
-        return ToolResult.ok(html[:20000])
+        if len(html) > 20000:
+            return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
+        return ToolResult.ok(html)
 
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -528,8 +619,11 @@ def build_browser_tools(
         if error is not None:
             return error
         url = await asyncio.to_thread(validate_fetch_url, args["url"])
-        await page.goto(url, timeout=60000, wait_until="load")
-        return ToolResult.ok(f"navigated to {await _url(page)}")
+        response = await page.goto(url, timeout=60000, wait_until="load")
+        # Surface the HTTP status: an error page otherwise reads as a successful navigation, hiding
+        # dead URLs and blank shells from the model.
+        status = f" (HTTP {response.status})" if response is not None else ""
+        return ToolResult.ok(f"navigated to {await _url(page)}{status}")
 
     async def file_upload(args: dict[str, Any]) -> ToolResult:
         # Lazy import: keeps this module importable for unit tests without the full forge/storage graph.
@@ -571,7 +665,7 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Call once per page, then act by selector.",
+            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached by selector. Call once per page, then act by selector.",
             _obj({}),
             observe,
         ),

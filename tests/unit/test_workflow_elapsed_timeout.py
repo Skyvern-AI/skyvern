@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from skyvern.forge.sdk.routes.agent_protocol import _workflow_run_request_to_legacy_request
 from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
@@ -201,7 +202,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -283,7 +284,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -361,7 +362,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -454,7 +455,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -553,7 +554,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -731,7 +732,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -824,7 +825,7 @@ async def test_execute_workflow_refreshes_failed_status_after_finally_write_time
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -919,7 +920,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -1012,7 +1013,7 @@ async def test_execute_workflow_preserves_escaped_failure_cause_before_terminal(
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label=None,
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -1181,7 +1182,11 @@ async def test_execute_workflow_skips_interrupted_finalize_for_cancellation(
         organization_id="org_1",
         generate_script_on_terminal=False,
         model=None,
-        workflow_definition=SimpleNamespace(parameters=[], finally_block_label=None, blocks=[]),
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            finally_block_label=None,
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+        ),
     )
     organization = SimpleNamespace(organization_id="org_1")
 

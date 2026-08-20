@@ -184,7 +184,6 @@ from .run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
-from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
 from .scouting import _capture_scout_ambiguity as _capture_scout_ambiguity
@@ -1009,6 +1008,13 @@ async def fill_credential_field_tool(
     OTP credentials are not filled during scouting because scouting has no
     workflow run/task context for safe polling.
 
+    The result's `readback_outcome` reports what the field held right after the fill —
+    `exact_match`, `different` (the field holds something other than what was typed),
+    `empty`, or `unavailable` (the field could not be read) — and only `empty` fails
+    the fill; decide from that outcome whether the page still needs another action.
+    An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
+    the page left the one the fill acted on, so the field was cleared by its own submit.
+
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id`: when a page observation returns
@@ -1019,7 +1025,9 @@ async def fill_credential_field_tool(
 
     `submit_selector` is optional and submits in the SAME call: pass the CSS
     selector of the form's submit control and this tool clicks it once the fill
-    has been typed, whether or not reading the field back could confirm it. The
+    has been typed, including when the field could not be read back. The one case
+    it does not click is a `totp` field that reads back holding something else,
+    because submitting a code the field does not hold voids it. The
     result's `submitted` says outright whether the control was clicked; when it is
     false, `submit_skipped` or `submit_error` says why, and the code is still
     waiting to be submitted. A selector matching more than one control is not

@@ -611,6 +611,10 @@ class AgentResult:
     # persistence path (rollback + ``Cancelled by user.`` chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
+    # Facts the route needs to persist an interruption record; the route sees the
+    # AgentResult, never the context that recorded them. None when unknown.
+    cancellation_iteration: int | None = None
+    cancellation_last_recorded_phase: str | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -671,6 +675,7 @@ class CopilotContext(AgentContext):
     update_workflow_called: bool = False
     test_after_update_done: bool = False
     copilot_total_timeout_exceeded: bool = False
+    copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
     model_calls_this_turn: int = 0
     enforcement_pass_count: int = 0

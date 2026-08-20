@@ -15,7 +15,7 @@ _CANDIDATE_METHODS = frozenset(
 )
 
 _DISCOVERED_BROWSER_API_CALLS = {
-    "skyvern/forge/agent.py": Counter({"evaluate": 2, "new_page": 1}),
+    "skyvern/forge/agent.py": Counter({"evaluate": 1, "new_page": 1}),
     "skyvern/forge/agent_functions.py": Counter({"close": 1, "scroll_into_view_if_needed": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
@@ -27,7 +27,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "dblclick": 2,
             "evaluate": 14,
             "fill": 2,
-            "focus": 2,
+            "focus": 3,
             "go_back": 1,
             "go_forward": 1,
             "goto": 2,
@@ -71,8 +71,8 @@ _DISCOVERED_BROWSER_API_CALLS = {
 }
 
 _EVALUATE_CALLERS = {
-    # Read-only DOM-shape probe for the v3 settle-before-complete check (two samples per probe).
-    "skyvern/forge/agent.py": Counter({"_settle_probe": 2}),
+    # Read-only DOM fingerprint sample for the v3 settle-before-complete check.
+    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "_blob_iframe_src_titles": 1,
@@ -223,7 +223,7 @@ def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 24
+    assert sum(sum(callers.values()) for callers in observed.values()) == 23
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

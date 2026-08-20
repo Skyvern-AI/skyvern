@@ -509,16 +509,16 @@ def test_json_error_body_length_tolerates_a_doc_less_error() -> None:
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        (SimpleNamespace(provider="Cloudflare", service_tier="flex"), ("Cloudflare", "flex")),
-        (SimpleNamespace(_hidden_params={"custom_llm_provider": "openrouter"}), ("openrouter", None)),
-        (SimpleNamespace(_hidden_params={}), (None, None)),
-        (SimpleNamespace(provider=None, service_tier=None), (None, None)),
-        (SimpleNamespace(provider=123, service_tier={"tier": "flex"}), (None, None)),
-        (SimpleNamespace(), (None, None)),
+        (SimpleNamespace(provider="Cloudflare"), "Cloudflare"),
+        (SimpleNamespace(_hidden_params={"custom_llm_provider": "openrouter"}), "openrouter"),
+        (SimpleNamespace(_hidden_params={}), None),
+        (SimpleNamespace(provider=None), None),
+        (SimpleNamespace(provider=123), None),
+        (SimpleNamespace(), None),
     ],
 )
-def test_response_routing_metadata_is_string_or_none(response: object, expected: tuple[str | None, str | None]) -> None:
-    assert api_handler_factory._response_routing_metadata(response) == expected
+def test_response_provider_is_string_or_none(response: object, expected: str | None) -> None:
+    assert api_handler_factory._response_provider(response) == expected
 
 
 def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_usage() -> None:
@@ -1977,9 +1977,9 @@ def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> 
     standard = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND"}})
     no_meta = SimpleNamespace(_hidden_params={})
 
-    assert LLMAPIHandlerFactory._completion_cost_or_none(flex) == pytest.approx(0.05)
-    assert LLMAPIHandlerFactory._completion_cost_or_none(standard) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost_or_none(no_meta) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(no_meta) == pytest.approx(0.10)
 
 
 def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2009,10 +2009,10 @@ def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypat
         _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
     )
 
-    assert LLMAPIHandlerFactory._completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
-    assert LLMAPIHandlerFactory._completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)
 
 
 def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2021,7 +2021,294 @@ def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(litellm, "completion_cost", _raise)
     resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
-    assert LLMAPIHandlerFactory._completion_cost_or_none(resp) is None
+    assert LLMAPIHandlerFactory.completion_cost_or_none(resp) is None
+
+
+# OpenAI rejects tools + reasoning_effort on /v1/chat/completions for gpt-5.6, so
+# litellm bridges those calls through /v1/responses and its response translation drops
+# service_tier. completion_cost then misses the *_flex price keys and bills flex traffic at the
+# standard rate. The tier is recovered from the deployment that served the call.
+
+_TIER_TEST_MODEL = "gpt-5.6-unittest"
+_TIER_TEST_STANDARD = {"input_cost_per_token": 1e-07, "output_cost_per_token": 6e-07}
+_TIER_TEST_LONG_CONTEXT = {
+    "input_cost_per_token_above_272k_tokens": 2e-07,
+    "output_cost_per_token_above_272k_tokens": 9e-07,
+}
+
+
+@pytest.fixture
+def tier_priced_model() -> Any:
+    """A model registered with real flex price keys, so the cost assertions exercise litellm's
+    own tier pricing instead of a stubbed completion_cost."""
+    litellm.register_model(
+        {
+            _TIER_TEST_MODEL: {
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "supports_service_tier": True,
+                **_TIER_TEST_STANDARD,
+                **{f"{key}_flex": value / 2 for key, value in _TIER_TEST_STANDARD.items()},
+                **_TIER_TEST_LONG_CONTEXT,
+                **{f"{key}_flex": value / 2 for key, value in _TIER_TEST_LONG_CONTEXT.items()},
+            }
+        }
+    )
+    yield _TIER_TEST_MODEL
+    litellm.model_cost.pop(_TIER_TEST_MODEL, None)
+    # register_model also registers the name as an OpenAI chat model; popping the cost map alone
+    # leaks it into every later test in the session.
+    litellm.open_ai_chat_completion_models.discard(_TIER_TEST_MODEL)
+
+
+def _bridge_response(
+    *,
+    model_id: str | None = "id:flex-leg",
+    service_tier: str | None = None,
+    prompt_tokens: int = 1000,
+    reasoning_tokens: int = 0,
+) -> litellm.ModelResponse:
+    """A ModelResponse shaped like one that came back through litellm's Responses-API bridge:
+    real usage and a serving deployment id, but no service_tier unless one is forced on."""
+    response = litellm.ModelResponse(
+        model=_TIER_TEST_MODEL,
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+    )
+    response.usage = litellm.Usage(
+        prompt_tokens=prompt_tokens, completion_tokens=1000, total_tokens=prompt_tokens + 1000
+    )
+    response.usage.completion_tokens_details = litellm.types.utils.CompletionTokensDetailsWrapper(
+        reasoning_tokens=reasoning_tokens
+    )
+    response._hidden_params = {"litellm_model_name": _TIER_TEST_MODEL, "custom_llm_provider": "openai"}
+    if model_id is not None:
+        response._hidden_params["model_id"] = model_id
+    if service_tier is not None:
+        response.service_tier = service_tier
+    return response
+
+
+class _TieredRouter:
+    """Router double whose deployments carry litellm_params the way litellm's do — the flex leg
+    declares a tier as a pydantic extra, the fallback leg declares none."""
+
+    def __init__(self) -> None:
+        self.deployments = {
+            "id:flex-leg": SimpleNamespace(
+                model_name="openai-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL, service_tier="flex"),
+            ),
+            "id:fallback-leg": SimpleNamespace(
+                model_name="openai-unittest-fallback",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL),
+            ),
+            "id:mixed-case-flex-leg": SimpleNamespace(
+                model_name="openai-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL, service_tier="Flex"),
+            ),
+            "id:vertex-style-leg": SimpleNamespace(
+                model_name="vertex-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(
+                    model=_TIER_TEST_MODEL, service_tier="SERVICE_TIER_FLEX"
+                ),
+            ),
+        }
+
+    def get_deployment(self, model_id: str) -> Any:
+        return self.deployments.get(model_id)
+
+
+def test_served_tier_prefers_the_provider_over_the_deployment_it_ran_on(tier_priced_model: str) -> None:
+    """A tier the provider reported is authoritative even when it contradicts the leg we
+    dispatched on. Overwriting a downgrade would hide a real billing event and under-report."""
+    response = _bridge_response(model_id="id:flex-leg", service_tier="default")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == ("default", "reported")
+    assert response.service_tier == "default"
+    assert LLMAPIHandlerFactory.completion_cost_or_none(response) == pytest.approx(0.0007)
+
+
+def test_dropped_tier_is_recovered_from_the_serving_deployment() -> None:
+    response = _bridge_response(model_id="id:flex-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == ("flex", "inferred")
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+    # Never written onto the response itself: that object is persisted as the LLM_RESPONSE
+    # artifact, where a tier we synthesized would read as one the provider sent.
+    assert getattr(response, "service_tier", None) is None
+
+
+def test_unresolvable_deployment_is_reported_rather_than_passing_as_standard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing to resolve the serving deployment leaves the call priced at the standard rate,
+    which is exactly the bug's signature — it must not be indistinguishable from a real one."""
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    response = _bridge_response(model_id=None)
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, "unresolved")
+    assert any(
+        event == "Router response carried no service tier and no resolvable deployment" for event, _ in logger.events
+    )
+
+
+def test_bridge_flex_call_is_costed_at_the_flex_rate_and_fallback_at_the_standard_rate(
+    tier_priced_model: str,
+) -> None:
+    """The headline accounting fix, against the real litellm price map: a flex-served call must
+    cost half a fallback-served one, where today both cost the same."""
+    router = _TieredRouter()
+    flex = _bridge_response(model_id="id:flex-leg")
+    fallback = _bridge_response(model_id="id:fallback-leg")
+
+    LLMAPIHandlerFactory._record_served_service_tier(router, flex)
+    LLMAPIHandlerFactory._record_served_service_tier(router, fallback)
+
+    flex_cost = LLMAPIHandlerFactory.completion_cost_or_none(flex)
+    fallback_cost = LLMAPIHandlerFactory.completion_cost_or_none(fallback)
+    assert fallback_cost == pytest.approx(0.0007)
+    assert flex_cost == pytest.approx(0.00035)
+
+
+def test_a_tier_litellm_cannot_price_is_not_recorded(tier_priced_model: str) -> None:
+    """Vertex deployments declare `service_tier="SERVICE_TIER_FLEX"`, which litellm does not map to
+    a price key — its flex tier travels as `provider_specific_fields.traffic_type` and is corrected
+    separately. Recording it would buy no discount and would put the working Vertex path through
+    this one."""
+    response = _bridge_response(model_id="id:vertex-style-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert tier is None
+    assert api_handler_factory._effective_service_tier(response) is None
+
+
+def test_a_recovered_tier_is_normalised_to_lower_case(tier_priced_model: str) -> None:
+    """litellm lower-cases before picking a price key, but our own >272k correction compares
+    exactly — so a deployment written as "Flex" would take the short-call discount and silently
+    lose the long-context halving, and would split the Datadog dimension in two."""
+    short = _bridge_response(model_id="id:mixed-case-flex-leg")
+    long_context = _bridge_response(model_id="id:mixed-case-flex-leg", prompt_tokens=300_000)
+
+    assert LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), short) == ("flex", "inferred")
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), long_context)
+
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context) == pytest.approx(0.03045)
+
+
+def test_a_reported_tier_outranks_a_previously_recovered_one(tier_priced_model: str) -> None:
+    """Pins the precedence itself, not just the write guard: with both values present on the same
+    response, the provider's must win. Inverting the order in `_effective_service_tier` would
+    otherwise stay green, because recording never produces both and no other test builds the pair.
+    Only the priced value is asserted — a response carrying both is unreachable in production, so
+    what the log would say about it is not a contract worth freezing."""
+    response = _bridge_response(model_id="id:flex-leg")
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+
+    response.service_tier = "default"
+
+    assert api_handler_factory._effective_service_tier(response) == "default"
+
+
+def test_a_deployment_with_no_tier_reports_no_provenance(tier_priced_model: str) -> None:
+    """A leg that declares no tier inferred nothing, so it must not claim "inferred". Most router
+    traffic is that shape — every Gemini router call among it — and labelling it would leave
+    `service_tier_source="inferred"` on millions of calls carrying no tier, which is the query
+    that is supposed to isolate the recovered ones."""
+    response = _bridge_response(model_id="id:fallback-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, None)
+    assert api_handler_factory._service_tier_with_provenance(response) == (None, None)
+
+
+def test_recovered_tier_does_not_double_discount_a_long_context_call(tier_priced_model: str) -> None:
+    """Pins the composite of litellm's pricing and Skyvern's >272k correction. litellm cannot
+    resolve the combined above-272k + flex price key today, so the correction supplies the
+    halving; if a litellm release starts resolving it, this fails instead of quietly billing
+    a quarter of the real cost."""
+    long_context = _bridge_response(model_id="id:flex-leg", prompt_tokens=300_000)
+    standard_reference = _bridge_response(model_id="id:fallback-leg", prompt_tokens=300_000)
+
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), long_context)
+
+    assert api_handler_factory._effective_service_tier(long_context) == "flex"
+    # litellm still prices the long-context flex call at the untiered rate, even when handed the
+    # tier explicitly — it cannot resolve the combined above-272k + flex key...
+    assert litellm.completion_cost(completion_response=long_context, service_tier="flex") == pytest.approx(0.0609)
+    # ...so exactly one halving reaches the books.
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context) == pytest.approx(0.03045)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard_reference) == pytest.approx(0.0609)
+
+
+def test_vertex_flex_correction_survives_tier_restoration(tier_priced_model: str) -> None:
+    """No-regression for the working Vertex path: its flex tier travels as a traffic_type, which
+    the restoration must neither consume nor disturb, and which litellm still does not price."""
+    response = _bridge_response(model_id="id:fallback-leg")
+    response._hidden_params["provider_specific_fields"] = {"traffic_type": "ON_DEMAND_FLEX"}
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, None)
+    assert getattr(response, "service_tier", None) is None
+    # litellm prices ON_DEMAND_FLEX at the standard rate, which is why the halving below is ours.
+    assert litellm.completion_cost(completion_response=response) == pytest.approx(0.0007)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(response) == pytest.approx(0.00035)
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_logs_the_served_leg_and_where_the_tier_came_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`model` on this log line is the router group, which is identical for the flex and the
+    fallback leg — so the split between them, and the mispricing riding on it, was invisible."""
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    caller._router = _TieredRouter()  # type: ignore[assignment]
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=_bridge_response(model_id="id:flex-leg")))
+
+    await caller.call(prompt="test", prompt_name="taskv3-agent-loop")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["served_model_group"] == "openai-unittest-flex"
+    assert metrics["service_tier_source"] == "inferred"
+    assert metrics["service_tier"] == "flex"
+
+
+def test_recovered_tier_stays_out_of_the_persisted_response_artifact() -> None:
+    """The LLM_RESPONSE artifact is dumped from this object. A tier we recovered must not appear
+    there, or a later investigation reads our own inference as something the provider reported —
+    which is how the mispricing survived in the first place."""
+    response = _bridge_response(model_id="id:flex-leg")
+
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+    assert "service_tier" not in api_handler_factory._safe_model_dump_json(response)
+
+
+@pytest.mark.asyncio
+async def test_reported_tier_is_still_logged_with_its_provenance_without_a_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier logged with no source beside it is the same conflation, just relocated to the log."""
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    response = _bridge_response(model_id=None, service_tier="flex")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+
+    await caller.call(prompt="test", prompt_name="extract-actions")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["service_tier"] == "flex"
+    assert metrics["service_tier_source"] == "reported"
 
 
 @pytest.mark.asyncio
@@ -2157,6 +2444,29 @@ def _run_flex_router_test(
 
 def _fallback_log_events(logger: DummyLogger) -> list[dict[str, Any]]:
     return [kwargs for event, kwargs in logger.events if event == "LLM router fallback succeeded"]
+
+
+@pytest.mark.asyncio
+async def test_step_engine_router_logs_the_served_leg_on_its_metrics_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step engine has its own metrics log line, separate from LLMCaller's, and carries the
+    bulk of router traffic. `model` there is the router group for both legs, so without the served
+    deployment the flex/fallback split is as invisible as it was on the other path."""
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_ROUTER_METRICS_SERVED_GROUP",
+        [FakeLLMResponse("shared-model", hidden_params={"model_id": "id:primary-group"})],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_ROUTER_METRICS_SERVED_GROUP")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["served_model_group"] == "primary-group"
+    # The deployment declares no priceable tier, so there is nothing to infer and no provenance
+    # to claim — `served_model_group` alone carries the leg.
+    assert metrics["service_tier_source"] is None
 
 
 @pytest.mark.asyncio

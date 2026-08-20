@@ -746,6 +746,59 @@ async def wrapper({default_args}):
         assert secret_marker not in json.dumps(entry, default=str)
 
     @pytest.mark.asyncio
+    async def test_inline_exec_emits_completion_log_with_duration(self) -> None:
+        """Completion pairs with inline_exec_entered so a legacy run's duration needs no log join."""
+        from unittest.mock import MagicMock
+
+        from structlog.testing import capture_logs
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="duration_output",
+            description="test output",
+            output_parameter_id="op_duration",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="duration_block", code="return {'x': 1}", output_parameter=output_parameter)
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            result = await user_function()
+        assert result == {"x": 1}
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        entry = events[0]
+        assert isinstance(entry["duration_ms"], float) and entry["duration_ms"] >= 0
+        assert entry["success"] is True
+        assert entry["organization_id"] == "org-dur"
+        assert entry["workflow_run_id"] == "wr-dur"
+        assert entry["workflow_run_block_id"] == "wrb-dur"
+
+        failing_function = block.generate_async_user_function(
+            "x = 1 / 0",
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            with pytest.raises(ZeroDivisionError):
+                await failing_function()
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        assert events[0]["success"] is False
+        assert isinstance(events[0]["duration_ms"], float)
+
+    @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
         """Legitimate code should execute and return results."""
         fn = self._exec_user_code("x = 1 + 2")

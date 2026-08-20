@@ -37,6 +37,7 @@ from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
+    InterruptedTurnFacts,
     assemble_terminal_envelope,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
@@ -482,6 +483,86 @@ async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
     assert persisted_payload["terminalEnvelope"]["next_state"] != "completed"
     assert persisted_payload["terminalEnvelope"]["response_kind"] == "stopped"
+
+
+async def _persist_cancel_and_read_row(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    record_as_interrupted: bool,
+) -> tuple[str, dict[str, Any]]:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical", version=7)
+    agent_result = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        cancelled=True,
+        cancellation_iteration=4,
+        cancellation_last_recorded_phase="persisted_block_run",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    await workflow_copilot_route._persist_cancel_turn(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        user_message="stop",
+        agent_result=agent_result,
+        turn_id="turn-1",
+        record_as_interrupted=record_as_interrupted,
+    )
+
+    written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    return written["content"], written["narrative_payload"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_nobody_asked_for_is_recorded_as_interrupted_with_what_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content, payload = await _persist_cancel_and_read_row(monkeypatch, record_as_interrupted=True)
+
+    assert "interrupted" in content.lower()
+    assert "Cancelled by user." not in content
+    assert not [
+        token
+        for token in ("failed", "navigated", "disconnected", "connection lost", "timed out")
+        if token in content.lower()
+    ]
+    assert "iteration 4" in content
+    assert "wpid-1" in content and "version 7" in content
+    assert "persisted_block_run" in content
+    interruption = payload["terminalEnvelope"]["interruption"]
+    assert interruption["iteration"] == 4
+    assert interruption["workflow_permanent_id"] == "wpid-1"
+    assert interruption["workflow_version"] == 7
+    assert interruption["last_recorded_build_test_phase"] == "persisted_block_run"
+    assert interruption["recorded_at"] is not None
+    assert payload["terminalEnvelope"]["halt_kind"] == INTERRUPTED_TERMINAL_REASON
+    # An interrupted turn halted rather than failed; the FE reads this to keep it
+    # out of failure treatment.
+    assert payload["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_user_stop_is_still_recorded_as_the_users_own_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content, payload = await _persist_cancel_and_read_row(monkeypatch, record_as_interrupted=False)
+
+    assert content == "Cancelled by user."
+    assert payload["terminalEnvelope"].get("interruption") is None
 
 
 @pytest.mark.asyncio
@@ -3066,6 +3147,7 @@ class _FakeCopilotChatStore:
         sender: WorkflowCopilotChatSender,
         content: str,
         turn_outcome: TurnOutcome | None = None,
+        narrative_payload: Any = None,
     ) -> WorkflowCopilotChatMessage:
         message = WorkflowCopilotChatMessage(
             workflow_copilot_chat_message_id=f"wccm-{len(self.messages)}",
@@ -3073,6 +3155,7 @@ class _FakeCopilotChatStore:
             sender=sender,
             content=content,
             turn_outcome=turn_outcome,
+            narrative_payload=narrative_payload,
             created_at=_NOW,
             modified_at=_NOW,
         )
@@ -3108,7 +3191,7 @@ class _FakeCopilotChatStore:
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: Any = None,
     ) -> WorkflowCopilotChatMessage:
-        return self.add_message(sender, content, turn_outcome)
+        return self.add_message(sender, content, turn_outcome, narrative_payload)
 
     async def replace_workflow_copilot_chat_message(
         self,
@@ -3121,7 +3204,13 @@ class _FakeCopilotChatStore:
     ) -> WorkflowCopilotChatMessage | None:
         for index, message in enumerate(self.messages):
             if message.workflow_copilot_chat_message_id == workflow_copilot_chat_message_id:
-                replaced = message.model_copy(update={"content": content, "turn_outcome": turn_outcome})
+                replaced = message.model_copy(
+                    update={
+                        "content": content,
+                        "turn_outcome": turn_outcome,
+                        "narrative_payload": narrative_payload,
+                    }
+                )
                 self.messages[index] = replaced
                 return replaced
         return None
@@ -3211,6 +3300,54 @@ async def test_chat_history_marks_abandoned_turn_interrupted_not_cancelled(
     assert chat.pending_turns == {}
     assert response.chat_history[-1].turn_outcome is not None
     restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_recovered_row_carries_what_is_known_and_never_says_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    row = store.assistant_messages[0]
+    assert "interrupted" in row.content.lower()
+    assert not [
+        token
+        for token in ("failed", "navigated", "disconnected", "connection lost", "timed out")
+        if token in row.content.lower()
+    ]
+    assert "wpid-1" in row.content
+    payload = row.narrative_payload
+    assert payload is not None
+    interruption = payload["terminalEnvelope"]["interruption"]
+    assert interruption["workflow_permanent_id"] == "wpid-1"
+    assert interruption["recorded_at"] is not None
+    assert interruption["last_recorded_build_test_phase"] is None
+    assert interruption["authored_edits_saved"] is None
+    assert payload["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_a_live_written_interrupted_row_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live cancel exit already answered the turn; a later read must not add a second row."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    await workflow_copilot_route._persist_interrupted_turn(
+        chat,
+        "turn-a",
+        facts=InterruptedTurnFacts(iteration=2, workflow_permanent_id="wpid-1"),
+    )
+
+    await _load_history()
+
+    assert len(store.assistant_messages) == 1
+    assert chat.pending_turns == {}
 
 
 @pytest.mark.asyncio

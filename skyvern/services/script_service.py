@@ -3154,9 +3154,9 @@ async def ensure_in_process_script_execution_allowed(
     if decision.allowed:
         return
 
-    # A degradable denial leaves the run to the agent, so it is not an error condition; keeping it
-    # off ERROR also keeps the fail-closed lines above distinguishable in the denial monitor.
-    log_denial = LOG.error if decision.fail_closed else LOG.warning
+    # A fail-open denial is the steady state on every tenant cached-script run (deny-all policy),
+    # so it stays at debug to keep out of indexed logs; fail-closed stays ERROR for the denial monitor.
+    log_denial = LOG.error if decision.fail_closed else LOG.debug
     log_denial(
         "script.in_process_execution_denied",
         seam=seam,

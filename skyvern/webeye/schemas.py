@@ -91,6 +91,11 @@ class BrowserSessionResponse(BaseModel):
     )
     modified_at: datetime = Field(description="Timestamp when the session was last modified")
     deleted_at: datetime | None = Field(None, description="Timestamp when the session was deleted, if applicable")
+    warning: str | None = Field(
+        None,
+        description="Advisory message about how the request was adjusted, if it was. Set when a requested timeout "
+        "above the maximum was capped; null otherwise.",
+    )
 
     @classmethod
     async def from_browser_session(

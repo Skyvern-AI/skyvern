@@ -49,10 +49,9 @@ from .credentials import _missing_credential_reference_tool_error
 from .guardrails import _authority_tool_error
 from .mcp_hooks import (
     _TYPE_READBACK_SETTLE_SECONDS,
-    ScoutTypeVerdict,
+    ScoutReadbackOutcome,
+    _scout_readback_outcome,
     _scout_type_landing_failure,
-    _scout_type_verdict,
-    _significant_character_count,
 )
 from .scouting import (
     _attach_scout_observation_step,
@@ -186,6 +185,16 @@ def _credential_submit_already_committed_notice() -> str:
         "The field was filled and the page moved on before the submit control could be clicked, so it "
         "was not clicked: the form submitted itself. Inspect the current page to see where the sign-in "
         "got to rather than filling this field again."
+    )
+
+
+def _credential_submit_unconfirmed_readback_notice() -> str:
+    # Deliberately does not tell the model to read the field: a field that differs usually holds a
+    # mutation of the secret, which the scrubber cannot match and so would not redact.
+    return (
+        "The code field does not hold what was typed, so the submit control was not clicked: submitting "
+        "a code the field does not hold voids it. Fill again with a selector for the intended field, or "
+        "click the submit control yourself if this page reformats the code on the way in."
     )
 
 
@@ -502,12 +511,8 @@ async def _read_filled_field_value(page: SkyvernBrowserPage, selector: str) -> s
 
     async def read() -> str | None:
         try:
-            # `.first` mirrors how the direct fill narrowed the selector. Reading the un-narrowed
-            # locator would raise Playwright strict mode whenever the selector matches more than
-            # one input — disabling the check in the very case the mismatch verdict exists to catch.
-            # The fill just resolved this locator, so a read that does not return promptly means
-            # the page moved on — an auto-submitting 2FA form does exactly that, and waiting out a
-            # navigation here would only age the code.
+            # `.first` matches the direct fill's narrowing — the un-narrowed locator raises strict
+            # mode on a multi-match, and a read that stalls means an auto-submit already moved on.
             value = await asyncio.wait_for(
                 page.locator(selector).first.input_value(), timeout=_CREDENTIAL_FILL_READBACK_TIMEOUT_SECONDS
             )
@@ -536,6 +541,14 @@ class _ScoutTargetProbe:
     accessible_name: str = ""
     role_name_match_count: int | None = None
     fingerprint: dict[str, str] = dataclass_field(default_factory=dict)
+
+
+def _fill_observed_effects(outcome: ScoutReadbackOutcome, *, landing_inferred_from_navigation: bool) -> dict[str, bool]:
+    """A landing is recorded only where one was observed, so `value_landed` is absent rather than
+    False whenever the field did not read back what was typed."""
+    if landing_inferred_from_navigation:
+        return {"landing_inferred_from_navigation": True}
+    return {"value_landed": True} if outcome is ScoutReadbackOutcome.EXACT_MATCH else {}
 
 
 async def _probe_scout_target(copilot_ctx: AgentContext, selector: str, *, fingerprint: bool) -> _ScoutTargetProbe:
@@ -750,8 +763,7 @@ async def _fill_credential_field_impl_serial(
                 _direct_fill_release_guard=_credential_fill_release_guard(origin_grant),
             )
             readback = await _read_filled_field_value(page, selector)
-            fill_verdict = _scout_type_verdict(readback, len(value))
-            readback_significant_count = _significant_character_count(readback) if readback is not None else 0
+            fill_outcome = _scout_readback_outcome(readback, value)
     except _CredentialFillOriginMismatchError:
         return finish({"ok": False, "error": _credential_fill_origin_mismatch_error()})
     except Exception as exc:
@@ -777,14 +789,12 @@ async def _fill_credential_field_impl_serial(
     _clear_pending_browser_interaction_observation(copilot_ctx)
     source_url = _consume_scout_source_url(copilot_ctx)
     landing_failure = _scout_type_landing_failure(
-        fill_verdict,
+        fill_outcome,
         tool_name="fill_credential_field",
         selector=selector,
-        typed_length=len(value),
-        significant_count=readback_significant_count,
     )
     landing_inferred_from_navigation = False
-    if landing_failure is not None and fill_verdict is ScoutTypeVerdict.EMPTY:
+    if landing_failure is not None and fill_outcome is ScoutReadbackOutcome.EMPTY:
         # A form that commits on the last character clears its own field and moves on, so the field
         # reads empty because the fill worked, not because it was lost. Only the page having left the
         # one the fill acted on distinguishes the two, and it is read here rather than up front
@@ -804,26 +814,25 @@ async def _fill_credential_field_impl_serial(
                 field=field,
             )
             landing_failure = None
-            fill_verdict = ScoutTypeVerdict.UNKNOWN
             landing_inferred_from_navigation = True
+    LOG.info(
+        "copilot fill_credential_field readback outcome",
+        selector=selector,
+        credential_id=credential_id,
+        field=field,
+        outcome=fill_outcome.value,
+        inferred_from_navigation=landing_inferred_from_navigation,
+    )
     if landing_failure is not None:
-        LOG.info(
-            "copilot fill_credential_field did not land",
-            selector=selector,
-            credential_id=credential_id,
-            field=field,
-            verdict=fill_verdict.value,
-        )
+        landing_failure["data"] = {
+            "selector": selector,
+            "credential_id": credential_id,
+            "field": field,
+            "typed_length": len(value),
+            "readback_outcome": fill_outcome.value,
+            "landing_inferred_from_navigation": landing_inferred_from_navigation,
+        }
         return finish(landing_failure)
-    if fill_verdict is ScoutTypeVerdict.UNKNOWN:
-        # The fill is recorded as landed either way; without this the unread case is
-        # indistinguishable in the logs from a readback that confirmed the value.
-        LOG.info(
-            "copilot fill_credential_field landing unverified",
-            selector=selector,
-            credential_id=credential_id,
-            field=field,
-        )
     url = await _live_working_page_url(copilot_ctx) or ""
     _record_scouted_interaction(
         copilot_ctx,
@@ -833,12 +842,8 @@ async def _fill_credential_field_impl_serial(
         selector_match_count=fill_probe.selector_match_count,
         source_url=source_url,
         result_url=url,
-        observed_effects=(
-            # The field read back empty and only the page having moved says the fill landed, so the
-            # landing is carried as the inference it is rather than as something read off the field.
-            {"value_landed": True, "landing_inferred_from_navigation": True}
-            if landing_inferred_from_navigation
-            else {"value_landed": True}
+        observed_effects=_fill_observed_effects(
+            fill_outcome, landing_inferred_from_navigation=landing_inferred_from_navigation
         ),
         typed_length=len(value),
         role=fill_probe.role,
@@ -869,6 +874,8 @@ async def _fill_credential_field_impl_serial(
         "typed_length": len(value),
         "url": url,
         "credential_name": credential_name,
+        "readback_outcome": fill_outcome.value,
+        "landing_inferred_from_navigation": landing_inferred_from_navigation,
         # Stated rather than left to be read off which other keys are present: whether the form went
         # in is the one thing here the model must not have to infer.
         "submitted": False,
@@ -878,6 +885,12 @@ async def _fill_credential_field_impl_serial(
         # The page moved on under the fill, which is the form having committed itself. The probed
         # control belongs to the page that is gone, so clicking now would act on a different one.
         data["submit_skipped"] = _credential_submit_already_committed_notice()
+    elif submit_probe is not None and fill_outcome is ScoutReadbackOutcome.DIFFERENT and field == "totp":
+        # Submitting a code the field does not hold voids it, which no retry recovers; a username or
+        # password that submits wrong just fails the sign-in, and the run says so. A field that
+        # reformats what it accepts also reads back different, so this trades one round trip for the
+        # code, and is scoped to the field where that trade is worth making.
+        data["submit_skipped"] = _credential_submit_unconfirmed_readback_notice()
     elif submit_probe is not None:
         submit = await _submit_after_credential_fill(
             copilot_ctx,

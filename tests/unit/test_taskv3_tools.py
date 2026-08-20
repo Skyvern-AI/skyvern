@@ -837,3 +837,344 @@ async def test_preflighted_tool_resolves_page_once_per_call() -> None:
     assert calls == 1
     await _tool(tools, "click").handler({"selector": "#b"})
     assert calls == 2
+
+
+_STATUS_PAGE_HTML = """
+<!doctype html><html><head><title>Apply</title></head><body>
+  <h1>Software Engineer</h1>
+  <p>{prose}</p>
+  <div id="result-panel">
+    <div role="status" aria-live="polite"><h2>Success</h2><p>Your submission was received. We will contact you if there are next steps.</p></div>
+  </div>
+  <div role="alert">We couldn't process your request. Please try again.</div>
+  <button id="toggle-no" aria-pressed="true">No</button>
+  <input id="email" type="email" placeholder="Email">
+</body></html>
+"""
+
+
+@contextlib.asynccontextmanager
+async def _content_page(html: str) -> AsyncIterator[Any]:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+            await page.set_content(html)
+            yield page
+        finally:
+            await browser.close()
+
+
+async def _observe_data(page: Any) -> dict[str, Any]:
+    from skyvern.forge.taskv3.tools import _OBSERVE_JS  # noqa: PLC0415
+
+    return json.loads(await page.evaluate(_OBSERVE_JS))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_status_alert_and_heading_text() -> None:
+    # After an async submit many sites replace the form with a static outcome banner (role=status /
+    # role=alert). observe lists only interactive elements, so without a text digest the outcome is
+    # invisible and the agent re-submits (duplicate submissions) or falsely reports failure.
+    prose = "word " * 200  # long plain prose: NOT a status source, must stay out of the digest
+    async with _content_page(_STATUS_PAGE_HTML.format(prose=prose)) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        joined = " | ".join(texts)
+        assert "Your submission was received" in joined  # role=status body, not just the heading
+        assert "We couldn't process your request" in joined  # role=alert
+        assert "word word word word word" not in joined  # plain prose excluded
+        assert sum(len(t) for t in texts) <= 900
+        assert all(len(t) <= 300 for t in texts)
+        # The role=status body and its inner heading must not appear twice (dedupe).
+        assert joined.count("Your submission was received") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_takes_heading_alone_when_parent_is_large() -> None:
+    # A heading inside a large container (e.g. h1 over the whole page body) contributes only its own
+    # text; pulling the parent text would re-open the context-growth problem the digest cap exists for.
+    prose = "word " * 200
+    async with _content_page(_STATUS_PAGE_HTML.format(prose=prose)) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert any(t == "Software Engineer" for t in texts)  # h1 text alone, not the whole body
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_total_cap_holds_under_adversarial_status_content() -> None:
+    html = (
+        "<!doctype html><html><body>"
+        + "".join(f'<div role="status">{"status entry %d " % i * 30}</div>' for i in range(20))
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert texts  # something survived
+        assert sum(len(t) for t in texts) <= 900
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_reports_aria_pressed_state() -> None:
+    # Toggle buttons (aria-pressed) previously showed no state, so agents re-clicked them for turns.
+    prose = "short"
+    async with _content_page(_STATUS_PAGE_HTML.format(prose=prose)) as page:
+        data = await _observe_data(page)
+        by_sel = {e["selector"]: e for e in data["elements"]}
+        assert by_sel["#toggle-no"].get("pressed") is True
+
+
+@pytest.mark.asyncio
+async def test_observe_renders_text_digest_and_pressed_state() -> None:
+    class _DigestPage(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps(
+                {
+                    "url": self.url,
+                    "title": "Apply",
+                    "text": ["Success Your submission was received."],
+                    "elements": [
+                        {"i": 0, "tag": "button", "type": None, "selector": "#no", "label": "No", "pressed": True}
+                    ],
+                }
+            )
+
+    tools = build_browser_tools(_fixed_page_provider(_DigestPage()))
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    assert "text: 'Success Your submission was received.'" in r.content
+    assert "pressed=True" in r.content
+
+
+@pytest.mark.asyncio
+async def test_get_html_falls_back_to_outer_html_for_empty_leaf() -> None:
+    # inner_html of a void/leaf element ("", e.g. <input>) used to return ok("") — no signal at all.
+    # The element's own tag+attributes are the useful answer for a leaf.
+    class _LeafElement(_FakeElement):
+        async def inner_html(self) -> str:
+            return ""
+
+        async def evaluate(self, js: str) -> str:
+            return '<input id="email" type="email">'
+
+    page = _FakePage()
+    page.element = _LeafElement()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "get_html").handler({"selector": "#email"})
+    assert r.status == "ok"
+    assert r.content == '<input id="email" type="email">'
+
+
+@pytest.mark.asyncio
+async def test_get_html_marks_truncation_explicitly() -> None:
+    class _BigElement(_FakeElement):
+        async def inner_html(self) -> str:
+            return "x" * 30000
+
+    page = _FakePage()
+    page.element = _BigElement()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "get_html").handler({"selector": "#big"})
+    assert r.status == "ok"
+    assert len(r.content) < 30000
+    assert r.content.endswith("…[truncated at 20000 chars]")
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_http_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    # navigate used to say "navigated to <url>" unconditionally — a 400 error page read as success,
+    # masking dead asset URLs and blank shells from the model.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+
+    class _Response:
+        status = 400
+
+    class _StatusPage(_FakePage):
+        async def goto(self, url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+            self.url = url
+            return _Response()
+
+    tools = build_browser_tools(_fixed_page_provider(_StatusPage()))
+    r = await _tool(tools, "navigate").handler({"url": "https://example.test/apply"})
+    assert r.status == "ok"
+    assert "HTTP 400" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_containment_dedupe_keeps_one_banner_copy() -> None:
+    # An alert's text re-surfaces inside its heading's parent container text; the digest must not
+    # spend its cap twice on the same banner.
+    html = """<!doctype html><html><body>
+      <div id="panel"><h2>Account Access</h2><div role="alert">Access revoked — contact your administrator</div></div>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert sum("Access revoked" in t for t in texts) == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_survives_hostile_page_with_throwing_text_accessor() -> None:
+    # Fingerprinting/prototype-patched pages can make innerText throw on nodes only the digest
+    # visits (headings, live regions). A digest failure must degrade to "no digest", never take
+    # down element perception with it.
+    filler = "lorem ipsum " * 40  # parent text > 300 chars forces the heading-text-alone branch
+    html = """<!doctype html><html><body>
+      <h1 id="poisoned">Title</h1>
+      <p>FILLER</p>
+      <input id="email" type="email" placeholder="Email">
+      <script>
+        Object.defineProperty(document.getElementById('poisoned'), 'innerText',
+          { get() { throw new Error('boom from poisoned innerText'); } });
+      </script>
+    </body></html>""".replace("FILLER", filler)
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        selectors = [e["selector"] for e in data["elements"]]
+        assert "#email" in selectors  # element perception intact despite the poisoned digest source
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_surfaces_cross_origin_iframe_presence() -> None:
+    # An anti-bot widget rendered in a cross-origin iframe gates submission on many sites, but
+    # element perception is main-frame only — without a presence record the model can neither see
+    # nor reason about the gate. Attributes only (host + signature); never the frame's document.
+    html = """<!doctype html><html><body>
+      <input id="email" type="email" placeholder="Email">
+      <iframe src="https://challenges.antibot-vendor.test/turnstile/anchor?k=secret123"
+              title="Widget containing a security challenge" width="300" height="65"></iframe>
+      <iframe src="https://tracker.analytics.test/pixel" style="display:none"></iframe>
+      <iframe srcdoc="<p>same-origin help panel</p>" src="https://legacy.fallback.test/x"
+              width="200" height="50"></iframe>
+      <button id="submit">Submit application</button>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        entries = info.get("entries") or []
+        assert info.get("total") == 1  # hidden and srcdoc frames (even with a src fallback) are excluded
+        assert len(entries) == 1
+        assert entries[0]["host"] == "challenges.antibot-vendor.test"
+        assert entries[0]["captcha"] is True
+        assert "secret123" not in json.dumps(entries)  # hosts only — no full URLs/query strings
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_iframe_summary_is_bounded() -> None:
+    # A frame-heavy page (embeds, ad slots) must not regrow the context the digest work bounded:
+    # detail is capped while the total count stays honest.
+    frames = "\n".join(
+        f'<iframe src="https://embed{i}.media.test/player" width="100" height="40"></iframe>' for i in range(12)
+    )
+    async with _content_page(f"<!doctype html><html><body>{frames}</body></html>") as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        assert info.get("total") == 12
+        assert len(info.get("entries") or []) <= 8
+
+
+@pytest.mark.asyncio
+async def test_observe_renders_cross_origin_iframe_presence_line() -> None:
+    # The rendered line must carry the captcha flag and say the frame's contents are unreachable,
+    # so the model doesn't hunt for the widget's elements with selectors that can never resolve.
+    class _IframePage(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps(
+                {
+                    "url": self.url,
+                    "title": "Apply",
+                    "text": [],
+                    "iframes": {
+                        "total": 9,
+                        "entries": [
+                            {"host": "challenges.antibot-vendor.test", "title": "Security challenge", "captcha": True},
+                            {"host": "embed.media.test", "title": "", "captcha": False},
+                        ],
+                    },
+                    "elements": [],
+                }
+            )
+
+    tools = build_browser_tools(_fixed_page_provider(_IframePage()))
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    assert "9 cross-origin" in r.content
+    assert "[captcha] challenges.antibot-vendor.test" in r.content
+    assert "embed.media.test" in r.content
+    assert "+7 more" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_iframe_scan_survives_poisoned_frame_and_renders_end_to_end() -> None:
+    # A hostile page can poison a single frame's accessors; the iframe scan must degrade to "no
+    # iframe report" without taking element perception down (same isolation contract as the digest).
+    # Also drives a healthy page through the REAL observe() handler — JS shape and Python renderer
+    # are otherwise only ever tested against each other's hand-written stand-ins.
+    poisoned = """<!doctype html><html><body>
+      <input id="email" type="email" placeholder="Email">
+      <iframe id="bad" src="https://challenges.antibot-vendor.test/anchor" width="100" height="40"></iframe>
+      <script>
+        Object.defineProperty(document.getElementById('bad'), 'getBoundingClientRect',
+          { get() { throw new Error('boom from poisoned frame'); } });
+      </script>
+    </body></html>"""
+    async with _content_page(poisoned) as page:
+        data = await _observe_data(page)
+        assert "#email" in [e["selector"] for e in data["elements"]]  # element perception intact
+        info = data.get("iframes") or {}
+        assert info.get("total") == 0 and not info.get("entries")  # degraded, not crashed
+    healthy = """<!doctype html><html><body>
+      <input id="email" type="email" placeholder="Email">
+      <iframe src="https://challenges.antibot-vendor.test/turnstile/anchor"
+              title="Security challenge" width="300" height="65"></iframe>
+    </body></html>"""
+    async with _content_page(healthy) as page:
+
+        async def _provider() -> Any:
+            return page
+
+        r = await _tool(build_browser_tools(_provider), "observe").handler({})
+        assert r.status == "ok"
+        assert "iframes: 1 cross-origin" in r.content
+        assert "[captcha] challenges.antibot-vendor.test" in r.content
+
+
+@pytest.mark.asyncio
+async def test_observe_omits_iframe_line_when_no_cross_origin_iframes() -> None:
+    # The common case (no cross-origin frames) must add zero output — not an empty line on every
+    # observe of every run.
+    tools = build_browser_tools(_fixed_page_provider(_FakePage()))
+    r = await _tool(tools, "observe").handler({})
+    assert r.status == "ok"
+    assert "iframes:" not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_superset_replaces_terse_contained_entry() -> None:
+    # A terse live-region entry collected first ("Saved") must not suppress a later, richer
+    # superset ("Saved — confirmation #A1B2") — the superset replaces it.
+    html = """<!doctype html><html><body>
+      <div role="status">Saved</div>
+      <div><h2>Saved</h2><p>— confirmation #A1B2</p></div>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert any("confirmation #A1B2" in t for t in texts)
+        assert "Saved" not in texts  # the bare terse entry was replaced, not kept alongside
