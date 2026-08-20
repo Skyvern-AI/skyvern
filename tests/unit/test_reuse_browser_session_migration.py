@@ -12,10 +12,18 @@ from sqlalchemy.engine import Connection, make_url
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.sequential_key import resolve_reuse_bound_key
 
-_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "alembic/versions/2026_08_15_1201-b7e5d9f3a201_add_persistent_session_workflow_binding.py"
-)
+def _resolve_migration_path() -> Path:
+    # Matched by suffix, not by full filename: the open-source mirror regenerates this
+    # migration under its own date and revision id, so a hardcoded name resolves in only
+    # one of the two trees.
+    versions = Path(__file__).resolve().parents[2] / "alembic/versions"
+    matches = sorted(versions.glob("*_add_persistent_session_workflow_binding.py"))
+    if not matches:
+        raise AssertionError(f"no persistent_session_workflow_binding migration found in {versions}")
+    return matches[-1]
+
+
+_MIGRATION_PATH = _resolve_migration_path()
 
 
 def _load_migration_module():
