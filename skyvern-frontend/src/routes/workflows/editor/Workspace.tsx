@@ -117,7 +117,11 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -726,11 +730,13 @@ function Workspace({
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
+    enabled: isGeneratingCode,
     workflowPermanentId,
     pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "pending",
