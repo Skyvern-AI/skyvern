@@ -24680,6 +24680,76 @@
         ],
         "title": "TaskV2BlockYAML"
       },
+      "TelInputOutcome": {
+        "properties": {
+          "flag_enabled": {
+            "type": "boolean",
+            "title": "Flag Enabled"
+          },
+          "final_element_id": {
+            "type": "string",
+            "title": "Final Element Id"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/TelInputStrategy"
+          },
+          "expected_digit_count": {
+            "type": "integer",
+            "title": "Expected Digit Count"
+          },
+          "actual_digit_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Digit Count"
+          },
+          "browser_valid": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Valid"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "title": "Attempt Count"
+          },
+          "retargeted": {
+            "type": "boolean",
+            "title": "Retargeted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "flag_enabled",
+          "final_element_id",
+          "strategy",
+          "expected_digit_count",
+          "attempt_count",
+          "retargeted"
+        ],
+        "title": "TelInputOutcome"
+      },
+      "TelInputStrategy": {
+        "type": "string",
+        "enum": [
+          "legacy_sequential",
+          "formatted_sequential",
+          "sequential_national",
+          "atomic_national",
+          "atomic_e164"
+        ],
+        "title": "TelInputStrategy"
+      },
       "TextPromptBlock": {
         "properties": {
           "label": {
