@@ -1,13 +1,6 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useWorkflowSchedulesQuery } from "@/routes/workflows/hooks/useWorkflowSchedulesQuery";
 import {
   useCreateScheduleMutation,
@@ -19,7 +12,7 @@ import { ScheduleCard } from "./ScheduleCard";
 import { CreateScheduleDialog } from "./CreateScheduleDialog";
 import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 type Props = {
   onClose?: () => void;
@@ -40,7 +33,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
     scheduleId: string | null;
   }>({ open: false, scheduleId: null });
 
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const workflowParameters = workflow?.workflow_definition.parameters ?? [];
 
@@ -80,9 +73,9 @@ function WorkflowSchedulePanel({ onClose }: Props) {
   };
 
   return (
-    <div className="flex h-full w-[22rem] flex-col rounded-lg border border-slate-700 bg-slate-elevation3">
-      <div className="flex items-center justify-between border-b border-slate-700 px-4 py-4">
-        <h3 className="text-sm font-normal text-slate-50">
+    <div className="flex h-full w-[22rem] flex-col rounded-lg border border-border bg-slate-elevation3">
+      <div className="flex items-center justify-between border-b border-border px-4 py-4">
+        <h3 className="text-sm font-normal text-foreground">
           Schedules
           {schedules && schedules.length > 0 ? ` (${schedules.length})` : ""}
         </h3>
@@ -111,14 +104,14 @@ function WorkflowSchedulePanel({ onClose }: Props) {
           <div className="flex flex-col gap-3 px-4 py-2">
             {isLoading && (
               <div className="flex items-center justify-center py-8">
-                <ReloadIcon className="size-5 animate-spin text-slate-400" />
+                <ReloadIcon className="size-5 animate-spin text-muted-foreground" />
               </div>
             )}
             {isError && (
-              <div className="py-8 text-center text-sm text-red-400">
+              <div className="py-8 text-center text-sm text-red-700 dark:text-red-400">
                 Failed to load schedules.
                 {error?.message && (
-                  <span className="block text-xs text-slate-500">
+                  <span className="block text-xs text-muted-foreground dark:text-slate-500">
                     {error.message}
                   </span>
                 )}
@@ -127,7 +120,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
             {!isLoading &&
               !isError &&
               (!schedules || schedules.length === 0) && (
-                <div className="py-8 text-center text-sm text-slate-500">
+                <div className="py-8 text-center text-sm text-muted-foreground dark:text-slate-500">
                   No schedules configured.
                   <br />
                   Click &quot;Add&quot; to create one.
@@ -148,42 +141,18 @@ function WorkflowSchedulePanel({ onClose }: Props) {
         </ScrollAreaViewport>
       </ScrollArea>
 
-      <Dialog
+      <ConfirmDialog
         open={deleteDialogState.open}
         onOpenChange={(open) => {
-          if (!open && !deleteSchedule.isPending) {
+          if (!open) {
             setDeleteDialogState({ open: false, scheduleId: null });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Schedule</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this schedule? This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={deleteSchedule.isPending}
-              onClick={() =>
-                setDeleteDialogState({ open: false, scheduleId: null })
-              }
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteSchedule.isPending}
-              onClick={handleDeleteConfirm}
-            >
-              {deleteSchedule.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title="Delete schedule?"
+        description={<p>This schedule will be permanently deleted.</p>}
+        isPending={deleteSchedule.isPending}
+        onConfirm={handleDeleteConfirm}
+      />
     </div>
   );
 }

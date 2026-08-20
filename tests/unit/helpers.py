@@ -22,9 +22,16 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 
 
 class FakeLLMResponse:
-    def __init__(self, model: str, content: str | None = '{"actions": []}', finish_reason: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        content: str | None = '{"actions": []}',
+        finish_reason: str | None = None,
+        hidden_params: dict[str, Any] | None = None,
+    ) -> None:
         self.model = model
         self._content = content
+        self._hidden_params = hidden_params or {}
         self.choices = [
             SimpleNamespace(
                 finish_reason=finish_reason,
@@ -56,15 +63,17 @@ class FakeLLMResponse:
 class DummyLogger:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, Any]]] = []
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+        self.exceptions: list[tuple[str, dict[str, Any]]] = []
 
     def info(self, event: str, **kwargs: dict[str, Any]) -> None:
         self.events.append((event, kwargs))
 
-    def warning(self, *args, **kwargs) -> None:  # pragma: no cover
-        pass
+    def warning(self, event: str = "", **kwargs: Any) -> None:
+        self.warnings.append((event, kwargs))
 
-    def exception(self, *args, **kwargs) -> None:  # pragma: no cover
-        pass
+    def exception(self, event: str = "", **kwargs: Any) -> None:
+        self.exceptions.append((event, kwargs))
 
     def debug(self, *args, **kwargs) -> None:  # pragma: no cover
         pass

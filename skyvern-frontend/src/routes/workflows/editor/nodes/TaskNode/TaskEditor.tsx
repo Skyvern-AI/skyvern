@@ -87,11 +87,13 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               <div className="space-y-2">
                 <div className="flex justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">URL</Label>
+                    <Label className="text-xs text-tertiary-foreground">
+                      URL
+                    </Label>
                     <HelpTooltip content={helpTooltips["task"]["url"]} />
                   </div>
                   {isFirstWorkflowBlock && !hasInteracted ? (
-                    <div className="flex justify-end text-xs text-slate-400">
+                    <div className="flex justify-end text-xs text-muted-foreground">
                       Tip: Type {"{{"} to reference a parameter
                     </div>
                   ) : null}
@@ -106,7 +108,9 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Goal</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Goal
+                  </Label>
                   <HelpTooltip
                     content={helpTooltips["task"]["navigationGoal"]}
                   />
@@ -138,7 +142,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
             <div className="space-y-4">
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Data Extraction Goal
                   </Label>
                   <HelpTooltip
@@ -182,7 +186,9 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
           <AccordionContent className="pl-6 pr-1 pt-1">
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">Complete if...</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  Complete if...
+                </Label>
                 <WorkflowBlockInputTextarea
                   aiImprove={AI_IMPROVE_CONFIGS.task.completeCriterion}
                   nodeId={blockId}
@@ -199,7 +205,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                   <HelpTooltip content={helpTooltips["task"]["engine"]} />
@@ -212,7 +218,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip
@@ -237,7 +243,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip
@@ -315,7 +321,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               <Separator />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Complete on Download
                   </Label>
                   <HelpTooltip
@@ -333,7 +339,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     File Name
                   </Label>
                   <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
@@ -350,7 +356,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -369,14 +375,14 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   className="nopan text-xs"
                 />
                 {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-muted-foreground dark:text-slate-500">
                     Leave empty to use the credential's value.
                   </p>
                 ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip

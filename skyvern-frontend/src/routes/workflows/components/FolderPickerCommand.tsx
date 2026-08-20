@@ -93,10 +93,10 @@ function FolderPickerCommand({
                   disabled={isCurrent || disabled}
                   onSelect={() => onSelect(folder.folder_id)}
                 >
-                  <FolderIcon className="mr-2 h-4 w-4 shrink-0 text-blue-400" />
+                  <FolderIcon className="mr-2 h-4 w-4 shrink-0 text-blue-700 dark:text-blue-400" />
                   <span className="truncate">{folder.title}</span>
                   {isCurrent ? (
-                    <CheckIcon className="ml-auto h-4 w-4 text-blue-400" />
+                    <CheckIcon className="ml-auto h-4 w-4 text-blue-700 dark:text-blue-400" />
                   ) : null}
                 </CommandItem>
               );

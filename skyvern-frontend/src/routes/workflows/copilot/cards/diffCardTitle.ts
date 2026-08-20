@@ -3,15 +3,24 @@ import { TurnNarrativeState } from "../narrativeState";
 type DiffCardTitleOptions = {
   pendingProposal?: boolean;
   rejected?: boolean;
+  accepted?: boolean;
 };
 
 export function getDiffCardTitle(
   turn: TurnNarrativeState,
-  { pendingProposal = false, rejected = false }: DiffCardTitleOptions = {},
+  {
+    pendingProposal = false,
+    rejected = false,
+    accepted = false,
+  }: DiffCardTitleOptions = {},
 ): string {
   const summary = turn.draft?.summary?.trim();
   if (summary) {
     return summary;
+  }
+
+  if (accepted) {
+    return "Applied changes";
   }
 
   // "Applied changes" requires the backend's explicit auto-applied signal.

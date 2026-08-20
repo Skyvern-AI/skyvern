@@ -116,7 +116,7 @@ function NavigationEditorBody({
       <div className="space-y-4">
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={helpTooltips["navigation"]["url"]} />
           </div>
           <WorkflowBlockInputTextarea
@@ -128,7 +128,7 @@ function NavigationEditorBody({
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-slate-300">Prompt</Label>
+          <Label className="text-xs text-tertiary-foreground">Prompt</Label>
           <WorkflowBlockInputTextarea
             aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
             nodeId={blockId}
@@ -140,7 +140,9 @@ function NavigationEditorBody({
         </div>
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs font-normal text-slate-300">Engine</Label>
+            <Label className="text-xs font-normal text-tertiary-foreground">
+              Engine
+            </Label>
             <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
           </div>
           <RunEngineSelector
@@ -166,7 +168,9 @@ function NavigationEditorBody({
               />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Max Steps</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Max Steps
+                  </Label>
                   <HelpTooltip content={helpTooltips["taskv2"]["maxSteps"]} />
                 </div>
                 <Input
@@ -201,7 +205,7 @@ function NavigationEditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -220,14 +224,14 @@ function NavigationEditorBody({
                   className="nopan text-xs"
                 />
                 {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-muted-foreground dark:text-slate-500">
                     Leave empty to use the credential's value.
                   </p>
                 ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip
@@ -254,7 +258,7 @@ function NavigationEditorBody({
       <div className="space-y-4">
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">URL</Label>
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
             <HelpTooltip content={helpTooltips["navigation"]["url"]} />
           </div>
           <WorkflowBlockInputTextarea
@@ -267,7 +271,7 @@ function NavigationEditorBody({
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Prompt</Label>
+            <Label className="text-xs text-tertiary-foreground">Prompt</Label>
             <HelpTooltip
               content={helpTooltips["navigation"]["navigationGoal"]}
             />
@@ -294,7 +298,9 @@ function NavigationEditorBody({
         )}
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Label className="text-xs font-normal text-slate-300">Engine</Label>
+            <Label className="text-xs font-normal text-tertiary-foreground">
+              Engine
+            </Label>
             <HelpTooltip content={helpTooltips["navigation"]["engine"]} />
           </div>
           <RunEngineSelector
@@ -323,7 +329,9 @@ function NavigationEditorBody({
                 />
               </div>
               <div className="space-y-2">
-                <Label className="text-xs text-slate-300">Complete if...</Label>
+                <Label className="text-xs text-tertiary-foreground">
+                  Complete if...
+                </Label>
                 <WorkflowBlockInputTextarea
                   aiImprove={AI_IMPROVE_CONFIGS.navigation.completeCriterion}
                   nodeId={blockId}
@@ -340,7 +348,7 @@ function NavigationEditorBody({
               />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip
@@ -365,7 +373,7 @@ function NavigationEditorBody({
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs font-normal text-slate-300">
+                    <Label className="text-xs font-normal text-tertiary-foreground">
                       Error Messages
                     </Label>
                     <HelpTooltip
@@ -430,7 +438,7 @@ function NavigationEditorBody({
               <Separator />
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Complete on Download
                   </Label>
                   <HelpTooltip
@@ -448,7 +456,7 @@ function NavigationEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     File Name
                   </Label>
                   <HelpTooltip
@@ -467,7 +475,7 @@ function NavigationEditorBody({
               <Separator />
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Identifier
                   </Label>
                   <HelpTooltip
@@ -486,14 +494,14 @@ function NavigationEditorBody({
                   className="nopan text-xs"
                 />
                 {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-muted-foreground dark:text-slate-500">
                     Leave empty to use the credential's value.
                   </p>
                 ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     2FA Verification URL
                   </Label>
                   <HelpTooltip

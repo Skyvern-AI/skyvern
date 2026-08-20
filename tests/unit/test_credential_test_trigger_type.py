@@ -16,7 +16,7 @@ from skyvern.schemas.runs import ProxyLocation
 
 USER_AGENT_CASES = [
     ("skyvern-ui", WorkflowRunTriggerType.manual),
-    ("skyvern-mcp", WorkflowRunTriggerType.manual),
+    ("skyvern-mcp", WorkflowRunTriggerType.mcp),
     (None, WorkflowRunTriggerType.api),
     ("python-sdk/1.0", WorkflowRunTriggerType.api),
 ]
@@ -212,7 +212,7 @@ def _auth_override() -> SimpleNamespace:
     "headers, expected",
     [
         ({"x-user-agent": "skyvern-ui"}, WorkflowRunTriggerType.manual),
-        ({"X-User-Agent": "skyvern-mcp"}, WorkflowRunTriggerType.manual),
+        ({"X-User-Agent": "skyvern-mcp"}, WorkflowRunTriggerType.mcp),
         ({}, WorkflowRunTriggerType.api),
         ({"x-user-agent": "python-sdk/1.0"}, WorkflowRunTriggerType.api),
     ],
@@ -243,6 +243,7 @@ def test_test_credential_endpoint_wires_user_agent_header(
     app = FastAPI()
     app.add_api_route("/credentials/{credential_id}/test", credentials.test_credential, methods=["POST"])
     app.dependency_overrides[org_auth_service.get_current_org] = _auth_override
+    app.dependency_overrides[org_auth_service.get_current_org_for_credential_routes] = _auth_override
 
     resp = TestClient(app).post(
         "/credentials/cred_test/test",
@@ -281,6 +282,7 @@ def test_test_login_endpoint_wires_user_agent_header(
     app = FastAPI()
     app.add_api_route("/credentials/test-login", credentials.test_login, methods=["POST"])
     app.dependency_overrides[org_auth_service.get_current_org] = _auth_override
+    app.dependency_overrides[org_auth_service.get_current_org_for_credential_routes] = _auth_override
 
     resp = TestClient(app).post(
         "/credentials/test-login",

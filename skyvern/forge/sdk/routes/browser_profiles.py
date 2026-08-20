@@ -31,6 +31,7 @@ from skyvern.forge.sdk.routes.code_samples import (
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
+    BrowserProfileUsage,
     CreateBrowserProfileRequest,
     UpdateBrowserProfileRequest,
 )
@@ -41,29 +42,11 @@ from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_pers
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
 
 LOG = structlog.get_logger()
 
 DEFAULT_PROFILE_BROWSER_TYPES = ("chrome", "chromium")
-DEFAULT_PROFILE_COPY_IGNORE = {
-    "Snapshots",
-    "GrShaderCache",
-    "ShaderCache",
-    "GraphiteDawnCache",
-    "DawnCache",
-    "DawnGraphiteCache",
-    "DawnWebGPUCache",
-    "Guest Profile",
-    "Profile 2",
-    "Profile 3",
-    "BrowserMetrics",
-    "Crashpad",
-    "CrashpadMetrics-active.pma",
-    "SingletonCookie",
-    "SingletonLock",
-    "SingletonSocket",
-    "DevToolsActivePort",
-}
 
 
 def _normalize_proxy_pin_fields(
@@ -310,6 +293,57 @@ async def get_browser_profile(
     return profile
 
 
+@base_router.get(
+    "/browser_profiles/{profile_id}/usage",
+    response_model=BrowserProfileUsage,
+    tags=["Browser Profiles"],
+    summary="Get browser profile usage",
+    description="List the workflows, credentials, and recent runs that depend on a browser profile.",
+    responses={
+        200: {"description": "Successfully retrieved browser profile usage"},
+        404: {"description": "Browser profile not found"},
+    },
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_browser_profile_usage",
+    },
+)
+@base_router.get(
+    "/browser_profiles/{profile_id}/usage/",
+    response_model=BrowserProfileUsage,
+    include_in_schema=False,
+)
+async def get_browser_profile_usage(
+    profile_id: str = Path(
+        ...,
+        description="The ID of the browser profile. browser_profile_id starts with `bp_`",
+        examples=["bp_123456"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserProfileUsage:
+    """List the workflows, credentials, and recent runs that depend on a browser profile."""
+    organization_id = current_org.organization_id
+    profile = await app.DATABASE.browser_sessions.get_browser_profile(
+        profile_id=profile_id,
+        organization_id=organization_id,
+    )
+    if not profile:
+        raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+
+    usage = await app.DATABASE.browser_sessions.get_browser_profile_usage(
+        profile_id=profile_id,
+        organization_id=organization_id,
+    )
+    LOG.info(
+        "Retrieved browser profile usage",
+        organization_id=organization_id,
+        browser_profile_id=profile_id,
+        workflow_count=len(usage.workflows),
+        credential_count=len(usage.credentials),
+        recent_seeded_run_count=usage.recent_seeded_run_count,
+    )
+    return usage
+
+
 @base_router.patch(
     "/browser_profiles/{profile_id}",
     response_model=BrowserProfile,
@@ -439,7 +473,9 @@ async def delete_browser_profile(
     )
 
     try:
-        await app.DATABASE.browser_sessions.delete_browser_profile(
+        # Soft-delete and credential-detach happen in one transaction (see the repo method), so a dangling
+        # bp id can't survive a mid-failure and 404 the credential's next login.
+        cleared_credential_ids = await app.DATABASE.browser_sessions.delete_browser_profile(
             profile_id=profile_id,
             organization_id=organization_id,
         )
@@ -450,6 +486,14 @@ async def delete_browser_profile(
             browser_profile_id=profile_id,
         )
         raise
+
+    if cleared_credential_ids:
+        LOG.info(
+            "Detached credentials from deleted browser profile",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+            credential_ids=cleared_credential_ids,
+        )
 
     # Reap the stored blob so soft-deleted profiles don't leave orphaned S3 objects behind.
     # Best-effort: the soft-delete already succeeded, so a reap failure must not fail the request.
@@ -510,13 +554,22 @@ def _versioned_browser_profile_template_candidates(base_dir: FilePath, browser_t
     return [path for _, path in candidates]
 
 
+def _browser_profile_template_identity(directory: FilePath) -> str | None:
+    if (
+        not directory.is_dir()
+        or (directory / ".skyvern_corrupt").exists()
+        or not (directory / "Default").is_dir()
+        or not (directory / "Default" / "Preferences").is_file()
+        or not (directory / "Local State").is_file()
+    ):
+        return None
+    if directory.name in DEFAULT_PROFILE_BROWSER_TYPES:
+        return valid_operator_profile_generation(str(directory.parent), directory.name, str(directory))
+    return ""
+
+
 def _is_valid_browser_profile_template(directory: FilePath) -> bool:
-    return (
-        directory.is_dir()
-        and (directory / "Default").is_dir()
-        and (directory / "Default" / "Preferences").is_file()
-        and (directory / "Local State").is_file()
-    )
+    return _browser_profile_template_identity(directory) is not None
 
 
 def _clear_directory(directory: FilePath) -> None:
@@ -529,7 +582,7 @@ def _clear_directory(directory: FilePath) -> None:
 
 def _copy_browser_profile_template(source_dir: FilePath, destination_dir: FilePath) -> None:
     for source_child in source_dir.iterdir():
-        if source_child.name in DEFAULT_PROFILE_COPY_IGNORE:
+        if source_child.name in FRESH_PROFILE_COPY_IGNORE:
             continue
 
         destination_child = destination_dir / source_child.name
@@ -548,10 +601,13 @@ def _seed_minimal_empty_browser_profile_directory(profile_dir: FilePath) -> None
 
 def _seed_empty_browser_profile_directory(profile_dir: FilePath) -> None:
     for template_dir in _default_browser_profile_template_candidates():
-        if not _is_valid_browser_profile_template(template_dir):
+        template_identity = _browser_profile_template_identity(template_dir)
+        if template_identity is None:
             continue
         try:
             _copy_browser_profile_template(template_dir, profile_dir)
+            if _browser_profile_template_identity(template_dir) != template_identity:
+                raise OSError("Default browser profile template was invalidated while copying")
             LOG.info(
                 "Seeded empty browser profile from default profile template",
                 template_dir=str(template_dir),
@@ -819,7 +875,13 @@ async def _create_profile_from_workflow_run(
         )
         raise WorkflowNotFound(workflow_id=workflow_run.workflow_id)
 
-    if not getattr(workflow, "persist_browser_session", False):
+    # Flag-off orgs keep the legacy immediate 400 when the workflow doesn't persist. Under the engine a
+    # plain picked profile is a living sink even without persist, so archive-presence is the gate — the
+    # poll below decides (it also serves the run's browser_sink_profile_id), not persist_browser_session.
+    if (
+        not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id)
+        and not workflow.persist_browser_session
+    ):
         LOG.warning(
             "Workflow does not persist browser sessions",
             organization_id=organization_id,

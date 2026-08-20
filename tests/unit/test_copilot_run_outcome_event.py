@@ -18,14 +18,21 @@ from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, run_outcome_display_reason
+from skyvern.forge.sdk.copilot.run_outcome import (
+    RecordedRunOutcome,
+    recorded_output_report,
+    run_outcome_display_reason,
+    trusted_terminal_challenge_category_name,
+)
 from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
-    _adjudicated_run_outcome,
+    _record_executed_block_labels,
     _record_run_blocks_result,
+    _recorded_run_outcome,
+    _recorded_watchdog_block_receipts,
     _stash_recorded_run_outcome,
     _verify_and_record_run_blocks_result,
 )
@@ -55,6 +62,76 @@ def _run_result(blocks: list[dict[str, Any]], *, ok: bool = True) -> dict[str, A
             "blocks": blocks,
         },
     }
+
+
+def test_recorded_execution_labels_accumulate_across_runs_and_ignore_unexecuted_statuses() -> None:
+    ctx = _ctx()
+
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "completed_step", "status": "completed"},
+                {"label": "failed_step", "status": "failed"},
+                {"label": "skipped_step", "status": "skipped"},
+                {"label": "queued_step", "status": "queued"},
+            ],
+            ok=False,
+        ),
+    )
+    ctx.block_state_map.clear()
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "timed_out_step", "status": "timed_out"},
+                {"label": "skipped_step", "status": "skipped"},
+            ],
+            ok=False,
+        ),
+    )
+
+    assert ctx.executed_block_labels == {"completed_step", "failed_step", "timed_out_step"}
+
+
+def test_recorded_execution_fingerprint_changes_with_the_workflow_shape() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: step
+      prompt: Before
+"""
+
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+    before = set(ctx.executed_block_fingerprints["step"])
+    ctx.workflow_yaml = ctx.workflow_yaml.replace("Before", "After")
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+
+    assert before < ctx.executed_block_fingerprints["step"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_receipts_preserve_terminal_block_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    observer = SimpleNamespace(
+        get_workflow_run_blocks=lambda **_kwargs: None,
+    )
+
+    async def get_workflow_run_blocks(**_kwargs: Any) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(label="ran", status=SimpleNamespace(value="failed")),
+            SimpleNamespace(label="waiting", status=SimpleNamespace(value="queued")),
+        ]
+
+    observer.get_workflow_run_blocks = get_workflow_run_blocks
+    monkeypatch.setattr(run_execution.app.DATABASE, "observer", observer)
+
+    assert await _recorded_watchdog_block_receipts("wr_test", "org") == [
+        {"label": "ran", "status": "failed"},
+        {"label": "waiting", "status": "queued"},
+    ]
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
@@ -107,6 +184,7 @@ def _challenge_failure_result() -> dict[str, Any]:
             "category": "ANTI_BOT_DETECTION",
             "confidence_float": 0.95,
             "reasoning": "Typed run analysis reported an anti-bot challenge.",
+            "evidence_source": "challenge_state",
         }
     ]
     result["data"]["blocks"] = [
@@ -186,21 +264,36 @@ def _run_outcome_frames(stream: _FakeStream) -> list[WorkflowCopilotRunOutcomeUp
     return [frame for frame in stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)]
 
 
+def test_run_outcome_event_role_defaults_to_recorded() -> None:
+    frame = WorkflowCopilotRunOutcomeUpdate.model_validate(
+        {
+            "type": "run_outcome",
+            "workflow_run_id": "wr_test",
+            "verdict": "not_evaluated",
+            "iteration": 0,
+            "timestamp": "2026-06-10T00:00:00Z",
+        }
+    )
+
+    assert frame.role == "recorded"
+
+
 @pytest.mark.asyncio
-async def test_blocker_run_emits_hold_then_not_demonstrated() -> None:
+async def test_blocker_run_emits_not_demonstrated() -> None:
     result = _blocked_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
+    assert [frame.verdict for frame in frames] == ["not_demonstrated"]
     final = frames[-1]
     assert final.reason_code == "terminal_challenge_blocker"
     assert final.workflow_run_id == "wr_test"
     assert final.workflow_run_block_ids == ["wrb_open_registry_search", "wrb_search_registry_person"]
     assert final.block_labels == ["open_registry_search", "search_registry_person"]
     assert final.display_reason is not None and "human verification challenge" in final.display_reason
+    assert final.role == "recorded"
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_run_outcome == RecordedRunOutcome(
         verdict=final.verdict,
@@ -259,16 +352,18 @@ def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_data_run_emits_no_meaningful_output() -> None:
+async def test_empty_data_run_reports_completion_without_grading_the_output() -> None:
     result = _run_result([_code_block("search_registry_person", {"records": [], "result_count": 0})])
     ctx = _ctx(result["data"]["blocks"])
 
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
-    assert frames[-1].reason_code == "no_meaningful_output"
-    assert ctx.last_test_suspicious_success is True
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
+    assert frames[-1].reason_code is None
+    assert frames[-1].role == "recorded"
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_run_outcome is not None and ctx.last_run_outcome.role == "recorded"
 
 
 def _terminal_metadata_entry(label: str) -> dict[str, Any]:
@@ -291,66 +386,51 @@ def _terminal_metadata_entry(label: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_negative_adjudication_emits_outcome_not_demonstrated(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_completion_judge_cannot_overturn_run_output() -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.code_artifact_metadata = {"search_registry_person": _terminal_metadata_entry("search_registry_person")}
 
-    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
-        return _evaluated(satisfied=False)
+    outcome = _record_run_blocks_result(ctx, result, completion_verification=_evaluated(satisfied=False))
 
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
-    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-
-    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
-    final = frames[-1]
-    assert final.reason_code == "outcome_not_demonstrated"
-    assert final.display_reason is not None and "did not demonstrate the goal outcome" in final.display_reason
-    assert ctx.last_test_suspicious_success is True
-    assert ctx.last_full_workflow_test_ok is False
-    assert ctx.last_run_outcome is not None and ctx.last_run_outcome.verdict == "not_demonstrated"
-
-
-@pytest.mark.asyncio
-async def test_mid_build_fall_through_still_emits_not_demonstrated(monkeypatch: pytest.MonkeyPatch) -> None:
-    result = _clean_run_result()
-    ctx = _ctx(result["data"]["blocks"])
-
-    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
-        return _evaluated(satisfied=False)
-
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
-    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-
-    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
-    assert frames[-1].reason_code == "outcome_not_demonstrated"
+    assert outcome == RecordedRunOutcome(
+        verdict="not_evaluated",
+        workflow_run_id="wr_test",
+    )
+    assert ctx.completion_verification_result is None
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is False
-
-
-@pytest.mark.asyncio
-async def test_satisfied_adjudication_emits_demonstrated(monkeypatch: pytest.MonkeyPatch) -> None:
-    result = _clean_run_result()
-    ctx = _ctx(result["data"]["blocks"])
-
-    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
-        return _evaluated(satisfied=True)
-
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
-    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
-
-    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
-    assert frames[-1].reason_code is None
     assert ctx.last_full_workflow_test_ok is True
 
 
 @pytest.mark.asyncio
-async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_judge_dissatisfaction_does_not_change_the_verdict() -> None:
+    """The outcome derives from what the run produced; a judge re-reading the same run does not."""
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
+    assert ctx.last_test_suspicious_success is False
+
+
+@pytest.mark.asyncio
+async def test_completed_run_emits_factual_ungraded_record() -> None:
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
+    assert frames[-1].reason_code is None
+    assert frames[-1].role == "recorded"
+    assert ctx.last_full_workflow_test_ok is True
+
+
+@pytest.mark.asyncio
+async def test_completed_partial_run_does_not_promote_full_workflow() -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.last_workflow = SimpleNamespace(
@@ -362,50 +442,45 @@ async def test_satisfied_adjudication_emits_demonstrated_with_unverified_prefix(
         )
     )
 
-    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
-        return _evaluated(satisfied=True)
-
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "demonstrated"]
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
     assert frames[-1].reason_code is None
-    # A fully-verified completion promotes the full-workflow test result; this is the
-    # deterministic terminal path that lets a verified run finalize success.
-    assert ctx.last_full_workflow_test_ok is True
-    assert ctx.last_run_outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_run_outcome == RecordedRunOutcome(
+        verdict="not_evaluated",
+        workflow_run_id="wr_test",
+    )
 
 
 @pytest.mark.asyncio
-async def test_verification_skipped_emits_not_evaluated(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_completed_run_needs_no_verification_frame() -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
-    async def _stub_verification(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
     assert ctx.last_test_suspicious_success is False
 
 
 @pytest.mark.asyncio
-async def test_failed_run_emits_no_frames() -> None:
+async def test_failed_run_emits_its_own_outcome() -> None:
     result = _run_result([], ok=False)
     ctx = _ctx()
 
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
-    assert _run_outcome_frames(ctx.stream) == []  # type: ignore[arg-type]
-    assert ctx.last_run_outcome is None
+    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
+    assert [frame.verdict for frame in frames] == ["not_demonstrated"]
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
 
 
 @pytest.mark.asyncio
-async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_recording_error_emits_no_invented_frame(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _clean_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -416,8 +491,7 @@ async def test_evaluating_hold_gets_final_frame_when_recording_raises(monkeypatc
     with pytest.raises(RuntimeError, match="recording failed"):
         await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
-    frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_evaluated"]
+    assert _run_outcome_frames(ctx.stream) == []  # type: ignore[arg-type]
 
 
 def test_failed_rerun_clears_prior_recorded_outcome() -> None:
@@ -427,9 +501,8 @@ def test_failed_rerun_clears_prior_recorded_outcome() -> None:
 
     outcome = _record_run_blocks_result(ctx, _run_result([], ok=False), completion_verification=None)
 
-    assert outcome is None
-    assert ctx.last_run_outcome is None
-    assert ctx.last_run_outcome_block_labels == []
+    assert outcome is not None and outcome.verdict == "not_demonstrated"
+    assert ctx.last_run_outcome == outcome
 
 
 def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
@@ -446,7 +519,7 @@ def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
     assert ctx.last_run_outcome.workflow_run_id == "wr_test"
 
 
-def test_recorded_run_outcome_commits_same_adjudication_reach_state_over_reperception_contradiction() -> None:
+def test_completion_reperception_cannot_grade_a_completed_run() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
 
     outcome = _record_run_blocks_result(
@@ -455,15 +528,14 @@ def test_recorded_run_outcome_commits_same_adjudication_reach_state_over_reperce
         completion_verification=_mixed_observed_reach_state_with_reperception_contradiction(),
     )
 
-    assert outcome == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    assert outcome is not None and outcome.verdict == "not_evaluated"
     assert ctx.last_run_outcome == outcome
-    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_test_failure_reason is None
-    assert outcome_fully_verified(ctx) is True
+    assert outcome.reason_code is None
 
 
-def test_recorded_run_outcome_does_not_commit_requested_output_contradiction() -> None:
+def test_requested_output_judge_does_not_change_completed_run_record() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
 
     outcome = _record_run_blocks_result(
@@ -473,65 +545,55 @@ def test_recorded_run_outcome_does_not_commit_requested_output_contradiction() -
     )
 
     assert outcome is not None
-    assert outcome.verdict == "not_demonstrated"
+    assert outcome.verdict == "not_evaluated"
     assert ctx.last_run_outcome == outcome
-    assert outcome_fully_verified(ctx) is False
 
 
-def test_adjudication_keeps_committed_same_run_demonstrated_outcome() -> None:
+def test_run_outcome_trace_is_append_only_across_pointer_updates() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
     ctx.last_run_blocks_workflow_run_id = "wr_test"
-    committed = _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="demonstrated"))
+    committed = _stash_recorded_run_outcome(ctx, RecordedRunOutcome(verdict="not_evaluated"))
 
-    assert committed == RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    assert committed == RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_test")
 
-    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
     stashed = _stash_recorded_run_outcome(
         ctx,
         RecordedRunOutcome(
             verdict="not_demonstrated",
-            reason_code="outcome_not_demonstrated",
+            reason_code="blocker_reported",
             workflow_run_id="wr_test",
         ),
     )
 
-    assert adjudicated == committed
-    assert stashed == committed
-    assert ctx.last_run_outcome == committed
+    assert stashed.verdict == "not_demonstrated"
+    assert ctx.last_run_outcome == stashed
+    assert ctx.terminal_envelope_run_outcomes == [committed, stashed]
 
 
-def test_adjudication_does_not_keep_committed_outcome_for_new_run() -> None:
+def test_recorded_outcome_for_new_run_uses_current_run_id() -> None:
     ctx = _ctx([_code_block("search_registry_person", {"records": []})])
-    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_prior")
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_prior")
     ctx.last_run_blocks_workflow_run_id = "wr_test"
 
-    adjudicated = _adjudicated_run_outcome(ctx, _evaluated(satisfied=False))
+    recorded = _recorded_run_outcome(workflow_run_id="wr_test")
 
-    assert adjudicated.verdict == "not_demonstrated"
+    assert recorded is not ctx.last_run_outcome
+    assert recorded.workflow_run_id == "wr_test"
 
 
 @pytest.mark.asyncio
-async def test_missing_run_id_does_not_emit_committed_demonstrated_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_missing_run_id_does_not_reuse_prior_run_id() -> None:
     result = _clean_run_result()
     result["data"].pop("workflow_run_id")
     ctx = _ctx(result["data"]["blocks"])
-    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_test")
     ctx.last_run_blocks_workflow_run_id = "wr_test"
-
-    async def _stub_verification(*args: Any, **kwargs: Any) -> CompletionVerificationResult:
-        return _evaluated(satisfied=False)
-
-    monkeypatch.setattr(run_execution, "_maybe_run_completion_verification", _stub_verification)
 
     await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
 
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
-    assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
+    assert [frame.verdict for frame in frames] == ["not_evaluated"]
     assert frames[-1].workflow_run_id != "wr_test"
-    assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.verdict == "not_demonstrated"
 
 
 def test_both_consumers_route_through_single_producer() -> None:
@@ -586,6 +648,7 @@ def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
         verdict="not_demonstrated",
         reason_code="blocker_reported",
         display_reason="The search form is gated by a human verification challenge.",
+        role="interim_build_test",
     )
     ctx.last_run_outcome_block_labels = ["open_registry_search", "search_registry_person"]
 
@@ -596,8 +659,10 @@ def test_narrative_payload_stamps_outcome_on_adjudicated_labels() -> None:
         assert by_label[label]["state"] == "completed"
         assert by_label[label]["outcome"] == "not_demonstrated"
         assert by_label[label]["outcomeReason"] == "The search form is gated by a human verification challenge."
+        assert by_label[label]["outcomeRole"] == "interim_build_test"
     assert "outcome" not in by_label["untested_block"]
     assert "outcomeReason" not in by_label["untested_block"]
+    assert "outcomeRole" not in by_label["untested_block"]
 
 
 def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> None:
@@ -608,6 +673,7 @@ def test_narrative_payload_without_recorded_outcome_has_no_outcome_keys() -> Non
     for block in payload["blocks"]:
         assert "outcome" not in block
         assert "outcomeReason" not in block
+        assert "outcomeRole" not in block
 
 
 class TestGenuineAttemptRunStamp:
@@ -633,3 +699,126 @@ class TestGenuineAttemptRunStamp:
         assert ctx.last_test_ok is None
         assert ctx.last_run_blocks_workflow_run_id == "wr_test"
         assert ctx.has_genuine_workflow_attempt() is True
+
+
+def test_trusted_terminal_challenge_category_requires_carrier() -> None:
+    carried = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "artifact"}
+    keyword = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9, "evidence_source": "keyword_only"}
+    legacy = {"category": "ANTI_BOT_DETECTION", "confidence_float": 0.9}
+
+    assert trusted_terminal_challenge_category_name(carried) == "ANTI_BOT_DETECTION"
+    assert trusted_terminal_challenge_category_name(keyword) is None
+    assert trusted_terminal_challenge_category_name(legacy) is None
+
+
+@pytest.mark.asyncio
+async def test_completed_run_adds_no_mandatory_next_action() -> None:
+    result = _clean_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert "next_step" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_registered_output_remains_a_fact_without_a_verdict_or_instruction() -> None:
+    result = _clean_run_result()
+    result["data"]["registered_output_parameter_values"] = [
+        {
+            "workflow_run_id": "wr_test",
+            "output_parameter_key": "extract_document_output",
+            "block_label": "extract_document",
+            "block_type": "code",
+            "value": {"document_name": "Resale Demand Package (Required Statement of Fees - Demand)"},
+        }
+    ]
+    ctx = _ctx(result["data"]["blocks"])
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert result["data"]["registered_output_parameter_values"][0]["value"] == {
+        "document_name": "Resale Demand Package (Required Statement of Fees - Demand)"
+    }
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.output_report == (
+        'Recorded output from the latest completed run: {"extract_document_output":'
+        '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
+    )
+    assert "next_step" not in result["data"]
+
+
+def test_recorded_output_report_redacts_secret_key_values_before_json_serialization() -> None:
+    report = recorded_output_report(
+        [
+            {"output_parameter_key": "password", "value": "synthetic-password"},
+            {
+                "output_parameter_key": "result",
+                "value": {
+                    "token": "synthetic-token",
+                    "next_token": "page-2",
+                    "nested": {"api_key": "synthetic-api-key"},
+                },
+            },
+        ]
+    )
+
+    assert report == (
+        'Recorded output from the latest completed run: {"password":"[REDACTED_SECRET]",'
+        '"result":{"nested":{"api_key":"[REDACTED_SECRET]"},"next_token":"page-2",'
+        '"token":"[REDACTED_SECRET]"}}'
+    )
+    assert "synthetic-password" not in report
+    assert "synthetic-token" not in report
+    assert "synthetic-api-key" not in report
+
+
+@pytest.mark.asyncio
+async def test_failed_run_carries_no_conclude_signal() -> None:
+    result = _run_result([], ok=False)
+    ctx = _ctx()
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert "next_step" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_conclude_cue_absent_when_nothing_verified(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _run_result([_code_block("extract_count", {})])
+    ctx = _ctx(result["data"]["blocks"])
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.run_execution._record_run_blocks_result",
+        lambda *_a, **_k: RecordedRunOutcome(verdict="not_demonstrated"),
+    )
+
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+    assert result["data"].get("next_step") is None
+
+
+def test_completed_run_uses_retained_terminal_output_when_parameter_identity_cannot_attach() -> None:
+    """Regression for wr_561146288153685940: a regenerated snapshot id must not erase the run's output."""
+    result = _run_result([_code_block("retrieve_resale_demand_document", {"document_name": None})])
+    result["data"][_INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY] = True
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.verified_terminal_block_outputs = {
+        "retrieve_resale_demand_document": {
+            "document_name": "Resale Demand Package (Required Statement of Fees - Demand)"
+        }
+    }
+
+    outcome = _record_run_blocks_result(ctx, result)
+
+    assert outcome == RecordedRunOutcome(
+        verdict="not_evaluated",
+        workflow_run_id="wr_test",
+        output_report=(
+            'Recorded output from the latest completed run: {"retrieve_resale_demand_document":'
+            '{"document_name":"Resale Demand Package (Required Statement of Fees - Demand)"}}'
+        ),
+    )
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None

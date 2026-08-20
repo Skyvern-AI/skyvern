@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
+import { freshArtifactUrl } from "@/api/artifactUrls";
+import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { type BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 
@@ -138,7 +140,7 @@ function BrowserSessionDownloads() {
               {file.url && (
                 <div className="flex w-full gap-1.5">
                   {previewable ? (
-                    <a
+                    <ArtifactDownloadLink
                       href={file.url}
                       target="_blank"
                       rel="noopener noreferrer"
@@ -147,7 +149,7 @@ function BrowserSessionDownloads() {
                     >
                       <EyeOpenIcon className="size-3" />
                       Preview
-                    </a>
+                    </ArtifactDownloadLink>
                   ) : (
                     <button
                       disabled
@@ -159,7 +161,11 @@ function BrowserSessionDownloads() {
                     </button>
                   )}
                   <button
-                    onClick={() => downloadFile(file.url, filename)}
+                    onClick={() =>
+                      void freshArtifactUrl(credentialGetter, file.url).then(
+                        (url) => downloadFile(url, filename),
+                      )
+                    }
                     className="flex flex-1 items-center justify-center gap-1 rounded border px-2 py-1 text-xs hover:bg-muted"
                     title={`Download ${filename}`}
                   >

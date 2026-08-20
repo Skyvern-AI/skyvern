@@ -17,29 +17,34 @@ from skyvern.exceptions import require_server_extra_modules
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
 
 from fastapi import FastAPI, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette_context.middleware import RawContextMiddleware
 from starlette_context.plugins.base import Plugin
 
 from skyvern.config import _ensure_sqlite_dir, settings
-from skyvern.cors import credentialed_cors_allow_origins
+from skyvern.cors import credentialed_cors_allow_origin_regex, credentialed_cors_allow_origins
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_request_exception
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
-from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
+from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
@@ -48,13 +53,46 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.services.browser_recording.session_registry import interpretation_registry
-from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
+from skyvern.services.cleanup_service import (
+    start_cleanup_scheduler,
+    start_temp_artifact_sweep,
+    stop_cleanup_scheduler,
+    stop_temp_artifact_sweep,
+)
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
 )
 
 LOG = structlog.get_logger()
+
+
+SECURITY_HEADERS = {
+    # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI (not BaseHTTPMiddleware) so streaming/SSE responses pass through unwrapped."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for key, value in SECURITY_HEADERS.items():
+                    headers[key] = value
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
@@ -64,6 +102,7 @@ def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_origin_regex=credentialed_cors_allow_origin_regex(settings.ALLOWED_ORIGIN_REGEX),
     )
 
 
@@ -86,6 +125,17 @@ def format_validation_errors(exc: ValidationError) -> str:
         if error_messages
         else "A validation error occurred. Please check your input and try again."
     )
+
+
+def sanitize_request_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    return [
+        {
+            "loc": error["loc"],
+            "msg": error["msg"],
+            "type": error["type"],
+        }
+        for error in exc.errors()
+    ]
 
 
 class ExecutionDatePlugin(Plugin):
@@ -275,6 +325,8 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if cleanup_task:
         LOG.info("Cleanup scheduler started")
 
+    start_temp_artifact_sweep()
+
     workflow_schedule_task = start_workflow_schedule_scheduler()
     if workflow_schedule_task:
         LOG.info("Workflow schedule scheduler started")
@@ -295,6 +347,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # Stop cleanup scheduler
     await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
+    await stop_temp_artifact_sweep()
     await interpretation_registry.stop_all()
 
     if forge_app.api_app_shutdown_event:
@@ -368,6 +421,8 @@ def create_api_app() -> FastAPI:
     # the frontend, not by SDK users.
     fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
     fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
+    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
     fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
 
@@ -376,6 +431,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_llms.router, prefix="/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
@@ -408,6 +466,20 @@ def create_api_app() -> FastAPI:
             content={"detail": detail},
         )
 
+    @fastapi_app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
+        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
+        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
+        path = request.url.path.rstrip("/")
+        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+            return await request_validation_exception_handler(request, exc)
+
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": sanitize_request_validation_errors(exc)},
+        )
+
     @fastapi_app.exception_handler(ClientDisconnect)
     async def handle_client_disconnect(request: Request, exc: ClientDisconnect) -> Response:
         # Client closed the connection mid-request (e.g. while a route reads the body).
@@ -418,8 +490,16 @@ def create_api_app() -> FastAPI:
     @fastapi_app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
         LOG.exception("Unexpected error in agent server.", exc_info=exc)
+        # Base-Exception handlers run inside Starlette's ServerErrorMiddleware, which sits
+        # outside SecurityHeadersMiddleware, so stamp the framing headers here too.
         # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
-        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {type(exc).__name__}"})
+        response = JSONResponse(
+            status_code=500,
+            content={"error": f"Unexpected error: {type(exc).__name__}"},
+            headers=SECURITY_HEADERS,
+        )
+        log_raw_request_exception(response.status_code)
+        return response
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -435,11 +515,15 @@ def create_api_app() -> FastAPI:
         finally:
             skyvern_context.reset()
 
-    @fastapi_app.middleware("http")
-    async def raw_request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        return await log_raw_request_middleware(request, call_next)
-
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Register after extensions so it stays outside cloud BaseHTTPMiddleware
+    # layers, whose child tasks do not propagate request ContextVars upstream.
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
+
+    # Added last so it is outermost: stamps every response, including CORS
+    # preflights short-circuited by the cloud middleware registered above.
+    fastapi_app.add_middleware(SecurityHeadersMiddleware)
 
     return fastapi_app

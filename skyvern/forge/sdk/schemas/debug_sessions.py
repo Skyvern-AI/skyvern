@@ -61,6 +61,10 @@ class DebugSessionRuns(BaseModel):
     runs: list[DebugSessionRun]
 
 
+class DebugSessionViewerState(BaseModel):
+    active_run_session_id: str | None = None
+
+
 # Backend-authoritative verdict for a single LoginBlock in a debug session.
 # The FE pre-check works off a bounded credentials window; this endpoint
 # resolves the credential through the org-scoped lookup the run path uses

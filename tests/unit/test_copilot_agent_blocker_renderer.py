@@ -9,27 +9,32 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.agent import (
     _FALLBACK_BLOCKER_REPLY,
     _RAW_SECRET_LEAK_REFUSAL,
-    _VERIFIED_WORKFLOW_SUCCESS_REPLY,
-    _build_goal_satisfied_exit_result,
     _build_output_policy_blocked_result,
-    _build_turn_halt_exit_result,
+)
+from skyvern.forge.sdk.copilot.agent import _build_turn_halt_exit_result as _build_turn_halt_exit_result
+from skyvern.forge.sdk.copilot.agent import (
     _finalize_result_with_blocker_override,
     _render_blocker_reply,
-    _verified_workflow_success_reply,
+    _runtime_self_heal_success_reply,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
     _LEAK_DENY_TOKENS,
-    CREDENTIAL_SCOUT_VERIFY_REPLY,
     BlockerKind,
     CopilotToolBlockerSignal,
     RecoveryHint,
 )
-from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
-from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, OutputPolicyReason, OutputPolicyVerdict
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+from skyvern.forge.sdk.copilot.output_policy import (
+    CopilotOutputKind,
+    OutputPolicyReason,
+    OutputPolicyVerdict,
+)
+from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from tests.unit.conftest import make_copilot_context as _ctx
 
 # Source-of-truth deny list lives in blocker_signal.py. Re-importing here
@@ -50,7 +55,7 @@ def _signal(
     user_facing: str = "I can't update or run this workflow on this turn.",
     recovery_hint: RecoveryHint = "report_blocker_to_user",
     blocked_tool: str = "update_workflow",
-    internal_reason_code: str = "turn_intent_no_mutation_run_blocked",
+    internal_reason_code: str = "no_mutation_run_blocked",
     classifier_mode: str = "docs_answer",
 ) -> CopilotToolBlockerSignal:
     return CopilotToolBlockerSignal(
@@ -64,7 +69,7 @@ def _signal(
     )
 
 
-def _agent_result(user_response: str = "Agent prose reply with leaked TurnIntent vocab.") -> AgentResult:
+def _agent_result(user_response: str = "Agent prose reply with leaked internal vocab.") -> AgentResult:
     return AgentResult(
         user_response=user_response,
         updated_workflow=None,
@@ -93,15 +98,10 @@ def _seed_terminal_evidence(ctx: CopilotContext, run_id: str = "wr_latest") -> N
     ctx.last_run_blocks_workflow_run_id = run_id
     ctx.last_run_outcome = RecordedRunOutcome(
         verdict="not_demonstrated",
-        reason_code="outcome_not_demonstrated",
+        reason_code="no_meaningful_output",
         display_reason="The requested record was not verified.",
         workflow_run_id=run_id,
     )
-    ctx.last_outcome_gate_reason = (
-        "Failed: The run completed but did not demonstrate the goal outcome(s): "
-        "the requested record was not verified. Add an end-state confirmation, then re-run."
-    )
-    ctx.last_outcome_gate_workflow_run_id = run_id
 
 
 @pytest.mark.parametrize("recovery_hint", _ALL_RECOVERY_HINTS)
@@ -113,6 +113,30 @@ def test_render_picks_response_type_from_hint(recovery_hint: RecoveryHint) -> No
     assert user_response == signal.user_facing_reason
 
 
+def test_google_run_gate_blocker_attaches_fresh_server_verified_choices() -> None:
+    ctx = _ctx()
+    ctx.connected_account_recovery_choices = [
+        ConnectedAccountChoice(connection_id="goac_first", name="First account", state="active")
+    ]
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Ask the user to choose a connected Google account.",
+        user_facing_reason="Choose one of the connected Google accounts below so I can run the workflow.",
+        recovery_hint="ask_user_clarifying",
+        internal_reason_code="unapproved_google_connection_reference",
+        blocked_tool="update_and_run_blocks",
+        preserves_workflow_draft=True,
+    )
+
+    result = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert result.user_response == "Choose one of the connected Google accounts below so I can run the workflow."
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices == ctx.connected_account_recovery_choices
+    assert "goac_" not in result.user_response
+    assert "unapproved_credential_reference" not in result.user_response
+
+
 def test_render_falls_back_when_template_leaks() -> None:
     # `model_construct` bypasses the @model_validator that blocks leaks at construction so we can exercise the renderer's defense-in-depth fallback.
     signal = CopilotToolBlockerSignal.model_construct(
@@ -122,7 +146,7 @@ def test_render_falls_back_when_template_leaks() -> None:
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=False,
-        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        internal_reason_code="no_mutation_run_blocked",
         blocked_tool="update_workflow",
         classifier_mode="docs_answer",
         exception_type=None,
@@ -247,7 +271,7 @@ def test_output_policy_blocked_result_zeroes_proposal_when_blocker_active() -> N
     assert result.proposal_disposition == "no_proposal"
 
 
-def test_output_policy_generic_block_uses_recorded_terminal_evidence() -> None:
+def test_output_policy_generic_block_uses_only_safety_and_draft_evidence() -> None:
     ctx = _ctx()
     fake_workflow: Any = object()
     ctx.last_workflow = fake_workflow
@@ -262,8 +286,8 @@ def test_output_policy_generic_block_uses_recorded_terminal_evidence() -> None:
     assert result.response_type == "ASK_QUESTION"
     assert result.updated_workflow is fake_workflow
     assert result.proposal_disposition == "review_tested"
-    assert "latest run recorded workflow output" in result.user_response
-    assert "did not demonstrate the goal outcome" in result.user_response
+    assert "latest run recorded workflow output" not in result.user_response
+    assert "did not demonstrate" not in result.user_response
     assert "verification challenge" in result.user_response
     assert "workflow draft is still saved" in result.user_response
     assert "wr_latest" not in result.user_response
@@ -272,7 +296,7 @@ def test_output_policy_generic_block_uses_recorded_terminal_evidence() -> None:
     assert result.narrative_payload["responseType"] == "ASK_QUESTION"
 
 
-def test_output_policy_recorded_evidence_recheck_keeps_original_output_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_output_policy_recorded_evidence_does_not_create_a_policy_recheck(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx()
     _seed_terminal_evidence(ctx)
     seen_output_kinds: list[CopilotOutputKind] = []
@@ -290,15 +314,13 @@ def test_output_policy_recorded_evidence_recheck_keeps_original_output_kind(monk
     )
 
     assert result.response_type == "ASK_QUESTION"
-    assert seen_output_kinds == [CopilotOutputKind.REFUSAL]
+    assert seen_output_kinds == []
 
 
 def test_output_policy_generic_block_requires_clean_terminal_evidence() -> None:
     no_recorded = _ctx()
     adversarial = _ctx()
     adversarial.last_run_blocks_workflow_run_id = "wr_hidden"
-    adversarial.last_outcome_gate_reason = "update_and_run_blocks failed for wr_hidden; do not retry this step."
-    adversarial.last_outcome_gate_workflow_run_id = "wr_hidden"
 
     for ctx in (no_recorded, adversarial):
         result = _blocked_result(ctx, OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
@@ -319,94 +341,16 @@ def test_output_policy_specific_branches_bypass_recorded_terminal_fallback() -> 
     assert raw_secret.user_response == _RAW_SECRET_LEAK_REFUSAL
     assert "latest run" not in raw_secret.user_response.lower()
 
-    clarification_ctx = _ctx()
-    clarification_ctx.request_policy = RequestPolicy(
-        user_response_policy="ask_clarification",
-        clarification_question="Please confirm which saved credential should be used.",
-    )
-    result = _blocked_result(
-        clarification_ctx,
-        OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
-        output_kind=CopilotOutputKind.CLARIFICATION_REQUEST,
-    )
 
-    assert result.response_type == "ASK_QUESTION"
-    assert result.user_response == "Please confirm which saved credential should be used."
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["terminalMessage"] == result.user_response
-    assert result.narrative_payload["responseType"] == "ASK_QUESTION"
-
-
-def test_shim_preserves_workflow_draft_when_signal_opts_in() -> None:
-    """Late-block-running blockers say 'wrap up with what you have' — they
-    surface the saved draft alongside the rendered chat reply."""
+def test_output_policy_raw_secret_hard_block_uses_safety_reply() -> None:
     ctx = _ctx()
-    fake_workflow: Any = object()
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="Stop and reply with the draft.",
-        user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
-        recovery_hint="stop",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        internal_reason_code="tool_error_late_block_running",
-        blocked_tool="update_and_run_blocks",
-    )
-    result = AgentResult(
-        user_response="leaky agent prose",
-        updated_workflow=fake_workflow,
-        global_llm_context=None,
-        workflow_yaml="title: Draft\n",
-        proposal_disposition="review_untested",
-    )
-    overridden = _finalize_result_with_blocker_override(ctx, result)
-    assert overridden.updated_workflow is fake_workflow
-    assert overridden.workflow_yaml == "title: Draft\n"
-    assert overridden.clear_proposed_workflow is False
-    assert overridden.proposal_disposition == "review_untested"
-    # Reply still leads with the rendered text; the shim appends the unvalidated-proposal affordance because preserves_workflow_draft is True.
-    assert overridden.user_response.startswith(ctx.blocker_signal.user_facing_reason)
-    assert overridden.user_response != ctx.blocker_signal.user_facing_reason
 
+    result = _blocked_result(ctx, OutputPolicyReason.RAW_SECRET_LEAK)
 
-def test_shim_preserves_staged_workflow_draft_when_verified_result_is_empty() -> None:
-    """Active-run terminal evidence can leave the verified workflow empty while
-    the keepable draft remains staged. That draft must still surface for
-    explicit user review instead of clearing the proposal controls."""
-    ctx = _ctx()
-    fake_workflow: Any = object()
-    ctx.staged_workflow = fake_workflow
-    ctx.staged_workflow_yaml = "title: Staged\n"
-    ctx.has_staged_proposal = True
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="Stop and reply with the staged draft.",
-        user_facing_reason=(
-            "I reached the requested browser state, but the reusable workflow "
-            "still needs a clean verification run before it is ready."
-        ),
-        recovery_hint="stop",
-        preserves_workflow_draft=True,
-        internal_reason_code="tool_error_active_run_terminal_evidence",
-        blocked_tool="update_and_run_blocks",
-    )
-    result = AgentResult(
-        user_response="agent reply",
-        updated_workflow=None,
-        global_llm_context=None,
-        workflow_yaml=None,
-        staged_workflow_yaml=ctx.staged_workflow_yaml,
-        staged_workflow=fake_workflow,
-        has_staged_proposal=True,
-    )
-    overridden = _finalize_result_with_blocker_override(ctx, result)
-    assert overridden.updated_workflow is fake_workflow
-    assert overridden.workflow_yaml == ctx.staged_workflow_yaml
-    assert overridden.clear_proposed_workflow is False
-    assert overridden.proposal_disposition == "review_untested"
-    assert overridden.narrative_payload is not None
-    assert overridden.narrative_payload["proposalDisposition"] == "review_untested"
-    assert "Accept to save" in overridden.user_response
+    assert result.user_response == _RAW_SECRET_LEAK_REFUSAL
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.reason_code == "output_policy_block"
+    assert result.turn_outcome.terminal_reason == "output_policy_block"
 
 
 def test_shim_keeps_model_reply_when_signal_opts_out_of_final_rendering() -> None:
@@ -492,74 +436,6 @@ def test_output_policy_blocked_result_surfaces_workflow_when_no_blocker() -> Non
     assert result.workflow_yaml == ctx.last_workflow_yaml
 
 
-def test_turn_halt_exit_keeps_halt_signal_when_context_signal_is_cleared() -> None:
-    ctx = _ctx()
-    signal = _signal(
-        kind="loop_detected",
-        user_facing="I'm stuck retrying the same step. Tell me what to change and I'll try a different approach.",
-        internal_reason_code="loop_detected_repeated_failed_step",
-        blocked_tool="run_blocks_and_collect_debug",
-    )
-    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-    ctx.blocker_signal = None
-
-    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-    assert result.user_response == signal.user_facing_reason
-
-
-def test_turn_halt_exit_renders_code_authoring_churn_reason() -> None:
-    ctx = _ctx()
-    signal = _signal(
-        kind="loop_detected",
-        user_facing="I kept rewriting the generated code, but the safety checks rejected each version.",
-        internal_reason_code="code_authoring_guardrail_churn",
-        blocked_tool="update_workflow",
-    )
-    ctx.blocker_signal = signal
-    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-    assert "safety checks rejected" in result.user_response
-    assert "update_workflow" not in result.user_response
-
-
-def test_turn_halt_exit_renders_no_forward_progress_interaction_reason() -> None:
-    ctx = _ctx()
-    signal = _signal(
-        kind="loop_detected",
-        user_facing="I couldn't get past this step. Tell me what to change and I'll try a different approach.",
-        internal_reason_code="loop_detected_no_forward_progress_interaction",
-        blocked_tool="click",
-    )
-    ctx.blocker_signal = signal
-    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-    assert "couldn't get past this step" in result.user_response
-    assert "click" not in result.user_response
-
-
-def test_turn_halt_exit_keeps_credential_scout_reply_through_refresh_with_draft() -> None:
-    ctx = _ctx()
-    ctx.last_workflow_yaml = "title: Draft\nworkflow_definition:\n  blocks: []\n"
-    signal = _signal(
-        kind="loop_detected",
-        user_facing=CREDENTIAL_SCOUT_VERIFY_REPLY,
-        internal_reason_code="credential_priority_authoring_churn",
-        blocked_tool="update_workflow",
-    )
-    ctx.blocker_signal = signal
-    halt = TurnHalt(kind=TurnHaltKind.LOOP_DETECTED, blocker_signal=signal)
-
-    result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
-
-    assert result.user_response == CREDENTIAL_SCOUT_VERIFY_REPLY
-    assert "update_workflow" not in result.user_response
-
-
 def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> None:
     ctx = _ctx()
     terminal = _signal(
@@ -577,243 +453,48 @@ def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> 
     assert result.user_response == terminal.user_facing_reason
 
 
-def _fully_satisfied_result() -> CompletionVerificationResult:
-    return CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=["c0"],
-        verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
-    )
-
-
-def _fully_satisfied_classification_result() -> CompletionVerificationResult:
-    return CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=["c_validation"],
-        verdicts=[
-            CriterionVerdict(
-                criterion_id="c_validation",
-                state="satisfied",
-                reason_code="evidence_confirms",
-                output_path="login_only",
-                grounding_mode="exact_value",
-                has_exact_value=True,
-            )
-        ],
-    )
-
-
-def _classification_policy() -> RequestPolicy:
-    return RequestPolicy(
-        completion_criteria=[
-            CompletionCriterion(
-                id="c_validation",
-                outcome="The run classifies the path as login gated.",
-                kind="validation_classification",
-                classification_output_key="login_only",
-                expected_classification=True,
-            )
-        ]
-    )
-
-
 def _seed_verified_outcome(ctx: CopilotContext) -> None:
-    ctx.completion_verification_result = _fully_satisfied_result()
+    ctx.last_run_blocks_workflow_run_id = "wr_test"
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_test")
     ctx.last_artifact_health_blocker_reason = None
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
     ctx.last_workflow_yaml = "title: built\nblocks: []\n"
 
 
-def test_verified_outcome_preserves_tested_proposal_over_blocker() -> None:
+def test_runtime_self_heal_reply_never_echoes_run_output() -> None:
     ctx = _ctx()
-    _seed_verified_outcome(ctx)
-    ctx.blocker_signal = _signal(
-        kind="loop_detected",
-        user_facing="I'm stuck retrying the same step.",
-        internal_reason_code="loop_detected_repeated_failed_step",
-        blocked_tool="update_and_run_blocks",
-    )
-    result = _agent_result()
+    ctx.turn_origin = TurnOrigin.runtime_self_heal
+    ctx.verified_terminal_block_outputs = {"result": {"access_token": "secret-value"}}
 
-    overridden = _finalize_result_with_blocker_override(ctx, result)
+    response = _runtime_self_heal_success_reply(ctx)
 
-    assert overridden.user_response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
-    assert overridden.updated_workflow is ctx.last_workflow
-    assert overridden.workflow_yaml == ctx.last_workflow_yaml
-    assert overridden.clear_proposed_workflow is False
-    assert overridden.proposal_disposition == "review_tested"
-    assert overridden.response_type == "REPLY"
-    assert "stuck retrying" not in overridden.user_response
+    assert response == "The unattended recovery check completed."
+    assert "secret-value" not in response
 
 
-def test_verified_outcome_preserve_sets_verified_success_payload() -> None:
+def test_interactive_authoring_cannot_request_a_server_authored_success_reply() -> None:
     ctx = _ctx()
-    ctx.turn_id = "turn-verified"
-    _seed_verified_outcome(ctx)
-    ctx.blocker_signal = _signal(
-        kind="loop_detected",
-        user_facing="I'm stuck retrying the same step.",
-        internal_reason_code="loop_detected_repeated_failed_step",
-        blocked_tool="update_and_run_blocks",
-    )
-
-    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
-
-    assert overridden.narrative_payload is not None
-    assert overridden.narrative_payload["verifiedSuccess"] is True
-    assert overridden.narrative_payload["proposalDisposition"] == "review_tested"
+    with pytest.raises(RuntimeError, match="interactive authoring"):
+        _runtime_self_heal_success_reply(ctx)
 
 
-@pytest.mark.asyncio
-async def test_verified_classification_success_surfaces_terminal_verdict_and_reload_payload() -> None:
+def _scouted_obligation_ctx() -> CopilotContext:
     ctx = _ctx()
-    ctx.stream = None
-    ctx.turn_id = "turn-classified"
-    ctx.last_test_ok = True
-    ctx.last_full_workflow_test_ok = True
-    _seed_verified_outcome(ctx)
-    ctx.request_policy = _classification_policy()
-    ctx.completion_verification_result = _fully_satisfied_classification_result()
-    ctx.verified_block_outputs = {
-        "inspect_access_path": {
-            "login_only": True,
-            "visible_page_path_label": "Start service sign-in gate",
-            "safest_reachable_next_step": "Stop before account-specific setup.",
-            "recommended_next_action": "Ask the user for online account access before continuing.",
-            "evidence_text": "The page says Sign in or register to continue.",
-        }
-    }
-
-    result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
-
-    assert "login-gated" in result.user_response
-    assert "login_only=true" in result.user_response
-    assert "visible_page_path_label=Start service sign-in gate" in result.user_response
-    assert "safest_reachable_next_step=Stop before account-specific setup." in result.user_response
-    assert "recommended_next_action=Ask the user for online account access before continuing." in result.user_response
-    assert "observed_gate_phrase=Sign in or register to continue" in result.user_response
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["terminalMessage"] == result.user_response
-
-
-def test_verified_classification_summary_does_not_display_unobserved_expected_value() -> None:
-    ctx = _ctx()
-    _seed_verified_outcome(ctx)
-    ctx.request_policy = _classification_policy()
-    ctx.completion_verification_result = _fully_satisfied_classification_result()
-    ctx.verified_block_outputs = {}
-
-    response = _verified_workflow_success_reply(ctx)
-
-    assert response == "I created and tested the workflow successfully."
-    assert "login_only=true" not in response
-    assert "login-gated" not in response
-    assert "observed_gate_phrase=Sign in or register to continue" not in response
-
-
-def test_verified_classification_summary_uses_terminal_snapshot_when_frontier_outputs_clear() -> None:
-    ctx = _ctx()
-    _seed_verified_outcome(ctx)
-    ctx.request_policy = _classification_policy()
-    ctx.completion_verification_result = _fully_satisfied_classification_result()
-    ctx.verified_block_outputs = {}
-    ctx.verified_terminal_block_outputs = {
-        "inspect_access_path": {
-            "login_only": True,
-            "visible_page_path_label": "Start, Stop or Move Service",
-            "matched_gate_phrases": ["sign in or register to continue"],
-        }
-    }
-
-    response = _verified_workflow_success_reply(ctx)
-
-    assert "login_only=true" in response
-    assert "login-gated" in response
-    assert "visible_page_path_label=Start, Stop or Move Service" in response
-    assert "observed_gate_phrase=Sign in or register to continue" in response
-
-
-def test_verified_classification_summary_labels_login_gate_from_verified_gate_phrase() -> None:
-    ctx = _ctx()
-    _seed_verified_outcome(ctx)
-    ctx.request_policy = RequestPolicy(completion_criteria=[CompletionCriterion(id="c0", outcome="Reached gate")])
-    ctx.completion_verification_result = _fully_satisfied_result()
-    ctx.verified_terminal_block_outputs = {
-        "inspect_access_path": {
-            "visible_page_path_label": "Start, Stop or Move Service > Start Service",
-            "observed_gate_phrase": "Sign in or register to continue",
-        }
-    }
-
-    response = _verified_workflow_success_reply(ctx)
-
-    assert "visible_page_path_label=Start, Stop or Move Service > Start Service" in response
-    assert "observed_gate_phrase=Sign in or register to continue" in response
-    assert "login-gated" in response
-
-
-def test_verified_classification_summary_requires_completion_verification() -> None:
-    ctx = _ctx()
-    ctx.request_policy = _classification_policy()
-    ctx.verified_block_outputs = {
-        "inspect_access_path": {
-            "login_only": True,
-            "visible_page_path_label": "Start service sign-in gate",
-            "evidence_text": "The page prose says login-gated and login_only=true.",
-        }
-    }
-
-    response = _verified_workflow_success_reply(ctx)
-
-    assert response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
-    assert "login-gated" not in response
-    assert "login_only=true" not in response
-
-
-def test_verified_classification_summary_requires_fully_satisfied_verification() -> None:
-    ctx = _ctx()
-    ctx.request_policy = _classification_policy()
-    ctx.completion_verification_result = CompletionVerificationResult(
-        status="evaluated",
-        criterion_ids=["c_validation"],
-        verdicts=[
-            CriterionVerdict(
-                criterion_id="c_validation",
-                state="unsatisfied",
-                reason_code="evidence_contradicts",
-                output_path="login_only",
-            )
-        ],
-    )
-    ctx.verified_block_outputs = {
-        "inspect_access_path": {
-            "login_only": True,
-            "visible_page_path_label": "Start service sign-in gate",
-        }
-    }
-
-    response = _verified_workflow_success_reply(ctx)
-
-    assert response == _VERIFIED_WORKFLOW_SUCCESS_REPLY
-    assert "login-gated" not in response
-    assert "login_only=true" not in response
-
-
-def test_unverified_blocker_still_renders_blocker_text() -> None:
-    ctx = _ctx()
-    ctx.completion_verification_result = None
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()]))
-    ctx.last_workflow_yaml = "title: built\nblocks: []\n"
-    ctx.blocker_signal = _signal(
-        kind="loop_detected",
-        user_facing="I'm stuck retrying the same step.",
-        internal_reason_code="loop_detected_repeated_failed_step",
-        blocked_tool="update_and_run_blocks",
-    )
-
-    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
-
-    assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
-    assert overridden.proposal_disposition != "review_tested"
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.has_staged_proposal = True
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.impose_synthesized_code_block = True
+    ctx.persisted_draft_browser_calls = []
+    ctx.scout_trajectory = [
+        {
+            "tool_name": "click",
+            "selector": "#search-submit",
+            "source_url": "https://example.com/search",
+            "trajectory_index": 0,
+        }
+    ]
+    return ctx
 
 
 def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> None:
@@ -831,5 +512,136 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
     overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
 
     assert overridden.user_response == challenge_text
-    assert overridden.user_response != _VERIFIED_WORKFLOW_SUCCESS_REPLY
     assert overridden.proposal_disposition != "review_tested"
+
+
+def test_unapproved_credential_reference_asks_without_naming_the_credential_inventory() -> None:
+    """`discovered_credentials` holds everything `list_credentials` returned, not page matches,
+    so the reply must not present it as a match set."""
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        discovered_credentials=[SimpleNamespace(credential_id="cred_unrelated", name="hr portal", tested_url=None)]
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "I need an approved credential to continue" in result.user_response
+    # Only the observation seam records a verdict, so no-verdict must not be rendered as "no match":
+    # a fill-seam ambiguity reaches this branch with a real match behind it.
+    assert "could not match" not in result.user_response
+    assert "Credentials UI" in result.user_response
+    assert "cred_unrelated" not in result.user_response
+    assert "hr portal" not in result.user_response
+
+
+def test_unapproved_credential_reference_ambiguous_does_not_enumerate_candidates() -> None:
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        live_page_resolution=LivePageResolutionRecord(
+            verdict="ambiguous",
+            tier="url_path",
+            candidates=(
+                SimpleNamespace(credential_id="cred_first", name="first login"),
+                SimpleNamespace(credential_id="cred_second", name="second login"),
+            ),
+        )
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    # The ambiguous branch used to list candidate ids; the FE now renders the full org selector, so the
+    # reply is one sentence with the Credentials UI marker and no prose dump.
+    assert "I need an approved credential to continue" in result.user_response
+    assert "Credentials UI" in result.user_response
+    assert "cred_first" not in result.user_response
+    assert "cred_second" not in result.user_response
+
+
+def test_unapproved_credential_reference_points_at_credentials_ui_when_nothing_matched() -> None:
+    """A no-match verdict must not borrow the ambiguous reply's candidate list."""
+    ctx = _ctx()
+    ctx.request_policy = RequestPolicy(
+        live_page_resolution=LivePageResolutionRecord(
+            verdict="no_match",
+            page_url="https://analytics.example.com/login",
+            candidates=(SimpleNamespace(credential_id="cred_unmatched", name="unmatched login"),),
+        )
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "Credentials UI" in result.user_response
+    # Candidates ride on the record whatever the verdict; only an ambiguous one may name them.
+    assert "cred_unmatched" not in result.user_response
+    assert "More than one saved credential" not in result.user_response
+
+
+def test_unapproved_google_connection_preserves_verified_clickable_choices() -> None:
+    choices = [
+        ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active"),
+        ConnectedAccountChoice(connection_id="goac_inactive", name="Sheets", state="error"),
+    ]
+    ctx = _ctx()
+    ctx.prior_turn_outcome = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=choices,
+    )
+    ctx.request_policy = RequestPolicy(existing_workflow_credential_ids=["goac_active"])
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "connected Google account" in result.user_response
+    assert "Credentials UI" not in result.user_response
+    assert "unapproved_credential_reference" not in result.user_response
+    assert "goac_" not in result.user_response
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices == choices
+
+
+def test_password_blocker_does_not_reuse_prior_google_choices() -> None:
+    choices = [ConnectedAccountChoice(connection_id="goac_active", name="Sheets", state="active")]
+    ctx = _ctx()
+    ctx.prior_turn_outcome = TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=choices,
+    )
+    ctx.request_policy = RequestPolicy(
+        existing_workflow_credential_ids=["goac_active", "cred_password"],
+        run_approved_google_connection_ids=["goac_active"],
+    )
+
+    result = _blocked_result(ctx, OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
+
+    assert "Credentials UI" in result.user_response
+    assert "connected Google account" not in result.user_response
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.connected_account_choices is None
+
+
+def test_shim_over_a_cancelled_turn_keeps_the_stop_label() -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal()
+    result = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        cancelled=True,
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden.turn_outcome is not None
+    assert overridden.turn_outcome.response_kind is ResponseKind.RECOVER
+    assert overridden.turn_outcome.response_kind is not ResponseKind.CLARIFY
+    assert overridden.turn_outcome.terminal_reason == "cancel"
+
+
+def test_shim_over_an_uncancelled_turn_still_records_clarify() -> None:
+    ctx = _ctx()
+    ctx.blocker_signal = _signal()
+
+    overridden = _finalize_result_with_blocker_override(ctx, _agent_result())
+
+    assert overridden.turn_outcome is not None
+    assert overridden.turn_outcome.response_kind is ResponseKind.CLARIFY
+    assert overridden.turn_outcome.terminal_reason is None

@@ -7,20 +7,44 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useEffect, useState } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CredentialAuthenticatorSupportProvider } from "./CredentialAuthenticatorSupportContext";
 import { PasswordCredentialContent } from "./PasswordCredentialContent";
+
+const mockEmailCredentials = vi.hoisted(() => ({
+  google: vi.fn(),
+  microsoft: vi.fn(),
+}));
+
+vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();
+  return {
+    ...actual,
+    useGoogleOAuthCredentials: mockEmailCredentials.google,
+  };
+});
+
+vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useMicrosoftOAuthCredentials")>();
+  return {
+    ...actual,
+    useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
+  };
+});
 
 type Values = {
   name: string;
   username: string;
   password: string;
   totp: string;
-  totp_type: "authenticator" | "email" | "text" | "none";
+  totp_type: string;
   totp_identifier: string;
 };
 
@@ -72,15 +96,182 @@ const ENTERPRISE_APPS = {
     "Scan the QR as usual - Skyvern detects these setup codes automatically.",
 };
 
+function installEmailCredentialHooks() {
+  mockEmailCredentials.google.mockReturnValue({
+    credentials: [
+      {
+        id: "google-mail",
+        organization_id: "org_1",
+        credential_name: "Default",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+        email_address: "connected@gmail.test",
+        created_at: "2026-07-30T00:00:00Z",
+        modified_at: "2026-07-30T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+  });
+  mockEmailCredentials.microsoft.mockReturnValue({
+    credentials: [],
+    isLoading: false,
+    isFetching: false,
+  });
+}
+
+describe("PasswordCredentialContent — additional two-factor methods", () => {
+  const additionalMethod = {
+    value: "security_device",
+    requestType: "none" as const,
+    label: "Security Device",
+    initialState: { deviceCode: "" },
+    renderFields: ({
+      state,
+      setState,
+      configured,
+    }: {
+      state: Record<string, string | number | boolean>;
+      setState: (next: Record<string, string | number | boolean>) => void;
+      disabled: boolean;
+      isEditMode: boolean;
+      configured: boolean;
+    }) => (
+      <>
+        <label>
+          Device code
+          <input
+            aria-label="Device code"
+            value={String(state.deviceCode ?? "")}
+            onChange={(event) =>
+              setState({ ...state, deviceCode: event.target.value })
+            }
+          />
+        </label>
+        <span>{configured ? "Configured" : "Not configured"}</span>
+      </>
+    ),
+    validate: () => null,
+    onSaved: vi.fn(),
+  };
+
+  it("renders methods supplied by the context as additional cards", () => {
+    render(
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods: [additionalMethod] }}
+      >
+        <MemoryRouter>
+          <PasswordCredentialContent
+            values={INITIAL_VALUES}
+            onChange={vi.fn()}
+            additionalTwoFactorStates={{
+              security_device: additionalMethod.initialState,
+            }}
+            onAdditionalTwoFactorStateChange={vi.fn()}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Security Device"));
+
+    expect(screen.getByLabelText("Device code")).toBeTruthy();
+    expect(screen.getByText("Not configured")).toBeTruthy();
+  });
+
+  it("marks a response-matched method as configured in edit mode", () => {
+    render(
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods: [additionalMethod] }}
+      >
+        <MemoryRouter>
+          <PasswordCredentialContent
+            values={{ ...INITIAL_VALUES, totp_type: "security_device" }}
+            onChange={vi.fn()}
+            editMode
+            editingGroups={{ name: false, values: true }}
+            configuredAdditionalTwoFactorMethod="security_device"
+            additionalTwoFactorStates={{
+              security_device: additionalMethod.initialState,
+            }}
+            onAdditionalTwoFactorStateChange={vi.fn()}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>,
+    );
+
+    expect(screen.getByText("Security Device")).toBeTruthy();
+    expect(screen.getByText("Configured")).toBeTruthy();
+  });
+
+  it("does not render an additional card with the default context", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={INITIAL_VALUES}
+          onChange={vi.fn()}
+          additionalTwoFactorStates={{}}
+          onAdditionalTwoFactorStateChange={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    expect(screen.queryByText("Security Device")).toBeNull();
+  });
+});
+
+describe("PasswordCredentialContent — built-in two-factor methods", () => {
+  beforeEach(() => {
+    installEmailCredentialHooks();
+  });
+
+  it("exposes every method as a focusable pressed button and updates selection", () => {
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent values={INITIAL_VALUES} onChange={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+
+    const methodNames = ["Authenticator App", "Email", "Text Message"];
+    const methodButtons = methodNames.map((name) =>
+      screen.getByRole("button", { name }),
+    );
+
+    for (const [index, button] of methodButtons.entries()) {
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      expect((button as HTMLButtonElement).type).toBe("button");
+      expect(button.tabIndex).toBe(0);
+      expect(button.getAttribute("aria-pressed")).toBe(
+        index === 0 ? "true" : "false",
+      );
+    }
+
+    const emailButton = methodButtons[1]!;
+    emailButton.focus();
+    expect(document.activeElement).toBe(emailButton);
+    fireEvent.click(emailButton);
+
+    expect(emailButton.getAttribute("aria-pressed")).toBe("true");
+    expect(methodButtons[0]?.getAttribute("aria-pressed")).toBe("false");
+  });
+});
+
 // Mirrors CredentialsModal: starts the form at INITIAL_VALUES, then after mount
 // applies the loaded credential via setPasswordCredentialValues — same flow
 // that produced SKY-9864.
 function ModalLikeHarness({
   appliedValues,
   onChangeSpy,
+  editingValues = false,
 }: {
   appliedValues: Values | null;
   onChangeSpy: (next: Values) => void;
+  editingValues?: boolean;
 }) {
   const [values, setValues] = useState<Values>(INITIAL_VALUES);
   useEffect(() => {
@@ -97,13 +288,17 @@ function ModalLikeHarness({
           setValues(next);
         }}
         editMode
-        editingGroups={{ name: false, values: false }}
+        editingGroups={{ name: false, values: editingValues }}
       />
     </MemoryRouter>
   );
 }
 
 describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression)", () => {
+  beforeEach(() => {
+    installEmailCredentialHooks();
+  });
+
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
@@ -182,6 +377,83 @@ describe("PasswordCredentialContent — edit-mode hydration (SKY-9864 regression
       );
     });
     expect(autoFillCall).toBeTruthy();
+  });
+
+  it("renders the connected account picker for Email and preserves manual entry", async () => {
+    const onChangeSpy = vi.fn();
+
+    render(
+      <ModalLikeHarness
+        appliedValues={{
+          name: "Example Login",
+          username: "connected@gmail.test",
+          password: "",
+          totp: "",
+          totp_type: "email",
+          totp_identifier: "connected@gmail.test",
+        }}
+        onChangeSpy={onChangeSpy}
+        editingValues
+      />,
+    );
+
+    expect(
+      await screen.findByRole("combobox", {
+        name: "Connected email account",
+      }),
+    ).toBeTruthy();
+    const modeToggle = screen.getByRole("button", { name: "Enter manually" });
+    fireEvent.click(modeToggle);
+    const identifierInput = modeToggle
+      .closest(".min-w-0")
+      ?.querySelector("input");
+    expect(identifierInput).toBeTruthy();
+    fireEvent.change(identifierInput as HTMLInputElement, {
+      target: { value: "manual@example.test" },
+    });
+
+    expect(onChangeSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totp_type: "email",
+        totp_identifier: "manual@example.test",
+      }),
+    );
+  });
+
+  it("enables editing from a locked connected account picker", async () => {
+    const onEnableEditValues = vi.fn();
+
+    render(
+      <MemoryRouter>
+        <PasswordCredentialContent
+          values={{
+            name: "Example Login",
+            username: "connected@gmail.test",
+            password: "",
+            totp: "",
+            totp_type: "email",
+            totp_identifier: "connected@gmail.test",
+          }}
+          onChange={vi.fn()}
+          editMode
+          editingGroups={{ name: false, values: false }}
+          onEnableEditValues={onEnableEditValues}
+        />
+      </MemoryRouter>,
+    );
+
+    const picker = await screen.findByRole("combobox", {
+      name: "Connected email account",
+    });
+    const pickerField = picker.closest(".relative");
+    expect(pickerField).toBeTruthy();
+
+    const editButton = within(pickerField as HTMLElement).getByRole("button", {
+      name: "Edit credential values",
+    });
+    fireEvent.click(editButton);
+
+    expect(onEnableEditValues).toHaveBeenCalledOnce();
   });
 
   it("marks Authenticator App as the selected 2FA method when a new credential opens the 2FA section", async () => {

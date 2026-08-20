@@ -16,6 +16,7 @@ from playwright.async_api import Page
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -86,10 +87,11 @@ async def detect_user_defined_errors_for_task(
     except Exception:
         # Gracefully handle any errors during detection
         # Error detection failure should never prevent task from failing
-        LOG.exception(
+        LOG.warning(
             "Failed to detect user-defined errors, continuing with task failure",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []
 
@@ -116,7 +118,11 @@ async def _detect_errors_from_page(
         )
         scraped_page = await browser_state.scrape_website(
             url=page.url,
-            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(task=task, step=step),
+            cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                task=task,
+                step=step,
+                engine_selection=browser_state.engine_selection,
+            ),
             take_screenshots=True,
             draw_boxes=False,
         )
@@ -154,10 +160,11 @@ async def _detect_errors_from_page(
         return user_defined_errors
 
     except Exception:
-        LOG.exception(
+        LOG.warning(
             "Failed to detect errors from page",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []
 
@@ -214,7 +221,7 @@ async def _detect_errors_from_context(
             error_code_mapping=task.error_code_mapping,
             failure_reason=failure_reason,
         )
-        json_response = await app.EXTRACTION_LLM_API_HANDLER(
+        json_response = await get_org_aware_primary_llm_api_handler(default=app.EXTRACTION_LLM_API_HANDLER)(
             prompt=prompt,
             screenshots=[],  # No screenshots available
             step=step,
@@ -259,9 +266,10 @@ async def _detect_errors_from_context(
         return user_defined_errors
 
     except Exception:
-        LOG.exception(
+        LOG.warning(
             "Failed to detect errors from context",
             task_id=task.task_id,
             step_id=step.step_id,
+            exc_info=True,
         )
         return []

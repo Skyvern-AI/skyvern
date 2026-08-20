@@ -1,10 +1,17 @@
 import asyncio
+import base64
+import binascii
+import json
+from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, Path, Query
+import structlog
+from fastapi import Depends, HTTPException, Path, Query, Request
 from fastapi.responses import ORJSONResponse
+from pydantic import ValidationError
 
 from skyvern import analytics
 from skyvern.forge import app
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
@@ -20,6 +27,17 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.schemas.action_log import (
+    ACTION_LOG_DEFAULT_PAGE_SIZE,
+    ACTION_LOG_MAX_BODY_BYTES,
+    ACTION_LOG_MAX_PAGE_SIZE,
+    ActionLogBatchRequest,
+    ActionLogBatchResponse,
+    ActionLogEvent,
+    ActionLogPage,
+    sanitize_action_log_event,
+)
+from skyvern.schemas.browser_session_timeouts import MAX_TIMEOUT, MAX_TIMEOUT_EXCEEDED_MESSAGE
 from skyvern.schemas.browser_sessions import (
     CreateBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
@@ -29,6 +47,65 @@ from skyvern.schemas.browser_sessions import (
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.schemas import BrowserSessionResponse
+
+LOG = structlog.get_logger(__name__)
+
+_ACTION_LOG_MAX_PAST_AGE = timedelta(days=7)
+_ACTION_LOG_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_ACTION_LOG_MAX_CURSOR_LENGTH = 256
+
+
+def _browser_session_not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail={"code": "browser_session_not_found"})
+
+
+async def _read_action_log_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > ACTION_LOG_MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail={"code": "action_log_body_too_large"})
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > ACTION_LOG_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "action_log_body_too_large"})
+    return bytes(body)
+
+
+def _validate_action_log_timestamps(events: list[ActionLogEvent]) -> None:
+    now = datetime.now(timezone.utc)
+    earliest = now - _ACTION_LOG_MAX_PAST_AGE
+    latest = now + _ACTION_LOG_MAX_FUTURE_SKEW
+    if any(event.occurred_at < earliest or event.occurred_at > latest for event in events):
+        raise HTTPException(status_code=422, detail={"code": "invalid_action_log_timestamp"})
+
+
+def _encode_action_log_cursor(artifact: Artifact) -> str:
+    created_at = artifact.created_at
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+    value = json.dumps([created_at.isoformat(), artifact.artifact_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def _decode_action_log_cursor(cursor: str | None) -> tuple[datetime | None, str | None]:
+    if cursor is None:
+        return None, None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        created_at_raw, artifact_id = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if not isinstance(created_at_raw, str) or not isinstance(artifact_id, str) or not artifact_id:
+            raise ValueError
+        created_at = datetime.fromisoformat(created_at_raw)
+        if created_at.tzinfo is not None:
+            created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+        return created_at, artifact_id
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_action_log_cursor"}) from exc
 
 
 @base_router.get(
@@ -82,6 +159,7 @@ async def get_browser_sessions_all(
     summary="Create a session",
     responses={
         200: {"description": "Successfully created browser session"},
+        400: {"description": f"Requested timeout exceeds the {MAX_TIMEOUT}-minute maximum"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
         404: {"description": "Browser profile not found"},
     },
@@ -95,6 +173,8 @@ async def create_browser_session(
     browser_session_request: CreateBrowserSessionRequest = CreateBrowserSessionRequest(),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> BrowserSessionResponse:
+    if browser_session_request.timeout is not None and browser_session_request.timeout > MAX_TIMEOUT:
+        raise HTTPException(status_code=400, detail=MAX_TIMEOUT_EXCEEDED_MESSAGE)
     proxy_location = browser_session_request.proxy_location
     proxy_session_id = browser_session_request.proxy_session_id
     if browser_session_request.browser_profile_id:
@@ -125,6 +205,7 @@ async def create_browser_session(
 
     browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
+        url=browser_session_request.url,
         timeout_minutes=browser_session_request.timeout,
         proxy_location=proxy_location,
         proxy_session_id=proxy_session_id,
@@ -132,6 +213,7 @@ async def create_browser_session(
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
         generate_browser_profile=browser_session_request.generate_browser_profile,
+        needs_live_view=browser_session_request.needs_live_view,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 
@@ -154,6 +236,7 @@ async def create_browser_session(
     summary="Close a session",
     responses={
         200: {"description": "Successfully closed browser session"},
+        404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
     },
 )
@@ -169,6 +252,12 @@ async def close_browser_session(
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ORJSONResponse:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if not browser_session:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
     await app.PERSISTENT_SESSIONS_MANAGER.close_session(current_org.organization_id, browser_session_id)
     return ORJSONResponse(
         content={"message": "Browser session closed"},
@@ -247,6 +336,27 @@ async def update_browser_session(
         200: {"description": "Successfully retrieved browser session details"},
         404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
+        503: {
+            "description": "Downloaded files could not be returned",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail"],
+                        "properties": {
+                            "detail": {
+                                "type": "object",
+                                "required": ["code", "retryable"],
+                                "properties": {
+                                    "code": {"type": "string", "enum": ["downloaded_files_unavailable"]},
+                                    "retryable": {"type": "boolean"},
+                                },
+                            }
+                        },
+                    }
+                }
+            },
+        },
     },
 )
 @base_router.get(
@@ -267,7 +377,12 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return await BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
+    return await BrowserSessionResponse.from_browser_session(
+        browser_session,
+        app.STORAGE,
+        fail_download_lookup=True,
+        include_stream_transport=True,
+    )
 
 
 @base_router.get(
@@ -344,6 +459,98 @@ async def get_browser_sessions(
 
 
 @base_router.post(
+    "/browser_sessions/{browser_session_id}/action_logs",
+    response_model=ActionLogBatchResponse,
+    include_in_schema=False,
+)
+async def create_browser_session_action_logs(
+    request: Request,
+    browser_session_id: str = Path(..., description="The ID of the browser session.", examples=["pbs_123456"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ActionLogBatchResponse:
+    body = await _read_action_log_body(request)
+    try:
+        batch = ActionLogBatchRequest.model_validate_json(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_action_log_batch"}) from exc
+    events = [sanitize_action_log_event(event) for event in batch.events]
+    _validate_action_log_timestamps(events)
+
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if browser_session is None:
+        raise _browser_session_not_found()
+
+    for event in events:
+        await app.ARTIFACT_MANAGER.create_browser_session_action_log_artifact(
+            organization_id=current_org.organization_id,
+            browser_session_id=browser_session_id,
+            event=event,
+        )
+    return ActionLogBatchResponse(accepted=len(events))
+
+
+@base_router.get(
+    "/browser_sessions/{browser_session_id}/action_logs",
+    response_model=ActionLogPage,
+    include_in_schema=False,
+)
+async def get_browser_session_action_logs(
+    browser_session_id: str = Path(..., description="The ID of the browser session.", examples=["pbs_123456"]),
+    cursor: str | None = Query(default=None, max_length=_ACTION_LOG_MAX_CURSOR_LENGTH),
+    page_size: int = Query(default=ACTION_LOG_DEFAULT_PAGE_SIZE, ge=1, le=ACTION_LOG_MAX_PAGE_SIZE),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ActionLogPage:
+    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        browser_session_id,
+        current_org.organization_id,
+    )
+    if browser_session is None:
+        raise _browser_session_not_found()
+
+    created_after, artifact_id_after = _decode_action_log_cursor(cursor)
+    artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type_after(
+        browser_session_id=browser_session_id,
+        organization_id=current_org.organization_id,
+        artifact_type=ArtifactType.BROWSER_SESSION_ACTION_LOG,
+        created_after=created_after,
+        artifact_id_after=artifact_id_after,
+        limit=page_size,
+    )
+    page_artifacts = artifacts
+    events: list[ActionLogEvent] = []
+    seen_event_ids: set[str] = set()
+    for artifact in page_artifacts:
+        data = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        if data is None:
+            LOG.warning(
+                "Browser session action log artifact is unavailable",
+                artifact_id=artifact.artifact_id,
+                browser_session_id=browser_session_id,
+            )
+            continue
+        try:
+            event = ActionLogEvent.model_validate_json(data)
+            event_id = str(event.event_id)
+            if event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event_id)
+            events.append(event)
+        except ValidationError:
+            LOG.warning(
+                "Browser session action log artifact is invalid",
+                artifact_id=artifact.artifact_id,
+                browser_session_id=browser_session_id,
+            )
+
+    events.sort(key=lambda event: event.order_key)
+    next_cursor = _encode_action_log_cursor(page_artifacts[-1]) if page_artifacts else None
+    return ActionLogPage(events=events, next_cursor=next_cursor)
+
+
+@base_router.post(
     "/browser_sessions/{browser_session_id}/process_recording",
     include_in_schema=False,
 )
@@ -365,6 +572,7 @@ async def process_recording(
         compressed_chunks=recording_request.compressed_chunks,
         workflow_permanent_id=recording_request.workflow_permanent_id,
         draft_steps=recording_request.draft_steps,
+        code_first=recording_request.code_first,
     )
 
     return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)

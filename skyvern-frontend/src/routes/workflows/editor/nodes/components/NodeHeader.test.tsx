@@ -79,13 +79,13 @@ function renderNodeHeader(props: Partial<ComponentProps<typeof NodeHeader>>) {
 describe("NodeHeader icon/title regressions (SKY-11885 / SKY-11887)", () => {
   test("icon wrapper has shrink-0 so a long title column can't compress it", () => {
     const { container } = renderNodeHeader({});
-    const iconWrapper = container.querySelector(".border-slate-600");
+    const iconWrapper = container.querySelector(".border-border");
     expect(iconWrapper?.className).toContain("shrink-0");
   });
 
   test("does not apply a code-specific icon scale", () => {
     const { container } = renderNodeHeader({ type: "code" });
-    const svg = container.querySelector(".border-slate-600 svg");
+    const svg = container.querySelector(".border-border svg");
     expect(svg?.getAttribute("class") ?? "").not.toContain("scale-90");
   });
 

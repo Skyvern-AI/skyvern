@@ -117,11 +117,11 @@ function ConditionalBlockFormBody({
             className="space-y-2 rounded-md border border-border bg-slate-elevation2 p-3"
           >
             <div className="flex items-center justify-between gap-2">
-              <Label className="text-xs text-slate-300">
+              <Label className="text-xs text-tertiary-foreground">
                 {getConditionLabel(branch, index)}
               </Label>
               {branch.id === activeBranchId && (
-                <span className="rounded bg-slate-elevation5 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-300">
+                <span className="rounded bg-slate-elevation5 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-tertiary-foreground">
                   Active
                 </span>
               )}

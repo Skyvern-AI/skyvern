@@ -14,4 +14,5 @@ export interface ValidationBlockYaml {
     error_code_mapping?: Record<string, string | undefined>;
     parameter_keys?: string[];
     disable_cache?: boolean;
+    without_page_information?: boolean;
 }

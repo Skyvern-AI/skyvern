@@ -39,7 +39,7 @@ const page = await browser.getWorkingPage();
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `timeout` | `int` | `None` | Session timeout in minutes (5-1440). Server default: 60 minutes |
+| `timeout` | `int` | `None` | Session timeout in minutes (min 5, max 240; higher values are rejected). Server default: 60 minutes |
 | `proxy_location` | `ProxyLocation` | `None` | Route traffic through a geographic proxy |
 
 The browser stays alive until `timeout` expires or you call `browser.close()`.
@@ -225,8 +225,6 @@ Available locations:
 | `RESIDENTIAL_AU` | Australia |
 | `RESIDENTIAL_CA` | Canada |
 | `NONE` | No proxy (direct connection) |
-
-For self-hosted proxy configuration, see [Proxy Setup](/developers/self-hosted/proxy).
 
 ---
 

@@ -19,9 +19,9 @@ type WorkflowYamlEditorState = {
   registerCommit: (
     commit: ((persist?: boolean) => Promise<boolean>) | null,
   ) => void;
-  // Serializes the live canvas and opens the editor. Registered by the
-  // embedded Workspace so shell chrome (the Editor pane header's toggle) can
-  // enter Code mode without owning the serialization.
+  // Serializes the live canvas and opens the editor. Registered by Workspace
+  // so header chrome outside its closure (studio's Editor pane header, the
+  // legacy overflow menu) can enter Code mode without owning the serialization.
   enterYamlMode: (() => void) | null;
   registerEnterYamlMode: (enter: (() => void) | null) => void;
   close: () => void;
@@ -65,6 +65,17 @@ export function isWorkflowYamlDirty(state: {
   entrySnapshot: string;
 }): boolean {
   return state.draft !== state.entrySnapshot;
+}
+
+// Fire `onChange` when the editable YAML draft changes while the Code editor is
+// active. A draft edit doesn't touch the canvas, so canvas-derived effects miss
+// it; subscribing to the draft lets them re-sync. Returns an unsubscribe.
+export function subscribeToYamlDraftChanges(onChange: () => void): () => void {
+  return useWorkflowYamlEditorStore.subscribe((state, prev) => {
+    if (state.active && state.draft !== prev.draft) {
+      onChange();
+    }
+  });
 }
 
 // Shared entry point for the commit-on-switch flow used by the overlay's Visual

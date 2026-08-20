@@ -66,7 +66,7 @@ function WorkflowCopilotHistoryContent({
       <div className="border-b p-3">
         <h4 className="mb-2 text-sm font-medium">Chat history</h4>
         <div className="relative">
-          <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             placeholder="Search chats..."
             value={search}
@@ -100,7 +100,7 @@ function WorkflowCopilotHistoryContent({
             ))}
           </>
         ) : chats.length === 0 ? (
-          <div className="px-3 py-8 text-center text-sm text-slate-400">
+          <div className="px-3 py-8 text-center text-sm text-muted-foreground">
             No chats found
           </div>
         ) : (
@@ -118,19 +118,19 @@ function WorkflowCopilotHistoryContent({
                     <span className="line-clamp-2 break-words [overflow-wrap:anywhere]">
                       {chat.title || "Untitled chat"}
                     </span>
-                    <span className="truncate text-xs text-slate-400">
+                    <span className="truncate text-xs text-muted-foreground">
                       {compactLocalDateTime(chat.created_at)}
                     </span>
                   </div>
                   {isCurrent && (
-                    <CheckIcon className="h-4 w-4 shrink-0 text-blue-400" />
+                    <CheckIcon className="h-4 w-4 shrink-0 text-blue-700 dark:text-blue-400" />
                   )}
                 </button>
               );
             })}
             {isFetchingNextPage && (
               <div className="flex items-center justify-center py-2">
-                <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                <ReloadIcon className="h-3 w-3 animate-spin text-muted-foreground" />
               </div>
             )}
           </>
@@ -171,7 +171,7 @@ function WorkflowCopilotHistory({
         onMouseDown={(e) => e.stopPropagation()}
         className={
           compact
-            ? "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+            ? "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-40"
             : "flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
         }
       >

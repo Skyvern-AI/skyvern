@@ -27,14 +27,17 @@ def _normalize_json_dumps(payload: dict) -> str:
 def create_access_token(
     subject: Union[str, Any],
     expires_delta: timedelta | None = None,
+    token_type: str | None = None,
 ) -> str:
-    if expires_delta:
+    if expires_delta is not None:
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(
             minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
         )
     to_encode = {"exp": expire, "sub": str(subject)}
+    if token_type is not None:
+        to_encode["token_type"] = token_type
     encoded_jwt = jwt.encode(
         to_encode,
         settings.SECRET_KEY,
@@ -59,29 +62,18 @@ def generate_skyvern_signature(
     return hash_obj.hexdigest()
 
 
-MAX_WEBHOOK_PAYLOAD_LOG_SIZE = 8000  # ~8KB – keeps Datadog log entries manageable
-
-
 @dataclass
 class WebhookSignature:
     timestamp: str
     signature: str
     signed_payload: str
     headers: dict[str, str]
-    # Truncated version of signed_payload safe for logging
-    payload_for_log: str
 
 
 def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSignature:
     payload_str = _normalize_json_dumps(payload)
     signature = generate_skyvern_signature(payload=payload_str, api_key=api_key)
     timestamp = str(int(datetime.utcnow().timestamp()))
-    if len(payload_str) > MAX_WEBHOOK_PAYLOAD_LOG_SIZE:
-        payload_for_log = (
-            payload_str[:MAX_WEBHOOK_PAYLOAD_LOG_SIZE] + f"... (truncated, original size: {len(payload_str)})"
-        )
-    else:
-        payload_for_log = payload_str
     return WebhookSignature(
         timestamp=timestamp,
         signature=signature,
@@ -91,5 +83,4 @@ def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSi
             "x-skyvern-signature": signature,
             "Content-Type": "application/json",
         },
-        payload_for_log=payload_for_log,
     )

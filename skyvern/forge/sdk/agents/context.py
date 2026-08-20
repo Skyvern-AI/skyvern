@@ -51,6 +51,7 @@ def compact_agent_messages_for_llm(
     summarize_tool_output: Callable[[str], str] | None = None,
     summarize_tool_arguments: Callable[[str], str] | None = None,
     tool_output_truncation_suffix: str = DEFAULT_TRUNCATION_SUFFIX,
+    on_recent_truncation: Callable[[int, int], None] | None = None,
     token_budget: int | None = None,
     estimate_tokens: Callable[[list[Any]], int] | None = None,
     is_synthetic_message: Callable[[Any], bool] | None = None,
@@ -75,6 +76,7 @@ def compact_agent_messages_for_llm(
         summarize_tool_output=summarize_tool_output,
         summarize_tool_arguments=summarize_tool_arguments,
         suffix=tool_output_truncation_suffix,
+        on_recent_truncation=on_recent_truncation,
     )
     if token_budget is None:
         return items
@@ -102,6 +104,57 @@ def compact_agent_messages_for_llm(
             return items
 
     return aggressive_prune(items) if aggressive_prune is not None else items
+
+
+def pair_tool_calls_with_outputs(
+    items: list[Any],
+    *,
+    on_repair: Callable[[int, int], None] | None = None,
+) -> list[Any]:
+    """Seat every ``function_call_output`` immediately after its own ``function_call``.
+
+    A provider rejects the whole request when a result is separated from its call by a later
+    assistant turn, so the invariant is restored at this shared boundary rather than trusted to
+    each producer. Reordering only: a half with no counterpart is left exactly where it was.
+    """
+    outputs_by_call: dict[str, list[Any]] = {}
+    call_position: dict[str, int] = {}
+    # Calls and outputs may legally interleave within one parallel batch; only a turn-bearing
+    # item between a call and its result is the drift a provider rejects.
+    non_tool_before: list[int] = [0]
+    for index, item in enumerate(items):
+        item_type = get_agent_message_field(item, "type")
+        call_id = get_agent_message_field(item, "call_id")
+        if item_type == "function_call_output" and isinstance(call_id, str) and call_id:
+            outputs_by_call.setdefault(call_id, []).append(item)
+        elif item_type == "function_call" and isinstance(call_id, str):
+            call_position.setdefault(call_id, index)
+        non_tool_before.append(non_tool_before[-1] + (item_type not in ("function_call", "function_call_output")))
+
+    relocating = {call_id: outputs for call_id, outputs in outputs_by_call.items() if call_id in call_position}
+    if not relocating:
+        return items
+
+    position = {id(item): index for index, item in enumerate(items)}
+    drifted = 0
+    repaired: list[Any] = []
+    for index, item in enumerate(items):
+        item_type = get_agent_message_field(item, "type")
+        call_id = get_agent_message_field(item, "call_id")
+        if item_type == "function_call_output" and call_id in relocating:
+            continue
+        repaired.append(item)
+        if item_type != "function_call":
+            continue
+        for output in relocating.get(call_id, ()):
+            start, end = sorted((call_position[call_id], position[id(output)]))
+            if non_tool_before[end] > non_tool_before[start]:
+                drifted += 1
+            repaired.append(output)
+
+    if drifted and on_repair is not None:
+        on_repair(drifted, len(items) - len(repaired))
+    return repaired
 
 
 def sanitize_agent_tool_result_for_llm(
@@ -147,6 +200,7 @@ def _compact_tool_payloads(
     summarize_tool_output: Callable[[str], str] | None,
     summarize_tool_arguments: Callable[[str], str] | None,
     suffix: str,
+    on_recent_truncation: Callable[[int, int], None] | None = None,
 ) -> list[Any]:
     output_indices = [i for i, item in enumerate(items) if _tool_output_field(item) is not None]
     call_indices = [i for i, item in enumerate(items) if get_agent_message_field(item, "type") == "function_call"]
@@ -154,6 +208,8 @@ def _compact_tool_payloads(
     recent_calls = set(call_indices[-keep_recent_tool_outputs:]) if keep_recent_tool_outputs > 0 else set()
 
     compacted: list[Any] = []
+    recent_truncated_count = 0
+    recent_truncated_largest = 0
     for i, item in enumerate(items):
         output_field = _tool_output_field(item)
         if output_field is not None:
@@ -164,6 +220,9 @@ def _compact_tool_payloads(
                     if i in recent_outputs
                     else _summarize_or_truncate(output, summarize_tool_output, max_recent_tool_output_chars, suffix)
                 )
+                if i in recent_outputs and new_output != output:
+                    recent_truncated_count += 1
+                    recent_truncated_largest = max(recent_truncated_largest, len(output))
                 item = replace_agent_message_field(item, output_field, new_output) if new_output != output else item
         elif get_agent_message_field(item, "type") == "function_call" and i not in recent_calls:
             arguments = get_agent_message_field(item, "arguments")
@@ -180,6 +239,8 @@ def _compact_tool_payloads(
                     else item
                 )
         compacted.append(item)
+    if recent_truncated_count and on_recent_truncation is not None:
+        on_recent_truncation(recent_truncated_count, recent_truncated_largest)
     return compacted
 
 

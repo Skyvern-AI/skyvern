@@ -1,13 +1,7 @@
-import { useState } from "react";
-import {
-  CheckCircledIcon,
-  CrossCircledIcon,
-  ReloadIcon,
-} from "@radix-ui/react-icons";
-import { Status, type ActionsApiResponse } from "@/api/types";
+import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 import { CopyButton } from "@/components/CopyButton";
+import { StatusBadge } from "@/components/StatusBadge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
 import {
   Tooltip,
   TooltipContent,
@@ -19,12 +13,13 @@ import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
 import { cn } from "@/util/utils";
 import {
-  isAction,
   type ObserverThought,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { ThoughtCard } from "../ThoughtCard";
+import { CodeBlockFailureDetails } from "../CodeBlockFailureDetails";
+import { describeCodeBlockFailure } from "../codeBlockFailure";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -50,47 +45,6 @@ function TruncatedWithTooltip({
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
-  );
-}
-
-function StatusPill({ status }: { status: Status | null }) {
-  if (status === null) return null;
-  const isSuccess = status === Status.Completed;
-  const isFailure =
-    status === Status.Failed ||
-    status === Status.Terminated ||
-    status === Status.TimedOut ||
-    status === Status.Canceled;
-  const isRunning = status === Status.Running;
-
-  if (isSuccess) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-success/15 px-2 py-0.5 text-xs text-success">
-        <CheckCircledIcon className="size-3.5" />
-        <span>Completed</span>
-      </span>
-    );
-  }
-  if (isFailure) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-destructive/15 px-2 py-0.5 text-xs text-destructive">
-        <CrossCircledIcon className="size-3.5" />
-        <span className="capitalize">{status}</span>
-      </span>
-    );
-  }
-  if (isRunning) {
-    return (
-      <span className="inline-flex items-center gap-1 rounded bg-sky-500/15 px-2 py-0.5 text-xs text-sky-300">
-        <ReloadIcon className="size-3.5 animate-spin" />
-        <span>Running</span>
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1 rounded bg-slate-700 px-2 py-0.5 text-xs capitalize text-slate-300">
-      {status}
-    </span>
   );
 }
 
@@ -140,57 +94,61 @@ function BlockDetailHeader({
       : null;
 
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1">
+    <div className="border-b border-border bg-slate-elevation1">
       <div
         data-slot="block-detail-header-primary"
         className="flex items-center gap-2 px-3 py-2"
       >
         <WorkflowBlockIcon
           workflowBlockType={block.block_type}
-          className="size-4 shrink-0 text-slate-300"
+          className="size-4 shrink-0 text-tertiary-foreground"
         />
-        <span className="min-w-0 truncate text-sm font-semibold text-slate-100">
+        <span className="min-w-0 truncate text-sm font-semibold text-foreground">
           {workflowBlockTitle[block.block_type]}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-2">
           {duration && (
-            <span className="text-[10px] tabular-nums text-slate-500">
+            <span className="text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
               {duration}
             </span>
           )}
-          <StatusPill status={block.status} />
+          {block.status && (
+            <StatusBadge status={block.status} alwaysShowLabel />
+          )}
         </span>
       </div>
       <div
         data-slot="block-detail-header-meta"
-        className="flex min-w-0 items-center gap-1.5 px-3 pb-2 text-[11px] text-slate-500"
+        className="flex min-w-0 items-center gap-1.5 px-3 pb-2 text-[11px] text-muted-foreground dark:text-slate-500"
       >
         {block.label && (
           <>
             <TruncatedWithTooltip
               full={block.label}
-              className="max-w-[12rem] text-slate-400"
+              className="max-w-[12rem] text-muted-foreground"
             />
             <span className="shrink-0 text-slate-600">·</span>
           </>
         )}
         <TruncatedWithTooltip
           full={block.workflow_run_block_id}
-          className="max-w-[11rem] font-mono text-[10px] text-slate-500"
+          className="max-w-[11rem] font-mono text-[10px] text-muted-foreground dark:text-slate-500"
         />
         {iterationLabel && (
-          <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground">
             {iterationLabel}
           </span>
         )}
       </div>
       {currentValuePreview && (
-        <div className="flex min-w-0 items-center gap-2 border-t border-slate-700/50 px-3 py-1.5 text-[11px] duration-200 animate-in fade-in slide-in-from-top-1">
-          <span className="shrink-0 text-slate-500">Iterated value:</span>
+        <div className="flex min-w-0 items-center gap-2 border-t border-border/50 px-3 py-1.5 text-[11px] duration-200 animate-in fade-in slide-in-from-top-1">
+          <span className="shrink-0 text-muted-foreground dark:text-slate-500">
+            Iterated value:
+          </span>
           <TooltipProvider delayDuration={300}>
             <Tooltip>
               <TooltipTrigger asChild>
-                <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-slate-300">
+                <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-tertiary-foreground">
                   {currentValuePreview}
                 </code>
               </TooltipTrigger>
@@ -205,8 +163,10 @@ function BlockDetailHeader({
         </div>
       )}
       {block.description && (
-        <div className="border-t border-slate-700/50 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
-          <div className="text-xs text-slate-400">{block.description}</div>
+        <div className="border-t border-border/50 px-3 py-2 duration-200 animate-in fade-in slide-in-from-top-1">
+          <div className="text-xs text-muted-foreground">
+            {block.description}
+          </div>
         </div>
       )}
     </div>
@@ -215,7 +175,7 @@ function BlockDetailHeader({
 
 function BlockDetailHeaderSkeleton() {
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1">
+    <div className="border-b border-border bg-slate-elevation1">
       <div className="flex items-center gap-2 px-3 py-2">
         <Skeleton className="size-4 shrink-0 rounded" />
         <Skeleton className="h-4 w-24 rounded" />
@@ -248,23 +208,42 @@ function Section({
         className,
       )}
     >
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+      <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground dark:text-slate-500">
         {title}
       </div>
-      <div className="text-sm text-slate-300">{children}</div>
+      <div className="text-sm text-tertiary-foreground">{children}</div>
     </div>
   );
 }
 
 function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
-  if (!block.failure_reason) return null;
+  const codeFailure = describeCodeBlockFailure(block);
+  if (!block.failure_reason && !codeFailure) return null;
   return (
     <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
         Failure
       </div>
-      <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs leading-relaxed text-destructive">
-        {block.failure_reason}
+      <div className="flex items-start gap-2.5 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs leading-relaxed text-foreground dark:bg-destructive/10">
+        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        {codeFailure ? (
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold leading-5">
+              {codeFailure.title}
+            </div>
+            <p className="mt-1 break-words text-muted-foreground">
+              {codeFailure.guidance}
+            </p>
+            <CodeBlockFailureDetails
+              failure={codeFailure}
+              reason={block.failure_reason}
+            />
+          </div>
+        ) : (
+          <span className="min-w-0 flex-1 break-words">
+            {block.failure_reason}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -285,7 +264,7 @@ function CodeBlock({
   if (copyValue !== undefined) {
     return (
       <div className={cn("group relative", className)}>
-        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 pr-10 font-mono text-xs text-slate-200">
+        <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 pr-10 font-mono text-xs text-foreground dark:text-slate-200">
           {children}
         </pre>
         <div className="absolute right-1 top-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
@@ -297,7 +276,7 @@ function CodeBlock({
   return (
     <pre
       className={cn(
-        "overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 font-mono text-xs text-slate-200",
+        "overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation1 p-2.5 font-mono text-xs text-foreground dark:text-slate-200",
         className,
       )}
     >
@@ -314,54 +293,9 @@ function JsonView({ value }: { value: unknown }) {
 function GoalText({ text }: { text: string | null | undefined }) {
   if (!text) return null;
   return (
-    <div className="whitespace-pre-wrap text-sm leading-relaxed text-slate-300">
+    <div className="whitespace-pre-wrap text-sm leading-relaxed text-tertiary-foreground">
       {text}
     </div>
-  );
-}
-
-function BlockActionList({
-  block,
-  activeItem,
-  onActionSelect,
-}: {
-  block: WorkflowRunBlock;
-  activeItem: WorkflowRunOverviewActiveElement;
-  onActionSelect?: (payload: {
-    block: WorkflowRunBlock;
-    action: ActionsApiResponse;
-  }) => void;
-}) {
-  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
-  const actions = block.actions ?? [];
-  const actionsTopDown = [...actions].reverse();
-  if (actions.length === 0) return null;
-  return (
-    <Section title={`Actions (${actions.length})`}>
-      <div className="space-y-2">
-        {actionsTopDown.map((action, index) => {
-          const isActive =
-            isAction(activeItem) && activeItem.action_id === action.action_id;
-          return (
-            <ActionCardCompact
-              key={action.action_id}
-              action={action}
-              active={isActive}
-              index={index + 1}
-              expanded={expandedActionId === action.action_id}
-              onToggleExpanded={() => {
-                setExpandedActionId((prev) =>
-                  prev === action.action_id ? null : action.action_id,
-                );
-              }}
-              onSelect={() => {
-                onActionSelect?.({ block, action });
-              }}
-            />
-          );
-        })}
-      </div>
-    </Section>
   );
 }
 
@@ -400,7 +334,6 @@ function BlockThoughtList({
 }
 
 export {
-  BlockActionList,
   BlockDetailFailure,
   BlockDetailHeader,
   BlockDetailHeaderSkeleton,
@@ -409,5 +342,4 @@ export {
   GoalText,
   JsonView,
   Section,
-  StatusPill,
 };

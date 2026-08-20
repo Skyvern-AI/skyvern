@@ -13,30 +13,56 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    ChallengeEvidenceSource,
+    composition_challenge_carrier,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _auto_credit_interaction_observation,
     has_bounded_page_schema,
+    has_witnessed_value_content,
+    parse_composition_structured,
+)
+from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import (
+    StructuredContext,
+    finalize_observation_context,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
-    MAX_NO_PROGRESS_INTERACTION_ATTEMPTS,
+    record_scouted_output_coverage,
 )
+from skyvern.forge.sdk.copilot.output_extraction_plan import ShapeExpectation, ValueCardinality, ValueShape
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.result_evidence import scout_observation_bound_paths
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.scouting import (
+    _SCOUT_RESULT_CHAR_CAP,
     _consume_pending_browser_interaction_observation,
-    _mark_pending_browser_interaction_observation,
+    _latest_same_page_evidence,
+    _observed_control_readiness,
+    _page_evidence_is_unchanged,
+    _page_evidence_location_fingerprint,
+    _page_evidence_matches_url_identity,
     _register_scout_interaction_observation,
+    _safe_page_evidence_url,
     _scout_act_observe_page_evidence,
-    account_no_progress_interaction_click,
 )
+from tests.unit.copilot_test_helpers import carried_interaction
 
 _SOURCE_URL = "https://example.com/product"
 _LANDING_URL = "https://example.com/results"
+
+
+@pytest.fixture(autouse=True)
+def _page_evidence_fingerprint_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
+
 
 _SCHEMA_LESS_PACKET_KEYS = {
     "inspected_url",
@@ -74,17 +100,72 @@ def _bounded_extractor_payload() -> dict[str, Any]:
     }
 
 
+def _bounded_challenge_signalled_payload(challenge_controls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Login page whose schema is already bounded while the challenge widget is only
+    signalled by a keyword; ``challenge_controls`` supplies the rendered carrier."""
+    payload = _bounded_extractor_payload()
+    payload["anti_bot_indicators"] = ["captcha"]
+    payload["challenge_controls"] = challenge_controls or []
+    return payload
+
+
+def _rendered_iframe_challenge_control() -> dict[str, Any]:
+    return {"tag": "iframe", "selector": 'iframe[title="reCAPTCHA"]', "text": ""}
+
+
+def _kv_only_extractor_payload() -> dict[str, Any]:
+    return {
+        "page_title": "Provider Record",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "key_value_relations": [
+            {
+                "key_text": "Ref Code",
+                "value_text": "AB-2931",
+                "container_selector": ".record .kv",
+                "container_match_count": 1,
+                "container_position": 0,
+                "value_child_index": 1,
+                "direct_child_count": 2,
+                "visible": True,
+                "value_visible": True,
+            }
+        ],
+    }
+
+
 def _ctx(*, server: Any = None, source_url: str | None = _SOURCE_URL) -> SimpleNamespace:
     return SimpleNamespace(
         pending_browser_interaction_observation=None,
-        pending_scout_typed_value=None,
+        pending_scout_input_value=None,
         pending_scout_role_name=None,
         pending_scout_click_selector=None,
+        pending_scout_ambiguous=None,
+        pending_scout_reanchor=None,
+        pending_scout_dynamic_row=None,
         discovery_mcp_server=server,
         scouted_interactions=[],
         scout_trajectory=[],
+        organization_id="o_test",
+        browser_session_id="bs_test",
+        prior_carried_trajectory=[],
+        carried_trajectory_rebound_done=False,
         pending_scout_source_url=source_url,
         flow_evidence=[],
+        completion_criteria_turn_state=None,
+        last_code_authoring_repair_context=None,
+        copilot_config=None,
+        scout_observation_contract=None,
+        scouted_output_covered_paths=set(),
+        scout_observed_terminal_criterion_ids=set(),
+        request_policy=None,
+        org_credentials_for_turn=None,
+        completion_verification_result=None,
+        reached_download_target=None,
+        pending_scout_popup=None,
+        pending_scout_popup_content_type=None,
+        pre_run_gated_output_warning_fingerprint=(),
     )
 
 
@@ -102,6 +183,18 @@ def _server_returning_sequence(payloads: list[dict[str, Any] | None | BaseExcept
     ]
     server.call_internal_tool = AsyncMock(side_effect=side_effects)
     return server
+
+
+async def _selector_count_one(
+    _ctx: SimpleNamespace, _selector: str | None, *, timeout_seconds: float | None = None
+) -> int:
+    return 1
+
+
+async def _role_name_textbox_account(
+    _ctx: SimpleNamespace, _selector: str | None, *, allow_browser_read: bool = True
+) -> tuple[str, str]:
+    return "textbox", "Account"
 
 
 def _monotonic_sequence(values: list[float]) -> Any:
@@ -127,6 +220,152 @@ def _flow_by_step(ctx: SimpleNamespace) -> dict[int, tuple[dict[str, Any], str]]
     return {entry["step"]: (entry["evidence"], entry["reached_via"]) for entry in ctx.flow_evidence}
 
 
+def test_safe_page_evidence_url_keeps_only_origin_and_fingerprints_location() -> None:
+    assert (
+        _safe_page_evidence_url("https://user:password@example.com/callback?code=secret#access_token=secret")
+        == "https://example.com/"
+    )
+
+    first = _page_evidence_location_fingerprint("https://example.com/search?q=first")
+    second = _page_evidence_location_fingerprint("https://example.com/search?q=second")
+    assert first is not None and first != "unkeyed"
+    assert second is not None and first != second
+    secret_path = "https://example.com/magic-link/29f4ed70-8c9a-4db6-b68d-f53a87bd2147"
+    safe_secret_path = _safe_page_evidence_url(secret_path)
+    assert safe_secret_path == "https://example.com/"
+    assert "29f4ed70-8c9a-4db6-b68d-f53a87bd2147" not in safe_secret_path
+    assert _page_evidence_location_fingerprint(secret_path) != _page_evidence_location_fingerprint(
+        "https://example.com/magic-link/a3e8be68-9304-42f0-bc81-42afca936dd6"
+    )
+    assert _page_evidence_location_fingerprint("https://example.com/#/home") != _page_evidence_location_fingerprint(
+        "https://example.com/#/admin"
+    )
+
+
+def test_latest_page_evidence_uses_secret_safe_location_identity() -> None:
+    first_url = "https://example.com/search?q=first"
+    evidence = parse_composition_structured(
+        _bounded_extractor_payload(),
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+    assert evidence is not None
+    evidence["current_url_location_fingerprint"] = _page_evidence_location_fingerprint(first_url)
+    ctx = _ctx()
+    ctx.flow_evidence = [{"step": 0, "reached_via": "current_page", "had_bounded_schema": True, "evidence": evidence}]
+
+    assert _latest_same_page_evidence(ctx, url=first_url) is evidence
+    assert _latest_same_page_evidence(ctx, url="https://example.com/search?q=second") is None
+
+
+def test_control_readiness_uses_secret_safe_location_identity() -> None:
+    page_url = "https://example.com/search?q=first"
+    evidence = parse_composition_structured(
+        _bounded_extractor_payload(),
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+    assert evidence is not None
+    evidence["current_url_location_fingerprint"] = _page_evidence_location_fingerprint(page_url)
+    evidence["forms"][0]["fields"][0]["visible"] = False
+    ctx = _ctx()
+    ctx.flow_evidence = [{"step": 0, "reached_via": "interaction", "had_bounded_schema": True, "evidence": evidence}]
+
+    assert _observed_control_readiness(ctx, "#npi", page_url) == (True, False)
+    assert _observed_control_readiness(ctx, "#npi", "https://example.com/search?q=second") == (False, False)
+
+
+def test_page_identity_uses_process_key_when_secret_key_is_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SECRET_KEY", type(settings).model_fields["SECRET_KEY"].default)
+    page_url = "https://example.com/search?q=first"
+    fingerprint = _page_evidence_location_fingerprint(page_url)
+    evidence = {
+        "current_url": "https://example.com/",
+        "current_url_location_fingerprint": fingerprint,
+    }
+
+    assert fingerprint is not None and fingerprint != "unkeyed"
+    assert _page_evidence_matches_url_identity(evidence, page_url) is True
+    assert _page_evidence_matches_url_identity(evidence, "https://example.com/search?q=second") is False
+
+
+def test_page_evidence_freshness_ignores_visual_challenge_provenance() -> None:
+    prior = parse_composition_structured(
+        _bounded_challenge_signalled_payload([_rendered_iframe_challenge_control()]),
+        inspected_url=_SOURCE_URL,
+        current_url=_SOURCE_URL,
+    )
+    current = parse_composition_structured(
+        _bounded_challenge_signalled_payload([_rendered_iframe_challenge_control()]),
+        inspected_url=_LANDING_URL,
+        current_url=_LANDING_URL,
+    )
+    assert prior is not None and current is not None
+    prior["challenge_state"] = {
+        **prior["challenge_state"],
+        "source": "dom+screenshot",
+        "evidence_source": "vision",
+        "visual_location": "centered overlay",
+    }
+
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+
+def test_page_evidence_freshness_compares_dom_state_not_visual_augmentation() -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    prior["challenge_state"] = {
+        **prior["challenge_state"],
+        "detected": True,
+        "requires_human_verification": True,
+        "kind": "visual_challenge",
+        "evidence_source": "vision",
+    }
+    prior["page_obstructions"] = [{"kind": "loading_overlay", "source": "vision"}]
+    prior["observed_empty_page"] = True
+    prior["empty_page_visual_state"] = "settled_empty"
+
+    assert _page_evidence_is_unchanged(prior, current) is True
+
+
+@pytest.mark.parametrize("candidate_on_prior", [False, True])
+def test_page_evidence_freshness_includes_dom_obstruction_candidates(candidate_on_prior: bool) -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    candidate = {
+        "selector": ".loading-overlay",
+        "position": "fixed",
+        "z_index": 1000,
+        "viewport_coverage": 0.95,
+    }
+    (prior if candidate_on_prior else current)["visual_obstruction_candidates"] = [candidate]
+
+    assert _page_evidence_is_unchanged(prior, current) is False
+
+
+def test_page_evidence_freshness_includes_reveal_truncation_state() -> None:
+    prior = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL
+    )
+    current = parse_composition_structured(
+        _bounded_extractor_payload(), inspected_url=_LANDING_URL, current_url=_LANDING_URL
+    )
+    assert prior is not None and current is not None
+    current["inspection_warnings"] = ["reveal_relations_truncated"]
+
+    assert _page_evidence_is_unchanged(prior, current) is False
+
+
 class TestActObserveSuccess:
     @pytest.mark.asyncio
     async def test_schema_merged_into_interaction_packet_before_append(self) -> None:
@@ -146,6 +385,7 @@ class TestActObserveSuccess:
         assert evidence["interaction_source_url"] == _SOURCE_URL
         assert evidence["inspected_url"] == _LANDING_URL
         assert evidence["current_url"] == _LANDING_URL
+        assert evidence["current_url_location_fingerprint"] == _page_evidence_location_fingerprint(_LANDING_URL)
         assert has_bounded_page_schema(evidence)
         assert evidence["forms"][0]["fields"][0]["label"] == "NPI number"
 
@@ -172,7 +412,151 @@ class TestActObserveSuccess:
         assert page["result_container_count"] == 1
         assert page["challenge_detected"] is False
         assert page["modal_dismiss_controls"] == ["Accept"]
-        assert len(json.dumps(result)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+        assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
+
+    @pytest.mark.asyncio
+    async def test_content_witnessed_kv_reveal_admitted_without_bounded_schema(self) -> None:
+        ctx = _ctx(server=_server_returning(_kv_only_extractor_payload()))
+
+        result = await _run_click(ctx)
+
+        assert result["ok"] is True
+        assert ctx.last_scout_act_observe_outcome == "hollow"
+        assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+        assert ctx.pending_browser_interaction_observation is None
+        assert len(ctx.flow_evidence) == 1
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["had_bounded_schema"] is False
+        evidence = entry["evidence"]
+        assert evidence["source_tool"] == "scout_interaction"
+        assert has_bounded_page_schema(evidence) is False
+        assert has_witnessed_value_content(evidence) is True
+
+
+def _zero_overlap_kv_relation(key_text: str, value_text: str, selector: str) -> dict[str, Any]:
+    return {
+        "key_text": key_text,
+        "value_text": value_text,
+        "container_selector": selector,
+        "container_match_count": 1,
+        "container_position": 0,
+        "value_child_index": 1,
+        "direct_child_count": 2,
+        "visible": True,
+        "value_visible": True,
+    }
+
+
+def _zero_overlap_kv_packet() -> dict[str, Any]:
+    return {
+        "current_url": _LANDING_URL,
+        "source_tool": "scout_interaction",
+        "interaction_selector": "#reveal",
+        "inspection_warnings": [],
+        "result_containers_truncated": False,
+        "key_value_relations_truncated": False,
+        "key_value_relations": [
+            _zero_overlap_kv_relation("Ref Code", "12345678", ".kv-ref"),
+            _zero_overlap_kv_relation("Site", "12 Peak Way Reno NV 89501", ".kv-site"),
+        ],
+        "result_containers": [],
+    }
+
+
+_ZERO_OVERLAP_BOUND_PATHS = {"output.widget_id", "output.address"}
+
+
+def _zero_overlap_requested_output_ctx() -> SimpleNamespace:
+    ctx = _ctx()
+    ctx.completion_criteria_turn_state = SimpleNamespace(
+        decision=SimpleNamespace(
+            criteria=(
+                CompletionCriterion(
+                    id="output.widget_id",
+                    outcome="the eight digit widget reference",
+                    output_path="output.widget_id",
+                ),
+                CompletionCriterion(
+                    id="output.address",
+                    outcome="the mailing address of the site",
+                    output_path="output.address",
+                ),
+            )
+        )
+    )
+    ctx.copilot_config = CopilotConfig(
+        requested_output_shape_expectations={
+            "widget_id": ShapeExpectation(ValueShape.NUMERIC_ID, ValueCardinality.SCALAR, id_digit_length=8),
+            "address": ShapeExpectation(ValueShape.POSTAL_ADDRESS, ValueCardinality.SCALAR),
+        }
+    )
+    ctx.scout_trajectory = [{"tool_name": "click", "selector": "#reveal", "trajectory_index": 0}]
+    return ctx
+
+
+class TestActObserveCoverageCredit:
+    @pytest.mark.asyncio
+    async def test_click_admit_branch_credits_value_grounded_on_witnessed_reveal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            scouting_module, "_scout_act_observe_page_evidence", AsyncMock(return_value=_zero_overlap_kv_packet())
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+
+        with capture_logs() as logs:
+            step, page_evidence = await _register_scout_interaction_observation(
+                ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+            )
+
+        assert page_evidence is not None
+        assert has_witnessed_value_content(page_evidence) is True
+        assert ctx.scout_observation_contract is not None
+        assert scout_observation_bound_paths(ctx.scout_observation_contract) == _ZERO_OVERLAP_BOUND_PATHS
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+        credited = next(entry for entry in logs if entry["event"] == "copilot_scouted_output_coverage_credited")
+        assert credited["provenance"] == "value_grounded"
+        assert sorted(credited["value_grounded_paths"]) == sorted(_ZERO_OVERLAP_BOUND_PATHS)
+
+    @pytest.mark.asyncio
+    async def test_second_record_for_same_paths_emits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            scouting_module, "_scout_act_observe_page_evidence", AsyncMock(return_value=_zero_overlap_kv_packet())
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+
+        await _register_scout_interaction_observation(
+            ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+        )
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+
+        with capture_logs() as logs:
+            record_scouted_output_coverage(
+                ctx, _zero_overlap_kv_packet(), contract=ctx.scout_observation_contract, include_lexical=False
+            )
+        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
+        assert ctx.scouted_output_covered_paths == _ZERO_OVERLAP_BOUND_PATHS
+
+    @pytest.mark.asyncio
+    async def test_unwitnessed_reveal_mints_and_credits_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            scouting_module,
+            "_scout_act_observe_page_evidence",
+            AsyncMock(return_value={"current_url": _LANDING_URL, "forms": [], "key_value_relations": []}),
+        )
+        ctx = _zero_overlap_requested_output_ctx()
+        ctx.last_scout_act_observe_outcome = None
+
+        with capture_logs() as logs:
+            step, page_evidence = await _register_scout_interaction_observation(
+                ctx, tool_name="click", selector="#reveal", source_url=_SOURCE_URL, url=_LANDING_URL
+            )
+
+        assert page_evidence is None
+        assert ctx.scout_observation_contract is None
+        assert ctx.scouted_output_covered_paths == set()
+        assert not any(entry["event"] == "copilot_scouted_output_coverage_credited" for entry in logs)
 
 
 class TestActObserveDegrade:
@@ -296,7 +680,7 @@ class TestActObserveDegrade:
         assert result["data"] == {
             "selector": "#open-details",
             "effective_target": "#open-details",
-            "url": _LANDING_URL,
+            "url": "https://example.com/",
             "title": "Results",
             "observation_step": ctx.flow_evidence[0]["step"],
         }
@@ -359,6 +743,343 @@ class TestActObserveDegrade:
         assert step is None
         assert page_evidence is None
         assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+
+
+class TestActObserveRecaptureSettle:
+    @pytest.mark.asyncio
+    async def test_unchanged_pre_action_page_is_recaptured_before_admission(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stale = _bounded_extractor_payload()
+        stale["page_title"] = "Two-factor authentication"
+        fresh = _bounded_extractor_payload()
+        fresh["page_title"] = "Project home"
+        fresh["navigation_targets"] = [
+            {"text": "Web analytics", "href": "/project/47954/web", "selector": 'a[href="/project/47954/web"]'}
+        ]
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        prior["screenshot_used"] = True
+        prior["evidence_sources"] = ["dom", "screenshot"]
+        ctx = _ctx(server=_server_returning_sequence([stale, fresh]), source_url=_SOURCE_URL)
+        ctx.pending_scout_role_name = ("#open-details", "button", "Continue")
+        ctx.flow_evidence = [
+            {
+                "step": 0,
+                "reached_via": "current_page",
+                "had_bounded_schema": True,
+                "evidence": prior,
+            }
+        ]
+        monkeypatch.setattr(
+            scouting_module,
+            "_live_working_page_url",
+            AsyncMock(return_value=f"{_LANDING_URL}/home"),
+        )
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+
+        result = await _run_click(ctx)
+
+        assert sleeps == [settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS]
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_recapture_result == "attached"
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert result["data"]["page"]["page_title"] == "Project home"
+        assert ctx.flow_evidence[-1]["evidence"]["current_url"] == f"{_LANDING_URL}/home"
+        assert ctx.flow_evidence[-1]["evidence"][
+            "current_url_location_fingerprint"
+        ] == _page_evidence_location_fingerprint(f"{_LANDING_URL}/home")
+
+    @pytest.mark.asyncio
+    async def test_persistently_unchanged_page_is_not_published_as_post_action_evidence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stale = _bounded_extractor_payload()
+        stale["page_title"] = "Two-factor authentication"
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        prior["screenshot_used"] = True
+        prior["evidence_sources"] = ["dom", "screenshot"]
+        ctx = _ctx(server=_server_returning_sequence([stale, stale]), source_url=_SOURCE_URL)
+        ctx.pending_scout_role_name = ("#open-details", "button", "Continue")
+        ctx.flow_evidence = [
+            {
+                "step": 0,
+                "reached_via": "current_page",
+                "had_bounded_schema": True,
+                "evidence": prior,
+            }
+        ]
+        monkeypatch.setattr(
+            scouting_module,
+            "_live_working_page_url",
+            AsyncMock(return_value=_LANDING_URL),
+        )
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "unchanged"
+        assert ctx.last_scout_act_observe_recapture_result == "unchanged"
+        assert result["data"]["page_observation"] == {
+            "status": "unchanged",
+            "message": "The page observation did not change after the click; no post-click page evidence was attached.",
+        }
+        assert "page" not in result["data"]
+        assert ctx.flow_evidence[-1]["had_bounded_schema"] is False
+
+    @pytest.mark.asyncio
+    async def test_visible_text_change_after_cross_url_click_is_fresh_evidence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stale = _bounded_extractor_payload()
+        stale["visible_text_excerpt"] = "Enter your verification code"
+        fresh = copy.deepcopy(stale)
+        fresh["visible_text_excerpt"] = "Visitors 12.1K Last 7 days"
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        ctx = _ctx(server=_server_returning_sequence([stale, fresh]), source_url=_SOURCE_URL)
+        ctx.pending_scout_role_name = ("#continue", "button", "Continue")
+        ctx.flow_evidence = [
+            {
+                "step": 0,
+                "reached_via": "current_page",
+                "had_bounded_schema": True,
+                "evidence": prior,
+            }
+        ]
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert "page" in result["data"]
+        assert ctx.flow_evidence[-1]["evidence"]["visible_text_excerpt"] == "Visitors 12.1K Last 7 days"
+        assert ctx.flow_evidence[-1]["evidence"]["current_url"] == _LANDING_URL
+        assert ctx.flow_evidence[-1]["evidence"][
+            "current_url_location_fingerprint"
+        ] == _page_evidence_location_fingerprint(_LANDING_URL)
+
+    @pytest.mark.asyncio
+    async def test_hollow_recapture_never_restores_known_stale_packet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stale = _bounded_extractor_payload()
+        stale["page_title"] = "Two-factor authentication"
+        hollow = {"page_title": "Loading", "forms": [], "visible_text_excerpt": "Loading"}
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        ctx = _ctx(server=_server_returning_sequence([stale, hollow]), source_url=_SOURCE_URL)
+        ctx.pending_scout_role_name = ("#continue", "button", "Continue")
+        ctx.flow_evidence = [{"step": 0, "reached_via": "current_page", "had_bounded_schema": True, "evidence": prior}]
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_outcome == "unchanged"
+        assert "page" not in result["data"]
+        assert result["data"]["page_observation"]["status"] == "unchanged"
+        assert ctx.last_scout_act_observe_packet is None
+        assert ctx.flow_evidence[-1]["had_bounded_schema"] is False
+
+    @pytest.mark.asyncio
+    async def test_hollow_first_capture_cannot_publish_stale_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stale = _bounded_extractor_payload()
+        stale["page_title"] = "Two-factor authentication"
+        hollow = {"page_title": "Loading", "forms": [], "visible_text_excerpt": "Loading"}
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        ctx = _ctx(server=_server_returning_sequence([hollow, stale]), source_url=_SOURCE_URL)
+        ctx.flow_evidence = [{"step": 0, "reached_via": "current_page", "had_bounded_schema": True, "evidence": prior}]
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "unchanged"
+        assert ctx.last_scout_act_observe_packet is None
+        assert "page" not in result["data"]
+        assert result["data"]["page_observation"]["status"] == "unchanged"
+
+    @pytest.mark.asyncio
+    async def test_fresh_post_challenge_page_may_drop_stale_challenge_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stale = _bounded_challenge_signalled_payload([_rendered_iframe_challenge_control()])
+        fresh = _bounded_extractor_payload()
+        fresh["page_title"] = "Project home"
+        prior = parse_composition_structured(copy.deepcopy(stale), inspected_url=_SOURCE_URL, current_url=_SOURCE_URL)
+        assert prior is not None
+        ctx = _ctx(server=_server_returning_sequence([stale, fresh]), source_url=_SOURCE_URL)
+        ctx.pending_scout_role_name = ("#continue", "button", "Continue")
+        ctx.flow_evidence = [{"step": 0, "reached_via": "current_page", "had_bounded_schema": True, "evidence": prior}]
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=_LANDING_URL))
+
+        result = await _run_click(ctx)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert result["data"]["page"]["page_title"] == "Project home"
+        assert ctx.flow_evidence[-1]["evidence"]["challenge_state"]["detected"] is False
+
+    @pytest.mark.asyncio
+    async def test_bounded_settle_paid_before_single_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        parsed = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert parsed is not None and has_bounded_page_schema(parsed)
+
+    @pytest.mark.asyncio
+    async def test_zero_settle_pays_no_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.0)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence([{"page_title": "Loading", "forms": []}, _bounded_extractor_payload()])
+        )
+
+        await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_outcome == "attached"
+
+    @pytest.mark.asyncio
+    async def test_attached_first_capture_pays_no_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
+
+        await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_outcome == "attached"
+
+    @pytest.mark.asyncio
+    async def test_attached_challenge_without_carrier_settles_and_recaptures(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        sleeps: list[float] = []
+
+        async def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    _bounded_challenge_signalled_payload([_rendered_iframe_challenge_control()]),
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert sleeps == []
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert composition_challenge_carrier(packet) is ChallengeEvidenceSource.CHALLENGE_STATE
+
+    @pytest.mark.asyncio
+    async def test_attached_keyword_only_challenge_recapture_still_yields_no_carrier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    _bounded_challenge_signalled_payload(),
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert composition_challenge_carrier(packet) is None
+
+    @pytest.mark.asyncio
+    async def test_recapture_may_not_erase_the_challenge_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recapture that still reports a bounded schema but has lost the challenge signal
+        must not replace the signalled packet: the signal is the visual fallback's only trigger."""
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        unsignalled = _bounded_extractor_payload()
+        ctx = _ctx(server=_server_returning_sequence([_bounded_challenge_signalled_payload(), unsignalled]))
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert packet is not None
+        assert packet["challenge_state"]["detected"] is True
+        assert packet["challenge_state"]["indicators"] == ["captcha"]
+
+    @pytest.mark.asyncio
+    async def test_attached_packet_survives_a_hollow_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+
+        async def record_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(scouting_module.asyncio, "sleep", record_sleep)
+        ctx = _ctx(
+            server=_server_returning_sequence(
+                [
+                    _bounded_challenge_signalled_payload(),
+                    {"page_title": "Results", "forms": []},
+                ]
+            )
+        )
+
+        packet = await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        assert ctx.last_scout_act_observe_outcome == "attached"
+        assert packet is not None
+        assert packet["forms"]
+
+    @pytest.mark.asyncio
+    async def test_capture_log_carries_container_and_relation_counts(self) -> None:
+        ctx = _ctx(server=_server_returning(_kv_only_extractor_payload()))
+
+        with capture_logs() as logs:
+            await _scout_act_observe_page_evidence(ctx, url=_LANDING_URL)
+
+        probe = next(entry for entry in logs if entry["event"] == "copilot_scout_act_observe")
+        assert probe["result_container_count"] == 0
+        assert probe["key_value_relation_count"] == 1
 
 
 class TestActObserveNoRace:
@@ -479,7 +1200,7 @@ class TestActObserveSummaryBound:
 
         assert result["ok"] is True
         serialized = json.dumps(result)
-        assert len(serialized) <= _RECENT_TOOL_OUTPUT_CHAR_CAP
+        assert len(serialized) <= _SCOUT_RESULT_CHAR_CAP
         assert json.loads(serialized) == result
         # The flow-evidence packet keeps the full schema; only the tool result is compact.
         assert ctx.flow_evidence[0]["had_bounded_schema"] is True
@@ -489,8 +1210,6 @@ class TestActObserveSummaryBound:
 class TestActObserveToolGate:
     @pytest.mark.asyncio
     async def test_non_click_tools_do_not_capture(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot import tools as tools_module
-
         async def passes(*_args: object, **_kwargs: object) -> None:
             return None
 
@@ -504,88 +1223,40 @@ class TestActObserveToolGate:
             ctx,
         )
 
-        server.call_internal_tool.assert_not_awaited()
+        awaited_tools = [call.args[0] for call in server.call_internal_tool.await_args_list]
+        assert awaited_tools == ["skyvern_get_value"]
         assert result["ok"] is True
         assert "page" not in result["data"]
         assert ctx.flow_evidence[0]["had_bounded_schema"] is False
 
+    @pytest.mark.asyncio
+    async def test_bare_css_selector_probes_control_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def passes(*_args: object, **_kwargs: object) -> None:
+            return None
 
-def _np_ctx(*, server: Any = None, counter: int = 0) -> SimpleNamespace:
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        server = _server_returning(_bounded_extractor_payload())
+        ctx = _ctx(server=server, source_url=_SOURCE_URL)
+
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#electricDate", "text_length": 10}},
+            {"browser_context": {"url": _LANDING_URL, "title": "Results"}},
+            ctx,
+        )
+
+        probed = [
+            call
+            for call in server.call_internal_tool.await_args_list
+            if call.args and call.args[0] == "skyvern_evaluate" and "readonly" in call.args[1]["expression"]
+        ]
+        assert len(probed) == 1
+
+
+def _np_ctx(*, server: Any = None) -> SimpleNamespace:
     ctx = _ctx(server=server)
-    ctx.consecutive_no_progress_interaction_count = counter
     ctx.last_scout_act_observe_outcome = None
     ctx.blocker_signal = None
     return ctx
-
-
-class TestNoProgressInteractionAccounting:
-    @pytest.mark.asyncio
-    async def test_hollow_click_increments_counter(self) -> None:
-        ctx = _np_ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
-
-        await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "hollow"
-        assert ctx.consecutive_no_progress_interaction_count == 1
-
-    @pytest.mark.asyncio
-    async def test_attached_click_resets_counter(self) -> None:
-        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()), counter=2)
-
-        await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "attached"
-        assert ctx.consecutive_no_progress_interaction_count == 0
-
-    @pytest.mark.asyncio
-    async def test_failed_click_increments_counter(self) -> None:
-        ctx = _np_ctx()
-
-        await _click_post_hook(
-            {"ok": False, "error": "Timeout 5000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
-            ctx,
-        )
-
-        assert ctx.consecutive_no_progress_interaction_count == 1
-
-    @pytest.mark.asyncio
-    async def test_capture_timeout_observe_is_neutral(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
-
-        async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
-            await asyncio.sleep(0.25)
-            return {"ok": True, "data": {"result": _bounded_extractor_payload()}}
-
-        server = SimpleNamespace()
-        server.call_internal_tool = AsyncMock(side_effect=slow_extract)
-        ctx = _np_ctx(server=server, counter=2)
-
-        await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "timeout"
-        assert ctx.consecutive_no_progress_interaction_count == 2
-
-    def test_neutral_outcome_does_not_touch_counter(self) -> None:
-        ctx = _np_ctx(counter=2)
-        ctx.last_scout_act_observe_outcome = None
-
-        account_no_progress_interaction_click(ctx, {"ok": True, "data": {"selector": "#x"}})
-
-        assert ctx.consecutive_no_progress_interaction_count == 2
-
-    def test_delayed_credit_via_consume_resets_counter(self) -> None:
-        ctx = _np_ctx(counter=3)
-        _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=_LANDING_URL)
-
-        consumed = _consume_pending_browser_interaction_observation(
-            ctx,
-            current_url=_LANDING_URL,
-            evidence={**_bounded_extractor_payload(), "current_url": _LANDING_URL},
-        )
-
-        assert consumed is True
-        assert ctx.consecutive_no_progress_interaction_count == 0
 
 
 def _standalone_controls_payload() -> dict[str, Any]:
@@ -605,71 +1276,144 @@ def _ungroundable_payload() -> dict[str, Any]:
     return {"page_title": "Loading", "forms": []}
 
 
-class TestNonAdvancingClickReperception:
-    @pytest.mark.asyncio
-    async def test_hollow_click_attaches_grounded_targets_without_touching_outcome(self) -> None:
-        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
-
-        result = await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "hollow"
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        selectors = {target.get("selector") for target in result["data"]["actionable_targets"]}
-        assert "#biz-tile" in selectors
-        assert 'div[data-action="selectAddress"]' in selectors
-
-    @pytest.mark.asyncio
-    async def test_failed_click_attaches_grounded_targets(self) -> None:
-        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
-
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 5000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
-            ctx,
+class TestCredentialInventoryCarry:
+    @staticmethod
+    def _credential_carry(available_fields: list[str] | None) -> dict[str, Any]:
+        return carried_interaction(
+            source_url=_LANDING_URL,
+            selector="#password",
+            tool_name="fill_credential_field",
+            credential_id="cred_123",
+            credential_field="username",
+            available_fields=available_fields,
         )
 
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        selectors = {target.get("selector") for target in result["data"]["actionable_targets"]}
-        assert "#biz-tile" in selectors
+    @pytest.mark.asyncio
+    async def test_rebind_rehydrates_inventory_alongside_carried_fills(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_carried_trajectory = [self._credential_carry(["password", "username"])]
+
+        scouting_module.hydrate_prior_carried_trajectory(ctx)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
 
     @pytest.mark.asyncio
-    async def test_ungroundable_non_advancing_click_attaches_no_targets(self) -> None:
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
+    async def test_page_mismatch_keeps_both_the_carry_and_the_inventory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_carried_trajectory = [self._credential_carry(["password", "username"])]
 
-        result = await _run_click(ctx)
+        scouting_module.hydrate_prior_carried_trajectory(ctx)
 
-        assert ctx.last_scout_act_observe_outcome == "hollow"
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        assert "actionable_targets" not in result["data"]
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
 
     @pytest.mark.asyncio
-    async def test_empty_url_attaches_no_targets(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def no_url(_raw: dict[str, Any], _ctx: AgentContext) -> tuple[str, str]:
-            return "", ""
+    async def test_legacy_carry_without_available_fields_rehydrates_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_carried_trajectory = [self._credential_carry(None)]
 
-        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_url_title", no_url)
-        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
+        scouting_module.hydrate_prior_carried_trajectory(ctx)
 
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 5000ms exceeded"},
-            {"browser_context": {}},
-            ctx,
+        assert ctx.scouted_credential_field_inventory_by_credential_id == {}
+        assert ctx.scout_trajectory[-1]["credential_id"] == "cred_123"
+
+    @pytest.mark.asyncio
+    async def test_inventory_round_trips_through_structured_context_and_agent_hydration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first_turn = SimpleNamespace(
+            prior_page_inspection_calls_made=0,
+            page_inspection_calls_this_turn=0,
+            flow_evidence=[],
+            scout_trajectory=[
+                {
+                    "tool_name": "fill_credential_field",
+                    "selector": "#password",
+                    "source_url": _LANDING_URL,
+                    "typed_length": 10,
+                    "credential_id": "cred_123",
+                    "credential_field": "username",
+                }
+            ],
+            scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+        )
+        raw = finalize_observation_context(first_turn, None)
+        assert raw is not None
+
+        monkeypatch.setattr(scouting_module, "_selector_live_match_count", _selector_count_one)
+        next_turn = _ctx()
+        next_turn.scouted_credential_field_inventory_by_credential_id = {}
+        next_turn.prior_carried_trajectory = list(StructuredContext.from_json_str(raw).carried_trajectory)
+
+        scouting_module.hydrate_prior_carried_trajectory(next_turn)
+
+        assert next_turn.scouted_credential_field_inventory_by_credential_id == {
+            "cred_123": frozenset({"username", "password"})
+        }
+        assert next_turn.scout_trajectory[-1]["credential_field"] == "username"
+
+
+class TestScoutPageObservationSignal:
+    def test_password_control_detected_in_forms(self) -> None:
+        evidence = {
+            "forms": [{"fields": [{"selector": "#user", "type": "text"}, {"selector": "#pass", "type": "password"}]}]
+        }
+        assert scouting_module._page_evidence_has_password_control(evidence) is True
+
+    def test_no_password_control_in_forms(self) -> None:
+        evidence = {"forms": [{"fields": [{"selector": "#user", "type": "text"}]}]}
+        assert scouting_module._page_evidence_has_password_control(evidence) is False
+        assert scouting_module._page_evidence_has_password_control({}) is False
+
+    def test_record_scout_page_observation_captures_stable_index_and_signal(self) -> None:
+        ctx = _ctx()
+        ctx.scout_trajectory = [
+            {"tool_name": "click", "selector": "#go", "source_url": _LANDING_URL, "trajectory_index": 4},
+            "scout-note",
+        ]
+        ctx.last_scout_observation_trajectory_index = None
+        ctx.last_scout_observation_has_password_control = False
+
+        scouting_module._record_scout_page_observation(
+            ctx, {"forms": [{"fields": [{"selector": "#pass", "type": "password"}]}]}
         )
 
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        assert "actionable_targets" not in (result.get("data") or {})
+        assert ctx.last_scout_observation_trajectory_index == 4
+        assert ctx.last_scout_observation_has_password_control is True
 
-    @pytest.mark.asyncio
-    async def test_attached_click_does_not_attach_reperception_targets(self) -> None:
-        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()))
+        scouting_module._record_scout_page_observation(ctx, {"forms": [{"fields": [{"selector": "#name"}]}]})
 
-        result = await _run_click(ctx)
+        assert ctx.last_scout_observation_has_password_control is False
 
-        assert ctx.last_scout_act_observe_outcome == "attached"
-        assert "actionable_targets" not in result["data"]
 
-    @pytest.mark.asyncio
-    async def test_ungroundable_churn_still_halts_at_max_without_reset(self) -> None:
+class TestTerminalActionObservationStampSeam:
+    _PORTAL_URL = "https://portal.example.test/login"
+    _BUSINESS_URL = "https://portal.example.test/business/start-service"
+
+    @staticmethod
+    def _terminal_action_criterion(*, method_mandated: bool = False) -> CompletionCriterion:
+        return CompletionCriterion(
+            id="start_service_request",
+            outcome="the business start-service request reaches its review page",
+            kind="terminal_action",
+            terminal_action_family="request",
+            method_mandated=method_mandated,
+        )
+
+    def _ctx_with(self, *criteria: CompletionCriterion) -> AgentContext:
         ctx = AgentContext(
             organization_id="o_1",
             workflow_id="w_1",
@@ -678,213 +1422,260 @@ class TestNonAdvancingClickReperception:
             browser_session_id="pbs_1",
             stream=MagicMock(),
         )
-        ctx.discovery_mcp_server = _server_returning(_ungroundable_payload())
+        ctx.completion_criteria_turn_state = SimpleNamespace(decision=SimpleNamespace(criteria=tuple(criteria)))
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+            {
+                "tool_name": "click",
+                "selector": "input[type='submit']",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 1,
+            },
+            {
+                "tool_name": "type_text",
+                "selector": "#service-address",
+                "source_url": self._BUSINESS_URL,
+                "role": "textbox",
+                "accessible_name": "Service Address",
+                "trajectory_index": 2,
+            },
+        ]
+        return ctx
 
-        for expected in range(1, MAX_NO_PROGRESS_INTERACTION_ATTEMPTS + 1):
-            result = await _run_click(ctx)
-            assert "actionable_targets" not in result["data"]
-            assert ctx.consecutive_no_progress_interaction_count == expected
+    def test_commit_past_login_stamps_terminal_action_observation(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="click",
+                selector="#find-address",
+                source_url=self._BUSINESS_URL,
+                role="button",
+                accessible_name="Find Address",
+            )
+        assert ctx.scout_observed_terminal_criterion_ids == {"start_service_request"}
+        assert [log for log in logs if log["event"] == "copilot_reached_terminal_action_observed"]
 
-        assert ctx.consecutive_no_progress_interaction_count == MAX_NO_PROGRESS_INTERACTION_ATTEMPTS
-        assert ctx.blocker_signal is not None
+    def test_matching_prior_page_observation_marks_demonstrated_control_readiness(self) -> None:
+        ctx = self._ctx_with()
+        ctx.scout_trajectory = []
+        ctx.scouted_interactions = []
+        ctx.composition_page_evidence = {
+            "current_url": self._BUSINESS_URL,
+            "forms": [
+                {
+                    "fields": [
+                        {
+                            "selector": "#breed",
+                            "disabled": True,
+                            "visible": False,
+                        }
+                    ]
+                }
+            ],
+        }
 
-
-def _sequenced_evidence(parses: list[dict[str, Any] | None]) -> Any:
-    calls = {"n": 0}
-
-    async def fake(_ctx: Any, *, inspected_url: str, current_url: str, timeout_seconds: float) -> dict[str, Any] | None:
-        index = calls["n"]
-        calls["n"] += 1
-        return parses[index] if index < len(parses) else parses[-1]
-
-    fake.calls = calls  # type: ignore[attr-defined]
-    return fake
-
-
-def _live_match(count: int | None) -> Any:
-    async def fake(_ctx: Any, _selector: str | None, *, timeout_seconds: float | None = None) -> int | None:
-        return count
-
-    return fake
-
-
-class TestPreconditionGatedClickSettle:
-    @pytest.mark.asyncio
-    async def test_settle_attaches_grounded_targets_and_steer_after_pending_ajax(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        monkeypatch.setattr(
-            tools_module.mcp_hooks,
-            "_composition_get_structured_evidence",
-            _sequenced_evidence([None, None, _standalone_controls_payload()]),
-        )
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
-
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 10000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
+        scouting_module._record_scouted_interaction(
             ctx,
+            tool_name="select_option",
+            selector="#breed",
+            source_url=self._BUSINESS_URL,
+            value="beagle",
         )
 
-        data = result["data"]
-        selectors = {target.get("selector") for target in data["actionable_targets"]}
-        assert "#biz-tile" in selectors
-        assert data["next_action"] == "click"
-        assert data["next_action_reason"]
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        assert ctx.last_scout_act_observe_outcome is None
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["observed_disabled"] is True
+        assert recorded["observed_hidden"] is True
 
-    @pytest.mark.asyncio
-    async def test_zero_match_invented_selector_skips_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
-        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(0))
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-        ctx.pending_scout_click_selector = "button[data-action='invented']"
+    def test_readiness_observation_does_not_cross_page_or_selector_identity(self) -> None:
+        ctx = self._ctx_with()
+        ctx.scout_trajectory = []
+        ctx.scouted_interactions = []
+        ctx.composition_page_evidence = {
+            "current_url": self._PORTAL_URL,
+            "forms": [{"fields": [{"selector": "#breed", "disabled": True, "visible": False}]}],
+        }
 
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 10000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
+        scouting_module._record_scouted_interaction(
             ctx,
+            tool_name="select_option",
+            selector="#animal-kind",
+            source_url=self._BUSINESS_URL,
+            value="dog",
         )
 
-        assert "actionable_targets" not in (result.get("data") or {})
-        assert evidence.calls["n"] == 1
-        assert ctx.consecutive_no_progress_interaction_count == 1
+        recorded = ctx.scout_trajectory[-1]
+        assert "observed_disabled" not in recorded
+        assert "observed_hidden" not in recorded
 
-    @pytest.mark.asyncio
-    async def test_settle_is_bounded_and_attaches_nothing_when_never_populates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_MAX_PROBES", 3)
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DEADLINE_SECONDS", 5.0)
-        evidence = _sequenced_evidence([None])
-        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+    def test_demonstrated_totp_fill_is_recorded_with_a_countable_capture_log(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        with capture_logs() as logs:
+            scouting_module._record_scouted_interaction(
+                ctx,
+                tool_name="fill_credential_field",
+                selector="#totpCode",
+                source_url=self._PORTAL_URL,
+                typed_length=6,
+                credential_id="cred_1",
+                credential_field="totp",
+                credential_name="mock-portal-login-totp",
+            )
+        assert ctx.scout_trajectory[-1]["credential_field"] == "totp"
+        capture = next(log for log in logs if log["event"] == "copilot_scout_interaction_captured")
+        assert capture["credential_field"] == "totp"
+        assert capture["credential_id"] == "cred_1"
 
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 10000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
+    def test_credential_fill_records_the_element_fingerprint_without_the_secret(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = []
+        scouting_module._record_scouted_interaction(
             ctx,
+            tool_name="fill_credential_field",
+            selector="#pass",
+            source_url=self._PORTAL_URL,
+            typed_length=14,
+            credential_id="cred_1",
+            credential_field="password",
+            credential_name="mock-portal-login",
+            element_fingerprint_id="pass",
+            element_fingerprint_name="password",
+            element_fingerprint_type="password",
+            element_fingerprint_placeholder="Password",
+            element_fingerprint_label="Password",
+            element_fingerprint_test_id="login-password",
+            element_fingerprint_tag="input",
         )
+        recorded = ctx.scout_trajectory[-1]
+        assert recorded["element_fingerprint_id"] == "pass"
+        assert recorded["element_fingerprint_type"] == "password"
+        assert recorded["element_fingerprint_placeholder"] == "Password"
+        assert recorded["element_fingerprint_tag"] == "input"
+        assert "Hunter2Portal!" not in str(recorded)
 
-        assert "actionable_targets" not in (result.get("data") or {})
-        assert evidence.calls["n"] == 4
-        assert ctx.consecutive_no_progress_interaction_count == 1
+    def test_login_only_commit_stamps_nothing(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion())
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "fill_credential_field",
+                "credential_id": "cred_1",
+                "credential_field": "password",
+                "selector": "#password",
+                "source_url": self._PORTAL_URL,
+                "trajectory_index": 0,
+            },
+        ]
+        scouting_module._record_scouted_interaction(
+            ctx, tool_name="click", selector="input[type='submit']", source_url=self._PORTAL_URL
+        )
+        assert ctx.scout_observed_terminal_criterion_ids == set()
 
-    @pytest.mark.asyncio
-    async def test_unreadable_selector_skips_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
-        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(None))
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 10000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
+    def test_method_mandated_criterion_is_not_stamped(self) -> None:
+        ctx = self._ctx_with(self._terminal_action_criterion(method_mandated=True))
+        scouting_module._record_scouted_interaction(
             ctx,
+            tool_name="click",
+            selector="#find-address",
+            source_url=self._BUSINESS_URL,
+            role="button",
+            accessible_name="Find Address",
         )
+        assert ctx.scout_observed_terminal_criterion_ids == set()
 
-        assert "actionable_targets" not in (result.get("data") or {})
-        assert evidence.calls["n"] == 1
-        assert ctx.consecutive_no_progress_interaction_count == 1
 
-    @pytest.mark.asyncio
-    async def test_expired_deadline_runs_no_warrants_or_extractor_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_MAX_PROBES", 5)
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DEADLINE_SECONDS", 0.0)
-        evidence = _sequenced_evidence([None, _standalone_controls_payload()])
-        monkeypatch.setattr(tools_module.mcp_hooks, "_composition_get_structured_evidence", evidence)
-        live = _counting_live_match(1)
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", live)
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
+class TestCarriedTrajectoryHydration:
+    """Successor to TestCarriedInteractionRebind (SKY-13617).
 
-        result = await _click_post_hook(
-            {"ok": False, "error": "Timeout 10000ms exceeded"},
-            {"browser_context": {"url": _LANDING_URL}},
-            ctx,
+    Those tests pinned a page-validation gate: the retained record only entered the
+    trajectory while the browser still stood on the page that produced it. After a login
+    that is never true, so the record was written and then dropped on the way back in.
+    Hydration is now unconditional and the tests assert that instead.
+    """
+
+    def test_hydrates_prior_record_whatever_page_the_browser_is_on(self) -> None:
+        ctx = _ctx()
+        ctx.scout_trajectory = [{"tool_name": "click", "selector": "#open", "source_url": _LANDING_URL}]
+        ctx.prior_carried_trajectory = [
+            carried_interaction(
+                source_url=_LANDING_URL,
+                selector="#account",
+                tool_name="type_text",
+                typed_value="ABC123",
+            ),
+            carried_interaction(
+                source_url=_LANDING_URL,
+                selector="#signin",
+                tool_name="click",
+            ),
+        ]
+        ctx.carried_trajectory_rebound_done = False
+
+        assert scouting_module.hydrate_prior_carried_trajectory(ctx) is True
+
+        carried = ctx.scout_trajectory[1:]
+        assert [(item["tool_name"], item["selector"], item["trajectory_index"]) for item in carried] == [
+            ("type_text", "#account", 1),
+            ("click", "#signin", 2),
+        ]
+        assert [item["carried"] for item in carried] == [True, True]
+        assert carried[0]["typed_value"] == "ABC123"
+
+    def test_hydration_carries_the_submit_click_the_fill_carry_could_not(self) -> None:
+        ctx = _ctx()
+        ctx.prior_carried_trajectory = [
+            carried_interaction(source_url=_LANDING_URL, selector="#signin", tool_name="click"),
+        ]
+        ctx.carried_trajectory_rebound_done = False
+
+        scouting_module.hydrate_prior_carried_trajectory(ctx)
+
+        assert [item["tool_name"] for item in ctx.scout_trajectory] == ["click"]
+
+    def test_hydration_runs_once_per_turn(self) -> None:
+        ctx = _ctx()
+        ctx.prior_carried_trajectory = [
+            carried_interaction(source_url=_LANDING_URL, selector="#account", tool_name="type_text"),
+        ]
+        ctx.carried_trajectory_rebound_done = False
+
+        assert scouting_module.hydrate_prior_carried_trajectory(ctx) is True
+        assert scouting_module.hydrate_prior_carried_trajectory(ctx) is False
+        assert len(ctx.scout_trajectory) == 1
+
+    def test_hydration_rehydrates_credential_field_inventory(self) -> None:
+        ctx = _ctx()
+        ctx.scouted_credential_field_inventory_by_credential_id = {}
+        ctx.prior_carried_trajectory = [
+            carried_interaction(
+                source_url=_LANDING_URL,
+                selector="#password",
+                tool_name="fill_credential_field",
+                credential_id="cred_123",
+                credential_field="password",
+                available_fields=["password", "username"],
+            ),
+        ]
+        ctx.carried_trajectory_rebound_done = False
+
+        scouting_module.hydrate_prior_carried_trajectory(ctx)
+
+        assert ctx.scouted_credential_field_inventory_by_credential_id["cred_123"] == frozenset(
+            {"password", "username"}
         )
+        assert "available_fields" not in ctx.scout_trajectory[0]
 
-        assert "actionable_targets" not in (result.get("data") or {})
-        assert evidence.calls["n"] == 1
-        assert live.calls["n"] == 0
-        assert ctx.consecutive_no_progress_interaction_count == 1
+    def test_empty_prior_record_hydrates_nothing(self) -> None:
+        ctx = _ctx()
+        ctx.prior_carried_trajectory = []
+        ctx.carried_trajectory_rebound_done = False
 
-
-def _counting_live_match(count: int | None) -> Any:
-    calls = {"n": 0}
-
-    async def fake(_ctx: Any, _selector: str | None, *, timeout_seconds: float | None = None) -> int | None:
-        calls["n"] += 1
-        return count
-
-    fake.calls = calls  # type: ignore[attr-defined]
-    return fake
-
-
-class TestClickReperceptionHardening:
-    @pytest.mark.asyncio
-    async def test_ok_hollow_empty_packet_falls_through_to_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_SETTLE_DELAY_SECONDS", 0.0)
-        monkeypatch.setattr(
-            tools_module.mcp_hooks,
-            "_composition_get_structured_evidence",
-            _sequenced_evidence([None, _standalone_controls_payload()]),
-        )
-        monkeypatch.setattr(tools_module.mcp_hooks, "_selector_live_match_count", _live_match(1))
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-        ctx.pending_scout_click_selector = 'button[data-action="selectAddress"]'
-
-        result = await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "hollow"
-        data = result["data"]
-        selectors = {target.get("selector") for target in data["actionable_targets"]}
-        assert "#biz-tile" in selectors
-        assert data["next_action"] == "click"
-        assert ctx.consecutive_no_progress_interaction_count == 1
-
-    @pytest.mark.asyncio
-    async def test_attach_exception_is_swallowed_and_increment_survives(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def boom(*_args: object, **_kwargs: object) -> None:
-            raise RuntimeError("attach blew up")
-
-        monkeypatch.setattr(tools_module.mcp_hooks, "_attach_reperception_targets_on_non_advancing_click", boom)
-        ctx = _np_ctx(server=_server_returning(_ungroundable_payload()))
-
-        result = await _run_click(ctx)
-
-        assert result["ok"] is True
-        assert ctx.consecutive_no_progress_interaction_count == 1
-        assert "actionable_targets" not in result["data"]
-
-    @pytest.mark.asyncio
-    async def test_channel_off_attaches_nothing_and_counter_climbs(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
-        ctx = _np_ctx(server=_server_returning(_standalone_controls_payload()))
-
-        result = await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "hollow"
-        assert "actionable_targets" not in result["data"]
-        assert ctx.consecutive_no_progress_interaction_count == 1
-
-    @pytest.mark.asyncio
-    async def test_channel_off_leaves_bounded_steer_intact(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICK_REPERCEPTION_ATTACH_ENABLED", False)
-        ctx = _np_ctx(server=_server_returning(_bounded_extractor_payload()), counter=2)
-
-        await _run_click(ctx)
-
-        assert ctx.last_scout_act_observe_outcome == "attached"
-        assert ctx.consecutive_no_progress_interaction_count == 0
+        assert scouting_module.hydrate_prior_carried_trajectory(ctx) is False
+        assert ctx.scout_trajectory == []

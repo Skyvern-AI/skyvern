@@ -4,12 +4,14 @@
  * How a workflow run was initiated.
  *
  * - manual: User clicked "Run" in the UI
+ * - mcp: First-party MCP client request
  * - api: Direct API call to the run endpoint
  * - scheduled: Triggered by a cron schedule
  * - webhook: Triggered by an external system via the webhook endpoint
  */
 export const WorkflowRunTriggerType = {
     Manual: "manual",
+    Mcp: "mcp",
     Api: "api",
     Scheduled: "scheduled",
     Webhook: "webhook",

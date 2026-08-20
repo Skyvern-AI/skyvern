@@ -120,6 +120,8 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
     frame = _mock_frame(locator_count=1)
     skyvern_el = _mock_skyvern_element(frame)
     inc_scrape = _mock_incremental_scrape(DROPDOWN_OPTIONS)
+    selection = object()
+    cleanup_factory = MagicMock(return_value=AsyncMock())
 
     llm_response = {
         "auto_completion_attempt": True,
@@ -141,6 +143,14 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         patch("skyvern.webeye.actions.handler.app") as mock_app,
         patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
         patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.resolve_engine_selection_for_task",
+            return_value=selection,
+        ) as resolve,
+        patch(
+            "skyvern.webeye.actions.handler.clean_and_remove_element_tree_factory",
+            cleanup_factory,
+        ),
     ):
         mock_app.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock(return_value=llm_response)
         mock_prompt.load_prompt.return_value = "mocked prompt"
@@ -163,6 +173,9 @@ async def test_discover_fallback_succeeds_when_options_appear() -> None:
         # Types the discovered value, then finds and clicks matched option via Playwright locator
         skyvern_el.press_fill.assert_awaited_with("I do not wish to disclose")
         inc_scrape.stop_listen_dom_increment.assert_awaited()
+        resolve.assert_called_once_with(_TASK, mock_app.BROWSER_MANAGER)
+        assert cleanup_factory.call_count == 1
+        assert cleanup_factory.call_args.kwargs["engine_selection"] is selection
 
 
 @pytest.mark.asyncio

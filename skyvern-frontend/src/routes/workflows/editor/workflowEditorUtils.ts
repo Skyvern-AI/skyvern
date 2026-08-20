@@ -53,9 +53,11 @@ import {
   HttpRequestBlockYAML,
   PrintPageBlockYAML,
   WorkflowTriggerBlockYAML,
+  EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
   PdfFillBlockYAML,
+  SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -145,10 +147,16 @@ import {
 } from "./nodes/HttpRequestNode/httpValidation";
 import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 import { validateErrorCodeMapping } from "./validateErrorCodeMapping";
+import { analyzeCodeBlockErrorCodes } from "./codeBlockErrorCodeDiagnostics";
 import {
   isWorkflowTriggerNode,
   workflowTriggerNodeDefaultData,
 } from "./nodes/WorkflowTriggerNode/types";
+import {
+  emailInboxNodeDefaultData,
+  isEmailInboxNode,
+} from "./nodes/EmailInboxNode/types";
+import { validateEmailInboxNode } from "./nodes/EmailInboxNode/validate";
 import {
   googleSheetsReadNodeDefaultData,
   isGoogleSheetsReadNode,
@@ -165,12 +173,21 @@ import {
 } from "./nodes/PdfFillNode/types";
 import { validatePdfFillNode } from "./nodes/PdfFillNode/validate";
 import {
+  isSplitPdfNode,
+  splitPdfNodeDefaultData,
+} from "./nodes/SplitPdfNode/types";
+import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
+import {
   containsJinjaReference,
   getAffectedBlocks,
   removeJinjaReference,
   replaceJinjaReference,
   type AffectedBlock,
 } from "./jinjaReferences";
+import {
+  findFinallyBlockNodeId,
+  isBlockFinallyGated,
+} from "./sortable/finallyBlockGate";
 
 /** If the trimmed expression is exactly one `{{ ... }}` wrapper, use `jinja2_template`; otherwise `prompt`. */
 export function inferBranchCriteriaTypeFromExpression(
@@ -231,6 +248,9 @@ function serializeLoopNodeWhileBranchToYAML(
 }
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
+
+// Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
+const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
 
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
@@ -694,7 +714,7 @@ function convertToNode(
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -748,7 +768,7 @@ function convertToNode(
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           disableCache: block.disable_cache ?? false,
         },
       };
@@ -766,7 +786,7 @@ function convertToNode(
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -788,7 +808,7 @@ function convertToNode(
           allowDownloads: block.complete_on_download ?? false,
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
@@ -840,7 +860,7 @@ function convertToNode(
               : typeof block.data_schema === "string"
                 ? block.data_schema
                 : JSON.stringify(block.data_schema, null, 2),
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           maxRetries: block.max_retries ?? null,
           maxStepsOverride: block.max_steps_per_run ?? null,
           disableCache: block.disable_cache ?? false,
@@ -859,13 +879,15 @@ function convertToNode(
           navigationGoal: block.navigation_goal ?? "",
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
+          includeActionHistoryInVerification:
+            block.include_action_history_in_verification ?? false,
           engine: block.engine ?? RunEngine.SkyvernV1,
         },
       };
@@ -893,13 +915,34 @@ function convertToNode(
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
           downloadSuffix: block.download_suffix ?? null,
           maxRetries: block.max_retries ?? null,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           totpIdentifier: block.totp_identifier ?? null,
           totpVerificationUrl: block.totp_verification_url ?? null,
           disableCache: block.disable_cache ?? false,
           maxStepsOverride: block.max_steps_per_run ?? null,
           engine: block.engine ?? RunEngine.SkyvernV1,
           downloadTimeout: block.download_timeout ?? null, // seconds
+          downloadTarget: block.download_target ?? "website",
+          path: block.path ?? "{{ workflow_run_id }}",
+          prompt: block.prompt ?? null,
+          s3Bucket: block.s3_bucket ?? "",
+          awsAccessKeyId: block.aws_access_key_id ?? "",
+          awsSecretAccessKey: block.aws_secret_access_key ?? "",
+          regionName: block.region_name ?? "",
+          azureStorageAccountName: block.azure_storage_account_name ?? "",
+          azureStorageAccountKey: block.azure_storage_account_key ?? "",
+          azureBlobContainerName: block.azure_blob_container_name ?? "",
+          googleCredentialId: block.google_credential_id ?? "",
+          googleDriveFolderId: block.google_drive_folder_id ?? "",
+          sftpHost: block.sftp_host ?? "",
+          sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
+          sftpUsername: block.sftp_username ?? "",
+          sftpPassword: block.sftp_password ?? "",
+          sftpPrivateKey: block.sftp_private_key ?? "",
+          sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
+          sftpRemotePath: block.sftp_remote_path ?? "",
+          sftpHostKey: block.sftp_host_key ?? "",
+          continueOnEmpty: block.continue_on_empty ?? false,
         },
       };
     }
@@ -911,10 +954,14 @@ function convertToNode(
         data: {
           ...commonData,
           code: block.code,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+          errorCodeMapping: JSON.stringify(
+            block.error_code_mapping ?? null,
+            null,
+            2,
+          ),
           prompt: block.prompt ?? null,
           steps: block.steps ?? null,
-          dataSchema: "null",
         },
       };
     }
@@ -934,6 +981,14 @@ function convertToNode(
           smtpPortSecretParameterKey: block.smtp_port?.key,
           smtpUsernameSecretParameterKey: block.smtp_username?.key,
           smtpPasswordSecretParameterKey: block.smtp_password?.key,
+          customSmtpHost: block.custom_smtp_host ?? null,
+          customSmtpPort:
+            block.custom_smtp_port !== null &&
+            block.custom_smtp_port !== undefined
+              ? String(block.custom_smtp_port)
+              : null,
+          customSmtpUsername: block.custom_smtp_username ?? null,
+          customSmtpPassword: block.custom_smtp_password ?? null,
         },
       };
     }
@@ -946,7 +1001,7 @@ function convertToNode(
           ...commonData,
           prompt: block.prompt,
           jsonSchema: JSON.stringify(block.json_schema, null, 2),
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1063,6 +1118,7 @@ function convertToNode(
         data: {
           ...commonData,
           path: block.path,
+          prompt: block.prompt ?? null,
           storageType: block.storage_type,
           s3Bucket: block.s3_bucket ?? "",
           awsAccessKeyId: block.aws_access_key_id ?? "",
@@ -1073,6 +1129,14 @@ function convertToNode(
           azureBlobContainerName: block.azure_blob_container_name ?? "",
           googleCredentialId: block.google_credential_id ?? "",
           googleDriveFolderId: block.google_drive_folder_id ?? "",
+          sftpHost: block.sftp_host ?? "",
+          sftpPort: block.sftp_port != null ? String(block.sftp_port) : "",
+          sftpUsername: block.sftp_username ?? "",
+          sftpPassword: block.sftp_password ?? "",
+          sftpPrivateKey: block.sftp_private_key ?? "",
+          sftpPrivateKeyPassphrase: block.sftp_private_key_passphrase ?? "",
+          sftpRemotePath: block.sftp_remote_path ?? "",
+          sftpHostKey: block.sftp_host_key ?? "",
         },
       };
     }
@@ -1102,7 +1166,7 @@ function convertToNode(
           files: JSON.stringify(block.files || {}, null, 2),
           timeout: block.timeout,
           followRedirects: block.follow_redirects,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
           downloadFilename: block.download_filename ?? "",
           saveResponseAsFile: block.save_response_as_file ?? false,
           secretResponsePaths: block.secret_response_paths ?? [],
@@ -1121,7 +1185,7 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1139,7 +1203,21 @@ function convertToNode(
               ? block.payload
               : JSON.stringify(block.payload || {}, null, 2),
           llmKey: block.llm_key ?? "",
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "split_pdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url ?? "",
+          prompt: block.prompt ?? "",
+          llmKey: block.llm_key ?? "",
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1156,7 +1234,27 @@ function convertToNode(
           waitForCompletion: block.wait_for_completion ?? true,
           browserSessionId: block.browser_session_id ?? "",
           useParentBrowserSession: block.use_parent_browser_session ?? false,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "email_inbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...commonData,
+          emailClient: block.email_client ?? "gmail",
+          credentialId: block.credential_id ?? "",
+          folder: block.folder ?? "INBOX",
+          prompt: block.prompt ?? "",
+          sender: block.sender ?? "",
+          subject: block.subject ?? "",
+          newerThanDays: block.newer_than_days ?? null,
+          maxResults: block.max_results ?? 25,
+          includeBody: block.include_body ?? true,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1172,7 +1270,7 @@ function convertToNode(
           range: block.range ?? "",
           credentialId: block.credential_id ?? "",
           hasHeaderRow: block.has_header_row ?? true,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1193,7 +1291,7 @@ function convertToNode(
             ? JSON.stringify(block.column_mapping, null, 2)
             : "",
           createSheetIfMissing: block.create_sheet_if_missing ?? false,
-          parameterKeys: block.parameters.map((p) => p.key),
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
     }
@@ -1393,21 +1491,42 @@ export class WorkflowValidationError extends Error {
   }
 }
 
+function validateNestedLoopBlocks(blocks: Array<WorkflowBlock>): void {
+  for (const block of blocks) {
+    if (isNestedLoopWorkflowBlock(block)) {
+      validateWorkflowBlocks(block.loop_blocks, block.label);
+    }
+  }
+}
+
 export function validateWorkflowBlocks(
   blocks: Array<WorkflowBlock>,
   loopLabel: string | null = null,
+  finallyBlockLabel: string | null = null,
 ): void {
   if (blocks.length === 0) return;
   const labelToBlock = new Map<string, WorkflowBlock>();
+  const seenLabels = new Set<string>();
   const where = loopLabel ? ` inside loop ${loopLabel}` : "";
 
   for (const block of blocks) {
-    if (labelToBlock.has(block.label)) {
+    if (seenLabels.has(block.label)) {
       throw new WorkflowValidationError(
         `Duplicate block label detected${where}: ${block.label}`,
       );
     }
-    labelToBlock.set(block.label, block);
+    seenLabels.add(block.label);
+    // A finally block runs out-of-band, so nothing points at it and it would
+    // read as a second root. Mirrors _strip_finally_block_references on the BE.
+    if (block.label !== finallyBlockLabel) {
+      labelToBlock.set(block.label, block);
+    }
+  }
+  // Only the finally block remained, so there is no graph to check — falling
+  // through would report zero roots as a circular reference.
+  if (labelToBlock.size === 0) {
+    validateNestedLoopBlocks(blocks);
+    return;
   }
 
   const adjacency = new Map<string, Set<string>>();
@@ -1418,7 +1537,7 @@ export function validateWorkflowBlocks(
   }
 
   const addEdge = (source: string, target: string | null | undefined): void => {
-    if (!target) return;
+    if (!target || target === finallyBlockLabel) return;
     if (!labelToBlock.has(target)) {
       throw new WorkflowValidationError(
         `Block ${source} references unknown next_block_label ${target}${where}`,
@@ -1474,15 +1593,12 @@ export function validateWorkflowBlocks(
     );
   }
 
-  for (const block of blocks) {
-    if (isNestedLoopWorkflowBlock(block)) {
-      validateWorkflowBlocks(block.loop_blocks, block.label);
-    }
-  }
+  validateNestedLoopBlocks(blocks);
 }
 
 export function applySequentialDefaulting(
   blocks: Array<WorkflowBlock>,
+  finallyBlockLabel: string | null = null,
 ): Array<WorkflowBlock> {
   if (blocks.length === 0) return blocks;
   const hasConditional = blocks.some((b) => b.block_type === "conditional");
@@ -1491,11 +1607,23 @@ export function applySequentialDefaulting(
   // (skip_sequential_defaulting=True) for already-explicit chains while still
   // upgrading legacy v1 lists where every next_block_label is null.
   const needsDefaulting = !hasConditional && findChainRoot(blocks) === null;
+  // The finally block is never part of the sequential chain: getElements draws
+  // its inbound edge as a display-only synthetic edge instead, so defaulting a
+  // real edge into it here would materialize that edge on the next save.
+  const sequence = blocks.filter(
+    (block) => !isBlockFinallyGated(block.label, finallyBlockLabel),
+  );
+  const nextInSequence = new Map<string, string | null>(
+    sequence.map((block, index) => [
+      block.label,
+      index < sequence.length - 1 ? sequence[index + 1]!.label : null,
+    ]),
+  );
 
-  return blocks.map((block, index) => {
+  return blocks.map((block) => {
     let next = block.next_block_label ?? null;
-    if (needsDefaulting && next === null && index < blocks.length - 1) {
-      next = blocks[index + 1]!.label;
+    if (needsDefaulting && next === null) {
+      next = nextInSequence.get(block.label) ?? null;
     }
     if (isNestedLoopWorkflowBlock(block)) {
       return {
@@ -1515,6 +1643,7 @@ function collectLabelsForBranch(
   startLabel: string | null,
   stopLabel: string | null,
   blocksByLabel: Map<string, WorkflowBlock>,
+  finallyBlockLabel: string | null,
   excludeLabels?: Set<string>,
 ): Array<string> {
   const labels: Array<string> = [];
@@ -1522,6 +1651,9 @@ function collectLabelsForBranch(
   let current = startLabel ?? null;
 
   while (current && current !== stopLabel && !visited.has(current)) {
+    if (isBlockFinallyGated(current, finallyBlockLabel)) {
+      break;
+    }
     if (excludeLabels?.has(current)) {
       break;
     }
@@ -1596,6 +1728,7 @@ function reconstructConditionalStructure(
   nodes: Array<AppNode>,
   labelToNodeMap: Map<string, AppNode>,
   blocksByLabel: Map<string, WorkflowBlock>,
+  finallyBlockLabel: string | null,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const newNodes = [...nodes];
   const newEdges: Array<Edge> = [];
@@ -1622,6 +1755,7 @@ function reconstructConditionalStructure(
           newNodes,
           labelToNodeMap,
           blocksByLabel,
+          finallyBlockLabel,
         );
         // Merge edges from recursive call
         newEdges.push(...recursiveResult.edges);
@@ -1674,6 +1808,7 @@ function reconstructConditionalStructure(
         branch.next_block_label,
         block.next_block_label ?? null,
         blocksByLabel,
+        finallyBlockLabel,
         excludeLabels,
       );
 
@@ -1849,7 +1984,9 @@ function findConditionalMergeTargetId(
 
   while (iterations < maxIterations) {
     iterations++;
-    const nextEdge = allEdges.find((edge) => edge.source === currentSource);
+    const nextEdge = allEdges.find(
+      (edge) => edge.source === currentSource && !isSyntheticEdge(edge),
+    );
     if (!nextEdge) {
       return null;
     }
@@ -1920,6 +2057,12 @@ export function edgeWithAddButton(source: string, target: string): Edge {
   } as Edge;
 }
 
+// Display-only edges: rendered like any chain edge but never serialized into a
+// real next_block_label. Currently only the finally-block chaining edge.
+export function isSyntheticEdge(edge: Edge): boolean {
+  return (edge.data as { synthetic?: boolean } | undefined)?.synthetic === true;
+}
+
 export function startNode(
   id: string,
   data: StartNodeData,
@@ -1963,7 +2106,10 @@ function getElements(
   edges: Array<Edge>;
   validationError: WorkflowValidationError | null;
 } {
-  blocks = applySequentialDefaulting(blocks);
+  blocks = applySequentialDefaulting(
+    blocks,
+    settings.finallyBlockLabel ?? null,
+  );
 
   // In editor / debugger contexts, surface the same shape errors the backend
   // raises at execute-time. Comparison/visualization views (editable=false)
@@ -1974,7 +2120,7 @@ function getElements(
   let validationError: WorkflowValidationError | null = null;
   if (editable) {
     try {
-      validateWorkflowBlocks(blocks);
+      validateWorkflowBlocks(blocks, null, settings.finallyBlockLabel ?? null);
     } catch (err) {
       if (err instanceof WorkflowValidationError) {
         validationError = err;
@@ -1988,12 +2134,21 @@ function getElements(
   const nodes: Array<AppNode> = [];
   const edges: Array<Edge> = [];
   const blocksByLabel = buildLabelToBlockMap(blocks);
+  // The finally block runs out-of-band, so it never competes as the chain root
+  // unless it is the only block in the workflow.
+  const nonFinallyBlocks = blocks.filter(
+    (block) =>
+      !isBlockFinallyGated(block.label, settings.finallyBlockLabel ?? null),
+  );
+  const blocksForRootDiscovery =
+    nonFinallyBlocks.length > 0 ? nonFinallyBlocks : blocks;
 
   const startNodeId = nanoid();
   nodes.push(
     startNode(startNodeId, {
       withWorkflowSettings: true,
       persistBrowserSession: settings.persistBrowserSession,
+      reuseBrowserSession: settings.reuseBrowserSession,
       pinSavedSessionIp: settings.pinSavedSessionIp,
       browserProfileId: settings.browserProfileId,
       browserProfileKey: settings.browserProfileKey,
@@ -2010,6 +2165,7 @@ function getElements(
       scriptCacheKey: settings.scriptCacheKey,
       aiFallback: settings.aiFallback ?? true,
       enableSelfHealing: settings.enableSelfHealing ?? false,
+      maskSecrets: settings.maskSecrets,
       label: "__start_block__",
       showCode: false,
       runSequentially: settings.runSequentially,
@@ -2074,6 +2230,7 @@ function getElements(
               branch.next_block_label,
               child.next_block_label ?? null,
               blocksByLabel,
+              settings.finallyBlockLabel ?? null,
               loopExclude,
             ).forEach((label) => branchLabels.add(label));
           });
@@ -2122,6 +2279,7 @@ function getElements(
     nodes,
     labelToNode,
     blocksByLabel,
+    settings.finallyBlockLabel ?? null,
   );
   nodes.length = 0;
   nodes.push(...conditionalResult.nodes);
@@ -2135,7 +2293,7 @@ function getElements(
   const cycleBackEdgeLabels = new Set<string>();
   {
     const visited = new Set<string>();
-    const chainRoot = findChainRoot(blocks);
+    const chainRoot = findChainRoot(blocksForRootDiscovery);
     let current = chainRoot?.label ?? null;
     while (current && !visited.has(current)) {
       visited.add(current);
@@ -2179,7 +2337,7 @@ function getElements(
   // Connect workflow START to the chain root (computed via adjacency, not
   // array order - see findChainRoot / Approach B in SKY-9051 design doc).
   if (blocks.length > 0) {
-    const chainRoot = findChainRoot(blocks);
+    const chainRoot = findChainRoot(blocksForRootDiscovery);
     const rootNode = chainRoot ? labelToNode.get(chainRoot.label) : null;
     if (rootNode) {
       edges.push(edgeWithAddButton(startNodeId, rootNode.id));
@@ -2196,7 +2354,7 @@ function getElements(
     // Find a top-level terminal block: one whose next_block_label is null OR
     // whose chain edge was skipped as a cycle break, and not inside a
     // conditional branch. Position in blocks[] is irrelevant.
-    const lastBlock = blocks.find((block) => {
+    const lastBlock = blocksForRootDiscovery.find((block) => {
       if (
         block.next_block_label !== null &&
         !cycleBackEdgeLabels.has(block.label)
@@ -2206,12 +2364,28 @@ function getElements(
       const node = labelToNode.get(block.label);
       return node && isWorkflowBlockNode(node) && !node.data.conditionalNodeId;
     });
+    const lastNode = lastBlock ? labelToNode.get(lastBlock.label) : undefined;
 
-    if (lastBlock) {
-      const lastNode = labelToNode.get(lastBlock.label);
-      if (lastNode) {
-        edges.push(defaultEdge(lastNode.id, adderNodeId));
-      }
+    // The finally block always renders last in the main chain. When no real
+    // edge reaches it, chain the main-chain tail into it with a synthetic
+    // edge so it never renders detached; `synthetic` keeps it out of
+    // serialization (findNextBlockLabel), so saves stay byte-equivalent.
+    const finallyNodeId = findFinallyBlockNodeId(
+      nodes,
+      settings.finallyBlockLabel ?? null,
+    );
+    const finallyHasRealInboundEdge = finallyNodeId
+      ? edges.some((edge) => edge.target === finallyNodeId)
+      : false;
+    if (finallyNodeId && !finallyHasRealInboundEdge && lastNode) {
+      const syntheticEdge = edgeWithAddButton(lastNode.id, finallyNodeId);
+      syntheticEdge.data = { ...syntheticEdge.data, synthetic: true };
+      edges.push(syntheticEdge);
+    }
+
+    const chainTailNodeId = finallyNodeId ?? lastNode?.id;
+    if (chainTailNodeId) {
+      edges.push(defaultEdge(chainTailNodeId, adderNodeId));
     }
   }
 
@@ -2562,6 +2736,17 @@ function createNode(
         },
       };
     }
+    case "splitPdf": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "splitPdf",
+        data: {
+          ...splitPdfNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "workflowTrigger": {
       return {
         ...identifiers,
@@ -2569,6 +2754,17 @@ function createNode(
         type: "workflowTrigger",
         data: {
           ...workflowTriggerNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "emailInbox": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "emailInbox",
+        data: {
+          ...emailInboxNodeDefaultData,
           label,
         },
       };
@@ -2713,8 +2909,12 @@ function findNextBlockLabel(
     return findNextBlockLabel(conditionalNodeId, nodes, edges);
   };
 
-  // Find the outgoing edge from this node
-  const outgoingEdge = edges.find((edge) => edge.source === nodeId);
+  // Find the outgoing edge from this node. Synthetic edges are display-only
+  // (see the finally-block chaining in getElements) and must never become a
+  // real next_block_label.
+  const outgoingEdge = edges.find(
+    (edge) => edge.source === nodeId && !isSyntheticEdge(edge),
+  );
 
   if (!outgoingEdge) {
     // No outgoing edge - check if this node is inside a conditional branch
@@ -2958,6 +3158,8 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
+        include_action_history_in_verification:
+          node.data.includeActionHistoryInVerification,
         engine: node.data.engine,
       };
     }
@@ -2990,6 +3192,44 @@ function getWorkflowBlock(
         disable_cache: node.data.disableCache ?? false,
         engine: node.data.engine,
         download_timeout: node.data.downloadTimeout, // seconds
+        ...(node.data.downloadTarget &&
+          node.data.downloadTarget !== "website" && {
+            download_target: node.data.downloadTarget,
+            path: node.data.path,
+            prompt: node.data.prompt,
+            continue_on_empty: node.data.continueOnEmpty ?? false,
+            google_credential_id: node.data.googleCredentialId ?? "",
+            ...(node.data.downloadTarget === "s3" && {
+              s3_bucket: node.data.s3Bucket ?? "",
+              aws_access_key_id: node.data.awsAccessKeyId ?? "",
+              aws_secret_access_key: node.data.awsSecretAccessKey ?? "",
+              region_name: node.data.regionName ?? "",
+            }),
+            ...(node.data.downloadTarget === "azure" && {
+              azure_storage_account_name:
+                node.data.azureStorageAccountName ?? "",
+              azure_storage_account_key: node.data.azureStorageAccountKey ?? "",
+              azure_blob_container_name: node.data.azureBlobContainerName ?? "",
+            }),
+            ...(node.data.downloadTarget === "google_drive" && {
+              google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+            }),
+            ...(node.data.downloadTarget === "sftp" && {
+              sftp_host: node.data.sftpHost ?? "",
+              sftp_port:
+                node.data.sftpPort &&
+                Number.isFinite(Number(node.data.sftpPort))
+                  ? Number(node.data.sftpPort)
+                  : null,
+              sftp_username: node.data.sftpUsername ?? "",
+              sftp_password: node.data.sftpPassword ?? "",
+              sftp_private_key: node.data.sftpPrivateKey ?? "",
+              sftp_private_key_passphrase:
+                node.data.sftpPrivateKeyPassphrase ?? "",
+              sftp_remote_path: node.data.sftpRemotePath ?? "",
+              sftp_host_key: node.data.sftpHostKey ?? "",
+            }),
+          }),
       };
     }
     case "sendEmail": {
@@ -3011,6 +3251,13 @@ function getWorkflowBlock(
           node.data.smtpUsernameSecretParameterKey,
         smtp_password_secret_parameter_key:
           node.data.smtpPasswordSecretParameterKey,
+        custom_smtp_host: node.data.customSmtpHost ?? null,
+        custom_smtp_port:
+          node.data.customSmtpPort && node.data.customSmtpPort !== ""
+            ? parseInt(node.data.customSmtpPort, 10)
+            : null,
+        custom_smtp_username: node.data.customSmtpUsername ?? null,
+        custom_smtp_password: node.data.customSmtpPassword ?? null,
       };
     }
     case "codeBlock": {
@@ -3019,6 +3266,9 @@ function getWorkflowBlock(
         block_type: "code",
         parameter_keys: node.data.parameterKeys,
         code: node.data.code,
+        error_code_mapping: JSONParseSafe(
+          node.data.errorCodeMapping ?? "null",
+        ) as Record<string, string> | null,
         prompt: node.data.prompt,
         steps: node.data.steps,
       };
@@ -3042,6 +3292,7 @@ function getWorkflowBlock(
         ...base,
         block_type: "file_upload",
         path: node.data.path,
+        prompt: node.data.prompt,
         storage_type: node.data.storageType,
         s3_bucket: node.data.s3Bucket ?? "",
         aws_access_key_id: node.data.awsAccessKeyId ?? "",
@@ -3052,6 +3303,17 @@ function getWorkflowBlock(
         azure_blob_container_name: node.data.azureBlobContainerName ?? "",
         google_credential_id: node.data.googleCredentialId ?? "",
         google_drive_folder_id: node.data.googleDriveFolderId ?? "",
+        sftp_host: node.data.sftpHost ?? "",
+        sftp_port:
+          node.data.sftpPort && Number.isFinite(Number(node.data.sftpPort))
+            ? Number(node.data.sftpPort)
+            : null,
+        sftp_username: node.data.sftpUsername ?? "",
+        sftp_password: node.data.sftpPassword ?? "",
+        sftp_private_key: node.data.sftpPrivateKey ?? "",
+        sftp_private_key_passphrase: node.data.sftpPrivateKeyPassphrase ?? "",
+        sftp_remote_path: node.data.sftpRemotePath ?? "",
+        sftp_host_key: node.data.sftpHostKey ?? "",
       };
     }
     case "fileParser": {
@@ -3143,6 +3405,16 @@ function getWorkflowBlock(
         parameter_keys: node.data.parameterKeys,
       };
     }
+    case "splitPdf": {
+      return {
+        ...base,
+        block_type: "split_pdf",
+        file_url: node.data.fileUrl,
+        prompt: node.data.prompt,
+        llm_key: node.data.llmKey || null,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
     case "workflowTrigger": {
       const parsedPayload = JSONParseSafe(node.data.payload) as Record<
         string,
@@ -3159,6 +3431,22 @@ function getWorkflowBlock(
         wait_for_completion: node.data.waitForCompletion,
         browser_session_id: node.data.browserSessionId || null,
         use_parent_browser_session: node.data.useParentBrowserSession,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "emailInbox": {
+      return {
+        ...base,
+        block_type: "email_inbox",
+        email_client: node.data.emailClient,
+        credential_id: node.data.credentialId || null,
+        folder: node.data.folder,
+        prompt: node.data.prompt,
+        sender: node.data.sender || null,
+        subject: node.data.subject || null,
+        newer_than_days: node.data.newerThanDays,
+        max_results: node.data.maxResults,
+        include_body: node.data.includeBody,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -3417,6 +3705,7 @@ function getWorkflowBlocks(
 function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   const defaultSettings = {
     persistBrowserSession: false,
+    reuseBrowserSession: false,
     pinSavedSessionIp: false,
     browserProfileId: null,
     browserProfileKey: null,
@@ -3432,6 +3721,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     scriptCacheKey: null,
     aiFallback: true,
     enableSelfHealing: false,
+    maskSecrets: false,
     runSequentially: false,
     sequentialKey: null,
     finallyBlockLabel: null,
@@ -3449,6 +3739,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   if (isWorkflowStartNodeData(data)) {
     return {
       persistBrowserSession: data.persistBrowserSession,
+      reuseBrowserSession: data.reuseBrowserSession,
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
@@ -3470,6 +3761,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       scriptCacheKey: data.scriptCacheKey,
       aiFallback: data.aiFallback,
       enableSelfHealing: data.enableSelfHealing,
+      maskSecrets: data.maskSecrets,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
       finallyBlockLabel: data.finallyBlockLabel ?? null,
@@ -4073,6 +4365,8 @@ function convertParametersToParameterYAML(
             credential_id: parameter.credential_id,
             credential_ids: parameter.credential_ids ?? null,
             selection_strategy: parameter.selection_strategy ?? null,
+            fallback_credential_ids: parameter.fallback_credential_ids ?? null,
+            fallback_trigger: parameter.fallback_trigger ?? null,
           };
         }
         case WorkflowParameterTypes.OnePassword: {
@@ -4145,7 +4439,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4175,7 +4469,7 @@ function convertBlocksToBlockYAML(
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4222,7 +4516,7 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4244,7 +4538,7 @@ function convertBlocksToBlockYAML(
           max_steps_per_run: block.max_steps_per_run,
           complete_on_download: block.complete_on_download,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
@@ -4265,7 +4559,7 @@ function convertBlocksToBlockYAML(
           data_schema: block.data_schema,
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
         };
@@ -4281,12 +4575,14 @@ function convertBlocksToBlockYAML(
           error_code_mapping: block.error_code_mapping,
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
+          include_action_history_in_verification:
+            block.include_action_history_in_verification,
           engine: block.engine,
         };
         return blockYaml;
@@ -4310,12 +4606,48 @@ function convertBlocksToBlockYAML(
           max_retries: block.max_retries,
           max_steps_per_run: block.max_steps_per_run,
           download_suffix: block.download_suffix,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           totp_identifier: block.totp_identifier,
           totp_verification_url: block.totp_verification_url,
           disable_cache: block.disable_cache ?? false,
           engine: block.engine,
           download_timeout: null, // seconds
+          ...(block.download_target &&
+            block.download_target !== "website" && {
+              download_target: block.download_target,
+              path: block.path,
+              prompt: block.prompt,
+              continue_on_empty: block.continue_on_empty ?? false,
+              google_credential_id: block.google_credential_id ?? "",
+              ...(block.download_target === "s3" && {
+                s3_bucket: block.s3_bucket ?? "",
+                aws_access_key_id: block.aws_access_key_id ?? "",
+                aws_secret_access_key: block.aws_secret_access_key ?? "",
+                region_name: block.region_name ?? "",
+              }),
+              ...(block.download_target === "azure" && {
+                azure_storage_account_name:
+                  block.azure_storage_account_name ?? "",
+                azure_storage_account_key:
+                  block.azure_storage_account_key ?? "",
+                azure_blob_container_name:
+                  block.azure_blob_container_name ?? "",
+              }),
+              ...(block.download_target === "google_drive" && {
+                google_drive_folder_id: block.google_drive_folder_id ?? "",
+              }),
+              ...(block.download_target === "sftp" && {
+                sftp_host: block.sftp_host ?? "",
+                sftp_port: block.sftp_port ?? null,
+                sftp_username: block.sftp_username ?? "",
+                sftp_password: block.sftp_password ?? "",
+                sftp_private_key: block.sftp_private_key ?? "",
+                sftp_private_key_passphrase:
+                  block.sftp_private_key_passphrase ?? "",
+                sftp_remote_path: block.sftp_remote_path ?? "",
+                sftp_host_key: block.sftp_host_key ?? "",
+              }),
+            }),
         };
         return blockYaml;
       }
@@ -4350,7 +4682,8 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "code",
           code: block.code,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+          error_code_mapping: block.error_code_mapping ?? null,
           prompt: block.prompt,
           steps: block.steps,
         };
@@ -4363,7 +4696,7 @@ function convertBlocksToBlockYAML(
           llm_key: block.llm_key,
           prompt: block.prompt,
           json_schema: block.json_schema,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4388,6 +4721,7 @@ function convertBlocksToBlockYAML(
           ...base,
           block_type: "file_upload",
           path: block.path,
+          prompt: block.prompt,
           storage_type: block.storage_type,
           s3_bucket: block.s3_bucket ?? "",
           aws_access_key_id: block.aws_access_key_id ?? "",
@@ -4398,6 +4732,14 @@ function convertBlocksToBlockYAML(
           azure_blob_container_name: block.azure_blob_container_name ?? "",
           google_credential_id: block.google_credential_id ?? "",
           google_drive_folder_id: block.google_drive_folder_id ?? "",
+          sftp_host: block.sftp_host ?? "",
+          sftp_port: block.sftp_port ?? null,
+          sftp_username: block.sftp_username ?? "",
+          sftp_password: block.sftp_password ?? "",
+          sftp_private_key: block.sftp_private_key ?? "",
+          sftp_private_key_passphrase: block.sftp_private_key_passphrase ?? "",
+          sftp_remote_path: block.sftp_remote_path ?? "",
+          sftp_host_key: block.sftp_host_key ?? "",
         };
         return blockYaml;
       }
@@ -4428,6 +4770,10 @@ function convertBlocksToBlockYAML(
           smtp_port_secret_parameter_key: block.smtp_port?.key,
           smtp_username_secret_parameter_key: block.smtp_username?.key,
           smtp_password_secret_parameter_key: block.smtp_password?.key,
+          custom_smtp_host: block.custom_smtp_host,
+          custom_smtp_port: block.custom_smtp_port,
+          custom_smtp_username: block.custom_smtp_username,
+          custom_smtp_password: block.custom_smtp_password,
           sender: block.sender,
           recipients: block.recipients,
           subject: block.subject,
@@ -4455,7 +4801,7 @@ function convertBlocksToBlockYAML(
           files: block.files,
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
           download_filename: block.download_filename,
           secret_response_paths: serializeSecretResponsePaths(
             block.secret_response_paths ?? [],
@@ -4472,7 +4818,7 @@ function convertBlocksToBlockYAML(
           format: block.format,
           landscape: block.landscape,
           print_background: block.print_background,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4484,7 +4830,18 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           payload: block.payload,
           llm_key: block.llm_key,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "split_pdf": {
+        const blockYaml: SplitPdfBlockYAML = {
+          ...base,
+          block_type: "split_pdf",
+          file_url: block.file_url,
+          prompt: block.prompt,
+          llm_key: block.llm_key,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4497,7 +4854,24 @@ function convertBlocksToBlockYAML(
           wait_for_completion: block.wait_for_completion,
           browser_session_id: block.browser_session_id,
           use_parent_browser_session: block.use_parent_browser_session,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "email_inbox": {
+        const blockYaml: EmailInboxBlockYAML = {
+          ...base,
+          block_type: "email_inbox",
+          email_client: block.email_client,
+          credential_id: block.credential_id,
+          folder: block.folder,
+          prompt: block.prompt,
+          sender: block.sender,
+          subject: block.subject,
+          newer_than_days: block.newer_than_days,
+          max_results: block.max_results,
+          include_body: block.include_body,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4510,7 +4884,7 @@ function convertBlocksToBlockYAML(
           range: block.range,
           credential_id: block.credential_id,
           has_header_row: block.has_header_row,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4526,7 +4900,7 @@ function convertBlocksToBlockYAML(
           values: block.values,
           column_mapping: block.column_mapping,
           create_sheet_if_missing: block.create_sheet_if_missing,
-          parameter_keys: block.parameters.map((p) => p.key),
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
       }
@@ -4545,6 +4919,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     proxy_location: workflow.proxy_location,
     webhook_callback_url: workflow.webhook_callback_url,
     persist_browser_session: workflow.persist_browser_session,
+    reuse_browser_session: workflow.reuse_browser_session,
     pin_saved_session_ip: workflow.pin_saved_session_ip,
     browser_profile_id: workflow.browser_profile_id ?? null,
     browser_profile_key: workflow.browser_profile_key ?? null,
@@ -4569,6 +4944,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     cache_key: workflow.cache_key,
     ai_fallback: workflow.ai_fallback ?? undefined,
     enable_self_healing: workflow.enable_self_healing ?? undefined,
+    mask_secrets: workflow.mask_secrets ?? false,
     run_sequentially: workflow.run_sequentially ?? undefined,
     sequential_key: workflow.sequential_key ?? undefined,
   };
@@ -4695,6 +5071,57 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     );
   });
 
+  const codeBlockNodes = nodes.filter((node) => node.type === "codeBlock");
+  const workflowStartNode = nodes
+    .filter(isStartNode)
+    .find((node) => isWorkflowStartNodeData(node.data));
+  const workflowErrorCodeMapping =
+    workflowStartNode && isWorkflowStartNodeData(workflowStartNode.data)
+      ? workflowStartNode.data.errorCodeMapping
+      : null;
+  codeBlockNodes.forEach((node) => {
+    const errorCodeMapping = node.data.errorCodeMapping || "null";
+    errors.push(...validateErrorCodeMapping(node.data.label, errorCodeMapping));
+
+    let blockErrorCodeMapping: Record<string, string> | null = null;
+    try {
+      const parsed = JSON.parse(errorCodeMapping) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        blockErrorCodeMapping = parsed as Record<string, string>;
+      }
+    } catch {
+      // Mapping validation above owns JSON parse errors.
+    }
+    const effectiveErrorCodeMapping = {
+      ...(workflowErrorCodeMapping ?? {}),
+      ...(blockErrorCodeMapping ?? {}),
+    };
+    const diagnostics = analyzeCodeBlockErrorCodes(
+      node.data.code,
+      Object.keys(effectiveErrorCodeMapping).length > 0
+        ? effectiveErrorCodeMapping
+        : null,
+    );
+    diagnostics.raisedButUndeclared.forEach(({ code, lines }) => {
+      errors.push(
+        `${node.data.label}: ErrorCode ${code} raised on ${
+          lines.length === 1 ? "line" : "lines"
+        } ${lines.join(", ")} is not declared.`,
+      );
+    });
+    if (diagnostics.malformedLines.length > 0) {
+      errors.push(
+        `${node.data.label}: Invalid ErrorCode use on ${
+          diagnostics.malformedLines.length === 1 ? "line" : "lines"
+        } ${diagnostics.malformedLines.join(", ")}.`,
+      );
+    }
+  });
+
   const conditionalNodes = nodes.filter((node) => node.type === "conditional");
   conditionalNodes.forEach((node) => {
     const branches = (node as ConditionalNode).data.branches ?? [];
@@ -4782,6 +5209,17 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
     if (!isNumber) {
       errors.push(`${node.data.label}: Invalid input for wait time.`);
+      return;
+    }
+
+    // Mirror the backend bounds (InvalidWaitBlockTime rejects <= 0 or
+    // > WORKFLOW_WAIT_BLOCK_MAX_SEC) so a save fails fast instead of passing
+    // validation and then erroring at run time.
+    const waitSeconds = Number(waitTimeString);
+    if (waitSeconds < 1 || waitSeconds > WORKFLOW_WAIT_BLOCK_MAX_SEC) {
+      errors.push(
+        `${node.data.label}: Wait time must be between 1 and ${WORKFLOW_WAIT_BLOCK_MAX_SEC} seconds.`,
+      );
     }
   });
 
@@ -4823,12 +5261,20 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
 
   nodes
+    .filter(isEmailInboxNode)
+    .forEach((node) => errors.push(...validateEmailInboxNode(node)));
+
+  nodes
     .filter(isGoogleSheetsWriteNode)
     .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
 
   nodes
     .filter(isPdfFillNode)
     .forEach((node) => errors.push(...validatePdfFillNode(node)));
+
+  nodes
+    .filter(isSplitPdfNode)
+    .forEach((node) => errors.push(...validateSplitPdfNode(node)));
 
   return errors;
 }

@@ -1,4 +1,5 @@
 import {
+  CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
@@ -25,6 +26,8 @@ export type SkyvernCredential = {
   credentialId: string;
   credentialIds?: Array<string> | null;
   selectionStrategy?: CredentialSelectionStrategy | null;
+  fallbackCredentialIds?: Array<string> | null;
+  fallbackTrigger?: CredentialFallbackTrigger | null;
   dataType?: typeof WorkflowParameterValueType.CredentialId;
 };
 

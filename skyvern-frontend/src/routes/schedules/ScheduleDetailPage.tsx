@@ -7,14 +7,7 @@ import {
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -27,15 +20,14 @@ import {
   useUpdateScheduleMutation,
 } from "./useScheduleActions";
 import {
-  CRON_PRESETS,
   cronToHumanReadable,
   formatNextRun,
-  getNextRuns,
-  getTimezones,
   isValidCron,
+  meetsMinCronInterval,
 } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
-import { cn } from "@/util/utils";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { ScheduleConfigFields } from "@/routes/workflows/components/ScheduleConfigFields";
 import { ScheduleParametersSection } from "@/routes/workflows/components/ScheduleParametersSection";
 import {
   buildScheduleParametersPayload,
@@ -46,13 +38,11 @@ import {
 import { useScheduleParameterState } from "@/routes/workflows/hooks/useScheduleParameterState";
 import type { Parameter } from "@/routes/workflows/types/workflowTypes";
 
-const allTimezones = getTimezones();
-
 function ScheduleDetailPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const { workflowPermanentId, scheduleId } = useParams();
-  const { data, isLoading, isError } = useScheduleDetailQuery(
+  const { data, isLoading, isError, error } = useScheduleDetailQuery(
     workflowPermanentId,
     scheduleId,
   );
@@ -76,9 +66,6 @@ function ScheduleDetailPage() {
   const [editing, setEditing] = useState(false);
   const [editCron, setEditCron] = useState("");
   const [editTimezone, setEditTimezone] = useState("");
-  // TODO - Create shared util
-  const [timezoneFilter, setTimezoneFilter] = useState<string | null>(null);
-
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
 
@@ -97,17 +84,9 @@ function ScheduleDetailPage() {
     data?.schedule.parameters ?? null,
   );
 
-  const filteredTimezones = useMemo(() => {
-    if (timezoneFilter === null) return allTimezones;
-    if (!timezoneFilter) return allTimezones;
-    const lower = timezoneFilter.toLowerCase();
-    return allTimezones.filter((tz) => tz.toLowerCase().includes(lower));
-  }, [timezoneFilter]);
-  // ! end TODO
-
   const editValid = isValidCron(editCron);
-  const editHumanReadable = editValid ? cronToHumanReadable(editCron) : null;
-  const editNextRuns = editValid ? getNextRuns(editCron, editTimezone, 5) : [];
+  const editIntervalTooShort = editValid && !meetsMinCronInterval(editCron);
+  const editCronAccepted = editValid && !editIntervalTooShort;
 
   if (isLoading) {
     return (
@@ -118,20 +97,26 @@ function ScheduleDetailPage() {
   }
 
   if (isError || !data) {
+    const detail = getErrorDetail(error);
     return (
       <div className="py-20 text-center text-sm text-red-400">
         Failed to load schedule details.
+        {detail && (
+          <span className="mt-1 block text-xs text-slate-500">{detail}</span>
+        )}
       </div>
     );
   }
 
   const { schedule, next_runs } = data;
   const humanReadable = cronToHumanReadable(schedule.cron_expression);
+  const scheduleCronTooFrequent =
+    isValidCron(schedule.cron_expression) &&
+    !meetsMinCronInterval(schedule.cron_expression);
 
   function startEditing() {
     setEditCron(schedule.cron_expression);
     setEditTimezone(schedule.timezone);
-    setTimezoneFilter(null);
     setEditName(schedule.name ?? "");
     setEditDescription(schedule.description ?? "");
     resetParameters();
@@ -140,7 +125,6 @@ function ScheduleDetailPage() {
 
   function cancelEditing() {
     setEditing(false);
-    setTimezoneFilter(null);
     // Drop any in-progress parameter edits so they don't reappear on
     // re-entry; re-seed from the stored schedule values.
     resetParameters();
@@ -149,7 +133,7 @@ function ScheduleDetailPage() {
   function handleSave() {
     if (!workflowPermanentId || !scheduleId) return;
     const parametersValid = validateParameters();
-    if (!editValid || !parametersValid) return;
+    if (!editCronAccepted || !parametersValid) return;
     // Only persist explicitly-set overrides. The form is seeded from
     // workflow defaults, so blindly sending the whole values dict would
     // pin the current default into the schedule and change semantics from
@@ -163,9 +147,10 @@ function ScheduleDetailPage() {
         workflowPermanentId,
         scheduleId,
         request: {
+          // `enabled` is intentionally omitted so the edit preserves whatever
+          // the enable/disable toggle set, even if this detail query is stale.
           cron_expression: editCron,
           timezone: editTimezone,
-          enabled: schedule.enabled,
           parameters: payload,
           ...(editName && { name: editName }),
           description: editDescription || undefined,
@@ -317,121 +302,21 @@ function ScheduleDetailPage() {
                 disabled={updateMutation.isPending}
               />
 
-              {/* Cron Presets */}
-              <div className="space-y-2">
-                <Label className="text-xs">Quick Presets</Label>
-                <div className="flex flex-wrap gap-1.5">
-                  {CRON_PRESETS.map((preset) => (
-                    <Button
-                      key={preset.label}
-                      variant={
-                        editCron === preset.expression ? "default" : "secondary"
-                      }
-                      size="sm"
-                      className="h-6 text-xs"
-                      onClick={() => setEditCron(preset.expression)}
-                    >
-                      {preset.label}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Cron Expression */}
-              <div className="space-y-1.5">
-                <Label className="text-xs">Cron Expression</Label>
-                <Input
-                  value={editCron}
-                  onChange={(e) => setEditCron(e.target.value)}
-                  placeholder="* * * * *"
-                  className={cn(
-                    "h-8 text-sm",
-                    !editValid && editCron && "border-destructive",
-                  )}
-                />
-                {editHumanReadable && (
-                  <p className="text-xs text-slate-400">{editHumanReadable}</p>
-                )}
-                {!editValid && editCron && (
-                  <p className="text-xs text-destructive">
-                    Invalid cron expression
-                  </p>
-                )}
-              </div>
-
-              {/* Timezone */}
-              <div className="space-y-1.5">
-                <Label className="text-xs">Timezone</Label>
-                <Input
-                  value={timezoneFilter ?? editTimezone}
-                  onChange={(e) => setTimezoneFilter(e.target.value)}
-                  onFocus={(e) => e.currentTarget.select()}
-                  onBlur={() => {
-                    if (
-                      filteredTimezones.length === 1 &&
-                      filteredTimezones[0] !== undefined
-                    ) {
-                      setEditTimezone(filteredTimezones[0]);
-                    }
-                    setTimezoneFilter(null);
-                  }}
-                  placeholder="Search timezones..."
-                  className="h-8 text-sm"
-                />
-                {timezoneFilter !== null && (
-                  <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
-                    {filteredTimezones.slice(0, 15).map((tz) => (
-                      <button
-                        key={tz}
-                        type="button"
-                        className={cn(
-                          "w-full px-3 py-1 text-left text-xs hover:bg-slate-700",
-                          tz === editTimezone && "bg-slate-700 text-slate-50",
-                        )}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          setEditTimezone(tz);
-                          setTimezoneFilter(null);
-                        }}
-                      >
-                        {tz}
-                      </button>
-                    ))}
-                    {filteredTimezones.length === 0 && (
-                      <div className="px-3 py-1.5 text-xs text-slate-500">
-                        No timezones found
-                      </div>
-                    )}
-                  </div>
-                )}
-                <p className="text-xs text-slate-500">
-                  Current: {editTimezone}
-                </p>
-              </div>
-
-              {/* Preview next runs */}
-              {editNextRuns.length > 0 && (
-                <div className="space-y-1">
-                  <Label className="text-xs">Next Runs Preview</Label>
-                  <div className="space-y-0.5">
-                    {editNextRuns.map((run) => (
-                      <p
-                        key={run.toISOString()}
-                        className="text-xs text-slate-500"
-                      >
-                        {formatNextRun(run, editTimezone)}
-                      </p>
-                    ))}
-                  </div>
-                </div>
-              )}
+              <ScheduleConfigFields
+                size="compact"
+                cronExpression={editCron}
+                timezone={editTimezone}
+                onCronChange={setEditCron}
+                onTimezoneChange={setEditTimezone}
+                disabled={updateMutation.isPending}
+              />
 
               {/* Save / Cancel */}
               <div className="flex gap-2 pt-1">
                 <Button
                   size="sm"
                   className="h-7 text-xs"
-                  disabled={!editValid || updateMutation.isPending}
+                  disabled={!editCronAccepted || updateMutation.isPending}
                   onClick={handleSave}
                 >
                   {updateMutation.isPending ? "Saving..." : "Save"}
@@ -464,6 +349,12 @@ function ScheduleDetailPage() {
                   {schedule.cron_expression}
                 </code>
               </div>
+              {scheduleCronTooFrequent && (
+                <div className="rounded border border-amber-600/40 bg-amber-900/20 px-2 py-1 text-xs text-amber-200">
+                  This schedule fires more often than the 5-minute minimum.
+                  Saving any change requires updating its cron expression first.
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -551,40 +442,18 @@ function ScheduleDetailPage() {
           </div>
         </div>
       </div>
-      <Dialog
+      <ConfirmDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
+          if (!open) {
             setDeleteDialogOpen(false);
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Schedule</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this schedule? This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={deleteMutation.isPending}
-              onClick={() => setDeleteDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteMutation.isPending}
-              onClick={handleDelete}
-            >
-              {deleteMutation.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title="Delete schedule?"
+        description={<p>This schedule will be permanently deleted.</p>}
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDelete}
+      />
     </div>
   );
 }

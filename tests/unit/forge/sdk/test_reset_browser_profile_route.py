@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
@@ -16,7 +17,8 @@ from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.services import org_auth_service
 
 
-def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, SimpleNamespace]:
+@pytest.fixture(scope="module")
+def app_client_and_mocks() -> Generator[tuple[TestClient, SimpleNamespace]]:
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id="org_oss")
 
@@ -27,29 +29,44 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, SimpleNa
         delete_profile_blob=AsyncMock(),
         delete_db_profile=AsyncMock(),
     )
-    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", mocks.get_workflow)
-    monkeypatch.setattr(forge_app.STORAGE, "delete_browser_session", mocks.delete_browser_session)
-    monkeypatch.setattr(forge_app.STORAGE, "delete_browser_profile", mocks.delete_profile_blob)
-    monkeypatch.setattr(
-        forge_app.DATABASE.browser_sessions,
-        "list_managed_browser_profiles_for_workflow",
-        mocks.list_managed_profiles,
-    )
-    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "delete_browser_profile", mocks.delete_db_profile)
+    module_patches = pytest.MonkeyPatch()
+    try:
+        module_patches.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", mocks.get_workflow)
+        module_patches.setattr(forge_app.STORAGE, "delete_browser_session", mocks.delete_browser_session)
+        module_patches.setattr(forge_app.STORAGE, "delete_browser_profile", mocks.delete_profile_blob)
+        module_patches.setattr(
+            forge_app.DATABASE.browser_sessions,
+            "list_managed_browser_profiles_for_workflow",
+            mocks.list_managed_profiles,
+        )
+        module_patches.setattr(forge_app.DATABASE.browser_sessions, "delete_browser_profile", mocks.delete_db_profile)
 
-    fastapi_app = FastAPI()
-    fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
+        fastapi_app = FastAPI()
+        fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
+        fastapi_app.include_router(routers_module.base_router, prefix="/v1")
 
-    @fastapi_app.exception_handler(SkyvernHTTPException)
-    async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        @fastapi_app.exception_handler(SkyvernHTTPException)
+        async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
-    return TestClient(fastapi_app), mocks
+        with TestClient(fastapi_app) as client:
+            yield client, mocks
+    finally:
+        module_patches.undo()
 
 
-def test_reset_browser_profile_clears_storage(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
+@pytest.fixture
+def client_and_mocks(app_client_and_mocks: tuple[TestClient, SimpleNamespace]) -> tuple[TestClient, SimpleNamespace]:
+    """Reuse the app/router while returning pristine mock state to every test."""
+    client, mocks = app_client_and_mocks
+    for mock in vars(mocks).values():
+        mock.reset_mock(return_value=True, side_effect=True)
+    mocks.list_managed_profiles.return_value = []
+    return client, mocks
+
+
+def test_reset_browser_profile_clears_storage(client_and_mocks: tuple[TestClient, SimpleNamespace]) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
 
     response = client.post("/v1/workflows/wpid_123/browser_session/reset_profile")
@@ -64,8 +81,8 @@ def test_reset_browser_profile_clears_storage(monkeypatch: pytest.MonkeyPatch) -
     mocks.delete_db_profile.assert_not_awaited()
 
 
-def test_reset_browser_profile_workflow_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
+def test_reset_browser_profile_workflow_not_found(client_and_mocks: tuple[TestClient, SimpleNamespace]) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.side_effect = WorkflowNotFound(workflow_permanent_id="wpid_missing")
 
     response = client.post("/v1/workflows/wpid_missing/browser_session/reset_profile")
@@ -75,8 +92,10 @@ def test_reset_browser_profile_workflow_not_found(monkeypatch: pytest.MonkeyPatc
     mocks.list_managed_profiles.assert_not_awaited()
 
 
-def test_reset_browser_profile_storage_failure_returns_500(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
+def test_reset_browser_profile_storage_failure_returns_500(
+    client_and_mocks: tuple[TestClient, SimpleNamespace],
+) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
     mocks.delete_browser_session.side_effect = RuntimeError("s3 AccessDenied")
 
@@ -86,8 +105,10 @@ def test_reset_browser_profile_storage_failure_returns_500(monkeypatch: pytest.M
     assert "retry" in response.json()["detail"].lower()
 
 
-def test_reset_browser_profile_clears_managed_profile_blobs_and_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
+def test_reset_browser_profile_clears_managed_profile_blobs_and_rows(
+    client_and_mocks: tuple[TestClient, SimpleNamespace],
+) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
     mocks.list_managed_profiles.return_value = [
         SimpleNamespace(browser_profile_id="bp_one", browser_profile_key_digest="", deleted_at=None),
@@ -112,8 +133,10 @@ def test_reset_browser_profile_clears_managed_profile_blobs_and_rows(monkeypatch
     ]
 
 
-def test_reset_browser_profile_clears_segmented_legacy_archives(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
+def test_reset_browser_profile_clears_segmented_legacy_archives(
+    client_and_mocks: tuple[TestClient, SimpleNamespace],
+) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
     mocks.list_managed_profiles.return_value = [
         SimpleNamespace(browser_profile_id="bp_seg", browser_profile_key_digest="abc123digest", deleted_at=None),
@@ -144,8 +167,8 @@ def test_reset_browser_profile_clears_segmented_legacy_archives(monkeypatch: pyt
         "/v1/workflows/wpid_123/browser_session/reset_profile/",
     ],
 )
-def test_alias_paths_still_work(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
-    client, mocks = _build_client(monkeypatch)
+def test_alias_paths_still_work(client_and_mocks: tuple[TestClient, SimpleNamespace], path: str) -> None:
+    client, mocks = client_and_mocks
     mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wpid_123")
 
     response = client.post(path)

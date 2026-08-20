@@ -1,3 +1,6 @@
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 from freezegun import freeze_time
 
@@ -105,3 +108,46 @@ class TestLocalStorageBuildURIs:
             uri
             == f"file://{local_storage.artifact_path}/{settings.ENV}/{TEST_ORGANIZATION_ID}/ai_suggestions/{TEST_AI_SUGGESTION_ID}/2025-06-09T12:00:00_artifact123_screenshot_llm.png"
         )
+
+
+@pytest.mark.asyncio
+async def test_delete_browser_profile_hard_delete_raises_on_failure(
+    local_storage: LocalStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path))
+    (tmp_path / TEST_ORGANIZATION_ID / "profiles" / "bp_1").mkdir(parents=True)
+    with patch("skyvern.forge.sdk.artifact.storage.local.shutil.rmtree", side_effect=OSError("disk")):
+        # hard_delete surfaces the failure so the caller reports reap_failed, not a false erasure.
+        with pytest.raises(OSError):
+            await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=True)
+        # default delete stays best-effort (swallowed).
+        await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=False)
+
+
+@pytest.mark.asyncio
+async def test_delete_legacy_file_deletes_managed_artifact(tmp_path: Path) -> None:
+    storage = LocalStorage(artifact_path=str(tmp_path))
+    artifact_paths = [
+        tmp_path / TEST_ORGANIZATION_ID / "tasks" / "legacy-artifact.png",
+        tmp_path / settings.ENV / TEST_ORGANIZATION_ID / "tasks" / "artifact.png",
+    ]
+    for artifact_path in artifact_paths:
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_bytes(b"artifact")
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+
+    assert not any(artifact_path.exists() for artifact_path in artifact_paths)
+
+
+@pytest.mark.asyncio
+async def test_delete_legacy_file_rejects_other_organization_path(tmp_path: Path) -> None:
+    storage = LocalStorage(artifact_path=str(tmp_path))
+    artifact_path = tmp_path / "other-organization" / "tasks" / "artifact.png"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"artifact")
+
+    with pytest.raises(PermissionError):
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+
+    assert artifact_path.exists()

@@ -49,6 +49,11 @@ class LiteLLMParams(TypedDict, total=False):
     service_tier: str | None
     extra_headers: dict[str, str] | None
     timeout: float | None
+    # Raw request-body keys, passed through without LiteLLM's per-provider
+    # translation. Use only when a provider accepts a param that LiteLLM would
+    # strip under drop_params=True (unrecognized model + provider pairing);
+    # prefer a real field above whenever LiteLLM knows how to translate it.
+    extra_body: dict[str, Any] | None
 
 
 def _settings() -> Any:
@@ -91,6 +96,10 @@ class LLMConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
     reasoning_effort: str | None = None
+    # When True, reasoning_effort is a deliberate per-config pin that the
+    # thinking-budget optimization leaves alone. Only honored on the generic branch;
+    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
         _resolve_generation_defaults(self, self.max_tokens, self.temperature)
@@ -121,11 +130,12 @@ class LLMRouterConfig(LLMConfigBase):
     """Base-safe router config with the same settings-default sentinel invariant as LLMConfig."""
 
     model_list: list[LLMRouterModelConfig]
-    # All three redis parameters are required. Even if there isn't a password, it should be an empty string.
+    # Router configs should set all Redis fields; use an empty string when there is no password.
     main_model_group: str
     redis_host: str | None = None
     redis_port: int | None = None
     redis_password: str | None = None
+    redis_max_connections: int | None = None
     fallback_model_group: str | list[str] | None = None
     routing_strategy: Literal[
         "simple-shuffle",
@@ -145,6 +155,11 @@ class LLMRouterConfig(LLMConfigBase):
     max_completion_tokens: int | None = None
     reasoning_effort: str | None = None
     temperature: float | None = _DEFAULT_TEMPERATURE
+    # When True, reasoning_effort is a deliberate per-config pin that the
+    # thinking-budget optimization leaves alone. Only honored on the generic branch;
+    # Gemini and Anthropic still apply their own thinking-budget shapes.
+    # Appended last so no existing field's positional slot shifts.
+    pin_reasoning_effort: bool = False
 
     def __post_init__(self) -> None:
         _resolve_generation_defaults(self, self.max_tokens, self.temperature)

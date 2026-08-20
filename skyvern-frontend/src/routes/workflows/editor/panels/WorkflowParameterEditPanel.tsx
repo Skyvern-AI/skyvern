@@ -13,9 +13,8 @@ import {
 } from "@/components/ui/select";
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/util/utils";
-import CloudContext from "@/store/CloudContext";
 import { CodeIcon, Cross2Icon } from "@radix-ui/react-icons";
-import { useContext, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BitwardenItemSelector } from "../../components/BitwardenItemSelector";
 import { CredentialParameterSourceSelector } from "../../components/CredentialParameterSourceSelector";
 import { OnePasswordItemSelector } from "../../components/OnePasswordItemSelector";
@@ -34,6 +33,7 @@ import {
   parameterIsAzureVaultCredential,
   AUTO_GENERATED_CREDENTIAL_KEY_PATTERN,
 } from "../types";
+import { applySkyvernCredentialEdit } from "../utils";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -49,6 +49,7 @@ import {
   header,
   ParameterTypeSelection,
 } from "./WorkflowParameterEditPanel.helpers";
+import { useSkyvernCredentialSourceAvailable } from "../../hooks/useSkyvernCredentialSourceAvailable";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -70,7 +71,7 @@ const workflowParameterTypeOptions = [
 // Determine available sources based on credential data type
 function getAvailableSourcesForDataType(
   dataType: CredentialDataType,
-  isCloud: boolean,
+  skyvernCredentialSourceAvailable: boolean,
   hasCustomCredentialService: boolean,
 ): Array<{ value: CredentialSource; label: string }> {
   const customOption = hasCustomCredentialService
@@ -85,7 +86,9 @@ function getAvailableSourcesForDataType(
   switch (dataType) {
     case "password":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
         { value: "azurevault" as const, label: "Azure Key Vault" },
@@ -93,13 +96,17 @@ function getAvailableSourcesForDataType(
       ];
     case "secret":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         ...customOption,
       ];
     case "creditCard":
       return [
-        ...(isCloud ? [{ value: "skyvern" as const, label: "Skyvern" }] : []),
+        ...(skyvernCredentialSourceAvailable
+          ? [{ value: "skyvern" as const, label: "Skyvern" }]
+          : []),
         { value: "bitwarden" as const, label: "Bitwarden" },
         { value: "onepassword" as const, label: "1Password" },
         ...customOption,
@@ -155,7 +162,9 @@ function BitwardenItemFieldHeader({
   return (
     <div className="flex items-center justify-between gap-2">
       <div className="flex items-center gap-2">
-        <Label className="text-xs text-slate-300">Bitwarden Item</Label>
+        <Label className="text-xs text-tertiary-foreground">
+          Bitwarden Item
+        </Label>
         <HelpTooltip content={tooltip} />
       </div>
       <button
@@ -167,8 +176,8 @@ function BitwardenItemFieldHeader({
             : "Enter a custom value"
         }
         className={cn(
-          "rounded p-1 text-slate-400 transition-colors hover:text-slate-200",
-          manualEntry && "bg-slate-700 text-slate-100",
+          "rounded p-1 text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200",
+          manualEntry && "bg-muted text-foreground dark:bg-slate-700",
         )}
         onClick={onToggle}
       >
@@ -192,7 +201,7 @@ function BitwardenManualInput({
   return (
     <div className="space-y-1">
       <div className="flex gap-2">
-        <Label className="text-xs text-slate-300">{label}</Label>
+        <Label className="text-xs text-tertiary-foreground">{label}</Label>
         <HelpTooltip content={tooltip} />
       </div>
       <Input value={value} onChange={(e) => onChange(e.target.value)} />
@@ -218,7 +227,8 @@ function WorkflowParameterEditPanel({
     "workflow_run_outputs",
     "workflow_run_summary",
   ];
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parsedConfig: customCredentialServiceConfig } =
     useCustomCredentialServiceConfig();
   const hasCustomCredentialService = customCredentialServiceConfig !== null;
@@ -246,8 +256,31 @@ function WorkflowParameterEditPanel({
       detectInitialCredentialDataType(initialValues),
     );
   const [credentialSource, setCredentialSource] = useState<CredentialSource>(
-    detectInitialCredentialSource(initialValues, isCloud),
+    detectInitialCredentialSource(
+      initialValues,
+      skyvernCredentialSourceAvailable,
+    ),
   );
+  const credentialSourceUserChangedRef = useRef(false);
+  const previousSkyvernCredentialSourceAvailableRef = useRef(
+    skyvernCredentialSourceAvailable,
+  );
+
+  useEffect(() => {
+    const becameAvailable =
+      !previousSkyvernCredentialSourceAvailableRef.current &&
+      skyvernCredentialSourceAvailable;
+    previousSkyvernCredentialSourceAvailableRef.current =
+      skyvernCredentialSourceAvailable;
+
+    if (
+      becameAvailable &&
+      !initialValues &&
+      !credentialSourceUserChangedRef.current
+    ) {
+      setCredentialSource("skyvern");
+    }
+  }, [initialValues, skyvernCredentialSourceAvailable]);
 
   const [urlParameterKey, setUrlParameterKey] = useState(
     isBitwardenCredential ? (initialValues?.urlParameterKey ?? "") : "",
@@ -281,6 +314,16 @@ function WorkflowParameterEditPanel({
           hasDefaultValue: false,
           defaultValue: null,
         },
+  );
+
+  // A Skyvern/custom credential can be left without a default so the workflow runs at-will
+  // (the credential is supplied at run time, or the run proceeds unauthenticated). This
+  // mirrors the "Use Default Value" opt-in on other input parameters, defaulting to on.
+  const [useDefaultCredential, setUseDefaultCredential] = useState(
+    initialValues?.parameterType === "credential" &&
+      parameterIsSkyvernCredential(initialValues)
+      ? initialValues.credentialId !== ""
+      : true,
   );
 
   const [sourceParameterKey, setSourceParameterKey] = useState<
@@ -357,7 +400,7 @@ function WorkflowParameterEditPanel({
     setBitwardenManualEntry(false);
     const availableSources = getAvailableSourcesForDataType(
       newDataType,
-      isCloud,
+      skyvernCredentialSourceAvailable,
       hasCustomCredentialService,
     );
     if (!availableSources.find((s) => s.value === credentialSource)) {
@@ -367,12 +410,19 @@ function WorkflowParameterEditPanel({
 
   const availableSources = getAvailableSourcesForDataType(
     credentialDataType,
-    isCloud,
+    skyvernCredentialSourceAvailable,
     hasCustomCredentialService,
   );
 
   const isCredentialSelected = parameterType === "credential";
   const showCredentialFields = type === "workflow" && isCredentialSelected;
+  // A rotation pool or fallback config serializes to a block-scoped credential parameter,
+  // which cannot be left without a default — force the default on there.
+  const skyvernCredentialHasPoolConfig =
+    initialValues?.parameterType === "credential" &&
+    parameterIsSkyvernCredential(initialValues) &&
+    ((initialValues.credentialIds?.length ?? 0) >= 2 ||
+      (initialValues.fallbackCredentialIds?.length ?? 0) > 0);
 
   // Determine what fields to show based on credential data type and source
   const showBitwardenPasswordFields =
@@ -392,7 +442,9 @@ function WorkflowParameterEditPanel({
   const showAzureVaultFields =
     showCredentialFields && credentialSource === "azurevault";
   const showSkyvernCredentialSelector =
-    showCredentialFields && credentialSource === "skyvern" && isCloud;
+    showCredentialFields &&
+    credentialSource === "skyvern" &&
+    skyvernCredentialSourceAvailable;
   const showCustomCredentialSelector =
     showCredentialFields &&
     credentialSource === "custom" &&
@@ -446,14 +498,16 @@ function WorkflowParameterEditPanel({
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
-            <Label className="text-xs text-slate-300">Key</Label>
+            <Label className="text-xs text-tertiary-foreground">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
             {keyValidationError && (
               <p className="text-xs text-destructive">{keyValidationError}</p>
             )}
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-slate-300">Description</Label>
+            <Label className="text-xs text-tertiary-foreground">
+              Description
+            </Label>
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -475,9 +529,14 @@ function WorkflowParameterEditPanel({
                     // Clear credential-specific state when switching away from credential
                     // to prevent stale data if user switches back
                     if (wasCredential && !isNowCredential) {
+                      credentialSourceUserChangedRef.current = false;
                       setCredentialId("");
                       setCredentialDataType("password");
-                      setCredentialSource(isCloud ? "skyvern" : "bitwarden");
+                      setCredentialSource(
+                        skyvernCredentialSourceAvailable
+                          ? "skyvern"
+                          : "bitwarden",
+                      );
                       setBitwardenLoginCredentialItemId("");
                       setBitwardenCollectionId("");
                       setUrlParameterKey("");
@@ -495,6 +554,7 @@ function WorkflowParameterEditPanel({
                     // Clear default value state when switching to credential type
                     // since credentials don't use default values
                     if (!wasCredential && isNowCredential) {
+                      setUseDefaultCredential(true);
                       setDefaultValueState({
                         hasDefaultValue: false,
                         defaultValue: null,
@@ -529,7 +589,7 @@ function WorkflowParameterEditPanel({
                 {isEditMode &&
                   initialParameterTypeSelection !== null &&
                   initialParameterTypeSelection !== parameterType && (
-                    <p className="text-xs text-amber-400">
+                    <p className="text-xs text-amber-700 dark:text-amber-400">
                       Changing the type of an existing parameter may break
                       blocks that reference it.
                     </p>
@@ -557,7 +617,7 @@ function WorkflowParameterEditPanel({
                         });
                       }}
                     />
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Use Default Value
                     </Label>
                   </div>
@@ -600,7 +660,7 @@ function WorkflowParameterEditPanel({
               {/* Step 1: Credential Type */}
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Credential Type
                   </Label>
                   <HelpTooltip content="Select the type of credential you want to use. Password for login credentials, Secret for sensitive data fields, Credit Card for payment information." />
@@ -627,14 +687,17 @@ function WorkflowParameterEditPanel({
               {/* Step 2: Source */}
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Source</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Source
+                  </Label>
                   <HelpTooltip content="Select the storage location for your credentials. Skyvern supports managed credentials such as Bitwarden, 1Password, and Azure Key Vault that connect directly to your vault. If you use a custom external credential service, you can add it here as well." />
                 </div>
                 <Select
                   value={credentialSource}
-                  onValueChange={(value) =>
-                    setCredentialSource(value as CredentialSource)
-                  }
+                  onValueChange={(value) => {
+                    credentialSourceUserChangedRef.current = true;
+                    setCredentialSource(value as CredentialSource);
+                  }}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue placeholder="Select source" />
@@ -710,7 +773,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Bitwarden Collection ID
                   </Label>
                   <HelpTooltip content="Collection containing the identity, such as {{ parameter_name }}." />
@@ -722,7 +785,9 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Identity Key</Label>
+                  <Label className="text-xs text-tertiary-foreground">
+                    Identity Key
+                  </Label>
                   <HelpTooltip content="Identity name or identifier, such as {{ parameter_name }}." />
                 </div>
                 <Input
@@ -732,7 +797,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Identity Fields
                   </Label>
                   <HelpTooltip content="Comma-separated list of field names to extract from the Bitwarden identity (e.g., 'ssn, address, phone')." />
@@ -798,7 +863,7 @@ function WorkflowParameterEditPanel({
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       1Password Item
                     </Label>
                     <HelpTooltip
@@ -816,8 +881,9 @@ function WorkflowParameterEditPanel({
                         : "Enter a custom value"
                     }
                     className={cn(
-                      "rounded p-1 text-slate-400 transition-colors hover:text-slate-200",
-                      opManualEntry && "bg-slate-700 text-slate-100",
+                      "rounded p-1 text-muted-foreground transition-colors hover:text-foreground dark:hover:text-slate-200",
+                      opManualEntry &&
+                        "bg-muted text-foreground dark:bg-slate-700",
                     )}
                     onClick={() => {
                       opUserTouchedRef.current = true;
@@ -843,7 +909,7 @@ function WorkflowParameterEditPanel({
                   <div className="space-y-3">
                     <div className="space-y-1">
                       <div className="flex gap-2">
-                        <Label className="text-xs text-slate-300">
+                        <Label className="text-xs text-tertiary-foreground">
                           1Password Vault ID
                         </Label>
                         <HelpTooltip content="Find this in the 1Password vault URL. Supports dynamic agent inputs like {{ my_input }}." />
@@ -858,7 +924,7 @@ function WorkflowParameterEditPanel({
                     </div>
                     <div className="space-y-1">
                       <div className="flex gap-2">
-                        <Label className="text-xs text-slate-300">
+                        <Label className="text-xs text-tertiary-foreground">
                           1Password Item ID
                         </Label>
                         <HelpTooltip content="Find this in the 1Password item URL. Supports dynamic agent inputs like {{ my_input }}." />
@@ -886,8 +952,8 @@ function WorkflowParameterEditPanel({
                 )}
               </div>
               {credentialDataType === "creditCard" && (
-                <div className="rounded-md bg-slate-800 p-2">
-                  <div className="space-y-1 text-xs text-slate-400">
+                <div className="rounded-md bg-muted p-2">
+                  <div className="space-y-1 text-xs text-muted-foreground">
                     Credit Cards: Due to a 1Password limitation, add the
                     expiration date as a separate text field named "Expire Date"
                     in the format MM/YYYY (e.g. 09/2027).
@@ -902,7 +968,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Azure Key Vault Name
                   </Label>
                   <HelpTooltip content="The name of your Azure Key Vault instance (e.g., 'my-company-vault'). This is the name you see in the Azure portal." />
@@ -914,7 +980,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Azure Username Secret Key
                   </Label>
                   <HelpTooltip content="The secret name in Azure Key Vault that stores the username (e.g., 'my-app-username')." />
@@ -927,7 +993,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Azure Password Secret Key
                   </Label>
                   <HelpTooltip content="The secret name in Azure Key Vault that stores the password (e.g., 'my-app-password')." />
@@ -939,7 +1005,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-tertiary-foreground">
                     Azure TOTP Secret Key
                   </Label>
                   <HelpTooltip content="Optional. The secret name in Azure Key Vault that stores the TOTP secret for two-factor authentication." />
@@ -954,40 +1020,86 @@ function WorkflowParameterEditPanel({
 
           {/* Skyvern Managed Credential Selector */}
           {showSkyvernCredentialSelector && (
-            <div className="space-y-1">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Skyvern Credential
-                </Label>
-                <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
-              </div>
-              <CredentialParameterSourceSelector
-                value={credentialId}
-                onChange={(value) => setCredentialId(value)}
-              />
+            <div className="space-y-2">
+              {!skyvernCredentialHasPoolConfig && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    checked={useDefaultCredential}
+                    onCheckedChange={(checked) => {
+                      const next = Boolean(checked);
+                      setUseDefaultCredential(next);
+                      if (!next) {
+                        setCredentialId("");
+                      }
+                    }}
+                  />
+                  <Label className="text-xs text-tertiary-foreground">
+                    Use Default Value
+                  </Label>
+                  <HelpTooltip content="A default credential is applied on every run. Uncheck to leave it unset — the workflow runs without a credential unless one is supplied at run time." />
+                </div>
+              )}
+              {useDefaultCredential && (
+                <div className="space-y-1">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Skyvern Credential
+                    </Label>
+                    <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
+                  </div>
+                  <CredentialParameterSourceSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                  />
+                </div>
+              )}
             </div>
           )}
 
           {/* Custom Credential Service Selector */}
           {showCustomCredentialSelector && (
-            <div className="space-y-1">
-              <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
-                  Custom Credential
-                </Label>
-                <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
-              </div>
-              <CredentialParameterSourceSelector
-                value={credentialId}
-                onChange={(value) => setCredentialId(value)}
-                vault_type="custom"
-              />
+            <div className="space-y-2">
+              {!skyvernCredentialHasPoolConfig && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    checked={useDefaultCredential}
+                    onCheckedChange={(checked) => {
+                      const next = Boolean(checked);
+                      setUseDefaultCredential(next);
+                      if (!next) {
+                        setCredentialId("");
+                      }
+                    }}
+                  />
+                  <Label className="text-xs text-tertiary-foreground">
+                    Use Default Value
+                  </Label>
+                  <HelpTooltip content="A default credential is applied on every run. Uncheck to leave it unset — the workflow runs without a credential unless one is supplied at run time." />
+                </div>
+              )}
+              {useDefaultCredential && (
+                <div className="space-y-1">
+                  <div className="flex gap-2">
+                    <Label className="text-xs text-tertiary-foreground">
+                      Custom Credential
+                    </Label>
+                    <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
+                  </div>
+                  <CredentialParameterSourceSelector
+                    value={credentialId}
+                    onChange={(value) => setCredentialId(value)}
+                    vault_type="custom"
+                  />
+                </div>
+              )}
             </div>
           )}
 
           {type === "context" && (
             <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Source Input</Label>
+              <Label className="text-xs text-tertiary-foreground">
+                Source Input
+              </Label>
               <SourceParameterKeySelector
                 value={sourceParameterKey}
                 onChange={setSourceParameterKey}
@@ -1116,20 +1228,24 @@ function WorkflowParameterEditPanel({
                     credentialSource === "skyvern" ||
                     credentialSource === "custom"
                   ) {
-                    if (!credentialId) {
+                    const requireCredential =
+                      useDefaultCredential || skyvernCredentialHasPoolConfig;
+                    if (requireCredential && !credentialId) {
                       toast({
                         variant: "destructive",
                         title: "Failed to save input",
-                        description: "Credential is required",
+                        description:
+                          "Select a credential, or uncheck Use Default Value to leave it unset",
                       });
                       return;
                     }
-                    onSave({
-                      key,
-                      parameterType: "credential",
-                      credentialId,
-                      description,
-                    });
+                    onSave(
+                      applySkyvernCredentialEdit(initialValues, {
+                        key,
+                        credentialId: requireCredential ? credentialId : "",
+                        description,
+                      }),
+                    );
                     return;
                   }
 

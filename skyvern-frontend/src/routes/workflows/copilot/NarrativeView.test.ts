@@ -1,22 +1,30 @@
 import { describe, expect, it } from "vitest";
 
+import { getReviewGateVerdict } from "./cards/ReviewGateCard";
+import { derivePhases } from "./copilotPhases";
 import {
+  ActivityEntry,
   BlockState,
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
   computeTurnSummary,
+  condenseActivityEntries,
   effectiveMode,
+  humanizeJudgeText,
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
+  mapBlockStatus,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
+  WorkflowCopilotNarrationUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
+  WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
@@ -27,7 +35,6 @@ const turnStart = (
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-05-25T00:00:00Z",
   ...overrides,
 });
@@ -77,6 +84,28 @@ const toolCall = (
   ...overrides,
 });
 
+const toolResult = (
+  overrides: Partial<WorkflowCopilotToolResultUpdate> = {},
+): WorkflowCopilotToolResultUpdate => ({
+  type: "tool_result",
+  tool_name: "update_and_run_blocks",
+  success: true,
+  summary: "Testing workflow successful",
+  iteration: 0,
+  tool_call_id: "call-1",
+  ...overrides,
+});
+
+const narration = (
+  overrides: Partial<WorkflowCopilotNarrationUpdate> = {},
+): WorkflowCopilotNarrationUpdate => ({
+  type: "narration",
+  narration: "Reading the page…",
+  iteration: 0,
+  timestamp: "2026-05-25T00:00:04Z",
+  ...overrides,
+});
+
 const response = (
   overrides: Partial<WorkflowCopilotStreamResponseUpdate> = {},
 ): WorkflowCopilotStreamResponseUpdate => ({
@@ -97,21 +126,15 @@ const errorUpdate = (
 });
 
 describe("applyNarrativeEvent — turn_start", () => {
-  it("seeds turnId/turnIndex/mode from an empty narrative", () => {
+  it("seeds turnId/turnIndex from an empty narrative", () => {
     const next = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
     expect(next.turnId).toBe("turn-1");
     expect(next.turnIndex).toBe(0);
-    expect(next.mode).toBe("build");
     expect(next.designStarted).toBe(false);
     expect(next.designEnded).toBe(false);
     expect(next.blocks).toEqual([]);
     expect(next.draft).toBeNull();
     expect(next.terminal).toBeNull();
-  });
-
-  it("falls back to 'unknown' mode when an empty mode is sent", () => {
-    const next = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart({ mode: "" }));
-    expect(next.mode).toBe("unknown");
   });
 
   it("resets prior turn state when a new turn_start arrives mid-stream", () => {
@@ -123,15 +146,11 @@ describe("applyNarrativeEvent — turn_start", () => {
       s,
       blockProgress({ block_label: "block_one", status: "running" }),
     );
-    s = applyNarrativeEvent(
-      s,
-      turnStart({ turn_id: "t2", turn_index: 1, mode: "edit" }),
-    );
+    s = applyNarrativeEvent(s, turnStart({ turn_id: "t2", turn_index: 1 }));
 
     expect(s).toMatchObject({
       turnId: "t2",
       turnIndex: 1,
-      mode: "edit",
       blocks: [],
       draft: null,
       designStarted: false,
@@ -265,7 +284,7 @@ describe("applyNarrativeEvent — block_progress", () => {
     ["failed", "failed"],
     ["terminated", "failed"],
     ["timed_out", "failed"],
-    ["canceled", "failed"],
+    ["canceled", "stopped"],
     ["skipped", "skipped"],
     ["queued", "queued"],
     ["something_new", "queued"],
@@ -350,6 +369,287 @@ describe("applyNarrativeEvent — activity", () => {
     });
     expect(s.designActivity[0]?.text).not.toContain("update_and_run_blocks");
   });
+
+  it("co-locates a run tool's result with its call after a block starts running (SKY-12831)", () => {
+    // The call lands in designActivity (no block running yet); the run then
+    // flips a block to running. The result must rejoin the call in
+    // designActivity so the pair folds — not land in the block card.
+    const afterCall = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      toolCall({ tool_call_id: "call-1" }),
+    );
+    const afterBlock = applyNarrativeEvent(
+      afterCall,
+      blockProgress({ block_label: "step_1", status: "running" }),
+    );
+    const s = applyNarrativeEvent(
+      afterBlock,
+      toolResult({ tool_call_id: "call-1" }),
+    );
+
+    expect(s.designActivity.map((e) => e.id)).toEqual([
+      "tc-call-1",
+      "tr-call-1",
+    ]);
+    expect(
+      s.blocks.find((b) => b.label === "step_1")?.activity ?? [],
+    ).toHaveLength(0);
+    expect(condenseActivityEntries(s.designActivity)).toHaveLength(1);
+  });
+});
+
+describe("condenseActivityEntries", () => {
+  function reduceEvents(events: Parameters<typeof applyNarrativeEvent>[1][]) {
+    return events.reduce(
+      (state: TurnNarrativeState, event) => applyNarrativeEvent(state, event),
+      EMPTY_NARRATIVE,
+    );
+  }
+
+  it("folds a resolved tool_call/tool_result pair into one row (no leftover calling… chatter)", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        success: true,
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ kind: "tool_result", success: true });
+  });
+
+  it("REGRESSION PIN: substitutes the humanized tool name for the backend's bare 'OK' fallback (celal QA catch)", () => {
+    // A tool with no dedicated backend summary falls back to a literal
+    // "OK" — condensing already removed the "<tool> · calling…" row that
+    // used to give it context, so a bare "OK" reads as meaningless.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        summary: "OK",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]?.text).toBe("Inspecting page");
+    expect(condensed[0]?.text).not.toBe("OK");
+  });
+
+  it("leaves a real (non-fallback) backend summary untouched, even if a mapped tool", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "evaluate" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "evaluate",
+        summary: "Evaluated JavaScript — returned a string",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed[0]?.text).toBe("Evaluated JavaScript — returned a string");
+  });
+
+  it("folds a failed attempt then a retry into one row, terminal outcome only", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "call-1", tool_name: "extract" }),
+      toolResult({
+        tool_call_id: "call-1",
+        tool_name: "extract",
+        success: false,
+        summary: "no results",
+      }),
+      toolCall({ tool_call_id: "call-2", tool_name: "extract" }),
+      toolResult({
+        tool_call_id: "call-2",
+        tool_name: "extract",
+        success: true,
+        summary: "top 5 titles",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      success: true,
+      attempts: 2,
+      text: "top 5 titles",
+    });
+  });
+
+  it("folds a 3-attempt retry chain into one row with attempts=3", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c3", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c3", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ success: true, attempts: 3 });
+  });
+
+  it("folds a retry across a narration sitting between two attempts (narration never breaks the fold)", () => {
+    // Array position can't reliably tell "narration between attempts" from
+    // "narration mid-flight during the retry itself" (see the regression
+    // pin below, where the same ordered shape arises from a genuinely
+    // different case) — so narration is never treated as a fold-breaking
+    // gap, full stop.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      narration(),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    // Narration arrived before the merged (2nd-attempt) result, so the
+    // fold keeps that order — narration first, not stranded after a row
+    // whose content is chronologically later than it.
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("REGRESSION PIN: folds a retry when the narration fires mid-flight during the RETRY itself (Codex catch)", () => {
+    // Ordering fix (pass 1) puts this narration in the identical array
+    // position as narration genuinely between two attempts — attempt 1's
+    // clean result already sits before attempt 2's call, so the retry's
+    // own mid-flight narration lands right after it either way. Only a
+    // narration-agnostic fold (last TOOL row, not literal adjacency)
+    // survives this case.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      narration(),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    // The merge must not leave the (chronologically later) result parked
+    // at attempt 1's old position, ahead of narration that streamed
+    // before it arrived.
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("REGRESSION PIN: folds a retry even when the narration fires mid-flight, during the FIRST attempt (reviewer catch)", () => {
+    // The narrator can emit a progress narration while a call is still
+    // pending. Pairing (pass 1) then places attempt 1's result at attempt
+    // 1's call position, ahead of that narration — which used to make the
+    // narration look like it sat BETWEEN the two attempts and break the
+    // fold, even though nothing genuinely interrupted the retry.
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      narration(),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
+    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+  });
+
+  it("does not fold two consecutive different-tool results", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "navigate_browser" }),
+      toolResult({
+        tool_call_id: "c1",
+        tool_name: "navigate_browser",
+        success: false,
+      }),
+      toolCall({ tool_call_id: "c2", tool_name: "evaluate" }),
+      toolResult({ tool_call_id: "c2", tool_name: "evaluate", success: true }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(2);
+  });
+
+  it("keeps an orphaned tool_result (its call was evicted) as its own row instead of dropping it", () => {
+    const entries: ActivityEntry[] = [
+      {
+        kind: "tool_result",
+        text: "done",
+        iteration: 0,
+        toolName: "evaluate",
+        success: true,
+        id: "tr-orphan-1",
+      },
+    ];
+    expect(condenseActivityEntries(entries)).toEqual(entries);
+  });
+
+  it("REGRESSION PIN: still pairs a call/result whose sliced tool_call_id is an empty string (Claude catch)", () => {
+    // toolCallIdOf returns "" (falsy but defined) for an id like "tc-" —
+    // a truthiness check would treat that as "no id" and never pair it,
+    // inconsistent with hasPendingToolCall's unconditional `?? ""`.
+    const entries: ActivityEntry[] = [
+      {
+        kind: "tool_call",
+        text: "Extracting…",
+        iteration: 0,
+        toolName: "extract",
+        id: "tc-",
+      },
+      {
+        kind: "tool_result",
+        text: "done",
+        iteration: 0,
+        toolName: "extract",
+        success: true,
+        id: "tr-",
+      },
+    ];
+    expect(condenseActivityEntries(entries)).toHaveLength(1);
+  });
+
+  it("an orphaned same-tool result immediately after a failed attempt still folds as its retry outcome", () => {
+    const s = reduceEvents([
+      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
+      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
+    ]);
+    const orphan: ActivityEntry = {
+      kind: "tool_result",
+      text: "top 5 titles + links",
+      iteration: 1,
+      toolName: "extract",
+      success: true,
+      id: "tr-evicted-call-2",
+    };
+    const condensed = condenseActivityEntries([...s.designActivity, orphan]);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({
+      success: true,
+      attempts: 2,
+      text: "top 5 titles + links",
+    });
+  });
+
+  it("leaves a still-pending retry visible, tagged with the attempt count", () => {
+    const s = reduceEvents([
+      toolCall({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
+      toolResult({
+        tool_call_id: "c1",
+        tool_name: "extract",
+        success: false,
+        display_label: "Extracting",
+      }),
+      toolCall({
+        tool_call_id: "c2",
+        tool_name: "extract",
+        display_label: "Extracting",
+      }),
+    ]);
+    const condensed = condenseActivityEntries(s.designActivity);
+    expect(condensed).toHaveLength(1);
+    expect(condensed[0]).toMatchObject({ kind: "tool_call", attempts: 2 });
+  });
 });
 
 describe("applyNarrativeEvent — terminal", () => {
@@ -393,7 +693,6 @@ describe("applyNarrativeEvent — terminal", () => {
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "build",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -436,7 +735,6 @@ describe("applyNarrativeEvent — terminal", () => {
         narrative_payload: {
           turnId: "turn-1",
           turnIndex: 0,
-          mode: "diagnose",
           designStarted: true,
           designEnded: true,
           draft: null,
@@ -510,7 +808,6 @@ describe("effectiveMode", () => {
   it("reports build when classifier said unknown but blocks were drafted from empty prior", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "unknown",
       draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
       terminal: "response",
     };
@@ -520,7 +817,6 @@ describe("effectiveMode", () => {
   it("reports edit when prior_block_count > 0 and turn drafted blocks", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "unknown",
       draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
       terminal: "response",
       priorBlockCount: 2,
@@ -531,41 +827,34 @@ describe("effectiveMode", () => {
   it("reports clarify when classifier said draft_only but no blocks were drafted", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "draft_only",
       draft: null,
       terminal: "response",
     };
     expect(effectiveMode(s)).toBe("clarify");
   });
 
-  it("preserves docs_answer / diagnose / refuse when terminal has no blocks", () => {
-    for (const mode of ["docs_answer", "diagnose", "refuse"]) {
+  it("derives docs_answer / diagnose / refuse from the response kind when there are no blocks", () => {
+    for (const [responseKind, expected] of [
+      ["answer", "docs_answer"],
+      ["diagnose", "diagnose"],
+      ["refuse", "refuse"],
+    ] as const) {
       const s: TurnNarrativeState = {
         ...EMPTY_NARRATIVE,
-        mode,
+        responseKind,
         terminal: "response",
       };
-      expect(effectiveMode(s)).toBe(mode);
+      expect(effectiveMode(s)).toBe(expected);
     }
   });
 
   it("reports clarify when backend classified the response as ASK_QUESTION", () => {
     const s: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
-      mode: "diagnose",
       responseType: "ASK_QUESTION",
       terminal: "response",
     };
     expect(effectiveMode(s)).toBe("clarify");
-  });
-
-  it("falls back to classifier mode while turn is still in-flight (no terminal)", () => {
-    const s: TurnNarrativeState = {
-      ...EMPTY_NARRATIVE,
-      mode: "build",
-      terminal: null,
-    };
-    expect(effectiveMode(s)).toBe("build");
   });
 });
 
@@ -601,7 +890,6 @@ const reproClarifyPayload = (
 ): Record<string, unknown> => ({
   turnId: "turn-repro",
   turnIndex: 0,
-  mode: "build",
   responseType: "REPLY",
   cancelled: false,
   proposalDisposition: "no_proposal",
@@ -637,7 +925,6 @@ const buildTurn = (
   overrides: Partial<TurnNarrativeState> = {},
 ): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
-  mode: "build",
   terminal: "response",
   ...overrides,
 });
@@ -649,36 +936,39 @@ const draft3 = {
 };
 
 describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
-  it("hydrates responseKind and verifiedSuccess from the payload", () => {
+  it("hydrates responseKind without inventing an authoring success stamp", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "build", verifiedSuccess: true }),
+      reproClarifyPayload({ responseKind: "build" }),
     );
     expect(turn?.responseKind).toBe("build");
-    expect(turn?.verifiedSuccess).toBe(true);
+  });
+
+  it("hydrates the answer response kind from persisted payloads", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ responseKind: "answer" }),
+    );
+    expect(turn?.responseKind).toBe("answer");
   });
 
   it("treats absent fields as null", () => {
     const turn = hydrateNarrativeFromPayload(reproClarifyPayload());
     expect(turn?.responseKind).toBeNull();
-    expect(turn?.verifiedSuccess).toBeNull();
   });
 
-  it("treats unknown responseKind and non-boolean verifiedSuccess as absent", () => {
+  it("treats an unknown responseKind as absent", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "celebrate",
-        verifiedSuccess: "yes",
       }),
     );
     expect(turn?.responseKind).toBeNull();
-    expect(turn?.verifiedSuccess).toBeNull();
   });
 });
 
 describe("computeTurnSummary — typed terminal adjudication", () => {
   it("renders the loop-guard clarify repro as a Question, not a green built-and-tested claim", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "clarify" }),
     );
     expect(turn).toBeDefined();
     const summary = computeTurnSummary(turn!);
@@ -687,9 +977,251 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     expect(summary.glyph).toBe("✦");
   });
 
+  it("renders non-build REPLY + not_demonstrated as Outcome not confirmed", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("suppresses the live turn warning for an interim last-run outcome", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "interim_build_test",
+          displayReason: "The workflow still needs its extraction block.",
+        },
+      }),
+    );
+
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("suppresses the live turn warning for an interim per-block outcome", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        blocks: [
+          {
+            ...summaryBlock("open_search"),
+            outcome: "not_demonstrated",
+            outcomeRole: "interim_build_test",
+            outcomeReason: "The workflow still needs its extraction block.",
+          },
+        ],
+      }),
+    );
+
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("keeps an explicitly adjudicated outcome warning", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "adjudicated",
+          displayReason: "The goal was not demonstrated.",
+        },
+      }),
+    );
+
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+  });
+
+  it("keeps the terminal envelope authoritative over interim live state", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "REPLY",
+        terminalEnvelope: {
+          runVerdict: "not_demonstrated",
+          runDisplayReason: "The final run did not demonstrate the goal.",
+        },
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          role: "interim_build_test",
+          displayReason: "The workflow still needs its extraction block.",
+        },
+        blocks: [
+          {
+            ...summaryBlock("open_search"),
+            outcome: "not_demonstrated",
+            outcomeRole: "interim_build_test",
+          },
+        ],
+      }),
+    );
+
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+  });
+
+  it("uses hydrated not_demonstrated block outcomes when lastRunOutcome is absent", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Outcome not confirmed");
+    expect(summary.accent).toBe("warn");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps the Question headline when response_type is ASK_QUESTION", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        lastRunOutcome: {
+          verdict: "not_demonstrated",
+          displayReason: "The run never reached the target page.",
+        },
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps the Question headline for ASK_QUESTION even when hydrated blocks carry not_demonstrated", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+        blocks: [
+          {
+            ...reproBlock("open_registry_find_registrant"),
+            outcome: "not_demonstrated",
+            outcomeReason: "A verification challenge prevented confirmation.",
+          },
+          {
+            ...reproBlock("search_jane_doe_credential_a"),
+            outcome: "demonstrated",
+          },
+          {
+            ...reproBlock("expand_and_extract_certifications"),
+            outcome: "demonstrated",
+          },
+        ],
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("treats build-kind ASK_QUESTION as an ask when no draft review is pending", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+
+    const uxSummary = computeTurnSummary(turn, { uxV1: true });
+    expect(uxSummary.headline).toBe("Needs your input");
+    expect(uxSummary.accent).toBe("qa");
+    expect(uxSummary.glyph).toBe("✦");
+  });
+
+  it("keeps review disposition precedence over build-kind ASK_QUESTION", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      responseKind: "build",
+      responseType: "ASK_QUESTION",
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("keeps build-kind REPLY summary behavior unchanged", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "no_proposal",
+      responseKind: "build",
+      responseType: "REPLY",
+    });
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Built and tested the workflow");
+    expect(summary.accent).toBe("ok");
+    expect(summary.glyph).toBe("✓");
+  });
+
+  it("keeps legacy non-build behavior unchanged when responseType and verdict are absent", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+      }),
+    );
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it("keeps legacy non-build behavior unchanged when hydrated turns have neither signal", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        responseKind: "clarify",
+      }),
+    )!;
+    expect(turn.lastRunOutcome).toBeNull();
+    expect(
+      turn.blocks.some((block) => block.outcome === "not_demonstrated"),
+    ).toBe(false);
+    const summary = computeTurnSummary(turn);
+    expect(summary.headline).toBe("Question");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
   it("keeps the factual stats line on an adjudicated clarify build turn", () => {
     const turn = hydrateNarrativeFromPayload(
-      reproClarifyPayload({ responseKind: "clarify", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "clarify" }),
     )!;
     const summary = computeTurnSummary(turn);
     expect(summary.stats).toEqual(["15:02", "3 blocks ran", "3 new"]);
@@ -699,7 +1231,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     const turn = hydrateNarrativeFromPayload(
       reproClarifyPayload({
         responseKind: "clarify",
-        verifiedSuccess: false,
         priorBlockCount: 2,
       }),
     )!;
@@ -714,12 +1245,11 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     ["recover", "Question"],
     ["refuse", "Declined"],
     ["diagnose", "Answered"],
+    ["answer", "Answered"],
   ] as const)(
     "maps non-build kind %s to %s with qa accent",
     (kind, headline) => {
-      const summary = computeTurnSummary(
-        buildTurn({ responseKind: kind, verifiedSuccess: false }),
-      );
+      const summary = computeTurnSummary(buildTurn({ responseKind: kind }));
       expect(summary.headline).toBe(headline);
       expect(summary.accent).toBe("qa");
       expect(summary.glyph).toBe("✦");
@@ -732,7 +1262,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "no_proposal",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Built and tested the workflow");
@@ -746,35 +1275,29 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         priorBlockCount: 2,
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Applied edits and re-tested");
     expect(summary.accent).toBe("ok");
   });
 
-  it("renders a verdict-authorized draftless turn as a completed run", () => {
-    const summary = computeTurnSummary(
-      buildTurn({ responseKind: "build", verifiedSuccess: true }),
-    );
-    expect(summary.headline).toBe("Completed the run");
-    expect(summary.accent).toBe("ok");
+  it("does not infer a completed run from a build response kind alone", () => {
+    const summary = computeTurnSummary(buildTurn({ responseKind: "build" }));
+    expect(summary.headline).toBe("Question");
   });
 
-  it("ignores the prose question heuristic when a typed verdict authorizes success", () => {
+  it("keeps the prose question heuristic without a run fact", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
         terminalMessage: "Could you provide feedback on the result?",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
-    expect(summary.headline).toBe("Built and tested the workflow");
-    expect(summary.accent).toBe("ok");
+    expect(summary.headline).toBe("Question");
   });
 
-  it("renders a clean built-unverified run as ran, not stopped", () => {
+  it("renders a clean completed build from its block lifecycle", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -785,15 +1308,14 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         ],
         proposalDisposition: "auto_applicable",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
     );
-    expect(summary.headline).toBe("Built and ran the workflow");
+    expect(summary.headline).toBe("Built and tested the workflow");
     expect(summary.accent).toBe("ok");
     expect(summary.glyph).toBe("✓");
   });
 
-  it("renders a clean built-unverified edit as ran, not re-tested", () => {
+  it("renders a clean completed edit from its block lifecycle", () => {
     const summary = computeTurnSummary(
       buildTurn({
         draft: draft3,
@@ -804,40 +1326,19 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         ],
         priorBlockCount: 2,
         responseKind: "build",
-        verifiedSuccess: false,
       }),
     );
-    expect(summary.headline).toBe("Applied edits and ran the workflow");
+    expect(summary.headline).toBe("Applied edits and re-tested");
     expect(summary.accent).toBe("ok");
     expect(summary.glyph).toBe("✓");
   });
 
   it.each([
-    [buildTurn({ responseKind: "build", verifiedSuccess: false }), "Stopped"],
-    [
-      buildTurn({
-        draft: draft3,
-        proposalDisposition: "auto_applicable",
-        responseKind: "build",
-        verifiedSuccess: false,
-      }),
-      "Stopped",
-    ],
-    [
-      buildTurn({
-        draft: draft3,
-        priorBlockCount: 2,
-        responseKind: "build",
-        verifiedSuccess: false,
-      }),
-      "Stopped",
-    ],
     [
       buildTurn({
         draft: draft3,
         proposalDisposition: "review_untested",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
       "Draft needs review",
     ],
@@ -846,7 +1347,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "review_tested",
         responseKind: "build",
-        verifiedSuccess: false,
       }),
       "Workflow ready for review",
     ],
@@ -860,6 +1360,21 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
     },
   );
 
+  it("surfaces a tested proposal for review even when the turn ends in a question", () => {
+    const askTurn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_tested",
+      responseKind: "clarify",
+      responseType: "ASK_QUESTION",
+      terminalMessage: "Is that output format okay?",
+    });
+
+    expect(computeTurnSummary(askTurn, { uxV1: true }).headline).toBe(
+      "Workflow ready for review",
+    );
+    expect(getReviewGateVerdict(askTurn, null)).toBe("tested");
+  });
+
   it("a failed block still renders Run halted even with a verdict-authorized success", () => {
     const summary = computeTurnSummary(
       buildTurn({
@@ -869,7 +1384,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
           summaryBlock("block_two", "failed"),
         ],
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Run halted");
@@ -884,7 +1398,6 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
         draft: draft3,
         proposalDisposition: "review_untested",
         responseKind: "build",
-        verifiedSuccess: true,
       }),
     );
     expect(summary.headline).toBe("Stopped with a draft");
@@ -900,13 +1413,113 @@ describe("computeTurnSummary — typed terminal adjudication", () => {
   });
 });
 
+describe("computeTurnSummary — uxV1 disposition-first reorder (SKY-12136)", () => {
+  it("a pending untested draft outranks a non-build responseKind (old: Question)", () => {
+    const turn = buildTurn({
+      responseKind: "clarify",
+      draft: draft3,
+      proposalDisposition: "review_untested",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("a pending tested draft outranks a non-build responseKind too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        draft: draft3,
+        proposalDisposition: "review_tested",
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Workflow ready for review");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("!");
+  });
+
+  it("fallback chain: an untested draft outranks needsInput text when responseKind is null", () => {
+    const turn = buildTurn({
+      draft: draft3,
+      proposalDisposition: "review_untested",
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(turn.responseKind).toBeNull();
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("old payload (hydrated, no responseKind) still gets the uxV1 draft-review reorder", () => {
+    const turn = hydrateNarrativeFromPayload(
+      reproClarifyPayload({ proposalDisposition: "review_untested" }),
+    )!;
+    expect(turn.responseKind).toBeNull();
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Draft needs review");
+  });
+
+  it("renames the pure-ask clarify headline to Needs your input", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        responseKind: "clarify",
+        responseType: "ASK_QUESTION",
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Needs your input");
+    expect(summary.accent).toBe("qa");
+    expect(summary.glyph).toBe("✦");
+  });
+
+  it.each([
+    ["refuse", "Declined"],
+    ["diagnose", "Answered"],
+    ["answer", "Answered"],
+  ] as const)(
+    "leaves %s as %s under uxV1 — only the clarify/Question case renames",
+    (kind, headline) => {
+      const summary = computeTurnSummary(buildTurn({ responseKind: kind }), {
+        uxV1: true,
+      });
+      expect(summary.headline).toBe(headline);
+      expect(summary.accent).toBe("qa");
+    },
+  );
+
+  it("isStoppedWithDraft keeps absolute precedence under uxV1 too", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        cancelled: true,
+        draft: draft3,
+        proposalDisposition: "review_untested",
+        responseKind: "build",
+      }),
+      { uxV1: true },
+    );
+    expect(summary.headline).toBe("Stopped with a draft");
+    expect(summary.accent).toBe("qa");
+  });
+
+  it("uxV1 fallback needsInput still renders Needs your input when no draft is pending", () => {
+    const turn = buildTurn({
+      terminalMessage: "Could you provide the login details?",
+    });
+    expect(computeTurnSummary(turn).headline).toBe("Question");
+    const summary = computeTurnSummary(turn, { uxV1: true });
+    expect(summary.headline).toBe("Needs your input");
+  });
+});
+
 describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
   it("grafts clarify from the adjacent turn_outcome onto a pre-fix payload", () => {
     const turn = hydrateHistoryNarrative(reproClarifyPayload(), {
       response_kind: "clarify",
     })!;
     expect(turn.responseKind).toBe("clarify");
-    expect(turn.verifiedSuccess).toBeNull();
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Question");
     expect(summary.accent).toBe("qa");
@@ -914,7 +1527,7 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
 
   it("keeps the payload's own responseKind over the graft", () => {
     const turn = hydrateHistoryNarrative(
-      reproClarifyPayload({ responseKind: "refuse", verifiedSuccess: false }),
+      reproClarifyPayload({ responseKind: "refuse" }),
       { response_kind: "clarify" },
     )!;
     expect(turn.responseKind).toBe("refuse");
@@ -925,7 +1538,6 @@ describe("hydrateHistoryNarrative — persisted turn_outcome graft", () => {
       response_kind: "build",
     })!;
     expect(turn.responseKind).toBe("build");
-    expect(turn.verifiedSuccess).toBeNull();
     const summary = computeTurnSummary(turn);
     expect(summary.headline).toBe("Built and tested the workflow");
     expect(summary.accent).toBe("ok");
@@ -954,18 +1566,298 @@ describe("applyNarrativeEvent — terminal adjudication on live frames", () => {
         message: "I'm stuck retrying the same step.",
         narrative_payload: reproClarifyPayload({
           responseKind: "clarify",
-          verifiedSuccess: false,
         }),
       }),
     );
     expect(s.responseKind).toBe("clarify");
-    expect(s.verifiedSuccess).toBe(false);
     expect(computeTurnSummary(s).headline).toBe("Question");
   });
 
   it("leaves both fields null on frames from an older backend", () => {
     const s = applyNarrativeEvent(EMPTY_NARRATIVE, response());
     expect(s.responseKind).toBeNull();
-    expect(s.verifiedSuccess).toBeNull();
+  });
+});
+
+describe("humanizeJudgeText", () => {
+  // Legacy backend display text still needs to render safely while old events remain in history.
+  const JUDGE_REASON =
+    "The run completed but did not demonstrate the goal outcome(s). " +
+    "Missing evidence: the number of Customer Agents is known. " +
+    "Add or fix the block that produces the missing outcome evidence, then re-run.";
+
+  // What actually reaches the client: run_outcome_display_reason truncates display_reason to
+  // _DISPLAY_REASON_MAX_CHARS (160), so the trailing instruction always arrives cut mid-word.
+  const TRUNCATED_JUDGE_REASON = JUDGE_REASON.slice(0, 160);
+
+  it("rewrites the truncated verdict the backend actually sends", () => {
+    expect(TRUNCATED_JUDGE_REASON).toHaveLength(160);
+    expect(TRUNCATED_JUDGE_REASON.endsWith("produces the ")).toBe(true);
+
+    expect(humanizeJudgeText(TRUNCATED_JUDGE_REASON)).toBe(
+      "The run finished but didn't produce what you asked for: the number of Customer Agents is known.",
+    );
+  });
+
+  it("still rewrites the untruncated verdict", () => {
+    expect(humanizeJudgeText(JUDGE_REASON)).toBe(
+      "The run finished but didn't produce what you asked for: the number of Customer Agents is known.",
+    );
+  });
+
+  it("strips the instruction wherever the 160-char cut lands inside it", () => {
+    const instruction =
+      " Add or fix the block that produces the missing outcome evidence, then re-run.";
+    const head =
+      "The run completed but did not demonstrate the goal outcome(s): title check.";
+    for (let cut = 0; cut <= instruction.length; cut += 1) {
+      const humanized = humanizeJudgeText(head + instruction.slice(0, cut));
+      expect(humanized).not.toContain("Add or fix");
+      expect(humanized.startsWith("The run finished but didn't produce")).toBe(
+        true,
+      );
+    }
+  });
+
+  it("rewrites the verdict where the backend appends it to the closing message", () => {
+    const closing = `I ran the workflow, but I could not confirm the goal was met. Reason: ${TRUNCATED_JUDGE_REASON}`;
+    const humanized = humanizeJudgeText(closing);
+
+    expect(humanized).toContain("I ran the workflow, but I could not confirm");
+    expect(humanized).not.toContain("did not demonstrate the goal outcome");
+    expect(humanized).not.toContain("Add or fix");
+  });
+
+  it("leaves ordinary assistant prose alone, even when it ends like the instruction", () => {
+    // The trailing-prefix scan must never reach free prose: the same helper
+    // runs over assistant prose on the headline paths, which is not judge text.
+    for (const prose of [
+      "Choose option A",
+      "Click the button labelled Add",
+      "Add or fix the selector yourself",
+    ]) {
+      expect(humanizeJudgeText(prose)).toBe(prose);
+    }
+  });
+
+  it("strips the instruction when the backend appends Evidence after it", () => {
+    // terminal_envelope.py appends " Evidence: <blocker_reason>" after the Reason sentence.
+    const withEvidence =
+      "I could not confirm the goal was met. Reason: " +
+      JUDGE_REASON +
+      " Evidence: the login form never submitted";
+    const humanized = humanizeJudgeText(withEvidence);
+
+    expect(humanized).not.toContain("Add or fix");
+    expect(humanized).not.toContain("did not demonstrate the goal outcome");
+    expect(humanized).toContain("Evidence: the login form never submitted");
+  });
+
+  it("passes unrecognized text through untouched", () => {
+    const other = "The run stopped because the browser session ended.";
+    expect(humanizeJudgeText(other)).toBe(other);
+  });
+
+  it("is idempotent, so a re-humanized string is unchanged", () => {
+    const once = humanizeJudgeText(TRUNCATED_JUDGE_REASON);
+    expect(humanizeJudgeText(once)).toBe(once);
+  });
+});
+
+describe("a user stop renders as stopped, never as a failure", () => {
+  it("maps a canceled block to stopped, keeping the other halt states failed", () => {
+    expect(mapBlockStatus("canceled")).toBe("stopped");
+    expect(mapBlockStatus("failed")).toBe("failed");
+    expect(mapBlockStatus("terminated")).toBe("failed");
+    expect(mapBlockStatus("timed_out")).toBe("failed");
+  });
+
+  it("records a canceled block as a terminal state so its elapsed pill freezes", () => {
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({ block_label: "login", status: "running" }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({ block_label: "login", status: "canceled" }),
+    );
+
+    const block = s.blocks.find((b) => b.label === "login");
+    expect(block?.state).toBe("stopped");
+    expect(block?.endedAt).not.toBeNull();
+  });
+
+  it("does not treat a stopped block as a failure in the turn summary", () => {
+    const summary = computeTurnSummary(
+      buildTurn({
+        cancelled: true,
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "login",
+            blockType: "task",
+            state: "stopped",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-05-25T00:00:01Z",
+            endedAt: "2026-05-25T00:00:04Z",
+          } as BlockState,
+        ],
+      }),
+    );
+
+    expect(summary.isFail).toBe(false);
+    expect(summary.isStopped).toBe(true);
+    expect(summary.headline).toBe("Stopped");
+    expect(summary.accent).not.toBe("fail");
+    expect(summary.stats).toContain("1 stopped");
+  });
+
+  it("keeps a stopped block through hydration so a reload does not downgrade it", () => {
+    const turn = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      designStarted: true,
+      designEnded: true,
+      draft: null,
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "login",
+          blockType: "task",
+          state: "stopped",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-05-25T00:00:01Z",
+          endedAt: "2026-05-25T00:00:04Z",
+        },
+      ],
+      terminal: "response",
+      terminalMessage: "Stopped.",
+      narrativeSummary: null,
+      priorBlockCount: null,
+      designActivity: [],
+      startedAt: "2026-05-25T00:00:00Z",
+      endedAt: "2026-05-25T00:00:05Z",
+    });
+
+    expect(turn?.blocks[0]?.state).toBe("stopped");
+  });
+});
+
+// The backend stamps a canceled block "failed" and a canceled turn's terminal
+// "error" (_BLOCK_STATUS_TO_UI_STATE, agent.py), so these payloads are the
+// shape a real cancel actually delivers — not the "stopped" shape the live
+// block_progress frames produce.
+describe("a real cancel's backend payload still renders neutrally", () => {
+  const cancelledPayload = () => ({
+    turnId: "turn-1",
+    turnIndex: 0,
+    designStarted: true,
+    designEnded: true,
+    draft: null,
+    blocks: [
+      {
+        workflowRunBlockId: "wrb_1",
+        label: "log_in",
+        blockType: "task",
+        state: "failed",
+        lastSeenIteration: 0,
+        activity: [],
+        startedAt: "2026-05-25T00:00:01Z",
+        endedAt: "2026-05-25T00:00:04Z",
+      },
+    ],
+    terminal: "error",
+    terminalMessage: "Cancelled by user.",
+    narrativeSummary: null,
+    cancelled: true,
+    priorBlockCount: null,
+    designActivity: [],
+    startedAt: "2026-05-25T00:00:00Z",
+    endedAt: "2026-05-25T00:00:05Z",
+  });
+
+  it("re-reads a backend-failed block on a cancelled turn as stopped", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload());
+    expect(turn?.blocks[0]?.state).toBe("stopped");
+  });
+
+  it("does not brand the settled cancel a failure", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
+    const summary = computeTurnSummary(turn);
+
+    expect(summary.isFail).toBe(false);
+    expect(summary.headline).not.toBe("Run halted");
+    expect(summary.accent).not.toBe("fail");
+  });
+
+  it("does not redden the rail for a run the user stopped", () => {
+    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
+    const phases = derivePhases(turn);
+    const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
+    expect(byId.done).toBe("stopped");
+    expect(byId.test).toBe("stopped");
+  });
+
+  // Stop pressed during the thinking phase, or on a QA turn: nothing to key a
+  // block state off, so only the turn's own cancelled flag can tell the truth.
+  it("does not read a blockless cancel as a clean success", () => {
+    const summary = computeTurnSummary(
+      buildTurn({ cancelled: true, blocks: [], draft: null }),
+    );
+
+    expect(summary.headline).toBe("Stopped");
+    expect(summary.headline).not.toBe("Completed the run");
+    expect(summary.glyph).not.toBe("✓");
+    expect(summary.accent).not.toBe("ok");
+  });
+
+  // The labels a cancel actually carried before the relabel: the payload surface
+  // wrote "build" through the terminal-reason arm, and "answer" without one.
+  it.each(["build", "answer"] as const)(
+    "renders a blockless cancel identically whether it is labelled %s or recover",
+    (priorKind) => {
+      const summaryFor = (responseKind: "build" | "answer" | "recover") =>
+        computeTurnSummary(
+          buildTurn({ cancelled: true, blocks: [], draft: null, responseKind }),
+          { uxV1: true },
+        );
+
+      expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));
+      expect(summaryFor("recover").headline).toBe("Stopped");
+      expect(summaryFor("recover").stats).toEqual(summaryFor(priorKind).stats);
+    },
+  );
+
+  it.each(["build", "answer"] as const)(
+    "renders a cancel that kept a draft identically whether it is labelled %s or recover",
+    (priorKind) => {
+      const summaryFor = (responseKind: "build" | "answer" | "recover") =>
+        computeTurnSummary(
+          buildTurn({
+            cancelled: true,
+            blocks: [],
+            draft: draft3,
+            proposalDisposition: "review_untested",
+            responseKind,
+          }),
+          { uxV1: true },
+        );
+
+      expect(summaryFor(priorKind)).toEqual(summaryFor("recover"));
+      expect(summaryFor("recover").headline).toBe("Stopped with a draft");
+      expect(summaryFor("recover").accent).toBe("qa");
+    },
+  );
+
+  it("still renders a genuine error turn as a failure", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...cancelledPayload(),
+      cancelled: false,
+    })!;
+    expect(turn.blocks[0]?.state).toBe("failed");
+    expect(computeTurnSummary(turn).isFail).toBe(true);
   });
 });

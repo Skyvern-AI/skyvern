@@ -24,6 +24,7 @@ from skyvern.config import settings
 from skyvern.webeye.cdp_connection import (
     connect_over_cdp_with_diagnostics,
     is_local_pbs_cdp_url,
+    redact_cdp_url,
     resolve_local_pbs_cdp_url,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
@@ -32,6 +33,23 @@ if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
 
 LOG = structlog.get_logger()
+
+
+@functools.lru_cache(maxsize=None)
+def _load_js_asset(file_name: str) -> str:
+    # Module-level so the cache key is the asset name only. A method-level lru_cache
+    # keys on `self`, pinning every channel instance (and its Playwright driver) for
+    # the lifetime of the process.
+    base_path = pathlib.Path(__file__).parent / "js"
+    file_name = file_name.lstrip("/")
+
+    if not file_name.endswith(".js"):
+        file_name += ".js"
+
+    full_path = base_path / pathlib.Path(file_name)
+
+    with open(full_path, encoding="utf-8") as f:
+        return f.read()
 
 
 class CdpChannel:
@@ -54,6 +72,10 @@ class CdpChannel:
         self.page: Page | None = None
         self.pw: Playwright | None = None
         self.url: str | None = None
+        # Set True by a terminal stop() so the browser "disconnected" callback (registered
+        # in connect()) does not resurrect the connection during teardown. close() stays
+        # reconnect-neutral because connect() calls it to recycle a dropped connection.
+        self._closing = False
 
     @property
     def class_name(self) -> str:
@@ -63,12 +85,19 @@ class CdpChannel:
     def identity(self) -> t.Dict[str, t.Any]:
         base = self.vnc_channel.identity
 
-        return base | {"cdp_url": self.url}
+        # This mapping is splatted into every log line this channel writes, and the url it holds
+        # is the session's own address — which carries the session token.
+        return base | {"cdp_url": redact_cdp_url(self.url)}
 
     async def connect(self, cdp_url: str | None = None) -> t.Self:
         """
         Idempotent.
         """
+
+        # A channel torn down by stop() never reconnects: this also neutralizes a
+        # reconnect task the "disconnected" callback may have scheduled just before teardown.
+        if self._closing:
+            return self
 
         if self.browser and self.browser.is_connected():
             return self
@@ -100,13 +129,20 @@ class CdpChannel:
             headers["X-Session-Id"] = self.vnc_channel.browser_session.persistent_browser_session_id
 
         def on_close() -> None:
+            if self._closing:
+                return
             LOG.warning(
                 f"{self.class_name} closing because the persistent browser disconnected itself.", **self.identity
             )
             close_task = asyncio.create_task(self.close())
             close_task.add_done_callback(lambda _: asyncio.create_task(self.connect()))  # TODO: avoid blind reconnect
 
-        self.browser = await connect_over_cdp_with_diagnostics(pw, url, headers=headers if headers else None)
+        self.browser = await connect_over_cdp_with_diagnostics(
+            pw,
+            url,
+            headers=headers if headers else None,
+            validate_browser_address=False,
+        )
         self.browser.on("disconnected", on_close)
 
         await self.apply_download_behavior(self.browser)
@@ -157,21 +193,35 @@ class CdpChannel:
     async def close(self) -> None:
         LOG.info(f"{self.class_name} closing connection", **self.identity)
 
-        if self.browser:
-            try:
-                await self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
+        try:
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+        finally:
+            # Release the driver even when browser.close() raised on a dead target;
+            # a skipped stop() orphans the node subprocess for the process lifetime.
+            if self.pw:
+                try:
+                    await self.pw.stop()
+                except Exception:
+                    LOG.warning(f"{self.class_name} failed to stop playwright driver", **self.identity, exc_info=True)
+                self.pw = None
 
-        if self.pw:
-            await self.pw.stop()
-            self.pw = None
-
-        self.browser_context = None
-        self.page = None
+            self.browser_context = None
+            self.page = None
 
         LOG.info(f"{self.class_name} closed", **self.identity)
+
+    async def stop(self) -> t.Self:
+        """Terminal close: unlike close() (which connect() reuses to recycle a dropped
+        connection), stop() marks the channel closing so the browser "disconnected"
+        callback registered in connect() cannot resurrect a fresh driver."""
+        self._closing = True
+        await self.close()
+        return self
 
     async def evaluate_js(
         self,
@@ -193,16 +243,5 @@ class CdpChannel:
             LOG.exception(f"{self.class_name} failed to evaluate js", expression=expression, **self.identity)
             raise
 
-    @functools.lru_cache(maxsize=None)
     def js(self, file_name: str) -> str:
-        base_path = pathlib.Path(__file__).parent / "js"
-        file_name = file_name.lstrip("/")
-
-        if not file_name.endswith(".js"):
-            file_name += ".js"
-
-        relative_path = pathlib.Path(file_name)
-        full_path = base_path / relative_path
-
-        with open(full_path, encoding="utf-8") as f:
-            return f.read()
+        return _load_js_asset(file_name)

@@ -7,7 +7,7 @@ from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_pro
 from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileRequest
 from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
-from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_proxy_url, _redact_url_query
+from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_url_query
 
 
 def test_redact_url_query_strips_presigned_signature() -> None:
@@ -26,32 +26,9 @@ def test_redact_url_query_plain_string_passes_through() -> None:
     assert _redact_url_query("not-a-url") == "not-a-url"
 
 
-def test_redact_proxy_url_strips_password() -> None:
-    assert _redact_proxy_url("http://user:secret@proxy.example.com:8080") == "http://user:***@proxy.example.com:8080"
-
-
-def test_redact_proxy_url_keeps_username_only() -> None:
-    assert _redact_proxy_url("http://user@proxy.example.com:8080") == "http://user@proxy.example.com:8080"
-
-
-def test_redact_proxy_url_no_creds() -> None:
-    assert _redact_proxy_url("http://proxy.example.com:8080") == "http://proxy.example.com:8080"
-
-
-def test_redact_proxy_url_invalid() -> None:
-    assert _redact_proxy_url("not-a-url") == "<redacted>"
-
-
-def test_build_browser_args_custom_proxy_url_takes_precedence() -> None:
+def test_build_browser_args_never_sets_proxy() -> None:
     args = BrowserContextFactory.build_browser_args(
         proxy_location={"url": "http://user:secret@proxy.example.com:8080"},
-    )
-    assert args["proxy"] == {"server": "http://user:secret@proxy.example.com:8080"}
-
-
-def test_build_browser_args_invalid_custom_proxy_url_ignored() -> None:
-    args = BrowserContextFactory.build_browser_args(
-        proxy_location={"url": "not-a-valid-proxy-url"},
     )
     assert "proxy" not in args
 

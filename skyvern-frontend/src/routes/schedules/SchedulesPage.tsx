@@ -1,16 +1,19 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import {
   ChevronDownIcon,
   CopyIcon,
   DotsHorizontalIcon,
+  ExclamationTriangleIcon,
   PauseIcon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
   TrashIcon,
 } from "@radix-ui/react-icons";
+import { Tip } from "@/components/Tip";
 import {
   Table,
   TableBody,
@@ -33,14 +36,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Select,
   SelectContent,
@@ -49,6 +45,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { SelectionBar } from "@/components/SelectionBar";
@@ -73,7 +70,11 @@ import {
   useDuplicateScheduleMutation,
   useEnableScheduleMutation,
 } from "./useScheduleActions";
-import { cronToHumanReadable } from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
+import {
+  cronToHumanReadable,
+  isValidCron,
+  meetsMinCronInterval,
+} from "@/routes/workflows/editor/panels/schedulePanel/cronUtils";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import type { OrganizationScheduleItem } from "@/routes/workflows/types/scheduleTypes";
 import { CreateOrgScheduleDialog } from "./CreateOrgScheduleDialog";
@@ -126,15 +127,31 @@ function SchedulesPage() {
     statusFilter,
     search: debouncedSearch || undefined,
   });
+  const errorDetail = getErrorDetail(error);
 
   const enableMutation = useEnableScheduleMutation();
   const disableMutation = useDisableScheduleMutation();
   const deleteMutation = useDeleteOrgScheduleMutation();
   const duplicateMutation = useDuplicateScheduleMutation();
 
-  const schedules = data?.schedules ?? [];
+  const schedules = useMemo(() => data?.schedules ?? [], [data]);
   const totalCount = data?.total_count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+
+  // meetsMinCronInterval samples up to 2000 future fires; memoize per cron string
+  // so unrelated re-renders (selection, dialogs) don't re-run it for every row.
+  const cronsBelowMinInterval = useMemo(() => {
+    const violations = new Set<string>();
+    for (const schedule of schedules) {
+      if (
+        isValidCron(schedule.cron_expression) &&
+        !meetsMinCronInterval(schedule.cron_expression)
+      ) {
+        violations.add(schedule.cron_expression);
+      }
+    }
+    return violations;
+  }, [schedules]);
 
   const {
     selected,
@@ -224,6 +241,10 @@ function SchedulesPage() {
 
   function handleBulkActivate() {
     const toActivate = selectedSchedules.filter((s) => !s.enabled);
+    if (toActivate.length === 0) {
+      toast({ title: "All selected schedules are already active." });
+      return;
+    }
     void runBulkOperation(
       toActivate,
       (client, item) =>
@@ -237,6 +258,10 @@ function SchedulesPage() {
 
   function handleBulkPause() {
     const toPause = selectedSchedules.filter((s) => s.enabled);
+    if (toPause.length === 0) {
+      toast({ title: "All selected schedules are already paused." });
+      return;
+    }
     void runBulkOperation(
       toPause,
       (client, item) =>
@@ -393,9 +418,9 @@ function SchedulesPage() {
                     className="py-8 text-center text-sm text-red-400"
                   >
                     Failed to load schedules.
-                    {error?.message && (
+                    {errorDetail && (
                       <span className="block text-xs text-slate-500">
-                        {error.message}
+                        {errorDetail}
                       </span>
                     )}
                   </TableCell>
@@ -455,7 +480,16 @@ function SchedulesPage() {
                     {schedule.name ?? "\u2014"}
                   </TableCell>
                   <TableCell className="text-slate-400">
-                    {cronToHumanReadable(schedule.cron_expression)}
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate">
+                        {cronToHumanReadable(schedule.cron_expression)}
+                      </span>
+                      {cronsBelowMinInterval.has(schedule.cron_expression) && (
+                        <Tip content="This schedule fires more often than the 5-minute minimum. Saving any change requires updating its cron expression first.">
+                          <ExclamationTriangleIcon className="size-3.5 shrink-0 text-amber-400" />
+                        </Tip>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="text-slate-400">
                     {schedule.next_run ? (
@@ -633,77 +667,43 @@ function SchedulesPage() {
       )}
 
       {/* Bulk delete confirmation dialog */}
-      <Dialog
+      <ConfirmDialog
         open={bulkDeleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !isBulkOperating) {
+          if (!open) {
             setBulkDeleteDialog({ open: false, count: 0 });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete {bulkDeleteDialog.count} Schedules</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete {bulkDeleteDialog.count}{" "}
-              {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"}? This
-              action cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={isBulkOperating}
-              onClick={() => setBulkDeleteDialog({ open: false, count: 0 })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={isBulkOperating}
-              onClick={handleBulkDeleteConfirm}
-            >
-              {isBulkOperating ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title={`Delete ${bulkDeleteDialog.count} schedule${
+          bulkDeleteDialog.count === 1 ? "" : "s"
+        }?`}
+        description={
+          <p>
+            {bulkDeleteDialog.count}{" "}
+            {bulkDeleteDialog.count === 1 ? "schedule" : "schedules"} will be
+            permanently deleted.
+          </p>
+        }
+        itemCount={bulkDeleteDialog.count}
+        isPending={isBulkOperating}
+        onConfirm={() => {
+          void handleBulkDeleteConfirm();
+        }}
+      />
 
       {/* Delete confirmation dialog */}
-      <Dialog
+      <ConfirmDialog
         open={deleteDialog.open}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
+          if (!open) {
             setDeleteDialog({ open: false, schedule: null });
           }
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Schedule</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete this schedule? This action cannot
-              be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="secondary"
-              disabled={deleteMutation.isPending}
-              onClick={() => setDeleteDialog({ open: false, schedule: null })}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleteMutation.isPending}
-              onClick={handleDeleteConfirm}
-            >
-              {deleteMutation.isPending ? "Deleting..." : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        title="Delete schedule?"
+        description={<p>This schedule will be permanently deleted.</p>}
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDeleteConfirm}
+      />
 
       {/* Create Schedule Dialog */}
       <CreateOrgScheduleDialog

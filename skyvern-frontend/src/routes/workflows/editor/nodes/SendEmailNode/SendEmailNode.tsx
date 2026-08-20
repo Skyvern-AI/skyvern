@@ -50,7 +50,7 @@ function SendEmailNode({ id, data }: NodeProps<SendEmailNode>) {
           open ? "shadow-md" : "shadow-sm",
           {
             "pointer-events-none": thisBlockIsPlaying,
-            "bg-slate-950 outline outline-2 outline-slate-300":
+            "bg-background outline outline-2 outline-ring":
               thisBlockIsTargetted,
           },
         )}

@@ -50,6 +50,11 @@ class CreateCredentialRequest(UniversalBaseModel):
     Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
     """
 
+    tested_url: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Login page URL used during the credential test
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:

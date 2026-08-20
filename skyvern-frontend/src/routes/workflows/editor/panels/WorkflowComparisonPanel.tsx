@@ -63,6 +63,8 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   goto_url: "url",
   http_request: "http_request",
   pdf_fill: "pdfFill",
+  split_pdf: "splitPdf",
+  email_inbox: "emailInbox",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
 };
@@ -142,6 +144,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     proxyLocation: version.proxy_location ?? ProxyLocation.Residential,
     webhookCallbackUrl: version.webhook_callback_url || "",
     persistBrowserSession: version.persist_browser_session,
+    reuseBrowserSession: version.reuse_browser_session ?? false,
     pinSavedSessionIp: version.pin_saved_session_ip ?? false,
     browserProfileId: version.browser_profile_id ?? null,
     browserProfileKey: version.browser_profile_key ?? null,
@@ -159,6 +162,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     scriptCacheKey: version.cache_key,
     aiFallback: version.ai_fallback ?? true,
     enableSelfHealing: version.enable_self_healing ?? false,
+    maskSecrets: version.mask_secrets ?? false,
     runSequentially: version.run_sequentially ?? false,
     sequentialKey: version.sequential_key ?? null,
     finallyBlockLabel: version.workflow_definition?.finally_block_label ?? null,
@@ -389,7 +393,7 @@ function WorkflowComparisonPanel({
           <button
             type="button"
             onClick={() => onCopilotReviewClose("close")}
-            className="absolute right-4 top-4 rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-slate-200"
+            className="absolute right-4 top-4 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-slate-700 dark:hover:text-slate-200"
             title="Close (Esc)"
           >
             <Cross2Icon className="h-5 w-5" />

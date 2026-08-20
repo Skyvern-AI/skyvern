@@ -2,29 +2,54 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+import structlog
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import NotRequired, TypedDict
 
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
-from skyvern.forge.sdk.copilot.result_evidence import (
-    LoadedResultCompositionEvidence,
-    loaded_result_target_structure_signature,
+from skyvern.forge.sdk.copilot.google_connection_notice import (
+    GoogleConnectionNotice,
+    GoogleConnectionNoticePayload,
+    GoogleSheetConnectionBinding,
 )
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
+from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+LOG = structlog.get_logger()
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+AskSubject = Literal["output_schema", "credentials", "target_url", "disambiguation", "deliverable_permission", "other"]
+COPILOT_ASK_SUBJECTS: tuple[AskSubject, ...] = get_args(AskSubject)
+
+
+def coerce_ask_subject(value: object) -> AskSubject | None:
+    for subject in COPILOT_ASK_SUBJECTS:
+        if value == subject:
+            return subject
+    return None
+
+
+def parsed_ask_refs(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [ref for ref in value if isinstance(ref, str) and ref]
 
 
 class NarrativeDraft(TypedDict):
@@ -55,33 +80,36 @@ class NarrativeBlock(TypedDict):
     endedAt: str | None
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
 
 
-class NarrativeOutcomeAdjudication(TypedDict):
-    satisfiedCount: int
-    unsatisfiedCount: int
-    unknownCount: int
-    # "verified_goal_satisfied" | "built_unverified".
-    claimTier: str
-    criteriaEpoch: NotRequired[int]
-    criteriaLifecycleReason: NotRequired[str]
+class NarrativeConnectedAccountChoice(TypedDict):
+    connection_id: str
+    name: str
+    state: str
+    email_address: str | None
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
-    mode: str
     responseType: NotRequired[ResponseType]
     cancelled: NotRequired[bool]
     proposalDisposition: NotRequired[ProposalDisposition]
-    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
-    # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
-    # True only when outcome evidence authorizes a tested-success claim.
-    verifiedSuccess: NotRequired[bool]
-    # Verdict-state summary from the turn's latest evaluated adjudication.
-    outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
+    terminalEnvelope: NotRequired[dict[str, Any]]
+    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    credentialPrompt: NotRequired[dict[str, str]]
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
+    # credential pause (credential_pause.py) resolved during this turn.
+    credentialPause: NotRequired[dict[str, str]]
+    # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
+    # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
+    credentialAutoBound: NotRequired[dict[str, str]]
+    connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
+    googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -93,24 +121,23 @@ class TurnNarrativePayload(TypedDict):
     designActivity: list[NarrativeActivityEntry]
     startedAt: str | None
     endedAt: str | None
+    review: NotRequired[NarrativeReviewProjection]
+    testedBlockFingerprints: NotRequired[dict[str, list[str]]]
 
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
-        RecordedOutcomeBindingConstraint,
-        RecordedOutcomeGroundingRequirement,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-    from skyvern.forge.sdk.copilot.schema_incompatibility import SchemaIncompatibility
+    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
-    from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, TurnOutcome
 
 
 class UrlVisit(BaseModel):
@@ -130,27 +157,34 @@ class CredentialCheck(BaseModel):
     found: bool = False
 
 
+class ApprovedCredential(BaseModel):
+    credential_id: str
+
+
 class ObservedPage(BaseModel):
     """Compact cross-turn record of a page the agent scouted (SKY-10562).
 
     Carries only what the composition gate needs to credit a prior observation:
-    the full scheme-bearing url (so urlparse-based _same_page/_same_origin match),
-    whether bounded page schema was captured, and how the state was reached. Full
-    page schemas stay within-turn; this keeps a resumed turn from re-scouting (or
-    deadlocking against a spent inspection budget) for pages already observed.
+    a model-safe origin, a keyed location fingerprint, whether bounded page schema
+    was captured, and how the state was reached. Full page schemas and raw location
+    state stay within-turn.
     """
 
     url: str = ""
+    location_fingerprint: str = ""
     had_bounded_schema: bool = False
     reached_via: str = ""
 
 
-class LoadedResultTargetContext(BaseModel):
-    selector: str = ""
-    is_table: bool = False
-    row_selector: str = ""
-    row_count: int | None = None
-    structure_signature: str = ""
+# The two fields ScoutedInteraction declares turn-ephemeral. Everything else on an
+# interaction crosses the turn boundary as captured: the turn boundary is not a
+# disclosure boundary, so there is no field roster here to keep in step with the record.
+# ``input_value`` is the private same-turn literal; the model sees ``input_id``, which does
+# cross. ``typed_value`` is absent because the record no longer has one — it was retired
+# with the literal, and is discarded when a legacy payload is migrated below.
+_TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_value"})
+# Held by chats persisted before the record exposed secret-safe input identities.
+_RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
 
 
 OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
@@ -167,8 +201,6 @@ class CodeAuthoringRepairContext(BaseModel):
     source_url: str | None = None
     refiner_selector: str | None = None
     selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
-    allowed_global_names: list[str] = Field(default_factory=list)
-    allowed_helper_surface: dict[str, list[str]] = Field(default_factory=dict)
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
     output_dependency_failure_class: str | None = None
@@ -183,8 +215,8 @@ class CodeAuthoringRepairContext(BaseModel):
     failed_block_status: str | None = None
     workflow_run_id: str | None = None
     current_origin: str | None = None
-    current_url_present: bool = False
-    current_title_present: bool = False
+    current_url: str | None = None
+    current_title: str | None = None
     page_evidence_source: str | None = None
     observed_after_workflow_run: bool = False
     page_form_summaries: list[str] = Field(default_factory=list)
@@ -195,30 +227,55 @@ class CodeAuthoringRepairContext(BaseModel):
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
     output_owner_candidate_labels: list[str] = Field(default_factory=list)
+    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
     repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
 
 
 class StructuredContext(BaseModel):
+    # Without populate_by_name, the alias on carried_trajectory below would make the field
+    # unconstructable by its own name.
+    model_config = ConfigDict(populate_by_name=True)
+
     user_goal: str = ""
     urls_visited: list[UrlVisit] = Field(default_factory=list)
     fields_filled: list[FieldFilled] = Field(default_factory=list)
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
+    approved_credentials: list[ApprovedCredential] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
-    # Per-chat discovery budget. Survives turn boundaries via
-    # AgentResult.global_llm_context — finalized deterministically at every
-    # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
-    discovery_calls_made: int = 0
     page_inspection_calls_made: int = 0
     observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
-    loaded_result_targets: list[LoadedResultTargetContext] = Field(default_factory=list)
+    # Chats persisted before this record was generalized still store it under ``fill_carry``.
+    carried_trajectory: list[dict[str, Any]] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("carried_trajectory", "fill_carry"),
+    )
+
+    @field_validator("carried_trajectory", mode="before")
+    @classmethod
+    def _drop_retired_fields(cls, value: object) -> object:
+        """A chat persisted under the old key still holds ``typed_value``, the literal the
+        record retired in favour of a secret-safe input identity. Migration drops it here
+        rather than in the ongoing filter, which admits every field the record still has.
+
+        The turn-ephemeral pair goes with it. Nothing legitimate carries them — the outbound
+        filter excludes both — so an inbound entry holding ``input_value`` is a stale payload
+        re-introducing the private literal the identity replaced.
+        """
+        if not isinstance(value, list):
+            return value
+        dropped = _RETIRED_INTERACTION_FIELDS | _TURN_EPHEMERAL_INTERACTION_FIELDS
+        return [
+            {key: item for key, item in entry.items() if key not in dropped} if isinstance(entry, dict) else entry
+            for entry in value
+        ]
+
+    entrypoint_url: str | None = None
 
     def to_json_str(self) -> str:
         payload = self.model_dump(mode="json")
-        payload["loaded_result_targets"] = [
-            _sanitized_loaded_result_target_payload(target) for target in self.loaded_result_targets
-        ]
-        return json.dumps(payload, indent=2)
+        payload["carried_trajectory"] = [dict(entry) for entry in self.carried_trajectory]
+        return json.dumps(payload, indent=2, default=str)
 
     @classmethod
     def from_json_str(cls, raw: str | None) -> StructuredContext:
@@ -229,6 +286,13 @@ class StructuredContext(BaseModel):
             try:
                 return cls.model_validate_json(raw)
             except Exception:
+                # The fallback erases every typed field, including credential approvals,
+                # so a silent hit here is invisible authority loss (SKY-13986).
+                LOG.warning(
+                    "structured_context_parse_failed",
+                    raw_length=len(raw),
+                    raw_sha256=hashlib.sha256(raw.encode()).hexdigest()[:16],
+                )
                 return cls(user_goal=raw)
         return cls(user_goal=raw)
 
@@ -303,20 +367,6 @@ class StructuredContext(BaseModel):
             self.credentials_checked = self.credentials_checked[-40:]
 
 
-def _sanitized_loaded_result_target_payload(
-    target: LoadedResultTargetContext,
-) -> dict[str, object]:
-    structure_signature = loaded_result_target_structure_signature(
-        is_table=target.is_table,
-        row_count=target.row_count,
-    )
-    return {
-        "is_table": target.is_table,
-        "row_count": target.row_count,
-        "structure_signature": structure_signature,
-    }
-
-
 def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> str:
     raw = global_llm_context or ""
     if not raw:
@@ -327,52 +377,84 @@ def sanitize_global_llm_context_for_prompt(global_llm_context: str | None) -> st
         return raw
     if not isinstance(payload, dict):
         return raw
-    targets = payload.get("loaded_result_targets")
-    if not isinstance(targets, list):
-        return raw
-
-    sanitized_targets: list[dict[str, object]] = []
-    for target in targets:
-        if not isinstance(target, Mapping):
-            continue
-        try:
-            target_context = LoadedResultTargetContext.model_validate(target)
-        except Exception:
-            continue
-        sanitized_targets.append(_sanitized_loaded_result_target_payload(target_context))
-    payload["loaded_result_targets"] = sanitized_targets
     return json.dumps(payload, indent=2)
 
 
-def render_loaded_result_context_for_prompt(global_llm_context: str) -> str:
-    structured = StructuredContext.from_json_str(global_llm_context)
-    if not structured.loaded_result_targets:
-        return ""
-    lines = [
-        "Author an extraction or validation block from these loaded-result targets.",
-        "Do not call evaluate just to re-read the same loaded results.",
-    ]
-    for index, target in enumerate(structured.loaded_result_targets, start=1):
-        lines.append(f"- target {index}:")
-        lines.append(f"  table: {str(target.is_table).lower()}")
-        if target.row_count is not None:
-            lines.append(f"  row_count: {target.row_count}")
-        if target.structure_signature:
-            lines.append(f"  structure_signature: {target.structure_signature}")
-    return "\n".join(lines)
+def build_model_safe_global_llm_context(global_llm_context: str | None) -> str:
+    """The model-facing view of the serialized context: values redacted structurally,
+    document kept valid. Policy code consumes the raw serialized context, never this view."""
+    return sanitize_global_llm_context_for_prompt(redact_raw_secrets_for_structured_prompt(global_llm_context or ""))
 
 
 _MAX_OBSERVED_ACTED_PAGES = 20
+_MAX_CARRIED_INTERACTIONS = 60
+
+
+def _carried_trajectory_from_scout_trajectory(
+    trajectory: Sequence[Mapping[str, Any]],
+    credential_field_inventory: Mapping[str, frozenset[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Carry each interaction forward as captured, minus the turn-ephemeral fields.
+
+    No tool filter and no field roster: a field added to ``ScoutedInteraction`` crosses
+    without an entry anywhere. Credential inventory is attached here because it is
+    resolve-time metadata the interaction itself never carried.
+    """
+    carried: list[dict[str, Any]] = []
+    for interaction in trajectory:
+        if not str(interaction.get("tool_name") or "").strip():
+            continue
+        entry = {key: value for key, value in interaction.items() if key not in _TURN_EPHEMERAL_INTERACTION_FIELDS}
+        credential_id = entry.get("credential_id")
+        inventory = (credential_field_inventory or {}).get(credential_id) if isinstance(credential_id, str) else None
+        if inventory:
+            entry["available_fields"] = sorted(inventory)
+        carried.append(entry)
+    return carried[-_MAX_CARRIED_INTERACTIONS:]
+
+
+def _merge_carried_trajectory(
+    prior: Sequence[Mapping[str, Any]], current: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Retained entries first, then this turn's, dropping entries already represented.
+
+    A turn whose rebind was declined never re-derives the prior entries from its own
+    trajectory, so replacing rather than merging would discard the record a turn at a
+    time — the loss compounding on itself.
+    """
+    merged = [dict(entry) for entry in prior]
+    # Hydration seeds this turn's trajectory with the retained record, marking each entry
+    # carried, so when there is a prior record those entries are already represented and
+    # re-appending would double them. Matching on content instead would collapse a genuine
+    # repeat — a banner dismissed twice, the same value read twice — and silently shorten
+    # the record. Tested against ``prior``, never the list being built, which grows.
+    skip_carried = bool(merged)
+    for entry in current:
+        if skip_carried and entry.get("carried") is True:
+            continue
+        merged.append(dict(entry))
+    return merged[-_MAX_CARRIED_INTERACTIONS:]
 
 
 def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
     """Fold this turn's flow-evidence trajectory into the persisted summary.
 
-    Keyed by url; a later observation of the same url replaces the earlier one,
+    Keyed by safe origin plus location fingerprint; a later observation of the same page replaces the earlier one,
     and a bounded-schema or interaction observation never regresses to a weaker
     one for the same page.
     """
-    by_url: dict[str, ObservedPage] = {page.url: page for page in prior if page.url}
+    by_location: dict[tuple[str, str], ObservedPage] = {}
+    for page in prior:
+        safe_url = safe_page_origin(page.url)
+        fingerprint = page.location_fingerprint or page_location_fingerprint(page.url)
+        if not safe_url or not fingerprint:
+            continue
+        by_location[(safe_url, fingerprint)] = ObservedPage(
+            url=safe_url,
+            location_fingerprint=fingerprint,
+            had_bounded_schema=page.had_bounded_schema,
+            reached_via=page.reached_via,
+        )
     for entry in flow_evidence:
         evidence = entry.get("evidence")
         url = entry.get("url")
@@ -380,32 +462,31 @@ def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[d
             url = evidence.get("current_url") or evidence.get("inspected_url")
         if not isinstance(url, str) or not url.strip():
             continue
-        existing = by_url.get(url)
+        safe_url = safe_page_origin(url)
+        if not safe_url:
+            continue
+        fingerprint = (
+            str(evidence.get("current_url_location_fingerprint") or "") if isinstance(evidence, dict) else ""
+        ) or page_location_fingerprint(url)
+        if not fingerprint:
+            continue
+        location_key = (safe_url, fingerprint)
+        existing = by_location.get(location_key)
         had_schema = bool(entry.get("had_bounded_schema")) or (existing.had_bounded_schema if existing else False)
         reached_via = str(entry.get("reached_via") or (existing.reached_via if existing else ""))
         if existing and existing.reached_via == "interaction":
             reached_via = "interaction"
-        by_url[url] = ObservedPage(url=url, had_bounded_schema=had_schema, reached_via=reached_via)
-    return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
-
-
-def _loaded_result_targets_from_steer(
-    steer: LoadedResultCompositionEvidence | None,
-) -> list[LoadedResultTargetContext]:
-    if steer is None:
-        return []
-    return [
-        LoadedResultTargetContext(
-            is_table=target.is_table,
-            row_count=target.row_count,
-            structure_signature=target.structure_signature,
+        by_location[location_key] = ObservedPage(
+            url=safe_url,
+            location_fingerprint=fingerprint,
+            had_bounded_schema=had_schema,
+            reached_via=reached_via,
         )
-        for target in steer.targets
-    ]
+    return list(by_location.values())[-_MAX_OBSERVED_ACTED_PAGES:]
 
 
-def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
-    """Fold the per-chat discovery counter into the outgoing global_llm_context.
+def finalize_observation_context(ctx: Any, raw_context: str | None) -> str | None:
+    """Fold durable observation evidence into the outgoing global LLM context.
 
     Called from agent.py's `_make_agent_result` factory so every AgentResult
     exit path — timeout, cancel, max-turns, output-policy block, request-
@@ -416,29 +497,98 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     Returns None when there is nothing to record and no prior context, so the
     pre-existing 'no global_llm_context' behaviour is preserved.
     """
-    prior = int(getattr(ctx, "prior_discovery_calls_made", 0) or 0)
-    this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
     prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
     inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
     flow_evidence = getattr(ctx, "flow_evidence", None) or []
-    loaded_result_targets = _loaded_result_targets_from_steer(
-        getattr(ctx, "latest_evaluate_result_composition_steer", None)
+    raw_scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    scout_trajectory = raw_scout_trajectory if isinstance(raw_scout_trajectory, Sequence) else ()
+    raw_inventory = getattr(ctx, "scouted_credential_field_inventory_by_credential_id", None)
+    raw_entrypoint_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    resolved_entrypoint_url = raw_entrypoint_url if isinstance(raw_entrypoint_url, str) else None
+    carried_this_turn = _carried_trajectory_from_scout_trajectory(
+        [interaction for interaction in scout_trajectory if isinstance(interaction, Mapping)],
+        credential_field_inventory=raw_inventory if isinstance(raw_inventory, Mapping) else None,
     )
     if (
         not raw_context
-        and this_turn == 0
         and inspections_this_turn == 0
         and not flow_evidence
-        and not loaded_result_targets
+        and not carried_this_turn
+        and not resolved_entrypoint_url
     ):
         return None
     sc = StructuredContext.from_json_str(raw_context)
-    sc.discovery_calls_made = prior + this_turn
+    if resolved_entrypoint_url:
+        sc.entrypoint_url = resolved_entrypoint_url
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
-    # Replace with this turn's targets so stale extraction hints do not persist.
-    sc.loaded_result_targets = loaded_result_targets
+    sc.carried_trajectory = _merge_carried_trajectory(sc.carried_trajectory, carried_this_turn)
+    if sc.carried_trajectory:
+        LOG.info(
+            "copilot_carried_trajectory_persisted",
+            source_url=sc.carried_trajectory[0].get("source_url"),
+            interaction_count=len(sc.carried_trajectory),
+            this_turn_count=len(carried_this_turn),
+        )
     return sc.to_json_str()
+
+
+_MAX_APPROVED_CREDENTIALS = 20
+
+
+def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
+    """Persist resolved credentials as durable cross-turn approval. Records only from
+    resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
+    holds by construction. A credential a live login page vouched for is left out: its
+    evidence is that page, which a later turn has not seen, so it must be re-earned there.
+    """
+    policy = ctx.request_policy
+    if policy is None or not policy.resolved_credentials:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    existing_ids = {record.credential_id for record in sc.approved_credentials}
+    for credential in policy.resolved_credentials:
+        # A credential the user picked from the card is durable approval even though the resume
+        # stamped an origin for it; only page-vouched ids have to be re-earned.
+        stamped_by_page = (
+            credential.credential_id in policy.live_page_admitted_urls
+            and credential.credential_id != ctx.credential_pause_connected_credential_id
+        )
+        if credential.credential_id in existing_ids or stamped_by_page:
+            continue
+        sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
+        existing_ids.add(credential.credential_id)
+    if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
+        sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
+    return sc.to_json_str()
+
+
+def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
+    """Take the model's context but keep the server-owned fields server-owned.
+
+    Approval is recorded only from server-resolved credentials; an entry the model
+    supplied would be promoted into `resolved_credentials` on the next turn and clear
+    the unapproved-credential gate for a credential the user never named. Membership
+    of the org is not evidence the user named it.
+
+    `carried_trajectory` is the record of what the browser was observed doing, so an
+    entry the model wrote would enter the factual record as an observation nothing made.
+    It also displaces the real one: the turn-end merge treats whatever arrives here as the
+    prior record and drops this turn's re-hydrated entries against it, so a model-authored
+    list survives and the observed one does not.
+    """
+    trusted = StructuredContext.from_json_str(trusted_raw)
+    structured = trusted
+    if isinstance(model_raw, dict):
+        try:
+            structured = StructuredContext.model_validate(model_raw)
+        except Exception:
+            structured = trusted
+    elif isinstance(model_raw, str):
+        structured = StructuredContext.from_json_str(model_raw)
+    structured.approved_credentials = list(trusted.approved_credentials)
+    structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
+    return structured
 
 
 @dataclass
@@ -463,22 +613,25 @@ class AgentResult:
     cancelled: bool = False
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
-    # Successful code-only build turns can be applied without requiring the
-    # chat's sticky "Always accept" setting.
-    apply_without_review: bool = False
     output_policy_diagnostics: dict[str, Any] | None = None
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None
     narrative_summary: str | None = None
     # Persisted on the assistant chat message so the bubble survives a reload.
     narrative_payload: TurnNarrativePayload | None = None
+    # Shadow-only typed terminal-state envelope persisted and streamed on terminal frames.
+    terminal_envelope: dict[str, Any] | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
+    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False
+    # Exact model-owned contract deletion must survive to the auto-accept write; ordinary saves
+    # still preserve a stored contract when their rebuilt definition omits this Copilot field.
+    clear_persisted_completion_contract: bool = False
     # Criteria lifecycle decision + adjudication counters the route persists
     # after the turn; None when persisted criteria are disabled.
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
@@ -489,6 +642,7 @@ class InFlightStreamToolCall:
     call_id: str
     tool_name: str
     iteration: int
+    display_label: str | None = None
 
 
 @dataclass
@@ -514,29 +668,45 @@ class CopilotContext(AgentContext):
     # Enforcement state
     navigate_called: bool = False
     observation_after_navigate: bool = False
-    navigate_enforcement_done: bool = False
     update_workflow_called: bool = False
     test_after_update_done: bool = False
-    post_update_nudge_count: int = 0
-    coverage_nudge_count: int = 0
-    format_nudge_count: int = 0
-    no_workflow_nudge_count: int = 0
     copilot_total_timeout_exceeded: bool = False
+    copilot_max_turns_exceeded: bool = False
+    model_calls_this_turn: int = 0
+    enforcement_pass_count: int = 0
+    pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     user_message: str = ""
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
-    impose_synthesized_code_block: bool = False
     target_block_label: str | None = None
-    turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
+    prior_turn_outcome: TurnOutcome | None = None
+    # Server-verified display data for recovering from a model-staged Google
+    # connection that has no run authority. This never grants authority itself.
+    connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
 
+    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
+    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
+    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
+    last_run_skipped_unbound_credentials: bool = False
+    client_supports_credential_pause: bool = False
+    credential_pause_used: bool = False
+    copilot_credential_pause_seconds: float = 0.0
+    credential_pause_outcome: str | None = None
+    credential_pause_connected_credential_id: str | None = None
+    # Preserve the immutable turn-open document because ``workflow_yaml`` is
+    # reassigned after every accepted update in the same agent turn.
+    google_connection_turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
+    google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    google_connection_notice_capture_written: bool = False
+
     # Tool tracking
-    consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     # A goal-satisfied stop raised from on_tool_end ends the SDK stream before
     # the satisfying tool's tool_output event flushes; these carry what the
@@ -547,7 +717,6 @@ class CopilotContext(AgentContext):
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
-    latest_schema_incompatibility: SchemaIncompatibility | None = None
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -556,6 +725,7 @@ class CopilotContext(AgentContext):
     output_tokens_used: int | None = None
 
     # Workflow state
+    persisted_workflow_yaml: str | None = None
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
     # Always False under staging; ``has_staged_proposal`` carries the signal.
@@ -566,8 +736,6 @@ class CopilotContext(AgentContext):
     last_artifact_health_blocker_reason: str | None = None
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
-    failed_test_nudge_count: int = 0
-    explore_without_workflow_nudge_count: int = 0
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     last_failed_workflow_yaml: str | None = None
@@ -580,8 +748,6 @@ class CopilotContext(AgentContext):
     # construction — ``CopilotContext`` is re-created per agent turn — so
     # this guards auto-retry WITHIN a turn but not cross-turn "user says
     # retry" requests.
-    pending_reconciliation_run_id: str | None = None
-    pending_reconciliation_requires_user_input: bool = False
     # Block-running tools make their own run context available for same-turn
     # reporting. This is deliberately not persisted across turns. The
     # successful variant is kept for "default to the last clean result"; the
@@ -589,29 +755,17 @@ class CopilotContext(AgentContext):
     # after a watchdog reconciliation read has cleared the retry guard.
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
-    last_outcome_gate_workflow_run_id: str | None = None
+    # The browser session the last run actually executed in. On the fresh-session replay path this
+    # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
+    last_run_blocks_browser_session_id: str | None = None
+    # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
+    # (the same source that powers run_outcome SSE frames). Append-only across
+    # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
+    terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
     # Consecutive failed runs where navigation completed but the scraper
     # could not read the page (generic "failed to load the website" template).
     # Resets on any non-matching run outcome. Streak crosses workflow-shape
-    # changes deliberately — the frontier fingerprint resets each time the
-    # copilot rewrites the workflow, but the underlying site-block pattern is
-    # shape-independent.
-    probable_site_block_streak_count: int = 0
-    probable_site_block_stop_nudge_count: int = 0
-    per_tool_budget_nudge_count: int = 0
     effective_workflow_proxy_location: Any | None = None
-    # Labels of navigation blocks that were canceled/failed inside a
-    # PER_TOOL_BUDGET run. Armed after get_run_results inspects the budgeted
-    # run, and cleared only when a workflow update removes or changes the
-    # label away from navigation. Prevents rerunning the same oversized
-    # navigation block unchanged.
-    per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
-    # Armed when a PER_TOOL_BUDGET run leaves the browser on a meaningful page.
-    # The next block-running call must be preceded by page inspection so the
-    # agent recovers from observed state instead of replaying the same search.
-    post_budget_page_inspection_required: bool = False
-    post_budget_page_inspection_url: str | None = None
-    post_budget_page_inspection_run_id: str | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -624,66 +778,30 @@ class CopilotContext(AgentContext):
     verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
+    executed_block_labels: set[str] = field(default_factory=set)
+    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     last_frontier_start_label: str | None = None
-    last_frontier_fingerprint: str | None = None
-    last_failure_signature: str | None = None
-    repeated_failure_streak_count: int = 0
-    last_repair_non_convergence_signature: str | None = None
-    consecutive_non_converging_repair_count: int = 0
-    # Unlike the identity-keyed repair ceiling, this climbs even when every
-    # rejection is different; it resets only on an accepted persist.
-    code_authoring_guardrail_reject_count: int = 0
-    # True when the most-recent such rejection deferred to the credential-scout
-    # gate, so the churn backstop yields to that message instead of pre-empting it.
-    last_code_authoring_reject_was_credential_priority: bool = False
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
-    recorded_outcome_grounding_requirement: RecordedOutcomeGroundingRequirement | None = None
-    recorded_outcome_binding_constraint: RecordedOutcomeBindingConstraint | None = None
-    # Turn-scoped monotonic marks of verified forward progress: the union of
-    # completion criteria the judge confirmed satisfied so far this turn, and the
-    # high-water length of the verified block prefix. A repair that grows either
-    # made progress and resets the non-convergence streak.
-    verified_criteria_high_water: frozenset[str] = frozenset()
-    verified_prefix_high_water_len: int = 0
-    # A fresh clean full-workflow pass counts as progress exactly once: latched
-    # here so a stale carry-over ``last_full_workflow_test_ok`` on a later non-run
-    # REPAIR verdict cannot keep resetting the non-convergence streak.
-    verified_full_pass_consumed: bool = False
-    # Highest streak level at which we've already emitted a repeated-failure
-    # nudge. Prevents the warn nudge from re-firing every turn while the
-    # streak is still at 2, and guarantees the stop nudge fires exactly once
-    # when the streak reaches 3.
-    repeated_failure_nudge_emitted_at_streak: int = 0
+    recorded_persisted_block_run_workflow_run_id: str | None = None
     # Set by _record_run_blocks_result when the most recent failed run matches
     # SKIP_INNER_NAV_RETRY_ERRORS (DNS / cert / SSL / invalid URL). Drives the
     # one-shot non-retriable-nav stop nudge and the deterministic exit-path
     # exception in run_with_enforcement. Cleared at the top of every call to
     # _record_run_blocks_result so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
+    # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
+    # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
+    last_infrastructure_tool_error: str | None = None
     # Normalized signature of the non-retriable nav error last nudged on.
     # Lets the stop nudge re-fire if the user retries with a different bad URL
     # (different signature) in the same session. Cleared on meaningful success.
-    non_retriable_nav_error_last_emitted_signature: str | None = None
     last_failure_category_top: str | None = None
-    # Hash of the ordered (action_type, element_id) tuples from the last run's
-    # action trace. When the same fingerprint repeats run-over-run with no
-    # intervening success, the agent is stuck re-firing the same clicks/inputs —
-    # typically because a captcha/popup/anti-bot is blocking progress. The
-    # streak counter drives the hard-abort short-circuit in _tool_loop_error.
-    # ``pending_action_sequence_fingerprint`` holds the fingerprint of the run
-    # that JUST completed, computed by ``_run_blocks_and_collect_debug`` before
-    # action_trace is stripped. ``update_repeated_failure_state`` compares it
-    # to ``last_action_sequence_fingerprint`` (the prior run's fingerprint),
-    # updates the streak, then promotes pending → last.
-    last_action_sequence_fingerprint: str | None = None
-    pending_action_sequence_fingerprint: str | None = None
-    repeated_action_fingerprint_streak_count: int = 0
 
     copilot_run_start_monotonic: float | None = None
 
@@ -696,22 +814,13 @@ class CopilotContext(AgentContext):
     # refactors can't strip it silently.
     narrator_state: NarratorState | None = None
 
-    # Default COMPOSING is the safe non-BUILD value; the orchestrator
-    # overrides at turn start via `initial_build_phase`.
-    build_phase: BuildPhase = BuildPhase.COMPOSING
-    # Hydrated from inbound StructuredContext.discovery_calls_made at turn start.
-    prior_discovery_calls_made: int = 0
-    discovery_calls_this_turn: int = 0
     prior_page_inspection_calls_made: int = 0
     page_inspection_calls_this_turn: int = 0
     discovery_step_count: int = 0
-    discovery_started_monotonic: float | None = None
     discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
     resolved_discovery_entrypoint_url: str | None = None
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
-    discovery_entrypoint_url_question_nudge_count: int = 0
-    pre_discovery_url_question_nudge_count: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None
@@ -723,8 +832,6 @@ class CopilotContext(AgentContext):
     # construction site, overriding this default.
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     turn_index: int = 0
-    design_start_emitted: bool = False
-    design_end_emitted: bool = False
     narrative_summary: str | None = None
 
     staged_workflow_yaml: str | None = None
@@ -735,6 +842,7 @@ class CopilotContext(AgentContext):
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False
+    clear_persisted_completion_contract: bool = False
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     prior_block_count: int | None = None
     block_state_map: dict[str, str] = field(default_factory=dict)
@@ -742,6 +850,40 @@ class CopilotContext(AgentContext):
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+
+    # Block types the workflow already carried when the turn opened. Tools reassign
+    # ``workflow_yaml`` mid-turn, so this must never be recomputed from it.
+    code_only_settled_block_types: frozenset[str] = field(init=False, default=frozenset())
+
+    def __post_init__(self) -> None:
+        parent_post_init = getattr(super(), "__post_init__", None)
+        if callable(parent_post_init):
+            parent_post_init()
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+        from skyvern.forge.sdk.copilot.tools.banned_blocks import _extract_existing_code_only_pending_block_types
+
+        self.code_only_settled_block_types = _extract_existing_code_only_pending_block_types(self.workflow_yaml)
+        self.google_connection_turn_start_workflow_yaml = self.workflow_yaml
+
+        if isinstance(self.last_run_outcome, RecordedRunOutcome):
+            super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name != "last_run_outcome":
+            return
+        from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+
+        if not isinstance(value, RecordedRunOutcome):
+            # ``last_run_outcome = None`` is a per-run pointer reset, not an
+            # archive reset. The trace retains the full in-order run record;
+            # terminal projection deliberately anchors to its latest run.
+            return
+        outcomes = getattr(self, "terminal_envelope_run_outcomes", None)
+        if isinstance(outcomes, list):
+            outcomes.append(value)
+        else:
+            super().__setattr__("terminal_envelope_run_outcomes", [value])
 
     def has_genuine_workflow_attempt(self) -> bool:
         """This turn persisted a workflow proposal or executed a real build-test run; excludes
@@ -756,7 +898,6 @@ class CopilotContext(AgentContext):
         for run_id in (
             self.last_run_blocks_workflow_run_id,
             self.last_successful_run_blocks_workflow_run_id,
-            self.last_outcome_gate_workflow_run_id,
         ):
             if run_id is not None and run_id.strip():
                 return True
@@ -771,6 +912,5 @@ class CopilotContext(AgentContext):
             "last_test_ok": self.last_test_ok,
             "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
             "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
-            "last_outcome_gate_workflow_run_id": self.last_outcome_gate_workflow_run_id,
             "ctx_last_workflow_present": self.last_workflow is not None,
         }

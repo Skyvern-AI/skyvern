@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+import litellm
 import structlog
 
 from skyvern.config import settings
@@ -11,10 +14,65 @@ from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 LOG = structlog.get_logger()
 
 FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+XAI_GROK_4_5_MODEL = "xai/grok-4.5"
+XAI_GROK_4_5_CONTEXT_WINDOW = 500_000
+# xAI publishes no output cap for grok-4.5; match the bound used by the other large reasoning
+# models here so LiteLLM's context bookkeeping never assumes 500k of output.
+XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
+
+
+@dataclass(frozen=True)
+class LLMConfigRegistrationIssue:
+    llm_key: str
+    missing_env_vars: tuple[str, ...]
+    detail: str
+
+
+def _register_model_cost_overrides() -> None:
+    # The pinned LiteLLM version can route xai/grok-4.5, but its price map predates the model.
+    litellm.register_model(
+        {
+            XAI_GROK_4_5_MODEL: {
+                "litellm_provider": "xai",
+                "mode": "chat",
+                "max_input_tokens": XAI_GROK_4_5_CONTEXT_WINDOW,
+                "max_output_tokens": XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+                "max_tokens": XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+                "input_cost_per_token": 2e-06,
+                "output_cost_per_token": 6e-06,
+                "output_cost_per_reasoning_token": 6e-06,
+                "supports_function_calling": True,
+                "supports_prompt_caching": True,
+                "supports_reasoning": True,
+                "supports_vision": True,
+                "supports_tool_choice": True,
+                "supports_web_search": True,
+            }
+        }
+    )
+
+
+def _build_xai_grok_4_5_config() -> LLMConfig:
+    return LLMConfig(
+        XAI_GROK_4_5_MODEL,
+        ["XAI_API_KEY"],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        max_completion_tokens=XAI_GROK_4_5_MAX_OUTPUT_TOKENS,
+        temperature=settings.LLM_CONFIG_TEMPERATURE,
+        reasoning_effort=settings.XAI_REASONING_EFFORT or None,
+        litellm_params=LiteLLMParams(
+            api_key=settings.XAI_API_KEY,
+            api_base=settings.XAI_API_BASE,
+            api_version=None,
+            model_info={"model_name": XAI_GROK_4_5_MODEL},
+        ),
+    )
 
 
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
+    _config_issues: dict[str, LLMConfigRegistrationIssue] = {}
 
     @staticmethod
     def is_router_config(llm_key: str) -> bool:
@@ -36,17 +94,62 @@ class LLMConfigRegistry:
         if llm_key in cls._configs:
             raise DuplicateLLMConfigError(llm_key)
 
-        cls.validate_config(llm_key, config)
+        try:
+            cls.validate_config(llm_key, config)
+        except MissingLLMProviderEnvVarsError as exc:
+            if settings.ENV != "local":
+                raise
+            cls.record_config_issue(llm_key, config.get_missing_env_vars(), str(exc))
+            return
 
+        cls._config_issues.pop(llm_key, None)
         cls._configs[llm_key] = config
+
+    @classmethod
+    def record_config_issue(cls, llm_key: str, missing_env_vars: list[str], detail: str) -> None:
+        cls._configs.pop(llm_key, None)
+        cls._config_issues[llm_key] = LLMConfigRegistrationIssue(
+            llm_key=llm_key,
+            missing_env_vars=tuple(missing_env_vars),
+            detail=detail,
+        )
+        LOG.warning(
+            "Skipping invalid LLM config",
+            llm_key=llm_key,
+            missing_env_vars=missing_env_vars,
+            detail=detail,
+        )
+
+    @classmethod
+    def get_config_issue(cls, llm_key: str) -> LLMConfigRegistrationIssue | None:
+        return cls._config_issues.get(llm_key)
+
+    @classmethod
+    def get_config_issues(cls) -> list[LLMConfigRegistrationIssue]:
+        return list(cls._config_issues.values())
+
+    @classmethod
+    def register_config_alias(cls, llm_key: str, source_llm_key: str) -> None:
+        if llm_key in cls._configs:
+            raise DuplicateLLMConfigError(llm_key)
+
+        if issue := cls.get_config_issue(source_llm_key):
+            cls.record_config_issue(llm_key, list(issue.missing_env_vars), issue.detail)
+            return
+
+        cls.register_config(llm_key, cls.get_config(source_llm_key))
 
     @classmethod
     def deregister_config(cls, llm_key: str) -> None:
         """Remove a registered LLM config. Idempotent — no-op if key doesn't exist."""
         cls._configs.pop(llm_key, None)
+        cls._config_issues.pop(llm_key, None)
 
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
+        if issue := cls.get_config_issue(llm_key):
+            raise InvalidLLMConfigError(issue.detail)
+
         if llm_key not in cls._configs:
             # If the key is not found in registered configs, treat it as a general model
             if not llm_key:
@@ -264,6 +367,42 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            "gpt-5.6-sol",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            "gpt-5.6-terra",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            "gpt-5.6-luna",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT4_TURBO",
         LLMConfig(
             "gpt-4-turbo",
@@ -383,6 +522,11 @@ if settings.ENABLE_OPENAI:
         ),
     )
 
+if settings.ENABLE_XAI:
+    _register_model_cost_overrides()
+
+    LLMConfigRegistry.register_config("XAI_GROK_4_5", _build_xai_grok_4_5_config())
+
 if settings.ENABLE_ANTHROPIC:
     # All Claude 4+ models require temperature=1 when extended thinking is enabled.
     # The runtime applies thinking optimization to all Anthropic models, so temperature=1
@@ -490,6 +634,17 @@ if settings.ENABLE_ANTHROPIC:
         "ANTHROPIC_CLAUDE5_FABLE",
         LLMConfig(
             "anthropic/claude-fable-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-5",
             ["ANTHROPIC_API_KEY"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -609,6 +764,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-fable-5",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-5",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -891,6 +1057,81 @@ if settings.ENABLE_AZURE_GPT5_4:
                 api_key=settings.AZURE_GPT5_4_API_KEY,
                 api_version=settings.AZURE_GPT5_4_API_VERSION,
                 model_info={"model_name": "azure/gpt-5.4"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_SOL:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_SOL",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_SOL_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_SOL_DEPLOYMENT",
+                "AZURE_GPT5_6_SOL_API_KEY",
+                "AZURE_GPT5_6_SOL_API_BASE",
+                "AZURE_GPT5_6_SOL_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_SOL_API_BASE,
+                api_key=settings.AZURE_GPT5_6_SOL_API_KEY,
+                api_version=settings.AZURE_GPT5_6_SOL_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-sol"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_TERRA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_TERRA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_TERRA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_TERRA_DEPLOYMENT",
+                "AZURE_GPT5_6_TERRA_API_KEY",
+                "AZURE_GPT5_6_TERRA_API_BASE",
+                "AZURE_GPT5_6_TERRA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_TERRA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_TERRA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_TERRA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-terra"},
+            ),
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+        ),
+    )
+
+if settings.ENABLE_AZURE_GPT5_6_LUNA:
+    LLMConfigRegistry.register_config(
+        "AZURE_OPENAI_GPT5_6_LUNA",
+        LLMConfig(
+            f"azure/{settings.AZURE_GPT5_6_LUNA_DEPLOYMENT}",
+            [
+                "AZURE_GPT5_6_LUNA_DEPLOYMENT",
+                "AZURE_GPT5_6_LUNA_API_KEY",
+                "AZURE_GPT5_6_LUNA_API_BASE",
+                "AZURE_GPT5_6_LUNA_API_VERSION",
+            ],
+            litellm_params=LiteLLMParams(
+                api_base=settings.AZURE_GPT5_6_LUNA_API_BASE,
+                api_key=settings.AZURE_GPT5_6_LUNA_API_KEY,
+                api_version=settings.AZURE_GPT5_6_LUNA_API_VERSION,
+                model_info={"model_name": "azure/gpt-5.6-luna"},
             ),
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1223,6 +1464,19 @@ if settings.ENABLE_GEMINI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "GEMINI_3.6_FLASH",
+        LLMConfig(
+            "gemini/gemini-3.6-flash",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "GEMINI_3_PRO",
         LLMConfig(
             "gemini/gemini-3.1-pro-preview",
@@ -1248,11 +1502,38 @@ if settings.ENABLE_GEMINI:
             ),
         ),
     )
-    # Backward compat alias for non-Vertex Gemini 3 Pro
+    # litellm prices the gemini/ flex tier itself (50% of standard), unlike the Vertex flex
+    # configs whose discount is applied at the cost site in api_handler_factory.
     LLMConfigRegistry.register_config(
-        "GEMINI_3.1_PRO",
-        LLMConfigRegistry.get_config("GEMINI_3_PRO"),
+        "GEMINI_3.1_FLASH_LITE_FLEX",
+        LLMConfig(
+            "gemini/gemini-3.1-flash-lite",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                service_tier="flex",
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
     )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.5_FLASH_LITE",
+        LLMConfig(
+            "gemini/gemini-3.5-flash-lite",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
+    # Backward compat alias for non-Vertex Gemini 3 Pro
+    LLMConfigRegistry.register_config_alias("GEMINI_3.1_PRO", "GEMINI_3_PRO")
 
 
 if settings.ENABLE_NOVITA:
@@ -1636,6 +1917,22 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.6_FLASH",
+        LLMConfig(
+            "vertex_ai/gemini-3.6-flash",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.6-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
             "vertex_ai/gemini-3.1-flash-lite",
@@ -1651,16 +1948,26 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.5_FLASH_LITE",
+        LLMConfig(
+            "vertex_ai/gemini-3.5-flash-lite",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.5-flash-lite" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
     # Backward compat aliases — both resolve to the canonical VERTEX_GEMINI_3_PRO.
     # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
-    LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_3.0_PRO",
-        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
-    )
-    LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_3.1_PRO",
-        LLMConfigRegistry.get_config("VERTEX_GEMINI_3_PRO"),
-    )
+    LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.0_PRO", "VERTEX_GEMINI_3_PRO")
+    LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.1_PRO", "VERTEX_GEMINI_3_PRO")
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_LITE",
         LLMConfig(
@@ -1774,6 +2081,25 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.5_FLASH_LITE_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.5-flash-lite",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.5-flash-lite" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_PRO_FLEX",
         LLMConfig(
             "vertex_ai/gemini-3.1-pro-preview",
@@ -1821,6 +2147,25 @@ if settings.ENABLE_VERTEX_AI:
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
                 api_base=f"{api_base}/gemini-3.5-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.6_FLASH_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.6-flash",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.6-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1972,6 +2317,31 @@ if settings.ENABLE_OPENROUTER:
     )
 
     LLMConfigRegistry.register_config(
+        "OPENROUTER_DEEPSEEK_V4_FLASH_0731",
+        LLMConfig(
+            "openrouter/deepseek/deepseek-v4-flash-0731",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash-0731"},
+                extra_body={
+                    "reasoning_effort": "high",
+                    "provider": {
+                        "order": ["cloudflare", "parasail"],
+                        "allow_fallbacks": False,
+                        "quantizations": ["fp8"],
+                    },
+                },
+            ),
+        ),
+    )
+
+    LLMConfigRegistry.register_config(
         "OPENROUTER_XIAOMI_MIMO_V2_5",
         LLMConfig(
             "openrouter/xiaomi/mimo-v2.5",
@@ -2056,8 +2426,13 @@ if settings.ENABLE_OPENAI_COMPATIBLE:
     openai_compatible_model_name = settings.OPENAI_COMPATIBLE_MODEL_NAME
 
     if not openai_compatible_model_name:
-        raise InvalidLLMConfigError(
-            "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
+        detail = "OPENAI_COMPATIBLE_MODEL_NAME is required but not set. OpenAI-compatible model will not be registered."
+        if settings.ENV != "local":
+            raise InvalidLLMConfigError(detail)
+        LLMConfigRegistry.record_config_issue(
+            openai_compatible_model_key,
+            ["OPENAI_COMPATIBLE_MODEL_NAME"],
+            detail,
         )
     else:
         # Required environment variables to check

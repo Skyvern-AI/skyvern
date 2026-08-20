@@ -5,6 +5,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .workflow_run_trigger_type import WorkflowRunTriggerType
 
 
 class TaskRunListItem(UniversalBaseModel):
@@ -23,6 +24,7 @@ class TaskRunListItem(UniversalBaseModel):
     workflow_permanent_id: typing.Optional[str] = None
     workflow_deleted: typing.Optional[bool] = None
     script_run: typing.Optional[bool] = None
+    trigger_type: typing.Optional[WorkflowRunTriggerType] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

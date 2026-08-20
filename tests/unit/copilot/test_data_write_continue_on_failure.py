@@ -184,3 +184,16 @@ def test_data_write_set_excludes_reads_and_notifications() -> None:
     assert "send_email" not in DATA_WRITE_BLOCK_TYPES
     assert "http_request" not in DATA_WRITE_BLOCK_TYPES
     assert "google_sheets_write" in DATA_WRITE_BLOCK_TYPES
+    assert "split_pdf" in DATA_WRITE_BLOCK_TYPES
+
+
+def test_split_pdf_block_with_true_is_forced_false() -> None:
+    new_yaml = _wf(
+        """
+        - block_type: split_pdf
+          label: split_docs
+          continue_on_failure: true
+        """
+    )
+    result = default_data_write_continue_on_failure(new_yaml, None)
+    assert _continue_on_failure_by_label(result)["split_docs"] is False

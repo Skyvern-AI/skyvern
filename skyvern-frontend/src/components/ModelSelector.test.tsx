@@ -82,6 +82,7 @@ describe("ModelSelector in a read-only comparison scope", () => {
           "claude-opus-4-6": "Anthropic Claude 4.6 Opus",
           "claude-opus-4-7": "Anthropic Claude 4.7 Opus",
           "claude-opus-4-8": "Anthropic Claude 4.8 Opus",
+          "claude-opus-5": "Anthropic Claude Opus 5",
         },
       },
     });
@@ -92,7 +93,8 @@ describe("ModelSelector in a read-only comparison scope", () => {
     expect(await screen.findByText("Anthropic Claude 4.6 Opus")).toBeTruthy();
     expect(await screen.findByText("Anthropic Claude 4.7 Opus")).toBeTruthy();
     expect(await screen.findByText("Anthropic Claude 4.8 Opus")).toBeTruthy();
-    expect(screen.getAllByText("Enterprise")).toHaveLength(4);
+    expect(await screen.findByText("Anthropic Claude Opus 5")).toBeTruthy();
+    expect(screen.getAllByText("Enterprise")).toHaveLength(5);
   });
 
   test("marks selected deprecated Claude Opus 4.5 as enterprise-only", async () => {
@@ -181,5 +183,21 @@ describe("ModelSelector in a read-only comparison scope", () => {
 
     expect(await screen.findByText("DeepSeek V4 Flash")).toBeTruthy();
     expect(screen.getByText("Xiaomi MiMo V2.5")).toBeTruthy();
+  });
+
+  test("surfaces the new Gemini 3.5 Flash Lite and 3.6 Flash models", async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        models: {
+          "gemini-3.5-flash-lite": "Gemini 3.5 Flash Lite",
+          "gemini-3.6-flash": "Gemini 3.6 Flash",
+        },
+      },
+    });
+
+    renderSelector(false, null);
+
+    expect(await screen.findByText("Gemini 3.5 Flash Lite")).toBeTruthy();
+    expect(screen.getByText("Gemini 3.6 Flash")).toBeTruthy();
   });
 });

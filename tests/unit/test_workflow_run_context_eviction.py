@@ -13,6 +13,7 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.webeye.browser_manager import BrowserCleanupResult
 
 
 def _context_manager_with(run_ids: list[str]) -> WorkflowContextManager:
@@ -32,6 +33,18 @@ def test_remove_workflow_run_context_evicts_and_is_idempotent() -> None:
     manager.remove_workflow_run_context("wr_never_seen")
 
 
+def test_has_workflow_run_context_tracks_process_local_liveness() -> None:
+    # The non-PBS sharing predicate reads this as its run-liveness signal: True only while the run's
+    # context is registered in THIS process, flipping to False once cleanup removes it.
+    manager = _context_manager_with(["wr_live"])
+
+    assert manager.has_workflow_run_context("wr_live") is True
+    assert manager.has_workflow_run_context("wr_absent") is False
+
+    manager.remove_workflow_run_context("wr_live")
+    assert manager.has_workflow_run_context("wr_live") is False
+
+
 @pytest.mark.asyncio
 async def test_clean_up_workflow_evicts_run_and_child_contexts(monkeypatch: pytest.MonkeyPatch) -> None:
     service = WorkflowService()
@@ -49,7 +62,12 @@ async def test_clean_up_workflow_evicts_run_and_child_contexts(monkeypatch: pyte
         AsyncMock(return_value=[child_run]),
         raising=False,
     )
-    monkeypatch.setattr(app.BROWSER_MANAGER, "cleanup_for_workflow_run", AsyncMock(return_value=None), raising=False)
+    monkeypatch.setattr(
+        app.BROWSER_MANAGER,
+        "cleanup_for_workflow_run",
+        AsyncMock(return_value=BrowserCleanupResult(browser_state=None, recording_finalized=False)),
+        raising=False,
+    )
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock(), raising=False)
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock(), raising=False)
 

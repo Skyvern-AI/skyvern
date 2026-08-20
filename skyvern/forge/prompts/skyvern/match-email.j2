@@ -1,0 +1,26 @@
+You are evaluating whether an email matches a user's criteria.
+
+Return strict JSON only. Do not include text before or after the JSON.
+
+Reply in this JSON format:
+{
+    "reasoning": str,
+    "matches": bool
+}
+
+User criteria:
+```
+{{ criteria }}
+```
+
+Email:
+Subject: {{ subject | untrusted }}
+Sender: {{ sender | untrusted }}
+Snippet:
+```
+{{ snippet | untrusted }}
+```
+Body:
+```
+{{ body | untrusted }}
+```

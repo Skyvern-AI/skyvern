@@ -25,12 +25,9 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
-    from skyvern.forge.sdk.copilot.context import CopilotContext
-    from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.copilot.challenge_evidence import ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES
 
 _FAILURE_REASON_MAX_CHARS = 200
 _ROOT_CAUSE_SIGNATURE_VERSION = "repair_root_cause:v1"
@@ -44,13 +41,9 @@ ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY = "ANTI_BOT_CHALLENGE"
 # Stable active-run terminal evidence identifiers. The category is stored in
 # tool result ``failure_categories``; the reason code is stored on blocker
 # signals that convert that tool result into product-safe final copy.
-ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY = "ACTIVE_RUN_TERMINAL_EVIDENCE"
-ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE = "tool_error_active_run_terminal_evidence"
 
 _ROOT_CAUSE_CATEGORY_ALIASES = {
-    "ANTI_BOT_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
-    "CHALLENGE_DETECTION": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
-    "HUMAN_VERIFICATION_CHALLENGE": ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY,
+    **{alias: ANTI_BOT_CHALLENGE_ROOT_CAUSE_CATEGORY for alias in ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES},
     # Self-mappings document categories whose noisy failure prose must not
     # affect repeat identity.
     "PARAMETER_BINDING_ERROR": "PARAMETER_BINDING_ERROR",
@@ -95,15 +88,6 @@ _BROWSER_SESSION_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 _TIMEOUT_ERROR_RE = re.compile(r"\b(timeout(?:error)?|timed out)\b", re.IGNORECASE)
-_CODE_BLOCK_IMPOSITION_DROPPED_RE = re.compile(
-    r"unable to impose synthesized code block:\s*dropped scout interaction\s+\d+\s+"
-    r"from\s+`?(?P<tool>[A-Za-z0-9_]+)`?\s+\((?P<reason>[A-Za-z0-9_]+)\)",
-    re.IGNORECASE,
-)
-_CODE_BLOCK_IMPOSITION_RE = re.compile(
-    r"unable to impose synthesized code block:\s*(?P<reason>[^\n.]+)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -166,10 +150,29 @@ def _selector_from_text(text: str) -> tuple[str, str]:
     return "", ""
 
 
+_CSS_SELECTOR_KIND = "locator"
+
+
+def selector_identity_from_failure(text: str) -> str:
+    kind, value = _selector_from_text(text or "")
+    # "selector" and "locator" are the same CSS string under two spellings; the code side only ever
+    # spells it "locator", so a failure that named it "selector" must normalize or never match.
+    return f"{_CSS_SELECTOR_KIND if kind == 'selector' else kind}:{value}" if kind else ""
+
+
+def selector_identities_in_text(text: str) -> set[str]:
+    """Every locator identity in ``text``, normalized to match ``selector_identity_from_failure``."""
+    identities: set[str] = set()
+    for match in _LOCATOR_RE.finditer(text or ""):
+        identities.add(f"{_CSS_SELECTOR_KIND}:{_normalize_signature_text(match.group('selector'))}")
+    for match in _ROLE_RE.finditer(text or ""):
+        role = _normalize_signature_text(match.group("role"))
+        name = _normalize_signature_text(match.group("name") or "")
+        identities.add(f"role:{role}:{name}" if name else f"role:{role}")
+    return identities
+
+
 def _error_class_from_text(text: str) -> str:
-    code_block_imposition = _code_block_imposition_error_class(text)
-    if code_block_imposition:
-        return code_block_imposition
     if _BROWSER_SESSION_ERROR_RE.search(text):
         return "browser_session_not_found"
     match = _EXCEPTION_CLASS_RE.search(text)
@@ -178,21 +181,6 @@ def _error_class_from_text(text: str) -> str:
     if _TIMEOUT_ERROR_RE.search(text):
         return "timeout_error"
     return ""
-
-
-def _code_block_imposition_error_class(text: str) -> str:
-    dropped_match = _CODE_BLOCK_IMPOSITION_DROPPED_RE.search(text)
-    if dropped_match:
-        return f"code_block_synthesis_{_snake_token(dropped_match.group('reason'))}"
-    match = _CODE_BLOCK_IMPOSITION_RE.search(text)
-    if match:
-        return f"code_block_synthesis_{_snake_token(match.group('reason'))}"
-    return ""
-
-
-def _snake_token(value: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
-    return normalized or "unknown"
 
 
 def _root_cause_texts(
@@ -257,86 +245,6 @@ def compute_repair_root_cause_signature(
     )
 
 
-def _top_failure_category(failure_categories: list[dict] | None) -> str:
-    if not failure_categories:
-        return ""
-    first = failure_categories[0]
-    if isinstance(first, dict):
-        return str(first.get("category") or "")
-    return ""
-
-
-def _failure_identity_terms(
-    failure_reason: str | None,
-    failure_categories: list[dict] | None,
-    suspicious_success: bool,
-    detected_challenge: bool = False,
-) -> list[str] | None:
-    """Category-stable failure half shared by both signatures, or ``None`` on a
-    real success. Per-call-data categories collapse to a constant so consecutive
-    trips hash identically."""
-    normalized = normalize_failure_reason(failure_reason)
-    has_signal = bool(normalized) or bool(failure_categories) or suspicious_success or detected_challenge
-    if not has_signal:
-        return None
-    structural_identity = compute_repair_root_cause_signature(
-        failure_categories=failure_categories,
-        failure_reason=failure_reason,
-        detected_challenge=detected_challenge,
-    )
-    terminal_state = "suspicious" if suspicious_success else "failed"
-    if structural_identity.root_cause_signature:
-        return [structural_identity.root_cause_signature]
-    top_category = _top_failure_category(failure_categories)
-    if top_category == "PARAMETER_BINDING_ERROR":
-        normalized = "parameter_binding_error"
-    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        normalized = "per_tool_budget"
-    return [normalized, top_category, terminal_state]
-
-
-def compute_failure_signature(
-    frontier_start_label: str | None,
-    failure_reason: str | None,
-    failure_categories: list[dict] | None,
-    suspicious_success: bool,
-    detected_challenge: bool = False,
-) -> str | None:
-    """Return a normalized signature for the current failure, or ``None`` on success.
-
-    ``None`` means "no signature — this was a real success". A suspicious-success
-    run (status=completed but data-producing blocks produced no output) still
-    generates a signature so repeated no-data runs can be counted as repeats.
-
-    ``frontier_start_label`` is kept for call-site compatibility. Labels are
-    intentionally excluded from the signature because block renames are not a
-    new root cause.
-    """
-    terms = _failure_identity_terms(failure_reason, failure_categories, suspicious_success, detected_challenge)
-    if terms is None:
-        return None
-    return "|".join(terms)
-
-
-def satisfied_criterion_ids(result: CompletionVerificationResult | None) -> frozenset[str]:
-    """Criterion ids the outcome-verification judge confirmed satisfied (evidence_confirms),
-    or empty when no judge result is available for this run."""
-    if result is None or result.status != "evaluated":
-        return frozenset()
-    return frozenset(verdict.criterion_id for verdict in result.verdicts if verdict.reason_code == "evidence_confirms")
-
-
-def made_newly_verified_progress(
-    current_satisfied: frozenset[str],
-    high_water: frozenset[str],
-    full_workflow_verified_this_run: bool,
-    verified_prefix_grew: bool,
-) -> bool:
-    """Whether this run advanced verified progress past the turn high-water: a newly
-    confirmed criterion, a clean end-to-end run, or a grown verified block prefix."""
-    return bool(current_satisfied - high_water) or full_workflow_verified_this_run or verified_prefix_grew
-
-
 def _canonical_block_config(block: Any) -> dict[str, Any]:
     """Stable dict view of a block's material config, with fields that don't
     affect downstream behavior (``output_parameter``) dropped.
@@ -353,168 +261,3 @@ def _canonical_block_config(block: Any) -> dict[str, Any]:
         return {"repr": repr(block)}
     cfg.pop("output_parameter", None)
     return cfg
-
-
-def compute_action_sequence_fingerprint(results: list[dict[str, Any]]) -> str | None:
-    """Hash the ordered ``(action_type, element_id)`` pairs across every
-    block's ``action_trace`` in ``results``. Returns ``None`` when the trace is
-    empty (e.g. fully-successful run where ``_attach_action_traces`` did not
-    attach anything). Stable across runs: a form-fill→click→re-fill loop that
-    retargets the same elements will produce the same fingerprint.
-    """
-    pairs: list[str] = []
-    for entry in results:
-        trace = entry.get("action_trace")
-        if not isinstance(trace, list):
-            continue
-        for action in trace:
-            if not isinstance(action, dict):
-                continue
-            action_type = action.get("action") or ""
-            element = action.get("element") or ""
-            pairs.append(f"{action_type}\x1f{element}")
-    if not pairs:
-        return None
-    payload = "\x1e".join(pairs).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def compute_frontier_fingerprint(
-    executed_labels: list[str],
-    workflow_definition: WorkflowDefinition | None,
-) -> str:
-    """SHA256 of the executed blocks' canonical config, joined by label order.
-
-    The fingerprint changes whenever a block's material config changes or the
-    executed suffix itself changes. Returns an empty string when the workflow
-    definition is missing — the caller treats "" as "can't fingerprint" and
-    does not increment the streak on that run.
-    """
-    if not executed_labels or workflow_definition is None:
-        return ""
-    by_label: dict[str, Any] = {}
-    blocks = getattr(workflow_definition, "blocks", None) or []
-    for block in blocks:
-        label = getattr(block, "label", None)
-        if isinstance(label, str):
-            by_label[label] = block
-    payload: list[dict[str, Any]] = []
-    for label in executed_labels:
-        block = by_label.get(label)
-        if block is None:
-            payload.append({"label": label, "missing": True})
-            continue
-        payload.append({"label": label, "config": _canonical_block_config(block)})
-    try:
-        serialized = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-    except (TypeError, ValueError):
-        serialized = repr(payload)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def _has_meaningful_success(result: dict[str, Any], suspicious_success: bool) -> bool:
-    """Successful run AND the suffix produced meaningful data (not suspicious)."""
-    return bool(result.get("ok")) and not suspicious_success
-
-
-def update_repeated_failure_state(
-    ctx: CopilotContext,
-    result: dict[str, Any],
-) -> None:
-    """Update ``repeated_failure_streak_count`` and related fields on ``ctx``.
-
-    Called after ``_record_run_blocks_result`` has populated the fail-mode
-    fields (``last_test_suspicious_success``, ``last_test_anti_bot``,
-    ``last_test_failure_reason``) and ``_run_blocks_and_collect_debug`` has
-    set ``last_executed_block_labels`` and ``last_frontier_start_label``.
-    """
-    data = result.get("data") if isinstance(result, dict) else None
-    failure_categories = None
-    if isinstance(data, dict):
-        raw_cats = data.get("failure_categories")
-        if isinstance(raw_cats, list):
-            failure_categories = raw_cats
-
-    suspicious_success_raw = getattr(ctx, "last_test_suspicious_success", False)
-    suspicious_success = bool(suspicious_success_raw) if isinstance(suspicious_success_raw, (bool, int)) else False
-    detected_challenge = bool(getattr(ctx, "last_test_anti_bot", None))
-    failure_reason_raw = getattr(ctx, "last_test_failure_reason", None)
-    failure_reason = failure_reason_raw if isinstance(failure_reason_raw, str) else None
-    frontier_start_raw = getattr(ctx, "last_frontier_start_label", None)
-    frontier_start_label = frontier_start_raw if isinstance(frontier_start_raw, str) else None
-    executed_labels_raw = getattr(ctx, "last_executed_block_labels", None)
-    executed_labels = (
-        [label for label in executed_labels_raw if isinstance(label, str)]
-        if isinstance(executed_labels_raw, list)
-        else []
-    )
-    workflow_definition = None
-    last_workflow = getattr(ctx, "last_workflow", None)
-    if last_workflow is not None:
-        candidate = getattr(last_workflow, "workflow_definition", None)
-        if candidate is not None and hasattr(candidate, "blocks"):
-            workflow_definition = candidate
-
-    new_action_fingerprint_raw = getattr(ctx, "pending_action_sequence_fingerprint", None)
-    new_action_fingerprint = new_action_fingerprint_raw if isinstance(new_action_fingerprint_raw, str) else None
-    prior_action_fingerprint_raw = getattr(ctx, "last_action_sequence_fingerprint", None)
-    prior_action_fingerprint = prior_action_fingerprint_raw if isinstance(prior_action_fingerprint_raw, str) else None
-
-    if _has_meaningful_success(result, suspicious_success):
-        ctx.last_failure_signature = None
-        ctx.last_frontier_fingerprint = compute_frontier_fingerprint(executed_labels, workflow_definition)
-        ctx.repeated_failure_streak_count = 0
-        ctx.repeated_failure_nudge_emitted_at_streak = 0
-        # Success resets the action-sequence streak. Promote the pending
-        # fingerprint so the next failure run can compare against it.
-        ctx.last_action_sequence_fingerprint = new_action_fingerprint
-        ctx.pending_action_sequence_fingerprint = None
-        ctx.repeated_action_fingerprint_streak_count = 0
-        return
-
-    signature = compute_failure_signature(
-        frontier_start_label=frontier_start_label,
-        failure_reason=failure_reason,
-        failure_categories=failure_categories,
-        suspicious_success=suspicious_success,
-        detected_challenge=detected_challenge,
-    )
-    fingerprint = compute_frontier_fingerprint(executed_labels, workflow_definition)
-
-    # Action-sequence streak runs independently of the frontier streak: a
-    # repeated action sequence can fire even when the failure-reason text
-    # changes turn to turn (e.g. different validation messages).
-    if new_action_fingerprint is not None and new_action_fingerprint == prior_action_fingerprint:
-        prior_action_streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
-        prior_action_streak = prior_action_streak_raw if isinstance(prior_action_streak_raw, int) else 0
-        ctx.repeated_action_fingerprint_streak_count = prior_action_streak + 1
-    elif new_action_fingerprint is not None:
-        ctx.repeated_action_fingerprint_streak_count = 1
-    else:
-        # No action trace on this run (e.g. all blocks succeeded or no failed
-        # blocks had a task_id). Don't reset — a transient empty trace between
-        # two repeats shouldn't erase an in-progress streak.
-        pass
-    ctx.last_action_sequence_fingerprint = new_action_fingerprint
-    ctx.pending_action_sequence_fingerprint = None
-
-    if not signature or not fingerprint:
-        ctx.last_failure_signature = signature
-        ctx.last_frontier_fingerprint = fingerprint
-        return
-
-    prior_signature_raw = getattr(ctx, "last_failure_signature", None)
-    prior_signature = prior_signature_raw if isinstance(prior_signature_raw, str) else None
-    prior_fingerprint_raw = getattr(ctx, "last_frontier_fingerprint", None)
-    prior_fingerprint = prior_fingerprint_raw if isinstance(prior_fingerprint_raw, str) else None
-    if signature == prior_signature and fingerprint == prior_fingerprint:
-        prior_streak_raw = getattr(ctx, "repeated_failure_streak_count", 0)
-        prior_streak = prior_streak_raw if isinstance(prior_streak_raw, int) else 0
-        ctx.repeated_failure_streak_count = prior_streak + 1
-    else:
-        ctx.repeated_failure_streak_count = 1
-        # New frontier/signature restarts the nudge escalation cycle.
-        ctx.repeated_failure_nudge_emitted_at_streak = 0
-
-    ctx.last_failure_signature = signature
-    ctx.last_frontier_fingerprint = fingerprint

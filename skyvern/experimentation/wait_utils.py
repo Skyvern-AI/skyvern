@@ -10,6 +10,7 @@ import structlog
 from cachetools import TTLCache
 
 from skyvern.experimentation.wait_config import WaitConfig, get_wait_config_from_experiment
+from skyvern.forge import app
 
 LOG = structlog.get_logger()
 
@@ -35,18 +36,13 @@ async def get_or_create_wait_config(
         organization_id: Organization ID for experiment properties
 
     Returns None if:
-    - ENABLE_WAIT_TIME_OPTIMIZATION_EXPERIMENT is False (killswitch activated)
+    - the wait-time optimization killswitch is off (cloud setting; always off in OSS)
     - organization_id is None
     - No experiment is active for this task/workflow
     """
-    # KILLSWITCH: Check if experiment is disabled globally (lazy import to avoid circular dependency)
-    try:
-        from cloud.config import settings as cloud_settings  # noqa: PLC0415
-
-        if not cloud_settings.ENABLE_WAIT_TIME_OPTIMIZATION_EXPERIMENT:
-            return None
-    except ImportError:
-        # If cloud.config isn't available (OSS), experiment is disabled by default
+    # KILLSWITCH: consult the cloud setting through the AgentFunction seam so
+    # skyvern/ never imports cloud.* (OSS default is disabled).
+    if not app.AGENT_FUNCTION.is_wait_time_optimization_enabled():
         return None
 
     if not organization_id:

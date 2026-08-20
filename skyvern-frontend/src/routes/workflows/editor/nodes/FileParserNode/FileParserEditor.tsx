@@ -1,4 +1,4 @@
-import { useReactFlow } from "@xyflow/react";
+import { useNodes, useReactFlow } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -21,6 +21,7 @@ import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/
 
 import { helpTooltips } from "../../helpContent";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
+import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type AppNode, isWorkflowBlockNode } from "..";
 import {
   isFileParserNode,
@@ -29,6 +30,10 @@ import {
 } from "./types";
 import { dataSchemaExampleForFileExtraction } from "../types";
 import { useUpdate } from "../../useUpdate";
+import {
+  getParentLoopSkipsOnFail,
+  isNodeInsideForLoop,
+} from "../../workflowEditorUtils";
 
 const FILE_TYPE_OPTIONS: Array<{ value: FileParserFileType; label: string }> = [
   { value: "auto_detect", label: "Auto detect" },
@@ -92,6 +97,9 @@ function FileParserEditorBody({
   const data = node.data;
   const editable = data.editable;
   const update = useUpdate<FileParserNode["data"]>({ id: blockId, editable });
+  const nodes = useNodes<AppNode>();
+  const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
+  const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
 
   const handleFileUrlChange = (value: string) => {
     const detected = detectFileTypeFromUrl(value);
@@ -112,7 +120,7 @@ function FileParserEditorBody({
     <div data-testid="file-parser-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File URL</Label>
+          <Label className="text-xs text-tertiary-foreground">File URL</Label>
           <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
@@ -124,7 +132,7 @@ function FileParserEditorBody({
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File Type</Label>
+          <Label className="text-xs text-tertiary-foreground">File Type</Label>
           <HelpTooltip content={helpTooltips["fileParser"]["fileType"]} />
         </div>
         <Select
@@ -150,12 +158,22 @@ function FileParserEditorBody({
           </SelectContent>
         </Select>
       </div>
-      <WorkflowDataSchemaInputGroup
-        exampleValue={dataSchemaExampleForFileExtraction}
-        value={data.jsonSchema}
-        onChange={(value) => update({ jsonSchema: value })}
-        suggestionContext={{ current_schema: data.jsonSchema }}
-      />
+      <div className="space-y-2">
+        <WorkflowDataSchemaInputGroup
+          exampleValue={dataSchemaExampleForFileExtraction}
+          value={data.jsonSchema}
+          onChange={(value) => update({ jsonSchema: value })}
+          suggestionContext={{ current_schema: data.jsonSchema }}
+        />
+        {(data.fileType === "zip" ||
+          ((data.fileType === "auto_detect" || data.fileType === "csv") &&
+            detectFileTypeFromUrl(data.fileUrl ?? "") === "zip")) && (
+          <p className="text-xs text-muted-foreground dark:text-slate-500">
+            Data Schema is ignored for ZIP archives. This block outputs the
+            extracted file list.
+          </p>
+        )}
+      </div>
       <ModelSelector
         className="nopan w-52 text-xs"
         value={data.model}
@@ -167,6 +185,21 @@ function FileParserEditorBody({
             Advanced Settings
           </AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-1">
+            <BlockExecutionOptions
+              continueOnFailure={data.continueOnFailure}
+              nextLoopOnFailure={data.nextLoopOnFailure}
+              editable={editable}
+              isInsideForLoop={isInsideForLoop}
+              parentLoopSkipsOnFail={parentLoopSkipsOnFail}
+              blockType="fileParser"
+              hideTopSeparator
+              onContinueOnFailureChange={(continueOnFailure) =>
+                update({ continueOnFailure })
+              }
+              onNextLoopOnFailureChange={(nextLoopOnFailure) =>
+                update({ nextLoopOnFailure })
+              }
+            />
             <IgnoreWorkflowSystemPrompt
               ignoreWorkflowSystemPrompt={
                 data.ignoreWorkflowSystemPrompt ?? false

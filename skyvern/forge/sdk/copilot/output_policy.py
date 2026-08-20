@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -15,7 +16,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     contains_email_password_pair,
-    request_policy_has_present_completion_contract,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
+    saved_credential_ids,
     url_origin,
     workflow_blocks,
     workflow_credential_ids_from_parsed,
@@ -115,18 +116,37 @@ _INFORMATIONAL_TAXONOMY_TERM_THRESHOLD = 3
 _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 _IDENTIFIER_DELIMITERS = frozenset({"`", '"', "'"})
 
-_INTERNAL_CLASSIFIER_VOCAB_PHRASES = ("turnintent classified this turn as",)
 _INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE = re.compile(r"\bsafe_reason_code\s*[:=]")
-_INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES = (
-    "turn_intent_",
-    "request_policy_",
-    "build_phase_",
-)
-_INTERNAL_CLASSIFIER_DELIMITED_NAMES = frozenset({"turnintent", "requestpolicy"})
+_INTERNAL_CLASSIFIER_REASON_CODE_PREFIXES = ("request_policy_",)
+_INTERNAL_CLASSIFIER_DELIMITED_NAMES = frozenset({"requestpolicy"})
 
 _INTERNAL_TOOL_PARAPHRASE_PHRASES = ("nudge turn", "nudge-turn")
 _INTERNAL_COPILOT_SENTINEL_PREFIX = "[copilot:"
-_LOOP_DETECTED_MARKER = "loop detected"
+
+# Copilot's own paraphrase for a formatting change it made — not standard YAML
+# vocabulary, so a legitimate clarification is not going to phrase itself this way.
+# Runs for every response type, including ASK_QUESTION.
+_YAML_AUTHORING_JARGON_PHRASES = (
+    "folded code formatting",
+    "literal code formatting",
+)
+# Standard YAML block-scalar terminology (folded `>` vs literal `|`). A legitimate
+# ASK_QUESTION can ask the user which style they want for a multi-line value, so these
+# only count as a leak once the reply is final and user-visible.
+_YAML_BLOCK_SCALAR_TERM_PHRASES = (
+    "folded block scalar",
+    "literal block scalar",
+)
+
+
+def _contains_yaml_authoring_vocab_leak(user_response: str, response_type: str) -> bool:
+    lower = user_response.lower()
+    if any(phrase in lower for phrase in _YAML_AUTHORING_JARGON_PHRASES):
+        return True
+    return response_type in _USER_VISIBLE_REPLY_TYPES and any(
+        phrase in lower for phrase in _YAML_BLOCK_SCALAR_TERM_PHRASES
+    )
+
 
 _SELF_PRESCRIPTIVE_FIXED_PHRASE = "send me a normal instruction like"
 _SELF_PRESCRIPTIVE_IMPERATIVE_VERBS = frozenset({"send", "reply", "type", "respond"})
@@ -151,16 +171,6 @@ _SELF_PRESCRIPTIVE_CONTINUATION_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_OUTPUT_FIELD_CONFIRMATION_RE = re.compile(
-    r"(?:"
-    r"\b(?:confirm|verify|approve|check|tell me|let me know)\b"
-    r"(?=[\s\S]{0,180}\b(?:output|record|schema|field|fields)\b)"
-    r"(?=[\s\S]{0,220}\b(?:field|fields|schema|record)\b)"
-    r"|\b(?:which|what)\s+fields\s+should\b"
-    r")",
-    re.IGNORECASE,
-)
-
 # Response types whose `user_response` is rendered verbatim as the agent's final
 # message — REPLY and REPLACE_WORKFLOW. ASK_QUESTION is excluded because legitimate
 # clarifications ("Reply 'yes' to proceed") would false-positive the residual detectors.
@@ -185,11 +195,9 @@ class CopilotOutputKind(StrEnum):
 
 class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
-    REQUEST_POLICY_CLARIFICATION_BYPASS = "request_policy_clarification_bypass"
     UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
     CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
     UNBACKED_WORKFLOW_DELIVERY_CLAIM = "unbacked_workflow_delivery_claim"
-    MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE = "missing_unvalidated_proposal_affordance"
     MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
@@ -198,7 +206,6 @@ class OutputPolicyReason(StrEnum):
     INTERNAL_CLASSIFIER_VOCAB_LEAK = "internal_classifier_vocab_leak"
     SELF_PRESCRIPTIVE_PHRASE_LEAK = "self_prescriptive_phrase_leak"
     WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
-    AVOIDABLE_OUTPUT_FIELD_CONFIRMATION = "avoidable_output_field_confirmation"
 
 
 @dataclass
@@ -225,15 +232,35 @@ class OutputPolicyVerdict:
 _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
         OutputPolicyReason.RAW_SECRET_LEAK,
-        OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
-        OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION,
     }
 )
+
+
+# The authoring seam refuses only a credential reference the org has not approved or that reaches
+# wider than the request, because either is an irreversible disclosure once persisted; everything
+# else steers. Each member's surface and the reason it cannot be dropped are in
+# cloud_docs/workflow-copilot/architecture/output-policy-disposition.md.
+_AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
+    {
+        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
+        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+    }
+)
+
+
+def demote_author_time_steer_reasons(verdict: OutputPolicyVerdict) -> list[OutputPolicyReason]:
+    """Drop the reasons that only steer the next authoring attempt, flipping ``allowed``
+    back to True when nothing that outlives the turn remains. Returns the demoted reasons
+    so the caller can trace them."""
+    steered = [reason for reason in verdict.reason_codes if reason not in _AUTHOR_TIME_HARD_BLOCK_REASONS]
+    for reason in steered:
+        verdict.remove(reason)
+    return steered
 
 
 def hard_block_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:
@@ -254,10 +281,7 @@ def derive_output_kind(
     workflow_attempted: bool,
     unvalidated: bool,
 ) -> CopilotOutputKind:
-    # Policy and explicit response type win before workflow state: a required
-    # clarification must never be reclassified as a workflow proposal.
-    if isinstance(request_policy, RequestPolicy) and request_policy.user_response_policy == "ask_clarification":
-        return CopilotOutputKind.CLARIFICATION_REQUEST
+    del request_policy
     if response_type == "ASK_QUESTION":
         return CopilotOutputKind.CLARIFICATION_REQUEST
     if updated_workflow is not None and workflow_attempted and not unvalidated:
@@ -400,11 +424,10 @@ def evaluate_output_policy(
             unvalidated=unvalidated,
         )
     verdict = OutputPolicyVerdict(output_kind=output_kind)
-    # Scan only proposed output/tool surfaces for hard leaks. The rolling
-    # global context can include prior turn state, so re-scanning it here can
-    # repeatedly block otherwise safe follow-up responses.
     values = [user_response, workflow_yaml, tool_arguments]
-    if any(_contains_raw_secret(value) for value in values):
+    # Only the reply is scanned for a raw secret: rebinding and persistence scrubbing own what
+    # reaches storage, and scanning a draft judged the YAML encoding rather than the value.
+    if _contains_raw_secret(user_response):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
     if _contains_internal_tool_instruction(user_response):
         verdict.add(OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
@@ -416,13 +439,6 @@ def evaluate_output_policy(
     ):
         verdict.add(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
         verdict.add(OutputPolicyReason.MISSING_PROPOSAL_STATE)
-    if (
-        response_type == "REPLY"
-        and has_workflow_proposal
-        and unvalidated
-        and not _has_unvalidated_affordance(user_response)
-    ):
-        verdict.add(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
     if _contains_internal_block_taxonomy_leak(user_response, output_kind, response_type):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_classifier_vocab_leak(user_response):
@@ -433,17 +449,6 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
-        if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
-            verdict.add(OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS)
-        if (
-            response_type == "ASK_QUESTION"
-            and request_policy.user_response_policy != "ask_clarification"
-            and request_policy_has_present_completion_contract(request_policy)
-            and not has_workflow_proposal
-            and not workflow_attempted
-            and _asks_to_confirm_output_fields(user_response)
-        ):
-            verdict.add(OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION)
         _apply_credential_policy(verdict, request_policy, values, workflow_yaml)
 
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
@@ -454,21 +459,9 @@ def evaluate_output_policy(
     return verdict
 
 
-def _asks_to_confirm_output_fields(user_response: str | None) -> bool:
-    if not isinstance(user_response, str) or not user_response.strip():
-        return False
-    return bool(_OUTPUT_FIELD_CONFIRMATION_RE.search(user_response[:500]))
-
-
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
     message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
-    if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
-        message += (
-            " For saved credentials, bind a credential_id workflow parameter and reference fields as "
-            "`<key>.username`, `<key>.password`, or `await <key>.otp()` for one-time codes; do not split, "
-            "concatenate, or obfuscate literal secrets in workflow code or YAML."
-        )
     return message
 
 
@@ -481,21 +474,20 @@ def _contains_raw_secret(value: Any) -> bool:
                 matched = match.group(0)
                 if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
                     continue
-                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and (
-                    _is_sanctioned_secret_reference(matched)
-                    or _is_sanctioned_secret_reference(_line_containing_match(text, match))
-                ):
+                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _keyword_assignment_is_exempt(text, match):
                     continue
                 return True
     return False
 
 
+def _line_end_after_match(text: str, match: re.Match[str]) -> int:
+    line_end = text.find("\n", match.end())
+    return len(text) if line_end == -1 else line_end
+
+
 def _line_containing_match(text: str, match: re.Match[str]) -> str:
     line_start = text.rfind("\n", 0, match.start()) + 1
-    line_end = text.find("\n", match.end())
-    if line_end == -1:
-        line_end = len(text)
-    return text[line_start:line_end]
+    return text[line_start : _line_end_after_match(text, match)]
 
 
 def _is_sanctioned_secret_reference(matched: str) -> bool:
@@ -503,6 +495,91 @@ def _is_sanctioned_secret_reference(matched: str) -> bool:
     if rhs_match is None:
         return False
     return bool(_SANCTIONED_SECRET_REFERENCE_RE.match(rhs_match.group(1)))
+
+
+# `token` is the one secret keyword with an unrelated English sense — a lexical token parsed out of
+# page text. The other keywords (password, passcode, secret, api key, bearer, authorization) carry no
+# such second meaning and keep the strict sanctioned-source rule.
+_LEXICAL_TOKEN_LHS_RE = re.compile(r"^[A-Za-z0-9_]*token(?=\s*[:=])", re.I)
+_UNAMBIGUOUS_SECRET_KEYWORD_RE = re.compile(r"password|passcode|api[_ -]?key|secret|bearer|authorization", re.I)
+
+
+def _parse_chain_receiver(node: ast.expr) -> ast.expr | None:
+    """The variable a read/index/method chain is rooted in, or None for anything else — `identity(...)`
+    roots in a free function and `("ghp_...", parts)[0]` in a literal container, so neither counts."""
+    while True:
+        if isinstance(node, (ast.Subscript, ast.Attribute, ast.Await)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Attribute):
+                return None
+            node = node.func.value
+        else:
+            return node
+
+
+def _parses_a_value_out_of_something(rhs: str) -> bool:
+    """Whether the assigned value is read out of a variable rather than written down: a credential
+    reaches code as a literal, a lexical token is parsed off something in scope (`m.group(1)`).
+    Anything that does not parse as one expression gets no verdict and keeps the keyword match."""
+    candidate = rhs.strip()
+    # On the last line of embedded code the scalar's own closing delimiter rides along.
+    for text in (candidate, candidate.rstrip("\"'")):
+        try:
+            body = ast.parse(text, mode="eval").body
+        except (SyntaxError, ValueError):
+            continue
+        # A bare dotted chain is how a JWT looks, so extraction has to involve an actual call or index.
+        if not any(isinstance(node, (ast.Call, ast.Subscript)) for node in ast.walk(body)):
+            return False
+        if any(_reads_as_a_written_down_secret(node) for node in ast.walk(body)):
+            return False
+        return isinstance(_parse_chain_receiver(body), ast.Name)
+    return False
+
+
+# A delimiter or key a parse chain consumes is short, or carries whitespace or punctuation
+# (`" logs found"`, `"access_token"`). A credential written into the chain is neither.
+_SECRET_SHAPED_LITERAL_LENGTH = 16
+
+
+def _reads_as_a_written_down_secret(node: ast.AST) -> bool:
+    """Whether a literal inside an extraction chain carries a value in rather than naming a
+    delimiter or key — `cache.get("ghp_...")` roots in a variable exactly as a real read does."""
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+        return False
+    return len(node.value) >= _SECRET_SHAPED_LITERAL_LENGTH and all(
+        char.isalnum() or char in "-_" for char in node.value
+    )
+
+
+def _keyword_assignment_is_exempt(text: str, match: re.Match[str]) -> bool:
+    matched = match.group(0)
+    line = _line_containing_match(text, match)
+    if _is_sanctioned_secret_reference(matched) or _is_sanctioned_secret_reference(line):
+        return True
+    return any(_is_lexical_token_assignment(matched, reading) for reading in _assignment_readings(text, match))
+
+
+def _assignment_readings(text: str, match: re.Match[str]) -> list[str]:
+    """The assignment as the whole line, as the text from the keyword on, and — when the code is
+    embedded in a quoted YAML scalar — as the single escaped segment carrying it.
+
+    Only the YAML decoder knows whether an embedded ``\\n`` ends a line or is code data, so both
+    readings are offered and either one showing an extraction exempts the match. Reading from the
+    keyword matters because a YAML key's own colon precedes the code on a scalar's opening line.
+    """
+    from_keyword = text[match.start() : _line_end_after_match(text, match)]
+    escaped_segment = from_keyword.split("\\n")[0].replace('\\"', '"').replace("\\'", "'")
+    return [_line_containing_match(text, match), from_keyword, escaped_segment]
+
+
+def _is_lexical_token_assignment(matched: str, assignment: str) -> bool:
+    if not _LEXICAL_TOKEN_LHS_RE.match(matched) or _UNAMBIGUOUS_SECRET_KEYWORD_RE.search(assignment):
+        return False
+    # The keyword pattern ends at the first whitespace, so the rest of the line carries the expression.
+    rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(assignment)
+    return rhs_match is not None and _parses_a_value_out_of_something(rhs_match.group(1))
 
 
 def _contains_internal_tool_instruction(user_response: str | None) -> bool:
@@ -554,6 +631,8 @@ def _contains_internal_block_taxonomy_leak(
         return False
     if _contains_deprecated_block_identifier(user_response):
         return True
+    if _contains_yaml_authoring_vocab_leak(user_response, response_type):
+        return True
     if response_type in _USER_VISIBLE_REPLY_TYPES and _contains_internal_tool_vocab_leak(user_response):
         return True
     if output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER:
@@ -564,8 +643,6 @@ def _contains_internal_block_taxonomy_leak(
 
 def _contains_internal_tool_vocab_leak(user_response: str) -> bool:
     lower = user_response.lower()
-    if _LOOP_DETECTED_MARKER in lower:
-        return True
     if _INTERNAL_COPILOT_SENTINEL_PREFIX in lower:
         return True
     return any(phrase in lower for phrase in _INTERNAL_TOOL_PARAPHRASE_PHRASES)
@@ -618,8 +695,6 @@ def _contains_internal_classifier_vocab_leak(user_response: str | None) -> bool:
     if not isinstance(user_response, str) or not user_response:
         return False
     lower = user_response.lower()
-    if any(phrase in lower for phrase in _INTERNAL_CLASSIFIER_VOCAB_PHRASES):
-        return True
     if _INTERNAL_CLASSIFIER_REASON_CODE_LABEL_RE.search(lower):
         return True
     for match in _IDENTIFIER_TOKEN_RE.finditer(user_response):
@@ -629,7 +704,7 @@ def _contains_internal_classifier_vocab_leak(user_response: str | None) -> bool:
             return True
         # CamelCase classifier names are internal vocabulary even without backticks;
         # the lowercase forms (`turn intent`, `request policy`) remain natural prose.
-        if token in {"TurnIntent", "RequestPolicy"}:
+        if token == "RequestPolicy":
             return True
         if lowered in _INTERNAL_CLASSIFIER_DELIMITED_NAMES and _is_delimited_identifier(
             user_response, match.start(), match.end()
@@ -779,12 +854,7 @@ def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str
 
 
 def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
-    return {
-        credential_id
-        for credential_id in request_policy.existing_workflow_credential_ids
-        if isinstance(credential_id, str) and credential_id.startswith("cred_")
-    }
+    return saved_credential_ids(request_policy.existing_workflow_credential_ids)
 
 
 def _existing_workflow_broadens_credential_scope(

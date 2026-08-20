@@ -6,7 +6,117 @@ import {
   WorkflowParameterTypes,
   WorkflowParameterValueType,
 } from "../types/workflowTypes";
-import { ParametersState } from "./types";
+import {
+  CredentialParameterYAML,
+  WorkflowParameterYAML,
+} from "../types/workflowYamlTypes";
+import {
+  ParametersState,
+  parameterIsSkyvernCredential,
+  SkyvernCredential,
+} from "./types";
+
+/**
+ * A single credential serializes to an editable workflow `credential_id`
+ * parameter (overridable at run/rerun time); only a rotation pool (2+
+ * credentials) becomes a block-scoped credential parameter.
+ */
+function skyvernCredentialToParameterYAML(
+  parameter: SkyvernCredential,
+): WorkflowParameterYAML | CredentialParameterYAML {
+  const hasCredentialRotation = (parameter.credentialIds?.length ?? 0) >= 2;
+  const hasFallbackCredentials =
+    (parameter.fallbackCredentialIds?.length ?? 0) > 0;
+  // An at-will credential (no default selected) cannot rotate or fall back — the pool
+  // shape requires a non-empty credential_id, so it serializes as a workflow parameter
+  // with a null default_value (the backend treats a no-default credential as at-will).
+  const hasPrimaryCredential = parameter.credentialId !== "";
+  if (
+    !hasPrimaryCredential ||
+    (!hasCredentialRotation && !hasFallbackCredentials)
+  ) {
+    return {
+      parameter_type: WorkflowParameterTypes.Workflow,
+      workflow_parameter_type: WorkflowParameterValueType.CredentialId,
+      default_value: parameter.credentialId || null,
+      key: parameter.key,
+      description: parameter.description || null,
+    };
+  }
+  return {
+    parameter_type: WorkflowParameterTypes.Credential,
+    credential_id: parameter.credentialId,
+    credential_ids: parameter.credentialIds ?? null,
+    selection_strategy: parameter.selectionStrategy ?? null,
+    fallback_credential_ids: parameter.fallbackCredentialIds ?? null,
+    fallback_trigger: parameter.fallbackTrigger ?? null,
+    key: parameter.key,
+    description: parameter.description || null,
+  };
+}
+
+/**
+ * The parameter edit panel only exposes key/credential/description, so an edit
+ * must carry over the rotation pool and fallback config it can't see — a plain
+ * rebuild silently wipes them. When the primary credential changes it is
+ * removed from the fallback list (a credential may not be its own fallback)
+ * and swapped into the head of the rotation pool.
+ */
+function applySkyvernCredentialEdit(
+  previous: ParametersState[number] | null | undefined,
+  edit: {
+    key: string;
+    credentialId: string;
+    description?: string | null;
+  },
+): SkyvernCredential {
+  const base: SkyvernCredential = {
+    key: edit.key,
+    parameterType: "credential",
+    credentialId: edit.credentialId,
+    description: edit.description ?? null,
+  };
+  if (
+    !previous ||
+    previous.parameterType !== "credential" ||
+    !parameterIsSkyvernCredential(previous)
+  ) {
+    return base;
+  }
+  if (!edit.credentialId) {
+    // Clearing the credential (at-will, no default) drops rotation/fallback
+    // config — those shapes require a primary credential.
+    return base;
+  }
+
+  const previousPool = previous.credentialIds ?? [];
+  const rotationPool =
+    previousPool.length >= 2
+      ? [
+          edit.credentialId,
+          ...previousPool.filter(
+            (id) => id !== previous.credentialId && id !== edit.credentialId,
+          ),
+        ]
+      : [];
+  const credentialIds = rotationPool.length >= 2 ? rotationPool : null;
+
+  const fallbackCredentialIds = (previous.fallbackCredentialIds ?? []).filter(
+    (id) => id !== edit.credentialId,
+  );
+  const hasFallback = fallbackCredentialIds.length > 0;
+
+  return {
+    ...base,
+    credentialIds,
+    selectionStrategy: credentialIds
+      ? (previous.selectionStrategy ?? null)
+      : null,
+    fallbackCredentialIds: hasFallback ? fallbackCredentialIds : null,
+    fallbackTrigger: hasFallback ? (previous.fallbackTrigger ?? null) : null,
+    dataType: previous.dataType,
+  };
+}
 
 const getInitialParameters = (workflow: WorkflowApiResponse) => {
   return workflow.workflow_definition.parameters
@@ -20,7 +130,7 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           return {
             key: parameter.key,
             parameterType: WorkflowEditorParameterTypes.Credential,
-            credentialId: parameter.default_value as string,
+            credentialId: (parameter.default_value as string | null) ?? "",
             dataType: WorkflowParameterValueType.CredentialId,
             description: parameter.description,
           };
@@ -71,6 +181,8 @@ const getInitialParameters = (workflow: WorkflowApiResponse) => {
           credentialId: parameter.credential_id,
           credentialIds: parameter.credential_ids ?? null,
           selectionStrategy: parameter.selection_strategy ?? null,
+          fallbackCredentialIds: parameter.fallback_credential_ids ?? null,
+          fallbackTrigger: parameter.fallback_trigger ?? null,
           description: parameter.description,
         };
       } else if (
@@ -170,7 +282,9 @@ const constructCacheKeyValueFromParameters = (opts: {
 };
 
 export {
+  applySkyvernCredentialEdit,
   constructCacheKeyValue,
   constructCacheKeyValueFromParameters,
   getInitialParameters,
+  skyvernCredentialToParameterYAML,
 };

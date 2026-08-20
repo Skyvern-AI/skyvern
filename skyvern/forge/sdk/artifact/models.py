@@ -11,7 +11,11 @@ class ArtifactType(StrEnum):
     RECORDING = "recording"
     AUDIO = "audio"
     SESSION_REPLAY = "session_replay"
+    EVAL_SCORE = "eval_score"
+    EVAL_TRAJECTORY = "eval_trajectory"
+    EVAL_RUBRICS = "eval_rubrics"
     BROWSER_CONSOLE_LOG = "browser_console_log"
+    BROWSER_SESSION_ACTION_LOG = "browser_session_action_log"
 
     SKYVERN_LOG = "skyvern_log"
     SKYVERN_LOG_RAW = "skyvern_log_raw"
@@ -23,6 +27,7 @@ class ArtifactType(StrEnum):
     SCREENSHOT_LLM = "screenshot_llm"
     SCREENSHOT_ACTION = "screenshot_action"
     SCREENSHOT_FINAL = "screenshot_final"
+    SCREENSHOT_PROXY = "screenshot_proxy"
 
     LLM_PROMPT = "llm_prompt"
     LLM_REQUEST = "llm_request"
@@ -104,6 +109,13 @@ class Artifact(BaseModel):
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
+
+
+class ArtifactSignedUrl(BaseModel):
+    artifact_id: str
+    signed_url: str
+    expires_at: int | None = None
+    """Unix seconds when signed_url stops working; None when the backing store controls expiry."""
 
 
 class LogEntityType(StrEnum):

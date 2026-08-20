@@ -8,6 +8,7 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { SelectionCheckbox } from "@/components/SelectionCheckbox";
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   CopyIcon,
   EyeNoneIcon,
@@ -36,6 +37,7 @@ import { toast } from "@/components/ui/use-toast";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 import { getCredentialErrorMessage } from "./authenticatorSaveError";
+import { useCredentialAuthenticatorSupport } from "./CredentialAuthenticatorSupportContext";
 
 type Props = {
   credential: CredentialApiResponse;
@@ -257,6 +259,8 @@ function CredentialItem({
   hasSelection = false,
   onSelect,
 }: Props) {
+  const { additionalTwoFactorMethods = [] } =
+    useCredentialAuthenticatorSupport();
   const [editModalOpen, setEditModalOpen] = useState(false);
   const activeTest = useCredentialTestStore((s) =>
     s.activeTest?.credentialId === credential.credential_id
@@ -291,8 +295,12 @@ function CredentialItem({
       case "text":
         return "Text Message";
       case "none":
-      default:
         return "";
+      default:
+        return (
+          additionalTwoFactorMethods.find(({ value }) => value === totpType)
+            ?.label ?? ""
+        );
     }
   };
 
@@ -419,22 +427,37 @@ function CredentialItem({
           </div>
         )}
         {credential.browser_profile_id && (
-          <div className="flex items-center gap-1 text-xs">
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="flex items-center text-green-400">
-                    <SaveIcon className="size-4" />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>Saved browser session</TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-            {credential.tested_url && (
-              <span className="text-muted-foreground">
-                {getHostname(credential.tested_url) ?? credential.tested_url}
-              </span>
-            )}
+          <div className="space-y-1 text-xs">
+            <div className="flex min-w-0 items-center gap-1">
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="flex items-center text-green-400">
+                      <SaveIcon className="size-4 shrink-0" />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent>Saved browser session</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              {credential.tested_url && (
+                <span
+                  className="truncate text-muted-foreground"
+                  title={
+                    getHostname(credential.tested_url) ?? credential.tested_url
+                  }
+                >
+                  {getHostname(credential.tested_url) ?? credential.tested_url}
+                </span>
+              )}
+            </div>
+            {/* Deep-links to the profile and auto-opens its Refresh dialog (the
+                fix-by-hand mechanism), so the user lands and sees what to do. */}
+            <Link
+              to={`/browser-profiles/${credential.browser_profile_id}?refresh=1`}
+              className="block text-blue-400 hover:text-blue-300"
+            >
+              Fix the saved login by hand
+            </Link>
           </div>
         )}
         {canResaveSession && !credential.browser_profile_id && !activeTest && (

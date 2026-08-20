@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import socket
+from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,7 +11,10 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.constants import DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api import files
+from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS
+from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 ATTACKER_ORG_ID = "o_attacker"
 VICTIM_ORG_ID = "o_victim"
@@ -55,6 +61,35 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(files, "app", SimpleNamespace(STORAGE=storage))
     return storage
+
+
+def test_validate_download_url_allows_canonical_legacy_download(legacy_download_uris: dict[str, str]) -> None:
+    assert files.validate_download_url(legacy_download_uris["canonical"]) is True
+
+
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+def test_validate_download_url_rejects_legacy_path_escape(legacy_download_uris: dict[str, str], case: str) -> None:
+    assert files.validate_download_url(legacy_download_uris[case]) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_returns_canonical_legacy_download(legacy_download_uris: dict[str, str]) -> None:
+    safe_path = files.parse_uri_to_path(legacy_download_uris["canonical"])
+    assert await files.download_file(legacy_download_uris["canonical"]) == os.path.realpath(safe_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+async def test_download_file_rejects_legacy_path_escape(
+    legacy_download_uris: dict[str, str], case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client_session = MagicMock()
+    monkeypatch.setattr(files.aiohttp, "ClientSession", client_session)
+
+    with pytest.raises(PermissionError, match="outside the downloads directory"):
+        await files.download_file(legacy_download_uris[case])
+
+    client_session.assert_not_called()
 
 
 def test_validate_download_url_rejects_cross_org_s3_uri() -> None:
@@ -242,3 +277,122 @@ async def test_download_file_routes_gcs_uri_to_managed_storage(storage: SimpleNa
             assert f.read() == b"tenant-secret-bytes"
     finally:
         os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_download_file_blocks_hostname_resolving_to_private_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_private(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.42", port or 0))]
+
+    client_session = MagicMock()
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_private)
+    monkeypatch.setattr(files.aiohttp, "ClientSession", client_session)
+
+    with pytest.raises(BlockedHost):
+        await files.download_file("https://evil.example.test/secret.pdf")
+
+    client_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_file_rejects_unsafe_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "http://169.254.169.254/latest/meta-data"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.get = MagicMock(return_value=redirect_response)
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
+
+    with pytest.raises(BlockedHost):
+        await files.download_file("https://example.com/start.pdf")
+
+    mock_session.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_download_file_strips_credentials_on_cross_origin_redirect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    class Content:
+        async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
+            yield b"file-bytes"
+
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "https://other.example.com/final.pdf"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    final_response = AsyncMock()
+    final_response.status = 200
+    final_response.headers = {}
+    final_response.content_length = len(b"file-bytes")
+    final_response.content = Content()
+    final_response.__aenter__ = AsyncMock(return_value=final_response)
+    final_response.__aexit__ = AsyncMock(return_value=None)
+
+    responses = [redirect_response, final_response]
+    requested_headers: list[dict[str, str]] = []
+
+    def capture_get(*args: object, **kwargs: object) -> AsyncMock:
+        headers = kwargs["headers"]
+        assert isinstance(headers, dict)
+        requested_headers.append(headers)
+        return responses.pop(0)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.get = MagicMock(side_effect=capture_get)
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
+
+    result = await files.download_file(
+        "https://example.com/start.pdf",
+        headers={"Authorization": "Bearer secret", "Cookie": "sid=abc", "X-Keep": "1"},
+        output_dir=str(tmp_path),
+    )
+
+    assert Path(result).read_bytes() == b"file-bytes"
+    assert requested_headers[0]["Authorization"] == "Bearer secret"
+    assert requested_headers[0]["Cookie"] == "sid=abc"
+    assert requested_headers[1] == {"X-Keep": "1"}
+
+
+@pytest.mark.asyncio
+async def test_download_file_redirect_limit_raises_http_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolves_public(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
+
+    redirect_response = AsyncMock()
+    redirect_response.status = 302
+    redirect_response.headers = {"Location": "https://example.com/next.pdf"}
+    redirect_response.__aenter__ = AsyncMock(return_value=redirect_response)
+    redirect_response.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.get = MagicMock(return_value=redirect_response)
+
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolves_public)
+    monkeypatch.setattr(files.aiohttp, "ClientSession", MagicMock(return_value=mock_session))
+
+    with pytest.raises(SkyvernHTTPException, match="Too many redirects"):
+        await files.download_file("https://example.com/start.pdf")
+
+    assert mock_session.get.call_count == MAX_SAFE_REDIRECTS + 1

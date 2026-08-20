@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -10,7 +9,6 @@ from urllib.parse import urlparse
 import structlog
 import yaml
 
-from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
@@ -19,15 +17,28 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    composition_structured_evidence_expression,
+)
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    clearable_dismiss_texts,
+    has_bounded_page_schema,
+    packet_describes_a_clearable_overlay,
+    parse_composition_structured,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
-from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.enforcement import (
+    TOTAL_TIMEOUT_SECONDS,
+    _elapsed_run_seconds,
+    _requested_output_labels_by_path,
+)
+from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
+from skyvern.forge.sdk.copilot.task_output_envelope import (
+    _TASK_ENVELOPE_BLOCK_TYPES,
+    _TASK_OUTPUT_PAYLOAD_FIELDS,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -55,21 +66,6 @@ _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
 # contains one of these, an unmet outcome criterion means the build is still
 # incomplete (no confirmation step yet), not a completed run that failed the goal.
 _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
-
-
-# Block types whose ``block.output`` is a ``TaskOutput.from_task()`` envelope
-# (schemas/tasks.py:TaskOutput) rather than the raw payload. The
-# meaningful-data check must unwrap these via ``_block_data_payload`` before
-# judging output, because envelope fields (task_id, status, artifact IDs) are
-# always populated on a completed run and would otherwise mask empty
-# extractions. This is a subset of ``_DATA_PRODUCING_BLOCK_TYPES`` — keep the
-# two in sync when adding a new task-backed type. ``TEXT_PROMPT`` is
-# deliberately excluded: its block.output is the raw LLM response dict (see
-# ``TextPromptBlock.execute``), no envelope to strip.
-_TASK_ENVELOPE_BLOCK_TYPES = frozenset({"EXTRACTION"})
-assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
-    "_TASK_ENVELOPE_BLOCK_TYPES must be a subset of _DATA_PRODUCING_BLOCK_TYPES"
-)
 
 
 # Absolute upper bound on a single ``run_blocks`` tool invocation. Exists only
@@ -172,16 +168,6 @@ def _is_meaningful_extracted_data(extracted: Any) -> bool:
     return True
 
 
-# Payload fields inside a ``TaskOutput.from_task()`` envelope
-# (schemas/tasks.py:TaskOutput). Only these carry "did the block produce
-# something useful?" signal; the rest (task_id, status, artifact IDs, etc.)
-# are always populated on a completed run and would short-circuit
-# _is_meaningful_extracted_data to True even when nothing useful was produced.
-_TASK_OUTPUT_PAYLOAD_FIELDS: tuple[str, ...] = (
-    "extracted_information",
-    "downloaded_files",
-    "downloaded_file_urls",
-)
 _TASK_OUTPUT_PARAMETER_SUFFIX = "_output"
 
 
@@ -243,15 +229,29 @@ def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
     return extracted_data
 
 
+def _registered_output_payload_view(value: Any, block_type: str | None) -> Any:
+    """Slice a registered task-envelope value (``_TASK_ENVELOPE_BLOCK_TYPES``) down to
+    ``_TASK_OUTPUT_PAYLOAD_FIELDS`` so always-populated envelope metadata can't read a
+    reach-state task that produced no content as meaningful; non-envelope values (e.g. a
+    code block emitting a user schema that happens to carry a ``task_id``) pass through
+    unsliced. Registered block types arrive lowercased, so normalize before matching."""
+    if (block_type or "").upper() in _TASK_ENVELOPE_BLOCK_TYPES and isinstance(value, Mapping):
+        payload = {field: value.get(field) for field in _TASK_OUTPUT_PAYLOAD_FIELDS}
+        payload.update(_workflow_output_parameter_payloads(value))
+        return payload
+    return value
+
+
+def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
+    return any(
+        _is_meaningful_extracted_data(_registered_output_payload_view(item.get("value"), item.get("block_type")))
+        for item in _registered_output_parameter_payloads(data)
+    )
+
+
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
-_CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS = BLOCK_RUNNING_TOOLS | {"fill_credential_field"}
-
-
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
-
-
-ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
@@ -270,7 +270,7 @@ def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
     started_at = getattr(ctx, "copilot_run_start_monotonic", None)
     if not isinstance(started_at, int | float):
         return None
-    return TOTAL_TIMEOUT_SECONDS - (time.monotonic() - float(started_at))
+    return TOTAL_TIMEOUT_SECONDS - _elapsed_run_seconds(ctx, float(started_at))
 
 
 def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
@@ -450,23 +450,39 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
     return url
 
 
-async def _fallback_page_info(ctx: AgentContext, session_id_override: str | None = None) -> tuple[str, str]:
+async def _fallback_page_info(
+    ctx: AgentContext, session_id_override: str | None = None, *, read_title: bool = True
+) -> tuple[str, str]:
     session_id = session_id_override or ctx.browser_session_id
     if not session_id:
         return "", ""
-    try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=session_id,
-            organization_id=ctx.organization_id,
-        )
+
+    # page.url is a synchronous property, so it is already in hand when the title stalls, and most
+    # callers here destructure the title away and want only the url.
+    url = ""
+
+    async def _read() -> str:
+        nonlocal url
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
         if not browser_state:
-            return "", ""
+            return ""
         page = await browser_state.get_or_create_page()
-        if page:
-            return page.url, await page.title()
+        if not page:
+            return ""
+        url = page.url
+        return await page.title() if read_title else ""
+
+    # page.title() waits on the renderer, so a wedged or busy page hangs here forever rather than
+    # raising — and every caller reaches this path, since a tool result's browser_context carries
+    # no url. Without the bound, one unreachable page deadlocks the whole turn.
+    try:
+        title = await asyncio.wait_for(_read(), timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        LOG.info("copilot page title read timed out", session_id=session_id, page_url=url)
+        return url, ""
     except Exception:
-        pass
-    return "", ""
+        return url, ""
+    return url, title
 
 
 def _composition_evidence_page_url(evidence: dict[str, Any] | None) -> str | None:
@@ -639,6 +655,8 @@ def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached
             "evidence": evidence,
             "reached_via": reached_via,
             "had_bounded_schema": has_bounded_page_schema(evidence),
+            "obstructed": packet_describes_a_clearable_overlay(evidence),
+            "dismiss_texts": sorted(clearable_dismiss_texts(evidence)),
             "step": step,
         }
     )
@@ -706,6 +724,82 @@ async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> 
     return "", str(error) if error else None, False, True
 
 
+def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
+    """The labels this turn asked for, so capture resolves them rather than guessing which relations matter."""
+    if not isinstance(copilot_ctx, AgentContext):
+        return ()
+    targets: list[str] = []
+    for labels in _requested_output_labels_by_path(copilot_ctx).values():
+        for label in labels:
+            text = label.strip()
+            if text and text not in targets:
+                targets.append(text)
+    return tuple(targets)
+
+
+async def _composition_get_structured_evidence_result(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Capture composition evidence and preserve why the observation failed."""
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None, "structured page evidence failed: discovery MCP server not attached to context"
+    with copilot_span("composition_structured_extract"):
+        try:
+            result = await asyncio.wait_for(
+                server.call_internal_tool(
+                    "skyvern_evaluate",
+                    {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return (
+                None,
+                f"skyvern_evaluate timed out after {timeout_seconds:g}s while capturing structured page evidence",
+            )
+        except Exception as exc:
+            LOG.warning(
+                "copilot_composition_structured_extract_failed",
+                error_type=type(exc).__name__,
+                detail_present=bool(str(exc).strip()),
+            )
+            return None, "skyvern_evaluate failed while capturing structured page evidence"
+    if not isinstance(result, dict) or not result.get("ok"):
+        LOG.warning(
+            "copilot_composition_structured_extract_rejected",
+            result_is_mapping=isinstance(result, dict),
+            error_present=bool(result.get("error")) if isinstance(result, dict) else False,
+        )
+        return None, "structured page evidence failed: evaluate returned an error"
+    raw = (result.get("data") or {}).get("result")
+    if isinstance(raw, str):
+        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None, "structured page evidence exceeded the bounded payload size"
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, "structured page evidence returned invalid JSON"
+    elif isinstance(raw, dict):
+        try:
+            serialized = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None, "structured page evidence returned an unsupported result type"
+        if len(serialized) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None, "structured page evidence exceeded the bounded payload size"
+        payload = raw
+    else:
+        return None, "structured page evidence returned an unsupported result type"
+    evidence = parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+    if evidence is None:
+        return None, "structured page evidence did not match the bounded schema"
+    return evidence, None
+
+
 async def _composition_get_structured_evidence(
     copilot_ctx: Any,
     *,
@@ -713,32 +807,11 @@ async def _composition_get_structured_evidence(
     current_url: str,
     timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
-    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
-    server = getattr(copilot_ctx, "discovery_mcp_server", None)
-    if server is None:
-        return None
-    with copilot_span("composition_structured_extract"):
-        try:
-            result = await asyncio.wait_for(
-                server.call_internal_tool(
-                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
-                ),
-                timeout=timeout_seconds,
-            )
-        except Exception:
-            return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    raw = (result.get("data") or {}).get("result")
-    if isinstance(raw, str):
-        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
-            return None
-        try:
-            payload = json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-    elif isinstance(raw, dict):
-        payload = raw
-    else:
-        return None
-    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+    """Compatibility wrapper for best-effort scout observers that intentionally ignore failures."""
+    evidence, _ = await _composition_get_structured_evidence_result(
+        copilot_ctx,
+        inspected_url=inspected_url,
+        current_url=current_url,
+        timeout_seconds=timeout_seconds,
+    )
+    return evidence

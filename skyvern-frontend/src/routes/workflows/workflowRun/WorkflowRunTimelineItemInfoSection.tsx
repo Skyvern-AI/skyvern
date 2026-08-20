@@ -206,7 +206,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
       if (item.wait_sec !== null && typeof item.wait_sec !== "undefined") {
         return (
           <div className="flex w-1/2 justify-between rounded bg-slate-elevation1 p-4">
-            <span className="text-sm text-slate-400">Wait Time</span>
+            <span className="text-sm text-muted-foreground">Wait Time</span>
             <span className="text-sm">{item.wait_sec} Seconds</span>
           </div>
         );

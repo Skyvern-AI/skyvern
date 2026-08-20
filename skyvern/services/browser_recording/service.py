@@ -23,6 +23,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.services.browser_recording.code_first import actions_to_code_first_blocks
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
@@ -34,6 +35,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
     OutputBlock,
+    ProcessedBlock,
     RecordingDraftStep,
 )
 
@@ -69,7 +71,39 @@ LOG = structlog.get_logger(__name__)
 
 # avoid decompression bombs
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
+# Cap decompressed output per chunk. The compressed input is already bounded to ~10MB, so this
+# allows a generous ~10x expansion for legitimate recordings while rejecting bombs that would
+# otherwise inflate to gigabytes and exhaust process memory on a shared host.
+MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024  # 100MB
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
+
+
+def _gunzip_bounded(compressed_data: bytes, max_output_size: int) -> bytes | None:
+    """Gzip-decompress `compressed_data`, returning None once the output would exceed
+    `max_output_size`.
+
+    The bound is enforced incrementally via zlib's ``max_length`` so a decompression bomb
+    aborts mid-stream and never materializes its full output in memory. Raises ``zlib.error``
+    on malformed input, matching a raw ``zlib.decompress`` call.
+    """
+    decompressor = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+    output = bytearray()
+    pending = compressed_data
+
+    while pending:
+        # +1 so an output that exactly fills the budget stays distinguishable from an overflow.
+        output.extend(decompressor.decompress(pending, max_output_size - len(output) + 1))
+        if len(output) > max_output_size:
+            return None
+        pending = decompressor.unconsumed_tail
+
+    # unconsumed_tail is empty, so all input was consumed within the budget; flush only drains
+    # zlib's small internal buffer and cannot reintroduce an unbounded amount of output.
+    output.extend(decompressor.flush())
+    if len(output) > max_output_size:
+        return None
+
+    return bytes(output)
 
 
 @functools.lru_cache(maxsize=None)
@@ -222,17 +256,22 @@ class Processor:
             return None
 
         try:
-            # gzip decompression -> bytes
+            # gzip decompression -> bytes, bounded to MAX_DECOMPRESSED_SIZE.
             #
-            # NOTE(llm): We use zlib.decompress with wbits=16 + zlib.MAX_WBITS (31).
-            # This tells zlib to automatically detect and handle Gzip headers,
-            # which is essential since the browser used CompressionStream('gzip').
-            # Using zlib is often faster than the higher-level gzip module for this
-            # purpose.
-            decompressed_bytes: bytes = zlib.decompress(compressed_data, wbits=16 + zlib.MAX_WBITS)
+            # NOTE(llm): wbits=16 + zlib.MAX_WBITS (31) tells zlib to detect and handle Gzip
+            # headers, which is essential since the browser used CompressionStream('gzip').
+            decompressed_bytes = _gunzip_bounded(compressed_data, MAX_DECOMPRESSED_SIZE)
         except zlib.error as e:
             LOG.warning(f"{self.class_name} decompression error: {e}", **self.identity)
             # Log the error, maybe log the first few characters of the payload for debugging
+            return None
+
+        if decompressed_bytes is None:
+            LOG.warning(
+                f"{self.class_name}: decompressed payload exceeded {MAX_DECOMPRESSED_SIZE} bytes; "
+                "rejecting suspected decompression bomb",
+                **self.identity,
+            )
             return None
 
         return decompressed_bytes
@@ -609,10 +648,33 @@ class Processor:
         self,
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
-    ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
+        code_first: bool = False,
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
+        if code_first:
+            # Code-first always re-derives selector-bearing actions from raw events;
+            # draft steps carry no locators and act only as an edit overlay.
+            events = self.compressed_chunks_to_events(compressed_chunks)
+            actions = self.events_to_actions(events)
+            code_first_result = actions_to_code_first_blocks(actions, draft_steps)
+            if code_first_result is not None:
+                code_blocks, code_parameters = code_first_result
+                LOG.info(
+                    "record_browser.process_recording_code_first",
+                    recording_code_block_count=len(code_blocks),
+                    recording_code_parameter_count=len(code_parameters),
+                    recording_action_count=len(actions),
+                    **self.identity,
+                )
+                return list(code_blocks), code_parameters
+            LOG.warning(
+                "record_browser.code_first_fallback_to_legacy",
+                recording_action_count=len(actions),
+                **self.identity,
+            )
+
         # `is not None` (not truthiness): an empty list means the user deleted every
         # live-interpreted step, which must not fall back to re-processing raw events.
         if draft_steps is not None:
@@ -647,7 +709,8 @@ class BrowserSessionRecordingService:
         workflow_permanent_id: str,
         compressed_chunks: list[str],
         draft_steps: list[RecordingDraftStep] | None = None,
-    ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
+        code_first: bool = False,
+    ) -> tuple[list[ProcessedBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
         """
@@ -657,7 +720,7 @@ class BrowserSessionRecordingService:
             workflow_permanent_id,
         )
 
-        return await processor.process(compressed_chunks, draft_steps=draft_steps)
+        return await processor.process(compressed_chunks, draft_steps=draft_steps, code_first=code_first)
 
 
 async def smoke() -> None:

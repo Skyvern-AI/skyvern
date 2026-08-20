@@ -3,6 +3,10 @@ from http import HTTPStatus
 import pytest
 
 from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionStartupTimeout,
+    CaptchaNotSolvedInTime,
+    CaptchaSolveError,
     CdpConnectionConfigurationError,
     SkyvernException,
     SkyvernExtraNotInstalled,
@@ -36,6 +40,116 @@ def test_unknown_error_while_creating_browser_context_strips_call_log() -> None:
     assert "support@skyvern.com" in message
 
 
+def test_unknown_error_omits_browser_type_from_user_facing_message() -> None:
+    # The browser_type label can be a remote-browser vendor identity; keep it on the
+    # exception for structured logs but never surface it in the user-facing message.
+    sentinel = "zzz-secret-browser-label"
+    error = UnknownErrorWhileCreatingBrowserContext(sentinel, RuntimeError("setup failed"))
+    message = str(error)
+
+    assert sentinel not in message
+    assert error.browser_type == sentinel
+    assert "Failed to create browser context" in message
+
+
+def test_unknown_error_renders_redacted_inner_type_name() -> None:
+    # A SkyvernException may hide a sensitive class name behind user_facing_type_name; the
+    # wrapper must render that neutral token, never the real class name.
+    class _SecretVendorRateLimitError(SkyvernException):
+        @property
+        def user_facing_type_name(self) -> str:
+            return "RemoteBrowserRateLimitError"
+
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", _SecretVendorRateLimitError("slow down"))
+    message = str(error)
+
+    assert "SecretVendor" not in message
+    assert "RemoteBrowserRateLimitError" in message
+
+
+def test_unknown_error_preserves_real_inner_type_name_by_default() -> None:
+    # Failure classification keys off the parenthesized inner class name in the message, so a
+    # plain SkyvernException (no redaction) must still surface its real class name.
+    class _PlainProxyError(SkyvernException):
+        pass
+
+    error = UnknownErrorWhileCreatingBrowserContext("dynamic-browser", _PlainProxyError("no proxy available"))
+    assert "_PlainProxyError" in str(error)
+
+
+def test_unknown_error_redacts_raw_cdp_endpoint_url() -> None:
+    # A raw connect_over_cdp failure echoes the ws/wss endpoint, which can carry the vendor
+    # host, a session-bearing query, or embedded credentials — none may reach the user.
+    inner_exception = Exception(
+        "browserType.connectOverCDP: WebSocket error: "
+        "wss://user:secret@remote.example.internal/session/tok-9f3a?apiKey=SEKRET connect ECONNREFUSED"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "tok-9f3a" not in message
+    assert "SEKRET" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
+def test_unknown_error_redacts_http_cdp_discovery_url() -> None:
+    # The /json/version discovery endpoint is reached over http(s) and can carry the vendor host
+    # and a session-bearing token just like the ws socket, so it must be redacted too.
+    inner_exception = Exception(
+        "connect_over_cdp: fetching https://remote.example.internal/json/version?token=SEKRET failed"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "https://" not in message
+    assert "SEKRET" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
+def test_unknown_error_preserves_generic_http_url() -> None:
+    # A non-CDP setup failure (proxy/public-IP probe) can echo an ordinary http(s) URL the user
+    # needs to diagnose their own configuration; with no CDP signal present it must not be redacted.
+    inner_exception = Exception("Proxy health check failed: GET http://proxy.example.com:8080/status returned 503")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "http://proxy.example.com:8080/status" in message
+    assert "[remote browser endpoint]" not in message
+    assert "returned 503" in message
+
+
+def test_unknown_error_redacts_generic_ws_url() -> None:
+    # Even without a CDP signal, a ws/wss URL is unambiguously a devtools socket that may carry the
+    # vendor host or embedded credentials, so ws/wss endpoints are always redacted.
+    inner_exception = Exception("Browser setup failed talking to wss://user:secret@vendor.internal/session/tok-42")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "tok-42" not in message
+    assert "vendor.internal" not in message
+    assert "[remote browser endpoint]" in message
+
+
+def test_unknown_error_preserves_useful_non_sensitive_prose() -> None:
+    # A generic setup failure carrying an ordinary http(s) URL should reach the user intact so the
+    # message stays actionable.
+    inner_exception = Exception("Failed to reach public IP service at https://api.ipify.org")
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "https://api.ipify.org" in message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "Failed to reach public IP service" in message
+    assert "[remote browser endpoint]" not in message
+
+
+def test_captcha_not_solved_in_time_is_captcha_solve_error() -> None:
+    # The action handler catches CaptchaSolveError before its generic arm; this
+    # subclass relationship is what routes captcha-solve failures to the handled
+    # log path instead of "Unhandled exception in action handler".
+    error = CaptchaNotSolvedInTime("task_123", "unsolved")
+    assert isinstance(error, CaptchaSolveError)
+    assert isinstance(error, SkyvernException)
+
+
 def test_unknown_error_preserves_cdp_configuration_guidance() -> None:
     inner_exception = CdpConnectionConfigurationError(
         "Skyvern reached the configured CDP address, but /json/version returned HTTP 404. "
@@ -65,6 +179,22 @@ def test_skyvern_http_exception_normalizes_status_code_to_plain_int() -> None:
 
     assert error.status_code == 400
     assert type(error.status_code) is int
+
+
+def test_browser_session_timeout_exceptions_distinguish_startup_from_expiry() -> None:
+    startup_timeout = BrowserSessionStartupTimeout("pbs_test")
+    expired = BrowserSessionClosed(
+        "pbs_test",
+        reason="expired after reaching its configured lifetime",
+    )
+
+    assert startup_timeout.status_code == 504
+    assert expired.status_code == 410
+    assert str(startup_timeout) == "Browser session pbs_test failed to start within the timeout period."
+    assert str(expired) == (
+        "Browser session pbs_test expired after reaching its configured lifetime. "
+        "Create a new browser session and retry."
+    )
 
 
 def test_raise_server_extra_required_translates_when_server_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,6 +351,7 @@ def test_browser_connection_error_connect_over_cdp_websocket() -> None:
     assert "Call log" not in message
     assert "WebSocket" not in message
     assert "Failed to connect to the browser session" in message
+    assert "high demand" in message
     assert "try re-running" in message
 
 
@@ -230,6 +361,55 @@ def test_browser_connection_error_websocket_closed() -> None:
     message = get_user_facing_exception_message(Exception(raw_error))
     assert "Failed to connect to the browser session" in message
     assert "try re-running" in message
+
+
+def test_session_closed_error_does_not_claim_high_demand() -> None:
+    # SKY-13502: a session-router lifecycle close (4410 "session closed") means the session was
+    # already closed before the connect — "high demand" asserts a cause that was never
+    # established, and retry advice cannot help a closed session.
+    raw_error = (
+        "BrowserType.connect_over_cdp: Target page, context or browser has been closed "
+        "Call log: - <ws connecting> wss://sessions.skyvern.com/pbs_000000000000000000 "
+        "- <ws error> error WebSocket was closed before the connection code=4410 reason=session closed"
+    )
+    message = get_user_facing_exception_message(Exception(raw_error))
+    assert "high demand" not in message
+    assert "re-run" not in message
+    assert "already closed" in message
+    assert "sessions.skyvern.com" not in message
+    assert "wss://" not in message
+
+
+def test_session_closed_requires_reason_text_not_bare_close_code() -> None:
+    # Close code 4410 is reused for other outcomes (e.g. the live-view stream closes with
+    # reason "no_working_page"), so the bare code must not trigger the session-closed story.
+    raw_error = (
+        "BrowserType.connect_over_cdp: WebSocket error: wss://sessions.skyvern.com/pbs_000000000000000000 "
+        "- <ws error> error WebSocket was closed before the connection code=4410 reason=no_working_page"
+    )
+    message = get_user_facing_exception_message(Exception(raw_error))
+    assert "already closed" not in message
+    assert "Failed to connect to the browser session" in message
+
+
+def test_unknown_error_still_redacts_cdp_endpoints_for_session_closed_error() -> None:
+    # SKY-13502 split _is_browser_connection_error's consumers: the narrow session-closed test
+    # picks the message, but redaction routing must keep the broad net — a session-closed CDP
+    # failure still echoes endpoint URLs carrying host, session tokens, or credentials.
+    inner_exception = Exception(
+        "browserType.connectOverCDP: WebSocket error: "
+        "wss://user:secret@remote.example.internal/session/tok-9f3a?apiKey=SEKRET "
+        "fetching https://remote.example.internal/json/version?token=SEKRET failed "
+        "WebSocket was closed before the connection code=4410 reason=session closed"
+    )
+    message = str(UnknownErrorWhileCreatingBrowserContext("dynamic-browser", inner_exception))
+
+    assert "wss://" not in message
+    assert "https://" not in message
+    assert "SEKRET" not in message
+    assert "tok-9f3a" not in message
+    assert "remote.example.internal" not in message
+    assert "[remote browser endpoint]" in message
 
 
 def test_non_browser_error_not_intercepted() -> None:

@@ -1,6 +1,11 @@
 import { describe, expect, test } from "vitest";
 
-import { ActionsApiResponse, Status } from "@/api/types";
+import {
+  ActionsApiResponse,
+  Status,
+  TaskV2,
+  type WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem,
@@ -11,6 +16,8 @@ import {
   buildBlockStatusMap,
   buildFilmstrip,
   finalizedRunStatus,
+  formatRunTimesTooltip,
+  runHasOutputs,
   runOutcomeFromStatus,
 } from "./runProjections";
 
@@ -125,6 +132,184 @@ describe("finalizedRunStatus", () => {
     expect(finalizedRunStatus(Status.Terminated)).toBe(Status.Terminated);
     expect(finalizedRunStatus(Status.TimedOut)).toBe(Status.TimedOut);
     expect(finalizedRunStatus(Status.Canceled)).toBe(Status.Canceled);
+  });
+});
+
+describe("runHasOutputs", () => {
+  type Source = NonNullable<Parameters<typeof runHasOutputs>[0]>;
+
+  function outputsSource(overrides: Partial<Source> = {}): Source {
+    return {
+      outputs: null,
+      errors: null,
+      downloaded_files: null,
+      downloaded_file_urls: null,
+      task_v2: null,
+      webhook_failure_reason: null,
+      ...overrides,
+    };
+  }
+
+  function taskV2(overrides: Partial<TaskV2> = {}): TaskV2 {
+    return {
+      task_id: "task_1",
+      status: Status.Completed,
+      workflow_run_id: null,
+      workflow_id: null,
+      workflow_permanent_id: null,
+      prompt: null,
+      url: null,
+      created_at: "2026-01-01T00:00:00Z",
+      modified_at: "2026-01-01T00:00:00Z",
+      output: null,
+      summary: null,
+      webhook_callback_url: null,
+      webhook_failure_reason: null,
+      totp_verification_url: null,
+      totp_identifier: null,
+      proxy_location: null,
+      extra_http_headers: null,
+      ...overrides,
+    };
+  }
+
+  test("false for a missing run", () => {
+    expect(runHasOutputs(null)).toBe(false);
+    expect(runHasOutputs(undefined)).toBe(false);
+  });
+
+  test("false when every signal is empty", () => {
+    expect(runHasOutputs(outputsSource())).toBe(false);
+  });
+
+  test("true for a record-shaped error", () => {
+    expect(
+      runHasOutputs(outputsSource({ errors: [{ error_code: "E1" }] })),
+    ).toBe(true);
+  });
+
+  test("false when the errors array holds no record entries", () => {
+    // Mirrors RunView's normalizeRunOutputErrors isRecord filter.
+    const nonRecordErrors = ["not a record"] as unknown as Array<
+      Record<string, unknown>
+    >;
+    expect(runHasOutputs(outputsSource({ errors: nonRecordErrors }))).toBe(
+      false,
+    );
+  });
+
+  test("true when extracted_information has a non-null value", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({ outputs: { extracted_information: { a: "b" } } }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false when extracted_information values are all null", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({ outputs: { extracted_information: { a: null } } }),
+      ),
+    ).toBe(false);
+  });
+
+  // extracted_information is cast to Record<string, unknown> without a runtime
+  // check (RunView.tsx), so a string/array/etc. flows through Object.values
+  // as-is. These pin that behavior against a well-meaning isRecord "cleanup".
+  test("true when extracted_information is a plain string", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({ outputs: { extracted_information: "some text" } }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false when extracted_information is explicitly null", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({ outputs: { extracted_information: null } }),
+      ),
+    ).toBe(false);
+  });
+
+  test("false when extracted_information is an empty object", () => {
+    expect(
+      runHasOutputs(outputsSource({ outputs: { extracted_information: {} } })),
+    ).toBe(false);
+  });
+
+  test("true when outputs carry a code block's returned field", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({
+          outputs: {
+            get_stars_output: {
+              star_count: 22600,
+              evidence_text: "22.6k stars",
+            },
+            extracted_information: [],
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("false when outputs hold only an empty extracted_information array", () => {
+    expect(
+      runHasOutputs(outputsSource({ outputs: { extracted_information: [] } })),
+    ).toBe(false);
+  });
+
+  test("true for rich downloaded_files", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({
+          downloaded_files: [
+            {
+              url: "https://example.test/a.pdf",
+              filename: "a.pdf",
+              checksum: null,
+              file_size: null,
+              modified_at: null,
+              artifact_id: null,
+            },
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("true for downloaded_file_urls with no rich file metadata", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({
+          downloaded_file_urls: ["https://example.test/a.pdf"],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("true for a task 2.0 observer output", () => {
+    expect(
+      runHasOutputs(outputsSource({ task_v2: taskV2({ output: { a: 1 } }) })),
+    ).toBe(true);
+  });
+
+  test("true for a task 2.0 webhook failure reason", () => {
+    expect(
+      runHasOutputs(
+        outputsSource({
+          task_v2: taskV2({ webhook_failure_reason: "x" }),
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  test("true for a top-level webhook failure reason with no task_v2", () => {
+    expect(runHasOutputs(outputsSource({ webhook_failure_reason: "x" }))).toBe(
+      true,
+    );
   });
 });
 
@@ -282,5 +467,40 @@ describe("buildActionIndex", () => {
 
   test("empty timeline yields an empty index", () => {
     expect(buildActionIndex(undefined).size).toBe(0);
+  });
+});
+
+describe("formatRunTimesTooltip", () => {
+  function run(
+    overrides: Partial<WorkflowRunStatusApiResponseWithWorkflow> = {},
+  ): WorkflowRunStatusApiResponseWithWorkflow {
+    return {
+      status: Status.Completed,
+      created_at: "2026-06-30T23:59:00Z",
+      queued_at: "2026-06-30T23:59:30Z",
+      started_at: "2026-07-01T00:00:00Z",
+      finished_at: "2026-07-01T00:05:00Z",
+      ...overrides,
+    } as WorkflowRunStatusApiResponseWithWorkflow;
+  }
+
+  test("lists created, queued, started, finished for a finalized run", () => {
+    const title = formatRunTimesTooltip(run());
+    expect(title).toContain("Created");
+    expect(title).toContain("Queued");
+    expect(title).toContain("Started");
+    expect(title).toContain("Finished");
+    expect(title.split("\n")).toHaveLength(4);
+  });
+
+  test("omits absent timestamps and holds Finished until the run finalizes", () => {
+    const title = formatRunTimesTooltip(
+      run({ status: Status.Running, queued_at: null, started_at: null }),
+    );
+    expect(title).toContain("Created");
+    expect(title).not.toContain("Queued");
+    expect(title).not.toContain("Started");
+    // finished_at is present but the run is not finalized → still hidden.
+    expect(title).not.toContain("Finished");
   });
 });

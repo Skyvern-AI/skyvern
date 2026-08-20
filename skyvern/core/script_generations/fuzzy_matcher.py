@@ -7,6 +7,7 @@ form-filling pipeline into a single, configurable implementation.
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 import structlog
 
@@ -99,26 +100,31 @@ def match_option(candidate: str, options: list[str], *, min_substring_len: int =
     return None
 
 
-def match_option_exact_or_stem(candidate: str, options: list[str], *, min_stem_len: int = 3) -> int | None:
-    """Find an exact or singular/plural stem option match.
+def match_option_exact_or_stem_with_tier(
+    candidate: str,
+    options: list[str],
+    *,
+    min_stem_len: int = 3,
+) -> tuple[int | None, Literal["exact", "stem"] | None]:
+    """Find an exact or singular/plural stem option match and its tier.
 
-    This deliberately excludes substring and word-overlap matches. Returning
-    None is the safe fallback signal for option matches that need the LLM path.
+    This deliberately excludes substring and word-overlap matches. A
+    ``(None, None)`` result is the safe fallback signal for the LLM path.
     """
     if not candidate or not options:
-        return None
+        return None, None
 
     candidate_norm = _normalize(candidate)
     exact_matches = [i for i, opt in enumerate(options) if _normalize(opt) == candidate_norm]
     if len(exact_matches) == 1:
-        return exact_matches[0]
+        return exact_matches[0], "exact"
     if len(exact_matches) > 1:
-        return None
+        return None, None
 
     # Simple trailing-s stripping is intentionally precision-first; min_stem_len keeps non-linguistic stems safe.
     candidate_stem = candidate_norm.rstrip("s")
     if len(candidate_stem) < min_stem_len:
-        return None
+        return None, None
 
     stem_matches = [
         i
@@ -126,6 +132,11 @@ def match_option_exact_or_stem(candidate: str, options: list[str], *, min_stem_l
         if len(opt_stem := _normalize(opt).rstrip("s")) >= min_stem_len and opt_stem == candidate_stem
     ]
     if len(stem_matches) == 1:
-        return stem_matches[0]
+        return stem_matches[0], "stem"
 
-    return None
+    return None, None
+
+
+def match_option_exact_or_stem(candidate: str, options: list[str], *, min_stem_len: int = 3) -> int | None:
+    """Find an exact or singular/plural stem option match."""
+    return match_option_exact_or_stem_with_tier(candidate, options, min_stem_len=min_stem_len)[0]

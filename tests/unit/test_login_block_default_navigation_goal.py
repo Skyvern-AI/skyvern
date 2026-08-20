@@ -76,3 +76,12 @@ class TestLoginBlockDefaultNavigationGoal:
         assert "credentials" in block.navigation_goal.lower()
         assert "password" in block.navigation_goal.lower()
         assert "login" in block.navigation_goal.lower()
+
+
+def test_login_block_preserves_include_action_history_in_verification() -> None:
+    block_yaml = LoginBlockYAML(label="login", include_action_history_in_verification=True)
+
+    block = _convert_login_block(block_yaml)
+
+    assert block_yaml.include_action_history_in_verification is True
+    assert block.include_action_history_in_verification is True

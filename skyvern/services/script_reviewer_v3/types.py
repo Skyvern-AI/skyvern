@@ -40,12 +40,13 @@ class FailureContext:
     failed_selector: str | None
     intention: str
     action_type: InterceptedActionType
-    value: str | None  # for fill / type / fill_autocomplete
+    value: str | None = dataclasses.field(repr=False)  # for fill / type / fill_autocomplete
     totp_identifier: str | None  # for fill with TOTP
     totp_url: str | None
     page: PlaywrightPage
     context: SkyvernContext
     episode_id: str
+    value_is_sensitive: bool = False
 
 
 @dataclasses.dataclass

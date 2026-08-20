@@ -1,5 +1,5 @@
 import { CopyIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Button } from "@/components/ui/button";
 
@@ -8,7 +8,7 @@ import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { convert } from "./workflowEditorUtils";
 
 function MakeACopyButton() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const createWorkflowMutation = useCreateWorkflowMutation();
 

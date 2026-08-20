@@ -792,6 +792,25 @@ class ScriptsRepository(BaseRepository):
             session.add(record)
             await session.commit()
 
+    @db_operation("update_workflow_script_status")
+    async def update_workflow_script_status(
+        self,
+        *,
+        workflow_script_id: str,
+        organization_id: str,
+        status: ScriptStatus,
+    ) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowScriptModel)
+                .where(
+                    WorkflowScriptModel.workflow_script_id == workflow_script_id,
+                    WorkflowScriptModel.organization_id == organization_id,
+                )
+                .values(status=status.value if isinstance(status, ScriptStatus) else status)
+            )
+            await session.commit()
+
     @db_operation("upsert_workflow_script")
     async def upsert_workflow_script(
         self,

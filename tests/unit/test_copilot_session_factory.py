@@ -3,13 +3,33 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+from structlog.testing import capture_logs
 
-def _mk_input_data(items: list[Any]) -> Any:
-    """Build a fake CallModelData payload with a model_data.input list."""
-    return SimpleNamespace(model_data=SimpleNamespace(input=list(items), instructions=None))
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.session_factory import (
+    copilot_call_model_input_filter,
+    make_copilot_call_model_input_filter,
+)
+from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
+
+
+def _image_parts(item: Any) -> list[Any]:
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [part for part in content if part.get("type") == "input_image"]
+
+
+def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(
+        pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+        supports_vision=supports_vision,
+    )
 
 
 class TestFirstTurnCompaction:
@@ -45,6 +65,71 @@ class TestFirstTurnCompaction:
             assert small_summary_marker in older["output"]
         for recent in recent_three:
             assert small_summary_marker not in recent["output"]
+
+    def test_recent_code_sized_output_survives_session_compaction(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        code_sized = json.dumps({"ok": True, "data": {"code": "await page.click()\n" * 400}})
+        assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-code", "output": code_sized},
+        ]
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert outputs[0]["output"] == code_sized
+
+    def test_recent_overcap_output_truncates_and_warns_on_session_path(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        oversized = "x" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-big", "output": oversized},
+        ]
+        with structlog.testing.capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items))
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert outputs[0]["output"].endswith("... [truncated]")
+        assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+
+    def test_emergency_truncation_logs_distinct_event_with_count(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.session_factory import make_copilot_call_model_input_filter
+
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            *({"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)),
+            {"type": "function_call_output", "call_id": "call-small", "output": "ok"},
+        ]
+        tight_filter = make_copilot_call_model_input_filter(token_budget=200)
+        with structlog.testing.capture_logs() as logs:
+            tight_filter(_mk_input_data(items))
+        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        assert [entry["cap"] for entry in emergency] == [2000, 300]
+        assert all(entry["truncated_count"] >= 2 for entry in emergency)
+
+    def test_soft_emergency_rung_spares_code_when_it_fits(self) -> None:
+        import structlog.testing
+
+        from skyvern.forge.sdk.copilot.session_factory import make_copilot_call_model_input_filter
+
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "please build me a workflow"},
+            {"type": "function_call_output", "call_id": "call-big", "output": "x" * 40_000},
+        ]
+        soft_filter = make_copilot_call_model_input_filter(token_budget=800)
+        with structlog.testing.capture_logs() as logs:
+            result = soft_filter(_mk_input_data(items))
+        emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
+        assert [entry["cap"] for entry in emergency] == [2000]
+        outputs = [it for it in result.input if it.get("type") == "function_call_output"]
+        assert 2000 <= len(outputs[0]["output"]) <= 2020
 
     def test_filter_summarizes_older_function_call_args_on_first_turn(self) -> None:
         """F3/CORR-2 guard: older `function_call` items get their bulky
@@ -137,3 +222,120 @@ class TestSessionInputCallback:
         assert len(combined) == 5
         assert combined[0] == goal
         assert combined[-1] == new[0]
+
+
+class TestModelInputCapture:
+    """COPILOT_DUMP_MODEL_INPUTS records what the model actually receives, so a prompt or
+    tool-schema change can be replayed offline instead of re-run live.
+    """
+
+    def test_capture_is_inert_and_lossless_when_unset(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.delenv("COPILOT_DUMP_MODEL_INPUTS", raising=False)
+        items = [{"role": "user", "content": "build me a workflow"}]
+
+        result = copilot_call_model_input_filter(_mk_input_data(items))
+
+        assert result.input == items
+        assert list(tmp_path.iterdir()) == []
+
+    def test_capture_records_instructions_and_input(self, tmp_path: Any, monkeypatch: Any) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        items = [
+            {"role": "user", "content": "output the number of azure errors"},
+            {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
+        ]
+
+        copilot_call_model_input_filter(_mk_input_data(items, instructions="SYSTEM PROMPT"))
+
+        dumps = sorted(tmp_path.glob("call-*.json"))
+        assert len(dumps) == 1
+        payload = json.loads(dumps[0].read_text())
+        assert payload["instructions"] == "SYSTEM PROMPT"
+        assert payload["input"] == items
+        # A context the derivation helper cannot read must not cost the run its model call.
+        assert payload["requested_output_paths"] == []
+
+    def test_capture_records_a_call_whichever_shape_carries_the_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A live turn dumped 2 of 34 calls: the copilot's own hand over the context directly, and
+        # reading it as a wrapper lost every one of them to an AttributeError (SKY-13226).
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        items = [{"role": "user", "content": "read the visitor count"}]
+
+        copilot_call_model_input_filter(_mk_input_data(items, context=SimpleNamespace()))
+        copilot_call_model_input_filter(_mk_input_data(items, context=RunContextWrapper(context=SimpleNamespace())))
+
+        assert len(sorted(tmp_path.glob("call-*.json"))) == 2
+
+
+def test_model_input_pipeline_has_no_generated_offer_special_case() -> None:
+    from skyvern.forge.sdk.copilot import enforcement
+
+    assert not hasattr(enforcement, "collapse_superseded_synthesized_offers")
+
+
+class TestStagedScreenshotBinding:
+    """A frame a tool captured mid-run must reach the acting model on the same turn."""
+
+    def test_staged_frame_rides_as_the_last_item(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        with capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert [len(_image_parts(item)) for item in result.input] == [0, 1]
+        assert any(log["event"] == "Injecting screenshot user message" for log in logs)
+
+    def test_a_second_pass_over_the_same_context_still_carries_the_frame(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        first = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+        second = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert len(_image_parts(first.input[-1])) == 1
+        assert len(_image_parts(second.input[-1])) == 1
+        assert len(ctx.pending_screenshots) == 1
+
+    def test_a_non_vision_fallback_model_gets_no_image(self) -> None:
+        # The frame was staged while the primary was still vision-capable; a retriable failure
+        # can swap in a fallback that cannot accept images.
+        ctx = _ctx_with_staged_frame(supports_vision=False)
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert not any(_image_parts(item) for item in result.input)
+        assert len(ctx.pending_screenshots) == 1
+
+    def test_call_with_nothing_staged_carries_no_image(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[])
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+
+        with capture_logs() as logs:
+            result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert result.input == items
+        assert not any(_image_parts(item) for item in result.input)
+        assert not any(log["event"] == "Injecting screenshot user message" for log in logs)
+
+    def test_aggressive_prune_drops_the_bound_frame_like_any_other_screenshot(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items: list[dict[str, Any]] = [{"role": "user", "content": "build me a workflow"}]
+        for i in range(12):
+            items.append({"type": "function_call", "call_id": f"call-{i}", "name": "observe", "arguments": "{}"})
+            items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=ctx))
+
+        assert not any(_image_parts(item) for item in result.input)

@@ -137,6 +137,33 @@ async def test_list_includes_search_key_only_when_search_is_present(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_list_accepts_query_alias_for_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    request_mock = _patch_skyvern_list_response(monkeypatch, payload=[])
+
+    result = await mcp_workflow.skyvern_workflow_list(query="invoice", page=2, page_size=5)
+
+    assert result["ok"] is True, result
+    params = request_mock.await_args.kwargs["params"]
+    assert params == {
+        "search_key": "invoice",
+        "page": 2,
+        "page_size": 5,
+        "only_workflows": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_conflicting_search_and_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    request_mock = _patch_skyvern_list_response(monkeypatch, payload=[])
+
+    result = await mcp_workflow.skyvern_workflow_list(search="invoice", query="receipt")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_INPUT"
+    request_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_raw_list_uses_fern_http_wrapper_auth_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     """The raw bypass still uses Fern's HTTP wrapper, including auth and query encoding."""
     seen_requests: list[httpx.Request] = []

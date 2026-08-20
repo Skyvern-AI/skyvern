@@ -21,8 +21,25 @@ const credentialBroadcastChannel: BroadcastChannel | null =
     ? new BroadcastChannel(BROADCAST_CHANNEL_NAME)
     : null;
 
-function broadcastCredentialsChanged() {
-  credentialBroadcastChannel?.postMessage("invalidate");
+// The channel can be disposed by the runtime (e.g. an embedded webview tearing
+// down its native bridge during auth navigation) before this fires, in which
+// case postMessage throws InvalidStateError. Cross-tab invalidation is
+// best-effort, so swallow the failure rather than surfacing it.
+export function safePostCredentialsInvalidate(
+  channel: Pick<BroadcastChannel, "postMessage"> | null,
+): void {
+  try {
+    channel?.postMessage("invalidate");
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "InvalidStateError") {
+      return;
+    }
+    throw error;
+  }
+}
+
+export function broadcastGoogleOAuthCredentialsChanged() {
+  safePostCredentialsInvalidate(credentialBroadcastChannel);
 }
 
 export function normalizeGoogleOAuthScopes(
@@ -104,7 +121,13 @@ function extractApiErrorMessage(error: unknown, fallback: string): string {
 
 export function useGoogleOAuthCredentials({
   enabled = true,
-}: { enabled?: boolean } = {}) {
+  includeEmail = false,
+  refetchOnMount,
+}: {
+  enabled?: boolean;
+  includeEmail?: boolean;
+  refetchOnMount?: boolean | "always";
+} = {}) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -126,11 +149,17 @@ export function useGoogleOAuthCredentials({
     isFetching,
     error,
   } = useQuery<GoogleOAuthCredential[]>({
-    queryKey: ["googleOAuthCredentials"],
+    queryKey: includeEmail
+      ? ["googleOAuthCredentials", "includeEmail"]
+      : ["googleOAuthCredentials"],
     enabled,
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const response = await client.get("/google/oauth/credentials");
+      const response = await client.get(
+        includeEmail
+          ? "/google/oauth/credentials?include_email=true"
+          : "/google/oauth/credentials",
+      );
       return (response.data as GoogleOAuthCredentialListResponse).credentials;
     },
     // Moderate staleness so multiple GoogleOAuthCredentialSelector instances
@@ -138,6 +167,7 @@ export function useGoogleOAuthCredentials({
     // window focus. The integrations directory and the OAuth callback path
     // explicitly invalidate this query, so user-visible updates remain prompt.
     staleTime: 30_000,
+    refetchOnMount,
     refetchOnWindowFocus: true,
   });
 
@@ -171,7 +201,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Google account connected successfully",
@@ -205,7 +235,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Connection renamed",
@@ -232,7 +262,7 @@ export function useGoogleOAuthCredentials({
       queryClient.invalidateQueries({
         queryKey: ["googleOAuthCredentials"],
       });
-      broadcastCredentialsChanged();
+      broadcastGoogleOAuthCredentialsChanged();
       toast({
         title: "Success",
         description: "Google credential disconnected",

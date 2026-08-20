@@ -10,9 +10,15 @@ import { useSelectedCredentialTotpIdentifier } from "./useSelectedCredentialTotp
 const credentialsQuery = vi.hoisted(() => ({
   data: [] as Array<unknown>,
 }));
+const credentialQuery = vi.hoisted(() => ({
+  data: undefined as unknown,
+}));
 
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: () => ({ data: credentialsQuery.data }),
+}));
+vi.mock("@/routes/workflows/hooks/useCredentialQuery", () => ({
+  useCredentialQuery: () => ({ data: credentialQuery.data }),
 }));
 
 const PASSWORD_CRED = {
@@ -33,6 +39,7 @@ const PASSWORD_CRED_NO_TOTP = {
 
 beforeEach(() => {
   credentialsQuery.data = [];
+  credentialQuery.data = undefined;
   useWorkflowParametersStore.setState({ parameters: [] });
 });
 
@@ -111,5 +118,24 @@ describe("useSelectedCredentialTotpIdentifier", () => {
       useSelectedCredentialTotpIdentifier("missing_key"),
     );
     expect(result.current).toBeNull();
+  });
+
+  test("resolves the identifier from the detail query when the first page omits the credential", () => {
+    credentialQuery.data = PASSWORD_CRED;
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "my_cred",
+          parameterType: "credential",
+          credentialId: "cred-1",
+        },
+      ],
+    });
+
+    const { result } = renderHook(() =>
+      useSelectedCredentialTotpIdentifier("my_cred"),
+    );
+
+    expect(result.current).toBe("alice@example.com");
   });
 });

@@ -1,17 +1,27 @@
+from __future__ import annotations
+
+import _thread
 import asyncio
 import atexit
 import json
 import logging
 import os
+import select
 import shutil
+import signal
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Annotated, List, Literal, Optional
+import threading
+import time
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from skyvern.library.local_browser_profile import LocalBrowserProfile
+
 import psutil
+import structlog
 import typer
 import uvicorn
 from dotenv import set_key
@@ -34,7 +44,17 @@ from skyvern.utils.env_paths import (
 )
 
 run_app = typer.Typer(help="Commands to run Skyvern services such as the API server or UI.")
+LOG = structlog.get_logger(__name__)
 _mcp_cleanup_done = False
+_mcp_cleanup_in_progress = False
+_mcp_eof_shutdown_requested = False
+_mcp_main_task: asyncio.Task[Any] | None = None
+_mcp_shutdown_exit_code: int | None = None
+_MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS = 5.0
+_MCP_NATIVE_EOF_GRACE_SECONDS = 0.25
+# The EOF watcher's os._exit(0) preempts cleanup unconditionally, so this must exceed
+# the cloud path's graceful join plus process-kill wait.
+_MCP_EOF_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 def _default_host() -> str:
@@ -43,48 +63,253 @@ def _default_host() -> str:
 
 
 async def _cleanup_mcp_resources() -> None:
+    from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
     from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import close_current_session  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import close_all_sessions  # noqa: PLC0415
 
     try:
-        await close_current_session()
+        await shutdown_action_log_worker()
     finally:
         try:
-            await close_skyvern()
+            await close_all_sessions()
         finally:
-            await close_auth_db()
+            try:
+                await close_skyvern()
+            finally:
+                await close_auth_db()
 
 
 def _cleanup_mcp_resources_blocking() -> None:
-    global _mcp_cleanup_done
-    if _mcp_cleanup_done:
+    global _mcp_cleanup_done, _mcp_cleanup_in_progress
+    # CPython runs signal handlers on the main thread, and all callers stay on that thread.
+    if _mcp_cleanup_done or _mcp_cleanup_in_progress:
         return
+    _mcp_cleanup_in_progress = True
 
     try:
-        asyncio.run(_cleanup_mcp_resources())
+        try:
+            local_browser_identity = _current_local_browser_identity()
+        except Exception:
+            LOG.warning("Failed to identify the local MCP browser", exc_info=True)
+            local_browser_identity = None
+        # In stdio, this main-thread read and a cleanup thread both resolve _global_session because
+        # ContextVars are not inherited. The exclusive mode means local identity cannot hide a cloud close.
+        if local_browser_identity is not None:
+            try:
+                _cleanup_local_browser_from_identity(local_browser_identity, event_prefix="mcp_local_browser")
+            except Exception:
+                LOG.warning("MCP local browser cleanup failed", exc_info=True)
+        else:
+            cleanup_errors: list[BaseException] = []
+
+            def run_cleanup() -> None:
+                try:
+                    asyncio.run(_cleanup_mcp_resources())
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            cleanup_thread = threading.Thread(target=run_cleanup, name="skyvern-mcp-cleanup", daemon=True)
+            cleanup_thread.start()
+            cleanup_thread.join(_MCP_GRACEFUL_CLEANUP_TIMEOUT_SECONDS)
+            if cleanup_thread.is_alive():
+                LOG.warning("MCP graceful cleanup timed out")
+            elif cleanup_errors:
+                error = cleanup_errors[0]
+                LOG.warning("MCP graceful cleanup failed", exc_info=(type(error), error, error.__traceback__))
+    finally:
         _mcp_cleanup_done = True
-    except Exception:
-        logging.getLogger(__name__).warning("MCP cleanup failed", exc_info=True)
+        _mcp_cleanup_in_progress = False
 
 
 def _cleanup_mcp_resources_sync() -> None:
-    """Atexit callback for MCP cleanup. Skips if an event loop is still running
-    because asyncio.run() cannot be called inside a running loop. This means
-    cleanup is best-effort for signal-based exits (e.g. SIGTERM) that fire atexit
-    while the MCP server's loop is still alive -- the finally block in run_mcp()
-    handles normal shutdown instead."""
-    logger = logging.getLogger(__name__)
+    """Atexit callback for MCP cleanup."""
+    _cleanup_mcp_resources_blocking()
+
+
+def _current_local_browser_identity() -> tuple[str | None, bool, LocalBrowserProfile | None] | None:
+    from skyvern.cli.core.session_manager import get_current_session  # noqa: PLC0415
+
+    current = get_current_session()
+    if current.context is None or current.context.mode != "local" or current.browser is None:
+        return None
+    return (
+        current.browser.local_user_data_dir,
+        current.browser.local_user_data_dir_owned,
+        current.browser.local_browser_profile,
+    )
+
+
+def _cleanup_local_browser_from_identity(
+    identity: tuple[str | None, bool, LocalBrowserProfile | None],
+    *,
+    event_prefix: str,
+) -> None:
+    from skyvern.library import local_browser_profile  # noqa: PLC0415
+
+    user_data_dir, owned, profile = identity
+    if owned and user_data_dir:
+        if not local_browser_profile.cleanup_local_browser_profile(profile or user_data_dir):
+            LOG.warning(f"{event_prefix}_profile_cleanup_deferred", user_data_dir=user_data_dir)
+    elif user_data_dir and not local_browser_profile.terminate_local_browser_processes(user_data_dir):
+        LOG.warning(f"{event_prefix}_termination_incomplete", user_data_dir=user_data_dir)
+
+
+def _watch_stdin_eof(
+    stop: threading.Event,
+    shutdown_complete: threading.Event,
+    *,
+    stdin_fd: int | None = None,
+    request_shutdown: Any | None = None,
+    force_exit: Any | None = None,
+    native_eof_grace: float = _MCP_NATIVE_EOF_GRACE_SECONDS,
+    shutdown_timeout: float = _MCP_EOF_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    def request_bounded_shutdown() -> None:
+        global _mcp_eof_shutdown_requested
+        if shutdown_complete.wait(native_eof_grace) or stop.is_set():
+            return
+        _mcp_eof_shutdown_requested = True
+        (request_shutdown or _thread.interrupt_main)()
+        if shutdown_complete.wait(shutdown_timeout):
+            return
+        try:
+            local_browser_identity = _current_local_browser_identity()
+            if local_browser_identity is not None:
+                _cleanup_local_browser_from_identity(local_browser_identity, event_prefix="mcp_eof_local_browser")
+        except Exception:
+            LOG.warning("MCP EOF fallback cleanup failed", exc_info=True)
+        (force_exit or os._exit)(0)
+
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        _cleanup_mcp_resources_blocking()
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            shutdown_events = select.POLLHUP | select.POLLERR | select.POLLNVAL
+            poller.register(sys.stdin.fileno() if stdin_fd is None else stdin_fd, shutdown_events)
+            while not stop.is_set():
+                if any(event & shutdown_events for _fd, event in poller.poll(100)):
+                    if not stop.is_set():
+                        request_bounded_shutdown()
+                    return
+            return
+
+        peek = cast(Any, sys.stdin.buffer).peek
+        while not stop.is_set():  # pragma: no cover - Windows pipe fallback
+            if not peek(1):
+                if not stop.is_set():
+                    request_bounded_shutdown()
+                return
+            stop.wait(0.05)
+    except (AttributeError, OSError, ValueError):
+        LOG.warning("MCP stdin EOF watcher failed", exc_info=True)
+
+
+def _start_stdin_eof_watcher() -> tuple[threading.Event, threading.Event]:
+    stop, shutdown_complete = threading.Event(), threading.Event()
+    threading.Thread(
+        target=_watch_stdin_eof,
+        args=(stop, shutdown_complete),
+        name="skyvern-mcp-stdin-eof",
+        daemon=True,
+    ).start()
+    return stop, shutdown_complete
+
+
+def _handle_mcp_shutdown_signal(_signum: int, _frame: Any) -> None:
+    global _mcp_shutdown_exit_code
+    if _mcp_cleanup_in_progress:
         return
+    # Exit 0 only for the EOF watcher's synthetic SIGINT; a real SIGTERM keeps 143.
+    eof_initiated = _mcp_eof_shutdown_requested and _signum == signal.SIGINT
+    _mcp_shutdown_exit_code = 0 if eof_initiated else 128 + _signum
+    if _mcp_main_task is None:
+        raise SystemExit(_mcp_shutdown_exit_code)
+    # Cancel only the wrapper so its finally drains sibling tasks before asyncio.run closes.
+    _mcp_main_task.cancel()
 
-    logger.debug("Skipping MCP cleanup because event loop is still running")
+
+def _log_mcp_boot_timings(
+    *,
+    transport: str,
+    env_started_at: float,
+    imports_started_at: float,
+    imports_finished_at: float,
+) -> None:
+    """Attribute the spawn-to-serving window, which MCP clients cap at tens of seconds."""
+    try:
+        spawn_ms = round((time.time() - psutil.Process().create_time()) * 1000)
+    except Exception:
+        spawn_ms = None
+    LOG.info(
+        "mcp_boot_ready",
+        transport=transport,
+        spawn_to_serve_ms=spawn_ms,
+        env_ms=round((imports_started_at - env_started_at) * 1000),
+        tool_import_ms=round((imports_finished_at - imports_started_at) * 1000),
+    )
 
 
-def get_pids_on_port(port: int) -> List[int]:
+async def _start_browser_extension_bridge() -> None:
+    from skyvern.browser_extension.errors import BrowserExtensionError  # noqa: PLC0415
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+
+    try:
+        await BrowserExtensionRuntime.get_or_start()
+    except BrowserExtensionError as exc:
+        LOG.warning(
+            "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
+            error=str(exc),
+        )
+    except Exception:
+        LOG.warning(
+            "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
+            exc_info=True,
+        )
+
+
+async def _settle_browser_extension_startup(startup: asyncio.Task[None]) -> None:
+    """Leave no half-started bridge behind: a relay that binds after we read the instance would leak its port."""
+    startup.cancel()
+    try:
+        await startup
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        LOG.warning("Browser extension bridge startup cleanup failed", exc_info=True)
+
+
+async def _run_mcp_with_cleanup(run_async: Any, *, browser_extension: bool = False, **kwargs: Any) -> None:
+    global _mcp_cleanup_done, _mcp_cleanup_in_progress, _mcp_main_task
+    current_task = asyncio.current_task()
+    _mcp_main_task = current_task
+    extension_startup: asyncio.Task[None] | None = None
+    try:
+        if browser_extension:
+            # Serving `initialize` must not wait on the relay: clients give the server tens of seconds
+            # to mount, and browser tools already start the bridge on demand.
+            extension_startup = asyncio.create_task(_start_browser_extension_bridge())
+        await run_async(**kwargs)
+    finally:
+        _mcp_cleanup_in_progress = True
+        try:
+            try:
+                if extension_startup is not None:
+                    await _settle_browser_extension_startup(extension_startup)
+                await _cleanup_mcp_resources()
+            finally:
+                from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+
+                extension_runtime = BrowserExtensionRuntime.instance()
+                if extension_runtime is not None:
+                    await extension_runtime.shutdown()
+        finally:
+            _mcp_cleanup_done = True
+            _mcp_cleanup_in_progress = False
+            if _mcp_main_task is current_task:
+                _mcp_main_task = None
+
+
+def get_pids_on_port(port: int) -> list[int]:
     """Return a list of PIDs listening on the given port."""
     pids = []
     try:
@@ -96,7 +321,7 @@ def get_pids_on_port(port: int) -> List[int]:
     return list(set(pids))
 
 
-def kill_pids(pids: List[int]) -> None:
+def kill_pids(pids: list[int]) -> None:
     """Kill the given list of PIDs in a cross-platform way."""
     host_system = detect_os()
     for pid in pids:
@@ -132,7 +357,12 @@ def run_server() -> None:
         access_log=False,
         log_config={"version": 1, "disable_existing_loggers": False},
         factory=True,
+        # uvloop can double-close a recycled fd after create_connection cancellation (MagicStack/uvloop#740).
+        loop="asyncio",
         ws="websockets-sansio",
+        # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=120.0,
     )
 
 
@@ -358,6 +588,8 @@ def run_dev() -> None:
             "--port",
             str(skyvern_settings.PORT),
             "--factory",
+            "--loop",
+            "asyncio",
             "--ws",
             "websockets-sansio",
         ],
@@ -392,7 +624,7 @@ def run_dev() -> None:
 class _ServerCardMiddleware:
     """Serve /.well-known/mcp/server-card.json for HTTP MCP transports."""
 
-    def __init__(self, app: "ASGIApp", transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
+    def __init__(self, app: ASGIApp, transport_type: str, host: str, port: int, mcp_path: str = "/mcp") -> None:
         from skyvern.cli.core.server_card import build_server_card  # noqa: PLC0415
 
         self.app = app
@@ -402,7 +634,7 @@ class _ServerCardMiddleware:
         endpoint_url = os.environ.get("SKYVERN_MCP_PUBLIC_URL") or f"http://{host_part}:{port}{mcp_path}"
         self.card = build_server_card(self.transport_type, endpoint_url)
 
-    async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope["path"] == "/.well-known/mcp/server-card.json":
             cors_headers = {
                 "Access-Control-Allow-Origin": "*",
@@ -428,9 +660,21 @@ def run_mcp(
             help="MCP transport: stdio (default), sse, or streamable-http.",
         ),
     ] = "stdio",
+    scope: Annotated[
+        Literal["all", "operate", "build", "browser", "lean"],
+        typer.Option("--scope", help="MCP tool scope: all (default), operate, build, browser, or lean."),
+    ] = "all",
     host: Annotated[
-        str, typer.Option("--host", help="Host for HTTP transports.")
-    ] = _default_host(),  # sys.platform is constant; safe at import time
+        str,
+        typer.Option(
+            "--host",
+            help=(
+                "Host for HTTP transports. Defaults to loopback; pass 0.0.0.0 explicitly to listen on all "
+                "interfaces. Binding wider does not widen the browser Origin allowlist: requests from a browser "
+                "are limited to loopback and Claude origins, so a browser UI on another host is answered with 403."
+            ),
+        ),
+    ] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help="Port for HTTP transports.")] = 8000,
     path: Annotated[str, typer.Option("--path", help="HTTP endpoint path for MCP transport.")] = "/mcp",
     stateless_http: Annotated[
@@ -447,44 +691,138 @@ def run_mcp(
             help="Return full tool responses including sdk_equivalent, browser_context, and timing.",
         ),
     ] = False,
+    browser_extension: Annotated[
+        bool,
+        typer.Option(
+            "--browser-extension/--no-browser-extension",
+            help="Start the relay for controlling Chrome through the Skyvern browser extension.",
+        ),
+    ] = False,
 ) -> None:
-    """Run the MCP server with configurable transport for local or remote hosting."""
+    """Run the MCP server with configurable transport for local or remote hosting.
+
+    Remote hosting serves non-browser clients. Browser callers stay restricted to the loopback and Claude
+    origins enforced by OriginValidationMiddleware, which takes no configuration on this path.
+    """
+    global _mcp_eof_shutdown_requested, _mcp_shutdown_exit_code
+    _mcp_eof_shutdown_requested = False
+    _mcp_shutdown_exit_code = None
+    if browser_extension and transport != "stdio":
+        raise typer.BadParameter("--browser-extension requires --transport stdio", param_hint="--browser-extension")
+    if browser_extension:
+        os.environ.setdefault("BROWSER_TYPE", "extension-connect")
+    profile_sweep_thread: threading.Thread | None = None
+    env_started_at = time.monotonic()
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
+    try:
+        from skyvern.library.local_browser_profile import (  # noqa: PLC0415
+            sweep_local_browser_profiles_once_in_background,
+        )
+
+        profile_sweep_thread = sweep_local_browser_profiles_once_in_background()
+    except Exception:
+        LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
+    imports_started_at = time.monotonic()
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
-    from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
+    from skyvern.cli.core.session_manager import (  # noqa: PLC0415
+        set_stateless_http_mode,
+        set_stdio_local_file_access_enabled,
+    )
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.instructions import instructions_for_scope  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.origin_middleware import OriginValidationMiddleware  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
 
+    mcp.instructions = instructions_for_scope(scope)
+    imports_finished_at = time.monotonic()
+    if scope != "all":
+        from skyvern.cli.mcp_tools.scopes import apply_scope  # noqa: PLC0415
+
+        apply_scope(mcp, scope)
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
-    configure_mcp_telemetry_runtime(server_mode="local_cli", transport=transport)
-    # atexit covers signal-based exits (SIGTERM); finally covers normal
-    # mcp.run() completion or unhandled exceptions. Both are needed because
-    # atexit doesn't fire on normal return and finally doesn't fire on signals.
+    boot_ready_logged = False
+
+    def log_mcp_boot_ready() -> None:
+        nonlocal boot_ready_logged
+        if boot_ready_logged:
+            return
+        boot_ready_logged = True
+        _log_mcp_boot_timings(
+            transport=transport,
+            env_started_at=env_started_at,
+            imports_started_at=imports_started_at,
+            imports_finished_at=imports_finished_at,
+        )
+
+    configure_mcp_telemetry_runtime(
+        server_mode="local_cli",
+        transport=transport,
+        boot_ready_callback=log_mcp_boot_ready,
+    )
+    # EOF dispatches the SIGINT cleanup handler; finally covers normal returns, with atexit as the last backstop.
     atexit.register(_cleanup_mcp_resources_sync)
     set_stateless_http_mode(stateless_http_enabled)
+    set_stdio_local_file_access_enabled(transport == "stdio")
     set_concise_responses(not verbose)
+    eof_watcher_stop: threading.Event | None = None
+    shutdown_complete: threading.Event | None = None
+    original_signal_handlers: dict[signal.Signals, Any] = {}
     try:
         if transport == "stdio":
-            mcp.run(transport="stdio")
+            original_signal_handlers[signal.SIGINT] = signal.signal(signal.SIGINT, _handle_mcp_shutdown_signal)
+            original_signal_handlers[signal.SIGTERM] = signal.signal(signal.SIGTERM, _handle_mcp_shutdown_signal)
+            eof_watcher_stop, shutdown_complete = _start_stdin_eof_watcher()
+            try:
+                asyncio.run(
+                    _run_mcp_with_cleanup(
+                        mcp.run_async,
+                        browser_extension=browser_extension,
+                        transport="stdio",
+                    )
+                )
+            except asyncio.CancelledError:
+                if _mcp_shutdown_exit_code is None:
+                    raise
+                raise SystemExit(_mcp_shutdown_exit_code) from None
             return
 
+        # Origin validation must precede MCPAPIKeyMiddleware: a hostile page riding a
+        # valid API key is already past the gate if auth resolves first. The server card
+        # stays outermost so discovery remains public.
         middleware = [
             Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
+            Middleware(OriginValidationMiddleware),
             Middleware(MCPAPIKeyMiddleware),
         ]
-        mcp.run(
-            transport=transport,
-            host=host,
-            port=port,
-            path=path,
-            middleware=middleware,
-            stateless_http=stateless_http_enabled,
+        asyncio.run(
+            _run_mcp_with_cleanup(
+                mcp.run_async,
+                browser_extension=browser_extension,
+                transport=transport,
+                host=host,
+                port=port,
+                path=path,
+                middleware=middleware,
+                stateless_http=stateless_http_enabled,
+            )
         )
     finally:
-        set_stateless_http_mode(False)
-        set_concise_responses(False)
-        _cleanup_mcp_resources_blocking()
+        if eof_watcher_stop is not None:
+            eof_watcher_stop.set()
+        try:
+            set_stateless_http_mode(False)
+            set_stdio_local_file_access_enabled(False)
+            set_concise_responses(False)
+        finally:
+            try:
+                for handled_signal, original_handler in original_signal_handlers.items():
+                    signal.signal(handled_signal, original_handler)
+                if shutdown_complete is not None:
+                    shutdown_complete.set()
+            finally:
+                if profile_sweep_thread is not None:
+                    profile_sweep_thread.join()
 
 
 def _normalize_mcp_path(path: str) -> str:
@@ -502,10 +840,10 @@ def _normalize_mcp_path(path: str) -> str:
 )
 def run_code(
     script_path: str = typer.Argument(..., help="Path to the Python script to run"),
-    params: List[str] = typer.Option([], "-p", help="Parameters in format param=value (without leading dash)"),
+    params: list[str] = typer.Option([], "-p", help="Parameters in format param=value (without leading dash)"),
     params_json: str = typer.Option(None, "--params", help="JSON string of parameters"),
     params_file: str = typer.Option(None, "--params-file", help="Path to JSON file with parameters"),
-    ai: Optional[str] = typer.Option(
+    ai: str | None = typer.Option(
         "fallback", "--ai", help="AI mode to use for the script. Options: fallback, proactive or None"
     ),
 ) -> None:

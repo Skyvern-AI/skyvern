@@ -6,8 +6,9 @@ Exercises the full embedded mode path:
 - LocalStorage with temp directory (rebuilt during bootstrap)
 - Lifecycle cleanup (engine disposal, client close)
 
-Requires OPENAI_API_KEY and Playwright browsers installed.
-Skipped in CI unless the key is available.
+Opt-in only: these launch a real browser and make real LLM calls, so they are
+skipped unless SKYVERN_EMBEDDED_E2E=1 is set (plus OPENAI_API_KEY and
+Playwright browsers installed).
 """
 
 import os
@@ -29,9 +30,12 @@ def _has_playwright_browser() -> bool:
         return False
 
 
+# Key-presence is not consent: every dev machine has OPENAI_API_KEY set, and these
+# tests open a visible browser and spend real LLM tokens. Require explicit opt-in.
 _skip_no_llm_or_browser = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY") or not _has_playwright_browser(),
-    reason="Requires OPENAI_API_KEY and Playwright browsers installed (run: playwright install chromium)",
+    not os.environ.get("SKYVERN_EMBEDDED_E2E") or not os.environ.get("OPENAI_API_KEY") or not _has_playwright_browser(),
+    reason="Opt-in E2E: set SKYVERN_EMBEDDED_E2E=1 with OPENAI_API_KEY and Playwright browsers installed "
+    "(run: playwright install chromium)",
 )
 
 
@@ -89,7 +93,7 @@ async def test_embedded_mode_page_extract() -> None:
     )
 
     try:
-        browser = await skyvern.launch_local_browser()
+        browser = await skyvern.launch_local_browser(headless=True)
         page = await browser.get_working_page()
         await page.goto("https://example.com")
         result = await page.extract("What is the title of this page?")

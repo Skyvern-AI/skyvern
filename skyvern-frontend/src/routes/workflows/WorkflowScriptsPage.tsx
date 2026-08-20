@@ -1,15 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -36,7 +27,6 @@ import {
   FileTextIcon,
   Pencil2Icon,
   PlayIcon,
-  ReloadIcon,
   TrashIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -72,7 +62,7 @@ function PinButton({
             size="icon"
             className={`size-8 ${
               script.is_pinned
-                ? "text-amber-500 hover:text-amber-400"
+                ? "text-amber-500 hover:text-amber-700 dark:hover:text-amber-400"
                 : "text-muted-foreground hover:text-foreground"
             }`}
             disabled={pinMutation.isPending}
@@ -136,45 +126,36 @@ function DeleteScriptButton({
   });
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8 text-muted-foreground hover:text-destructive"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <TrashIcon className="size-4" />
-        </Button>
-      </DialogTrigger>
-      <DialogContent onClick={(e) => e.stopPropagation()}>
-        <DialogHeader>
-          <DialogTitle>Delete script?</DialogTitle>
-          <DialogDescription>
-            This will delete the cached script for{" "}
-            <span className="font-mono font-semibold text-primary">
-              {script.cache_key_value}
-            </span>
-            . The script will be regenerated on the next run.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
-          </DialogClose>
-          <Button
-            variant="destructive"
-            onClick={() => deleteMutation.mutate()}
-            disabled={deleteMutation.isPending}
-          >
-            {deleteMutation.isPending && (
-              <ReloadIcon className="mr-2 size-4 animate-spin" />
-            )}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="size-8 text-muted-foreground hover:text-destructive"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen(true);
+        }}
+      >
+        <TrashIcon className="size-4" />
+      </Button>
+      <span onClick={(e) => e.stopPropagation()}>
+        <ConfirmDialog
+          open={open}
+          onOpenChange={setOpen}
+          title="Delete script?"
+          description={
+            <p>
+              This deletes the cached script for{" "}
+              <span className="font-mono">{script.cache_key_value}</span>. It's
+              regenerated on the next run.
+            </p>
+          }
+          reversible
+          isPending={deleteMutation.isPending}
+          onConfirm={() => deleteMutation.mutate()}
+        />
+      </span>
+    </>
   );
 }
 
@@ -211,38 +192,32 @@ function ClearAllScriptsButton({
   });
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="destructive" size="sm" disabled={disabled}>
-          <TrashIcon className="mr-2 size-4" />
-          Clear All Scripts
-        </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Clear all scripts?</DialogTitle>
-          <DialogDescription>
-            This will delete all cached scripts for this agent. Scripts will be
-            regenerated on the next run. This action cannot be undone.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <DialogClose asChild>
-            <Button variant="secondary">Cancel</Button>
-          </DialogClose>
-          <Button
-            variant="destructive"
-            onClick={() => clearMutation.mutate()}
-            disabled={clearMutation.isPending}
-          >
-            {clearMutation.isPending && (
-              <ReloadIcon className="mr-2 size-4 animate-spin" />
-            )}
-            Clear All
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <>
+      <Button
+        variant="destructive"
+        size="sm"
+        disabled={disabled}
+        onClick={() => setOpen(true)}
+      >
+        <TrashIcon className="mr-2 size-4" />
+        Clear All Scripts
+      </Button>
+      <ConfirmDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Clear all scripts?"
+        description={
+          <p>
+            This deletes all cached scripts for this agent. They're regenerated
+            on the next run.
+          </p>
+        }
+        reversible
+        confirmLabel="Clear All"
+        isPending={clearMutation.isPending}
+        onConfirm={() => clearMutation.mutate()}
+      />
+    </>
   );
 }
 
@@ -290,8 +265,8 @@ function ScriptsTableRows({
       <TableRow>
         <TableCell colSpan={TABLE_COL_COUNT}>
           <div className="flex flex-col items-center gap-2 py-12 text-center">
-            <FileTextIcon className="size-8 text-slate-400" />
-            <p className="text-sm text-slate-500">
+            <FileTextIcon className="size-8 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground dark:text-slate-500">
               No scripts yet. Scripts are created automatically when this agent
               runs with Code mode enabled.
             </p>
@@ -391,7 +366,7 @@ function ScriptRow({
             <div className="flex flex-col gap-0.5">
               <Link
                 to={`/agents/${workflowPermanentId}/scripts/${script.script_id}`}
-                className="font-mono text-sm text-blue-400 hover:underline"
+                className="font-mono text-sm text-blue-700 hover:underline dark:text-blue-400"
                 onClick={(e) => e.stopPropagation()}
               >
                 {script.cache_key_value || "(default)"}
@@ -438,7 +413,7 @@ function ScriptRow({
                   {group.run_id ? (
                     <Link
                       to={`/agents/${workflowPermanentId}/${group.run_id}/code`}
-                      className="font-mono text-xs text-blue-400 hover:underline"
+                      className="font-mono text-xs text-blue-700 hover:underline dark:text-blue-400"
                       onClick={(e) => e.stopPropagation()}
                     >
                       {group.run_id}
@@ -514,7 +489,7 @@ function WorkflowScriptsPage() {
             <>
               <Link
                 to={`/agents/${workflowPermanentId}/runs`}
-                className="text-lg font-semibold hover:text-blue-400 hover:underline"
+                className="text-lg font-semibold hover:text-blue-700 hover:underline dark:hover:text-blue-400"
               >
                 {workflow?.title}
               </Link>

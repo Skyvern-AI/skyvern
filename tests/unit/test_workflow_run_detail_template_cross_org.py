@@ -44,6 +44,7 @@ def _make_workflow_run() -> SimpleNamespace:
         status=WorkflowRunStatus.running,
         failure_reason=None,
         failure_category=None,
+        retried_from_workflow_run_id=None,
         proxy_location=None,
         webhook_callback_url=None,
         webhook_failure_reason=None,
@@ -60,6 +61,7 @@ def _make_workflow_run() -> SimpleNamespace:
         cached_credits_used=0,
         browser_session_id=None,
         browser_profile_id=None,
+        browser_seed_source=None,
         max_screenshot_scrolls=None,
         browser_address=None,
         run_with=None,
@@ -90,6 +92,7 @@ async def test_template_run_detail_resolves_via_run_join(monkeypatch: pytest.Mon
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
+                get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),
         ),
     )

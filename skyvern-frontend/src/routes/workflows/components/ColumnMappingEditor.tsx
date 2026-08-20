@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Cross2Icon, PlusIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/util/utils";
 import {
+  formatDestinationLabel,
   newEntryId,
   parseColumnMapping,
   resolveDestination,
@@ -54,15 +55,6 @@ function ColumnMappingEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
-  const headerOptions = useMemo(
-    () =>
-      headers.map((h) => ({
-        value: h.letter,
-        label: `${h.letter} - ${h.name}`,
-      })),
-    [headers],
-  );
-
   const commit = (next: ColumnMappingEntry[]) => {
     setEntries(next);
     onChange(serializeColumnMapping(next));
@@ -91,7 +83,7 @@ function ColumnMappingEditor({
 
   if (entries.length === 0) {
     return (
-      <div className="rounded-md border border-dashed border-slate-700 bg-slate-900/40 p-3 text-xs text-slate-400">
+      <div className="rounded-md border border-dashed border-border bg-slate-elevation1/40 p-3 text-xs text-muted-foreground">
         <div className="mb-2">
           No column mappings. Add mappings when your data is a list of objects;
           each source field maps to one sheet column.
@@ -112,7 +104,7 @@ function ColumnMappingEditor({
 
   return (
     <div className={cn("space-y-2", disabled && "opacity-60")}>
-      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 text-[0.65rem] uppercase tracking-wider text-slate-500">
+      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 text-[0.65rem] uppercase tracking-wider text-muted-foreground dark:text-slate-500">
         <Label className="text-[0.65rem]">Source field</Label>
         <Label className="text-[0.65rem]">
           Destination
@@ -142,12 +134,10 @@ function ColumnMappingEditor({
               disabled={disabled}
               onChange={(e) => updateLetter(index, e.target.value)}
             />
-            {headerOptions.length > 0 ? (
+            {headers.length > 0 ? (
               <datalist id={`column-mapping-headers-${idScope}-${rowId}`}>
-                {headerOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
+                {headers.map((h) => (
+                  <option key={h.letter} value={formatDestinationLabel(h)} />
                 ))}
               </datalist>
             ) : null}

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile, CreateBro
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.webeye.browser_profile_utils import operator_profile_generation, write_operator_profile_marker
 
 _default_profile_template_candidates = browser_profiles_route._default_browser_profile_template_candidates
 
@@ -81,10 +82,12 @@ def _build_client(
         delete_profile_blob=AsyncMock(),
         rate_limit_submit_run=AsyncMock(),
         get_workflow_browser_session_storage_key=AsyncMock(return_value="wp_1"),
+        engine_enabled=AsyncMock(return_value=True),
     )
 
     forge_app.set_app(
         SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(is_browser_memory_engine_enabled_for_org=mocks.engine_enabled),
             RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=mocks.rate_limit_submit_run),
             WORKFLOW_SERVICE=SimpleNamespace(
                 get_workflow_browser_session_storage_key=mocks.get_workflow_browser_session_storage_key,
@@ -267,14 +270,16 @@ def test_create_empty_profile_uses_latest_versioned_default_profile(
     tmp_path: Path,
 ) -> None:
     client, mocks = _build_client(monkeypatch)
+    monkeypatch.setattr(browser_profiles_route.settings, "DEFAULT_BROWSER_PROFILE_DIR", str(tmp_path))
     _make_default_profile_template(tmp_path, name="chrome_100", marker="old-template")
-    _make_default_profile_template(tmp_path, name="chrome_200", marker="new-template")
+    operator_template = _make_default_profile_template(tmp_path, name="chrome", marker="operator-template")
+    generation = operator_profile_generation(str(operator_template))
+    write_operator_profile_marker(str(tmp_path), "chrome", generation or "")
 
     async def _store_profile(**kwargs: str) -> None:
         directory = Path(kwargs["directory"])
-        assert (directory / "Default" / "template-marker.txt").read_text(encoding="utf-8") == "new-template"
+        assert (directory / "Default" / "template-marker.txt").read_text(encoding="utf-8") == "old-template"
 
-    monkeypatch.setattr(browser_profiles_route.settings, "DEFAULT_BROWSER_PROFILE_DIR", str(tmp_path))
     monkeypatch.setattr(
         browser_profiles_route,
         "_default_browser_profile_template_candidates",
@@ -284,8 +289,30 @@ def test_create_empty_profile_uses_latest_versioned_default_profile(
 
     response = client.post("/v1/browser_profiles/", json={"name": "fresh profile"})
 
+    marker_file = operator_template / "Default" / "template-marker.txt"
+    marker_file.write_text("repaired-template-with-new-size")
+
     assert response.status_code == 200
-    mocks.store_profile.assert_awaited_once()
+    assert browser_profiles_route._is_valid_browser_profile_template(operator_template)
+
+
+def test_empty_profile_seed_rejects_template_changed_during_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _make_default_profile_template(tmp_path, name="chrome")
+    profile_dir = tmp_path / "seed"
+    profile_dir.mkdir()
+    copy_template = browser_profiles_route._copy_browser_profile_template
+
+    def _copy_then_change(source: Path, destination: Path) -> None:
+        copy_template(source, destination)
+        (source / "Default" / "template-marker.txt").write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(browser_profiles_route, "_copy_browser_profile_template", _copy_then_change)
+    browser_profiles_route._seed_empty_browser_profile_directory(profile_dir)
+
+    assert (profile_dir / "Default" / "Preferences").read_text(encoding="utf-8") == "{}"
+    assert not (profile_dir / "Default" / "template-marker.txt").exists()
 
 
 def test_create_empty_profile_falls_back_to_minimal_seed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,6 +350,45 @@ def test_create_empty_profile_rate_limit_failure_does_not_seed_or_create(
     assert response.status_code == 429
     create_directory.assert_not_called()
     mocks.create_profile.assert_not_awaited()
+    mocks.store_profile.assert_not_awaited()
+
+
+def _workflow_run(**kwargs: object) -> SimpleNamespace:
+    base: dict[str, object] = {
+        "workflow_run_id": "wr_1",
+        "workflow_id": "w_1",
+        "workflow_permanent_id": "wp_1",
+        "browser_profile_id": None,
+        "browser_sink_profile_id": None,
+    }
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+def test_create_from_run_promotes_even_when_persist_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Browser Memory un-gate: any run with a persisted archive can be promoted, regardless of the
+    # legacy persist_browser_session flag. Fails on the old code (gate raised 400 when persist=False).
+    client, mocks = _build_client(monkeypatch)
+    mocks.get_workflow_run.return_value = _workflow_run()
+    mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wp_1", persist_browser_session=False)
+    mocks.retrieve_session.return_value = "/tmp/session-dir"
+
+    response = client.post("/v1/browser_profiles", json={"name": "promoted", "workflow_run_id": "wr_1"})
+
+    assert response.status_code == 200
+    mocks.store_profile.assert_awaited_once()
+
+
+def test_create_from_run_400_when_no_persisted_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, mocks = _build_client(monkeypatch)
+    monkeypatch.setattr(browser_profiles_route.asyncio, "sleep", AsyncMock())
+    mocks.get_workflow_run.return_value = _workflow_run()
+    mocks.get_workflow.return_value = SimpleNamespace(workflow_permanent_id="wp_1", persist_browser_session=True)
+    mocks.retrieve_session.return_value = None
+
+    response = client.post("/v1/browser_profiles", json={"name": "promoted", "workflow_run_id": "wr_1"})
+
+    assert response.status_code == 400
     mocks.store_profile.assert_not_awaited()
 
 
@@ -423,6 +489,7 @@ async def test_create_profile_from_workflow_run_still_stores_workflow_archive(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id=None,
+        browser_sink_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -458,6 +525,7 @@ async def test_create_profile_from_workflow_run_reads_managed_profile_blob(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_managed",
+        browser_sink_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -491,6 +559,7 @@ async def test_create_profile_from_workflow_run_falls_back_to_legacy_archive_for
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_managed",
+        browser_sink_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -527,6 +596,7 @@ async def test_create_profile_from_workflow_run_skips_user_profile_blob(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id="bp_user",
+        browser_sink_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -559,6 +629,7 @@ async def test_failed_workflow_run_profile_creation_hard_deletes_half_created_pr
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         browser_profile_id=None,
+        browser_sink_profile_id=None,
     )
     mocks.get_workflow.return_value = SimpleNamespace(
         workflow_permanent_id="wp_1",
@@ -671,3 +742,107 @@ def test_non_opted_in_session_returns_400(monkeypatch: pytest.MonkeyPatch) -> No
     assert "not configured to generate a browser profile" in response.json()["detail"]
     mocks.store_profile.assert_not_awaited()
     mocks.delete_profile_blob.assert_not_awaited()
+
+
+def _run_and_workflow(persist: bool) -> tuple[SimpleNamespace, SimpleNamespace]:
+    run = SimpleNamespace(workflow_id="w", workflow_permanent_id="wpid")
+    workflow = SimpleNamespace(persist_browser_session=persist, workflow_permanent_id="wpid")
+    return run, workflow
+
+
+@pytest.mark.asyncio
+async def test_create_from_run_flag_off_no_persist_returns_immediate_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Legacy byte-for-byte: flag-off + a workflow that doesn't persist -> immediate 400, never polls.
+    run, workflow = _run_and_workflow(persist=False)
+    monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION, "is_browser_memory_engine_enabled_for_org", AsyncMock(return_value=False)
+    )
+    retrieve = AsyncMock(return_value=None)
+    monkeypatch.setattr(browser_profiles_route, "retrieve_persisted_workflow_browser_state_dir", retrieve)
+
+    with pytest.raises(HTTPException) as exc:
+        await browser_profiles_route._create_profile_from_workflow_run(
+            organization_id="o", name="n", description=None, workflow_run_id="wr"
+        )
+    assert exc.value.status_code == 400
+    assert "does not persist browser sessions" in exc.value.detail
+    retrieve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_from_run_engine_on_no_persist_polls_instead_of_immediate_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under the engine an archive can exist without persist, so the persist gate is dropped: it polls
+    # for the session and only 400s with the poll's message, proving it skipped the legacy persist gate.
+    run, workflow = _run_and_workflow(persist=False)
+    monkeypatch.setattr(forge_app.DATABASE.workflow_runs, "get_workflow_run", AsyncMock(return_value=run))
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION, "is_browser_memory_engine_enabled_for_org", AsyncMock(return_value=True)
+    )
+    retrieve = AsyncMock(return_value=None)
+    monkeypatch.setattr(browser_profiles_route, "retrieve_persisted_workflow_browser_state_dir", retrieve)
+    monkeypatch.setattr(browser_profiles_route.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(HTTPException) as exc:
+        await browser_profiles_route._create_profile_from_workflow_run(
+            organization_id="o", name="n", description=None, workflow_run_id="wr"
+        )
+    assert exc.value.status_code == 400
+    assert "does not have a persisted session" in exc.value.detail
+    retrieve.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persisted_state_dir_exports_engine_sink_for_picked_plain(monkeypatch: pytest.MonkeyPatch) -> None:
+    # v32: a plain picked run writes its end-state to browser_sink_profile_id (not persist, not a managed
+    # profile), so the poll helper must export that sink. Flag-off must NOT (legacy write-back never wrote
+    # the pick, so its archive is untouched starting state) -> falls through to the session archive.
+    from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+
+    workflow = SimpleNamespace(workflow_permanent_id="wp")
+    run = SimpleNamespace(browser_profile_id="bp_pick", workflow_permanent_id="wp", browser_sink_profile_id="bp_pick")
+    monkeypatch.setattr(
+        forge_app,
+        "DATABASE",
+        SimpleNamespace(
+            browser_sessions=SimpleNamespace(
+                # a plain picked profile is NOT managed -> the managed branch skips it
+                get_browser_profile=AsyncMock(
+                    return_value=SimpleNamespace(is_managed=False, workflow_permanent_id="wp")
+                )
+            )
+        ),
+    )
+    retrieve_profile = AsyncMock(return_value="/tmp/sink")
+    monkeypatch.setattr(
+        forge_app,
+        "STORAGE",
+        SimpleNamespace(
+            retrieve_browser_profile=retrieve_profile, retrieve_browser_session=AsyncMock(return_value=None)
+        ),
+    )
+    monkeypatch.setattr(
+        forge_app,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(get_workflow_browser_session_storage_key=AsyncMock(return_value="k")),
+    )
+
+    monkeypatch.setattr(
+        forge_app, "AGENT_FUNCTION", SimpleNamespace(is_browser_memory_engine_enabled=AsyncMock(return_value=True))
+    )
+    assert (
+        await retrieve_persisted_workflow_browser_state_dir(organization_id="o", workflow=workflow, workflow_run=run)
+        == "/tmp/sink"
+    )
+
+    monkeypatch.setattr(
+        forge_app, "AGENT_FUNCTION", SimpleNamespace(is_browser_memory_engine_enabled=AsyncMock(return_value=False))
+    )
+    assert (
+        await retrieve_persisted_workflow_browser_state_dir(organization_id="o", workflow=workflow, workflow_run=run)
+        is None
+    )

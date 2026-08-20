@@ -181,6 +181,8 @@
             "pages": [
               "developers/optimization/browser-sessions",
               "developers/optimization/browser-profiles",
+              "developers/optimization/browser-tunneling",
+              "developers/optimization/chrome-extension",
               "developers/optimization/cost-control"
             ]
           },
@@ -209,9 +211,9 @@
               "developers/self-hosted/docker",
               "developers/self-hosted/llm-configuration",
               "developers/self-hosted/browser",
-              "developers/self-hosted/proxy",
               "developers/self-hosted/kubernetes",
               "developers/self-hosted/storage",
+              "developers/self-hosted/google-integrations",
               "integrations/local-llms"
             ]
           }
@@ -392,7 +394,10 @@
     "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode", "mcp"]
   },
   "seo": {
-    "indexing": "navigable"
+    "indexing": "navigable",
+    "metatags": {
+      "canonical": "https://www.skyvern.com/docs"
+    }
   },
   "css": "/style.css",
   "api": {

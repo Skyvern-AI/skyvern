@@ -16,11 +16,7 @@ import {
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
-import {
-  CODE_BLOCK_FALLBACK_TITLE,
-  getCodeBlockTitle,
-  workflowBlockTitle,
-} from "../editor/nodes/types";
+import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
@@ -36,7 +32,12 @@ import {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
-import { findCodeStepForLine } from "../workflowBlockUtils";
+import {
+  describeRecordedAction,
+  findCodeStepForLine,
+  isRecorderCallText,
+  normalizeInlineText,
+} from "../workflowBlockUtils";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -89,6 +90,7 @@ const INDENT_PX = 14;
 const MAX_INDENT_RAIL_DEPTH = 6;
 const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
 const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
+export const TIMELINE_DESCRIPTOR_SEPARATOR = "·";
 
 const railHighlightStyle = {
   marginLeft: `-${RAIL_HIGHLIGHT_OFFSET_PX}px`,
@@ -108,7 +110,7 @@ function IndentRails({ depth }: { depth: number }) {
           className="relative shrink-0 self-stretch"
           style={{ width: `${INDENT_PX}px` }}
         >
-          <div className="absolute inset-y-0 left-1/2 w-px bg-slate-700" />
+          <div className="absolute inset-y-0 left-1/2 w-px bg-border" />
         </div>
       ))}
     </>
@@ -141,15 +143,12 @@ function StatusDot({
   }
   if (isRunning) {
     return (
-      <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-400" />
+      <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
     );
   }
-  return <div className="size-2 shrink-0 rounded-full bg-slate-600" />;
-}
-
-function normalizeInlineText(value: string | null | undefined): string | null {
-  const normalized = value?.replace(/\s+/g, " ").trim();
-  return normalized ? normalized : null;
+  return (
+    <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
+  );
 }
 
 function getActionSummary(action: ActionsApiResponse): string | null {
@@ -188,6 +187,8 @@ type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
   summary: string | null;
+  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  detail: string | null;
   tone: "default" | "error";
 };
 
@@ -196,7 +197,7 @@ type ActionRowPresentation = {
 // (failed null_action) is labeled Error instead of Screenshot. The leading
 // text reuses the matched definition step's plain-English copy so a fired
 // action reads the same as the editor, falling back to the action's own
-// reasoning and finally to the readable action type chip.
+// reasoning and finally to the readable action type label.
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
   matchedStep: CodeBlockStep | null,
@@ -215,15 +216,13 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  const stepText =
-    !isCodeError && matchedStep
-      ? (normalizeInlineText(matchedStep.title) ??
-        normalizeInlineText(matchedStep.description))
-      : null;
   const parts = [
-    stepText ??
-      getActionSummary(action) ??
-      normalizeInlineText(action.description),
+    // This row hides its label from sighted users, so it falls back to the readable type
+    // where the chat, which always shows the label, prints nothing.
+    isCodeError
+      ? getActionSummary(action)
+      : (describeRecordedAction(action, matchedStep) ??
+        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -231,6 +230,10 @@ function getCodeActionRowPresentation(
     icon,
     label,
     summary: parts.length > 0 ? parts.join(" · ") : null,
+    detail:
+      !isCodeError && isRecorderCallText(action.description)
+        ? normalizeInlineText(action.description)
+        : null,
     tone: isCodeError ? "error" : "default",
   };
 }
@@ -249,8 +252,19 @@ function countSchemaFields(value: WorkflowRunBlock["data_schema"]): number {
 }
 
 function getTimelineDescriptor(block: WorkflowRunBlock): string {
+  const description = normalizeInlineText(block.description);
+
+  if (block.block_type === WorkflowBlockTypes.Code) {
+    return (
+      description ??
+      normalizeInlineText(block.prompt) ??
+      normalizeInlineText(block.instructions) ??
+      "Code block"
+    );
+  }
+
   const explicit =
-    normalizeInlineText(block.description) ??
+    description ??
     normalizeInlineText(block.navigation_goal) ??
     normalizeInlineText(block.data_extraction_goal) ??
     normalizeInlineText(block.prompt) ??
@@ -285,41 +299,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-function getTimelineTypeLabel(block: WorkflowRunBlock): string {
-  switch (block.block_type) {
-    case "conditional":
-      return "Condition";
-    case "for_loop":
-    case "while_loop":
-      return "Loop";
-    case "navigation":
-    case "task":
-    case "task_v2":
-      return "Task";
-    case "http_request":
-      return "HTTP";
-    default:
-      return workflowBlockTitle[block.block_type];
-  }
-}
-
-// getCodeBlockTitle ends at the bare "Code" label for prompt-less runs, which
-// dropped the reasoning subtitle the timeline used to show. Fall back to the
-// block reasoning (description) before bare "Code", normalized like a prompt.
-function getCodeBlockTimelineName(
-  block: WorkflowRunBlock,
-  steps: Array<CodeBlockStep>,
-): string {
-  const title = getCodeBlockTitle({ prompt: block.prompt, steps });
-  if (title !== CODE_BLOCK_FALLBACK_TITLE) {
-    return title;
-  }
-  const reasoning = normalizeInlineText(block.description);
-  return reasoning
-    ? getCodeBlockTitle({ prompt: reasoning, steps: [] })
-    : title;
 }
 
 function getLoopIterationGroups(
@@ -536,7 +515,7 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
@@ -548,6 +527,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
+              detail: null,
               tone: "default" as const,
             };
 
@@ -560,8 +540,8 @@ function TimelineActionRows({
             <div
               className={cn(
                 "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
-                "hover:bg-slate-800/60",
-                isActive && "bg-slate-800",
+                "hover:bg-muted/60",
+                isActive && "bg-slate-elevation4 dark:bg-slate-800",
               )}
               style={railHighlightStyle}
             >
@@ -573,30 +553,31 @@ function TimelineActionRows({
                   onActionClick({ block, action });
                 }}
                 aria-pressed={isActive}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+                title={detail ?? undefined}
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
                 <StatusDot
                   status={getActionDisplayStatus(action)}
                   isFinalized={!!workflowRunIsFinalized}
                 />
-                <span className="shrink-0 text-slate-400" aria-hidden="true">
+                <span
+                  className="shrink-0 text-muted-foreground"
+                  aria-hidden="true"
+                >
                   {icon}
                 </span>
-                <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
+                <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                   #{displayIndex}
                 </span>
-                <span
-                  className={cn(
-                    "shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium",
-                    tone === "error"
-                      ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
-                      : "border-slate-700 text-slate-400",
-                  )}
-                >
-                  {label}
-                </span>
+                {tone === "error" ? (
+                  <span className="shrink-0 text-[10px] text-rose-700 dark:text-rose-300">
+                    {label}
+                  </span>
+                ) : (
+                  <span className="sr-only">{label}</span>
+                )}
                 {summary && (
-                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
                     · {summary}
                   </span>
                 )}
@@ -684,7 +665,7 @@ function TimelineCodeStepRows({
             <div
               className={cn(
                 "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
-                "hover:bg-slate-800/60",
+                "hover:bg-muted/60",
               )}
               style={railHighlightStyle}
             >
@@ -695,21 +676,21 @@ function TimelineCodeStepRows({
                   event.stopPropagation();
                   onBlockItemClick(block);
                 }}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
-                <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
+                <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                   #{index + 1}
                 </span>
-                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                <span className="shrink-0 text-[10px] text-muted-foreground">
                   {getReadableActionType(step.action_type)}
                 </span>
                 {summary && (
-                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
                     · {summary}
                   </span>
                 )}
                 {lines && (
-                  <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                     {lines}
                   </span>
                 )}
@@ -758,7 +739,7 @@ function TimelineSkippedStepRows({
             <div
               className={cn(
                 "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
-                "hover:bg-slate-800/60",
+                "hover:bg-muted/60",
               )}
               style={railHighlightStyle}
             >
@@ -769,27 +750,27 @@ function TimelineSkippedStepRows({
                   event.stopPropagation();
                   onBlockItemClick(block);
                 }}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
                 <span
-                  className="size-2 shrink-0 rounded-full border border-dashed border-slate-500"
+                  className="size-2 shrink-0 rounded-full border border-dashed border-border dark:border-slate-500"
                   aria-hidden="true"
                 />
-                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                <span className="shrink-0 text-[10px] text-muted-foreground">
                   {getReadableActionType(step.action_type)}
                 </span>
                 {summary && (
-                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
                     · {summary}
                   </span>
                 )}
                 {lines && (
-                  <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                     {lines}
                   </span>
                 )}
                 <span
-                  className="ml-auto shrink-0 rounded bg-slate-800 px-1 text-[10px] uppercase tracking-wide text-slate-400"
+                  className="ml-auto shrink-0 rounded bg-muted px-1 text-[10px] uppercase tracking-wide text-muted-foreground"
                   title="This step did not execute because the code block stopped before reaching it."
                 >
                   didn't run
@@ -914,13 +895,13 @@ function TimelineSkippedBranchGroup({
       <div className="flex min-h-[24px] items-stretch text-xs opacity-70">
         <IndentRails depth={depth} />
         <div
-          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5 text-slate-400"
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5 text-muted-foreground"
           style={railHighlightStyle}
           title={title}
         >
           <button
             type="button"
-            className="inline-flex size-4 shrink-0 items-center justify-center rounded text-slate-400 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+            className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-1 focus-visible:ring-foreground/40 dark:hover:bg-slate-700 dark:hover:text-slate-200"
             onClick={(event) => {
               event.stopPropagation();
               setExpanded((prev) => !prev);
@@ -938,19 +919,19 @@ function TimelineSkippedBranchGroup({
           </button>
           <div className="flex min-w-0 flex-1 items-center gap-1.5">
             <span
-              className="size-2 shrink-0 rounded-full border border-dashed border-slate-500"
+              className="size-2 shrink-0 rounded-full border border-dashed border-border dark:border-slate-500"
               aria-hidden="true"
             />
-            <span className="shrink-0 rounded border border-slate-700 bg-slate-800/50 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+            <span className="shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
               {branchMarker}
             </span>
-            <span className="min-w-0 flex-1 truncate text-slate-500">
+            <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
               · {branchLabel}
             </span>
-            <span className="shrink-0 rounded bg-slate-800/60 px-1 text-[10px] text-slate-400">
+            <span className="shrink-0 rounded bg-muted/60 px-1 text-[10px] text-muted-foreground">
               {branchReason}
             </span>
-            <span className="shrink-0 rounded bg-slate-800 px-1 text-[10px] tabular-nums text-slate-400">
+            <span className="shrink-0 rounded bg-muted px-1 text-[10px] tabular-nums text-muted-foreground">
               {group.blocks.length}{" "}
               {group.blocks.length === 1 ? "block" : "blocks"}
             </span>
@@ -995,7 +976,6 @@ function WorkflowRunTimelineBlockItem({
   const duration =
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
   const blockTypeTitle = workflowBlockTitle[block.block_type];
-  const blockTypeLabel = getTimelineTypeLabel(block);
   const blockIndex = blockOrder?.get(block.workflow_run_block_id);
   const actions = block.actions ?? [];
   const actionCount = actions.length;
@@ -1005,12 +985,8 @@ function WorkflowRunTimelineBlockItem({
   const definitionCodeSteps = isCodeBlock
     ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
     : [];
-  const blockName = isCodeBlock
-    ? getCodeBlockTimelineName(block, definitionCodeSteps)
-    : (block.label ?? block.title ?? blockTypeTitle);
-  const descriptor = isCodeBlock
-    ? (block.label ?? "Code block")
-    : getTimelineDescriptor(block);
+  const blockName = block.label ?? blockTypeTitle;
+  const descriptor = getTimelineDescriptor(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
@@ -1143,15 +1119,15 @@ function WorkflowRunTimelineBlockItem({
         <div
           className={cn(
             "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-1 pr-1.5",
-            "hover:bg-slate-800/60",
-            isActiveBlock && "bg-slate-800",
+            "hover:bg-muted/60",
+            isActiveBlock && "bg-slate-elevation4 dark:bg-slate-800",
           )}
           style={railHighlightStyle}
         >
           {isContainer ? (
             <button
               type="button"
-              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-slate-400 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-1 focus-visible:ring-foreground/40 dark:hover:bg-slate-700 dark:hover:text-slate-200"
               onClick={(event) => {
                 event.stopPropagation();
                 userToggledRef.current = true;
@@ -1176,31 +1152,33 @@ function WorkflowRunTimelineBlockItem({
               onBlockItemClick(block);
             }}
             aria-pressed={isActiveBlock}
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
           >
             <StatusDot
               status={block.status}
               isFinalized={!!workflowRunIsFinalized}
             />
-            <span title={blockTypeTitle} className="shrink-0">
+            <span
+              title={blockTypeTitle}
+              role="img"
+              aria-label={blockTypeTitle}
+              className="shrink-0"
+            >
               <WorkflowBlockIcon
                 workflowBlockType={block.block_type}
-                className="size-3.5 text-slate-300"
+                className="size-3.5 text-tertiary-foreground"
               />
             </span>
             {blockIndex !== undefined && (
-              <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
+              <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                 #{blockIndex}
               </span>
             )}
-            <span className="inline-flex min-w-[6rem] max-w-[8rem] shrink-0 justify-center truncate rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
-              {blockTypeLabel}
-            </span>
-            <span className="min-w-0 max-w-[12rem] truncate text-slate-200">
+            <span className="min-w-0 max-w-[12rem] truncate text-foreground dark:text-slate-200">
               {blockName}
             </span>
-            <span className="min-w-0 flex-1 truncate text-slate-500">
-              · {descriptor}
+            <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
+              {TIMELINE_DESCRIPTOR_SEPARATOR} {descriptor}
             </span>
             {isFinallyBlock && (
               <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">
@@ -1208,17 +1186,17 @@ function WorkflowRunTimelineBlockItem({
               </span>
             )}
             {hasActions && (
-              <span className="shrink-0 rounded bg-slate-800 px-1 text-[10px] tabular-nums text-slate-400">
+              <span className="shrink-0 rounded bg-muted px-1 text-[10px] tabular-nums text-muted-foreground">
                 {actionCount} {actionCount === 1 ? "action" : "actions"}
               </span>
             )}
             {loopCounter && (
-              <span className="shrink-0 rounded bg-slate-700 px-1 text-[10px] tabular-nums text-slate-300">
+              <span className="shrink-0 rounded bg-muted px-1 text-[10px] tabular-nums text-tertiary-foreground dark:bg-slate-700">
                 {loopCounter}
               </span>
             )}
             {duration && (
-              <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                 {duration}
               </span>
             )}
@@ -1472,19 +1450,19 @@ function LoopIterationRow({
 
   return (
     <div className="min-w-0">
-      <div className="flex min-h-[24px] items-stretch text-[11px] text-slate-300">
+      <div className="flex min-h-[24px] items-stretch text-[11px] text-tertiary-foreground">
         <IndentRails depth={depth} />
         <div
           className={cn(
             "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
-            "hover:bg-slate-800/60",
-            isActiveIteration && "bg-slate-800",
+            "hover:bg-muted/60",
+            isActiveIteration && "bg-slate-elevation4 dark:bg-slate-800",
           )}
           style={railHighlightStyle}
         >
           <button
             type="button"
-            className="-ml-0.5 size-3.5 shrink-0 rounded text-slate-500 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+            className="-ml-0.5 size-3.5 shrink-0 rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-1 focus-visible:ring-foreground/40 dark:text-slate-500 dark:hover:bg-slate-700 dark:hover:text-slate-200"
             onClick={(event) => {
               event.stopPropagation();
               userToggledRef.current = true;
@@ -1510,14 +1488,14 @@ function LoopIterationRow({
               }
             }}
             aria-pressed={isActiveIteration}
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
           >
             <StatusDot status={status} isFinalized={!!workflowRunIsFinalized} />
-            <span className="shrink-0 text-slate-400">
+            <span className="shrink-0 text-muted-foreground">
               Iteration {iterationNumber}
             </span>
             {currentValuePreview && (
-              <span className="min-w-0 flex-1 truncate text-slate-500">
+              <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
                 · {currentValuePreview}
               </span>
             )}

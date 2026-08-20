@@ -28,6 +28,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)
@@ -62,6 +63,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
     stream.is_disconnected = AsyncMock(return_value=False)

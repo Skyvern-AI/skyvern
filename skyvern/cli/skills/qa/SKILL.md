@@ -7,10 +7,10 @@ description: "QA test your code changes by reading your git diff, choosing the r
 
 Read the diff, classify what changed, and run the right validation path: browser QA for frontend/browser changes, API validation for backend surface changes, repo-native validation for backend-internal changes, and both for mixed changes.
 
-<!-- NOTE: This content is maintained in three places — keep all in sync:
-     1. skyvern/cli/skills/qa/SKILL.md         (bundled with pip package — canonical)
-     2. .claude/skills/qa/SKILL.md              (project-local copy for this repo)
-     3. skyvern/cli/mcp_tools/prompts.py        (QA_TEST_CONTENT for the MCP prompt) -->
+<!-- NOTE: .agents/skills/qa/SKILL.md is the repository canonical source.
+     Keep both synchronized copies in sync with it:
+     1. skyvern/cli/skills/qa/SKILL.md  (bundled with the pip package)
+     2. skyvern/cli/mcp_tools/prompts.py (QA_TEST_CONTENT for the MCP prompt) -->
 
 You changed code. This skill is diff-driven first: it reads what changed, understands the
 affected behavior, and validates that behavior with the right tools. It is not a generic
@@ -371,43 +371,21 @@ Report the evidence that actually matters:
 After generating the QA report, persist it to the pull request as a sticky comment so the
 evidence survives beyond the conversation.
 
-### Check for an open PR
+### Save and post the sticky comment
+
+Write the full report markdown from Step 5 to `.qa/latest-report.md` with a filesystem editing tool.
+Do not place report text in a shell command, variable assignment, heredoc, or command substitution.
+
+Then run the fixed command below. It reads `.qa/latest-report.md` and passes it to `gh` as a literal
+argument vector without shell evaluation, updating this user's own `<!-- skyvern-qa-report -->` comment
+when one already exists:
 
 ```bash
-PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null)
+skyvern skill post-qa-report
 ```
 
-If no PR exists for the current branch:
-1. Save the full report markdown to `.qa/latest-report.md` in the project root (create the directory if needed).
-2. Tell the user: "No open PR found for this branch. QA report saved to `.qa/latest-report.md`. Run /qa again after creating a PR to post it."
-3. Stop here — do not attempt to create a PR.
-
-### Post or update the sticky comment
-
-Use a hidden HTML marker to make the comment idempotent across multiple runs:
-
-```bash
-# Prepare the comment body with the hidden marker
-COMMENT_BODY="<!-- skyvern-qa-report -->
-## QA Report — $(git rev-parse --short HEAD) — $(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-<the full report markdown from Step 5>
-"
-
-# Find an existing QA comment on the PR
-EXISTING_COMMENT_ID=$(gh api "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \
-  --jq '.[] | select(.body | test("skyvern-qa-report")) | .id' \
-  2>/dev/null | head -1)
-
-if [ -n "$EXISTING_COMMENT_ID" ]; then
-  # Update the existing comment in place
-  gh api "repos/{owner}/{repo}/issues/comments/${EXISTING_COMMENT_ID}" \
-    -X PATCH -f body="$COMMENT_BODY"
-else
-  # Create a new comment
-  gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY"
-fi
-```
+If no PR exists for the current branch, the command leaves the report at `.qa/latest-report.md`.
+Tell the user to run `/qa` again after creating a PR. Do not create a PR just to post a QA report.
 
 ### Screenshot handling
 
@@ -421,8 +399,8 @@ other reviewers.
 
 ### Rules
 
-- Always include the `<!-- skyvern-qa-report -->` marker so repeated runs update the same comment instead of creating duplicates.
-- Include the short commit hash and UTC timestamp in the comment header.
+- Use `skyvern skill post-qa-report`; do not reconstruct its `gh` calls in a shell.
+- The command includes the `<!-- skyvern-qa-report -->` marker, short commit hash, and UTC timestamp.
 - Do not create a PR just to post a QA report — that is the user's decision.
 - If `gh` is not available or not authenticated, fall back to saving the report locally and tell the user.
 

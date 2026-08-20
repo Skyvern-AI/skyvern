@@ -126,9 +126,9 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                   {statusIsFinalized(task) && (
                     <div
                       className={cn(
-                        "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700",
+                        "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-muted dark:hover:bg-slate-700",
                         {
-                          "bg-slate-700 text-foreground":
+                          "bg-muted text-foreground dark:bg-slate-700":
                             activeTab === "output",
                         },
                       )}
@@ -146,9 +146,10 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
 
                   <div
                     className={cn(
-                      "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
+                      "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-slate-700",
                       {
-                        "bg-slate-700 text-foreground": activeTab === "goal",
+                        "bg-muted text-foreground dark:bg-slate-700":
+                          activeTab === "goal",
                       },
                     )}
                     onClick={() => {
@@ -159,9 +160,9 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                   </div>
                   <div
                     className={cn(
-                      "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
+                      "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-slate-700",
                       {
-                        "bg-slate-700 text-foreground":
+                        "bg-muted text-foreground dark:bg-slate-700":
                           activeTab === "parameters",
                       },
                     )}

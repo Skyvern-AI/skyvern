@@ -4,6 +4,7 @@ from enum import StrEnum
 class RunType(StrEnum):
     task_v1 = "task_v1"
     task_v2 = "task_v2"
+    task_v3 = "task_v3"
     workflow_run = "workflow_run"
     openai_cua = "openai_cua"
     anthropic_cua = "anthropic_cua"
@@ -14,6 +15,7 @@ class RunType(StrEnum):
 class RunEngine(StrEnum):
     skyvern_v1 = "skyvern-1.0"
     skyvern_v2 = "skyvern-2.0"
+    skyvern_v3 = "skyvern-3.0"
     openai_cua = "openai-cua"
     anthropic_cua = "anthropic-cua"
     ui_tars = "ui-tars"
@@ -32,6 +34,7 @@ class RunStatus(StrEnum):
     created = "created"
     queued = "queued"
     running = "running"
+    paused = "paused"
     timed_out = "timed_out"
     failed = "failed"
     terminated = "terminated"

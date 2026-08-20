@@ -7,7 +7,7 @@ import {
   useReactFlow,
   type Node,
 } from "@xyflow/react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { cn } from "@/util/utils";
 import { NodeHeader } from "../components/NodeHeader";
@@ -31,7 +31,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const isCollapsed = useIsBlockCollapsed(data.label);
   const prevIsCollapsed = useRef<boolean | null>(null);
   const { open } = useCollapseContext();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
 
   const children = useMemo(() => {
     return nodes.filter((node) => node.parentId === id && !node.hidden);
@@ -169,7 +169,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         className="opacity-0"
       />
       <div
-        className="rounded-xl border-2 border-dashed border-slate-600 p-2"
+        className="rounded-xl border-2 border-dashed border-border p-2 dark:border-slate-600"
         style={{
           width: conditionalNodeWidth,
           height: childrenHeightExtent,

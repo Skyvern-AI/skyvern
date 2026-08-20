@@ -30,6 +30,19 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     ).toBe(true);
   });
 
+  it("keeps a verified fix pending when auto accept is off and the backend did not apply it", () => {
+    // A verified fix the backend left pending (workflow_applied=false) must NOT
+    // auto-apply when auto accept is off — it lands as a pending proposal for
+    // the review gate.
+    expect(
+      shouldAutoApplyWorkflowResponse(
+        response({ workflow_applied: false }),
+        false,
+        false,
+      ),
+    ).toBe(false);
+  });
+
   it.each(["review_untested", "review_tested"] as const)(
     "forces explicit review for %s proposals",
     (proposal_disposition) => {

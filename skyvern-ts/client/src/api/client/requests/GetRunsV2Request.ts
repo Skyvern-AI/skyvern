@@ -16,4 +16,5 @@ export interface GetRunsV2Request {
     status?: Skyvern.RunStatus | Skyvern.RunStatus[];
     /** Case-insensitive substring search (min 3 chars for trigram index). */
     search_key?: string;
+    run_type?: Skyvern.RunType | Skyvern.RunType[];
 }

@@ -5,6 +5,7 @@ import { ActionsApiResponse, Status } from "@/api/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
+import { actionCodeLine } from "@/routes/workflows/workflowRun/codeBlockFailure";
 import type {
   CodeBlockStep,
   WorkflowParameter,
@@ -19,15 +20,6 @@ type Props = {
   failureReason?: string | null;
   actions?: Array<ActionsApiResponse> | null;
 };
-
-function getActionCodeLine(action: ActionsApiResponse): number | null {
-  const output = action.output;
-  if (!output || typeof output !== "object" || Array.isArray(output)) {
-    return null;
-  }
-  const codeLine = (output as Record<string, unknown>).code_line;
-  return typeof codeLine === "number" ? codeLine : null;
-}
 
 function formatStepLines(step: CodeBlockStep): string {
   if (step.line_start == null) {
@@ -54,11 +46,10 @@ function CodeBlockParameters({
     blockStatus === Status.Failed
       ? (actions ?? []).find(
           (action) =>
-            action.status === Status.Failed &&
-            getActionCodeLine(action) !== null,
+            action.status === Status.Failed && actionCodeLine(action) !== null,
         )
       : undefined;
-  const failingLine = failingAction ? getActionCodeLine(failingAction) : null;
+  const failingLine = failingAction ? actionCodeLine(failingAction) : null;
   const failingReason = failureReason ?? failingAction?.response ?? null;
   const codeExtensions = useMemo<Array<Extension>>(() => {
     if (failingLine == null) {
@@ -80,7 +71,7 @@ function CodeBlockParameters({
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Code</h1>
-          <h2 className="text-base text-slate-400">
+          <h2 className="text-base text-muted-foreground">
             The Python snippet executed for this block
           </h2>
         </div>
@@ -106,11 +97,11 @@ function CodeBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Goal</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               What this block is meant to accomplish
             </h2>
           </div>
-          <div className="flex w-full min-w-0 items-start text-sm text-slate-200">
+          <div className="flex w-full min-w-0 items-start text-sm text-foreground dark:text-slate-200">
             {prompt}
           </div>
         </div>
@@ -119,7 +110,7 @@ function CodeBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Steps</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               Plain-language outline of the code
             </h2>
           </div>
@@ -127,19 +118,19 @@ function CodeBlockParameters({
             {steps.map((step, index) => (
               <li
                 key={index}
-                className="flex items-center gap-2 rounded border border-slate-700/40 bg-slate-elevation3 px-2.5 py-1.5 text-xs"
+                className="flex items-center gap-2 rounded border border-border/40 bg-slate-elevation3 px-2.5 py-1.5 text-xs"
               >
-                <span className="w-5 shrink-0 tabular-nums text-slate-500">
+                <span className="w-5 shrink-0 tabular-nums text-muted-foreground dark:text-slate-500">
                   {index + 1}.
                 </span>
-                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-400">
+                <span className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
                   {step.action_type}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-slate-300">
+                <span className="min-w-0 flex-1 truncate text-tertiary-foreground">
                   {step.title ?? step.description}
                 </span>
                 {step.line_start != null ? (
-                  <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                     {formatStepLines(step)}
                   </span>
                 ) : null}
@@ -152,7 +143,7 @@ function CodeBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Inputs</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               Inputs passed to this code block
             </h2>
           </div>
@@ -160,11 +151,11 @@ function CodeBlockParameters({
             {parameters.map((parameter) => (
               <div
                 key={parameter.key}
-                className="rounded border border-slate-700/40 bg-slate-elevation3 p-3"
+                className="rounded border border-border/40 bg-slate-elevation3 p-3"
               >
                 <p className="font-medium">{parameter.key}</p>
                 {parameter.description ? (
-                  <p className="text-sm text-slate-400">
+                  <p className="text-sm text-muted-foreground">
                     {parameter.description}
                   </p>
                 ) : null}

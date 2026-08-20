@@ -63,7 +63,7 @@ async def test_handle_potential_verification_code_uses_resolver_without_db_looku
     agent = ForgeAgent.__new__(ForgeAgent)
     await agent.handle_potential_verification_code(task, step, scraped_page, browser_state, json_response)
 
-    resolver.assert_awaited_once_with(task)
+    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP)
     db_get.assert_not_awaited()
 
 
@@ -116,7 +116,7 @@ async def test_handle_potential_verification_code_skips_polling_when_credential_
     finally:
         skyvern_context.reset()
 
-    resolver.assert_awaited_once_with(task)
+    resolver.assert_awaited_once_with(task, expected_otp_type=OTPType.TOTP)
     poll.assert_not_awaited()
     db_get.assert_not_awaited()
     rescrape.assert_awaited_once()

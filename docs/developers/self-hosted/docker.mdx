@@ -160,9 +160,11 @@ The `.env` file controls the Skyvern server. Here are the most important variabl
 
 `docker-compose.yml` uses TWO sources for service environment:
 
-1. **Inline `environment:` block** — compose-network values that depend on the docker network topology. Examples: `DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern` (the `postgres` hostname only resolves inside the compose network), `BROWSER_TYPE`, `BROWSER_STREAMING_MODE`, `ENABLE_CODE_BLOCK`.
+1. **Inline `environment:` block** — compose-network values that depend on the docker network topology. Examples:
+   `DATABASE_STRING=postgresql+psycopg://skyvern:skyvern@postgres:5432/skyvern` (the `postgres` hostname only resolves
+   inside the compose network), `BROWSER_TYPE`, `BROWSER_STREAMING_MODE`.
 
-2. **`env_file: .env`** — user secrets (LLM API keys, etc.).
+2. **`env_file: .env`** — user settings such as `CODE_BLOCK_MODE` and secrets such as LLM API keys.
 
 **Do not move `DATABASE_STRING` from compose into `.env`.** The `.env.example` shipped with the repo uses a `localhost` host that points at the backend container itself when used inside compose — moving that value into `.env` will break the database connection.
 
@@ -305,7 +307,10 @@ Update the frontend environment to use your domain:
 VITE_API_BASE_URL=https://api.your-domain.com/api/v1
 VITE_WSS_BASE_URL=wss://api.your-domain.com/api/v1
 VITE_ARTIFACT_API_BASE_URL=https://artifacts.your-domain.com
+ARTIFACT_ALLOWED_ORIGIN=https://your-domain.com
 ```
+
+`ARTIFACT_ALLOWED_ORIGIN` must match the browser-visible UI origin (`https://your-domain.com`), not the artifact server URL.
 
 <Warning>
 If exposing Skyvern to the internet, add authentication at the reverse proxy layer or use a VPN.
@@ -397,8 +402,5 @@ The page content is too large for the LLM. Try:
   </Card>
   <Card title="Storage Configuration" icon="hard-drive" href="/developers/self-hosted/storage">
     Store artifacts in S3 or Azure Blob instead of local disk
-  </Card>
-  <Card title="Proxy Setup" icon="shield" href="/developers/self-hosted/proxy">
-    Configure proxies to avoid bot detection
   </Card>
 </CardGroup>

@@ -37,7 +37,24 @@ class FileUploadBlock(UniversalBaseModel):
     azure_blob_container_name: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    sftp_host: typing.Optional[str] = None
+    sftp_port: typing.Optional[int] = None
+    sftp_username: typing.Optional[str] = None
+    sftp_password: typing.Optional[str] = None
+    sftp_private_key: typing.Optional[str] = None
+    sftp_private_key_passphrase: typing.Optional[str] = None
+    sftp_remote_path: typing.Optional[str] = None
+    sftp_host_key: typing.Optional[str] = None
+    prompt: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Optional natural-language control over which downloaded files are uploaded; empty means upload all.
+    """
+
     path: typing.Optional[str] = None
+    continue_on_empty: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    When the run download directory has no files, allow the empty upload only after confirming no registered, browser-session, or alternate candidate downloads exist (False, default). Set True to always allow an empty upload.
+    """
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

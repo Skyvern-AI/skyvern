@@ -4,12 +4,19 @@ import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
 import {
+  markCommit,
+  markLoad,
+  markMessage,
+  startDebugReport,
+} from "@/routes/streaming/streamStats";
+import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
 import {
   STREAM_MAX_RECONNECT_ATTEMPTS,
   STREAM_RECONNECT_DELAY_MS,
+  diagnosticForStatus,
   isTerminalStreamStatus,
   shouldReconnectStream,
 } from "./BrowserSessionStream.utils";
@@ -37,36 +44,6 @@ function diagnosticForReconnectExhausted(): StreamDiagnostic {
     detail: "The browser stream disconnected and could not reconnect.",
     hint: "Refresh the editor or create a new browser session.",
   };
-}
-
-function diagnosticForStatus(status: string): StreamDiagnostic {
-  switch (status) {
-    case "not_found":
-      return {
-        title: "We've misplaced this browser session",
-        detail: "The backend can't find it for your org.",
-        hint: "Refresh the page or spin up a fresh browser session.",
-      };
-    case "timeout":
-      return {
-        title: "The browser's gone strangely quiet",
-        detail:
-          "The stream connected, but no active page showed up to screencast.",
-        hint: "Check backend logs for browser launch errors and verify BROWSER_STREAMING_MODE=cdp.",
-      };
-    case "completed":
-    case "failed":
-      return {
-        title: "This browser session has wandered off",
-        detail: `It's no longer live — status: ${status}.`,
-      };
-    default:
-      return {
-        title: "Waiting for browser frames",
-        detail: `The stream is connected and the session status is ${status}.`,
-        pending: true,
-      };
-  }
 }
 
 function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
@@ -99,6 +76,15 @@ interface Props {
   onReadyChange?: (isReady: boolean, browserSessionId: string | null) => void;
   onUrlChange?: (url: string) => void;
   onActivity?: () => void;
+  // Bypasses a stale RFB selection after the authenticated RFB socket has failed.
+  forceCdp?: boolean;
+  // Opt-in: turns the read-only URL bar into a navigable input. Only the
+  // hosted-browser-session live view passes this today (SKY-13683) -- the
+  // workflow studio/editor callers of this component leave it unset and keep
+  // today's read-only display.
+  enableUrlInput?: boolean;
+  // Passing this hands the window frame to the caller (see InteractiveStreamView).
+  onFrameWidthChange?: (width: number | null) => void;
 }
 
 function BrowserSessionStream({
@@ -109,8 +95,12 @@ function BrowserSessionStream({
   onReadyChange,
   onUrlChange,
   onActivity,
+  forceCdp = false,
+  enableUrlInput = false,
+  onFrameWidthChange,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
+  const [streamImgToken, setStreamImgToken] = useState<number>(0);
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
@@ -123,6 +113,13 @@ function BrowserSessionStream({
   const socketRef = useRef<WebSocket | null>(null);
   const onActivityRef = useRef(onActivity);
   const hasFrameRef = useRef(false);
+  const pendingFrameRef = useRef<{
+    token: number;
+    screenshot: string;
+    message: StreamMessage;
+  } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastCommittedTokenRef = useRef<number>(0);
   const reconnectAttemptsRef = useRef(0);
   const terminalStatusSeenRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -141,6 +138,9 @@ function BrowserSessionStream({
     inputReady,
     containerRef,
     handlers,
+    navigate,
+    historyNavigate,
+    navigateError,
   } = useCdpInput({
     inputWsUrl,
     interactive: controllable,
@@ -151,6 +151,8 @@ function BrowserSessionStream({
   useEffect(() => {
     onActivityRef.current = onActivity;
   }, [onActivity]);
+
+  useEffect(() => startDebugReport(), []);
 
   // Once control can't be offered (input socket torn down), forget any prior
   // grab so re-enabling doesn't silently restore control without a new click.
@@ -179,20 +181,32 @@ function BrowserSessionStream({
       }
     };
 
+    const clearPendingFrame = () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      pendingFrameRef.current = null;
+    };
+
     async function connect() {
       const credentialParam = await getCredentialParam(credentialGetter);
       if (cancelled) {
         return;
       }
 
-      if (socketRef.current) {
-        socketRef.current.close();
-      }
-      socketRef.current = new WebSocket(
-        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}`,
+      socketRef.current?.close();
+      const socket = new WebSocket(
+        `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}${forceCdp ? "&force_cdp=true" : ""}`,
       );
+      socketRef.current = socket;
 
-      socketRef.current.addEventListener("open", () => {
+      const isCurrentSocket = () => !cancelled && socketRef.current === socket;
+
+      socket.addEventListener("open", () => {
+        if (!isCurrentSocket()) {
+          return;
+        }
         setDiagnostic({
           title: "Hooked up to the stream",
           detail: "Just waiting for the backend to hand us a browser.",
@@ -200,37 +214,78 @@ function BrowserSessionStream({
         });
       });
 
-      socketRef.current.addEventListener("message", (event) => {
+      socket.addEventListener("message", (event) => {
+        if (!isCurrentSocket()) {
+          return;
+        }
         try {
           const message: StreamMessage = JSON.parse(event.data);
+          if (
+            message.browser_session_id !== undefined &&
+            message.browser_session_id !== browserSessionId
+          ) {
+            return;
+          }
           const hasActivity =
             Boolean(message.screenshot) || message.url !== undefined;
+          // Presentation metadata is committed only with its pixels. Applying it
+          // on receipt would pair the new viewport (which maps click coordinates)
+          // with the previous screenshot.
+          const applyMetadata = (m: StreamMessage) => {
+            if (m.format) {
+              setStreamFormat((prev) => (prev === m.format ? prev : m.format!));
+            }
+            if (m.viewport_width) {
+              setViewportWidth((prev) =>
+                prev === m.viewport_width ? prev : m.viewport_width!,
+              );
+            }
+            if (m.viewport_height) {
+              setViewportHeight((prev) =>
+                prev === m.viewport_height ? prev : m.viewport_height!,
+              );
+            }
+            if (m.url !== undefined) {
+              setCurrentUrl((prev) => (prev === m.url ? prev : m.url!));
+            }
+          };
           if (message.screenshot) {
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
-            setStreamImgSrc(message.screenshot);
-          }
-          if (message.format) {
-            setStreamFormat(message.format);
-          }
-          if (message.viewport_width) {
-            setViewportWidth(message.viewport_width);
-          }
-          if (message.viewport_height) {
-            setViewportHeight(message.viewport_height);
-          }
-          if (message.url !== undefined) {
-            setCurrentUrl(message.url);
+            const token = markMessage();
+            pendingFrameRef.current = {
+              token,
+              screenshot: message.screenshot,
+              message,
+            };
+            if (rafRef.current === null) {
+              rafRef.current = requestAnimationFrame(() => {
+                rafRef.current = null;
+                const pending = pendingFrameRef.current;
+                if (!pending || !isCurrentSocket()) return;
+                pendingFrameRef.current = null;
+                lastCommittedTokenRef.current = pending.token;
+                setStreamImgSrc(pending.screenshot);
+                setStreamImgToken(pending.token);
+                applyMetadata(pending.message);
+                markCommit(pending.token);
+              });
+            }
           }
           if (hasActivity) {
             onActivityRef.current?.();
           }
-          if (!message.screenshot && message.status) {
+          const isTerminal = isTerminalStreamStatus(message.status);
+          if (message.status && (isTerminal || !message.screenshot)) {
             setDiagnostic(diagnosticForStatus(message.status));
           }
-          if (isTerminalStreamStatus(message.status)) {
+          if (isTerminal) {
             terminalStatusSeenRef.current = true;
-            socketRef.current?.close();
+            // Drop the last frame: keeping it leaves a dead, still-interactive
+            // screenshot covering the terminal status panel.
+            clearPendingFrame();
+            setStreamImgSrc("");
+            socket.close();
           }
         } catch (e) {
           console.error("Failed to parse message", e);
@@ -241,14 +296,23 @@ function BrowserSessionStream({
         }
       });
 
-      socketRef.current.addEventListener("error", () => {
+      socket.addEventListener("error", () => {
+        if (!isCurrentSocket()) {
+          return;
+        }
         setDiagnostic({
           title: "The stream hit a snag",
           detail: "The connection ran into a network or server error.",
         });
       });
 
-      socketRef.current.addEventListener("close", (event) => {
+      socket.addEventListener("close", (event) => {
+        if (socketRef.current !== socket) {
+          return;
+        }
+        clearPendingFrame();
+        socketRef.current = null;
+
         if (
           !cancelled &&
           !hasFrameRef.current &&
@@ -256,8 +320,6 @@ function BrowserSessionStream({
         ) {
           setDiagnostic(diagnosticForClose(event));
         }
-        socketRef.current = null;
-
         const canReconnect =
           !cancelled &&
           shouldReconnectStream({
@@ -297,12 +359,14 @@ function BrowserSessionStream({
     return () => {
       cancelled = true;
       clearReconnectTimer();
-      if (socketRef.current) {
-        socketRef.current.close();
+      clearPendingFrame();
+      const socket = socketRef.current;
+      if (socket) {
         socketRef.current = null;
+        socket.close();
       }
     };
-  }, [credentialGetter, browserSessionId]);
+  }, [credentialGetter, browserSessionId, forceCdp]);
 
   const isReady = streamImgSrc.length > 0;
 
@@ -345,6 +409,12 @@ function BrowserSessionStream({
         handlers={handlers}
         currentUrl={currentUrl}
         centered={centered}
+        onNavigate={enableUrlInput ? navigate : undefined}
+        navigateError={enableUrlInput ? navigateError : undefined}
+        onHistoryNavigate={enableUrlInput ? historyNavigate : undefined}
+        onFrameWidthChange={onFrameWidthChange}
+        frameToken={streamImgToken}
+        onFrameLoad={markLoad}
       />
     );
   }

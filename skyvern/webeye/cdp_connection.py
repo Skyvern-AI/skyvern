@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse, urlsplit, urlunparse, urlunsplit
 
 import structlog
 from playwright.async_api import Browser, Playwright
 
 from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
+from skyvern.utils.url_validators import validate_browser_host
+from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_SEGMENT, marked_credential_segment
 
 LOG = structlog.get_logger()
 DEFAULT_CDP_CONNECT_TIMEOUT_MS = 30_000
@@ -90,6 +93,60 @@ def strip_browser_address_discriminator(url: str) -> str:
     return url
 
 
+REDACTED = "[REDACTED]"
+
+
+def redact_cdp_url(url: str | None) -> str:
+    """A CDP or live-view address with every credential position masked.
+
+    The single place that decides what of an address may be written down. Five positions carry a
+    secret, and each is one an edge reads back out:
+
+    - the query (a session token, a vendor api key) and userinfo;
+    - the segment after a path credential marker, ``/<marker>/<secret>/<session_id>``, which is
+      how a header-less client authenticates to the router;
+    - the routing token in ``/{session_id}/{token}/devtools/...`` (legacy CDP);
+    - the token trailing ``/vnc/{session_id}`` (legacy live view).
+
+    The markers and the live-view prefix come from ``cdp_credentials``, which owns them; the
+    router's ``_parse_request`` restates them (it may not import this package) and a contract
+    test pins the two equal, so this cannot fall behind what the router will accept. Scheme,
+    host, port, parameter names and the session id survive, so a redacted line still identifies
+    the session and the endpoint it was dialing.
+    """
+    if not url:
+        return ""
+    try:
+        split = urlsplit(url)
+    except ValueError:
+        return REDACTED
+
+    netloc = split.netloc
+    if "@" in netloc:
+        netloc = f"{REDACTED}@{netloc.rsplit('@', 1)[1]}"
+
+    query = "&".join(f"{name}={REDACTED}" for name, _ in parse_qsl(split.query, keep_blank_values=True))
+
+    path = split.path
+    segments = [segment for segment in path.split("/") if segment]
+    credential_indices: set[int] = set()
+    marked = marked_credential_segment(segments)
+    if marked is not None:
+        credential_indices.add(marked)
+    if len(segments) >= 4 and segments[2] == "devtools":
+        credential_indices.add(1)
+    if segments and segments[0].lower() == LIVE_VIEW_PATH_SEGMENT:
+        # /vnc/{session_id} carries its token in the query; anything past the session id is the
+        # legacy edge's trailing token.
+        credential_indices.update(range(2, len(segments)))
+    if credential_indices:
+        path = "/" + "/".join(
+            REDACTED if index in credential_indices else segment for index, segment in enumerate(segments)
+        )
+
+    return urlunsplit((split.scheme, netloc, path, query, split.fragment))
+
+
 _LOCAL_CONTAINER_CDP_PORT = 9222
 
 
@@ -144,21 +201,42 @@ def is_local_pbs_cdp_url(url: str) -> bool:
     return local_pbs_cdp_host_port(url) is not None
 
 
+def is_managed_session_router_cdp_url(url: str, browser_session_id: str | None) -> bool:
+    if not browser_session_id:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme != "wss":
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    return (
+        len(segments) == 5
+        and segments[0] == browser_session_id
+        and bool(segments[1])
+        and segments[2:4] == ["devtools", "browser"]
+        and bool(segments[4])
+    )
+
+
 def prepare_persistent_browser_cdp_connect(
     browser_address: str,
     *,
     browser_session_id: str | None = None,
     x_api_key: str | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
+    is_resolved_runner_cdp_proxy: bool = False,
+    is_managed_session_router: bool = False,
 ) -> tuple[str, dict[str, str] | None]:
-    """Normalize CDP URL and headers for host API connections to local PBS."""
+    """Normalize CDP URL and headers for connections to managed destinations."""
     connect_url = resolve_local_pbs_cdp_url(browser_address)
     headers: dict[str, str] = {}
     if cdp_connect_headers:
         headers.update(cdp_connect_headers)
-    if x_api_key:
+    is_managed_destination = (
+        is_local_pbs_cdp_url(connect_url) or is_resolved_runner_cdp_proxy or is_managed_session_router
+    )
+    if x_api_key and is_managed_destination:
         headers["x-api-key"] = x_api_key
-    if browser_session_id and is_local_pbs_cdp_url(connect_url):
+    if browser_session_id and is_managed_destination:
         headers["X-Session-Id"] = browser_session_id
     return connect_url, headers or None
 
@@ -228,8 +306,8 @@ def build_cdp_configuration_error(
         return None
 
     guidance = (
-        f"Skyvern reached the configured CDP address ({remote_browser_url}), but "
-        f"{discovery_url} returned HTTP {status_code}. Skyvern cdp-connect requires "
+        f"Skyvern reached the configured CDP address ({redact_cdp_url(remote_browser_url)}), but "
+        f"{redact_cdp_url(discovery_url)} returned HTTP {status_code}. Skyvern cdp-connect requires "
         "Chrome's classic DevTools Protocol endpoint, where /json/version returns JSON "
         "with webSocketDebuggerUrl. If you enabled chrome://inspect/#remote-debugging, "
         "set BROWSER_REMOTE_DEBUGGING_URL to the direct full "
@@ -253,8 +331,13 @@ async def connect_over_cdp_with_diagnostics(
     remote_browser_url: str,
     headers: dict[str, str] | None = None,
     timeout_ms: int = DEFAULT_CDP_CONNECT_TIMEOUT_MS,
+    validate_browser_address: bool = True,
 ) -> Browser:
     remote_browser_url = strip_browser_address_discriminator(remote_browser_url)
+    if validate_browser_address:
+        host = urlparse(remote_browser_url).hostname
+        if host:
+            await asyncio.to_thread(validate_browser_host, host, resolve_dns=True)
     try:
         return await playwright.chromium.connect_over_cdp(
             remote_browser_url,
@@ -272,8 +355,8 @@ async def connect_over_cdp_with_diagnostics(
             LOG.warning(
                 message,
                 reason=candidate.label,
-                remote_browser_url=remote_browser_url,
-                fallback_url=candidate.url,
+                remote_browser_url=redact_cdp_url(remote_browser_url),
+                fallback_url=redact_cdp_url(candidate.url),
             )
             try:
                 return await playwright.chromium.connect_over_cdp(

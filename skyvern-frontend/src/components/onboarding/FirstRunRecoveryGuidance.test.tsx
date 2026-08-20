@@ -1,12 +1,17 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import posthog from "posthog-js";
-import { FirstRunRecoveryGuidance } from "./FirstRunRecoveryGuidance";
+import type * as ReactRouterDom from "react-router-dom";
+import {
+  FirstRunRecoveryGuidance,
+  shouldShowRecoveryGuidance,
+} from "./FirstRunRecoveryGuidance";
 import { getRecoveryPaths } from "./recoveryPaths";
+import type { RecoveryGuidanceTelemetryContext } from "@/util/onboarding/recoveryGuidanceTelemetry";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react-router-dom")>();
+  const actual = await importOriginal<typeof ReactRouterDom>();
   return { ...actual, useNavigate: () => navigateMock };
 });
 
@@ -17,42 +22,53 @@ vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => studioState.enabled,
 }));
 
+const telemetryContext: RecoveryGuidanceTelemetryContext = {
+  organizationId: "org_opaque",
+  experimentVersion: "sky-13471-recovery-guidance-v1",
+  arm: "treatment",
+  eligibleRunId: "wr_failure",
+  failureCategory: "AUTH_FAILURE",
+};
+
 describe("getRecoveryPaths", () => {
-  it("always returns at least two paths (AC1)", () => {
+  it("always returns at least two paths", () => {
     for (const category of [
       null,
       "",
       "totally_unknown_thing",
-      "invalid_credentials",
-      "element_not_found",
-      "network_error",
+      "AUTH_FAILURE",
+      "ELEMENT_NOT_FOUND",
+      "PAGE_LOAD_TIMEOUT",
     ]) {
       expect(getRecoveryPaths(category).length).toBeGreaterThanOrEqual(2);
     }
   });
+});
 
-  it("selects credential recovery for auth failures (AC2)", () => {
-    const ids = getRecoveryPaths("invalid_credentials").map((p) => p.id);
-    expect(ids).toContain("update_credentials");
-    expect(ids).toContain("retry");
-  });
+describe("recovery guidance dormant gate", () => {
+  it("keeps the treatment surface invisible until its dedicated flag is explicitly enabled", () => {
+    const assignment = {
+      experiment_version: "sky-13471-recovery-guidance-v1",
+      organization_id: "org_opaque",
+      eligible_run_id: "wr_failure",
+      eligible_at: "2026-08-14T12:00:00Z",
+      arm: "treatment" as const,
+    };
 
-  it("selects workflow editing for element/selector failures (AC2)", () => {
-    const ids = getRecoveryPaths("element_not_found").map((p) => p.id);
-    expect(ids).toContain("edit_workflow");
-    expect(ids).toContain("retry");
-  });
-
-  it("selects retry + docs for network failures (AC2)", () => {
-    const ids = getRecoveryPaths("network_error").map((p) => p.id);
-    expect(ids).toContain("retry");
-    expect(ids).toContain("view_docs");
-  });
-
-  it("falls back to a generic catalog for unknown categories (AC2 default)", () => {
-    const ids = getRecoveryPaths(null).map((p) => p.id);
-    expect(ids).toContain("retry");
-    expect(ids).toContain("contact_support");
+    expect(
+      shouldShowRecoveryGuidance({
+        assignment,
+        workflowRunId: "wr_failure",
+        treatmentSurfaceEnabled: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowRecoveryGuidance({
+        assignment: { ...assignment, arm: "control" as const },
+        workflowRunId: "wr_failure",
+        treatmentSurfaceEnabled: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -61,139 +77,104 @@ describe("FirstRunRecoveryGuidance", () => {
     vi.clearAllMocks();
     studioState.enabled = true;
   });
+
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
-  it("renders one button per recovery path with at least two actions (AC1)", () => {
-    const { getByTestId, container } = render(
-      <FirstRunRecoveryGuidance surface="runs" failureCategory={null} />,
-    );
-    expect(getByTestId("first-run-recovery-guidance")).toBeTruthy();
-    const buttons = container.querySelectorAll("button");
-    expect(buttons.length).toBeGreaterThanOrEqual(2);
-  });
+  it("emits the exact shown event once when the dormant component is mounted", () => {
+    render(<FirstRunRecoveryGuidance telemetryContext={telemetryContext} />);
 
-  it("emits the shown event once on mount with the path count (AC3)", () => {
-    render(
-      <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="invalid_credentials"
-      />,
-    );
-    const shownCalls = vi
-      .mocked(posthog.capture)
-      .mock.calls.filter((c) => c[0] === "onboarding.recovery_guidance_shown");
-    expect(shownCalls).toHaveLength(1);
-    expect(shownCalls[0]?.[1]).toMatchObject({
-      surface: "runs",
-      failure_category: "invalid_credentials",
-      path_count: 2,
-    });
-  });
-
-  it("records chosen + navigated outcome for a navigate path (AC3)", () => {
-    const { getByTestId } = render(
-      <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="invalid_credentials"
-        workflowPermanentId="wpid_123"
-      />,
-    );
-    fireEvent.click(getByTestId("recovery-path-update_credentials"));
-    expect(navigateMock).toHaveBeenCalledWith("/credentials");
+    expect(posthog.capture).toHaveBeenCalledTimes(1);
     expect(posthog.capture).toHaveBeenCalledWith(
-      "onboarding.recovery_path_chosen",
-      expect.objectContaining({ path_id: "update_credentials" }),
-    );
-    expect(posthog.capture).toHaveBeenCalledWith(
-      "onboarding.recovery_outcome",
+      "recovery_guidance_shown",
       expect.objectContaining({
-        path_id: "update_credentials",
-        outcome: "navigated",
+        organization_id: "org_opaque",
+        eligible_run_id: "wr_failure",
+        surface: "runs",
+        failure_category: "AUTH_FAILURE",
       }),
     );
   });
 
-  it("navigates to the workflow editor with the permanent id (AC2 wiring)", () => {
+  it("records an exact click but does not call retry_started on form navigation", () => {
+    const onRetry = vi.fn();
     const { getByTestId } = render(
       <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="element_not_found"
-        workflowPermanentId="wpid_123"
+        telemetryContext={telemetryContext}
+        onRetry={onRetry}
       />,
     );
-    fireEvent.click(getByTestId("recovery-path-edit_workflow"));
-    expect(navigateMock).toHaveBeenCalledWith("/agents/wpid_123/studio");
-  });
 
-  it("navigates to /build when the studio preview is off (AC2 wiring)", () => {
-    studioState.enabled = false;
-    const { getByTestId } = render(
-      <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="element_not_found"
-        workflowPermanentId="wpid_123"
-      />,
-    );
-    fireEvent.click(getByTestId("recovery-path-edit_workflow"));
-    expect(navigateMock).toHaveBeenCalledWith("/agents/wpid_123/build");
-  });
+    fireEvent.click(getByTestId("recovery-path-retry"));
 
-  it("records chosen + opened outcome for an external path (AC3)", () => {
-    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
-    const { getByTestId } = render(
-      <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="network_error"
-      />,
-    );
-    fireEvent.click(getByTestId("recovery-path-view_docs"));
-    expect(openSpy).toHaveBeenCalled();
+    expect(onRetry).toHaveBeenCalledOnce();
     expect(posthog.capture).toHaveBeenCalledWith(
-      "onboarding.recovery_outcome",
-      expect.objectContaining({ path_id: "view_docs", outcome: "opened" }),
+      "recovery_guidance_clicked",
+      expect.objectContaining({
+        eligible_run_id: "wr_failure",
+        path_id: "retry",
+      }),
     );
-    openSpy.mockRestore();
+    expect(posthog.capture).not.toHaveBeenCalledWith(
+      "retry_started",
+      expect.anything(),
+    );
   });
 
-  it("records retry_started when the retry handler resolves (AC3)", async () => {
-    const onRetry = vi.fn().mockResolvedValue(undefined);
+  it("keeps workflow-editor navigation wired to the selected path", () => {
     const { getByTestId } = render(
       <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="network_error"
-        onRetry={onRetry}
+        telemetryContext={{
+          ...telemetryContext,
+          failureCategory: "ELEMENT_NOT_FOUND",
+        }}
+        workflowPermanentId="wpid_123"
       />,
     );
-    fireEvent.click(getByTestId("recovery-path-retry"));
-    expect(onRetry).toHaveBeenCalled();
-    await waitFor(() => {
-      expect(posthog.capture).toHaveBeenCalledWith(
-        "onboarding.recovery_outcome",
-        expect.objectContaining({ path_id: "retry", outcome: "retry_started" }),
-      );
-    });
+
+    fireEvent.click(getByTestId("recovery-path-edit_workflow"));
+
+    expect(navigateMock).toHaveBeenCalledWith("/agents/wpid_123/studio");
+    expect(posthog.capture).toHaveBeenCalledWith(
+      "recovery_guidance_clicked",
+      expect.objectContaining({ path_id: "edit_workflow" }),
+    );
   });
 
-  it("records retry_failed_to_start when the retry handler rejects (AC3)", async () => {
-    const onRetry = vi.fn().mockRejectedValue(new Error("boom"));
+  it("falls back to the agents page when edit-workflow has no workflow id", () => {
     const { getByTestId } = render(
       <FirstRunRecoveryGuidance
-        surface="runs"
-        failureCategory="network_error"
-        onRetry={onRetry}
+        telemetryContext={{
+          ...telemetryContext,
+          failureCategory: "ELEMENT_NOT_FOUND",
+        }}
       />,
     );
-    fireEvent.click(getByTestId("recovery-path-retry"));
-    await waitFor(() => {
-      expect(posthog.capture).toHaveBeenCalledWith(
-        "onboarding.recovery_outcome",
-        expect.objectContaining({
-          path_id: "retry",
-          outcome: "retry_failed_to_start",
-        }),
-      );
-    });
+
+    fireEvent.click(getByTestId("recovery-path-edit_workflow"));
+
+    expect(navigateMock).toHaveBeenCalledWith("/agents");
+  });
+
+  it("opens external recovery links without an opener or referrer", () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const { getByTestId } = render(
+      <FirstRunRecoveryGuidance
+        telemetryContext={{
+          ...telemetryContext,
+          failureCategory: "PAGE_LOAD_TIMEOUT",
+        }}
+      />,
+    );
+
+    fireEvent.click(getByTestId("recovery-path-view_docs"));
+
+    expect(open).toHaveBeenCalledWith(
+      "https://docs.skyvern.com",
+      "_blank",
+      "noopener,noreferrer",
+    );
   });
 });

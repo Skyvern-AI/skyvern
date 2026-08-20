@@ -11,6 +11,8 @@ import {
   getReadableActionType,
   type ActionsApiResponse,
 } from "@/api/types";
+import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
+import { CopyButton } from "@/components/CopyButton";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
@@ -19,6 +21,8 @@ import {
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import { jsonClipboardText } from "./formatValue";
+import { BlockDetailFailure } from "./shared";
 
 type InspectorField = {
   label: string;
@@ -96,7 +100,7 @@ function HighlightedText({ text, search }: { text: string; search: string }) {
         part.matched ? (
           <mark
             key={index}
-            className="rounded bg-amber-300/20 px-0.5 font-medium text-amber-100 ring-1 ring-amber-200/20"
+            className="rounded bg-amber-300/20 px-0.5 font-medium text-amber-800 ring-1 ring-amber-200/20 dark:text-amber-100"
           >
             {part.text}
           </mark>
@@ -113,7 +117,7 @@ function FieldValue({ field }: { field: InspectorField }) {
     return <JsonExplorer value={field.value} rootLabel={field.label} />;
   }
   return (
-    <div className="whitespace-pre-wrap break-words rounded bg-slate-elevation1 px-2.5 py-2 text-xs text-slate-300">
+    <div className="whitespace-pre-wrap break-words rounded bg-slate-elevation1 px-2.5 py-2 text-xs text-tertiary-foreground">
       {String(field.value)}
     </div>
   );
@@ -127,13 +131,17 @@ function FieldList({
   emptyText: string;
 }) {
   if (fields.length === 0) {
-    return <div className="text-xs text-slate-500">{emptyText}</div>;
+    return (
+      <div className="text-xs text-muted-foreground dark:text-slate-500">
+        {emptyText}
+      </div>
+    );
   }
   return (
     <div className="space-y-3">
       {fields.map((field) => (
         <div key={field.label} className="space-y-1.5">
-          <div className="text-[11px] font-medium text-slate-500">
+          <div className="text-[11px] font-medium text-muted-foreground dark:text-slate-500">
             {field.label}
           </div>
           <FieldValue field={field} />
@@ -228,44 +236,57 @@ function JsonNode({
 
   const isOpen = hasSearch || expanded.has(path);
   const childCount = children.length;
+  const copyButton = (
+    // The path keeps accessible names unique when the same key repeats at
+    // different depths (e.g. two "id" fields).
+    <CopyButton
+      value={() => jsonClipboardText(value)}
+      ariaLabel={`Copy ${path === "$" ? label : path.slice(2)}`}
+      className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/jsonnode:opacity-100 [&_svg]:size-3"
+    />
+  );
 
   if (!isExpandable) {
     return (
-      <div className="flex min-w-0 items-start gap-1 py-0.5 text-xs">
+      <div className="group/jsonnode flex min-w-0 items-start gap-1 py-0.5 text-xs">
         <span className="size-3.5 shrink-0" aria-hidden="true" />
-        <span className="shrink-0 text-slate-500">
+        <span className="shrink-0 text-muted-foreground dark:text-slate-500">
           <HighlightedText text={label} search={search} />
         </span>
-        <span className="min-w-0 break-words font-mono text-slate-300">
+        <span className="min-w-0 break-words font-mono text-tertiary-foreground">
           <HighlightedText text={primitivePreview(value)} search={search} />
         </span>
+        {copyButton}
       </div>
     );
   }
 
   return (
     <div className="min-w-0 text-xs">
-      <button
-        type="button"
-        onClick={() => onToggle(path)}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-slate-800/60 focus-visible:ring-1 focus-visible:ring-white/40"
-      >
-        {isOpen ? (
-          <ChevronDownIcon className="size-3.5 shrink-0 text-slate-500" />
-        ) : (
-          <ChevronRightIcon className="size-3.5 shrink-0 text-slate-500" />
-        )}
-        <span className="shrink-0 text-slate-400">
-          <HighlightedText text={label} search={search} />
-        </span>
-        {!isOpen && (
-          <span className="min-w-0 truncate font-mono text-slate-300">
-            {expandablePreview(value, childCount)}
+      <div className="group/jsonnode flex min-w-0 items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onToggle(path)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-muted/60 focus-visible:ring-1 focus-visible:ring-foreground/40"
+        >
+          {isOpen ? (
+            <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          ) : (
+            <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          )}
+          <span className="shrink-0 text-muted-foreground">
+            <HighlightedText text={label} search={search} />
           </span>
-        )}
-      </button>
+          {!isOpen && (
+            <span className="min-w-0 truncate font-mono text-tertiary-foreground">
+              {expandablePreview(value, childCount)}
+            </span>
+          )}
+        </button>
+        {copyButton}
+      </div>
       {isOpen && (
-        <div className="ml-4 border-l border-slate-700 pl-3">
+        <div className="ml-4 border-l border-border pl-3">
           {children.map(([childKey, childValue]) => (
             <JsonNode
               key={`${path}.${childKey}`}
@@ -308,7 +329,7 @@ function JsonExplorer({ value, rootLabel = "value" }: JsonExplorerProps) {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search JSON"
-          className="h-7 border-slate-700 bg-slate-elevation2 text-xs"
+          className="h-7 border-border bg-slate-elevation2 text-xs"
         />
       )}
       <div className="max-h-80 overflow-auto rounded bg-slate-elevation2 p-2">
@@ -335,8 +356,17 @@ function pushField(
   fields.push({ label, value, kind });
 }
 
-function getInputFields(block: WorkflowRunBlock): Array<InspectorField> {
+function getInputFields(
+  block: WorkflowRunBlock,
+  action?: ActionsApiResponse | null,
+): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
+  // Block-level config (Navigation goal, Prompt, ...) doesn't change per
+  // action, so it stays visible instead of being fully replaced by the
+  // selected action's own input.
+  if (action) {
+    pushField(fields, "Input", getActionInputValue(action));
+  }
   pushField(fields, "Description", block.description);
   pushField(fields, "Prompt", block.prompt);
   pushField(fields, "URL", block.url);
@@ -367,7 +397,6 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
   pushField(fields, "Task ID", block.task_id);
   pushField(fields, "Engine", block.engine);
-  pushField(fields, "Failure reason", block.failure_reason);
   pushField(fields, "Executed branch", block.executed_branch_expression);
   pushField(fields, "Executed branch result", block.executed_branch_result);
   pushField(fields, "Executed next block", block.executed_branch_next_block);
@@ -375,19 +404,11 @@ function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
 }
 
 function getActionInputValue(action: ActionsApiResponse): string | null {
-  // Mirror ActionCardCompact: script-generated input text lives in response.
+  // Script-generated input text lives in response, not text.
   if (action.action_type === ActionTypes.InputText) {
     return action.text ?? action.response;
   }
   return action.text;
-}
-
-function getActionInputFields(
-  action: ActionsApiResponse,
-): Array<InspectorField> {
-  const fields: Array<InspectorField> = [];
-  pushField(fields, "Input", getActionInputValue(action));
-  return fields;
 }
 
 function getActionSummaryFields(
@@ -405,6 +426,11 @@ function getActionSummaryFields(
   );
   pushField(fields, "Reasoning", action.reasoning);
   pushField(fields, "Intention", action.intention);
+  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
+  // this panel is the reachable home for it.
+  if (isRecorderCallText(action.description)) {
+    pushField(fields, "Recorded call", action.description);
+  }
   return fields;
 }
 
@@ -517,7 +543,7 @@ function BlockInspector({
   action?: ActionsApiResponse | null;
 }) {
   const inputFields = useMemo(
-    () => (action ? getActionInputFields(action) : getInputFields(block)),
+    () => getInputFields(block, action),
     [action, block],
   );
   const summaryFields = useMemo(
@@ -538,27 +564,33 @@ function BlockInspector({
   const outputTabLabel = showsExtractedInformation
     ? "Extracted Information"
     : "Outputs";
-  const defaultTab = hasOutput ? "outputs" : "summary";
+  // A failed block/action opens on Summary so its failure reason (the only
+  // place it now renders) is visible without hunting through tabs.
+  const defaultTab = block.failure_reason
+    ? "summary"
+    : hasOutput
+      ? "outputs"
+      : "summary";
   const [activeTab, setActiveTab] = useState(defaultTab);
   const diagnosticsTaskId = action?.task_id ?? block.task_id;
   const diagnosticsStepIndex = action
     ? getActionStepIndex(block.actions, action)
     : null;
   const triggerClassName =
-    "rounded px-2.5 py-1 text-xs font-medium text-slate-400 transition-colors hover:bg-white/5 hover:text-slate-200 data-[state=active]:bg-slate-elevation4 data-[state=active]:text-slate-50 data-[state=active]:shadow-sm";
+    "rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-white/5 dark:hover:text-slate-200 data-[state=active]:bg-slate-elevation4 data-[state=active]:text-foreground data-[state=active]:shadow-sm";
 
   useEffect(() => {
     setActiveTab(defaultTab);
   }, [block.workflow_run_block_id, action?.action_id, defaultTab]);
 
   return (
-    <div className="border-b border-slate-700 bg-slate-elevation1 px-3 py-3">
+    <div className="border-b border-border bg-slate-elevation1 px-3 py-3">
       <Tabs
         value={activeTab}
         onValueChange={setActiveTab}
         className="space-y-3"
       >
-        <TabsList className="h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5 ring-1 ring-inset ring-slate-700/60">
+        <TabsList className="h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5 ring-1 ring-inset ring-border/60">
           <TabsTrigger className={triggerClassName} value="summary">
             Summary
           </TabsTrigger>
@@ -594,7 +626,8 @@ function BlockInspector({
             </Link>
           )}
         </TabsList>
-        <TabsContent value="summary" className="m-0">
+        <TabsContent value="summary" className="m-0 space-y-3">
+          <BlockDetailFailure block={block} />
           <FieldList
             fields={summaryFields}
             emptyText="No additional summary data."
@@ -607,7 +640,9 @@ function BlockInspector({
           {hasOutput ? (
             <JsonExplorer value={outputValue} rootLabel={outputRootLabel} />
           ) : (
-            <div className="text-xs text-slate-500">No block output.</div>
+            <div className="text-xs text-muted-foreground dark:text-slate-500">
+              No block output.
+            </div>
           )}
         </TabsContent>
       </Tabs>

@@ -8,6 +8,7 @@ import { ActionBlockForm } from "./BlockConfigForm/ActionBlockForm";
 import { CodeBlockBlockForm } from "./BlockConfigForm/CodeBlockBlockForm";
 import { ConditionalBlockForm } from "./BlockConfigForm/ConditionalBlockForm";
 import { DownloadBlockForm } from "./BlockConfigForm/DownloadBlockForm";
+import { EmailInboxBlockForm } from "./BlockConfigForm/EmailInboxBlockForm";
 import { ExtractionBlockForm } from "./BlockConfigForm/ExtractionBlockForm";
 import { FileDownloadBlockForm } from "./BlockConfigForm/FileDownloadBlockForm";
 import { FileParserBlockForm } from "./BlockConfigForm/FileParserBlockForm";
@@ -23,6 +24,7 @@ import { PDFParserBlockForm } from "./BlockConfigForm/PDFParserBlockForm";
 import { PrintPageBlockForm } from "./BlockConfigForm/PrintPageBlockForm";
 import { PdfFillBlockForm } from "./BlockConfigForm/PdfFillBlockForm";
 import { SendEmailBlockForm } from "./BlockConfigForm/SendEmailBlockForm";
+import { SplitPdfBlockForm } from "./BlockConfigForm/SplitPdfBlockForm";
 import { TaskBlockForm } from "./BlockConfigForm/TaskBlockForm";
 import { Taskv2BlockForm } from "./BlockConfigForm/Taskv2BlockForm";
 import { TextPromptBlockForm } from "./BlockConfigForm/TextPromptBlockForm";
@@ -49,6 +51,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   conditional: ConditionalBlockForm,
   textPrompt: TextPromptBlockForm,
   sendEmail: SendEmailBlockForm,
+  emailInbox: EmailInboxBlockForm,
   codeBlock: CodeBlockBlockForm,
   fileParser: FileParserBlockForm,
   fileDownload: FileDownloadBlockForm,
@@ -65,6 +68,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   workflowTrigger: WorkflowTriggerBlockForm,
   googleSheetsRead: GoogleSheetsReadBlockForm,
   googleSheetsWrite: GoogleSheetsWriteBlockForm,
+  splitPdf: SplitPdfBlockForm,
 };
 
 function BlockConfigForm({ blockId }: Readonly<{ blockId: string }>) {

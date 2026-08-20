@@ -1,5 +1,5 @@
 import { CodeIcon } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import {
   DropdownMenuCheckboxItem,
@@ -29,7 +29,7 @@ import { useToggleCodeView } from "../hooks/useToggleCodeView";
  * Renders nothing until that's the case, mirroring the old inline controls.
  */
 function CodeSubmenu() {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const cacheKey = workflow?.cache_key ?? "";
 

@@ -15,10 +15,6 @@ export type AuthDiagnosticsResponse = {
   status: AuthStatusValue;
   detail?: string;
   next_step?: string;
-  fingerprint?: string;
-  organization_id?: string;
-  expires_at?: number;
-  api_key?: string;
 };
 
 // HTTP statuses that mean "diagnostics can't run against THIS deployment" —

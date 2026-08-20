@@ -56,7 +56,7 @@
     "api_key": {
       "type": "string",
       "title": "Skyvern API Key",
-      "description": "Create an API key in Skyvern Settings, then paste it here.",
+      "description": "Paste your API key from app.skyvern.com -> Settings. Claude cannot use Skyvern until this is set.",
       "sensitive": true,
       "required": true
     },

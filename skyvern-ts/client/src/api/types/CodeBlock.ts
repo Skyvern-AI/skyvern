@@ -15,4 +15,6 @@ export interface CodeBlock {
     next_loop_on_failure?: boolean;
     code: string;
     parameters?: Skyvern.CodeBlockParametersItem[];
+    prompt?: string;
+    steps?: Skyvern.CodeBlockStep[];
 }

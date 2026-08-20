@@ -47,6 +47,8 @@ def update_or_add_env_var(
             "ENV": "local",
             "ENABLE_OPENAI": "false",
             "OPENAI_API_KEY": "",
+            "ENABLE_XAI": "false",
+            "XAI_API_KEY": "",
             "ENABLE_ANTHROPIC": "false",
             "ANTHROPIC_API_KEY": "",
             "ENABLE_AZURE": "false",
@@ -117,6 +119,21 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
     else:
         set_env_var("ENABLE_OPENAI", "false")
 
+    console.print("\n[bold blue]--- xAI Configuration ---[/bold blue]")
+    console.print("To enable xAI Grok, you must have an xAI API key.")
+    enable_xai = Confirm.ask("Do you want to enable xAI Grok?")
+    if enable_xai:
+        xai_api_key = ask_secret("Enter your xAI API key")
+        if not xai_api_key:
+            console.print("[red]Error: xAI API key is required. xAI will not be enabled.[/red]")
+        else:
+            set_env_var("XAI_API_KEY", xai_api_key)
+            set_env_var("ENABLE_XAI", "true")
+            enabled_providers.append("xai")
+            model_options.append("XAI_GROK_4_5")
+    else:
+        set_env_var("ENABLE_XAI", "false")
+
     console.print("\n[bold blue]--- Anthropic Configuration ---[/bold blue]")
     console.print("To enable Anthropic, you must have an Anthropic API key.")
     enable_anthropic = Confirm.ask("Do you want to enable Anthropic?")
@@ -130,6 +147,7 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
             enabled_providers.append("anthropic")
             model_options.extend(
                 [
+                    "ANTHROPIC_CLAUDE5_OPUS",
                     "ANTHROPIC_CLAUDE5_FABLE",
                     "ANTHROPIC_CLAUDE4.7_OPUS",
                     "ANTHROPIC_CLAUDE4.6_OPUS",
@@ -176,8 +194,10 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
             model_options.extend(
                 [
                     "GEMINI_3.1_PRO",
+                    "GEMINI_3.6_FLASH",
                     "GEMINI_3.5_FLASH",
                     "GEMINI_3.0_FLASH",
+                    "GEMINI_3.5_FLASH_LITE",
                     "GEMINI_3.1_FLASH_LITE",
                     "GEMINI_2.5_PRO",
                     "GEMINI_2.5_FLASH",

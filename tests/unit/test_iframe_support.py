@@ -67,6 +67,7 @@ class TestMCPFrameTools:
 
         fake_page = MagicMock()
         fake_page.goto = AsyncMock()
+        fake_page.wait_for_load_state = AsyncMock()
         fake_page.url = "https://example.com/new"
         fake_page.title = AsyncMock(return_value="New Page")
         fake_ctx = MagicMock()
@@ -237,3 +238,31 @@ class TestBrowserOps:
         assert len(result) == 2
         assert result[0].is_main is True
         assert result[1].name == "embed"
+
+
+class TestSessionFramePropagation:
+    @pytest.mark.asyncio
+    async def test_get_page_propagates_detached_working_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli.core import session_manager
+        from skyvern.cli.core.result import BrowserContext
+        from skyvern.cli.core.session_manager import SessionState
+        from skyvern.cli.mcp_tools import inspection
+
+        frame = MagicMock()
+        frame.is_detached.return_value = True
+        wrapper = MagicMock()
+        browser = MagicMock()
+        browser.get_working_page = AsyncMock(return_value=wrapper)
+        browser._browser_context.pages = []
+        browser._browser_context.on = MagicMock()
+        ctx = BrowserContext(mode="local")
+        state = SessionState(browser=browser, context=ctx)
+        state._working_frame = frame
+        monkeypatch.setattr(session_manager, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
+        monkeypatch.setattr(session_manager, "get_current_session", lambda: state)
+        monkeypatch.setattr(inspection, "ensure_hooks_on_all_pages", MagicMock())
+
+        page, _ = await session_manager.get_page()
+
+        assert state._working_frame is frame
+        assert page._working_frame is frame

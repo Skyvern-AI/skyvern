@@ -36,12 +36,13 @@ import { buildTaskRunPayload } from "@/util/taskRunPayload";
 import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "react-router-dom";
-import { statusIsFinalized } from "../types";
+import { statusIsCancellable, statusIsFinalized } from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import * as env from "@/util/env";
 import { TaskRunVerificationCodeForm } from "./TaskRunVerificationCodeForm";
+import { RunTagsEditor } from "../components/tagging/RunTagsEditor";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -94,6 +95,8 @@ function TaskDetails() {
       },
       enabled: !!workflowRun?.workflow_id,
     });
+
+  const workflowRunId = task?.workflow_run_id ?? null;
 
   const cancelTaskMutation = useMutation({
     mutationFn: async () => {
@@ -167,8 +170,7 @@ function TaskDetails() {
     </div>
   ) : null;
 
-  const taskIsRunningOrQueued =
-    task?.status === Status.Running || task?.status === Status.Queued;
+  const taskIsCancellable = task ? statusIsCancellable(task) : false;
 
   const taskHasTerminalState = task && statusIsFinalized(task);
 
@@ -202,17 +204,40 @@ function TaskDetails() {
     </div>
   ) : null;
 
+  const browserConsoleLog = task?.browser_console_log_url ? (
+    <div className="space-y-1">
+      <Label>Browser Console Log</Label>
+      <div>
+        <a
+          href={task.browser_console_log_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm underline underline-offset-4"
+        >
+          Download console log
+        </a>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div className="flex flex-col gap-8">
       <header className="space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-5">
-            <span className="text-3xl">{taskId}</span>
-            {taskIsLoading ? (
-              <Skeleton className="h-8 w-32" />
-            ) : (
-              task && <StatusBadge status={task.status} />
-            )}
+            <div className="flex min-w-0 flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                <span className="text-3xl">{taskId}</span>
+                {taskIsLoading ? (
+                  <Skeleton className="h-8 w-32" />
+                ) : (
+                  task && <StatusBadge status={task.status} />
+                )}
+              </div>
+              {workflowRunId ? (
+                <RunTagsEditor workflowRunId={workflowRunId} />
+              ) : null}
+            </div>
           </div>
           <div className="flex items-center gap-2">
             {/** API & Webhooks consolidated dropdown + controlled dialog */}
@@ -258,13 +283,13 @@ function TaskDetails() {
               onTestWebhook={() => setReplayOpen(true)}
             />
             <WebhookReplayDialog
-              runId={task?.workflow_run_id ?? ""}
+              runId={task?.workflow_run_id ?? task?.task_id ?? ""}
               disabled={taskIsLoading || !taskHasTerminalState}
               open={replayOpen}
               onOpenChange={setReplayOpen}
               hideTrigger
             />
-            {taskIsRunningOrQueued && (
+            {taskIsCancellable && (
               <Dialog>
                 <DialogTrigger asChild>
                   <Button variant="destructive">Cancel</Button>
@@ -335,6 +360,7 @@ function TaskDetails() {
           {extractedInformation}
           {failureReason}
           {webhookFailureReason}
+          {browserConsoleLog}
         </>
       )}
       <SwitchBarNavigation

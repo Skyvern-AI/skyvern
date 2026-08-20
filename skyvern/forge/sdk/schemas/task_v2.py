@@ -7,11 +7,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
+TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL = "__timeout_webhook_delivered__"
 
 
 class TaskV2Status(StrEnum):
@@ -130,6 +132,12 @@ class TaskV2(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    @field_serializer("webhook_failure_reason")
+    def _mask_internal_webhook_delivery_marker(self, failure_reason: str | None) -> str | None:
+        if failure_reason == TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL:
+            return None
+        return failure_reason
+
 
 class ThoughtType(StrEnum):
     """
@@ -210,23 +218,24 @@ class TaskV2Request(BaseModel):
     user_prompt: str
     url: str | None = None
     browser_session_id: str | None = None
-    webhook_callback_url: str | None = None
+    webhook_callback_url: WebhookUrl | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     proxy_location: ProxyLocationInput = None
     publish_workflow: bool = False
+    generate_script: bool | None = None
     extracted_information_schema: dict | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
     model: dict[str, Any] | None = None
-    max_screenshot_scrolls: int | None = None
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool = False
 
-    @field_validator("url", "webhook_callback_url", "totp_verification_url")
+    @field_validator("url", "totp_verification_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
         if not url:

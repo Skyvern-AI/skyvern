@@ -7,10 +7,10 @@ description: "Run smoke tests against a deployed or local app based on your git 
 
 Read the diff, classify changes, start the app, and run targeted smoke tests via Skyvern browser tools with Chrome DevTools MCP as fallback.
 
-<!-- NOTE: This content is maintained in two places — keep in sync:
-     1. skyvern/cli/skills/smoke-test/SKILL.md  (bundled with pip — canonical)
-     2. .claude/skills/smoke-test/SKILL.md       (project-local copy)
-     Steps 1-4 are copied from skyvern/cli/skills/qa/SKILL.md.
+<!-- NOTE: .agents/skills/smoke-test/SKILL.md is the repository canonical source.
+     Keep the synchronized bundled copy in sync with it:
+     skyvern/cli/skills/smoke-test/SKILL.md
+     Steps 1-4 are copied from .agents/skills/qa/SKILL.md.
      If you fix bugs in /qa's diff-reading, classification, or app startup,
      mirror those fixes here. -->
 
@@ -387,9 +387,11 @@ cat >> "$COMMENT_FILE" <<'REPORT_EOF'
 <the full report markdown from Step 7>
 REPORT_EOF
 
-# Find an existing smoke test comment on the PR
-EXISTING_COMMENT_ID=$(gh api "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \
-  --jq '.[] | select(.body | test("skyvern-smoke-test-report")) | .id' \
+# Find this user's own sticky comment across all pages. Matching the marker as a bare
+# substring, or without the author, would PATCH someone else's comment out of existence.
+GH_LOGIN=$(gh api user --jq .login 2>/dev/null)
+EXISTING_COMMENT_ID=$(GH_LOGIN="$GH_LOGIN" gh api --paginate "repos/{owner}/{repo}/issues/${PR_NUMBER}/comments" \
+  --jq '.[] | select(.user.login == $ENV.GH_LOGIN) | select(.body | startswith("<!-- skyvern-smoke-test-report -->")) | .id' \
   2>/dev/null | head -1)
 
 if [ -n "$EXISTING_COMMENT_ID" ]; then

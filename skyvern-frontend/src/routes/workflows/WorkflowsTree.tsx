@@ -6,14 +6,7 @@ import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { Button } from "@/components/ui/button";
 import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Table,
   TableBody,
@@ -71,6 +64,7 @@ import { useInfiniteFoldersQuery } from "./hooks/useInfiniteFoldersQuery";
 import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
+import { useWorkflowsReliabilityBatchQuery } from "./hooks/useWorkflowsReliabilityBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
 import {
@@ -403,6 +397,8 @@ function WorkflowsTree() {
       enabled: taggingEnabled,
     },
   );
+  const { data: workflowReliabilityMap = {} } =
+    useWorkflowsReliabilityBatchQuery(workflowIds);
 
   // Tags observed on the page for editor/filter suggestions: grouped values per
   // key plus standalone labels. Maps avoid prototype-key collisions.
@@ -700,6 +696,7 @@ function WorkflowsTree() {
     selectedCount: selectedWorkflows.length,
     foldersMap,
     workflowTagsMap,
+    workflowReliabilityMap,
     tagDescriptions,
     tagColors,
     tagKeys,
@@ -824,7 +821,7 @@ function WorkflowsTree() {
       return (
         <TableMessageRow colSpan={columnCount}>
           <div className="flex flex-col items-center gap-3 py-6">
-            <FolderIcon className="h-8 w-8 text-blue-400 opacity-50" />
+            <FolderIcon className="h-8 w-8 text-blue-700 opacity-50 dark:text-blue-400" />
             <p className="text-sm text-muted-foreground">
               No folders or agents yet. Create a folder to organize your work,
               or create your first agent.
@@ -1055,49 +1052,29 @@ function WorkflowsTree() {
           />
         )}
 
-        <Dialog
+        <ConfirmDialog
           open={bulkDeleteDialog.open}
           onOpenChange={(open) => {
-            if (!open && !isBulkOperating) {
+            if (!open) {
               setBulkDeleteDialog({ open: false, targets: [] });
             }
           }}
-        >
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>
-                Delete {bulkDeleteDialog.targets.length} Agent
-                {bulkDeleteDialog.targets.length === 1 ? "" : "s"}
-              </DialogTitle>
-              <DialogDescription>
-                Are you sure you want to delete{" "}
-                {bulkDeleteDialog.targets.length}{" "}
-                {bulkDeleteDialog.targets.length === 1 ? "agent" : "agents"}?
-                This action cannot be undone.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button
-                variant="secondary"
-                disabled={isBulkOperating}
-                onClick={() =>
-                  setBulkDeleteDialog({ open: false, targets: [] })
-                }
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                disabled={isBulkOperating}
-                onClick={() => {
-                  void handleBulkDeleteConfirm();
-                }}
-              >
-                {isBulkOperating ? "Deleting..." : "Delete"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+          title={`Delete ${bulkDeleteDialog.targets.length} agent${
+            bulkDeleteDialog.targets.length === 1 ? "" : "s"
+          }?`}
+          description={
+            <p>
+              {bulkDeleteDialog.targets.length}{" "}
+              {bulkDeleteDialog.targets.length === 1 ? "agent" : "agents"} will
+              be permanently deleted.
+            </p>
+          }
+          itemCount={bulkDeleteDialog.targets.length}
+          isPending={isBulkOperating}
+          onConfirm={() => {
+            void handleBulkDeleteConfirm();
+          }}
+        />
 
         {/* Folder Dialogs */}
         <CreateFolderDialog

@@ -3,8 +3,8 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { helpTooltips } from "../../helpContent";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
-import { useContext, useMemo } from "react";
-import CloudContext from "@/store/CloudContext";
+import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
+import { useMemo } from "react";
 import { parameterIsSkyvernCredential } from "../../types";
 
 type Props = {
@@ -13,18 +13,21 @@ type Props = {
   onParametersChange: (parameters: Array<string>) => void;
 };
 
+const CREDENTIALS_PAGE_SIZE = 100;
+
 function ParametersMultiSelect({
   availableOutputParameters,
   parameters,
   onParametersChange,
 }: Props) {
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parameters: workflowParameters } = useWorkflowParametersStore();
 
   // Fetch credentials to check for orphaned Skyvern credential parameters
   const { data: credentials = [], isSuccess } = useCredentialsQuery({
-    enabled: isCloud,
-    page_size: 100,
+    enabled: skyvernCredentialSourceAvailable,
+    page_size: CREDENTIALS_PAGE_SIZE,
   });
 
   // Get the set of credential IDs that exist in the vault
@@ -45,6 +48,7 @@ function ParametersMultiSelect({
       // Check if this is an orphaned Skyvern credential parameter
       const isOrphanedCredential =
         isSuccess &&
+        credentials.length < CREDENTIALS_PAGE_SIZE &&
         param &&
         param.parameterType === "credential" &&
         parameterIsSkyvernCredential(param) &&
@@ -55,12 +59,18 @@ function ParametersMultiSelect({
         value: key,
       };
     });
-  }, [keys, workflowParameters, isSuccess, credentialIdsInVault]);
+  }, [
+    keys,
+    workflowParameters,
+    isSuccess,
+    credentials.length,
+    credentialIdsInVault,
+  ]);
 
   return (
     <div className="space-y-2">
       <header className="flex gap-2">
-        <h1 className="text-xs text-slate-300">Inputs</h1>
+        <h1 className="text-xs text-tertiary-foreground">Inputs</h1>
         <HelpTooltip content={helpTooltips["task"]["parameters"]} />
       </header>
       <MultiSelect

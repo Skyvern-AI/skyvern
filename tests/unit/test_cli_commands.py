@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import shlex
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,10 +140,19 @@ class TestResolveConnection:
     def test_explicit_cdp_wins(self) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
 
-        result = _resolve_connection(None, "ws://localhost:9222/devtools/browser/abc")
+        cdp_url = "wss://browser.test/devtools/browser/pbs_123"
+        result = _resolve_connection(None, cdp_url)
         assert result.mode == "cdp"
         assert result.session_id is None
-        assert result.cdp_url == "ws://localhost:9222/devtools/browser/abc"
+        assert result.cdp_url == cdp_url
+
+    def test_bare_session_id_in_explicit_cdp_routes_to_cloud(self) -> None:
+        from skyvern.cli.commands.browser import _resolve_connection
+
+        result = _resolve_connection(None, "pbs_explicit")
+        assert result.mode == "cloud"
+        assert result.session_id == "pbs_explicit"
+        assert result.cdp_url is None
 
     def test_rejects_both_connection_flags(self) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
@@ -157,14 +169,29 @@ class TestResolveConnection:
         assert result.mode == "cloud"
         assert result.session_id == "pbs_from_state"
 
-    def test_state_fallback_cdp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("mode", ["cdp", None])
+    def test_state_fallback_cdp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str | None) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
 
         _patch_state_dir(monkeypatch, tmp_path)
-        save_state(CLIState(session_id=None, cdp_url="ws://localhost:9222/devtools/browser/abc", mode="cdp"))
+        cdp_url = "wss://browser.test/devtools/browser/pbs_123"
+        save_state(CLIState(session_id=None, cdp_url=cdp_url, mode=mode))
         result = _resolve_connection(None, None)
         assert result.mode == "cdp"
-        assert result.cdp_url == "ws://localhost:9222/devtools/browser/abc"
+        assert result.cdp_url == cdp_url
+
+    @pytest.mark.parametrize("mode", ["cdp", None])
+    def test_bare_session_id_in_cdp_state_routes_to_cloud(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str | None
+    ) -> None:
+        from skyvern.cli.commands.browser import _resolve_connection
+
+        _patch_state_dir(monkeypatch, tmp_path)
+        save_state(CLIState(session_id=None, cdp_url="pbs_from_state", mode=mode))
+        result = _resolve_connection(None, None)
+        assert result.mode == "cloud"
+        assert result.session_id == "pbs_from_state"
+        assert result.cdp_url is None
 
     def test_no_session_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.cli.commands.browser import _resolve_connection
@@ -335,6 +362,36 @@ class TestBrowserCommands:
 
 
 class TestWorkflowCommands:
+    def test_workflow_list_query_alias_maps_to_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.cli import workflow as workflow_cmd
+
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        tool = AsyncMock(
+            return_value={
+                "ok": True,
+                "action": "skyvern_workflow_list",
+                "browser_context": {"mode": "none", "session_id": None, "cdp_url": None},
+                "data": {"workflows": [], "page": 1, "page_size": 10, "count": 0, "has_more": False},
+                "artifacts": [],
+                "timing_ms": {},
+                "warnings": [],
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(workflow_cmd, "tool_workflow_list", tool)
+
+        result = CliRunner().invoke(workflow_cmd.workflow_app, ["list", "--query", "invoice", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert tool.await_args.kwargs == {
+            "search": "invoice",
+            "page": 1,
+            "page_size": 10,
+            "only_workflows": False,
+        }
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+
     def test_workflow_get_outputs_mcp_envelope_in_json_mode(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
@@ -353,7 +410,7 @@ class TestWorkflowCommands:
         tool = AsyncMock(return_value=expected)
         monkeypatch.setattr(workflow_cmd, "tool_workflow_get", tool)
 
-        workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, json_output=True)
+        workflow_cmd.workflow_get(workflow_id="wpid_123", version=2, definition_file=None, json_output=True)
 
         parsed = json.loads(capsys.readouterr().out)
         # emit_tool_result adds schema_version and warnings defaults to the output copy
@@ -361,6 +418,76 @@ class TestWorkflowCommands:
         assert parsed["data"] == expected["data"]
         assert parsed["schema_version"] == "1.0"
         assert tool.await_args.kwargs == {"workflow_id": "wpid_123", "version": 2}
+
+    def test_workflow_get_definition_file_feeds_directly_into_update(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import asyncio
+
+        from skyvern.cli import workflow as workflow_cmd
+        from skyvern.cli.mcp_tools import workflow as workflow_tools
+
+        preserved_settings = {
+            "description": "Existing description",
+            "webhook_callback_url": "https://example.com/webhook",
+            "persist_browser_session": True,
+            "browser_profile_id": "bp_existing",
+            "run_with": "code",
+            "cache_key": None,
+            "adaptive_caching": True,
+            "ai_fallback": False,
+        }
+        existing_workflow = {
+            "title": "Status workflow",
+            "proxy_location": "RESIDENTIAL",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [{"block_type": "code", "label": "report_status", "code": "return {'status': 'ready'}"}],
+            },
+            **preserved_settings,
+        }
+        exported = {
+            "title": existing_workflow["title"],
+            "proxy_location": existing_workflow["proxy_location"],
+            "workflow_definition": existing_workflow["workflow_definition"],
+        }
+        monkeypatch.setattr(workflow_cmd, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(
+            workflow_cmd,
+            "tool_workflow_get",
+            AsyncMock(return_value={"ok": True, "data": existing_workflow}),
+        )
+        definition_file = tmp_path / "wf.json"
+
+        cli_result = CliRunner().invoke(
+            workflow_cmd.workflow_app,
+            ["get", "--id", "wpid_123", "--definition-file", str(definition_file)],
+        )
+
+        assert cli_result.exit_code == 0, cli_result.output
+        assert "Wrote workflow definition to" in cli_result.output
+        assert json.loads(definition_file.read_text()) == exported
+
+        monkeypatch.setattr(workflow_tools, "get_workflow_by_id", AsyncMock(return_value=existing_workflow))
+        update_raw = AsyncMock(
+            return_value={"workflow_permanent_id": "wpid_123", "title": "Status workflow", "version": 2}
+        )
+        monkeypatch.setattr(workflow_tools, "update_workflow_raw", update_raw)
+
+        update_result = asyncio.run(
+            workflow_cmd.tool_workflow_update(
+                workflow_id="wpid_123",
+                definition=definition_file.read_text(),
+                format="json",
+            )
+        )
+
+        assert update_result["ok"] is True
+        update_raw.assert_awaited_once()
+        sent_definition = update_raw.await_args.kwargs["json_definition"]
+        assert {field: sent_definition[field] for field in preserved_settings} == preserved_settings
 
     def test_workflow_create_reads_definition_from_file(
         self,
@@ -785,7 +912,7 @@ class TestTasksCommands:
     ) -> None:
         from skyvern.cli import tasks as tasks_cmd
 
-        monkeypatch.setattr(tasks_cmd, "_get_client", lambda _api_key=None: object())
+        monkeypatch.setattr(tasks_cmd, "_get_client", lambda _api_key=None, **_: object())
         monkeypatch.setattr(
             tasks_cmd, "_list_workflow_tasks", lambda _client, _run_id: (_ for _ in ()).throw(RuntimeError("boom"))
         )
@@ -800,6 +927,205 @@ class TestTasksCommands:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["ok"] is False
         assert parsed["action"] == "tasks.list"
+
+
+@pytest.mark.parametrize("module_name", ["skyvern.cli.credentials", "skyvern.cli.tasks"])
+class TestCredentialClientBaseUrlGuard:
+    def test_rejects_credential_when_base_url_uses_untouched_default(
+        self, module_name: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        cli_module = importlib.import_module(module_name)
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        with pytest.raises(SystemExit, match="1"):
+            cli_module._get_client("test-api-key")
+
+        output = " ".join(capsys.readouterr().out.split())
+        assert "Set SKYVERN_BASE_URL" in output
+        # The remediation must not hand the user the production URL this guard exists to protect.
+        assert "https://api.skyvern.com" not in output
+
+    def test_rejection_uses_json_envelope_when_requested(
+        self, module_name: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        cli_module = importlib.import_module(module_name)
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        with pytest.raises(SystemExit, match="1"):
+            cli_module._get_client("test-api-key", action="credentials.list", json_mode=True)
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert parsed["action"] == "credentials.list"
+        assert "Set SKYVERN_BASE_URL" in parsed["error"]["message"]
+        assert "https://api.skyvern.com" not in parsed["error"]["message"]
+
+    @pytest.mark.parametrize("base_url", ["https://api.skyvern.com", "https://staging.skyvern.com"])
+    def test_allows_credential_when_base_url_is_explicitly_configured(
+        self, module_name: str, base_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.setenv("SKYVERN_BASE_URL", base_url)
+        cli_module = importlib.import_module(module_name)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(cli_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        cli_module._get_client("test-api-key")
+
+        client_constructor.assert_called_once_with(base_url=base_url, api_key="test-api-key")
+
+    def test_allows_untouched_default_without_a_credential(
+        self, module_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern import config
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        cli_module = importlib.import_module(module_name)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(cli_module, "prepare_cli_runtime", lambda **_: None)
+        monkeypatch.setattr(cli_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(config, "settings", config.Settings(_env_file=None))
+
+        cli_module._get_client()
+
+        client_constructor.assert_called_once_with(base_url="https://api.skyvern.com", api_key="PLACEHOLDER")
+
+
+class TestSharedFactoryBaseUrlGuard:
+    def _client_module_with_fresh_settings(self, monkeypatch: pytest.MonkeyPatch) -> object:
+        from skyvern import config
+        from skyvern.cli.core import client as client_module
+
+        # Stateless HTTP mode is process-global; pin it so tests hold under xdist
+        # regardless of what an earlier test on the same worker left behind.
+        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: False)
+        monkeypatch.setattr(client_module, "settings", config.Settings(_env_file=None))
+        return client_module
+
+    def test_cli_process_rejects_credential_on_untouched_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        client_module = self._client_module_with_fresh_settings(monkeypatch)
+        monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
+
+        with pytest.raises(RuntimeError, match="Set SKYVERN_BASE_URL"):
+            client_module._build_cloud_client("test-api-key")
+
+    def test_non_cli_process_builds_client_on_untouched_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prod temporal workers run with SKYVERN_BASE_URL unset and reach this factory via
+        copilot self-heal; an unconditional guard here is a production outage."""
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        client_module = self._client_module_with_fresh_settings(monkeypatch)
+        monkeypatch.setattr(client_module, "is_cli_runtime", lambda: False)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+
+        client_module._build_cloud_client("test-api-key")
+
+        assert client_constructor.call_args.kwargs["base_url"] == "https://api.skyvern.com"
+
+    @pytest.mark.parametrize("base_url", ["https://api.skyvern.com", "http://localhost:8000"])
+    def test_cli_process_builds_client_when_base_url_is_explicit(
+        self, base_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKYVERN_BASE_URL", base_url)
+        client_module = self._client_module_with_fresh_settings(monkeypatch)
+        monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+
+        client_module._build_cloud_client("test-api-key")
+
+        assert client_constructor.call_args.kwargs["base_url"] == base_url
+
+    def test_cli_process_builds_client_with_placeholder_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        client_module = self._client_module_with_fresh_settings(monkeypatch)
+        monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+
+        client_module._build_cloud_client("PLACEHOLDER")
+
+        assert client_constructor.call_args.kwargs["base_url"] == "https://api.skyvern.com"
+
+    def test_stateless_http_mode_targets_self_and_skips_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        client_module = self._client_module_with_fresh_settings(monkeypatch)
+        monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
+        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
+        client_constructor = MagicMock(return_value=object())
+        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+
+        client_module._build_cloud_client("test-api-key")
+
+        assert client_constructor.call_args.kwargs["base_url"] == f"http://127.0.0.1:{client_module.settings.PORT}"
+
+
+class TestBrowserGroupBaseUrlGuard:
+    def test_browser_session_create_refuses_credential_on_untouched_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The browser group callback must mark the CLI runtime so the shared factory guard
+        fires for nested subcommands; without it a real key silently reaches production."""
+        from skyvern import _cli_bootstrap, config
+        from skyvern.cli.commands import browser as browser_cmd
+        from skyvern.cli.core import client as client_module
+
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr("skyvern.utils.env_paths.load_backend_env_files", lambda intent: tmp_path / ".env")
+        monkeypatch.setattr(_cli_bootstrap, "configure_cli_runtime_logging", lambda: None)
+        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: False)
+        monkeypatch.setattr(client_module, "settings", config.Settings(_env_file=None))
+        monkeypatch.setattr(client_module, "_resolve_api_key", lambda: "test-api-key")
+        monkeypatch.setattr(client_module, "_global_skyvern_instance", None)
+        monkeypatch.setattr(browser_cmd, "capture_cli_tool_call", lambda *_args, **_kwargs: None)
+
+        token = client_module._skyvern_instance.set(None)
+        try:
+            result = CliRunner().invoke(browser_cmd.browser_app, ["session", "create", "--json"])
+        finally:
+            client_module._skyvern_instance.reset(token)
+
+        assert result.exit_code == 1, result.output
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is False
+        assert "Set SKYVERN_BASE_URL" in parsed["error"]["message"]
+
+
+class TestCliRuntimeFlag:
+    def test_prepare_cli_runtime_marks_cli_process(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from skyvern import _cli_bootstrap
+
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr("skyvern.utils.env_paths.load_backend_env_files", lambda intent: tmp_path / ".env")
+        monkeypatch.setattr(_cli_bootstrap, "configure_cli_runtime_logging", lambda: None)
+
+        assert not _cli_bootstrap.is_cli_runtime()
+        _cli_bootstrap.prepare_cli_runtime(intent="cloud")
+        assert _cli_bootstrap.is_cli_runtime()
+
+    def test_cli_import_defers_settings_construction(self) -> None:
+        """Both base-url guards read a settings singleton that must be constructed only after
+        prepare_cli_runtime has loaded env files; an eager skyvern.config import breaks that."""
+        code = "import sys; import skyvern.cli; raise SystemExit(1 if 'skyvern.config' in sys.modules else 0)"
+        completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        assert completed.returncode == 0, completed.stderr
 
 
 class TestCredentialsCommands:

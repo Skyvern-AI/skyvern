@@ -50,6 +50,7 @@ function makeCtx(
     updateState: vi.fn(),
     isNewUser: false,
     abVariant: "template-first",
+    recoveryGuidanceAssignment: null,
     ...overrides,
   };
 }

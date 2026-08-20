@@ -4,7 +4,7 @@ Ensures that _repair_next_block_label_chain correctly stitches orphaned blocks
 back into the reachable workflow chain when the LLM produces disconnected paths.
 """
 
-from skyvern.forge.sdk.routes.workflow_copilot import (
+from skyvern.forge.sdk.copilot.workflow_yaml import (
     _break_cycles,
     _collect_reachable,
     _find_terminal_label,

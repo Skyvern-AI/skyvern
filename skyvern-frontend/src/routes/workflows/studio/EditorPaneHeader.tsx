@@ -1,4 +1,8 @@
-import { MagnifyingGlassIcon } from "@radix-ui/react-icons";
+import {
+  CodeIcon,
+  EyeOpenIcon,
+  MagnifyingGlassIcon,
+} from "@radix-ui/react-icons";
 import { useMemo, useState } from "react";
 
 import {
@@ -21,19 +25,19 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 
-import { YamlModeToggle } from "../editor/YamlModeToggle";
 import { filterBlockSearchTargets } from "./blockSearch";
 import { PANE_HEADER_ICON_BUTTON_CLASS, studioPanelId } from "./constants";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useStudioPaneCompact } from "./StudioShellContext";
+import { ViewToggle } from "./ViewToggle";
 
 /**
- * Editor pane header chrome: the Visual/Code mode toggle, relocated from the
- * canvas's floating overlay. Entry is registered by the embedded Workspace
- * (it owns the canvas→YAML serialization); exit is the store's shared
- * commit-on-switch flow. Hidden for read-only (global) workflows, which never
- * register an entry point.
+ * Editor pane header chrome: the Visual/YAML mode toggle, the same segmented
+ * ViewToggle pair the other pane strips use. Entry is registered by the
+ * embedded Workspace (it owns the canvas→YAML serialization); exit is the
+ * store's shared commit-on-switch flow. Hidden for read-only (global)
+ * workflows, which never register an entry point.
  */
 export function EditorPaneModeToggle() {
   const compact = useStudioPaneCompact();
@@ -46,13 +50,40 @@ export function EditorPaneModeToggle() {
   return (
     <>
       <PaneHeaderDivider />
-      <YamlModeToggle
-        mode={active ? "code" : "visual"}
-        compact={compact}
-        disabled={committing}
-        onCode={enterYamlMode}
-        onVisual={() => void commitYamlDraft(false)}
-      />
+      <div
+        role="group"
+        aria-label="Editor view"
+        className="flex shrink-0 items-center gap-1"
+      >
+        <ViewToggle
+          active={!active}
+          // Only the inactive segment acts: re-committing from Visual or
+          // re-entering from YAML would reserialize the canvas and discard the
+          // in-progress YAML draft (the old YamlModeToggle omitted the handler
+          // on the active segment for the same reason).
+          onClick={() => {
+            if (active) {
+              void commitYamlDraft(false);
+            }
+          }}
+          disabled={committing}
+          compact={compact}
+          label="Visual"
+          icon={<EyeOpenIcon className="h-3 w-3" />}
+        />
+        <ViewToggle
+          active={active}
+          onClick={() => {
+            if (!active) {
+              enterYamlMode();
+            }
+          }}
+          disabled={committing}
+          compact={compact}
+          label="YAML"
+          icon={<CodeIcon className="h-3 w-3" />}
+        />
+      </div>
     </>
   );
 }

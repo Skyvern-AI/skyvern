@@ -28,6 +28,7 @@ def _workflow(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         persist_browser_session=persist_browser_session,
+        reuse_browser_session=False,
         pin_saved_session_ip=pin_saved_session_ip,
         browser_profile_key=browser_profile_key,
         proxy_location=proxy_location,
@@ -44,7 +45,7 @@ def _workflow(
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
-        workflow_definition=SimpleNamespace(parameters=parameters or []),
+        workflow_definition=SimpleNamespace(parameters=parameters or [], blocks=[]),
     )
 
 
@@ -90,8 +91,16 @@ def _workflow_run(
         workflow_run_id="wr_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        browser_session_id=None,
         browser_profile_id=browser_profile_id,
+        browser_address=None,
+        browser_seed_source=None,
+        browser_sink_profile_id=None,
+        retried_from_workflow_run_id=None,
         proxy_location=proxy_location,
+        reuse_browser_session=None,
+        reuse_bound_key=None,
+        start_fresh_browser=False,
     )
 
 
@@ -197,7 +206,7 @@ async def _prepare_profile(
     profile: SimpleNamespace | None = None,
     update_profile: AsyncMock | None = None,
     parameter_values: dict[str, object] | None = None,
-) -> SimpleNamespace:
+) -> str | None:
     workflow = workflow or _workflow()
     workflow_run = workflow_run or _workflow_run()
     profile = profile or _profile()
@@ -212,7 +221,7 @@ async def _prepare_profile(
     monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", AsyncMock(return_value=updated_run))
     _mock_storage(monkeypatch)
 
-    return await WorkflowService()._prepare_persisted_workflow_browser_profile(
+    return await WorkflowService()._ensure_managed_browser_profile(
         workflow=workflow,  # type: ignore[arg-type]
         workflow_run=workflow_run,  # type: ignore[arg-type]
         parameter_values=parameter_values or {"credential_id": "cred_a"},
@@ -260,7 +269,12 @@ async def _setup_profile_with_reconcile_failure(
             request_id="req_test",
             workflow_request=workflow_request,
             workflow_permanent_id="wpid_test",
-            organization=SimpleNamespace(organization_id="org_test", organization_name="Test Org"),
+            organization=SimpleNamespace(
+                organization_id="org_test",
+                organization_name="Test Org",
+                default_llm_key=None,
+                default_secondary_llm_key=None,
+            ),
         )
     except Exception as exc:
         caught = exc
@@ -361,7 +375,6 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
         monkeypatch,
         workflow=workflow,
         workflow_request=WorkflowRequestBody(
-            data={"login_cred": "cred_request"},
             proxy_location=ProxyLocation.RESIDENTIAL_ISP,
         ),
         update_profile=update_profile,
@@ -397,6 +410,48 @@ async def test_force_browser_session_rotating_profile_key_selects_after_run_crea
         browser_session_id="pbs_forced",
     )
     assert forced.result is forced.update_workflow_run.return_value
+
+
+@pytest.mark.asyncio
+async def test_force_browser_session_rotating_profile_key_uses_run_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    select_credential_for_run = AsyncMock(return_value="cred_selected")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.service.select_credential_for_run",
+        select_credential_for_run,
+    )
+    update_profile = AsyncMock(return_value=_profile())
+    workflow = _workflow(
+        browser_profile_key="{{ login_cred }}",
+        parameters=[
+            _credential_parameter(
+                "login_cred",
+                credential_ids=["cred_a", "cred_selected"],
+                selection_strategy="round_robin",
+            )
+        ],
+    )
+
+    forced = await _create_forced_workflow_run(
+        monkeypatch,
+        workflow=workflow,
+        workflow_request=WorkflowRequestBody(
+            data={"login_cred": "cred_selected"},
+            proxy_location=ProxyLocation.RESIDENTIAL_ISP,
+        ),
+        update_profile=update_profile,
+    )
+
+    digest = build_browser_profile_key_digest("cred_selected")
+    select_credential_for_run.assert_not_awaited()
+    forced.get_or_create_profile.assert_awaited_once_with(
+        organization_id="org_test",
+        workflow_permanent_id="wpid_test",
+        browser_profile_key_digest=digest,
+        name="Workflow (auto-saved: cred_selected)",
+    )
+    forced.create_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -722,6 +777,9 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         organization_id="org_test",
         browser_session_id="pbs_requested",
         browser_profile_id=None,
+        start_fresh_browser=request.start_fresh_browser,
+        reuse_browser_session=request.reuse_browser_session,
+        reuse_bound_key=None,
         proxy_location=request.proxy_location,
         webhook_callback_url=request.webhook_callback_url,
         totp_verification_url=request.totp_verification_url,
@@ -740,6 +798,8 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         workflow_run_id=None,
         trigger_type=None,
         workflow_schedule_id=None,
+        retried_from_workflow_run_id=None,
+        fallback_attempt=None,
         ignore_inherited_workflow_system_prompt=False,
         copilot_session_id=None,
     )
@@ -761,7 +821,7 @@ async def test_prepare_managed_profile_sets_deterministic_pin(
     )
 
     expected_pin = derive_proxy_session_id("org_test", "wpid_test", digest)
-    assert result.browser_profile_id == "bp_managed"
+    assert result == "bp_managed"
     update_profile.assert_awaited_once_with(
         profile_id="bp_managed",
         organization_id="org_test",

@@ -213,7 +213,7 @@ class SchedulesRepository(BaseRepository):
         organization_id: str,
         cron_expression: str,
         timezone: str,
-        enabled: bool,
+        enabled: bool | object = _UNSET,
         parameters: dict[str, Any] | None = None,
         backend_schedule_id: str | None | object = _UNSET,
         name: str | None | object = _UNSET,
@@ -235,7 +235,8 @@ class SchedulesRepository(BaseRepository):
 
             workflow_schedule.cron_expression = cron_expression
             workflow_schedule.timezone = timezone
-            workflow_schedule.enabled = enabled
+            if enabled is not _UNSET:
+                workflow_schedule.enabled = enabled
             workflow_schedule.parameters = parameters
             if backend_schedule_id is not _UNSET:
                 workflow_schedule.backend_schedule_id = backend_schedule_id
@@ -297,6 +298,24 @@ class SchedulesRepository(BaseRepository):
                 WorkflowScheduleModel.enabled.is_(True),
                 WorkflowScheduleModel.deleted_at.is_(None),
             )
+            if organization_id:
+                stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
+            rows = (await session.scalars(stmt)).all()
+            return [convert_to_workflow_schedule(r, self.debug_enabled) for r in rows]
+
+    @db_operation("get_all_schedules")
+    async def get_all_schedules(
+        self,
+        organization_id: str | None = None,
+    ) -> list[WorkflowSchedule]:
+        """Fetch all non-deleted schedules — including disabled/paused ones — optionally filtered by org.
+
+        Unlike get_all_enabled_schedules, this does not filter on `enabled`, because a generation
+        migration must re-point every persisted Temporal schedule (paused schedules included) while
+        preserving their paused state.
+        """
+        async with self.Session() as session:
+            stmt = select(WorkflowScheduleModel).where(WorkflowScheduleModel.deleted_at.is_(None))
             if organization_id:
                 stmt = stmt.where(WorkflowScheduleModel.organization_id == organization_id)
             rows = (await session.scalars(stmt)).all()

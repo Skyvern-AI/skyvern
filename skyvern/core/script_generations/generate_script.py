@@ -338,6 +338,7 @@ ACTION_MAP = {
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
+    "goto_url": "goto",
     "scroll": "scroll",
     "keypress": "keypress",
     "type": "type",
@@ -406,7 +407,7 @@ def _build_semantic_selector(act: dict[str, Any]) -> str | None:
     return None
 
 
-ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
+ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract", "goto", "magic_link"]
 
 INDENT = " " * 4
 DOUBLE_INDENT = " " * 8
@@ -419,6 +420,15 @@ MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 # from being scanned against every prompt; values longer than this would never
 # legitimately appear verbatim in a click prompt anyway.
 MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
+
+
+def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
+    return not any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+
+
+def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> None:
+    if not _actions_support_cached_scripts(actions):
+        raise ValueError("PASTE_TEXT has no cached-script representation")
 
 
 def _build_value_to_param_lookup(
@@ -919,12 +929,14 @@ def _action_to_stmt(
             selector_emitted = True
 
     if method == "click":
+        click_context = act.get("click_context")
+        if not isinstance(click_context, dict):
+            click_context = {}
         if use_semantic_selectors:
             ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         else:
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
-            click_context = act.get("click_context")
-            if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+            if click_context.get("single_option_click"):
                 ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
         args.append(
             cst.Arg(
@@ -936,6 +948,19 @@ def _action_to_stmt(
                 ),
             )
         )
+
+        desired_state = click_context.get("desired_state")
+        if isinstance(desired_state, bool):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("desired_state"),
+                    value=_value(desired_state),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method == "hover":
         hold_seconds = act.get("hold_seconds")
         if hold_seconds and hold_seconds > 0:
@@ -1230,6 +1255,59 @@ def _action_to_stmt(
                     ),
                 )
             )
+    elif method == "goto":
+        if act.get("is_magic_link"):
+            # The recorded URL is single-use and already spent by replay time, so the cached
+            # script re-requests a link instead of navigating to the captured value.
+            method = "magic_link"
+            magic_link_identifier: cst.BaseExpression | None = None
+            if task.get("totp_identifier"):
+                magic_link_identifier = _value(task.get("totp_identifier"))
+            elif credential_key := pick_credential_root_for_block(
+                goal_template=goal_template,
+                credential_param_keys=credential_param_keys,
+            ):
+                magic_link_identifier = cst.Call(
+                    func=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("credential_totp_identifier"),
+                    ),
+                    args=[cst.Arg(value=_value(credential_key))],
+                )
+            if magic_link_identifier is not None:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=magic_link_identifier,
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_verification_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=_value(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+        elif act.get("url"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("url"),
+                    value=_value(act.get("url")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+
     elif method == "extract":
         args.append(
             cst.Arg(
@@ -1406,6 +1484,8 @@ def _build_block_fn(
     all_blocks: list[dict[str, Any]] | None = None,
     credential_param_keys: frozenset[str] = frozenset(),
 ) -> FunctionDef:
+    _ensure_actions_support_cached_scripts(actions)
+
     # Check for platform-specific pipeline (cloud-only; returns None in OSS)
     if use_semantic_selectors:
         ats_platform = _detect_block_ats_platform(block, all_blocks=all_blocks)
@@ -1469,9 +1549,7 @@ def _build_block_fn(
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
                 ActionType.NULL_ACTION,
-                # Tab management isn't represented in generated scripts yet (no ACTION_MAP
-                # entry); skip so cached replay of a multi-tab run falls back to the agent
-                # instead of raising KeyError and breaking script generation.
+                # These actions have no ACTION_MAP representation in cached scripts.
                 ActionType.NEW_TAB,
                 ActionType.SWITCH_TAB,
             ]:
@@ -1640,6 +1718,50 @@ def _build_download_statement(
 ) -> cst.SimpleStatementLine:
     """Build a skyvern.download statement."""
     args = __build_base_task_statement(block_title, block, data_variable_name, value_to_param=value_to_param)
+    download_target = str(block.get("download_target") or "")
+    destination_fields_by_target = {
+        "s3": ["s3_bucket", "aws_access_key_id", "aws_secret_access_key", "region_name"],
+        "azure": ["azure_storage_account_name", "azure_storage_account_key", "azure_blob_container_name"],
+        "google_drive": ["google_credential_id", "google_drive_folder_id"],
+        "sftp": [
+            "sftp_host",
+            "sftp_port",
+            "sftp_username",
+            "sftp_password",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_remote_path",
+            "sftp_host_key",
+        ],
+    }
+    destination_fields = destination_fields_by_target.get(download_target)
+    if destination_fields is not None and block.get("prompt") is not None:
+        args[0] = args[0].with_changes(keyword=cst.Name("navigation_goal"))
+
+    if destination_fields is not None:
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("download_target"),
+                value=_value(download_target),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+        for key in [*destination_fields, "prompt", "path", "continue_on_empty"]:
+            if block.get(key) is not None:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name(key),
+                        value=_value(block.get(key, "")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+    _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
         args=args,
@@ -1871,6 +1993,24 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
+    ]
+
+    for custom_smtp_field in ("custom_smtp_host", "custom_smtp_port", "custom_smtp_username", "custom_smtp_password"):
+        custom_smtp_value = block.get(custom_smtp_field)
+        if custom_smtp_value is None or custom_smtp_value == "":
+            continue
+        args.append(
+            cst.Arg(
+                keyword=cst.Name(custom_smtp_field),
+                value=_value(custom_smtp_value),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    args.append(
         cst.Arg(
             keyword=cst.Name("label"),
             value=_value(block.get("label", "")),
@@ -1878,8 +2018,8 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 indent=True,
             ),
             comma=cst.Comma(),
-        ),
-    ]
+        )
+    )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("send_email")),
@@ -2132,6 +2272,15 @@ def _build_file_upload_statement(block: dict[str, Any]) -> cst.SimpleStatementLi
         "azure_blob_container_name",
         "google_credential_id",
         "google_drive_folder_id",
+        "sftp_host",
+        "sftp_port",
+        "sftp_username",
+        "sftp_password",
+        "sftp_private_key",
+        "sftp_private_key_passphrase",
+        "sftp_remote_path",
+        "sftp_host_key",
+        "prompt",
         "path",
     ]:
         if block.get(key) is not None:
@@ -3287,13 +3436,20 @@ async def generate_workflow_script_python_code(
     task_v1_blocks = [block for block in blocks if block["block_type"] in SCRIPT_TASK_BLOCKS]
     task_v2_blocks = [block for block in blocks if block["block_type"] == "task_v2"]
 
-    def append_block_code(block_code: str) -> None:
+    # Source of the blocks this run actually generated, kept apart from blocks
+    # reused verbatim from the cache so the parameter-reference guard only sees
+    # code this run is responsible for (SKY-13946).
+    generated_block_code: list[str] = []
+
+    def append_block_code(block_code: str, *, carried_forward: bool = False) -> None:
         nonlocal block_fns
         parsed = cst.parse_module(block_code)
         if block_fns:
             block_fns.append(cst.EmptyLine())
             block_fns.append(cst.EmptyLine())
         block_fns.extend(parsed.body)
+        if not carried_forward:
+            generated_block_code.append(block_code)
 
     # Handle task v1 blocks (excluding child blocks of task_v2)
     for idx, task in enumerate(task_v1_blocks):
@@ -3301,6 +3457,17 @@ async def generate_workflow_script_python_code(
             continue
 
         block_name = task.get("label") or task.get("title") or task.get("task_id") or f"task_{idx}"
+        task_id = task.get("task_id", "")
+        block_actions = actions_by_task.get(task_id, [])
+        if not _actions_support_cached_scripts(block_actions):
+            LOG.warning(
+                "Skipping cached script generation for block with unsupported actions",
+                block_label=block_name,
+                script_id=script_id,
+            )
+            blocks_failed += 1
+            continue
+
         cached_source = cached_blocks.get(block_name)
         use_cached = cached_source is not None and block_name not in updated_block_labels
         input_fields = _collect_block_input_fields(task, actions_by_task)
@@ -3314,9 +3481,6 @@ async def generate_workflow_script_python_code(
             block_workflow_run_id = cached_source.workflow_run_id
             block_workflow_run_block_id = cached_source.workflow_run_block_id
         else:
-            task_id = task.get("task_id", "")
-            block_actions = actions_by_task.get(task_id, [])
-
             # Skip blocks that have no actions AND no task_id — they haven't executed yet.
             # Creating script_block entries for actionless blocks causes a permanent
             # stuck state where generate_script_if_needed thinks they're cached but
@@ -3370,12 +3534,23 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
-        append_block_code(block_code)
+        append_block_code(block_code, carried_forward=use_cached)
 
     # Handle task_v2 blocks
     for task_v2 in task_v2_blocks:
         task_v2_label = task_v2.get("label") or f"task_v2_{task_v2.get('workflow_run_block_id')}"
         child_blocks = task_v2_child_blocks.get(task_v2_label, [])
+        if any(
+            not _actions_support_cached_scripts(actions_by_task.get(child_block.get("task_id", ""), []))
+            for child_block in child_blocks
+        ):
+            LOG.warning(
+                "Skipping cached script generation for task v2 block with unsupported child actions",
+                block_label=task_v2_label,
+                script_id=script_id,
+            )
+            blocks_failed += 1
+            continue
 
         cached_source = cached_blocks.get(task_v2_label)
         use_cached = cached_source is not None and task_v2_label not in updated_block_labels
@@ -3445,7 +3620,7 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
-        append_block_code(block_code)
+        append_block_code(block_code, carried_forward=use_cached)
 
     # Handle for_loop and while_loop blocks
     _SCRIPT_LOOP_BUILDERS: list[tuple[str, Callable[[str, dict[str, Any]], cst.For]]] = [
@@ -3592,6 +3767,15 @@ async def generate_workflow_script_python_code(
                     or loop_block.get("title")
                     or f"block_{loop_block.get('workflow_run_block_id')}"
                 )
+                inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
+                if not _actions_support_cached_scripts(inner_actions):
+                    LOG.warning(
+                        "Skipping cached script generation for loop child block with unsupported actions",
+                        block_label=inner_label,
+                        script_id=script_id,
+                    )
+                    blocks_failed += 1
+                    continue
 
                 # Check if already cached (for progressive caching)
                 cached_inner = cached_blocks.get(inner_label)
@@ -3604,7 +3788,6 @@ async def generate_workflow_script_python_code(
                     inner_wrbi = cached_inner.workflow_run_block_id
                     inner_wri = cached_inner.workflow_run_id
                 else:
-                    inner_actions = actions_by_task.get(loop_block.get("task_id", ""), [])
                     if not inner_actions:
                         # No actions from agent run = can't generate cached function.
                         # No script_block row is created; the block will be cached on
@@ -3650,7 +3833,7 @@ async def generate_workflow_script_python_code(
                     else:
                         blocks_failed += 1
 
-                append_block_code(inner_block_code)
+                append_block_code(inner_block_code, carried_forward=use_inner_cached)
 
     # --- agent-required blocks (adaptive caching) -----------------------
     # Structural blocks (conditional, text_prompt, wait) can't be code-generated
@@ -3684,7 +3867,7 @@ async def generate_workflow_script_python_code(
                         blocks_created += 1
                     else:
                         blocks_failed += 1
-                    append_block_code(cached_source.code)
+                    append_block_code(cached_source.code, carried_forward=True)
             else:
                 # Create a requires_agent entry (no code, no run_signature)
                 placeholder_code = f"# Block '{arb_label}' ({arb['block_type']}) — executed via agent"
@@ -3778,7 +3961,7 @@ async def generate_workflow_script_python_code(
         if _is_inline_only_loop_cached_code(cached_source.code):
             continue
 
-        append_block_code(cached_source.code)
+        append_block_code(cached_source.code, carried_forward=True)
         preserved_count += 1
 
     if preserved_count > 0:
@@ -3866,10 +4049,18 @@ async def generate_workflow_script_python_code(
     # violation, preventing phantom-parameter scripts from being cached.
     # Phase 1 (now in prod) logged warnings; 13 violations in 7 days confirmed
     # the bug is real and low-frequency (~0.05%), safe to enforce.
+    #
+    # SKY-13946: only the code this run generated is in scope. Blocks reused
+    # verbatim from the cache were validated when they were generated, and the
+    # schema this run synthesizes is derived from this run's actions — so a
+    # reference inside a carried-forward block can never enter the valid-keys
+    # set no matter how legitimate it is, and enforcing against it fails codegen
+    # on every replay with no path to recovery.
     try:
+        guarded_source = "\n".join([cst.Module(body=start_block_body).code, *generated_block_code])
         synthesized_keys = _collect_synthesized_field_keys(generated_schema)
         guard_result = validate_context_parameter_refs(
-            code=source_code,
+            code=guarded_source,
             declared_param_keys=declared_keys,
             upstream_schema_keys=upstream_keys,
             synthesized_keys=synthesized_keys,

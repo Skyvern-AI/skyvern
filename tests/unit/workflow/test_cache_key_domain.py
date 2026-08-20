@@ -3,9 +3,18 @@
 from datetime import datetime, timezone
 
 from skyvern.forge.sdk.workflow.models.block import BlockType, TaskBlock
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    OutputParameter,
+    ParameterType,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
-from skyvern.services.workflow_script_service import _extract_first_block_domain, _jinja_domain_filter
+from skyvern.services.workflow_script_service import (
+    _extract_first_block_domain,
+    _jinja_domain_filter,
+    resolve_target_domain_for_run_provenance,
+)
 
 
 def _output_param(key: str = "out") -> OutputParameter:
@@ -28,6 +37,18 @@ def _task_block(label: str, url: str | None = None) -> TaskBlock:
         url=url,
         title="Test",
         navigation_goal="Do something",
+    )
+
+
+def _workflow_param(key: str) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        workflow_id="w_test",
+        key=key,
+        created_at=now,
+        modified_at=now,
     )
 
 
@@ -163,3 +184,42 @@ class TestExtractFirstBlockDomain:
         wf = _workflow(blocks)
         params = {"website_url": "example.com/login"}
         assert _extract_first_block_domain(wf, params) == "example.com"
+
+
+class TestResolveTargetDomainForRunProvenance:
+    def test_omits_unresolved_url_parameter_key(self) -> None:
+        wf = _workflow(
+            [
+                _task_block("step1", url="website_url"),
+                _task_block("step2", url="https://later.example.com"),
+            ]
+        )
+        wf.workflow_definition.parameters = [_workflow_param("website_url")]
+
+        assert resolve_target_domain_for_run_provenance(wf, {}) == ""
+        assert resolve_target_domain_for_run_provenance(wf, {"website_url": ""}) == ""
+
+    def test_sanitizes_resolved_domain(self) -> None:
+        wf = _workflow([_task_block("step1", url="website_url")])
+        wf.workflow_definition.parameters = [_workflow_param("website_url")]
+
+        assert (
+            resolve_target_domain_for_run_provenance(
+                wf,
+                {"website_url": "https://user:secret@Jobs.Example.com/openings"},
+            )
+            == "jobs.example.com"
+        )
+
+    def test_omits_bare_url_literal_that_is_not_a_declared_parameter(self) -> None:
+        """A misconfigured ``url`` that is a bare identifier (neither a declared
+        parameter nor a runtime value) resolves to a single-label host; provenance
+        must omit it rather than record the literal as a fake domain."""
+        wf = _workflow([_task_block("step1", url="unknown_key")])
+
+        assert resolve_target_domain_for_run_provenance(wf, {}) == ""
+
+    def test_returns_domain_for_literal_url(self) -> None:
+        wf = _workflow([_task_block("step1", url="https://www.irs.gov/apply-ein")])
+
+        assert resolve_target_domain_for_run_provenance(wf, {}) == "www.irs.gov"

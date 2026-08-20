@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -10,27 +11,41 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import mcp_http_auth
+from skyvern.cli.core import mcp_http_auth, session_manager
+from skyvern.cli.core.result import BrowserContext
 
 _TEST_BASE_URL = "http://testserver"
 
 
 @pytest.fixture(autouse=True)
-def _reset_auth_context() -> None:
+def _reset_auth_context() -> Iterator[None]:
     client_mod._api_key_override.set(None)
+    session_manager._current_session.set(None)
+    session_manager._global_session = None
+    session_manager._copilot_sessions.clear()
+    session_manager._organization_sessions.clear()
+    session_manager._current_organization_id.set(None)
+    session_manager.set_stateless_http_mode(False)
     mcp_http_auth._auth_db = None
     mcp_http_auth._api_key_validation_cache.clear()
     mcp_http_auth._API_KEY_CACHE_TTL_SECONDS = 30.0
     mcp_http_auth._API_KEY_CACHE_MAX_SIZE = 1024
     mcp_http_auth._MAX_VALIDATION_RETRIES = 2
     mcp_http_auth._RETRY_DELAY_SECONDS = 0.0  # no delay in tests
+    mcp_http_auth.set_scoped_mcp_resources_enabled(False)
+    try:
+        yield
+    finally:
+        mcp_http_auth.set_scoped_mcp_resources_enabled(False)
 
 
 async def _echo_request_context(request: Request) -> JSONResponse:
@@ -108,9 +123,55 @@ async def test_mcp_http_auth_rejects_missing_api_key(monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "UNAUTHORIZED"
-    assert "x-api-key" in response.json()["error"]["message"]
+    assert response.json()["error"]["message"] == mcp_http_auth._MISSING_CREDENTIALS_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
     assert response.headers["www-authenticate"] == expected_challenge
     assert response.headers["access-control-expose-headers"] == "WWW-Authenticate"
+
+
+@pytest.mark.parametrize("api_key", ["", "   "])
+@pytest.mark.asyncio
+async def test_mcp_http_auth_rejects_empty_api_key_without_oauth_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+) -> None:
+    validate_api_key = AsyncMock(side_effect=AssertionError("empty API key should not be validated"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+
+    response = await _request(app, "POST", "/mcp", headers={"x-api-key": api_key}, json={})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+    assert response.json()["error"]["message"] == mcp_http_auth._EMPTY_API_KEY_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
+    assert "www-authenticate" not in response.headers
+    validate_api_key.assert_not_awaited()
+
+
+@pytest.mark.parametrize("bearer_token", ["", "   "])
+@pytest.mark.asyncio
+async def test_mcp_http_auth_rejects_empty_bearer_with_oauth_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    bearer_token: str,
+) -> None:
+    validate_oauth_token = AsyncMock(side_effect=AssertionError("empty Bearer token should not be validated"))
+    validate_api_key = AsyncMock(side_effect=AssertionError("empty Bearer token should not be validated"))
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", validate_oauth_token)
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = _build_test_app()
+    expected_challenge = _expected_oauth_challenge(monkeypatch)
+
+    response = await _request(app, "POST", "/mcp", headers={"authorization": f"Bearer {bearer_token}"}, json={})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
+    assert response.json()["error"]["message"] == mcp_http_auth._EMPTY_BEARER_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
+    assert response.headers["www-authenticate"] == expected_challenge
+    assert response.headers["access-control-expose-headers"] == "WWW-Authenticate"
+    validate_oauth_token.assert_not_awaited()
+    validate_api_key.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -148,7 +209,8 @@ async def test_mcp_http_auth_rejects_invalid_api_key(monkeypatch: pytest.MonkeyP
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "UNAUTHORIZED"
-    assert response.json()["error"]["message"] == "Invalid API key"
+    assert response.json()["error"]["message"] == mcp_http_auth._INVALID_API_KEY_MESSAGE
+    assert "Configure" in response.json()["error"]["message"]
     assert "www-authenticate" not in response.headers
 
 
@@ -215,6 +277,152 @@ async def test_mcp_http_auth_sets_request_scoped_api_key(monkeypatch: pytest.Mon
         "organization_id": "org_123",
     }
     assert client_mod.get_active_api_key() != "sk_live_abc"
+
+
+@pytest.mark.asyncio
+async def test_stateful_http_session_is_scoped_to_authenticated_organization_with_exact_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "pbs_owned_session"
+    first_browser = SimpleNamespace(owner="first")
+    denied_connection = AsyncMock(side_effect=PermissionError("session is not owned by this organization"))
+    monkeypatch.setattr(
+        session_manager,
+        "get_skyvern",
+        lambda: SimpleNamespace(connect_to_cloud_browser_session=denied_connection),
+    )
+
+    async def session_endpoint(request: Request) -> JSONResponse:
+        payload = await request.json()
+        if payload["action"] == "seed":
+            state = session_manager.SessionState(
+                browser=first_browser,
+                context=BrowserContext(mode="cloud_session", session_id=session_id),
+                api_key_hash=session_manager.active_api_key_hash(),
+            )
+            session_manager.set_current_session(state)
+            session_manager.register_copilot_session(session_id, state, organization_id="org_first")
+            return JSONResponse({"owner": first_browser.owner})
+
+        try:
+            browser, _ = await session_manager.resolve_browser(session_id=payload["session_id"])
+        except PermissionError:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        return JSONResponse({"owner": browser.owner})
+
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=session_endpoint, methods=["POST"])],
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+    )
+    shared_api_key = "sk_shared_test_key"
+    validate_oauth_token = AsyncMock(
+        side_effect=[
+            SimpleNamespace(validation=_build_validation("org_first"), api_key=shared_api_key),
+            SimpleNamespace(validation=_build_validation("org_second"), api_key=shared_api_key),
+        ]
+    )
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_oauth_token", validate_oauth_token)
+
+    first_response = await _request(
+        app,
+        "POST",
+        "/mcp",
+        headers={"authorization": f"Bearer {_jwtish_token(payload={'sub': 'first'})}"},
+        json={"action": "seed"},
+    )
+    second_response = await _request(
+        app,
+        "POST",
+        "/mcp",
+        headers={"authorization": f"Bearer {_jwtish_token(payload={'sub': 'second'})}"},
+        json={"action": "resolve", "session_id": session_id},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 403
+    assert denied_connection.await_count == 1
+    assert session_manager._current_session.get() is None
+
+
+def test_stateful_fastmcp_transport_rejects_exact_session_id_from_another_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FastMCP("session-owner-test")
+
+    @server.tool
+    async def session_owner() -> str:
+        return session_manager._current_organization_id.get() or "missing"
+
+    validations = {
+        "sk_org_first": _build_validation("org_first"),
+        "sk_org_first_rotated": _build_validation("org_first"),
+        "sk_org_second": _build_validation("org_second"),
+    }
+
+    async def validate_api_key(api_key: str) -> mcp_http_auth.MCPAPIKeyValidation:
+        return validations[api_key]
+
+    monkeypatch.setattr(mcp_http_auth, "validate_mcp_api_key", validate_api_key)
+    app = server.http_app(
+        path="/",
+        middleware=[Middleware(mcp_http_auth.MCPAPIKeyMiddleware)],
+        stateless_http=False,
+        json_response=True,
+    )
+    initialize_request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    tool_request = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "session_owner", "arguments": {}},
+    }
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+
+    with TestClient(app) as client:
+        initialize_response = client.post(
+            "/",
+            headers={**headers, "x-api-key": "sk_org_first"},
+            json=initialize_request,
+        )
+        session_id = initialize_response.headers["mcp-session-id"]
+        rotated_credential_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "x-api-key": "sk_org_first_rotated",
+                "mcp-session-id": session_id,
+            },
+            json=tool_request,
+        )
+        hijack_response = client.post(
+            "/",
+            headers={
+                **headers,
+                "x-api-key": "sk_org_second",
+                "mcp-session-id": session_id,
+            },
+            json=tool_request,
+        )
+
+    assert initialize_response.status_code == 200
+    assert rotated_credential_response.status_code == 404
+    assert rotated_credential_response.json()["error"]["message"] == "Session not found"
+    assert hijack_response.status_code == 404
+    assert hijack_response.json()["error"]["message"] == "Session not found"
+    assert session_manager._current_session.get() is None
+    assert session_manager._current_organization_id.get() is None
 
 
 @pytest.mark.asyncio
@@ -354,6 +562,41 @@ def test_validate_token_audience_tolerates_trailing_slash_mismatch() -> None:
     )
 
 
+def test_validate_token_audience_rejects_scoped_resource_suffix_by_default() -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience(
+            {"aud": ["https://api.skyvern.com/mcp/x/operate"]},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_audience_tolerates_scoped_resource_suffix_when_enabled() -> None:
+    mcp_http_auth.set_scoped_mcp_resources_enabled(True)
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp/x/operate"]},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_audience(
+        {"aud": ["https://api.skyvern.com/mcp"]},
+        "https://api.skyvern.com/mcp/x/operate",
+    )
+
+
+@pytest.mark.parametrize(
+    "audience",
+    [
+        "https://evil.example/mcp/x/operate",
+        "https://api.skyvern.com/mcp/x/../admin",
+        "https://api.skyvern.com/mcp/x//operate",
+        "https://api.skyvern.com/mcp/x/OPERATE",
+        "https://api.skyvern.com/mcp/x/a/x/b",
+    ],
+)
+def test_validate_token_audience_rejects_invalid_scoped_resource_suffix(audience: str) -> None:
+    with pytest.raises(HTTPException, match="Token audience is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_audience({"aud": [audience]}, "https://api.skyvern.com/mcp")
+
+
 def test_validate_token_resource_claim_tolerates_trailing_slash_mismatch() -> None:
     # Same normalization applies to the RFC 8707 `resource` claim.
     mcp_http_auth._validate_token_resource_claims(
@@ -363,6 +606,26 @@ def test_validate_token_resource_claim_tolerates_trailing_slash_mismatch() -> No
     mcp_http_auth._validate_token_resource_claims(
         {"resource": "https://api.skyvern.com/mcp"},
         "https://api.skyvern.com/mcp/",
+    )
+
+
+def test_validate_token_resource_claim_rejects_scoped_resource_suffix_by_default() -> None:
+    with pytest.raises(HTTPException, match="Token resource is not valid for this MCP resource"):
+        mcp_http_auth._validate_token_resource_claims(
+            {"resource": "https://api.skyvern.com/mcp/x/browser/"},
+            "https://api.skyvern.com/mcp",
+        )
+
+
+def test_validate_token_resource_claim_tolerates_scoped_resource_suffix_when_enabled() -> None:
+    mcp_http_auth.set_scoped_mcp_resources_enabled(True)
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp/x/browser/"},
+        "https://api.skyvern.com/mcp",
+    )
+    mcp_http_auth._validate_token_resource_claims(
+        {"resource": "https://api.skyvern.com/mcp"},
+        "https://api.skyvern.com/mcp/x/browser/",
     )
 
 

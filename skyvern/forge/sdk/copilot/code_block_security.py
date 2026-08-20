@@ -1,3 +1,13 @@
+"""Deterministic AST denylist over Copilot-synthesized code blocks, enforced at authoring and at runtime pre-dispatch.
+
+`page.request` and `page.context` remain denied at both seams because they reach the live browser session's HTTP
+client and its BrowserContext (cookies, `storage_state`, new pages, route interception), so prompt-injected
+synthesized code could exfiltrate session credentials out of band. Retaining them does not mitigate exfiltration
+through `page.evaluate`, which can read page-visible data and egress it directly from in-page JS; this module is a
+guardrail on one code path, not a sandbox, and Copilot code still executes in-process with credentials resolved
+before the run until out-of-process isolation lands.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -9,14 +19,10 @@ COPILOT_CODE_SECURITY_FAILURE_CATEGORY = "COPILOT_CODE_SECURITY"
 _AUTHOR_ATTR_REASONS = {
     "request": "AUTHOR_PAGE_REQUEST",
     "context": "AUTHOR_PAGE_CONTEXT",
-    "evaluate": "AUTHOR_PAGE_EVALUATE",
-    "evaluate_handle": "AUTHOR_PAGE_EVALUATE",
 }
 _RUNTIME_ATTR_REASONS = {
     "request": "RUNTIME_PAGE_REQUEST",
     "context": "RUNTIME_PAGE_CONTEXT",
-    "evaluate": "RUNTIME_PAGE_EVALUATE",
-    "evaluate_handle": "RUNTIME_PAGE_EVALUATE",
 }
 
 
@@ -51,7 +57,7 @@ def author_time_code_security_errors(*, label: str, code: str) -> list[CodeBlock
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return []
+        return [_error(label, "AUTHOR_SYNTAX_ERROR")]
     return _security_errors_for_tree(label, tree, _AUTHOR_ATTR_REASONS)
 
 
@@ -78,8 +84,8 @@ def _security_errors_for_tree(label: str, tree: ast.AST, attr_reasons: dict[str,
     errors: list[CodeBlockSecurityError] = []
     seen: set[str] = set()
     for node in ast.walk(tree):
-        # This AST layer catches direct attribute access. The sandbox's unresolved-name,
-        # private-attribute, and builtins restrictions remain the backstop for dynamic forms.
+        # This AST layer catches direct attribute access. The sandbox's private-attribute
+        # and builtins restrictions remain the backstop for dynamic forms.
         if isinstance(node, ast.Attribute) and node.attr in attr_reasons:
             reason = attr_reasons[node.attr]
             if reason not in seen:
@@ -109,6 +115,8 @@ def _surface_for_reason(reason_code: str) -> str:
 
 
 def _message_for_reason(*, label: str, reason_code: str, surface: str) -> str:
+    if reason_code == "AUTHOR_SYNTAX_ERROR":
+        return f"Code block `{label}` failed the Copilot code security check: the code does not parse as Python."
     if reason_code.startswith("AUTHOR_"):
         return f"Code block `{label}` failed the Copilot code security check: {surface} is not allowed."
     return f"Code block `{label}` was blocked before browser dispatch: {surface} is not allowed at Copilot runtime."

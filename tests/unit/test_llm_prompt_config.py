@@ -8,11 +8,13 @@ Verified contracts:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation import llm_prompt_config as module
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,54 @@ def _make_log_recorder() -> tuple[MagicMock, list[tuple[str, dict[str, Any]]]]:
 # ---------------------------------------------------------------------------
 # get_llm_handler_for_prompt_type: no-config path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prompt_type_config_uses_cached_posthog_methods(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(return_value="enabled"),
+        get_payload_cached=AsyncMock(return_value='{"workflow-copilot-lite": "OPENAI_GPT5_4_MINI"}'),
+        get_value=AsyncMock(side_effect=AssertionError("must use cached value lookup")),
+        get_payload=AsyncMock(side_effect=AssertionError("must use cached payload lookup")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+
+    config = await module.get_llm_config_by_prompt_type("wpid_1", "org_1")
+
+    assert config == {"workflow-copilot-lite": "OPENAI_GPT5_4_MINI"}
+    provider.get_value_cached.assert_awaited_once_with(
+        "LLM_CONFIG_BY_PROMPT_TYPE", "wpid_1", properties={"organization_id": "org_1"}
+    )
+    provider.get_payload_cached.assert_awaited_once_with(
+        "LLM_CONFIG_BY_PROMPT_TYPE", "wpid_1", properties={"organization_id": "org_1"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_type_config_exposes_workflow_and_script_mode_targeting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(return_value="enabled"),
+        get_payload_cached=AsyncMock(return_value='{"text-prompt": "OPENAI_GPT5_4_MINI"}'),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(workflow_permanent_id="wpid_1", script_mode=True),
+    )
+
+    config = await module.get_llm_config_by_prompt_type("wr_1", "org_1")
+
+    assert config == {"text-prompt": "OPENAI_GPT5_4_MINI"}
+    properties = {
+        "organization_id": "org_1",
+        "workflow_permanent_id": "wpid_1",
+        "script_mode": True,
+    }
+    provider.get_value_cached.assert_awaited_once_with("LLM_CONFIG_BY_PROMPT_TYPE", "wr_1", properties=properties)
+    provider.get_payload_cached.assert_awaited_once_with("LLM_CONFIG_BY_PROMPT_TYPE", "wr_1", properties=properties)
 
 
 @pytest.mark.asyncio
@@ -119,3 +169,221 @@ async def test_prompt_type_in_config_returns_handler(monkeypatch: pytest.MonkeyP
         result = await module.get_llm_handler_for_prompt_type("extract-information", "wr_123", "org_1")
 
     assert result is fake_handler
+
+
+# ---------------------------------------------------------------------------
+# resolve_prompt_type_handler: payload-first with default fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_type_handler_returns_flex_wrapped_payload_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_handler = MagicMock(name="payload_handler")
+    wrapped_handler = MagicMock(name="wrapped_handler")
+    default_handler = MagicMock(name="default_handler")
+    monkeypatch.setattr(module, "get_llm_handler_for_prompt_type", AsyncMock(return_value=payload_handler))
+    wrap = MagicMock(return_value=wrapped_handler)
+    monkeypatch.setattr(module.LLMAPIHandlerFactory, "wrap_for_flex_routing", wrap)
+
+    result = await module.resolve_prompt_type_handler(
+        "confirm-multi-selection-finish", "wr_123", "org_1", default_handler
+    )
+
+    assert result is wrapped_handler
+    wrap.assert_called_once_with(payload_handler)
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_type_handler_falls_back_when_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    default_handler = MagicMock(name="default_handler")
+    monkeypatch.setattr(module, "get_llm_handler_for_prompt_type", AsyncMock(return_value=None))
+
+    result = await module.resolve_prompt_type_handler("checkbox-verification", "tsk_123", "org_1", default_handler)
+
+    assert result is default_handler
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_type_handler_falls_back_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    default_handler = MagicMock(name="default_handler")
+    monkeypatch.setattr(module, "get_llm_handler_for_prompt_type", AsyncMock(side_effect=RuntimeError("posthog down")))
+    log, calls = _make_log_recorder()
+    monkeypatch.setattr(module, "LOG", log)
+
+    result = await module.resolve_prompt_type_handler("checkbox-verification", "wr_123", None, default_handler)
+
+    assert result is default_handler
+    assert [level for level, _ in calls] == ["warning"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_prompt_type_handler_with_override: explicit key opts out of routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_override_key_skips_prompt_type_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    default_handler = MagicMock(name="default_handler")
+    payload_lookup = AsyncMock(side_effect=AssertionError("payload must not be consulted when override key is set"))
+    monkeypatch.setattr(module, "get_llm_handler_for_prompt_type", payload_lookup)
+
+    result = await module.resolve_prompt_type_handler_with_override(
+        "confirm-multi-selection-finish", "SOME_EXPLICIT_KEY", "wr_123", "org_1", default_handler
+    )
+
+    assert result is default_handler
+    payload_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_override_key_delegates_to_prompt_type_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    default_handler = MagicMock(name="default_handler")
+    resolver = AsyncMock(return_value=default_handler)
+    monkeypatch.setattr(module, "resolve_prompt_type_handler", resolver)
+
+    result = await module.resolve_prompt_type_handler_with_override(
+        "confirm-multi-selection-finish", None, "wr_123", "org_1", default_handler
+    )
+
+    assert result is default_handler
+    resolver.assert_awaited_once_with("confirm-multi-selection-finish", "wr_123", "org_1", default_handler)
+
+
+@pytest.mark.asyncio
+async def test_org_secondary_override_skips_prompt_type_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+        get_payload_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+
+    result = await module.get_llm_config_by_prompt_type("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+    provider.get_payload_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_primary_override_skips_prompt_type_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+        get_payload_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+
+    result = await module.get_llm_config_by_prompt_type("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+    provider.get_payload_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_secondary_override_skips_check_user_goal_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_fast"),
+    )
+
+    result = await module.get_check_user_goal_llm_override("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_primary_override_skips_check_user_goal_config_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = SimpleNamespace(
+        get_value_cached=AsyncMock(side_effect=AssertionError("PostHog must not be consulted")),
+    )
+    monkeypatch.setattr(module, "app", SimpleNamespace(EXPERIMENTATION_PROVIDER=provider))
+    monkeypatch.setattr(
+        module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_smart"),
+    )
+
+    result = await module.get_check_user_goal_llm_override("wr_123", "org_1")
+
+    assert result is None
+    provider.get_value_cached.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_assist_llm_handler: script-assist call sites honor the payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assist_handler_delegates_to_prompt_type_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.core.script_generations import real_skyvern_page_ai as page_ai
+
+    default_handler = AsyncMock(name="default")
+    org_aware_handler = AsyncMock(name="org_aware")
+    payload_handler = AsyncMock(name="payload")
+    monkeypatch.setattr(page_ai, "get_org_aware_secondary_llm_api_handler", lambda default: org_aware_handler)
+    resolve = AsyncMock(return_value=payload_handler)
+    monkeypatch.setattr(page_ai, "resolve_prompt_type_handler", resolve)
+    monkeypatch.setattr(
+        page_ai.skyvern_context,
+        "current",
+        lambda: SkyvernContext(workflow_run_id="wr_123", task_id="tsk_456", organization_id="org_1"),
+    )
+
+    result = await page_ai._resolve_assist_llm_handler("single-input-action", default_handler)
+
+    assert result is payload_handler
+    resolve.assert_awaited_once_with("single-input-action", "wr_123", "org_1", org_aware_handler)
+
+
+@pytest.mark.asyncio
+async def test_assist_handler_uses_task_id_when_no_workflow_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.core.script_generations import real_skyvern_page_ai as page_ai
+
+    org_aware_handler = AsyncMock(name="org_aware")
+    monkeypatch.setattr(page_ai, "get_org_aware_secondary_llm_api_handler", lambda default: org_aware_handler)
+    resolve = AsyncMock(return_value=org_aware_handler)
+    monkeypatch.setattr(page_ai, "resolve_prompt_type_handler", resolve)
+    monkeypatch.setattr(
+        page_ai.skyvern_context,
+        "current",
+        lambda: SkyvernContext(task_id="tsk_456", organization_id="org_1"),
+    )
+
+    await page_ai._resolve_assist_llm_handler("single-click-action", AsyncMock())
+
+    resolve.assert_awaited_once_with("single-click-action", "tsk_456", "org_1", org_aware_handler)
+
+
+@pytest.mark.asyncio
+async def test_assist_handler_falls_back_without_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.core.script_generations import real_skyvern_page_ai as page_ai
+
+    org_aware_handler = AsyncMock(name="org_aware")
+    monkeypatch.setattr(page_ai, "get_org_aware_secondary_llm_api_handler", lambda default: org_aware_handler)
+    resolve = AsyncMock(side_effect=AssertionError("must not consult the payload without a distinct id"))
+    monkeypatch.setattr(page_ai, "resolve_prompt_type_handler", resolve)
+    monkeypatch.setattr(page_ai.skyvern_context, "current", lambda: None)
+
+    result = await page_ai._resolve_assist_llm_handler("single-input-action", AsyncMock())
+
+    assert result is org_aware_handler
+    resolve.assert_not_awaited()

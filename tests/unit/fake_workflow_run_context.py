@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+
 
 class FakeWorkflowRunContext:
     def __init__(
@@ -33,6 +35,7 @@ class FakeWorkflowRunContext:
         self.workflow_run_id = "wf-run-id"
         self.browser_session_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
+        self.workflow = None
 
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
         if not label:
@@ -45,6 +48,12 @@ class FakeWorkflowRunContext:
         else:
             self._blocks_metadata[label] = dict(metadata)
 
+    def resolve_effective_workflow_system_prompt(self) -> str | None:
+        return None
+
+    def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        return None
+
     def has_value(self, key: str) -> bool:
         return key in self.values
 
@@ -56,3 +65,11 @@ class FakeWorkflowRunContext:
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         return data
+
+    def get_original_secret_value_or_none(self, secret_id_or_value: Any) -> Any:
+        if isinstance(secret_id_or_value, str) and secret_id_or_value in self.secrets:
+            return self.secrets[secret_id_or_value]
+        return None
+
+    # Borrow the real implementation so scoping behavior cannot drift from production.
+    credential_template_entries = WorkflowRunContext.credential_template_entries

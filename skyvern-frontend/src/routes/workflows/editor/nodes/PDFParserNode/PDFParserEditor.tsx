@@ -42,7 +42,7 @@ function PDFParserEditorBody({
     <div data-testid="pdf-parser-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">File URL</Label>
+          <Label className="text-xs text-tertiary-foreground">File URL</Label>
           <HelpTooltip content={helpTooltips["pdfParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,7 +9,30 @@ from playwright._impl._errors import Error as PWError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 
 from skyvern.config import settings
-from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry
+from skyvern.exceptions import BlockedHost
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_errors import BrowserCdpConnectionError
+from skyvern.webeye.cdp_retry import _resolve_retry_budget, connect_over_cdp_with_retry, is_cdp_connection_error
+
+
+class _FakeEngineError(Exception):
+    pass
+
+
+class _FakeEngineRetryable(_FakeEngineError):
+    pass
+
+
+def _fake_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name="fake",
+        start_driver=cast(Any, lambda: None),
+        error_type=_FakeEngineError,
+        timeout_error_type=_FakeEngineError,
+        metadata=BrowserEngineMetadata(name="fake"),
+        selection_reason="test-fake",
+        retryable_error_types=(_FakeEngineRetryable,),
+    )
 
 
 def _make_playwright(side_effect):
@@ -23,9 +48,54 @@ def _set_budget(monkeypatch: pytest.MonkeyPatch, attempts: int, backoff: list[fl
 
 class TestRetryBehavior:
     @pytest.mark.asyncio
+    async def test_validates_browser_address_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "ENV", "prod")
+        pw = _make_playwright(["browser"])
+
+        with pytest.raises(BlockedHost):
+            await connect_over_cdp_with_retry(pw, "http://10.0.0.5:9224")
+
+        pw.chromium.connect_over_cdp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_resolution_failure_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _set_budget(monkeypatch, attempts=3, backoff=[1, 2])
+        pw = _make_playwright(["browser"])
+        resolver = MagicMock(
+            side_effect=[
+                OSError("synthetic resolver failure"),
+                [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))],
+            ]
+        )
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await connect_over_cdp_with_retry(pw, "wss://cdp.example.test")
+
+        assert result == "browser"
+        assert resolver.call_count == 2
+        pw.chromium.connect_over_cdp.assert_awaited_once()
+        mock_sleep.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_blocked_host_fails_closed_without_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pw = _make_playwright(["browser"])
+        resolver = MagicMock(return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))])
+        monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", resolver)
+
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
+            with pytest.raises(BlockedHost) as excinfo:
+                await connect_over_cdp_with_retry(pw, "wss://blocked.example.test")
+
+        assert type(excinfo.value) is BlockedHost
+        resolver.assert_called_once_with("blocked.example.test", None, type=socket.SOCK_STREAM)
+        pw.chromium.connect_over_cdp.assert_not_awaited()
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_succeeds_on_first_attempt(self):
         pw = _make_playwright(["browser"])
-        result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+        result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 1
 
@@ -38,7 +108,7 @@ class TestRetryBehavior:
             ]
         )
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
-            result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+            result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 2
         mock_sleep.assert_called_once_with(1)
@@ -60,6 +130,7 @@ class TestRetryBehavior:
                 pw,
                 secret_address,
                 log_browser_address="remote-cdp-vendor:cdp.vendor.test",
+                validate_browser_address=False,
             )
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_args.args[0] == secret_address
@@ -80,7 +151,7 @@ class TestRetryBehavior:
             ]
         )
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
-            result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+            result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 3
         assert mock_sleep.call_count == 2
@@ -92,45 +163,44 @@ class TestRetryBehavior:
         pw = _make_playwright([error, error, error])
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock):
             with pytest.raises(PWError):
-                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert pw.chromium.connect_over_cdp.call_count == 3
 
     @pytest.mark.asyncio
     async def test_non_retryable_error_raises_immediately(self):
         pw = _make_playwright([PWError("net::ERR_NAME_NOT_RESOLVED")])
         with pytest.raises(PWError):
-            await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+            await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert pw.chromium.connect_over_cdp.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_final_attempt_raised_exception_does_not_leak_url_when_label_provided(self, monkeypatch):
-        """When log_browser_address is set, the final-attempt exception is a plain
-        RuntimeError whose message contains only the safe label and the original
-        error class name — never the raw browser_address."""
+    async def test_final_attempt_safe_error_is_classified_without_leaking_url(self, monkeypatch):
         _set_budget(monkeypatch, attempts=3, backoff=[1, 3])
-        secret_address = "wss://cdp.vendor.test/devtools/browser/SECRET?token=ABC"
-        underlying_msg = (
-            "BrowserType.connect_over_cdp: connect ECONNREFUSED wss://cdp.vendor.test/devtools/browser/SECRET?token=ABC"
-        )
-        error = PWError(underlying_msg)
+        synthetic_key = "SYNTHETIC_KEY_DO_NOT_USE"
+        raw_address = f"wss://cdp.example.test/devtools/browser/SYNTHETIC_SESSION?api_key={synthetic_key}"
+        error = _FakeEngineRetryable(f"connect failed: {raw_address}")
         pw = _make_playwright([error, error, error])
+        selection = _fake_selection()
 
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock):
-            with pytest.raises(RuntimeError) as excinfo:
+            with pytest.raises(BrowserCdpConnectionError) as excinfo:
                 await connect_over_cdp_with_retry(
                     pw,
-                    secret_address,
-                    log_browser_address="remote-cdp-vendor:cdp.vendor.test",
+                    raw_address,
+                    log_browser_address="remote-cdp-vendor:cdp.example.test",
+                    selection=selection,
+                    validate_browser_address=False,
                 )
 
         message = str(excinfo.value)
-        assert "SECRET" not in message
-        assert "token=ABC" not in message
+        assert raw_address not in message
+        assert synthetic_key not in message
+        assert "SYNTHETIC_SESSION" not in message
         assert "/devtools/browser/" not in message
-        assert "remote-cdp-vendor:cdp.vendor.test" in message
-        # Original error class name preserved for log debuggability.
-        assert "PWError" in message or "Error" in message
-        # Chain suppressed so __cause__ cannot leak the URL either.
+        assert "remote-cdp-vendor:cdp.example.test" in message
+        assert "_FakeEngineRetryable" in message
+        assert is_cdp_connection_error(excinfo.value)
+        assert is_cdp_connection_error(excinfo.value, selection)
         assert excinfo.value.__cause__ is None
 
     @pytest.mark.asyncio
@@ -144,7 +214,7 @@ class TestRetryBehavior:
 
         with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock):
             with pytest.raises(PWError) as excinfo:
-                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
 
         assert str(excinfo.value) == underlying_msg
 
@@ -160,7 +230,7 @@ class TestRetryBehavior:
 
         with patch("skyvern.webeye.cdp_retry._sleep", side_effect=track_sleep):
             with pytest.raises(PWError):
-                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
+                await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224", validate_browser_address=False)
         assert sleep_values == [1, 3]
 
     @pytest.mark.asyncio
@@ -199,6 +269,38 @@ class TestRetryBudget:
         monkeypatch.setattr(settings, "CDP_CONNECT_RETRY_BACKOFF_SECONDS", [])
         _, backoff = _resolve_retry_budget()
         assert backoff == (1, 2, 3, 4, 5)
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_retryable_error_is_retried(self, monkeypatch):
+        """A selected engine's own retryable-CDP class (foreign to Playwright) is recognized via the
+        selection and retried, then recovered — proving the retry loop forwards ``selection`` to the
+        classifier instead of relying on Playwright's hardcoded identities."""
+        _set_budget(monkeypatch, attempts=3, backoff=[1, 2])
+        pw = _make_playwright([_FakeEngineRetryable("transient CDP disconnect"), "browser"])
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await connect_over_cdp_with_retry(
+                pw,
+                "http://10.0.0.1:9224",
+                selection=_fake_selection(),
+                validate_browser_address=False,
+            )
+        assert result == "browser"
+        assert pw.chromium.connect_over_cdp.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_selected_engine_foreign_error_is_not_retried(self):
+        """Under a non-stock selection a foreign Playwright error is not a recognized connection
+        error, so it is raised immediately (never swallowed by a blind retry)."""
+        pw = _make_playwright([PWTimeoutError("Timeout 30000ms exceeded.")])
+        with pytest.raises(PWTimeoutError):
+            await connect_over_cdp_with_retry(
+                pw,
+                "http://10.0.0.1:9224",
+                selection=_fake_selection(),
+                validate_browser_address=False,
+            )
+        assert pw.chromium.connect_over_cdp.call_count == 1
 
     @pytest.mark.asyncio
     async def test_slow_to_bind_local_port_reconnects_on_a_later_attempt(self, monkeypatch):

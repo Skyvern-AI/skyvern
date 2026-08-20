@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunStatusApiResponse } from "@/api/types";
+import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
 import {
@@ -7,7 +7,7 @@ import {
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import {
   getActiveOrgQueryKeyScope,
@@ -15,10 +15,34 @@ import {
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunQuery(options?: { workflowRunId?: string }) {
+const RUN_STATUS_POLL_INTERVAL_MS = 5000;
+
+// Data from before a failed refetch is retained, so a run whose workflow stops
+// resolving mid-run would keep a non-finalized stale payload and poll its error
+// every 5s forever; the error state has to stop the poll first.
+function getRunStatusRefetchInterval(state: {
+  status: "pending" | "error" | "success";
+  data?: { status: Status };
+}): number | false {
+  if (state.status === "error") {
+    return false;
+  }
+  if (!state.data) {
+    return false;
+  }
+  if (statusIsNotFinalized(state.data)) {
+    return RUN_STATUS_POLL_INTERVAL_MS;
+  }
+  return false;
+}
+
+function useWorkflowRunQuery(options?: {
+  workflowRunId?: string;
+  enabled?: boolean;
+}) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
   const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const credentialGetter = useCredentialGetter();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const activeOrgId = useActiveOrgId();
@@ -45,15 +69,7 @@ function useWorkflowRunQuery(options?: { workflowRunId?: string }) {
         })
         .then((response) => response.data);
     },
-    refetchInterval: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      if (statusIsNotFinalized(query.state.data)) {
-        return 5000;
-      }
-      return false;
-    },
+    refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
     // required for OS-level notifications to work (workflow run completion)
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
@@ -69,8 +85,16 @@ function useWorkflowRunQuery(options?: { workflowRunId?: string }) {
       }
       return statusIsRunningOrQueued(query.state.data);
     },
-    enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
+    enabled:
+      (options?.enabled ?? true) &&
+      !!globalWorkflows &&
+      !!workflowPermanentId &&
+      !!workflowRunId,
   });
 }
 
-export { useWorkflowRunQuery };
+export {
+  getRunStatusRefetchInterval,
+  RUN_STATUS_POLL_INTERVAL_MS,
+  useWorkflowRunQuery,
+};

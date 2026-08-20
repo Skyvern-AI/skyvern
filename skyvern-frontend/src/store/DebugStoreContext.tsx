@@ -2,6 +2,7 @@ import React, { createContext, useMemo } from "react";
 
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useAgentsPathMatch } from "@/routes/workflows/useAgentsPathMatch";
+import { useStudioRunRouteMatch } from "@/routes/workflows/useStudioRunRouteMatch";
 
 function useIsDebugMode() {
   const workflowBuildMatch = useAgentsPathMatch("/:workflowPermanentId/build");
@@ -19,10 +20,11 @@ function useIsDebugMode() {
 function useBlockRunsEnabled() {
   const editMatch = useAgentsPathMatch("/:workflowPermanentId/edit");
   const studioMatch = useAgentsPathMatch("/:workflowPermanentId/studio");
+  const runStudioMatch = useStudioRunRouteMatch();
   const studioEnabled = useWorkflowStudioEnabled();
   return useMemo(
-    () => studioEnabled && Boolean(editMatch || studioMatch),
-    [studioEnabled, editMatch, studioMatch],
+    () => studioEnabled && Boolean(editMatch || studioMatch || runStudioMatch),
+    [studioEnabled, editMatch, studioMatch, runStudioMatch],
   );
 }
 

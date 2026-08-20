@@ -9,6 +9,7 @@ from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPag
 from skyvern.core.script_generations.skyvern_page import RunContext, SkyvernPage
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 
@@ -99,7 +100,7 @@ async def _llm_extract_from_text(
     try:
         skyvern_ctx = skyvern_context.current()
         org_id = skyvern_ctx.organization_id if skyvern_ctx else None
-        result = await app.SECONDARY_LLM_API_HANDLER(
+        result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
             prompt=prompt_text,
             prompt_name="extract-applicant-parameters",
             organization_id=org_id,
@@ -136,6 +137,9 @@ async def setup(
                 parameter = parameters_in_workflow_context[key]
                 if parameter.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID:
                     parameters[key] = workflow_run_context.values[key]
+        # An absent at-will credential needs no backfill here: RunContext wraps parameters in
+        # SafeParameters, so generated code indexing context.parameters[key] already resolves a
+        # missing key to None without a KeyError.
         context.script_run_parameters.update(parameters)
 
     # Pre-extract structured values from all parameters (1 LLM call max, cached for entire run)

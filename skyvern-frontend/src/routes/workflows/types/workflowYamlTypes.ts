@@ -1,6 +1,7 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
 import {
   CodeBlockStep,
+  CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   WorkflowBlockType,
   WorkflowModel,
@@ -12,6 +13,7 @@ export type WorkflowCreateYAMLRequest = {
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
+  reuse_browser_session?: boolean;
   pin_saved_session_ip?: boolean;
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
@@ -30,6 +32,7 @@ export type WorkflowCreateYAMLRequest = {
   enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
+  mask_secrets?: boolean | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;
@@ -133,6 +136,8 @@ export type CredentialParameterYAML = ParameterYAMLBase & {
   credential_id: string;
   credential_ids?: Array<string> | null;
   selection_strategy?: CredentialSelectionStrategy | null;
+  fallback_credential_ids?: Array<string> | null;
+  fallback_trigger?: CredentialFallbackTrigger | null;
 };
 
 export type BlockYAML =
@@ -161,9 +166,11 @@ export type BlockYAML =
   | HttpRequestBlockYAML
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
+  | EmailInboxBlockYAML
   | GoogleSheetsReadBlockYAML
   | GoogleSheetsWriteBlockYAML
-  | PdfFillBlockYAML;
+  | PdfFillBlockYAML
+  | SplitPdfBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -292,6 +299,7 @@ export type LoginBlockYAML = BlockYAMLBase & {
   disable_cache: boolean;
   complete_criterion: string | null;
   terminate_criterion: string | null;
+  include_action_history_in_verification: boolean;
   engine: RunEngine | null;
 };
 
@@ -302,6 +310,27 @@ export type WaitBlockYAML = BlockYAMLBase & {
 
 export type FileDownloadBlockYAML = BlockYAMLBase & {
   block_type: "file_download";
+  download_target?: "website" | "s3" | "azure" | "google_drive" | "sftp";
+  path?: string | null;
+  prompt?: string | null;
+  s3_bucket?: string | null;
+  region_name?: string | null;
+  aws_access_key_id?: string | null;
+  aws_secret_access_key?: string | null;
+  azure_storage_account_name?: string | null;
+  azure_storage_account_key?: string | null;
+  azure_blob_container_name?: string | null;
+  google_credential_id?: string | null;
+  google_drive_folder_id?: string | null;
+  sftp_host?: string | null;
+  sftp_port?: number | null;
+  sftp_username?: string | null;
+  sftp_password?: string | null;
+  sftp_private_key?: string | null;
+  sftp_private_key_passphrase?: string | null;
+  sftp_remote_path?: string | null;
+  sftp_host_key?: string | null;
+  continue_on_empty?: boolean;
   url: string | null;
   title?: string;
   navigation_goal: string | null;
@@ -321,6 +350,7 @@ export type CodeBlockYAML = BlockYAMLBase & {
   block_type: "code";
   code: string;
   parameter_keys?: Array<string> | null;
+  error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
 };
@@ -346,6 +376,7 @@ export type UploadToS3BlockYAML = BlockYAMLBase & {
 export type FileUploadBlockYAML = BlockYAMLBase & {
   block_type: "file_upload";
   path?: string | null;
+  prompt?: string | null;
   storage_type: string;
   s3_bucket: string;
   region_name: string;
@@ -356,6 +387,14 @@ export type FileUploadBlockYAML = BlockYAMLBase & {
   azure_blob_container_name?: string | null;
   google_credential_id?: string | null;
   google_drive_folder_id?: string | null;
+  sftp_host?: string | null;
+  sftp_port?: number | null;
+  sftp_username?: string | null;
+  sftp_password?: string | null;
+  sftp_private_key?: string | null;
+  sftp_private_key_passphrase?: string | null;
+  sftp_remote_path?: string | null;
+  sftp_host_key?: string | null;
 };
 
 export type SendEmailBlockYAML = BlockYAMLBase & {
@@ -365,6 +404,11 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   smtp_port_secret_parameter_key?: string;
   smtp_username_secret_parameter_key?: string;
   smtp_password_secret_parameter_key?: string;
+
+  custom_smtp_host?: string | null;
+  custom_smtp_port?: number | null;
+  custom_smtp_username?: string | null;
+  custom_smtp_password?: string | null;
 
   sender: string;
   recipients: Array<string>;
@@ -460,6 +504,20 @@ export type WorkflowTriggerBlockYAML = BlockYAMLBase & {
   parameter_keys?: Array<string> | null;
 };
 
+export type EmailInboxBlockYAML = BlockYAMLBase & {
+  block_type: "email_inbox";
+  email_client: "gmail" | "outlook";
+  credential_id: string | null;
+  folder: string;
+  prompt: string;
+  sender: string | null;
+  subject: string | null;
+  newer_than_days: number | null;
+  max_results: number;
+  include_body: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
 export type GoogleSheetsReadBlockYAML = BlockYAMLBase & {
   block_type: "google_sheets_read";
   spreadsheet_url: string;
@@ -488,6 +546,14 @@ export type PdfFillBlockYAML = BlockYAMLBase & {
   file_url: string;
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key?: string | null;
+  parameter_keys?: Array<string> | null;
+};
+
+export type SplitPdfBlockYAML = BlockYAMLBase & {
+  block_type: "split_pdf";
+  file_url: string;
+  prompt: string;
   llm_key?: string | null;
   parameter_keys?: Array<string> | null;
 };

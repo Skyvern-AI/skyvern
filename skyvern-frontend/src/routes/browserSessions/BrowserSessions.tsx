@@ -2,7 +2,11 @@ import { GlobeIcon, PlusIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
-import { ProxyLocation } from "@/api/types";
+import {
+  BROWSER_SESSION_MAX_TIMEOUT_MINUTES,
+  BROWSER_SESSION_MIN_TIMEOUT_MINUTES,
+  ProxyLocation,
+} from "@/api/types";
 
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -394,8 +398,8 @@ function BrowserSessions() {
                   </div>
                   <Input
                     type="number"
-                    min={5}
-                    max={1440}
+                    min={BROWSER_SESSION_MIN_TIMEOUT_MINUTES}
+                    max={BROWSER_SESSION_MAX_TIMEOUT_MINUTES}
                     value={sessionOptions.timeoutMinutes ?? ""}
                     placeholder="timeout (minutes)"
                     onChange={(event) => {
@@ -490,8 +494,10 @@ function BrowserSessions() {
                     createBrowserSessionMutation.isPending ||
                     sessionOptions.timeoutMinutes === null ||
                     Number.isNaN(sessionOptions.timeoutMinutes) ||
-                    sessionOptions.timeoutMinutes < 5 ||
-                    sessionOptions.timeoutMinutes > 1440
+                    sessionOptions.timeoutMinutes <
+                      BROWSER_SESSION_MIN_TIMEOUT_MINUTES ||
+                    sessionOptions.timeoutMinutes >
+                      BROWSER_SESSION_MAX_TIMEOUT_MINUTES
                   }
                   className="mt-6 w-full"
                   onClick={() => {

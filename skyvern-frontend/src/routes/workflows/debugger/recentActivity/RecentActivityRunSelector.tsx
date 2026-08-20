@@ -70,10 +70,10 @@ function RecentActivityRunSelector({
           type="button"
           aria-label="Recent activity — select a run"
           className={cn(
-            "flex w-full items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-200 outline-none transition-colors hover:bg-white/10 focus-visible:ring-1 focus-visible:ring-white/40",
+            "flex w-full items-center gap-2 rounded-lg border border-border bg-muted px-3 py-2 text-xs text-foreground outline-none transition-colors hover:bg-accent focus-visible:ring-1 focus-visible:ring-foreground/40 dark:border-white/10 dark:bg-white/5 dark:text-slate-200 dark:hover:bg-white/10",
           )}
         >
-          <CounterClockwiseClockIcon className="size-4 shrink-0 text-slate-400" />
+          <CounterClockwiseClockIcon className="size-4 shrink-0 text-muted-foreground" />
           {selected ? (
             <>
               <RunStatusGlyph
@@ -85,18 +85,18 @@ function RecentActivityRunSelector({
                 {selected.block_label}
               </span>
               {ago && (
-                <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
                   {ago}
                 </span>
               )}
             </>
           ) : (
-            <span className="text-slate-400">Recent activity</span>
+            <span className="text-muted-foreground">Recent activity</span>
           )}
-          <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
             · {runs.length} {runs.length === 1 ? "run" : "runs"}
           </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 text-slate-500" />
+          <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
         </button>
       </PopoverTrigger>
       <PopoverContent

@@ -27,8 +27,11 @@ export type WhileLoopBlockYamlLoopBlocksItem =
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.HttpRequest
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.Conditional
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.PrintPage
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.PdfFill
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.SplitPdf
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.WorkflowTrigger
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.GoogleSheetsRead
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.EmailInbox
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.GoogleSheetsWrite;
 
 export namespace WhileLoopBlockYamlLoopBlocksItem {
@@ -128,12 +131,24 @@ export namespace WhileLoopBlockYamlLoopBlocksItem {
         block_type: "print_page";
     }
 
+    export interface PdfFill extends Skyvern.PdfFillBlockYaml {
+        block_type: "pdf_fill";
+    }
+
+    export interface SplitPdf extends Skyvern.SplitPdfBlockYaml {
+        block_type: "split_pdf";
+    }
+
     export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlockYaml {
         block_type: "workflow_trigger";
     }
 
     export interface GoogleSheetsRead extends Skyvern.GoogleSheetsReadBlockYaml {
         block_type: "google_sheets_read";
+    }
+
+    export interface EmailInbox extends Skyvern.EmailInboxBlockYaml {
+        block_type: "email_inbox";
     }
 
     export interface GoogleSheetsWrite extends Skyvern.GoogleSheetsWriteBlockYaml {

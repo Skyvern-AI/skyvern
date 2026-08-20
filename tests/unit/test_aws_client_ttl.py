@@ -12,6 +12,46 @@ _EXPIRED_TOKEN_ERROR = ClientError(
 )
 
 
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetObject")
+
+
+@pytest.mark.parametrize("code", ["NoSuchKey", "NotFound", "404"])
+def test_is_not_found_error_true_for_missing_object_codes(code: str) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(_client_error(code)) is True
+
+
+@pytest.mark.parametrize("error", [_client_error("AccessDenied"), Exception("boom")])
+def test_is_not_found_error_false_for_other_errors(error: Exception) -> None:
+    client = aws.AsyncAWSClient()
+    assert client._is_not_found_error(error) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_missing_key_returns_none_without_traceback() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("NoSuchKey"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/missing.zip")
+    assert result is None
+    mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_file_real_error_still_logs_exception() -> None:
+    client = aws.AsyncAWSClient()
+    with (
+        patch.object(client, "_s3_with_retry", AsyncMock(side_effect=_client_error("AccessDenied"))),
+        patch.object(aws, "LOG") as mock_log,
+    ):
+        result = await client.download_file("s3://bucket/denied.zip")
+    assert result is None
+    mock_log.exception.assert_called_once()
+
+
 @pytest.fixture(autouse=True)
 def reset_aws_client():
     """Reset the global singleton before each test."""
@@ -41,6 +81,42 @@ def test_refresh_session_creates_new_session():
     old_session = client.session
     client.refresh_session()
     assert client.session is not old_session
+
+
+def test_client_session_reused_within_ttl():
+    with patch.object(aws.aioboto3, "Session", side_effect=lambda **_: MagicMock()) as mock_session:
+        client = aws.AsyncAWSClient()
+        first = client.session
+        second = client.session
+
+    assert first is second
+    assert mock_session.call_count == 1
+
+
+def test_client_session_recreated_after_ttl():
+    """Any holder of AsyncAWSClient (e.g. the storage singleton on a long-lived worker) gets a
+    fresh session past the TTL, not just callers of the module-level get_aws_client() factory."""
+    with patch.object(aws.aioboto3, "Session", side_effect=lambda **_: MagicMock()) as mock_session:
+        client = aws.AsyncAWSClient()
+        first = client.session
+        client._session_created_at = time.monotonic() - (aws._SESSION_TTL_SECONDS + 1)
+        second = client.session
+
+    assert first is not second
+    assert mock_session.call_count == 2
+
+
+def test_setter_stamps_session_ttl_clock():
+    """A backdated clock plus a setter-installed session must not trigger recreation: the setter
+    stamps the TTL clock. Deterministic regardless of host uptime, unlike the compat test."""
+    client = aws.AsyncAWSClient()
+    client._session_created_at = -(aws._SESSION_TTL_SECONDS + 1)
+    session = MagicMock()
+
+    client.session = session
+
+    assert client._session_created_at > 0
+    assert client.session is session
 
 
 def test_no_profile_session_creation_uses_default_credential_chain(monkeypatch: pytest.MonkeyPatch):

@@ -71,6 +71,41 @@ export function isViewportStranded({
   );
 }
 
+// Sub-pixel drift below this delta is Dagre/float jitter, not a real shift;
+// skip correcting it so the viewport doesn't nudge on every relayout.
+const RELAYOUT_DRIFT_EPSILON_PX = 1;
+
+/**
+ * Counter-translates the viewport to keep a stable anchor node's x visually
+ * put across a collapse/expand-triggered Dagre relayout. `layoutUtil`
+ * (workflowEditorUtils.ts) recomputes every node's x from scratch each pass,
+ * so a container's width change shifts every node uniformly; the anchor's
+ * own x is what tracks that shift. The union bounding box's left edge does
+ * NOT: Dagre renormalizes its coordinate space per layout call, so that edge
+ * lands near the same value regardless of width changes elsewhere — measured
+ * at 0 before and after a real collapse in manual verification, even though
+ * on-screen nodes visibly moved. Returns null (no-op) for sub-epsilon drift.
+ */
+export function relayoutDriftCorrection({
+  viewport,
+  xBefore,
+  xAfter,
+}: {
+  viewport: Viewport;
+  xBefore: number;
+  xAfter: number;
+}): Viewport | null {
+  const deltaX = xAfter - xBefore;
+  if (Math.abs(deltaX) < RELAYOUT_DRIFT_EPSILON_PX) {
+    return null;
+  }
+  return {
+    x: viewport.x - deltaX * viewport.zoom,
+    y: viewport.y,
+    zoom: viewport.zoom,
+  };
+}
+
 export function paneRefitDuration(): number {
   if (
     typeof window === "undefined" ||

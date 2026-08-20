@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 
@@ -10,6 +11,7 @@ class TagSource(StrEnum):
     BACKFILL = "backfill"  # written by a one-off migration/script over existing rows
     INHERITED = "inherited"  # copied from a parent (e.g. folder) rather than set directly
     IMPORT = "import"  # ingested from an external system
+    SYSTEM = "system"  # written by Skyvern-owned automation, not a public caller
 
 
 class TagEventType(StrEnum):
@@ -31,8 +33,12 @@ class CallerType(StrEnum):
 
 @dataclass(frozen=True)
 class TagWriteContext:
-    """Attribution persisted on each tag event row. caller_type is nullable for backfill scripts."""
+    """Attribution persisted on each tag event row.
+
+    ``caller_type`` and ``set_at`` are nullable for backfill scripts.
+    """
 
     caller_id: str
     source: TagSource
     caller_type: CallerType | None = None
+    set_at: datetime | None = None

@@ -5,6 +5,7 @@ load → domcontentloaded → commit instead of hard-failing on SPA pages.
 Degradation is scoped to extraction tasks only.
 """
 
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.constants import ScrapeType
 from skyvern.exceptions import FailedToReloadPage
 from skyvern.forge.agent import ForgeAgent
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 _AGENT_MODULE = "skyvern.forge.agent"
@@ -21,6 +23,7 @@ _AGENT_MODULE = "skyvern.forge.agent"
 @pytest.fixture
 def browser_state() -> RealBrowserState:
     state = RealBrowserState.__new__(RealBrowserState)
+    state.engine_selection = None
     return state
 
 
@@ -190,3 +193,179 @@ async def test_scrape_with_type_normal_no_reload_call() -> None:
         )
 
     bs.reload_page.assert_not_called()
+
+
+def _reconnect_state(binding: DownloadBinding) -> RealBrowserState:
+    state = RealBrowserState.__new__(RealBrowserState)
+    state.pw = AsyncMock()
+    state.browser_context = MagicMock()
+    state.engine_selection = MagicMock()
+    state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
+    state.set_working_page = AsyncMock()
+    state.browser_artifacts = BrowserArtifacts(download_binding=binding)
+
+    async def _factory_rebuild(**kwargs: object) -> None:
+        # Model the authoritative creator seam: check_and_fix_state forwards the binding and the factory
+        # stamps it on the fresh artifacts (there is no post-hoc marker override on the state).
+        forwarded = kwargs.get("download_binding")
+        stamped = forwarded if isinstance(forwarded, DownloadBinding) else DownloadBinding.RUN_DIR
+        state.browser_artifacts = BrowserArtifacts(download_binding=stamped)
+
+    state.check_and_fix_state = _factory_rebuild  # type: ignore[method-assign]
+    return state
+
+
+@pytest.mark.asyncio
+async def test_reconnect_preserves_session_dir_binding() -> None:
+    state = _reconnect_state(DownloadBinding.SESSION_DIR)
+    await state.reconnect(workflow_run_id="wr-1")
+    assert state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR
+
+
+@pytest.mark.asyncio
+async def test_reconnect_keeps_run_dir_binding() -> None:
+    state = _reconnect_state(DownloadBinding.RUN_DIR)
+    await state.reconnect(workflow_run_id="wr-1")
+    assert state.browser_artifacts.download_binding == DownloadBinding.RUN_DIR
+
+
+def _reconnect_state_capturing_check(binding: DownloadBinding, captured: dict[str, object]) -> RealBrowserState:
+    state = RealBrowserState.__new__(RealBrowserState)
+    state.pw = AsyncMock()
+    state.browser_context = MagicMock()
+    state.engine_selection = MagicMock()
+    state.engine_selection.start_driver = AsyncMock(return_value=AsyncMock())
+    state.set_working_page = AsyncMock()
+    state.browser_artifacts = BrowserArtifacts(download_binding=binding)
+
+    async def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    state.check_and_fix_state = _capture  # type: ignore[method-assign]
+    return state
+
+
+@pytest.mark.asyncio
+async def test_reconnect_threads_session_dir_binding_into_check_and_fix_state() -> None:
+    """Metadata restore alone is not enough — reconnect must hand the SESSION_DIR binding to
+    check_and_fix_state so the factory skips the run-dir setDownloadBehavior rebind and preserves the
+    provider-selected destination instead of re-pointing and relabeling afterward."""
+    captured: dict[str, object] = {}
+    state = _reconnect_state_capturing_check(DownloadBinding.SESSION_DIR, captured)
+    await state.reconnect(workflow_run_id="wr-1")
+    assert captured.get("download_binding") == DownloadBinding.SESSION_DIR
+
+
+@pytest.mark.asyncio
+async def test_reconnect_threads_run_dir_binding_into_check_and_fix_state() -> None:
+    """A RUN_DIR session threads RUN_DIR so the ordinary run-scoped rebind still fires on reconnect."""
+    captured: dict[str, object] = {}
+    state = _reconnect_state_capturing_check(DownloadBinding.RUN_DIR, captured)
+    await state.reconnect(workflow_run_id="wr-1")
+    assert captured.get("download_binding") == DownloadBinding.RUN_DIR
+
+
+def _recreation_state(
+    binding: DownloadBinding, captured: dict[str, object]
+) -> tuple[RealBrowserState, Callable[..., Awaitable[tuple[object, BrowserArtifacts, object]]]]:
+    state = RealBrowserState.__new__(RealBrowserState)
+    state.pw = AsyncMock()
+    state.browser_context = None  # force the check_and_fix_state recreation branch
+    state.engine_selection = None
+    state.browser_artifacts = BrowserArtifacts(download_binding=binding)
+    state.set_working_page = AsyncMock()
+    state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    async def _fake_create(_playwright: object, **kwargs: object) -> tuple[object, BrowserArtifacts, object]:
+        captured.update(kwargs)
+        return MagicMock(pages=[MagicMock()]), BrowserArtifacts(), None
+
+    return state, _fake_create
+
+
+@pytest.mark.asyncio
+async def test_check_and_fix_state_recreation_preserves_session_dir_when_binding_omitted() -> None:
+    """Non-reconnect entry: a recreation entry point (get_or_create_page, retry paths) that calls
+    check_and_fix_state() without an explicit binding must not downgrade a live SESSION_DIR state to the
+    RUN_DIR default and rebind it off the provider-selected destination. The omitted binding derives
+    from the state's own prior artifacts."""
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.SESSION_DIR, captured)
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=fake_create,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(workflow_run_id="wr-1")
+
+    assert captured.get("download_binding") == DownloadBinding.SESSION_DIR
+
+
+@pytest.mark.asyncio
+async def test_check_and_fix_state_recreation_defaults_run_dir_for_run_dir_state() -> None:
+    """A RUN_DIR state omitting the binding still recreates as RUN_DIR — the sticky-derive must not
+    accidentally promote ordinary local/OSS/vendor states to SESSION_DIR."""
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.RUN_DIR, captured)
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=fake_create,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(workflow_run_id="wr-1")
+
+    assert captured.get("download_binding") == DownloadBinding.RUN_DIR
+
+
+@pytest.mark.asyncio
+async def test_check_and_fix_state_explicit_binding_overrides_prior_artifacts() -> None:
+    """An explicit binding still wins over the derived one (reconnect passes prior_download_binding)."""
+    captured: dict[str, object] = {}
+    state, fake_create = _recreation_state(DownloadBinding.RUN_DIR, captured)
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=fake_create,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(workflow_run_id="wr-1", download_binding=DownloadBinding.SESSION_DIR)
+
+    assert captured.get("download_binding") == DownloadBinding.SESSION_DIR
+
+
+@pytest.mark.asyncio
+async def test_check_and_fix_state_recreation_stamps_forwarded_binding_on_assigned_artifacts() -> None:
+    """Outer contract: on recreation, check_and_fix_state forwards the derived binding and the factory
+    stamps it on the fresh artifacts, so the state ends up SESSION_DIR — with no later override that
+    could mislabel a genuine provider change."""
+    state = RealBrowserState.__new__(RealBrowserState)
+    state.pw = AsyncMock()
+    state.browser_context = None
+    state.engine_selection = None
+    state.browser_artifacts = BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR)
+    state.set_working_page = AsyncMock()
+    state.get_working_page = AsyncMock(return_value=MagicMock())
+
+    async def _factory_stamps(_playwright: object, **kwargs: object) -> tuple[object, BrowserArtifacts, object]:
+        forwarded = kwargs.get("download_binding")
+        stamped = forwarded if isinstance(forwarded, DownloadBinding) else DownloadBinding.RUN_DIR
+        return MagicMock(pages=[MagicMock()]), BrowserArtifacts(download_binding=stamped), None
+
+    with (
+        patch(
+            "skyvern.webeye.real_browser_state.BrowserContextFactory.create_browser_context",
+            new=_factory_stamps,
+        ),
+        patch("skyvern.webeye.real_browser_state.skyvern_context.current", return_value=None),
+    ):
+        await state.check_and_fix_state(workflow_run_id="wr-1")
+
+    assert state.browser_artifacts.download_binding == DownloadBinding.SESSION_DIR

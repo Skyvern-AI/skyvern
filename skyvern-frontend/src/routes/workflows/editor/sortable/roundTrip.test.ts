@@ -6,13 +6,17 @@ import { ProxyLocation } from "@/api/types";
 import type { AppNode } from "../nodes";
 import {
   getElements,
+  convert,
   getWorkflowBlocks,
   getWorkflowSettings,
 } from "../workflowEditorUtils";
 import {
   type CodeBlock,
+  type EmailInboxBlock,
   type OutputParameter,
   type WorkflowBlock,
+  type WorkflowApiResponse,
+  type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
 import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
@@ -43,6 +47,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
@@ -56,6 +61,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
@@ -76,6 +82,21 @@ function makeOutputParameter(label: string): OutputParameter {
   };
 }
 
+function makeWorkflowParameter(key: string): WorkflowParameter {
+  return {
+    parameter_type: "workflow",
+    key,
+    description: null,
+    workflow_id: "wf-fixture",
+    workflow_parameter_id: `wp-${key}`,
+    workflow_parameter_type: "string",
+    default_value: "",
+    created_at: "2026-04-20T00:00:00Z",
+    modified_at: "2026-04-20T00:00:00Z",
+    deleted_at: null,
+  };
+}
+
 function makeCodeBlock(
   label: string,
   nextBlockLabel: string | null,
@@ -89,6 +110,31 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
+  };
+}
+
+function makeEmailInboxBlock(
+  label: string,
+  parameters: Array<WorkflowParameter>,
+): EmailInboxBlock {
+  return {
+    label,
+    block_type: "email_inbox",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: makeOutputParameter(label),
+    email_client: "outlook",
+    credential_id: "{{ microsoft_credential_id }}",
+    folder: "Inbox",
+    prompt: "",
+    sender: null,
+    subject: null,
+    newer_than_days: null,
+    max_results: 25,
+    include_body: true,
+    parameters,
   };
 }
 
@@ -204,6 +250,7 @@ function codeYamlToWorkflowBlock(yaml: CodeBlockYAML): CodeBlock {
     output_parameter: makeOutputParameter(yaml.label),
     code: yaml.code,
     parameters: [],
+    error_code_mapping: yaml.error_code_mapping,
   };
 }
 
@@ -220,6 +267,104 @@ function reloadFromSavedYaml(
 }
 
 describe("round-trip reorder → save → reload (M1 top-level)", () => {
+  test("email inbox preserves parameter keys across load and save", () => {
+    const credentialParameter = makeWorkflowParameter(
+      "microsoft_credential_id",
+    );
+    const initialBlocks: Array<WorkflowBlock> = [
+      makeEmailInboxBlock("Read Inbox", [credentialParameter]),
+    ];
+
+    const { nodes, edges } = getElements(initialBlocks, DEFAULT_SETTINGS, true);
+
+    const emailNode = nodes.find((node) => node.type === "emailInbox");
+    expect(emailNode?.data).toMatchObject({
+      parameterKeys: ["microsoft_credential_id"],
+    });
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      block_type: "email_inbox",
+      parameter_keys: ["microsoft_credential_id"],
+    });
+  });
+
+  test("code manifest preserves opaque keys through API, node, save, YAML, and reload", () => {
+    const codeBlock = makeCodeBlock("Guard Output", null);
+    codeBlock.error_code_mapping = {
+      lowercase_missing_output: "when output is absent",
+      "opaque.code-v1": "when the opaque condition occurs",
+    };
+
+    const { nodes, edges } = getElements([codeBlock], DEFAULT_SETTINGS, true);
+    const codeNode = nodes.find((candidate) => candidate.type === "codeBlock");
+    expect(codeNode?.data).toMatchObject({
+      errorCodeMapping: JSON.stringify(codeBlock.error_code_mapping, null, 2),
+    });
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(saved[0]).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+    expect(saved[0]).not.toHaveProperty("error_code");
+
+    const exported = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [codeBlock] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exported).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+    expect(exported).not.toHaveProperty("error_code");
+
+    const reloaded = reloadFromSavedYaml(saved);
+    expect(getWorkflowBlocks(reloaded.nodes, reloaded.edges)[0]).toMatchObject({
+      error_code_mapping: codeBlock.error_code_mapping,
+    });
+  });
+
+  test("code manifest normalizes absent API fields to the disabled null state", () => {
+    const codeBlock = makeCodeBlock("No Manifest", null);
+    delete (codeBlock as Partial<CodeBlock>).error_code_mapping;
+
+    const { nodes, edges } = getElements([codeBlock], DEFAULT_SETTINGS, true);
+    const codeNode = nodes.find((candidate) => candidate.type === "codeBlock");
+    expect(codeNode?.data).toMatchObject({ errorCodeMapping: "null" });
+    expect(codeNode?.data).not.toHaveProperty("errorCode");
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      error_code_mapping: null,
+    });
+  });
+
+  test("nested loop code manifest survives save and reload", () => {
+    const nestedCode = makeCodeBlock("Nested Guard", null);
+    nestedCode.error_code_mapping = {
+      nested_lowercase: "when the nested condition occurs",
+    };
+    const loop = {
+      label: "FOR1",
+      block_type: "for_loop",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("FOR1"),
+      loop_over: { key: "items" },
+      loop_blocks: [nestedCode],
+      loop_variable_reference: null,
+      complete_if_empty: false,
+      data_schema: null,
+    } as unknown as WorkflowBlock;
+
+    const first = getElements([loop], DEFAULT_SETTINGS, true);
+    const firstSaved = getWorkflowBlocks(first.nodes, first.edges)[0] as {
+      loop_blocks: Array<CodeBlockYAML>;
+    };
+    expect(firstSaved.loop_blocks[0]?.error_code_mapping).toEqual(
+      nestedCode.error_code_mapping,
+    );
+    expect(firstSaved.loop_blocks[0]).not.toHaveProperty("error_code");
+  });
+
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
     // 1. Load the workflow: YAML-like blocks → nodes + edges via getElements.
     const initialBlocks = buildFiveBlockFixture();
@@ -478,7 +623,9 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     const settings: WorkflowSettings = {
       ...DEFAULT_SETTINGS,
       errorCodeMapping: { OUT_OF_STOCK: "item unavailable" },
+      reuseBrowserSession: true,
       finallyBlockLabel: "B5",
+      maskSecrets: true,
       workflowSystemPrompt: "always double-check totals",
     };
     const { nodes } = getElements(buildFiveBlockFixture(), settings, true);
@@ -486,7 +633,58 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(recovered.errorCodeMapping).toEqual({
       OUT_OF_STOCK: "item unavailable",
     });
+    expect(recovered.reuseBrowserSession).toBe(true);
     expect(recovered.finallyBlockLabel).toBe("B5");
+    expect(recovered.maskSecrets).toBe(true);
     expect(recovered.workflowSystemPrompt).toBe("always double-check totals");
+  });
+});
+
+describe("login block configuration round trip", () => {
+  test("preserves Include Action History through load and save", () => {
+    const loginBlock = {
+      label: "login",
+      block_type: "login",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("login"),
+      url: "https://example.test/login",
+      title: "Login",
+      navigation_goal: "Log in",
+      error_code_mapping: null,
+      max_retries: 0,
+      max_steps_per_run: null,
+      parameters: [],
+      totp_verification_url: null,
+      totp_identifier: null,
+      disable_cache: false,
+      complete_criterion: null,
+      terminate_criterion: null,
+      engine: null,
+      include_action_history_in_verification: true,
+    } as unknown as WorkflowBlock;
+
+    const { nodes, edges } = getElements([loginBlock], DEFAULT_SETTINGS, true);
+    const loginNode = nodes.find((node) => node.type === "login");
+
+    expect(loginNode).toBeDefined();
+    expect(
+      (
+        loginNode!.data as unknown as {
+          includeActionHistoryInVerification?: boolean;
+        }
+      ).includeActionHistoryInVerification,
+    ).toBe(true);
+
+    const saved = getWorkflowBlocks(nodes, edges);
+    expect(
+      (
+        saved[0] as unknown as {
+          include_action_history_in_verification?: boolean;
+        }
+      ).include_action_history_in_verification,
+    ).toBe(true);
   });
 });

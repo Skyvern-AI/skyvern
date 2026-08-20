@@ -1,24 +1,40 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
-from typing import Any, cast
+from collections.abc import Mapping
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import structlog
+from playwright.async_api import Download, Page, Response
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES,
+    RecordedBuildTestOutcome,
+    bind_post_run_page_path_failure,
     record_build_test_outcome,
-    recorded_outcome_from_loaded_result_evidence,
     recorded_outcome_from_scout_act_observe_hollow,
+)
+from skyvern.forge.sdk.copilot.challenge_evidence import (
+    challenge_evidence_unsettled,
+    challenge_signal_regressed,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    enclosing_form_submit_controls_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    selector_candidates_expression as _selector_candidates_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
@@ -27,30 +43,28 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
+    has_witnessed_value_content,
+    post_run_evidence_source_refused,
+    stamp_page_evidence_provenance,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    mint_scout_observation_contract_for_ctx,
+    record_reached_terminal_action_observation,
     record_scouted_output_coverage,
-    register_no_progress_interaction_click,
-    reset_no_progress_interaction_count,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    ReachedDownloadTarget,
-)
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
-)
-from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
-from skyvern.forge.sdk.copilot.result_evidence import (
-    loaded_result_composition_evidence_from_page,
-    loaded_result_composition_target_summary,
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
+from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
+from skyvern.forge.sdk.copilot.page_identity import (
+    safe_page_origin,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
     ScoutedInteraction,
+    ScoutedSelectorCandidate,
+    resolve_browser_state_for_context,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -59,15 +73,13 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
-from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
 
-
-def _mark_page_inspected(ctx: AgentContext) -> None:
-    ctx.post_budget_page_inspection_required = False
-    ctx.post_budget_page_inspection_url = None
-    ctx.post_budget_page_inspection_run_id = None
+# Emission budget for scout/evaluate tool results: bounds how much live page content
+# a result may carry into the authoring context, so it must not follow the transcript
+# recent-window cap.
+_SCOUT_RESULT_CHAR_CAP = 2000
 
 
 def _clear_pending_browser_interaction_observation(ctx: AgentContext) -> None:
@@ -99,12 +111,11 @@ def _consume_pending_browser_interaction_observation(
     if not _same_page_ignoring_fragment(pending.url, current_url):
         LOG.warning(
             "copilot_pending_browser_interaction_observation_page_mismatch",
-            tool_name=pending.tool_name,
-            pending_url=pending.url,
-            current_url=current_url,
+            tool_name_present=bool(pending.tool_name),
+            pending_url_present=bool(pending.url),
+            current_url_present=bool(current_url),
         )
         return False
-    reset_no_progress_interaction_count(ctx)
     return True
 
 
@@ -115,10 +126,7 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
     if not ctx.browser_session_id:
         return None
     try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
-            organization_id=ctx.organization_id,
-        )
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=ctx.browser_session_id)
         if not browser_state:
             return None
         page = await browser_state.get_or_create_page()
@@ -129,7 +137,8 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
-    ctx.pending_scout_source_url = await _live_working_page_url(ctx)
+    source_url = await _live_working_page_url(ctx)
+    ctx.pending_scout_source_url = source_url
 
 
 def _consume_scout_source_url(ctx: AgentContext) -> str | None:
@@ -236,6 +245,72 @@ async def _selector_live_match_count(
     return value
 
 
+async def _capture_scout_selector_candidates(ctx: AgentContext, selector: str | None) -> None:
+    """Capture source-page selector identities without selecting a replacement."""
+    ctx.pending_scout_selector_candidates = None
+    selector = _selector_text(selector)
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if not selector or server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _selector_candidates_expression(selector)},
+            ),
+            timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+    raw_candidates = (result.get("data") or {}).get("result")
+    if not isinstance(raw_candidates, list):
+        return
+    candidates: list[ScoutedSelectorCandidate] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate_selector = _selector_text(raw.get("selector"))
+        source = _selector_text(raw.get("source"))
+        if not candidate_selector or not source:
+            continue
+        candidate: ScoutedSelectorCandidate = {"selector": candidate_selector, "source": source}
+        if candidate not in candidates:
+            candidates.append(candidate)
+    if candidates:
+        ctx.pending_scout_selector_candidates = candidates
+
+
+async def _role_name_match_count(
+    ctx: AgentContext, role: str, name: str, *, timeout_seconds: float = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+) -> int | None:
+    """Live count of elements whose computed ARIA role and accessible name exactly match, or None when
+    the page read is unavailable; lets the ambiguity guard tell a uniquely-resolvable re-anchor apart from
+    a name-degenerate one before trusting get_by_role(role, name, exact=True)."""
+    if not role or not name:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None or timeout_seconds <= 0:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _role_name_match_count_expression(role, name)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
     """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
 
@@ -243,22 +318,37 @@ async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> N
     element; this captures the source-page anchor so a bare-selector navigating click still carries a
     role/name into the trajectory."""
     ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
     selector = _selector_text(selector)
     if not selector:
         return
     parsed = _role_name_from_selector(selector)
+    source = "selector"
     if parsed is not None:
         role, name = parsed
     else:
+        source = "page_read"
         captured = await _capture_accessible_role_name(
             ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
         )
         if captured is None:
+            # A read that never answered and one that answered namelessly leave the same empty
+            # trajectory, and only the first is a timeout worth widening.
+            LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
             return
         role, name = captured
     if not role or not name:
+        LOG.info(
+            "copilot_scout_role_name_unavailable",
+            reason="empty_role" if not role else "empty_name",
+            source=source,
+            role_present=bool(role),
+        )
         return
     ctx.pending_scout_role_name = (selector, role, name)
+    count = await _role_name_match_count(ctx, role, name)
+    if count is not None:
+        ctx.pending_scout_role_name_match_count = (selector, role, name, count)
 
 
 def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
@@ -270,6 +360,61 @@ def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selecto
     if stashed_selector != _selector_text(selector):
         return "", ""
     return role, name
+
+
+async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> None:
+    """Stash source-page selector ambiguity and, when unique, a role/name re-anchor.
+
+    The ambiguity fact never replaces the observed role/name packet. The re-anchor is an additional
+    fact about uniqueness, not authority to discard a non-unique accessible identity.
+    """
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
+    ctx.pending_scout_selector_match_count = None
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    count = await _selector_live_match_count(ctx, selector)
+    if count is None:
+        return
+    ctx.pending_scout_selector_match_count = (selector, count)
+    if count <= 1:
+        return
+    ctx.pending_scout_ambiguous = (selector, True)
+    pending_role_name = getattr(ctx, "pending_scout_role_name", None)
+    if isinstance(pending_role_name, tuple) and len(pending_role_name) == 3 and pending_role_name[0] == selector:
+        role, name = pending_role_name[1:]
+    else:
+        captured = await _capture_accessible_role_name(
+            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
+        )
+        if captured is None:
+            return
+        role, name = captured
+    if not role or not name:
+        return
+    pending_role_count = getattr(ctx, "pending_scout_role_name_match_count", None)
+    if (
+        isinstance(pending_role_count, tuple)
+        and len(pending_role_count) == 4
+        and pending_role_count[:3] == (selector, role, name)
+    ):
+        role_count = pending_role_count[3]
+    else:
+        role_count = await _role_name_match_count(ctx, role, name)
+    if role_count == 1:
+        ctx.pending_scout_reanchor = (selector, role, name)
+
+
+def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
+    """Return the stashed ambiguity verdict only when the recorded selector matches the probed one, so a
+    navigating click's verdict is never applied to a different element."""
+    if pending is None:
+        return False
+    stashed_selector, ambiguous = pending
+    if stashed_selector != _selector_text(selector):
+        return False
+    return ambiguous
 
 
 async def _resolve_scout_role_name(
@@ -295,39 +440,283 @@ async def _resolve_scout_role_name(
     return "", ""
 
 
+# Attributes the one-shot probe always reads off a resolved element, recorded only when that probe
+# succeeded. An attribute absent from a fingerprint carrying this marker proves the element has none;
+# without the marker (probe failed, element gone, older record) absence stays undecidable and fails closed.
+# `label` is excluded: it is only read via `label[for=id]`, so its absence does not prove there is no label.
+_FINGERPRINT_PROBED_ATTRS = "id,name,placeholder,tag,test_id,type"
+
+
+def _element_fingerprint_expression(css_selector: str) -> str:
+    """Capture element identity fingerprint (tag, id, name, type, placeholder, data-testid, label) for
+    credential-fill resolution. Returns attributes only, never values."""
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const el = document.querySelector({sel});"
+        "  if (!el) return null;"
+        "  const attr = (name) => el.getAttribute(name) || '';"
+        "  const result = {"
+        "    tag: (el.tagName || '').toLowerCase(),"
+        "    id: attr('id'),"
+        "    name: attr('name'),"
+        "    type: attr('type'),"
+        "    placeholder: attr('placeholder'),"
+        "    test_id: attr('data-testid'),"
+        "  };"
+        "  const label = document.querySelector(`label[for=\"${attr('id')}\"]`);"
+        "  if (label) result.label = (label.textContent || '').trim().slice(0, 200);"
+        "  return result;"
+        "})()"
+    )
+
+
+async def _capture_element_fingerprint(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> dict[str, str]:
+    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
+    for credential-fill resolution. Returns empty dict on failure, never None."""
+    selector = _selector_text(selector)
+    if not selector:
+        return {}
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return {}
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _element_fingerprint_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {}
+    fingerprint = (result.get("data") or {}).get("result")
+    if not isinstance(fingerprint, dict):
+        return {}
+    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
+
+
+async def _capture_post_interaction_screenshot(
+    ctx: AgentContext, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> None:
+    """Attach a look at the page after a state-changing action. Reading the DOM answers "what is
+    on the page" but not "did that work" -- a filled password reads as empty, and a dialog covering
+    the content reads as an ordinary node. Only the most recent screenshot is retained.
+    """
+    if getattr(ctx, "codeblock_redaction_parameters", None):
+        return
+    # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
+    if not getattr(ctx, "supports_vision", False):
+        return
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_screenshot", {}),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return
+    if isinstance(result, dict) and result.get("ok"):
+        enqueue_screenshot_from_result(ctx, result)
+
+
+async def _capture_enclosing_form_submits(
+    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+) -> list[dict[str, str]]:
+    """Submit controls of the form holding a just-filled field, so submitting what was filled is not
+    a guess among the page's other prominent buttons. Returns an empty list on failure."""
+    selector = _selector_text(selector)
+    if not selector:
+        return []
+    server = ctx.discovery_mcp_server
+    if server is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": enclosing_form_submit_controls_expression(selector)},
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return []
+    if not isinstance(result, dict) or not result.get("ok"):
+        return []
+    controls = (result.get("data") or {}).get("result")
+    if not isinstance(controls, list):
+        return []
+    return [
+        {"label": str(entry.get("label") or "")[:80], "selector": str(entry.get("selector") or "")[:160]}
+        for entry in controls
+        if isinstance(entry, dict) and (entry.get("label") or entry.get("selector"))
+    ]
+
+
+def _capped_with_eviction_accounting(
+    items: list[ScoutedInteraction],
+    *,
+    collection: Literal["scout_trajectory", "scouted_interactions"],
+) -> list[ScoutedInteraction]:
+    if len(items) <= _MAX_SCOUTED_INTERACTIONS:
+        return items
+    try:
+        for item in items[: len(items) - _MAX_SCOUTED_INTERACTIONS]:
+            event: dict[str, Any] = {
+                "collection": collection,
+                "tool_name_present": bool(item.get("tool_name")),
+                "selector_present": bool(item.get("selector")),
+                "source_url_present": bool(item.get("source_url")),
+            }
+            if collection == "scout_trajectory":
+                event["trajectory_index"] = item.get("trajectory_index")
+            LOG.info("copilot_scout_interaction_evicted", **event)
+    except Exception:
+        pass
+    return items[-_MAX_SCOUTED_INTERACTIONS:]
+
+
+def _next_trajectory_index(trajectory: list[ScoutedInteraction]) -> int:
+    # len() regresses once eviction trims the list, so the next index continues from the highest recorded one.
+    highest = -1
+    for item in trajectory:
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else len(trajectory)
+
+
+def _redact_codeblock_value(ctx: AgentContext, value: Any) -> Any:
+    parameters = getattr(ctx, "codeblock_redaction_parameters", {})
+    return app.AGENT_FUNCTION.redact_codeblock_parameter_values(value, parameters) if parameters else value
+
+
+def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> ScoutedInteraction | None:
+    """Append one observed fact with a monotone index and bounded retention."""
+    redacted = _redact_codeblock_value(ctx, artifact)
+    if not isinstance(redacted, dict) or "tool_name" not in redacted:
+        return None
+    trajectory = list(ctx.scout_trajectory)
+    recorded = cast(ScoutedInteraction, redacted.copy())
+    recorded["trajectory_index"] = _next_trajectory_index(trajectory)
+    trajectory.append(recorded)
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+    return recorded
+
+
+def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: str) -> tuple[bool, bool]:
+    """Return (hidden, disabled) when bounded same-page evidence observed this exact selector unready."""
+    packets: list[dict[str, Any]] = []
+    for entry in getattr(ctx, "flow_evidence", None) or []:
+        if isinstance(entry, dict) and isinstance(entry.get("evidence"), dict):
+            packets.append(entry["evidence"])
+    current = getattr(ctx, "composition_page_evidence", None)
+    if isinstance(current, dict):
+        packets.append(current)
+
+    observed_hidden = False
+    observed_disabled = False
+    for packet in packets:
+        if not _page_evidence_matches_url_identity(packet, source_url):
+            continue
+        for form in packet.get("forms") or []:
+            if not isinstance(form, dict):
+                continue
+            controls = [*(form.get("fields") or []), *(form.get("submit_controls") or [])]
+            for control in controls:
+                if not isinstance(control, dict) or _selector_text(control.get("selector")) != selector:
+                    continue
+                observed_hidden = observed_hidden or control.get("visible") is False
+                observed_disabled = observed_disabled or control.get("disabled") is True
+    return observed_hidden, observed_disabled
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
     tool_name: str,
     selector: str | None = None,
+    selector_candidates: list[ScoutedSelectorCandidate] | None = None,
+    selector_match_count: int | None = None,
     source_url: str | None = None,
+    result_url: str | None = None,
+    observed_effects: dict[str, bool] | None = None,
+    observed_wait_ms: int | None = None,
     value: str = "",
-    typed_value: str = "",
-    raw_typed_value: str = "",
+    input_id: str = "",
+    input_value: str = "",
+    observation_step: int | None = None,
     key: str = "",
     typed_length: int = 0,
     role: str = "",
     accessible_name: str = "",
+    role_name_match_count: int | None = None,
+    control_readonly: bool | None = None,
+    control_disabled: bool | None = None,
+    control_value_satisfied: bool | None = None,
     credential_id: str = "",
     credential_field: str = "",
     credential_name: str = "",
+    element_fingerprint_id: str | None = None,
+    element_fingerprint_name: str | None = None,
+    element_fingerprint_type: str | None = None,
+    element_fingerprint_placeholder: str | None = None,
+    element_fingerprint_label: str | None = None,
+    element_fingerprint_test_id: str | None = None,
+    element_fingerprint_tag: str | None = None,
+    element_fingerprint_probed: str | None = None,
+    ambiguous: bool = False,
 ) -> None:
     selector = _selector_text(selector)
-    # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
-    if tool_name != "press_key" and not selector:
+    # Page-level key presses, waits, and navigations are factual steps without an element selector.
+    if tool_name not in {"press_key", "navigate_browser", "wait_for_either_state"} and not selector:
+        LOG.info(
+            "copilot_scout_capture_loss",
+            tool_name=tool_name,
+            reason="unresolvable_selector",
+            url_present=bool((source_url or "").strip()),
+        )
         return
-    _reset_evaluate_tracker(ctx)
     artifact: ScoutedInteraction = {"tool_name": tool_name}
     if selector:
         artifact["selector"] = selector
+    if selector_candidates:
+        artifact["selector_candidates"] = selector_candidates.copy()
+    if selector_match_count is not None:
+        artifact["selector_match_count"] = selector_match_count
     if source_url and source_url.strip():
         artifact["source_url"] = source_url.strip()
+    if result_url and result_url.strip():
+        artifact["result_url"] = result_url.strip()
+    direct_effects = dict(observed_effects or {})
+    if source_url and source_url.strip() and result_url and result_url.strip():
+        direct_effects["url_changed"] = source_url.strip() != result_url.strip()
+    if direct_effects:
+        artifact["observed_effects"] = direct_effects
+    if observed_wait_ms is not None:
+        artifact["observed_wait_ms"] = observed_wait_ms
+    if selector and source_url and source_url.strip():
+        observed_hidden, observed_disabled = _observed_control_readiness(ctx, selector, source_url.strip())
+        if observed_hidden:
+            artifact["observed_hidden"] = True
+        if observed_disabled:
+            artifact["observed_disabled"] = True
     if value:
         artifact["value"] = value
-    if typed_value:
-        artifact["typed_value"] = typed_value
-    if raw_typed_value:
-        artifact["raw_typed_value"] = raw_typed_value
+    if input_id:
+        artifact["input_id"] = input_id
+    if input_value:
+        artifact["input_value"] = input_value
+    if observation_step is not None:
+        artifact["observation_step"] = observation_step
     if key:
         artifact["key"] = key
     if typed_length:
@@ -336,12 +725,43 @@ def _record_scouted_interaction(
         artifact["role"] = role
     if accessible_name:
         artifact["accessible_name"] = accessible_name
+    if role_name_match_count is not None:
+        artifact["role_name_match_count"] = role_name_match_count
+    if tool_name == "type_text":
+        if control_readonly is not None:
+            artifact["control_readonly"] = control_readonly
+        if control_disabled is not None:
+            artifact["control_disabled"] = control_disabled
+        if control_value_satisfied is not None:
+            artifact["control_value_satisfied"] = control_value_satisfied
     if credential_id:
         artifact["credential_id"] = credential_id
     if credential_field:
         artifact["credential_field"] = credential_field
     if credential_name:
         artifact["credential_name"] = credential_name
+    if element_fingerprint_id:
+        artifact["element_fingerprint_id"] = element_fingerprint_id
+    if element_fingerprint_name:
+        artifact["element_fingerprint_name"] = element_fingerprint_name
+    if element_fingerprint_type:
+        artifact["element_fingerprint_type"] = element_fingerprint_type
+    if element_fingerprint_placeholder:
+        artifact["element_fingerprint_placeholder"] = element_fingerprint_placeholder
+    if element_fingerprint_label:
+        artifact["element_fingerprint_label"] = element_fingerprint_label
+    if element_fingerprint_test_id:
+        artifact["element_fingerprint_test_id"] = element_fingerprint_test_id
+    if element_fingerprint_tag:
+        artifact["element_fingerprint_tag"] = element_fingerprint_tag
+    if element_fingerprint_probed:
+        artifact["element_fingerprint_probed"] = element_fingerprint_probed
+    if ambiguous:
+        artifact["ambiguous"] = True
+    redacted_artifact = _redact_codeblock_value(ctx, artifact)
+    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
+        return
+    artifact = cast(ScoutedInteraction, redacted_artifact)
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -353,23 +773,85 @@ def _record_scouted_interaction(
         )
     ]
     interactions.append(artifact)
-    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
 
-    trajectory = list(ctx.scout_trajectory)
-    trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
-    trajectory_artifact["trajectory_index"] = len(trajectory)
-    trajectory.append(trajectory_artifact)
-    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+    _record_scout_trajectory_fact(ctx, artifact)
 
     LOG.info(
         "copilot_scout_interaction_captured",
-        tool_name=tool_name,
-        selector=selector or None,
+        tool_name=artifact["tool_name"],
+        selector=artifact.get("selector"),
         source_url=artifact.get("source_url"),
-        role=role or None,
+        role=artifact.get("role"),
+        credential_field=artifact.get("credential_field"),
+        credential_id=artifact.get("credential_id"),
         total_scouted_interactions=len(ctx.scouted_interactions),
         total_scout_trajectory=len(ctx.scout_trajectory),
     )
+    record_reached_terminal_action_observation(ctx)
+
+
+def _attach_scout_observation_step(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    selector: str,
+    observation_step: int | None,
+) -> None:
+    """Attach the exact post-action page observation to the interaction it witnessed."""
+    if observation_step is None:
+        return
+    for collection_name in ("scout_trajectory", "scouted_interactions"):
+        collection = getattr(ctx, collection_name)
+        for interaction in reversed(collection):
+            if interaction.get("tool_name") == tool_name and interaction.get("selector", "") == selector:
+                interaction["observation_step"] = observation_step
+                break
+
+
+def _page_evidence_has_selector(value: Any, selector: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("selector") == selector:
+            return True
+        return any(_page_evidence_has_selector(child, selector) for child in value.values())
+    if isinstance(value, list):
+        return any(_page_evidence_has_selector(child, selector) for child in value)
+    return False
+
+
+def _fill_carry_to_interaction(carry: Mapping[str, Any], trajectory_index: int) -> ScoutedInteraction:
+    interaction = {key: value for key, value in carry.items() if key != "available_fields"}
+    interaction["trajectory_index"] = trajectory_index
+    interaction["carried"] = True
+    return cast(ScoutedInteraction, interaction)
+
+
+def hydrate_prior_carried_trajectory(ctx: AgentContext) -> bool:
+    """Put the retained record into this turn's trajectory, marked ``carried``.
+
+    Unconditional: what the previous turn did is not contingent on where this turn's
+    browser happens to be standing. Entries keep ``source_url``, so a consumer that
+    needs current-page truth reads the page rather than being handed a shorter record.
+    """
+    if ctx.carried_trajectory_rebound_done:
+        return False
+    ctx.carried_trajectory_rebound_done = True
+    prior = [raw for raw in ctx.prior_carried_trajectory if isinstance(raw, Mapping)]
+    if not prior:
+        return False
+    for carry in prior:
+        credential_id = carry.get("credential_id")
+        available_fields = carry.get("available_fields")
+        if carry.get("tool_name") == "fill_credential_field" and credential_id and isinstance(available_fields, list):
+            ctx.scouted_credential_field_inventory_by_credential_id.setdefault(
+                str(credential_id), frozenset(str(field_name) for field_name in available_fields)
+            )
+    trajectory = list(ctx.scout_trajectory)
+    for carry in prior:
+        trajectory.append(_fill_carry_to_interaction(carry, _next_trajectory_index(trajectory)))
+    ctx.scout_trajectory = _capped_with_eviction_accounting(trajectory, collection="scout_trajectory")
+    LOG.info("copilot_carried_trajectory_hydrated", interaction_count=len(prior))
+    return True
 
 
 _ACT_OBSERVE_TOOLS = frozenset({"click"})
@@ -387,12 +869,78 @@ def _scout_act_observe_no_payload_result(*, started: float, timeout_seconds: flo
     return "timeout" if time.monotonic() - started >= timeout_seconds else "no_payload"
 
 
-async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
+def _evidence_list_len(packet: dict[str, Any] | None, key: str) -> int:
+    if not isinstance(packet, dict):
+        return 0
+    value = packet.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+_PAGE_EVIDENCE_STATE_KEYS = (
+    "page_title",
+    "forms",
+    "navigation_targets",
+    "result_containers",
+    "result_containers_truncated",
+    "key_value_relations",
+    "key_value_relations_truncated",
+    "clickable_controls",
+    "visible_text_excerpt",
+    "anti_bot_indicators",
+    "challenge_controls",
+    "modal_overlays",
+    "visual_obstruction_candidates",
+    "schema_empty_page",
+)
+
+
+def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
+    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
+    inspection_warnings = packet.get("inspection_warnings")
+    state["reveal_relations_truncated"] = (
+        isinstance(inspection_warnings, list) and "reveal_relations_truncated" in inspection_warnings
+    )
+    return state
+
+
+def _page_evidence_is_unchanged(prior: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
+    return prior is not None and current is not None and _page_evidence_state(prior) == _page_evidence_state(current)
+
+
+def _safe_page_evidence_url(value: str | None) -> str | None:
+    return safe_page_origin(value)
+
+
+def _latest_same_page_evidence(ctx: AgentContext, *, url: str) -> dict[str, Any] | None:
+    for entry in reversed(getattr(ctx, "flow_evidence", ())):
+        if not isinstance(entry, dict):
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if not _page_evidence_matches_url_identity(evidence, url):
+            continue
+        if has_bounded_page_schema(evidence) or has_witnessed_value_content(evidence):
+            return evidence
+    return None
+
+
+async def _scout_act_observe_page_evidence(
+    ctx: AgentContext,
+    *,
+    url: str,
+    observed_after_interaction: bool = False,
+    prior_page_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Run the bounded page-side extractor right after a scout interaction.
 
     Degrades to None on timeout or error so the interaction result is never
     blocked or failed by capture problems. Hollow packets still return so an
-    interaction-proven hollow page can be recorded as a typed outcome."""
+    interaction-proven hollow page can be recorded as a typed outcome. When the
+    first packet is unchanged from the latest same-page evidence, one bounded
+    recapture prevents pre-action state from being published as the click effect.
+    """
     if getattr(ctx, "discovery_mcp_server", None) is None:
         return None
     timeout_seconds = settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
@@ -400,57 +948,124 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
     ctx.last_scout_act_observe_recapture_attempted = False
     ctx.last_scout_act_observe_recapture_result = ""
     parsed: dict[str, Any] | None = None
+    # Keep the exact URL inside turn-local evidence for structural grounding. Only
+    # model-facing/cross-turn summaries reduce it to origin plus a keyed fingerprint.
+    capture_url = url
+    capture_location_fingerprint = _page_evidence_location_fingerprint(url)
     try:
         parsed = await _composition_get_structured_evidence(
-            ctx, inspected_url=url, current_url=url, timeout_seconds=timeout_seconds
+            ctx, inspected_url=capture_url, current_url=capture_url, timeout_seconds=timeout_seconds
         )
     except Exception:
         parsed = None
         outcome = "error"
     else:
+        if parsed is not None and capture_location_fingerprint is not None:
+            parsed["current_url_location_fingerprint"] = capture_location_fingerprint
         outcome = _scout_act_observe_capture_outcome(parsed, started=started, timeout_seconds=timeout_seconds)
-        if outcome == "hollow" and parsed is not None:
-            first_hollow = parsed
+        unchanged_after_interaction = observed_after_interaction and _page_evidence_is_unchanged(
+            prior_page_evidence, parsed
+        )
+        if parsed is not None and (
+            outcome == "hollow" or challenge_evidence_unsettled(parsed) or unchanged_after_interaction
+        ):
+            first_packet = parsed
+            first_outcome = outcome
             remaining_seconds = timeout_seconds - (time.monotonic() - started)
             if remaining_seconds <= 0:
                 ctx.last_scout_act_observe_recapture_result = "not_attempted_no_budget"
+                if unchanged_after_interaction:
+                    parsed = None
+                    outcome = "unchanged"
             else:
                 ctx.last_scout_act_observe_recapture_attempted = True
+                if unchanged_after_interaction:
+                    settle_seconds = min(
+                        settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS,
+                        remaining_seconds,
+                    )
+                    if settle_seconds > 0:
+                        await asyncio.sleep(settle_seconds)
+                    remaining_seconds = timeout_seconds - (time.monotonic() - started)
                 try:
+                    live_recapture_url = await _live_working_page_url(ctx)
+                    recapture_url = live_recapture_url or capture_url
                     recaptured = await _composition_get_structured_evidence(
-                        ctx, inspected_url=url, current_url=url, timeout_seconds=remaining_seconds
+                        ctx,
+                        inspected_url=recapture_url,
+                        current_url=recapture_url,
+                        timeout_seconds=remaining_seconds,
                     )
                 except Exception:
-                    parsed = first_hollow
-                    outcome = "hollow"
                     ctx.last_scout_act_observe_recapture_result = (
                         "timeout" if time.monotonic() - started >= timeout_seconds else "error"
                     )
+                    if unchanged_after_interaction:
+                        parsed = None
+                        outcome = "unchanged"
+                    else:
+                        parsed = first_packet
+                        outcome = first_outcome
                 else:
+                    recapture_location_fingerprint = _page_evidence_location_fingerprint(live_recapture_url)
+                    if recaptured is not None and recapture_location_fingerprint is not None:
+                        recaptured["current_url_location_fingerprint"] = recapture_location_fingerprint
                     if recaptured is None:
-                        parsed = first_hollow
-                        outcome = "hollow"
                         ctx.last_scout_act_observe_recapture_result = _scout_act_observe_no_payload_result(
                             started=started, timeout_seconds=timeout_seconds
                         )
+                        if unchanged_after_interaction:
+                            parsed = None
+                            outcome = "unchanged"
+                        else:
+                            parsed = first_packet
+                            outcome = first_outcome
                     else:
                         recaptured_outcome = _scout_act_observe_capture_outcome(
                             recaptured, started=started, timeout_seconds=timeout_seconds
                         )
-                        parsed = recaptured
-                        outcome = recaptured_outcome
-                        ctx.last_scout_act_observe_recapture_result = recaptured_outcome
+                        recaptured_is_attachable = has_bounded_page_schema(recaptured) or has_witnessed_value_content(
+                            recaptured
+                        )
+                        if observed_after_interaction and _page_evidence_is_unchanged(prior_page_evidence, recaptured):
+                            parsed = None
+                            outcome = "unchanged"
+                            ctx.last_scout_act_observe_recapture_result = "unchanged"
+                        elif unchanged_after_interaction and not recaptured_is_attachable:
+                            parsed = None
+                            outcome = "unchanged"
+                            ctx.last_scout_act_observe_recapture_result = recaptured_outcome
+                        # Never trade down: a page that navigated mid-recapture would otherwise
+                        # lose the form the first capture proved, or erase the challenge signal
+                        # that justified re-looking while still reporting a bounded schema.
+                        elif not unchanged_after_interaction and (
+                            (first_outcome == "attached" and recaptured_outcome != "attached")
+                            or challenge_signal_regressed(first_packet, recaptured)
+                        ):
+                            parsed = first_packet
+                            outcome = first_outcome
+                        else:
+                            parsed = recaptured
+                            outcome = recaptured_outcome
+                        if outcome != "unchanged":
+                            ctx.last_scout_act_observe_recapture_result = recaptured_outcome
+    safe_parsed = parsed
+    if parsed is not None:
+        redacted = _redact_codeblock_value(ctx, parsed)
+        safe_parsed = cast(dict[str, Any], redacted) if isinstance(redacted, dict) else None
     ctx.last_scout_act_observe_outcome = outcome
-    ctx.last_scout_act_observe_packet = parsed
+    ctx.last_scout_act_observe_packet = safe_parsed
     LOG.info(
         "copilot_scout_act_observe",
         outcome=outcome,
         duration_ms=int((time.monotonic() - started) * 1000),
-        url=url,
+        url_present=bool(url),
+        result_container_count=_evidence_list_len(parsed, "result_containers"),
+        key_value_relation_count=_evidence_list_len(parsed, "key_value_relations"),
         recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
         recapture_result=ctx.last_scout_act_observe_recapture_result,
     )
-    return parsed
+    return safe_parsed
 
 
 async def _register_scout_interaction_observation(
@@ -462,34 +1077,70 @@ async def _register_scout_interaction_observation(
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
+    redacted_identity = _redact_codeblock_value(ctx, {"selector": selector, "source_url": source_url, "url": url})
+    if not isinstance(redacted_identity, dict):
+        return None, None
+    safe_selector = _selector_text(redacted_identity.get("selector"))
+    safe_source_url = _selector_text(redacted_identity.get("source_url"))
+    safe_url = _selector_text(redacted_identity.get("url"))
+    if not safe_selector or not safe_url:
+        return None, None
     evidence: dict[str, Any] = {
-        "inspected_url": url,
-        "current_url": url,
+        "inspected_url": safe_url,
+        "current_url": safe_url,
         "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
         "interaction_tool": tool_name,
-        "interaction_selector": selector,
+        "interaction_selector": safe_selector,
     }
-    if source_url and source_url.strip():
-        evidence["interaction_source_url"] = source_url.strip()
+    if safe_source_url:
+        evidence["interaction_source_url"] = safe_source_url
     page_evidence: dict[str, Any] | None = None
     if tool_name in _ACT_OBSERVE_TOOLS:
-        parsed = await _scout_act_observe_page_evidence(ctx, url=url)
-        if parsed is not None and has_bounded_page_schema(parsed):
+        # Freshness compares the first post-click DOM to the page the click acted on.
+        # Looking up only by the destination URL misses the exact stale-hydration seam:
+        # navigation commits first while the old page remains rendered underneath it.
+        prior_page_evidence = _latest_same_page_evidence(ctx, url=safe_source_url or safe_url)
+        parsed = await _scout_act_observe_page_evidence(
+            ctx,
+            url=safe_url,
+            observed_after_interaction=True,
+            prior_page_evidence=prior_page_evidence,
+        )
+        # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
+        # that rendered witnessed value content is bindable even when it exposes no actionable schema.
+        if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
+            observed_url = str(parsed.get("current_url") or parsed.get("inspected_url") or safe_url).strip() or safe_url
+            evidence["inspected_url"] = observed_url
+            evidence["current_url"] = observed_url
             # Identity keys overwrite the parsed packet so the entry stays a
             # scout_interaction observation, with the schema merged before append.
             evidence = {**parsed, **evidence}
             page_evidence = evidence
+            contract = mint_scout_observation_contract_for_ctx(ctx, parsed, url=safe_url)
+            ctx.scout_observation_contract = contract
+            record_scouted_output_coverage(
+                ctx, parsed, contract=contract, include_lexical=has_actionable_steer_content(parsed)
+            )
+            _mark_post_run_page_observed(
+                ctx,
+                source_tool="evaluate",
+                url=safe_url,
+                page_evidence=parsed,
+                source_browser_session_id=ctx.browser_session_id,
+            )
             # The schema is already attached; leaving the marker set would let a
             # later evaluate/inspect mint a second interaction credit for one click.
             _clear_pending_browser_interaction_observation(ctx)
+        elif ctx.last_scout_act_observe_outcome == "unchanged":
+            evidence["page_observation_status"] = "unchanged"
         elif parsed is not None and ctx.last_scout_act_observe_outcome == "hollow":
             record_build_test_outcome(
                 ctx,
                 recorded_outcome_from_scout_act_observe_hollow(
                     interaction_tool=tool_name,
-                    selector=selector,
-                    current_url=url,
-                    source_url=source_url,
+                    selector=safe_selector,
+                    current_url=safe_url,
+                    source_url=safe_source_url,
                     page_evidence=parsed,
                     recapture_attempted=ctx.last_scout_act_observe_recapture_attempted,
                     recapture_result=ctx.last_scout_act_observe_recapture_result,
@@ -497,21 +1148,6 @@ async def _register_scout_interaction_observation(
             )
     step = _append_flow_evidence(ctx, evidence, reached_via="interaction")
     return step, page_evidence
-
-
-def account_no_progress_interaction_click(ctx: AgentContext, result: dict[str, Any]) -> None:
-    """Climb or reset the no-forward-progress counter from a click's outcome: a failed click or hollow
-    observe is no progress, an attached observe is progress, a capture timeout/error is neutral."""
-    if not result.get("ok"):
-        register_no_progress_interaction_click(ctx, outcome="click_failed")
-        return
-    outcome = ctx.last_scout_act_observe_outcome
-    if outcome == "attached":
-        reset_no_progress_interaction_count(ctx)
-    elif outcome == "hollow":
-        register_no_progress_interaction_click(ctx, outcome="hollow")
-    else:
-        LOG.info("copilot_no_progress_interaction_neutral", outcome=outcome)
 
 
 _PAGE_SUMMARY_TEXT_CAP = 80
@@ -620,7 +1256,7 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
 
 def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
     """Attach a compact page summary at result["data"]["page"], keeping the whole
-    serialized result under the recent-output pruner cap by shedding sections —
+    serialized result under the scout result budget by shedding sections —
     never by slicing the serialized JSON."""
     data = result.get("data")
     if not isinstance(data, dict):
@@ -628,542 +1264,297 @@ def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, 
     try:
         summary = _build_scout_page_summary(page_evidence)
         data["page"] = summary
-        while len(json.dumps(result)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        while len(json.dumps(result)) > _SCOUT_RESULT_CHAR_CAP:
             if not _shed_scout_page_summary_section(summary):
                 data.pop("page", None)
                 return
     except Exception:
         data.pop("page", None)
-        LOG.warning("copilot_scout_act_observe_summary_failed", exc_info=True)
+        LOG.warning("copilot_scout_act_observe_summary_failed")
 
 
-_EVALUATE_ACTIONABLE_MAX_TARGETS = 4
-
-_EVALUATE_ACTIONABLE_ACT_INSTRUCTION = (
-    "This page already exposes actionable targets; click the intended one rather than re-evaluating."
-)
-_EVALUATE_RESULT_COMPOSITION_INSTRUCTION = (
-    "Loaded results are already visible on the current page; inspect this page for composition or author an "
-    "extraction/validation block from the loaded results instead of re-reading it."
-)
-
-
-def _reset_evaluate_tracker(ctx: AgentContext) -> None:
-    ctx.last_evaluate_actionable_signature = None
-    ctx.last_evaluate_actionable_url = None
-    ctx.latest_evaluate_result_composition_steer = None
-
-
-def _actionable_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
-    affordances: list[tuple[str, str]] = []
-    fields: list[tuple[str, str]] = []
-
-    def identity(control: Any) -> tuple[str, str] | None:
-        if not isinstance(control, dict):
-            return None
-        selector = _summary_text(control.get("selector"))
-        text = _summary_text(control.get("text") or control.get("value") or control.get("aria_label"))
-        if selector or text:
-            return (selector, text)
-        return None
-
-    def add_affordance(control: Any) -> None:
-        ident = identity(control)
-        if ident is not None:
-            affordances.append(ident)
-
-    for form in evidence.get("forms") or []:
+def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
+    forms = page_evidence.get("forms")
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
         if not isinstance(form, dict):
             continue
-        for control in form.get("submit_controls") or []:
-            add_affordance(control)
-        for field_entry in form.get("fields") or []:
-            ident = identity(field_entry)
-            if ident is not None:
-                fields.append(ident)
-    for target in evidence.get("navigation_targets") or []:
-        add_affordance(target)
-    for control in evidence.get("clickable_controls") or []:
-        add_affordance(control)
-    for overlay in evidence.get("modal_overlays") or []:
-        if not isinstance(overlay, dict):
+        fields = form.get("fields")
+        if not isinstance(fields, list):
             continue
-        for control in overlay.get("dismiss_controls") or []:
-            add_affordance(control)
-    for container in evidence.get("result_containers") or []:
-        add_affordance(container)
-    # Click affordances precede plain input fields, and selector-bearing controls precede
-    # text-only ones, so the capped payload surfaces executable selectors first.
-    affordances.sort(key=lambda item: 0 if item[0] else 1)
-    return affordances + fields
-
-
-def _click_affordance_target_identities(evidence: dict[str, Any]) -> list[tuple[str, str]]:
-    """Selector-bearing click affordances only (submit controls, navigation targets, standalone
-    clickable controls, modal dismiss controls), so the re-perception attach hands back a real
-    selector to copy and never a plain input field, result container, or text-only control."""
-    identities: list[tuple[str, str]] = []
-
-    def add(control: Any) -> None:
-        if not isinstance(control, dict):
-            return
-        selector = _summary_text(control.get("selector"))
-        if not selector:
-            return
-        text = _summary_text(control.get("text") or control.get("value") or control.get("aria_label"))
-        identities.append((selector, text))
-
-    for form in evidence.get("forms") or []:
-        if not isinstance(form, dict):
-            continue
-        for control in form.get("submit_controls") or []:
-            add(control)
-    for target in evidence.get("navigation_targets") or []:
-        add(target)
-    for control in evidence.get("clickable_controls") or []:
-        add(control)
-    for overlay in evidence.get("modal_overlays") or []:
-        if not isinstance(overlay, dict):
-            continue
-        for control in overlay.get("dismiss_controls") or []:
-            add(control)
-    return identities
-
-
-def _actionable_target_signature(identities: list[tuple[str, str]]) -> str:
-    canonical = json.dumps(sorted(identities), separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _actionable_targets_for_result(identities: list[tuple[str, str]]) -> list[dict[str, str]]:
-    targets: list[dict[str, str]] = []
-    for selector, text in identities[:_EVALUATE_ACTIONABLE_MAX_TARGETS]:
-        entry = {key: value for key, value in {"selector": selector, "text": text}.items() if value}
-        if entry:
-            targets.append(entry)
-    return targets
-
-
-# Verbs that imply an irreversible or money-moving side effect — never auto-clicked.
-_AUTO_ACT_HIGH_TIER_VERBS = frozenset(
-    {
-        "pay",
-        "payment",
-        "purchase",
-        "buy",
-        "order",
-        "place order",
-        "checkout",
-        "delete",
-        "remove",
-        "transfer",
-        "send",
-        "submit payment",
-        "confirm payment",
-        "wire",
-        "withdraw",
-        "cancel",
-    }
-)
-
-
-def _auto_act_is_high_tier_label(*labels: Any) -> bool:
-    for label in labels:
-        if not isinstance(label, str):
-            continue
-        normalized = label.strip().lower()
-        if not normalized:
-            continue
-        if any(verb in normalized for verb in _AUTO_ACT_HIGH_TIER_VERBS):
-            return True
+        for form_field in fields:
+            if isinstance(form_field, dict) and str(form_field.get("type") or "").strip().lower() == "password":
+                return True
     return False
 
 
-def _auto_act_href_is_navigation(href: Any) -> bool:
-    if not isinstance(href, str):
-        return False
-    candidate = href.strip()
-    if not candidate or candidate.startswith("#"):
-        return False
-    lowered = candidate.lower()
-    if lowered.startswith(("javascript:", "mailto:", "tel:")):
-        return False
-    if lowered.startswith(("http://", "https://")):
-        return True
-    return not lowered.startswith(("data:", "blob:"))
+def _record_scout_page_observation(ctx: AgentContext, page_evidence: dict[str, Any]) -> None:
+    observed_index: int | None = None
+    for item in ctx.scout_trajectory:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("trajectory_index")
+        if isinstance(index, int) and (observed_index is None or index > observed_index):
+            observed_index = index
+    ctx.last_scout_observation_trajectory_index = observed_index
+    ctx.last_scout_observation_has_password_control = _page_evidence_has_password_control(page_evidence)
 
 
-def _auto_act_candidate(parsed: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the single unambiguous, low-tier nav link to auto-click, or None.
+async def _scout_session_download_names(ctx: AgentContext) -> frozenset[str] | None:
+    """Filenames currently registered in the scout's browser session, or empty when unavailable.
 
-    Eligible only from navigation_targets (`<a href>` with a real http/https/relative
-    href and non-empty text); form submit_controls, form fields, result containers, and
-    modal dismiss controls are excluded. Form submits are never candidates because the
-    structured-evidence producer cannot reliably distinguish a writing submit from a
-    bare default-submit button, so the whole form-submit class is dropped for safety.
-    Money-moving / destructive verbs are dropped. Exactly one survivor ⇒ act; zero or
-    more than one ⇒ None."""
-    candidates: list[dict[str, Any]] = []
-
-    for target in parsed.get("navigation_targets") or []:
-        if not isinstance(target, dict):
-            continue
-        selector = _summary_text(target.get("selector"))
-        if not selector or target.get("disabled") is True:
-            continue
-        if not _auto_act_href_is_navigation(target.get("href")):
-            continue
-        text = _summary_text(target.get("text"))
-        if not text:
-            continue
-        if _auto_act_is_high_tier_label(text, target.get("name"), target.get("id")):
-            continue
-        candidates.append({"selector": selector, "text": text})
-
-    if len(candidates) != 1:
+    Read-only and failure-tolerant: this only sharpens download detection, so a storage hiccup must
+    never break a scout click."""
+    browser_session_id = ctx.browser_session_id
+    organization_id = ctx.organization_id
+    if not browser_session_id or not organization_id:
         return None
-    return candidates[0]
-
-
-_EVALUATE_STEER_SHED_MARKER = "[omitted on repeat — act on the named target instead of re-reading]"
-
-# Keys the steer must never shed: navigation/identity context plus the steer's own output.
-_EVALUATE_STEER_ESSENTIAL_KEYS = frozenset(
-    {
-        "url",
-        "title",
-        "observation_step",
-        "actionable_targets",
-        "composition_targets",
-        "next_action",
-        "next_action_reason",
-    }
-)
-
-# Nested bulky subfields inside an evaluate `result` dict (the raw page payload).
-_EVALUATE_STEER_NESTED_BULKY_KEYS = ("html", "outerHTML", "innerHTML", "body", "bodyText", "text", "buttons")
-
-
-def _serialized_len(value: Any) -> int:
     try:
-        return len(json.dumps(value, default=str))
+        files = await app.STORAGE.list_downloaded_files_in_browser_session(
+            organization_id=organization_id, browser_session_id=browser_session_id
+        )
     except Exception:
-        return len(str(value))
-
-
-def _largest_non_essential_data_key(data: dict[str, Any]) -> str | None:
-    candidates = [
-        (key, _serialized_len(value))
-        for key, value in data.items()
-        if key not in _EVALUATE_STEER_ESSENTIAL_KEYS and value != _EVALUATE_STEER_SHED_MARKER
-    ]
-    if not candidates:
+        LOG.warning("copilot_scout_download_snapshot_failed", exc_info=True)
         return None
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    return candidates[0][0]
+    return frozenset(str(name) for name in files or ())
 
 
-def _fit_evaluate_steer_under_cap(
-    result: dict[str, Any],
-    data: dict[str, Any],
-    *,
-    keep_raw_page_payload: bool,
-) -> None:
-    """Keep the serialized result under the recent-output cap without ever head-slicing it.
+def _record_popup_navigation_headers(ctx: AgentContext, response: Response) -> None:
+    """Record the popup's own document content type as the browser received it.
 
-    Reconnaissance output needs the raw page payload available to the model; imperative steers have
-    enough structured evidence to shed bulky non-essential payload while always preserving the action."""
-
-    def over_cap() -> bool:
-        return len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP
-
-    if not over_cap():
-        return
-    if keep_raw_page_payload:
-        data.pop("actionable_targets", None)
-        return
-    nested = data.get("result")
-    if isinstance(nested, dict):
-        for key in _EVALUATE_STEER_NESTED_BULKY_KEYS:
-            if key in nested and nested[key] != _EVALUATE_STEER_SHED_MARKER:
-                nested[key] = _EVALUATE_STEER_SHED_MARKER
-                if not over_cap():
-                    return
-    while over_cap():
-        largest_key = _largest_non_essential_data_key(data)
-        if largest_key is None:
-            break
-        data[largest_key] = _EVALUATE_STEER_SHED_MARKER
-        if not over_cap():
-            return
-    targets = data.get("actionable_targets")
-    while isinstance(targets, list) and len(targets) > 1 and over_cap():
-        targets.pop()
-
-
-def _auto_act_essential_keys() -> frozenset[str]:
-    return _EVALUATE_STEER_ESSENTIAL_KEYS | {"auto_acted", "page"}
-
-
-async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url: str, target: dict[str, Any]) -> bool:
-    """Issue the in-process click for the single unambiguous target and reshape the result.
-
-    Returns True when the click landed and the result was reshaped to report it; False
-    degrades the caller to the advisory steer (next_action/actionable_targets left intact)."""
-    data = result.get("data")
-    if not isinstance(data, dict):
-        return False
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if server is None:
-        return False
-    selector = target["selector"]
-    pre_url = await _live_working_page_url(ctx) or url
-    try:
-        click_result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_click", {"selector": selector, "selector_mode": "direct"}),
-            timeout=settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        LOG.warning("copilot_evaluate_auto_act_failed", url=pre_url, selector=selector, exc_info=True)
-        return False
-    if not isinstance(click_result, dict) or not click_result.get("ok"):
-        LOG.warning(
-            "copilot_evaluate_auto_act_failed",
-            url=pre_url,
-            selector=selector,
-            error=(click_result or {}).get("error") if isinstance(click_result, dict) else None,
-        )
-        return False
-
-    post_url = await _live_working_page_url(ctx) or url
-    post_evidence = await _scout_act_observe_page_evidence(ctx, url=post_url)
-    navigated = bool(pre_url) and bool(post_url) and pre_url != post_url
-    role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
-    _record_scouted_interaction(
-        ctx,
-        tool_name="click",
-        selector=selector,
-        source_url=pre_url,
-        role=role,
-        accessible_name=accessible_name,
-    )
-
-    for key in ("next_action", "next_action_reason", "actionable_targets"):
-        data.pop(key, None)
-    data["auto_acted"] = {"tool": "click", "selector": selector, "text": target.get("text", "")}
-    if post_evidence is None:
-        data["auto_acted"]["note"] = "clicked; post-click page evidence unavailable"
-    else:
-        data["page"] = _build_scout_page_summary(post_evidence)
-    essential = _auto_act_essential_keys()
-    while len(json.dumps(result, default=str)) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
-        largest = max(
-            (
-                (key, _serialized_len(value))
-                for key, value in data.items()
-                if key not in essential and value != _EVALUATE_STEER_SHED_MARKER
-            ),
-            key=lambda item: item[1],
-            default=None,
-        )
-        if largest is None:
-            page = data.get("page")
-            if not isinstance(page, dict) or not _shed_scout_page_summary_section(page):
-                break
-            continue
-        data[largest[0]] = _EVALUATE_STEER_SHED_MARKER
-    LOG.info("copilot_evaluate_auto_acted", url=post_url, selector=selector)
-    return True
-
-
-class _UnsetEvidence:
-    pass
-
-
-_EVIDENCE_UNSET = _UnsetEvidence()
-
-
-async def _maybe_steer_evaluate_to_action(
-    ctx: AgentContext,
-    result: dict[str, Any],
-    *,
-    url: str,
-    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
-) -> bool:
-    data = result.get("data")
-    if not isinstance(data, dict):
-        return False
-    try:
-        parsed = (
-            await _scout_act_observe_page_evidence(ctx, url=url)
-            if isinstance(page_evidence, _UnsetEvidence)
-            else page_evidence
-        )
-        if parsed is None or not has_actionable_steer_content(parsed):
-            _reset_evaluate_tracker(ctx)
-            return False
-        record_scouted_output_coverage(ctx, parsed)
-        loaded_results = loaded_result_composition_evidence_from_page(parsed)
-        if loaded_results is not None:
-            _reset_evaluate_tracker(ctx)
-            ctx.latest_evaluate_result_composition_steer = loaded_results
-            record_build_test_outcome(ctx, recorded_outcome_from_loaded_result_evidence(loaded_results))
-            data.pop("actionable_targets", None)
-            data["composition_targets"] = loaded_result_composition_target_summary(loaded_results)
-            data["next_action"] = "compose_extraction"
-            data["next_action_reason"] = _EVALUATE_RESULT_COMPOSITION_INSTRUCTION
-            # The steer is structured enough to keep under cap without preserving raw page payload.
-            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=False)
-            LOG.info(
-                "copilot_evaluate_result_composition_steer",
-                url=url,
-                result_container_count=loaded_results.result_container_count,
-                table_result_container_count=loaded_results.table_result_container_count,
-            )
-            # The result is patched in-place; returning False keeps the normal tool-loop guard active.
-            return False
-        ctx.latest_evaluate_result_composition_steer = None
-        identities = _actionable_target_identities(parsed)
-        if not identities:
-            _reset_evaluate_tracker(ctx)
-            return False
-        signature = _actionable_target_signature(identities)
-        # Strict full-URL match (fragment included): on an SPA a hash-route change
-        # is a navigation, so a differing fragment must read as a different page.
-        is_repeat = ctx.last_evaluate_actionable_signature == signature and ctx.last_evaluate_actionable_url == url
-        ctx.last_evaluate_actionable_signature = signature
-        ctx.last_evaluate_actionable_url = url
-        if signature != ctx.last_auto_acted_signature and ctx.last_auto_acted_signature is not None:
-            ctx.last_auto_acted_signature = None
-        targets = _actionable_targets_for_result(identities)
-        # Generic evaluate-loop breaker: intentionally fires for all v2 policies, not only code-first.
-        if is_repeat and ctx.last_auto_acted_signature != signature:
-            candidate = _auto_act_candidate(parsed)
-            if candidate is not None:
-                ctx.last_auto_acted_signature = signature
-                if await _auto_act_on_repeat(ctx, result, url=url, target=candidate):
-                    LOG.info("copilot_evaluate_actionable_target_steer", url=url, is_repeat=True, steered=True)
-                    return True
-        if targets:
-            data["actionable_targets"] = targets
-            if is_repeat:
-                data["next_action"] = "click"
-                data["next_action_reason"] = _EVALUATE_ACTIONABLE_ACT_INSTRUCTION
-            _fit_evaluate_steer_under_cap(result, data, keep_raw_page_payload=not is_repeat)
-        LOG.info(
-            "copilot_evaluate_actionable_target_steer",
-            url=url,
-            actionable_target_count=len(identities),
-            is_repeat=is_repeat,
-            steered=is_repeat and bool(targets),
-        )
-    except Exception:
-        data.pop("actionable_targets", None)
-        data.pop("composition_targets", None)
-        data.pop("next_action", None)
-        data.pop("next_action_reason", None)
-        _reset_evaluate_tracker(ctx)
-        LOG.warning("copilot_evaluate_actionable_target_steer_failed", exc_info=True)
-    return False
-
-
-def _register_reached_download_scout_interaction(ctx: AgentContext, target: ReachedDownloadTarget, *, url: str) -> None:
-    """Record the evaluate-resolved download affordance as a scout_interaction observation.
-
-    The scout-act download gate is cleared by a scout_interaction this turn, but the reached-download
-    target is resolved on the evaluate post-hook (source_tool="evaluate"). Registering the affordance
-    here unifies the two: the same evaluate call that feeds the synthesizer also clears the gate, so
-    obeying the scout-act steering is sufficient and the gate cannot loop on a scouted download.
+    Re-requesting the URL to read headers would send the context's cookies to an address the page
+    chose, replaying one-click confirm links and sign-in redirects, and many document endpoints
+    answer HEAD differently or refuse it. The navigation response the browser already made costs
+    nothing and, unlike `document.contentType`, cannot be shadowed by page script.
     """
-    selector = target.selector.strip()
-    if not selector or not url.strip():
-        return
-    _append_flow_evidence(
-        ctx,
-        {
-            "inspected_url": url,
-            "current_url": url,
-            "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
-            "interaction_tool": "evaluate",
-            "interaction_selector": selector,
-            "download_kind": target.download_kind,
-        },
-        reached_via="interaction",
-    )
+    try:
+        if ctx.pending_scout_popup_content_type is None and response.request.is_navigation_request():
+            ctx.pending_scout_popup_content_type = str(response.headers.get("content-type", ""))
+    except Exception:
+        LOG.debug("copilot_popup_navigation_headers_unreadable", exc_info=True)
 
 
-async def _maybe_attach_reached_download_target(
+def _record_scout_download(ctx: AgentContext) -> None:
+    ctx.pending_scout_download = True
+
+
+def _watch_downloads_for_click(ctx: AgentContext, page: Page) -> None:
+    """Record downloads from ``page`` for the in-flight click, and register the remover.
+
+    ``once`` would be wrong here: it detaches only when it fires, so a click that downloads nothing
+    leaves a live writer behind that a later download would deliver into another click's window.
+    """
+
+    def _capture(_: Download) -> None:
+        _record_scout_download(ctx)
+
+    page.on("download", _capture)
+    ctx.pending_scout_download_detachers.append(lambda: page.remove_listener("download", _capture))
+
+
+def _release_scout_download_listeners(ctx: AgentContext) -> None:
+    for detach in ctx.pending_scout_download_detachers:
+        try:
+            detach()
+        except Exception:
+            LOG.debug("copilot_scout_download_listener_detach_failed", exc_info=True)
+    ctx.pending_scout_download_detachers = []
+
+
+async def _arm_scout_download_listener(ctx: AgentContext) -> None:
+    """Arm a download listener for the click about to dispatch.
+
+    The browser reports the download the click fired as an event, so detection does not depend on
+    when the session store registers the file — the store lags the event by seconds (watcher
+    upload) or never sees it (vendor sessions), and a diff read in that window is blind."""
+    _release_scout_download_listeners(ctx)
+    ctx.pending_scout_download = False
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+        _watch_downloads_for_click(ctx, page)
+    except Exception:
+        LOG.warning("copilot_scout_download_listener_failed", exc_info=True)
+
+
+async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
+    """Arm a one-shot popup listener before a click dispatches.
+
+    Playwright reports the popup the click opened by identity, so nothing polls and an ordinary
+    click costs nothing; a URL-set diff would both stall every click and mistake a same-tab
+    navigation for a new tab."""
+    ctx.pending_scout_popup = None
+    ctx.pending_scout_popup_content_type = None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+
+        def _capture(popup: Page) -> None:
+            ctx.pending_scout_popup = popup
+            popup.on("response", lambda response: _record_popup_navigation_headers(ctx, response))
+            # An <a download target=_blank> click fires its download event on the transient popup
+            # page, never on the clicked page.
+            _watch_downloads_for_click(ctx, popup)
+
+        page.once("popup", _capture)
+    except Exception:
+        LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
+
+
+# Bounded so a page that stalls the probe cannot spend the turn budget one click at a time.
+_RENDER_PROBE_TIMEOUT_MS = 5000.0
+
+
+def _attach_observed_click_effect(
     ctx: AgentContext,
     result: dict[str, Any],
     *,
-    url: str,
-    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
+    selector: str,
+    effect: str,
 ) -> None:
-    """Attach a typed reached-download target + guidance when the page exposes exactly one same-host
-    download affordance, matched on the captured selector (never URL — a download does not change the SPA URL)."""
+    """Attach a browser-observed click effect without choosing a future action or locator."""
     data = result.get("data")
     if not isinstance(data, dict):
         return
-    # Code-first only: the guidance steers toward an expect_download code block (ADR 0010), which
-    # standard-mode v2 does not author.
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    result_effects = data.setdefault("observed_effects", {})
+    if isinstance(result_effects, dict):
+        result_effects[effect] = True
+    for collection_name in ("scout_trajectory", "scouted_interactions"):
+        collection = getattr(ctx, collection_name, None)
+        if not isinstance(collection, list):
+            continue
+        for interaction in reversed(collection):
+            if interaction.get("tool_name") != "click" or interaction.get("selector") != selector:
+                continue
+            effects = dict(interaction.get("observed_effects") or {})
+            effects[effect] = True
+            interaction["observed_effects"] = effects
+            break
+
+
+async def _maybe_attach_observed_render_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    selector: str,
+    url: str,
+) -> None:
+    """Report when the click opened an image document in a new tab."""
+    data = result.get("data")
+    if not isinstance(data, dict) or not selector:
+        return
+    popup = ctx.pending_scout_popup
+    ctx.pending_scout_popup = None
+    if popup is None:
         return
     try:
-        parsed = (
-            await _scout_act_observe_page_evidence(ctx, url=url)
-            if isinstance(page_evidence, _UnsetEvidence)
-            else page_evidence
-        )
-        if parsed is None:
+        await popup.wait_for_load_state("domcontentloaded", timeout=_RENDER_PROBE_TIMEOUT_MS)
+        content_type = ctx.pending_scout_popup_content_type or ""
+        ctx.pending_scout_popup_content_type = None
+        if not content_type:
+            content_type = str(await popup.evaluate("document.contentType") or "")
+        if not content_type.lower().startswith("image/"):
+            LOG.debug("copilot_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
             return
-        target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
-        if target is None:
-            return
-        data["reached_download_target"] = target.to_dict()
-        data["reached_download_guidance"] = _reached_download_guidance_for(target)
-        if not target.already_registered:
-            # The pure synthesizer compiles the terminal expect_download step from this typed object.
-            ctx.reached_download_target = target
-            if ctx.synthesized_block_offered and not ctx.update_workflow_called:
-                # The prompt-side offer latched before this download target resolved, so it rendered the
-                # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
-                ctx.synthesized_block_offered = False
-                ctx.synthesized_block_offered_goal_complete = False
-                LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
-        if not target.already_registered:
-            _register_reached_download_scout_interaction(ctx, target, url=url)
-        LOG.info(
-            "copilot_reached_download_target_steer",
-            url=url,
-            download_kind=target.download_kind,
-            already_registered=target.already_registered,
-        )
+        _attach_observed_click_effect(ctx, result, selector=selector, effect="rendered_document_opened")
     except Exception:
-        data.pop("reached_download_target", None)
-        data.pop("reached_download_guidance", None)
-        LOG.warning("copilot_reached_download_target_steer_failed", exc_info=True)
+        LOG.warning("copilot_observed_render_target_attach_failed", exc_info=True)
 
 
-async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
-    # Observe the bounded page evidence once and feed both evaluate steers; re-observe for the
-    # download steer only when the actionable steer auto-acted and may have changed the page.
+async def _maybe_attach_observed_download_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    selector: str,
+    url: str,
+) -> None:
+    """Report when the scout's click directly produced a download."""
+    data = result.get("data")
+    if not isinstance(data, dict) or not selector:
+        return
+    observed_event = ctx.pending_scout_download
+    ctx.pending_scout_download = False
+    _release_scout_download_listeners(ctx)
+    before = ctx.pending_scout_download_snapshot
+    ctx.pending_scout_download_snapshot = None
+    try:
+        download_signal = "event" if observed_event else None
+        if download_signal is None:
+            if before is None:
+                return
+            after = await _scout_session_download_names(ctx)
+            if after is None or not (after - before):
+                return
+            download_signal = "store_diff"
+        LOG.info("copilot_observed_download_signal", signal=download_signal, url=url)
+        _attach_observed_click_effect(ctx, result, selector=selector, effect="download_started")
+    except Exception:
+        LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+
+
+async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    """Attach bounded page facts without selecting or suggesting the model's next action."""
     if not isinstance(result.get("data"), dict):
         return
     page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
-    acted = await _maybe_steer_evaluate_to_action(ctx, result, url=url, page_evidence=page_evidence)
-    await _maybe_attach_reached_download_target(
-        ctx, result, url=url, page_evidence=_EVIDENCE_UNSET if acted else page_evidence
-    )
+    if page_evidence is None:
+        return
+    contract = mint_scout_observation_contract_for_ctx(ctx, page_evidence, url=url)
+    ctx.scout_observation_contract = contract
+    record_scouted_output_coverage(ctx, page_evidence, contract=contract, include_lexical=False)
+    _record_scout_page_observation(ctx, page_evidence)
+    if has_bounded_page_schema(page_evidence):
+        _append_flow_evidence(ctx, page_evidence, reached_via="current_page")
+    _attach_scout_page_summary(result, page_evidence)
 
 
-def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
+def _mark_post_run_page_observed(
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    url: str,
+    page_evidence: dict[str, Any] | None = None,
+    source_browser_session_id: str | None,
+) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
+        return
+    if post_run_evidence_source_refused(
+        run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=ctx.last_run_blocks_browser_session_id,
+    ):
         return
     ctx.post_run_page_observation_tool = source_tool
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
-    ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    latest_outcome = getattr(ctx, "latest_recorded_build_test_outcome", None)
+    authoritative_unsatisfied = (
+        isinstance(latest_outcome, RecordedBuildTestOutcome)
+        and latest_outcome.is_authoritative
+        and latest_outcome.phase == "persisted_block_run"
+        and latest_outcome.reason_code in _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES
+        and latest_outcome.workflow_run_id == run_id
+    )
+    ctx.post_run_page_observation_after_failed_test = (
+        getattr(ctx, "last_test_ok", None) is False or authoritative_unsatisfied
+    )
+    if page_evidence is not None and ctx.post_run_page_observation_after_failed_test:
+        bound_evidence = stamp_page_evidence_provenance(
+            {**page_evidence, "current_url": url},
+            source_browser_session_id=source_browser_session_id,
+            run_id=run_id,
+            run_browser_session_id=ctx.last_run_blocks_browser_session_id,
+        )
+        if bind_post_run_page_path_failure(ctx, bound_evidence):
+            ctx.post_run_page_observation_generation = (
+                getattr(ctx, "post_run_page_observation_generation", 0) or 0
+            ) + 1
     evidence = _workflow_verification_evidence(ctx)
     evidence.live_page_state_verified = True
     evidence.verified_from_current_browser_state = True

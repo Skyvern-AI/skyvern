@@ -27,6 +27,11 @@ def _mock_app(browser_state: MagicMock) -> MagicMock:
     return mock_app
 
 
+@pytest.fixture(autouse=True)
+def mock_navigation_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.webeye.actions.handler.validate_fetch_url", lambda url: url)
+
+
 @pytest.mark.asyncio
 async def test_new_tab_opens_navigates_pins_and_stops_batch() -> None:
     new_page = MagicMock()

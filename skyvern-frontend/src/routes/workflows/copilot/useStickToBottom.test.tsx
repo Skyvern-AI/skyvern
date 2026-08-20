@@ -18,7 +18,6 @@ const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
   turn_id: "turn-1",
   turn_index: 0,
-  mode: "build",
   timestamp: "2026-05-25T00:00:00Z",
 });
 

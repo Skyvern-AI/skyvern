@@ -22,15 +22,29 @@ async def download_file(
 ) -> str | list[str]:
     if file_url.startswith("/"):
         run_id = resolve_run_download_id(skyvern_context.current())
-        return validate_local_file_path(file_url, run_id)
+        try:
+            return validate_local_file_path(file_url, run_id)
+        except PermissionError:
+            # Expected when the LLM/user supplies an absolute path outside the run's download
+            # directory. The containment guard is doing its job; the action fails cleanly rather
+            # than surfacing as an unhandled ERROR with a traceback.
+            LOG.warning(
+                "Local file path is outside the allowed download directory, continuing without it",
+                action=action,
+                file_url=file_url,
+                run_id=run_id,
+            )
+            return []
 
     try:
         return await download_file_api(file_url, organization_id=organization_id)
     except Exception:
-        LOG.exception(
+        # Fully self-recovering: the action proceeds without the file.
+        LOG.warning(
             "Failed to download file, continuing without it",
             action=action,
             file_url=file_url,
+            exc_info=True,
         )
         return []
 

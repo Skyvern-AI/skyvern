@@ -4,9 +4,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  getWorkflowBlocks,
+  getWorkflowErrors,
+} from "@/routes/workflows/editor/workflowEditorUtils";
 
 import { CodeBlockEditor } from "./CodeBlockEditor";
 import { codeBlockNodeDefaultData, type CodeBlockNodeData } from "./types";
+import { navigationNodeDefaultData } from "../NavigationNode/types";
+import type { WorkflowStartNodeData } from "../StartNode/types";
 
 const baseData: CodeBlockNodeData = {
   debuggable: true,
@@ -15,9 +21,9 @@ const baseData: CodeBlockNodeData = {
   code: "print(1)",
   continueOnFailure: false,
   parameterKeys: [],
+  errorCodeMapping: "null",
   prompt: null,
   steps: null,
-  dataSchema: "null",
   model: null,
 };
 
@@ -29,9 +35,21 @@ const node = {
 
 const updateNodeData = vi.fn();
 let codeBlockAccess = true;
+let workflowErrorCodeMapping: Record<string, string> | null = null;
 
 vi.mock("@xyflow/react", () => ({
-  useReactFlow: () => ({ getNode: () => node, updateNodeData }),
+  useNodes: () => [
+    {
+      id: "start",
+      type: "start",
+      data: { errorCodeMapping: workflowErrorCodeMapping },
+    },
+    node,
+  ],
+  useReactFlow: () => ({
+    getNode: () => node,
+    updateNodeData,
+  }),
 }));
 
 vi.mock("@/hooks/useFeatureFlag", () => ({
@@ -40,7 +58,26 @@ vi.mock("@/hooks/useFeatureFlag", () => ({
 }));
 
 vi.mock("..", () => ({
+  errorMappingExampleValue: {
+    sample_invalid_credentials: "if the credentials are incorrect, terminate",
+  },
   isWorkflowBlockNode: () => true,
+}));
+
+vi.mock("@/routes/workflows/editor/ErrorCodeMappingEditor", () => ({
+  ErrorCodeMappingEditor: ({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+  }) => (
+    <textarea
+      data-testid="error-code-mapping-editor"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  ),
 }));
 
 vi.mock("@/components/WorkflowBlockInputSet", () => ({
@@ -92,9 +129,132 @@ beforeEach(() => {
   node.data = { ...baseData };
   updateNodeData.mockClear();
   codeBlockAccess = true;
+  workflowErrorCodeMapping = null;
 });
 
 afterEach(cleanup);
+
+describe("save-time error code mapping validation", () => {
+  const createCodeBlock = (
+    errorCodeMapping: string,
+    code: string = baseData.code,
+  ) => ({
+    id: "code-1",
+    type: "codeBlock" as const,
+    position: { x: 0, y: 0 },
+    data: {
+      ...baseData,
+      label: "code_block",
+      errorCodeMapping,
+      code,
+    },
+  });
+
+  const createWorkflowStart = (
+    errorCodeMapping: Record<string, string> | null,
+  ) => ({
+    id: "start",
+    type: "start" as const,
+    position: { x: 0, y: 0 },
+    data: {
+      withWorkflowSettings: true as const,
+      errorCodeMapping,
+    } as WorkflowStartNodeData,
+  });
+
+  test("rejects malformed JSON with the same error as Navigation", () => {
+    const malformedMapping = "{not json";
+    const codeErrors = getWorkflowErrors([createCodeBlock(malformedMapping)]);
+    const navigationErrors = getWorkflowErrors([
+      {
+        id: "navigation-1",
+        type: "navigation",
+        position: { x: 0, y: 0 },
+        data: {
+          ...navigationNodeDefaultData,
+          label: "code_block",
+          navigationGoal: "Navigate",
+          errorCodeMapping: malformedMapping,
+        },
+      },
+    ]);
+
+    expect(codeErrors).toEqual(navigationErrors);
+    expect(codeErrors).toHaveLength(1);
+    expect(codeErrors[0]).toContain("code_block");
+    expect(codeErrors[0]).toContain("Error messages are not valid JSON");
+  });
+
+  test.each(["null", ""])(
+    "allows a cleared mapping (%j) and serializes it to null",
+    (errorCodeMapping) => {
+      const codeBlock = createCodeBlock(errorCodeMapping);
+
+      expect(getWorkflowErrors([codeBlock])).toEqual([]);
+      expect(getWorkflowBlocks([codeBlock], [])[0]).toMatchObject({
+        error_code_mapping: null,
+      });
+    },
+  );
+
+  test("allows a valid mapping and round-trips it unchanged", () => {
+    const mapping = { FAILED: "the code failed" };
+    const codeBlock = createCodeBlock(JSON.stringify(mapping));
+
+    expect(getWorkflowErrors([codeBlock])).toEqual([]);
+    expect(getWorkflowBlocks([codeBlock], [])[0]).toMatchObject({
+      error_code_mapping: mapping,
+    });
+  });
+
+  test("rejects an undeclared raised error code", () => {
+    const errors = getWorkflowErrors([
+      createCodeBlock("null", "raise ErrorCode('NEW_CODE', 'reason')"),
+    ]);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("code_block");
+    expect(errors[0]).toContain("NEW_CODE");
+  });
+
+  test("allows a declared but unused error code", () => {
+    expect(
+      getWorkflowErrors([
+        createCodeBlock(JSON.stringify({ UNUSED: "draft description" })),
+      ]),
+    ).toEqual([]);
+  });
+
+  test("rejects malformed ErrorCode usage", () => {
+    const errors = getWorkflowErrors([
+      createCodeBlock("null", "raise ErrorCode(code, 'reason')"),
+    ]);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("code_block");
+    expect(errors[0]).toContain("line 1");
+  });
+
+  test("allows a declared and raised error code", () => {
+    expect(
+      getWorkflowErrors([
+        createCodeBlock(
+          JSON.stringify({ DECLARED: "known failure" }),
+          "raise ErrorCode('DECLARED', 'reason')",
+        ),
+      ]),
+    ).toEqual([]);
+  });
+
+  test("allows a raise declared in the workflow-level manifest", () => {
+    expect(
+      getWorkflowErrors([
+        createWorkflowStart({ INHERITED: "workflow failure" }),
+        createCodeBlock("null", "raise ErrorCode('INHERITED', 'reason')"),
+      ]),
+    ).toEqual([]);
+  });
+});
 
 function renderEditor(readOnly: boolean = false) {
   return render(
@@ -139,6 +299,171 @@ test("wires the jinja highlight into the code editor", () => {
   expect(
     screen.getByTestId("code-editor").getAttribute("data-extension-count"),
   ).toBe("2");
+});
+
+describe("CodeBlockEditor error messages", () => {
+  const sampleMapping = JSON.stringify(
+    {
+      sample_invalid_credentials: "if the credentials are incorrect, terminate",
+    },
+    null,
+    2,
+  );
+
+  const expectToRenderBefore = (first: HTMLElement, second: HTMLElement) => {
+    expect(
+      first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  };
+
+  test("renders error messages below the code in the legacy layout", () => {
+    renderEditor();
+
+    expectToRenderBefore(
+      screen.getByText("Code Input"),
+      screen.getByText("Error Messages"),
+    );
+  });
+
+  test("renders error messages below the code in the code-first code view", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+    switchToCode();
+
+    expectToRenderBefore(
+      screen.getByText("Code Input"),
+      screen.getByText("Error Messages"),
+    );
+  });
+
+  test("renders error messages below the steps card in the code-first plain view", () => {
+    node.data = { ...baseData, ...codeFirstData };
+    renderEditor();
+
+    expectToRenderBefore(
+      screen.getByText("Open the page"),
+      screen.getByText("Error Messages"),
+    );
+  });
+
+  test("toggles the Navigation-compatible editor in the legacy layout", () => {
+    renderEditor();
+    expect(screen.getByText("Error Messages")).toBeTruthy();
+    expect(screen.queryByTestId("error-code-mapping-editor")).toBeNull();
+
+    fireEvent.click(screen.getByRole("switch"));
+    expect(updateNodeData).toHaveBeenLastCalledWith("cb1", {
+      errorCodeMapping: sampleMapping,
+    });
+
+    node.data = { ...baseData, errorCodeMapping: sampleMapping };
+    cleanup();
+    renderEditor();
+    expect(screen.getByTestId("error-code-mapping-editor")).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch"));
+    expect(updateNodeData).toHaveBeenLastCalledWith("cb1", {
+      errorCodeMapping: "null",
+    });
+  });
+
+  test("renders the editor in both code-first layouts", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      errorCodeMapping: sampleMapping,
+    };
+    renderEditor();
+    expect(screen.getByTestId("error-code-mapping-editor")).toBeTruthy();
+    switchToCode();
+    expect(screen.getByTestId("error-code-mapping-editor")).toBeTruthy();
+  });
+
+  test("shows effective-manifest advisory statuses without disabling Generate", () => {
+    workflowErrorCodeMapping = {
+      workflow_only: "workflow declaration",
+      matched: "workflow value overridden by block",
+    };
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      code: [
+        'raise ErrorCode("matched", "reason")',
+        'raise ErrorCode("raised_only", "reason")',
+        'raise ErrorCode("workflow_only", "reason")',
+        "raise ErrorCode(dynamic_code, 'reason')",
+      ].join("\n"),
+      errorCodeMapping: JSON.stringify({
+        matched: "block override",
+        declared_only: "unused block entry",
+      }),
+    };
+    renderEditor();
+
+    expect(screen.getByText("matched — raised on line 1")).toBeTruthy();
+    expect(screen.getByText("workflow_only — raised on line 3")).toBeTruthy();
+    expect(
+      screen.getByText("declared_only — declared, not raised"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText("raised_only — raised on line 2, not declared"),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Malformed/nonliteral ErrorCode raises (ErrorCode cannot be imported or aliased) — line 4",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", {
+        name: "Regenerate block",
+      }).disabled,
+    ).toBe(false);
+  });
+
+  test("caps rendered synchronization diagnostics", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      code: "return {'ok': True}",
+      errorCodeMapping: JSON.stringify(
+        Object.fromEntries(
+          Array.from({ length: 55 }, (_, index) => [
+            `unused_${index}`,
+            `condition ${index}`,
+          ]),
+        ),
+      ),
+    };
+
+    renderEditor();
+
+    const status = screen.getByLabelText(
+      "Error message synchronization status",
+    );
+    expect(status.querySelectorAll("li")).toHaveLength(51);
+    expect(screen.getByText("+5 more")).toBeTruthy();
+    expect(screen.queryByText("unused_54 — declared, not raised")).toBeNull();
+  });
+
+  test("caps line numbers inside the malformed diagnostic row", () => {
+    node.data = {
+      ...baseData,
+      code: Array.from(
+        { length: 25 },
+        (_, index) => `raise ErrorCode(dynamic_${index}, 'reason')`,
+      ).join("\n"),
+    };
+
+    renderEditor();
+
+    const status = screen.getByLabelText(
+      "Error message synchronization status",
+    );
+    const malformedRow = status.querySelector("li");
+    expect(malformedRow?.textContent).toContain("1, 2, 3, 4, 5");
+    expect(malformedRow?.textContent).toContain("20 … and 5 more");
+    expect(malformedRow?.textContent).not.toContain("21, 22");
+    expect(malformedRow?.textContent.length).toBeLessThan(250);
+  });
 });
 
 describe("CodeBlockEditor for a code-first block", () => {

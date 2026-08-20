@@ -117,6 +117,15 @@ def test_concise_preserves_meaningful_data() -> None:
     assert result["data"] == {"extracted": {"price": 42.0}}
 
 
+def test_concise_preserves_trajectory_capture_status() -> None:
+    result = make_result(
+        "skyvern_trajectory_get",
+        data={"trajectory_json": "[]", "entry_count": 0, "truncated": False, "capture_status": "not_found"},
+    )
+
+    assert result["data"]["capture_status"] == "not_found"
+
+
 def test_concise_preserves_error() -> None:
     err = {"code": "SELECTOR_NOT_FOUND", "message": "Not found", "hint": "Try another selector"}
     result = make_result("skyvern_click", ok=False, error=err)

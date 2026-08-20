@@ -58,10 +58,106 @@ def _make_updated_row(now: datetime | None = None) -> MagicMock:
     row.workflow_id = "wf_abc"
     row.organization_id = "org_abc"
     row.run_with = None
+    row.failure_category = None
     row.ai_fallback = False
     row.trigger_type = None
     row.workflow_schedule_id = None
     return row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_status",
+    [WorkflowRunStatus.failed, WorkflowRunStatus.terminated, WorkflowRunStatus.timed_out],
+)
+async def test_completion_tags_write_final_status_execution_mode_and_primary_failure_category(
+    monkeypatch: pytest.MonkeyPatch,
+    final_status: WorkflowRunStatus,
+) -> None:
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = f"wr_{final_status.value}"
+    workflow_run.status = final_status
+    workflow_run.run_with = "code"
+    workflow_run.failure_category = [{"category": "PARAMETER_BINDING_ERROR"}]
+    apply_tags = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.tags, "apply_system_run_tag_changes", apply_tags)
+
+    await WorkflowService._apply_completion_run_tags_best_effort(workflow_run)
+
+    apply_tags.assert_awaited_once_with(
+        workflow_run_id=workflow_run.workflow_run_id,
+        organization_id="org_abc",
+        sets={
+            "skyvern.status": final_status.value,
+            "skyvern.execution_mode": "code",
+            "skyvern.failure_category": "PARAMETER_BINDING_ERROR",
+        },
+        caller_id="system:completion-tagging",
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_tags_write_status_and_execution_mode_for_completed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = "wr_completed"
+    workflow_run.status = "completed"
+    workflow_run.run_with = "agent"
+    apply_tags = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.tags, "apply_system_run_tag_changes", apply_tags)
+
+    await WorkflowService._apply_completion_run_tags_best_effort(workflow_run)
+
+    apply_tags.assert_awaited_once_with(
+        workflow_run_id="wr_completed",
+        organization_id="org_abc",
+        sets={"skyvern.status": "completed", "skyvern.execution_mode": "agent"},
+        caller_id="system:completion-tagging",
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_tag_write_failure_does_not_interrupt_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = "wr_completion"
+    monkeypatch.setattr(
+        app.DATABASE.tags,
+        "apply_system_run_tag_changes",
+        AsyncMock(side_effect=RuntimeError("tag write failed")),
+    )
+
+    await WorkflowService._apply_completion_run_tags_best_effort(workflow_run)
+
+
+@pytest.mark.asyncio
+async def test_conditional_cancel_writes_completion_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    updated_row = _make_updated_row()
+    updated_row.workflow_run_id = "wr_canceled"
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=updated_row),
+    )
+    completion_tags = AsyncMock()
+    monkeypatch.setattr(WorkflowService, "_apply_completion_run_tags_best_effort", completion_tags)
+    monkeypatch.setattr(WorkflowService, "_sync_task_run_from_workflow_run", AsyncMock())
+
+    await WorkflowService().mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_canceled")
+
+    completion_tags.assert_awaited_once_with(updated_row)
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ export type WorkflowDefinitionBlocksItem =
     | Skyvern.WorkflowDefinitionBlocksItem.Code
     | Skyvern.WorkflowDefinitionBlocksItem.Conditional
     | Skyvern.WorkflowDefinitionBlocksItem.DownloadToS3
+    | Skyvern.WorkflowDefinitionBlocksItem.EmailInbox
     | Skyvern.WorkflowDefinitionBlocksItem.Extraction
     | Skyvern.WorkflowDefinitionBlocksItem.FileDownload
     | Skyvern.WorkflowDefinitionBlocksItem.FileUpload
@@ -19,9 +20,11 @@ export type WorkflowDefinitionBlocksItem =
     | Skyvern.WorkflowDefinitionBlocksItem.HumanInteraction
     | Skyvern.WorkflowDefinitionBlocksItem.Login
     | Skyvern.WorkflowDefinitionBlocksItem.Navigation
+    | Skyvern.WorkflowDefinitionBlocksItem.PdfFill
     | Skyvern.WorkflowDefinitionBlocksItem.PdfParser
     | Skyvern.WorkflowDefinitionBlocksItem.PrintPage
     | Skyvern.WorkflowDefinitionBlocksItem.SendEmail
+    | Skyvern.WorkflowDefinitionBlocksItem.SplitPdf
     | Skyvern.WorkflowDefinitionBlocksItem.Task
     | Skyvern.WorkflowDefinitionBlocksItem.TaskV2
     | Skyvern.WorkflowDefinitionBlocksItem.TextPrompt
@@ -46,6 +49,10 @@ export namespace WorkflowDefinitionBlocksItem {
 
     export interface DownloadToS3 extends Skyvern.DownloadToS3Block {
         block_type: "download_to_s3";
+    }
+
+    export interface EmailInbox extends Skyvern.EmailInboxBlock {
+        block_type: "email_inbox";
     }
 
     export interface Extraction extends Skyvern.ExtractionBlock {
@@ -96,6 +103,10 @@ export namespace WorkflowDefinitionBlocksItem {
         block_type: "navigation";
     }
 
+    export interface PdfFill extends Skyvern.PdfFillBlock {
+        block_type: "pdf_fill";
+    }
+
     export interface PdfParser extends Skyvern.PdfParserBlock {
         block_type: "pdf_parser";
     }
@@ -106,6 +117,10 @@ export namespace WorkflowDefinitionBlocksItem {
 
     export interface SendEmail extends Skyvern.SendEmailBlock {
         block_type: "send_email";
+    }
+
+    export interface SplitPdf extends Skyvern.SplitPdfBlock {
+        block_type: "split_pdf";
     }
 
     export interface Task extends Skyvern.TaskBlock {

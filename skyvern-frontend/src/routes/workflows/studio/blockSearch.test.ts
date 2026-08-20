@@ -13,6 +13,7 @@ import {
   filterBlockSearchTargets,
   focusBlockTarget,
   resolveConditionalBranchPath,
+  resolveContainerAncestorLabels,
   waitForNodeSettle,
   type FocusBlockDeps,
 } from "./blockSearch";
@@ -526,6 +527,13 @@ describe("focusBlockTarget", () => {
       ),
       waitForSettle: vi.fn(async () => {
         calls.push("settle");
+        // Simulate the visibility cascade: after each settle, the target
+        // becomes visible so the collapsed-ancestor expansion path is not
+        // triggered.
+        const target = conditionalNodes.find(
+          (node) => node.id === "inner-branch-y-block",
+        )!;
+        (target as { hidden?: boolean }).hidden = false;
       }),
     });
 
@@ -543,5 +551,196 @@ describe("focusBlockTarget", () => {
       "settle",
     ]);
     expect(calls[calls.length - 1]).toBe("select:inner-branch-y-block");
+  });
+});
+
+describe("resolveContainerAncestorLabels", () => {
+  test("returns empty for a top-level target with no parentId", () => {
+    expect(resolveContainerAncestorLabels(nodes, "login-node")).toEqual([]);
+  });
+
+  test("returns empty for a target that is itself a container (parentId traversal starts from parent)", () => {
+    expect(resolveContainerAncestorLabels(nodes, "loop-node")).toEqual([]);
+  });
+
+  test("returns the direct loop ancestor label for a node nested in a loop", () => {
+    expect(resolveContainerAncestorLabels(nodes, "nested-node")).toEqual([
+      "Iterate rows",
+    ]);
+  });
+
+  test("returns the direct conditional ancestor label for a node nested in a conditional", () => {
+    const conditionalNodes = makeConditionalNodes();
+    expect(
+      resolveContainerAncestorLabels(conditionalNodes, "branch-b-block"),
+    ).toEqual(["Route by type"]);
+  });
+
+  test("returns ancestor labels root→leaf when a loop is nested inside a conditional", () => {
+    const conditionalNodes = makeConditionalNodes();
+    expect(
+      resolveContainerAncestorLabels(conditionalNodes, "branch-b-loop-child"),
+    ).toEqual(["Route by type", "Iterate type B rows"]);
+  });
+
+  test("stops gracefully for a dangling parentId", () => {
+    const orphan = {
+      id: "orphan-node",
+      type: "task",
+      parentId: "gone-container",
+      position: { x: 0, y: 0 },
+      data: { label: "Orphan" },
+    } as AppNode;
+    expect(resolveContainerAncestorLabels([orphan], "orphan-node")).toEqual([]);
+  });
+});
+
+describe("focusBlockTarget — collapsed container ancestors", () => {
+  function makeDeps(
+    depsNodes: Array<AppNode> = nodes,
+    overrides?: Partial<FocusBlockDeps>,
+  ): FocusBlockDeps {
+    return {
+      getNodes: () => depsNodes,
+      getInternalNode: () => undefined,
+      getPaneWidth: () => 1000,
+      viewportZoom: 0.75,
+      duration: 300,
+      setViewport: vi.fn(),
+      selectBlock: vi.fn(),
+      expandBlock: vi.fn(),
+      switchBranch: vi.fn(),
+      waitForSettle: vi.fn().mockResolvedValue(undefined),
+      ...overrides,
+    };
+  }
+
+  test("top-level target: no ancestor expand, no extra settle (sequence identical to pre-fix)", async () => {
+    const deps = makeDeps();
+    await expect(focusBlockTarget("login-node", deps)).resolves.toBe(true);
+    expect(deps.waitForSettle).not.toHaveBeenCalled();
+    expect(deps.expandBlock).toHaveBeenCalledTimes(1);
+    expect(deps.expandBlock).toHaveBeenCalledWith("Login");
+  });
+
+  test("visible nested target (not hidden): no ancestor expand, no extra settle", async () => {
+    // nestedNode has parentId=loop-node but is not hidden — already visible.
+    const deps = makeDeps();
+    await expect(focusBlockTarget("nested-node", deps)).resolves.toBe(true);
+    expect(deps.waitForSettle).not.toHaveBeenCalled();
+    expect(deps.expandBlock).toHaveBeenCalledTimes(1);
+    expect(deps.expandBlock).toHaveBeenCalledWith("Extract row data");
+  });
+
+  test("target inside collapsed loop: expands the loop ancestor and re-settles before anchoring", async () => {
+    const collapsedNestedNodes = nodes.map((node) =>
+      node.id === "nested-node" ? { ...node, hidden: true } : node,
+    );
+    const calls: Array<string> = [];
+    const deps = makeDeps(collapsedNestedNodes, {
+      getNodes: () => collapsedNestedNodes,
+      expandBlock: vi.fn((label) => calls.push(`expand:${label}`)),
+      waitForSettle: vi.fn(async () => {
+        calls.push("settle");
+        // Simulate expand revealing the node.
+        (
+          collapsedNestedNodes.find((n) => n.id === "nested-node") as {
+            hidden?: boolean;
+          }
+        ).hidden = false;
+      }),
+      selectBlock: vi.fn((id) => calls.push(`select:${id}`)),
+      setViewport: vi.fn(() => calls.push("anchor")),
+    });
+
+    await expect(focusBlockTarget("nested-node", deps)).resolves.toBe(true);
+    // The ancestor "Iterate rows" must be expanded, then settle, then target-expand and anchor.
+    expect(calls).toContain("expand:Iterate rows");
+    expect(calls).toContain("settle");
+    expect(calls.indexOf("expand:Iterate rows")).toBeLessThan(
+      calls.indexOf("settle"),
+    );
+    expect(calls.indexOf("settle")).toBeLessThan(
+      calls.indexOf("expand:Extract row data"),
+    );
+    expect(calls.indexOf("expand:Extract row data")).toBeLessThan(
+      calls.indexOf("anchor"),
+    );
+  });
+
+  test("loop-inside-conditional (active branch, but loop collapsed): both ancestors expanded root→leaf", async () => {
+    // Build a node set where the conditional branch is already active (no
+    // branch switch needed) but the loop inside is collapsed, keeping the
+    // nested target hidden.
+    const innerLoop = {
+      id: "inner-loop",
+      type: "loop",
+      parentId: "cond-node-b",
+      position: { x: 20, y: 200 },
+      data: { label: "Rows loop" },
+    } as AppNode;
+    const innerTarget = {
+      id: "inner-target",
+      type: "task",
+      parentId: "inner-loop",
+      position: { x: 10, y: 60 },
+      hidden: true,
+      data: { label: "Row task" },
+    } as AppNode;
+    const outerCond = {
+      id: "cond-node-b",
+      type: "conditional",
+      position: { x: 0, y: 100 },
+      data: { label: "Outer cond", activeBranchId: "branch-a" },
+    } as AppNode;
+    // Loop's conditionalBranchId matches the active branch, so no branch switch
+    // is needed — but the loop itself is collapsed (inner-target is hidden).
+    const innerLoopWithBranch = {
+      ...innerLoop,
+      data: {
+        ...innerLoop.data,
+        conditionalNodeId: "cond-node-b",
+        conditionalBranchId: "branch-a",
+      },
+    } as AppNode;
+    const nestedHiddenNodes = [
+      startNode,
+      outerCond,
+      innerLoopWithBranch,
+      innerTarget,
+    ];
+    const expandCalls: Array<string> = [];
+    const deps = makeDeps(nestedHiddenNodes, {
+      getNodes: () => nestedHiddenNodes,
+      expandBlock: vi.fn((label) => expandCalls.push(label)),
+      switchBranch: vi.fn(),
+      waitForSettle: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await focusBlockTarget("inner-target", deps);
+    // No branch switches (branch already active).
+    expect(deps.switchBranch).not.toHaveBeenCalled();
+    // Ancestor expands in root→leaf order before the target's own expand.
+    expect(expandCalls).toEqual(["Outer cond", "Rows loop", "Row task"]);
+  });
+
+  test("hidden node with dangling parentId: no expand, no extra settle (no 2s timeout reintroduced)", async () => {
+    // A node hidden for a reason other than a collapsed container (dangling
+    // parentId → resolveContainerAncestorLabels returns []). waitForSettle
+    // must NOT be called — calling it with nothing expanded re-introduces the
+    // 2s timeout the fix set out to remove.
+    const orphanNode = {
+      id: "orphan-node",
+      type: "task",
+      parentId: "gone-container",
+      position: { x: 0, y: 0 },
+      hidden: true,
+      data: { label: "Orphan" },
+    } as AppNode;
+    const deps = makeDeps([startNode, orphanNode]);
+    await focusBlockTarget("orphan-node", deps);
+    expect(deps.expandBlock).toHaveBeenCalledTimes(1);
+    expect(deps.expandBlock).toHaveBeenCalledWith("Orphan");
+    expect(deps.waitForSettle).not.toHaveBeenCalled();
   });
 });

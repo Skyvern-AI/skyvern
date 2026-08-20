@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -97,6 +99,7 @@ def workflow_list(
     search: str | None = typer.Option(
         None,
         "--search",
+        "--query",
         help="Search across workflow titles, folder names, and parameter metadata.",
     ),
     page: int = typer.Option(1, "--page", min=1, help="Page number (1-based)."),
@@ -131,12 +134,33 @@ def workflow_list(
 def workflow_get(
     workflow_id: str = typer.Option(..., "--id", help="Workflow permanent ID (wpid_...)."),
     version: int | None = typer.Option(None, "--version", min=1, help="Specific version to retrieve."),
+    definition_file: Path | None = typer.Option(
+        None,
+        "--definition-file",
+        help="Write only the authoring-shape workflow definition JSON to this path.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Get a workflow definition by ID."""
 
     async def _run() -> dict[str, Any]:
-        return await tool_workflow_get(workflow_id=workflow_id, version=version)
+        result = await tool_workflow_get(workflow_id=workflow_id, version=version)
+        if definition_file is None or not result.get("ok"):
+            return result
+
+        data = result.get("data") or {}
+        workflow_definition = data.get("workflow_definition")
+        if not isinstance(workflow_definition, dict):
+            raise RuntimeError("Workflow response has no workflow_definition; cannot write --definition-file")
+        exported = {
+            "title": data.get("title"),
+            "workflow_definition": workflow_definition,
+        }
+        if data.get("proxy_location") is not None:
+            exported["proxy_location"] = data["proxy_location"]
+        path = definition_file.expanduser()
+        path.write_text(f"{json.dumps(exported, indent=2, ensure_ascii=False)}\n", encoding="utf-8")
+        return {**result, "data": f"Wrote workflow definition to {path}"}
 
     run_tool(
         _run,

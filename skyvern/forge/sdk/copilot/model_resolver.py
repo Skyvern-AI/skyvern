@@ -16,6 +16,8 @@ Known limitations:
 
 from __future__ import annotations
 
+import re
+from itertools import count
 from typing import Any
 
 import structlog
@@ -40,10 +42,20 @@ from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
+# Shape of a Skyvern registry alias (e.g. AZURE_OPENAI_GPT5_6_SOL, VERTEX_GEMINI_2.5_PRO, or a
+# single-token key like OLLAMA, or a hyphenated one like OPENAI_GPT-4O-2024-08-06): all-caps
+# alphanumeric segments, optionally joined by "-"/"_"/".", no provider prefix. Real litellm
+# model strings (gpt-4o, azure/gpt-4.1) never match — they are lowercase and/or provider-
+# prefixed. Used to fail fast when the copilot is pointed at an alias whose config isn't
+# registered here, rather than letting get_config synthesize a provider-less model that 400s
+# inside the Agents SDK with "LLM Provider NOT provided". Scoped to this copilot path so the
+# self-hosted LLM_KEY synth fallback in get_config stays intact. SKY-12322.
+_REGISTRY_STYLE_ALIAS = re.compile(r"[A-Z0-9]+(?:[-_.][A-Z0-9]+)*")
+
 # Keys in litellm_params that are routed elsewhere (top-level kwargs to
 # LitellmModel or the dedicated ModelSettings.extra_headers slot), so they
 # don't count as "unrouted" when we log dropped keys.
-_TOP_LEVEL_ROUTED_FIELDS = frozenset({"api_base", "api_key", "extra_headers"})
+_TOP_LEVEL_ROUTED_FIELDS = frozenset({"api_base", "api_key", "extra_headers", "extra_body"})
 
 # LiteLLMParams fields that LiteLLM consumes as call-level kwargs (splatted
 # via ``extra_args`` by the Agents SDK into ``litellm.acompletion(**kwargs)``).
@@ -170,13 +182,32 @@ def resolve_model_config(
         and not LLMConfigRegistry.is_registered(llm_key)
     ):
         llm_key = settings.OPENAI_COMPATIBLE_MODEL_KEY
+
     config = LLMConfigRegistry.get_config(llm_key)
+
+    # get_config synthesizes a config whose model_name IS the llm_key when the key isn't
+    # registered. For a registry-style alias (its ENABLE_* flag/credentials unset here) that
+    # synthesized model has no provider prefix and 400s inside the Agents SDK with "LLM Provider
+    # NOT provided", so fail fast. A registered config or a raw self-hosted model string has
+    # model_name != the alias (or isn't registry-style), so the self-hosted synth path and all
+    # normal resolutions are untouched. SKY-12322.
+    if (
+        not LLMConfigRegistry.is_registered(llm_key)
+        and isinstance(config, LLMConfig)
+        and config.model_name == llm_key
+        and _REGISTRY_STYLE_ALIAS.fullmatch(llm_key)
+    ):
+        raise InvalidLLMConfigError(
+            f"copilot llm_key '{llm_key}' looks like a Skyvern LLM registry alias but is not "
+            f"registered in this environment; its ENABLE_* flag or provider credentials are likely unset."
+        )
 
     if isinstance(config, LLMRouterConfig):
         config = _degrade_router_to_direct(llm_key, config)
 
     extra_args: dict[str, Any] = {}
     extra_headers: dict[str, str] | None = None
+    extra_body: dict[str, Any] | None = None
     base_url: str | None = None
     api_key: str | None = None
 
@@ -206,6 +237,10 @@ def resolve_model_config(
         if headers:
             extra_headers = dict(headers)
 
+        body = lp.get("extra_body")
+        if body:
+            extra_body = dict(body)
+
         # Warn if litellm_params has keys we don't explicitly route. Covers both
         # future additions to the LiteLLMParams TypedDict and runtime-only keys
         # (typos, dynamically-injected values). Without this, such keys are
@@ -233,6 +268,7 @@ def resolve_model_config(
         include_usage=True,
         extra_args=extra_args or None,
         extra_headers=extra_headers,
+        extra_body=extra_body,
     )
 
     provider = CopilotLitellmProvider(base_url=base_url, api_key=api_key)
@@ -259,13 +295,16 @@ class CopilotLitellmProvider(LitellmProvider):
         super().__init__()
         self._base_url = base_url
         self._api_key = api_key
+        self._model_call_indices = count(1)
 
     def get_model(self, model_name: str | None) -> Model:
-        from agents.extensions.models.litellm_model import LitellmModel
         from agents.models.default_models import get_default_model
 
-        return LitellmModel(
+        from skyvern.forge.sdk.copilot.model_telemetry import CopilotLitellmModel
+
+        return CopilotLitellmModel(
             model=model_name or get_default_model(),
             base_url=self._base_url,
             api_key=self._api_key,
+            next_model_call_index=self._model_call_indices.__next__,
         )

@@ -53,16 +53,16 @@ function ScriptUpdateCard({
   const beforeRevisionId = episodesWithUpdates[0]?.script_revision_id ?? null;
 
   return (
-    <div className="rounded-md border border-blue-600/50 bg-blue-950/30 p-4">
+    <div className="rounded-md border border-blue-300 bg-blue-100 p-4 dark:border-blue-600/50 dark:bg-blue-950/30">
       <Accordion type="single" collapsible>
         <AccordionItem value="script-update" className="border-none">
           <AccordionTrigger className="py-0 hover:no-underline">
             <div className="flex items-center gap-2">
-              <CodeIcon className="size-4 text-blue-400" />
-              <span className="font-medium text-blue-300">
+              <CodeIcon className="size-4 text-blue-700 dark:text-blue-400" />
+              <span className="font-medium text-blue-700 dark:text-blue-300">
                 Script updated after this run
               </span>
-              <Badge className="bg-blue-800/60 text-blue-200 hover:bg-blue-800/60">
+              <Badge className="bg-blue-100 text-blue-700 hover:bg-blue-100 dark:bg-blue-800/60 dark:text-blue-200 dark:hover:bg-blue-800/60">
                 {episodesWithUpdates.length}{" "}
                 {episodesWithUpdates.length === 1 ? "update" : "updates"}
               </Badge>
@@ -98,9 +98,11 @@ function EpisodeDetail({ episode }: { episode: ScriptFallbackEpisode }) {
       : errorMessage;
 
   return (
-    <div className="rounded border border-slate-700 bg-slate-800/50 p-3 text-sm">
+    <div className="rounded border border-border bg-muted/50 p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-slate-200">{episode.block_label}</span>
+        <span className="font-mono text-foreground dark:text-slate-200">
+          {episode.block_label}
+        </span>
         <Badge variant="secondary" className="text-xs">
           {fallbackTypeLabels[episode.fallback_type] ?? episode.fallback_type}
         </Badge>
@@ -122,11 +124,11 @@ function EpisodeDetail({ episode }: { episode: ScriptFallbackEpisode }) {
       </div>
       {errorMessage && (
         <div className="mt-2">
-          <p className="text-xs text-slate-400">{displayMessage}</p>
+          <p className="text-xs text-muted-foreground">{displayMessage}</p>
           {isTruncated && (
             <button
               onClick={() => setExpanded(!expanded)}
-              className="mt-1 text-xs text-blue-400 hover:text-blue-300"
+              className="mt-1 text-xs text-blue-700 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
             >
               {expanded ? "Show less" : "Show more"}
             </button>
@@ -189,26 +191,28 @@ function DiffSection({
     <div className="pt-1">
       <button
         onClick={() => setShowDiff(!showDiff)}
-        className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 hover:underline"
+        className="inline-flex items-center gap-1.5 text-sm text-blue-700 hover:text-blue-700 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
       >
         <CodeIcon className="size-3.5" />
         {showDiff ? "Hide code changes" : "View code changes"}
         {beforeVersion != null && afterVersion != null && (
-          <span className="text-xs text-slate-500">
+          <span className="text-xs text-muted-foreground dark:text-slate-500">
             v{beforeVersion} → v{afterVersion}
           </span>
         )}
       </button>
       {showDiff && isLoading && (
-        <p className="mt-2 text-xs text-slate-500">Loading diff…</p>
+        <p className="mt-2 text-xs text-muted-foreground dark:text-slate-500">
+          Loading diff…
+        </p>
       )}
       {showDiff && hasBothVersions && (
-        <div className="mt-3 overflow-hidden rounded border border-slate-700">
+        <div className="mt-3 overflow-hidden rounded border border-border">
           <ScriptDiffViewer original={beforeText} modified={afterText} />
         </div>
       )}
       {showDiff && noCodeAvailable && (
-        <p className="mt-2 text-xs text-slate-500">
+        <p className="mt-2 text-xs text-muted-foreground dark:text-slate-500">
           Code not available for these versions.
         </p>
       )}

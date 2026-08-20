@@ -1,8 +1,10 @@
 """Tests for the workflow-copilot v2 LLM key wiring (SKY-10642).
 
-Two optional settings give operators independent control over (a) the main
-Copilot reasoning/guardrail/evidence lane and (b) the fast-consumer lane:
-``WORKFLOW_COPILOT_AGENT_LLM_KEY`` and ``WORKFLOW_COPILOT_FAST_LLM_KEY``.
+Optional settings give operators independent control over the main Copilot lane,
+agent-specific lane, and fast-consumer lane:
+``WORKFLOW_COPILOT_LLM_KEY``, ``WORKFLOW_COPILOT_AGENT_LLM_KEY``, and
+``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` is the
+dedicated raw-secret safety lane and never falls back to the acting model.
 These tests cover the public contract: defaults, fallback chains, and
 PostHog → env-specific → default resolution order.
 """
@@ -15,7 +17,6 @@ from typing import Any
 import pytest
 
 from skyvern.config import Settings
-from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import llm_config as copilot_llm_config
 from skyvern.forge.sdk.copilot import narration
 from skyvern.forge.sdk.copilot import tools as copilot_tools
@@ -27,11 +28,40 @@ from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 
 
 def test_workflow_copilot_agent_llm_key_default_is_none() -> None:
+    assert Settings.model_fields["WORKFLOW_COPILOT_LLM_KEY"].default is None
     assert Settings.model_fields["WORKFLOW_COPILOT_AGENT_LLM_KEY"].default is None
 
 
-def test_workflow_copilot_narration_llm_key_default_is_none() -> None:
+def test_workflow_copilot_fast_llm_key_default_is_none() -> None:
     assert Settings.model_fields["WORKFLOW_COPILOT_FAST_LLM_KEY"].default is None
+
+
+def test_workflow_copilot_lite_llm_key_default_is_none() -> None:
+    assert Settings.model_fields["WORKFLOW_COPILOT_LITE_LLM_KEY"].default is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_raw_secret_safety_handler_uses_dedicated_posthog_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dedicated = object()
+
+    async def _lookup(prompt_type: str, *_args: object) -> object:
+        assert prompt_type == "workflow-copilot-raw-secret-safety"
+        return dedicated
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
+    assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is dedicated
+
+
+@pytest.mark.asyncio
+async def test_resolve_raw_secret_safety_handler_has_no_main_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _lookup(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
+    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=None))
+    assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +161,7 @@ async def test_resolve_main_copilot_handler_posthog_override_wins(monkeypatch: p
         "app",
         SimpleNamespace(
             WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=dedicated,
+            WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -162,6 +193,31 @@ async def test_resolve_main_copilot_handler_falls_back_to_dedicated(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_resolve_main_copilot_handler_falls_back_to_workflow_copilot_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_copilot = object()
+    primary = object()
+
+    async def _posthog_lookup(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _posthog_lookup)
+    monkeypatch.setattr(
+        copilot_llm_config,
+        "app",
+        SimpleNamespace(
+            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
+            WORKFLOW_COPILOT_LLM_API_HANDLER=workflow_copilot,
+            LLM_API_HANDLER=primary,
+        ),
+    )
+
+    handler = await copilot_llm_config.resolve_main_copilot_handler("wpid_1", "org_1")
+    assert handler is workflow_copilot
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "make_app",
     [
@@ -173,7 +229,8 @@ async def test_resolve_main_copilot_handler_falls_back_to_dedicated(monkeypatch:
         pytest.param(
             lambda primary: SimpleNamespace(
                 WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-                LLM_API_HANDLER=primary,
+                WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
+                LLM_API_HANDLER=object(),
             ),
             id="dedicated_is_none",
         ),
@@ -290,11 +347,6 @@ async def test_resolve_narrator_handler_skips_posthog_when_ids_missing(monkeypat
 # ---------------------------------------------------------------------------
 # non-narration Copilot helpers use the main lane
 # ---------------------------------------------------------------------------
-
-
-def test_resolve_request_policy_handler_uses_main_copilot_handler() -> None:
-    main_handler = object()
-    assert copilot_agent._resolve_request_policy_handler(main_handler) is main_handler
 
 
 @pytest.mark.asyncio

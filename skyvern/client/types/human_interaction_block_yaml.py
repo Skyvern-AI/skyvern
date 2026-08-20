@@ -24,11 +24,11 @@ class HumanInteractionBlockYaml(UniversalBaseModel):
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
-    timeout_seconds: int
-    sender: str
+    timeout_seconds: typing.Optional[int] = None
+    sender: typing.Optional[str] = None
     recipients: typing.List[str]
-    subject: str
-    body: str
+    subject: typing.Optional[str] = None
+    body: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

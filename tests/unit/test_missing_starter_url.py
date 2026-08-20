@@ -64,7 +64,7 @@ def _mock_block_execute_deps(working_page_url: str) -> Iterator[dict[str, Any]]:
 
     working_page = SimpleNamespace(url=working_page_url)
     browser_state = MagicMock()
-    browser_state.get_working_page = AsyncMock(return_value=working_page)
+    browser_state.must_get_working_page = AsyncMock(return_value=working_page)
     browser_state.take_fullpage_screenshot = AsyncMock(return_value=None)
     browser_state.navigate_to_url = AsyncMock()
 

@@ -6,4 +6,6 @@
 export interface TagKeyDeleteResponse {
     key: string;
     removed_from_workflow_count: number;
+    removed_from_run_count?: number;
+    removed_count?: number;
 }

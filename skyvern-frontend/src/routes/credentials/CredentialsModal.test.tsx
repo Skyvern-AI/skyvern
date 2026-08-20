@@ -10,10 +10,14 @@ import {
 } from "@testing-library/react";
 import { AxiosError, AxiosHeaders } from "axios";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CredentialApiResponse } from "@/api/types";
 
+import {
+  CredentialAuthenticatorSupportProvider,
+  type CredentialAdditionalTwoFactorMethod,
+} from "./CredentialAuthenticatorSupportContext";
 import { getAuthenticatorKeyError } from "./credentialTotpValidation";
 import { CredentialsModal } from "./CredentialsModal";
 import { CredentialModalTypes } from "./useCredentialModalState";
@@ -23,6 +27,10 @@ const patchMock = vi.hoisted(() => vi.fn());
 const deleteMock = vi.hoisted(() => vi.fn());
 const getMock = vi.hoisted(() => vi.fn());
 const toastMock = vi.hoisted(() => vi.fn());
+const mockEmailCredentials = vi.hoisted(() => ({
+  google: vi.fn(),
+  microsoft: vi.fn(),
+}));
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn(async () => ({
@@ -45,9 +53,58 @@ vi.mock("@/hooks/useCustomCredentialServiceConfig", () => ({
   useCustomCredentialServiceConfig: () => ({ parsedConfig: null }),
 }));
 
+vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();
+  return {
+    ...actual,
+    useGoogleOAuthCredentials: mockEmailCredentials.google,
+  };
+});
+
+vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useMicrosoftOAuthCredentials")>();
+  return {
+    ...actual,
+    useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
+  };
+});
+
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: () => ({ data: [] }),
 }));
+
+// Default off so the existing legacy-path tests are unaffected; the browser-memory
+// describe flips it on per-test.
+const useFeatureFlagMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/hooks/useFeatureFlag", () => ({
+  useFeatureFlag: useFeatureFlagMock,
+}));
+
+function installEmailCredentialHooks() {
+  mockEmailCredentials.google.mockReturnValue({
+    credentials: [
+      {
+        id: "google-mail",
+        organization_id: "org_1",
+        credential_name: "Default",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+        email_address: "connected@gmail.test",
+        created_at: "2026-07-30T00:00:00Z",
+        modified_at: "2026-07-30T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+  });
+  mockEmailCredentials.microsoft.mockReturnValue({
+    credentials: [],
+    isLoading: false,
+    isFetching: false,
+  });
+}
 
 function axiosErrorWithDetail(detail: unknown): AxiosError {
   const error = new AxiosError("Request failed");
@@ -61,7 +118,11 @@ function axiosErrorWithDetail(detail: unknown): AxiosError {
   return error;
 }
 
-function renderPasswordCredentialsModal() {
+function renderPasswordCredentialsModal(
+  additionalTwoFactorMethods?: CredentialAdditionalTwoFactorMethod[],
+  onOpenChange = vi.fn(),
+  onCredentialCreated?: (id: string, name?: string) => void,
+) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -70,13 +131,18 @@ function renderPasswordCredentialsModal() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <CredentialsModal
-          isOpen
-          onOpenChange={vi.fn()}
-          overrideType={CredentialModalTypes.PASSWORD}
-        />
-      </MemoryRouter>
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods }}
+      >
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={onOpenChange}
+            onCredentialCreated={onCredentialCreated}
+            overrideType={CredentialModalTypes.PASSWORD}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>
     </QueryClientProvider>,
   );
 }
@@ -91,6 +157,7 @@ const editingPasswordCredential: CredentialApiResponse = {
     totp_identifier: null,
   },
   browser_profile_id: "existing-profile-id",
+  auto_profile_disabled: false,
   tested_url: "https://example.com/login",
   user_context: null,
   save_browser_session_intent: true,
@@ -99,7 +166,10 @@ const editingPasswordCredential: CredentialApiResponse = {
   proxy_session_id: null,
 };
 
-function renderEditPasswordCredentialsModal() {
+function renderEditPasswordCredentialsModal(
+  credential = editingPasswordCredential,
+  additionalTwoFactorMethods?: CredentialAdditionalTwoFactorMethod[],
+) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -108,15 +178,19 @@ function renderEditPasswordCredentialsModal() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <CredentialsModal
-          isOpen
-          onOpenChange={vi.fn()}
-          overrideType={CredentialModalTypes.PASSWORD}
-          editingCredential={editingPasswordCredential}
-          onStartBackgroundTest={vi.fn()}
-        />
-      </MemoryRouter>
+      <CredentialAuthenticatorSupportProvider
+        value={{ additionalTwoFactorMethods }}
+      >
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={credential}
+            onStartBackgroundTest={vi.fn()}
+          />
+        </MemoryRouter>
+      </CredentialAuthenticatorSupportProvider>
     </QueryClientProvider>,
   );
 }
@@ -157,7 +231,7 @@ describe("getAuthenticatorKeyError", () => {
     ).toBeNull();
   });
 
-  it("does not validate the key for email, text, or disabled 2FA methods", () => {
+  it("does not validate the key for email, text, extension, or disabled 2FA methods", () => {
     expect(
       getAuthenticatorKeyError({ totp: "", totp_type: "email" }),
     ).toBeNull();
@@ -167,7 +241,284 @@ describe("getAuthenticatorKeyError", () => {
     expect(
       getAuthenticatorKeyError({ totp: "", totp_type: "none" }),
     ).toBeNull();
+    expect(
+      getAuthenticatorKeyError({ totp: "", totp_type: "security_device" }),
+    ).toBeNull();
   });
+});
+
+describe("CredentialsModal additional two-factor methods", () => {
+  beforeEach(() => {
+    installEmailCredentialHooks();
+  });
+
+  it("validates extension state and runs its post-save callback with the created id", async () => {
+    const onSaved = vi.fn().mockResolvedValue(undefined);
+    const additionalMethod: CredentialAdditionalTwoFactorMethod = {
+      value: "security_device",
+      requestType: "none",
+      label: "Security Device",
+      initialState: { deviceCode: "" },
+      renderFields: ({ state, setState }) => (
+        <label>
+          Device code
+          <input
+            aria-label="Device code"
+            value={String(state.deviceCode ?? "")}
+            onChange={(event) =>
+              setState({ ...state, deviceCode: event.target.value })
+            }
+          />
+        </label>
+      ),
+      validate: (state) =>
+        String(state.deviceCode ?? "").trim()
+          ? null
+          : "Device code is required.",
+      onSaved,
+    };
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-security-device", name: "credentials" },
+    });
+    renderPasswordCredentialsModal([additionalMethod]);
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    expect(usernameInput).toBeTruthy();
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    const passwordInput = document.querySelector('input[type="password"]');
+    expect(passwordInput).toBeTruthy();
+    fireEvent.change(passwordInput as HTMLInputElement, {
+      target: { value: "password" },
+    });
+
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Security Device"));
+
+    const saveButton = screen.getByRole("button", { name: "Save" });
+    expect((saveButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Device code is required.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Device code"), {
+      target: { value: "device-value" },
+    });
+    expect((saveButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials",
+        expect.objectContaining({
+          credential: {
+            username: "user@example.com",
+            password: "password",
+            totp: null,
+            totp_type: "none",
+            totp_identifier: null,
+          },
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(onSaved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          credentialId: "cred-security-device",
+          state: { deviceCode: "device-value" },
+          wasSelected: true,
+          previouslyConfigured: false,
+        }),
+      );
+    });
+    const request = postMock.mock.calls[0]?.[1] as {
+      credential: Record<string, unknown>;
+    };
+    expect(request.credential).not.toHaveProperty("security_device");
+  });
+
+  it("surfaces a post-save extension failure as a partial save", async () => {
+    const onOpenChange = vi.fn();
+    const additionalMethod: CredentialAdditionalTwoFactorMethod = {
+      value: "security_device",
+      requestType: "none",
+      label: "Security Device",
+      renderFields: () => null,
+      validate: () => null,
+      onSaved: vi
+        .fn()
+        .mockRejectedValue(axiosErrorWithDetail("Device setup failed.")),
+    };
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-security-device", name: "credentials" },
+    });
+    renderPasswordCredentialsModal([additionalMethod], onOpenChange);
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(document.querySelector('input[type="password"]')!, {
+      target: { value: "password" },
+    });
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Security Device"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith({
+        title: "Partial save",
+        description: "Device setup failed.",
+        variant: "destructive",
+      });
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("rolls back the created credential when the passkey material attach fails", async () => {
+    const onSaved = vi
+      .fn()
+      .mockRejectedValue(axiosErrorWithDetail("Passkey setup failed."));
+    const onCredentialCreated = vi.fn();
+    const additionalMethod: CredentialAdditionalTwoFactorMethod = {
+      value: "passkey",
+      requestType: "passkey",
+      label: "Passkey",
+      renderFields: () => null,
+      validate: () => null,
+      onSaved,
+    };
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-passkey", name: "credentials" },
+    });
+    deleteMock.mockResolvedValueOnce({ data: {} });
+    renderPasswordCredentialsModal(
+      [additionalMethod],
+      vi.fn(),
+      onCredentialCreated,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(document.querySelector('input[type="password"]')!, {
+      target: { value: "password" },
+    });
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByText("Passkey"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSaved).toHaveBeenCalledWith(
+        expect.objectContaining({ credentialId: "cred-passkey" }),
+      );
+    });
+    await waitFor(() => {
+      expect(deleteMock).toHaveBeenCalledWith("/credentials/cred-passkey");
+    });
+    expect(onCredentialCreated).not.toHaveBeenCalled();
+  });
+
+  it("runs the configured method callback after turning two-factor off", async () => {
+    const onSaved = vi.fn().mockResolvedValue(undefined);
+    const additionalMethod: CredentialAdditionalTwoFactorMethod = {
+      value: "security_device",
+      requestType: "none",
+      label: "Security Device",
+      initialState: { deviceCode: "" },
+      renderFields: () => null,
+      validate: () => null,
+      onSaved,
+    };
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditPasswordCredentialsModal(
+      {
+        ...editingPasswordCredential,
+        credential: {
+          username: "user@example.com",
+          totp_type: "security_device",
+          totp_identifier: null,
+        },
+      } as unknown as CredentialApiResponse,
+      [additionalMethod],
+    );
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(screen.getByPlaceholderText("••••••••"), {
+      target: { value: "password" },
+    });
+    // Collapsing the Two-Factor Authentication section turns 2FA off (no None tile).
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    // Removing a saved 2FA method now requires confirming an in-app dialog.
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({ totp_type: "none" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(onSaved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          credentialId: "real-cred-id",
+          wasSelected: false,
+          previouslyConfigured: true,
+        }),
+      );
+    });
+  });
+
+  it.each(["Authenticator App", "Email", "Text Message"])(
+    "keeps the inline test affordance for %s",
+    (methodLabel) => {
+      renderPasswordCredentialsModal();
+
+      fireEvent.click(screen.getByText("Two-Factor Authentication"));
+      fireEvent.click(screen.getByText(methodLabel));
+
+      const inlineTestToggle = screen.getByLabelText(
+        "Save browser session for future logins",
+      ) as HTMLButtonElement;
+      expect(inlineTestToggle.disabled).toBe(false);
+      fireEvent.click(inlineTestToggle);
+      expect(screen.getByRole("button", { name: "Test" })).toBeTruthy();
+      expect(
+        screen.queryByText(
+          "Inline login testing is not available for this two-factor method.",
+        ),
+      ).toBeNull();
+    },
+  );
 });
 
 describe("CredentialsModal authenticator save errors", () => {
@@ -229,6 +580,12 @@ describe("CredentialsModal authenticator save errors", () => {
         }),
       );
     });
+    const submittedCredential = postMock.mock.calls[0]?.[1] as {
+      credential: Record<string, unknown>;
+    };
+    expect(submittedCredential.credential).not.toHaveProperty(
+      "additionalTwoFactorState",
+    );
     await waitFor(() => {
       expect(screen.getByText(/push-approval app/)).toBeTruthy();
     });
@@ -329,4 +686,503 @@ describe("CredentialsModal edit-mode inline test", () => {
       expect(call[0]).not.toBe("/credentials/temp-cred-id");
     }
   }, 15_000);
+
+  it("shows only the partial-save toast, not a success toast, when the metadata PATCH fails", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockRejectedValueOnce(new Error("patch failed"));
+
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { target: { value: "rotated-password" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Partial save",
+          // Flag-off the PATCH omits browser profile / IP, so the copy names
+          // login instructions and sequential settings only — byte-identical
+          // to the flag-off partial-save message.
+          description:
+            "Credential updated, but login instructions and sequential settings could not be saved. Please try editing again.",
+        }),
+      );
+    });
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Credential updated" }),
+    );
+  }, 15_000);
+});
+
+describe("CredentialsModal browser-memory profile section (flag on)", () => {
+  beforeEach(() => {
+    useFeatureFlagMock.mockImplementation(
+      (flag?: string) => flag === "browser_memory_v1",
+    );
+  });
+  afterEach(() => {
+    useFeatureFlagMock.mockImplementation(() => false);
+  });
+
+  it("create mode shows the auto-save caption and a collapsed Advanced section", async () => {
+    renderPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    expect(
+      screen.getByText(/Skyvern saves this login.s browser state/i),
+    ).toBeTruthy();
+    const advanced = screen.getByRole("button", { name: "Advanced" });
+    // Both browser-memory controls live behind the disclosure.
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Don't automatically save or reuse a browser profile for this credential",
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    ).toBeNull();
+    fireEvent.click(advanced);
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("checkbox", {
+          name: "Don't automatically save or reuse a browser profile for this credential",
+        })
+        .getAttribute("data-state"),
+    ).toBe("unchecked");
+    expect(screen.queryByText("Browser profile")).toBeNull();
+  });
+
+  it("create mode submits the IP pin and automatic-profile opt-out", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "c1", name: "credentials" },
+    });
+    renderPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.change(
+      document.querySelector('input[type="password"]') as HTMLInputElement,
+      { target: { value: "password" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Keep the same IP for this credential",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Don't automatically save or reuse a browser profile for this credential",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials",
+        expect.objectContaining({
+          browser_profile_id: null,
+          pin_saved_session_ip: true,
+          auto_profile_disabled: true,
+        }),
+      );
+    });
+  }, 10_000);
+
+  it("edit mode shows the Browser profile select and Advanced section", async () => {
+    getMock.mockImplementation((url: string) =>
+      url.includes("/browser_profiles/")
+        ? Promise.resolve({
+            data: {
+              browser_profile_id: "existing-profile-id",
+              name: "Saved login",
+              is_managed: false,
+              linked_credential_name: "Acme Login",
+            },
+          })
+        : Promise.resolve({ data: [] }),
+    );
+    renderEditPasswordCredentialsModal();
+    await waitFor(() => {
+      expect(screen.getByText("Browser profile")).toBeTruthy();
+    });
+    expect(screen.getByRole("combobox")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
+    expect(
+      screen.queryByText(/Skyvern saves this login.s browser state/i),
+    ).toBeNull();
+  });
+
+  it("edit mode persists opting back in without unlinking the profile", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: {
+        ...editingPasswordCredential,
+        auto_profile_disabled: false,
+      },
+    });
+    const view = renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      auto_profile_disabled: true,
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    const optOut = screen.getByRole("checkbox", {
+      name: "Don't automatically save or reuse a browser profile for this credential",
+    });
+    expect(optOut.getAttribute("data-state")).toBe("checked");
+    fireEvent.click(optOut);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({
+          auto_profile_disabled: false,
+          browser_profile_id: "existing-profile-id",
+        }),
+      );
+    });
+
+    view.unmount();
+    renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      auto_profile_disabled: false,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    expect(
+      screen
+        .getByRole("checkbox", {
+          name: "Don't automatically save or reuse a browser profile for this credential",
+        })
+        .getAttribute("data-state"),
+    ).toBe("unchecked");
+  });
+
+  it("keeps the proxy IP-pin UI for card credentials under the flag", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.CREDIT_CARD}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // The password-only "Keep the same IP" checkbox does not cover card/secret,
+    // so the proxy-pin UI must stay for them even when the flag is on.
+    await waitFor(() => {
+      expect(screen.getByText("Use a consistent IP address")).toBeTruthy();
+    });
+    expect(
+      screen.queryByText(/Skyvern saves this login.s browser state/i),
+    ).toBeNull();
+  });
+
+  const pinnedEditCredential: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    proxy_session_id: "psi_9f8a7b6c5d4e3f2a1b",
+    pin_saved_session_ip: true,
+  };
+
+  const pinnedNoSessionCredential: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    proxy_session_id: null,
+    pin_saved_session_ip: true,
+  };
+
+  function renderEditModalFor(cred: CredentialApiResponse) {
+    getMock.mockImplementation((url: string) =>
+      url.includes("/browser_profiles/")
+        ? Promise.resolve({
+            data: {
+              browser_profile_id: "existing-profile-id",
+              name: "Saved login",
+              is_managed: false,
+              linked_credential_name: "Acme Login",
+            },
+          })
+        : Promise.resolve({ data: [] }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={cred}
+            onStartBackgroundTest={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  async function openAdvanced() {
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Advanced" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  }
+
+  it("shows the IP session identity and Rotate when the credential is pinned", async () => {
+    renderEditModalFor(pinnedEditCredential);
+    await openAdvanced();
+    await waitFor(() => {
+      expect(screen.getByText(/psi_9f8a7b/)).toBeTruthy();
+    });
+    expect(screen.getByRole("button", { name: "Rotate" })).toBeTruthy();
+  });
+
+  it("hides the IP session identity and Rotate when no session is pinned", async () => {
+    renderEditModalFor(pinnedNoSessionCredential);
+    await openAdvanced();
+    await waitFor(() => {
+      expect(
+        screen.getByText("Keep the same IP for this credential"),
+      ).toBeTruthy();
+    });
+    expect(screen.queryByRole("button", { name: "Rotate" })).toBeNull();
+    expect(screen.queryByText(/IP session:/)).toBeNull();
+  });
+
+  it("Rotate sends rotate_proxy_session_id on save", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditModalFor(pinnedEditCredential);
+    await openAdvanced();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Rotate" })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Rotate" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ rotate_proxy_session_id: true }),
+      );
+    });
+  }, 10_000);
+});
+
+describe("CredentialsModal copilot-context tested_url default", () => {
+  function renderCopilotPasswordModal(opts: {
+    defaultTestUrl?: string;
+    onCredentialCreated?: (id: string, name?: string) => void;
+  }) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            defaultTestUrl={opts.defaultTestUrl}
+            onCredentialCreated={opts.onCredentialCreated}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  async function fillUsernameAndPassword() {
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    expect(usernameInput).toBeTruthy();
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    const passwordInput = document.querySelector('input[type="password"]');
+    expect(passwordInput).toBeTruthy();
+    fireEvent.change(passwordInput as HTMLInputElement, {
+      target: { value: "password" },
+    });
+  }
+
+  it("persists tested_url from defaultTestUrl on a plain create (no test run)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-x", name: "credentials" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({
+      defaultTestUrl: "https://news.ycombinator.com/login",
+      onCredentialCreated,
+    });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith("/credentials", expect.anything()),
+    );
+    await waitFor(() =>
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/cred-x",
+        expect.objectContaining({
+          tested_url: "https://news.ycombinator.com/login",
+        }),
+      ),
+    );
+    expect(onCredentialCreated).toHaveBeenCalledWith("cred-x", "credentials");
+  }, 10_000);
+
+  it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-y", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsernameAndPassword();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(onCredentialCreated).toHaveBeenCalledWith("cred-y", "credentials"),
+    );
+    expect(patchMock).not.toHaveBeenCalled();
+  }, 10_000);
+});
+
+describe("CredentialsModal run-sequentially toggle", () => {
+  const sequentialLabel = /Run workflows sequentially for this credential/i;
+
+  function renderEditModalFor(cred: CredentialApiResponse) {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <CredentialsModal
+            isOpen
+            onOpenChange={vi.fn()}
+            overrideType={CredentialModalTypes.PASSWORD}
+            editingCredential={cred}
+            onStartBackgroundTest={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("reflects run_sequentially=false as an unchecked toggle", async () => {
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("helper copy says scheduled/sync runs fail closed and does not over-promise", async () => {
+    renderEditModalFor(editingPasswordCredential);
+    await screen.findByLabelText(sequentialLabel);
+    expect(
+      screen.getByText(
+        /scheduled or sync-triggered runs are not yet supported and fail closed/i,
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/run without serialization/i)).toBeNull();
+  });
+
+  it("reflects run_sequentially=true as a checked toggle (readback)", async () => {
+    renderEditModalFor({
+      ...editingPasswordCredential,
+      run_sequentially: true,
+    });
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("persists run_sequentially via PATCH and shows success on a toggle-only edit", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ run_sequentially: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Credential saved" }),
+      );
+    });
+  }, 10_000);
+
+  it("surfaces the save failure and shows no success toast when the PATCH rejects", async () => {
+    patchMock.mockRejectedValueOnce(axiosErrorWithDetail("nope"));
+    renderEditModalFor(editingPasswordCredential);
+    const toggle = await screen.findByLabelText(sequentialLabel);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ run_sequentially: true }),
+      );
+    });
+    expect(toastMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Credential saved" }),
+    );
+  }, 10_000);
 });

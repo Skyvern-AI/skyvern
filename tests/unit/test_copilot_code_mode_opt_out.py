@@ -28,7 +28,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _resolve_copilot_code_available,
     _should_emit_copilot_code_mode_opt_out,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
@@ -49,7 +49,6 @@ def _outcome(
     mode: str | None,
     code_available: bool = True,
     last_code_build_failed: bool = False,
-    repair_ceiling_hit: bool = False,
     pending_capability: str | None = None,
     turn_id: str | None = "prior-turn",
 ) -> TurnOutcome:
@@ -58,7 +57,6 @@ def _outcome(
         copilot_effective_mode=mode,
         copilot_code_available=code_available,
         copilot_last_code_build_failed=last_code_build_failed,
-        copilot_repair_ceiling_hit=repair_ceiling_hit,
         copilot_pending_capability=pending_capability,
         copilot_turn_id=turn_id,
     )
@@ -126,7 +124,7 @@ def test_should_emit_copilot_code_mode_opt_out_transitions(
     ("prior", "expected"),
     [
         (_outcome(mode="code", last_code_build_failed=True, pending_capability="capability"), "failure"),
-        (_outcome(mode="code", repair_ceiling_hit=True, pending_capability="capability"), "failure"),
+        (_outcome(mode="code", last_code_build_failed=True, pending_capability="capability"), "failure"),
         (
             TurnOutcome(
                 response_kind=ResponseKind.RECOVER,
@@ -151,7 +149,6 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
     prior = _outcome(
         mode="code",
         last_code_build_failed=True,
-        repair_ceiling_hit=False,
         pending_capability="credential-typed code synthesis",
         turn_id="turn-prior",
     )
@@ -173,7 +170,6 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
             "to_mode": "ask",
             "reason_category": "failure",
             "last_code_build_failed": True,
-            "repair_ceiling_hit": False,
             "pending_capability": "credential-typed code synthesis",
             "org_id": "org-123",
             "workflow_permanent_id": "wpid-123",
@@ -203,6 +199,14 @@ def test_capture_copilot_code_mode_opt_out_skips_non_transition(monkeypatch: pyt
 
 
 def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> None:
+    choices = [
+        ConnectedAccountChoice(
+            connection_id="goac_1",
+            name="Google Sheets",
+            state="active",
+            email_address="first@example.test",
+        )
+    ]
     agent_result, failure = _build_recoverable_route_agent_result(
         RuntimeError("boom"),
         workflow_modified=False,
@@ -210,12 +214,21 @@ def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> Non
         global_llm_context=None,
         turn_id="turn-error",
         turn_index=2,
+        prior_turn_outcome=TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            connected_account_choices=choices,
+        ),
     )
 
     assert agent_result.turn_outcome is not None
     assert agent_result.turn_outcome.response_kind is ResponseKind.RECOVER
     assert agent_result.turn_outcome.reason_code == failure.failure_kind
     assert agent_result.turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    assert agent_result.turn_outcome.connected_account_choices == choices
+    assert agent_result.narrative_payload is not None
+    assert agent_result.narrative_payload["connectedAccountChoices"] == [
+        choice.model_dump(mode="json") for choice in choices
+    ]
     assert _reason_category_for_copilot_code_mode_opt_out(agent_result.turn_outcome) == "failure"
 
 
@@ -257,19 +270,30 @@ def test_with_copilot_code_mode_metadata_preserves_turn_outcome_fields() -> None
 
 
 def test_derive_copilot_code_mode_diagnostics_uses_context_state() -> None:
-    ctx = type("Ctx", (), {})()
-    ctx.last_test_ok = False
-    ctx.last_failed_workflow_yaml = None
-    ctx.code_native_pending_capability = "credential-typed code synthesis"
-    ctx.turn_halt = type("Halt", (), {"kind": type("Kind", (), {"value": "repair_ceiling_reached"})()})()
+    ctx = SimpleNamespace(
+        last_test_ok=False,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability="credential-typed code synthesis",
+        turn_halt=SimpleNamespace(kind=SimpleNamespace(value="loop_detected")),
+    )
 
-    diagnostics = derive_copilot_code_mode_diagnostics(ctx)
-
-    assert diagnostics == {
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
         "copilot_last_code_build_failed": True,
-        "copilot_repair_ceiling_hit": True,
         "copilot_pending_capability": "credential-typed code synthesis",
-        "copilot_schema_incompatibility": None,
+    }
+
+
+def test_derive_copilot_code_mode_diagnostics_on_a_clean_turn() -> None:
+    ctx = SimpleNamespace(
+        last_test_ok=True,
+        last_failed_workflow_yaml=None,
+        code_native_pending_capability=None,
+        turn_halt=None,
+    )
+
+    assert derive_copilot_code_mode_diagnostics(ctx) == {
+        "copilot_last_code_build_failed": False,
+        "copilot_pending_capability": None,
     }
 
 

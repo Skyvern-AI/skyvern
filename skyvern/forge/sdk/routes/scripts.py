@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import hashlib
 from typing import TYPE_CHECKING
 
@@ -9,7 +8,6 @@ from fastapi import BackgroundTasks, Depends, HTTPException, Path, Query, Reques
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import WorkflowScriptModel
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.routers import base_router
@@ -230,6 +228,7 @@ async def get_script_blocks_response(
     description="Create a new script with optional files and metadata",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "create_script",
     },
 )
@@ -276,6 +275,7 @@ async def deploy_cached_script(
     description="Retrieves a specific script by its ID",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "get_script",
     },
 )
@@ -499,6 +499,7 @@ async def get_script_version_detail(
     description="Retrieves a paginated list of scripts for the current organization",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "get_scripts",
     },
 )
@@ -546,6 +547,7 @@ async def get_scripts(
     description="Deploy a script with updated files, creating a new version",
     tags=["Scripts"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "deploy_script",
     },
 )
@@ -581,6 +583,7 @@ async def deploy_script(
         if not latest_script:
             raise HTTPException(status_code=404, detail="Script not found")
 
+        file_bytes_by_path = script_service.validate_uploaded_script_files(data.files)
         # Create a new version of the script
         new_version = latest_script.version + 1
         new_script = await app.DATABASE.scripts.create_script(
@@ -606,7 +609,7 @@ async def deploy_script(
         if data.files:
             file_count = len(data.files)
             for file in data.files:
-                content_bytes = base64.b64decode(file.content)
+                content_bytes = file_bytes_by_path[file.path]
                 content_hash = hashlib.sha256(content_bytes).hexdigest()
                 file_name = file.path.split("/")[-1]
                 deployed_file_paths.add(file.path)
@@ -695,6 +698,7 @@ async def deploy_script(
     summary="Run script",
     description="Run a script",
     tags=["Scripts"],
+    openapi_extra={"x-hidden": True},
 )
 @base_router.post(
     "/scripts/{script_id}/run/",
@@ -1311,17 +1315,8 @@ async def review_script_with_instructions(
     """
     organization_id = current_org.organization_id
 
-    # Enforce CODE_BLOCK_ENABLED feature flag server-side (mirrors frontend gating).
-    # When ENABLE_CODE_BLOCK=True (self-hosted), all orgs have code block access by default
-    # so the PostHog check is skipped — self-hosted operators control their own deployment.
-    if not settings.ENABLE_CODE_BLOCK and app.EXPERIMENTATION_PROVIDER:
-        code_block_enabled = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-            "CODE_BLOCK_ENABLED",
-            organization_id,
-            properties={"organization_id": organization_id},
-        )
-        if not code_block_enabled:
-            raise HTTPException(status_code=403, detail="Script editing is not enabled for this organization")
+    if not await app.AGENT_FUNCTION.has_code_block_access(organization_id):
+        raise HTTPException(status_code=403, detail="Script editing is not enabled for this organization")
 
     # Load the workflow
     workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(

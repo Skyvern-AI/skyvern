@@ -29,7 +29,7 @@ function WorkflowTemplates() {
     );
   }
 
-  if (!workflowTemplates) {
+  if (!workflowTemplates || workflowTemplates.length === 0) {
     return null;
   }
 

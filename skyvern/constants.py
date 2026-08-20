@@ -16,18 +16,24 @@ INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
+# Independent budget for disabling the download interceptor during close(). Kept well below
+# BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
+# and can never consume the budget the paid-provider cleanup phase needs.
+BROWSER_INTERCEPTOR_DISABLE_TIMEOUT = 30  # 30 seconds
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute
 DIALOG_LLM_TIMEOUT = 10  # 10 seconds
 DOWNLOAD_FILE_PREFIX = "downloads"
 SAVE_DOWNLOADED_FILES_TIMEOUT = 180
+SPECULATIVE_COST_PERSIST_DRAIN_TIMEOUT = 30
 GET_DOWNLOADED_FILES_TIMEOUT = 30
 NAVIGATION_MAX_RETRY_TIME = 5
 PERMANENT_NAV_ERRORS = ("net::ERR_INVALID_URL",)
 PROXY_SENSITIVE_NAV_ERRORS = (
     "net::ERR_NAME_NOT_RESOLVED",
     "net::ERR_NAME_RESOLUTION_FAILED",
+    "net::ERR_TUNNEL_CONNECTION_FAILED",
     "net::ERR_CERT_",
     "net::ERR_SSL_",
 )
@@ -39,10 +45,14 @@ SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
 AUTO_COMPLETION_POTENTIAL_VALUES_COUNT = 3
 DROPDOWN_MENU_MAX_DISTANCE = 100
 BROWSER_DOWNLOADING_SUFFIX = ".crdownload"
-MAX_UPLOAD_FILE_COUNT = 50
-AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 50
+MAX_UPLOAD_FILE_COUNT = 300
+AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT = 300
 CUSTOMER_STORAGE_UPLOAD_MAX_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB per file (FileUploadBlock)
 DEFAULT_MAX_SCREENSHOT_SCROLLS = 3
+# Sanity ceiling for a user-supplied scroll count. Bounds the value well below the
+# INTEGER column limit (a larger value overflowed workflow_runs on insert) while
+# staying far above any real screenshot need.
+MAX_SCREENSHOT_SCROLLS = 1000
 
 # Default navigation_goal for LoginBlocks. Instructs the LLM how to find the login
 # page, fill credentials, and handle multi-step flows / 2FA.
@@ -114,6 +124,11 @@ MAX_FILE_PARSE_INPUT_TOKENS = 256_000
 MAX_PDF_OCR_PAGES = 50
 # Max concurrent per-page OCR calls when transcribing a scanned PDF.
 PDF_OCR_PAGE_CONCURRENCY = 5
+# Wall-clock ceiling for one blocking file-parse step (validation, text extraction, page
+# rendering). Parse cost tracks document complexity more than raw byte size, so a size cap
+# alone cannot bound it; this keeps a pathological document to one failed block instead of
+# letting it consume the run's whole activity budget.
+FILE_PARSE_STEP_TIMEOUT_SECONDS = 300
 MAX_IMAGE_MESSAGES = 10
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
@@ -129,3 +144,7 @@ DEFAULT_SCRIPT_RUN_ID = "default"
 
 # SkyvernPage constants
 SKYVERN_PAGE_MAX_SCRAPING_RETRIES = 2
+
+# Placeholder titles a workflow carries before anything names it. Two strings because
+# the frontend and backend defaults drifted apart.
+DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider, resolve_model_config
 
 
 def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) -> MagicMock:
@@ -23,6 +23,21 @@ def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) 
 
 
 class TestModelResolver:
+    def test_provider_returns_copilot_usage_adapter_with_per_provider_indices(self) -> None:
+        from skyvern.forge.sdk.copilot.model_telemetry import CopilotLitellmModel
+
+        provider = CopilotLitellmProvider(base_url="https://example.test", api_key="test-key")
+
+        first = provider.get_model("openai/gpt-5.6")
+        second = provider.get_model("openai/gpt-5.6")
+
+        assert isinstance(first, CopilotLitellmModel)
+        assert isinstance(second, CopilotLitellmModel)
+        assert first.base_url == second.base_url == "https://example.test"
+        assert first.api_key == second.api_key == "test-key"
+        assert first.next_model_call_index() == 1
+        assert second.next_model_call_index() == 2
+
     def test_router_config_empty_model_list_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
         from skyvern.schemas.llm import LLMRouterConfig
@@ -220,6 +235,7 @@ class TestModelResolver:
             "thinking_level": "high",
             "service_tier": "flex",
             "extra_headers": {"X-Skyvern-Route": "copilot"},
+            "extra_body": {"reasoning_effort": "high"},
             "timeout": 900.0,
         }
         config = LLMConfig(
@@ -237,6 +253,7 @@ class TestModelResolver:
         assert ms is not None
 
         assert ms.extra_headers == {"X-Skyvern-Route": "copilot"}
+        assert ms.extra_body == {"reasoning_effort": "high"}
 
         assert ms.extra_args is not None
         assert ms.extra_args["thinking"] == lp["thinking"]
@@ -408,3 +425,30 @@ class TestModelResolver:
         assert model_name == "openai/gpt-4o"
         assert run_config.model_provider._base_url == "https://api.githubcopilot.com"
         assert run_config.model_provider._api_key == "gho_test"
+
+
+@pytest.mark.parametrize(
+    "alias", ["ACME_UNREGISTERED_PROVIDER_MODEL", "ZZUNREGISTEREDPROVIDER", "ZZ-UNREGISTERED-HYPHEN-KEY"]
+)
+def test_resolve_model_config_raises_for_unregistered_registry_alias(alias: str) -> None:
+    # Copilot pointed at a registry-style alias whose config isn't registered here must fail
+    # fast, not synthesize a provider-less model that 400s inside the Agents SDK. SKY-12322.
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+    from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
+
+    assert not LLMConfigRegistry.is_registered(alias)
+    handler = MagicMock()
+    handler.llm_key = alias
+    with pytest.raises(InvalidLLMConfigError):
+        resolve_model_config(handler)
+
+
+@pytest.mark.parametrize("model_name", ["gpt-4o", "azure/gpt-4.1"])
+def test_resolve_model_config_synthesizes_self_hosted_model(model_name: str) -> None:
+    # A raw self-hosted model string is not registry-style, so the guard leaves it alone and
+    # get_config's synth fallback resolves it — the self-hosted LLM_KEY path stays intact.
+    handler = MagicMock()
+    handler.llm_key = model_name
+    resolved_model_name, _run_config, resolved_llm_key, _ = resolve_model_config(handler)
+    assert resolved_model_name == model_name
+    assert resolved_llm_key == model_name

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -50,6 +51,46 @@ async def test_block_validate_task_type_warns_deprecated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_block_validate_code_without_prompt_warns_without_mutating_response() -> None:
+    block = {
+        "block_type": "code",
+        "label": "transform",
+        "code": "return 1",
+    }
+    result = await skyvern_block_validate(block_json=json.dumps(block))
+
+    assert result["ok"] is True
+    assert result["data"] == {
+        "valid": True,
+        "block_type": "code",
+        "label": "transform",
+        "field_count": 2,
+    }
+    assert len(result["warnings"]) == 1
+    warning = result["warnings"][0]
+    assert "prompt" in warning
+    assert "Workflow create" in warning
+    assert "new label" in warning
+    assert "not migrated" in warning
+
+
+@pytest.mark.asyncio
+async def test_block_validate_code_with_explicit_null_prompt_does_not_warn() -> None:
+    block = {
+        "block_type": "code",
+        "label": "transform",
+        "code": "return 1",
+        "prompt": None,
+    }
+    result = await skyvern_block_validate(block_json=json.dumps(block))
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True
+    assert result["data"]["field_count"] == 3
+    assert result["warnings"] == []
+
+
+@pytest.mark.asyncio
 async def test_block_schema_no_type_lists_all() -> None:
     """Calling without a block_type should list all available types."""
     result = await skyvern_block_schema(block_type=None)
@@ -77,3 +118,28 @@ async def test_block_validate_pdf_fill() -> None:
 
     assert result["ok"] is True
     assert result["data"]["valid"] is True
+
+
+def test_block_schema_takes_block_type_only_not_a_definition() -> None:
+    """block_schema accepts only a block_type string; a full block definition belongs in block_validate.
+
+    Guards the routing contract (SKY-12140/12141): callers that send a `definition`/`format` payload
+    to block_schema are misrouted. The fix is the tool description, NOT adding those params here — so
+    the function must keep rejecting them at the Python boundary.
+    """
+    params = inspect.signature(skyvern_block_schema).parameters
+    assert set(params) == {"block_type"}
+
+    with pytest.raises(TypeError):
+        skyvern_block_schema(definition="{}", format="json")  # type: ignore[call-arg]
+
+
+def test_block_schema_docstring_routes_full_definitions_to_block_validate() -> None:
+    doc = skyvern_block_schema.__doc__ or ""
+    assert "block_type" in doc
+    assert "skyvern_block_validate" in doc
+
+
+def test_block_validate_docstring_cross_refs_block_schema() -> None:
+    doc = skyvern_block_validate.__doc__ or ""
+    assert "skyvern_block_schema" in doc

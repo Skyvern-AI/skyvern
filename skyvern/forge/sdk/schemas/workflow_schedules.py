@@ -94,7 +94,11 @@ class DeleteScheduleResponse(BaseModel):
 class WorkflowScheduleUpsertRequest(BaseModel):
     cron_expression: str
     timezone: str
-    enabled: bool = True
+    # Default True is the create default (new schedules start enabled). On
+    # update the route inspects model_fields_set, so an omitted `enabled`
+    # preserves the existing state (never clobbering a concurrent
+    # enable/disable) while an explicit true/false is honored.
+    enabled: bool | None = True
     parameters: dict[str, Any] | None = None
     name: str | None = None
     description: str | None = None

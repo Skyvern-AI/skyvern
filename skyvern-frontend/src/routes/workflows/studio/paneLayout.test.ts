@@ -9,6 +9,7 @@ import {
   paneResizable,
   paneWidthsKey,
   STUDIO_PANE_DEFAULT_WIDTH,
+  STUDIO_TWO_PANE_SIDE_BASIS,
 } from "./paneLayout";
 import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
 
@@ -92,8 +93,44 @@ describe("paneFlex", () => {
     );
   });
 
+  test("a two-pane default gives the side pane ~35% and the browser the rest", () => {
+    expect(paneFlex("editor", ["editor", "browser"], noWidths)).toBe(
+      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+    );
+    expect(paneFlex("browser", ["editor", "browser"], noWidths)).toBe("1 1 0%");
+    expect(paneFlex("overview", ["browser", "overview"], noWidths)).toBe(
+      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+    );
+    expect(paneFlex("browser", ["browser", "overview"], noWidths)).toBe(
+      "1 1 0%",
+    );
+  });
+
+  test("the ~35% side split holds for any greedy two-pane row, not just the factory combos", () => {
+    expect(paneFlex("editor", ["copilot", "editor"], noWidths)).toBe("1 1 0%");
+    expect(paneFlex("copilot", ["copilot", "editor"], noWidths)).toBe(
+      `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`,
+    );
+  });
+
+  test("a third pane reverts the side panes to the fixed default", () => {
+    const panes: StudioPaneId[] = ["editor", "browser", "overview"];
+    expect(paneFlex("editor", panes, noWidths)).toBe(
+      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
+    );
+    expect(paneFlex("overview", panes, noWidths)).toBe(
+      `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
+    );
+  });
+
+  test("a pinned width still wins over the two-pane default", () => {
+    expect(paneFlex("editor", ["editor", "browser"], { editor: 480 })).toBe(
+      "0 1 480px",
+    );
+  });
+
   test("garbage persisted widths fall back to the default", () => {
-    const panes: StudioPaneId[] = ["copilot", "browser"];
+    const panes: StudioPaneId[] = ["copilot", "browser", "editor"];
     expect(paneFlex("copilot", panes, { copilot: Number.NaN })).toBe(
       `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`,
     );

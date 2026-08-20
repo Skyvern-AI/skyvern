@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 from typer.testing import CliRunner
@@ -17,12 +18,16 @@ class TestOrganizationUpdateSchema:
             max_retries_per_step=3,
             webhook_callback_url="https://example.com/hook",
             artifact_url_expiry_seconds=3600,
+            default_llm_key="CUSTOM_LLM_oat_primary",
+            default_secondary_llm_key="CUSTOM_LLM_oat_secondary",
         )
         assert update.model_dump(exclude_unset=True) == {
             "max_steps_per_run": 25,
             "max_retries_per_step": 3,
             "webhook_callback_url": "https://example.com/hook",
             "artifact_url_expiry_seconds": 3600,
+            "default_llm_key": "CUSTOM_LLM_oat_primary",
+            "default_secondary_llm_key": "CUSTOM_LLM_oat_secondary",
         }
 
     def test_partial_update_excludes_unset(self) -> None:
@@ -34,6 +39,12 @@ class TestOrganizationUpdateSchema:
 
     def test_clear_max_steps_per_workflow_run_defaults_false(self) -> None:
         assert OrganizationUpdate().clear_max_steps_per_workflow_run is False
+
+    def test_clear_default_llm_flags_default_false(self) -> None:
+        update = OrganizationUpdate()
+
+        assert update.clear_default_llm_key is False
+        assert update.clear_default_secondary_llm_key is False
 
     def test_accepts_max_steps_per_workflow_run(self) -> None:
         update = OrganizationUpdate(max_steps_per_workflow_run=42)
@@ -68,6 +79,12 @@ class TestOrganizationUpdateSchema:
         with pytest.raises(ValueError):
             OrganizationUpdate(max_steps_per_run=-1)
 
+    def test_accepts_max_steps_per_run_above_150(self) -> None:
+        # This schema is shared with the self-hosted CLI/MCP tool, so it must
+        # not carry Skyvern Cloud's frontend-only cap.
+        update = OrganizationUpdate(max_steps_per_run=500)
+        assert update.model_dump(exclude_unset=True) == {"max_steps_per_run": 500}
+
     def test_rejects_negative_max_retries_per_step(self) -> None:
         with pytest.raises(ValueError):
             OrganizationUpdate(max_retries_per_step=-1)
@@ -76,6 +93,13 @@ class TestOrganizationUpdateSchema:
         # "" clears the webhook via the repository's ``is not None`` guard.
         update = OrganizationUpdate(webhook_callback_url="")
         assert update.model_dump(exclude_unset=True) == {"webhook_callback_url": ""}
+
+    def test_raw_aws_load_balancer_webhook_url_is_deferred_to_the_update_route(self) -> None:
+        url = "https://service-123.us-east-1.elb.amazonaws.com/webhook"
+
+        update = OrganizationUpdate(webhook_callback_url=url)
+
+        assert update.webhook_callback_url == url
 
 
 class TestMcpUpdateFieldsDerivedFromSchema:
@@ -88,6 +112,24 @@ class TestMcpUpdateRejectsNoneValues:
         result = asyncio.run(skyvern_org_update(updates={"max_steps_per_run": None}))
         assert not result["ok"]
         assert "None" in result["error"]["message"]
+
+    def test_raw_load_balancer_webhook_server_rejection_returns_structured_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw_http_put = AsyncMock(
+            side_effect=RuntimeError(
+                "HTTP 400: Webhook URL must use a stable custom hostname instead of an AWS load balancer DNS name."
+            )
+        )
+        monkeypatch.setattr("skyvern.cli.mcp_tools.org.raw_http_put", raw_http_put)
+
+        result = asyncio.run(
+            skyvern_org_update(updates={"webhook_callback_url": "https://service-123.elb.us-east-1.amazonaws.com/hook"})
+        )
+
+        assert not result["ok"]
+        assert "stable custom hostname" in result["error"]["message"]
+        raw_http_put.assert_awaited_once()
 
 
 class TestConfigCli:

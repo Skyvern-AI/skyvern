@@ -128,6 +128,34 @@ function useDeleteTagKeyMutation() {
 // carries the value in the BODY (so a value containing "/" can't break the path),
 // and delete is a DELETE-with-body — axios sends it via the `data` option.
 
+function useCreateTagValueMutation() {
+  const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      key,
+      value,
+      color,
+    }: {
+      key: string;
+      value: string;
+      color: PaletteColorName;
+    }) => {
+      const client = await getClient(credentialGetter);
+      return client
+        .post<TagValue>("/tag-values", { key, value, color })
+        .then((response) => response.data);
+    },
+    onSuccess: () => {
+      // Registering a label also registers its key row for pickers.
+      queryClient.invalidateQueries({ queryKey: ["tag-values"] });
+      queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
+    },
+    // No global onError toast: the caller surfaces 409 (already exists) inline.
+  });
+}
+
 function useRenameTagValueMutation() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -229,6 +257,7 @@ export {
   useApplyWorkflowTagsMutation,
   useUpdateTagKeyMutation,
   useDeleteTagKeyMutation,
+  useCreateTagValueMutation,
   useRenameTagValueMutation,
   useRecolorTagValueMutation,
   useDeleteTagValueMutation,

@@ -7,38 +7,90 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.webeye.actions import handler_utils
-from skyvern.webeye.actions.handler import _is_plain_nanp_number, _is_tel_digit_fix_enabled, _plan_tel_text
+from skyvern.webeye.actions.handler import (
+    _is_tel_digit_fix_enabled,
+    _nanp_e164_fallback,
+    _nanp_national_digits,
+    _plan_tel_text,
+)
 from tests.unit.helpers import make_organization, make_task
 
 
 @pytest.mark.parametrize(
     "value,expected",
     [
-        ("224-555-0199", True),
-        ("(224) 555-0199", True),
-        ("2245550199", True),
-        ("  224 555 0199  ", True),
-        ("+44 20 7946 0958", False),  # international: leave to the format-check LLM
-        ("+1 224-555-0199", False),  # explicit country code
-        ("224-555-0199 x123", False),  # extension marker
-        ("1-224-555-0199", False),  # 11 digits (leading country code)
-        ("224-555-019", False),  # 9 digits
-        ("", False),
+        ("+1 (224) 555-0199", "2245550199"),
+        ("+12245550199", "2245550199"),
+        ("1-224-555-0199", "2245550199"),
+        ("1 (224) 555-0199", "2245550199"),
+        ("(224) 555-0199", "2245550199"),
+        ("224-555-0199", "2245550199"),
+        ("224.555.0199", "2245550199"),
+        ("224 555 0199", "2245550199"),
+        ("12245550199", None),  # bare leading 1 is not written as a country code
+        ("13912345678", None),  # 11-digit non-NANP mobile whose first digit is 1
+        ("15012345678", None),
+        ("13987654321", None),
+        ("(13) 98765-4321", None),  # 2-digit area code + 9-digit subscriber, strips to 1 + 10
+        ("0412345678", None),
+        ("0412 345 678", None),
+        ("1234567890", None),
+        ("2245550199", None),
+        ("4155550123", None),
+        ("(024) 555-0199", None),
+        ("(224) 155-0199", None),
+        ("+44 20 7946 0958", None),
+        ("224-555-0199 x123", None),
+        ("224-555-019", None),
+        ("", None),
     ],
 )
-def test_is_plain_nanp_number(value: str, expected: bool) -> None:
-    assert _is_plain_nanp_number(value) is expected
+def test_nanp_national_digits(value: str, expected: str | None) -> None:
+    assert _nanp_national_digits(value) == expected
+
+
+@pytest.mark.parametrize(
+    "source_value,pattern,maxlength,expected",
+    [
+        ("+1 (224) 555-0199", None, None, "+12245550199"),
+        ("1-224-555-0199", r"\+1\d{10}", "12", "+12245550199"),
+        ("(224) 555-0199", None, None, None),
+        ("224-555-0199", None, None, None),
+        ("+1 (224) 555-0199", r"\d{10}", None, None),
+        ("+1 (224) 555-0199", "[", None, None),
+        ("+1 (224) 555-0199", None, "10", None),
+        ("+1 (224) 555-0199", None, "-1", None),
+        ("+1 (224) 555-0199", None, "not-a-number", None),
+    ],
+)
+def test_nanp_e164_fallback_respects_live_field_constraints(
+    source_value: str, pattern: str | None, maxlength: str | None, expected: str | None
+) -> None:
+    assert _nanp_e164_fallback(source_value, pattern=pattern, maxlength=maxlength) == expected
 
 
 def test_plan_tel_text_strips_secret_resolved_formatted_nanp() -> None:
-    # A secret that resolves to a formatted 10-digit NANP number is typed as bare digits and is never
-    # sent to the format-check LLM.
+    # A secret with an affirmative NANP country code is typed as national digits and is never sent to
+    # the format-check LLM.
     text, used_bare, run_format_check = _plan_tel_text(
-        is_tel=True, is_secret=True, value="(224) 555-0199", pattern=None
+        is_tel=True, is_secret=True, value="+1 (224) 555-0199", pattern=None
     )
     assert text == "2245550199"
     assert used_bare is True
     assert run_format_check is False
+
+
+@pytest.mark.parametrize(
+    "is_secret,expected_format_check",
+    [(False, True), (True, False)],
+)
+def test_plan_tel_text_ineligible_value_falls_back(is_secret: bool, expected_format_check: bool) -> None:
+    value = "0412 345 678"
+    assert _plan_tel_text(is_tel=True, is_secret=is_secret, value=value, pattern=None) == (
+        value,
+        False,
+        expected_format_check,
+    )
 
 
 def test_plan_tel_text_self_formatting_field_uses_bare_digits() -> None:

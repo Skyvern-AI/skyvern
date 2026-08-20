@@ -76,7 +76,7 @@ function HttpRequestBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Files</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               File fields and their paths/URLs
             </h2>
           </div>
@@ -93,7 +93,7 @@ function HttpRequestBlockParameters({
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Timeout</h1>
-          <h2 className="text-base text-slate-400">In seconds</h2>
+          <h2 className="text-base text-muted-foreground">In seconds</h2>
         </div>
         <Input value={timeout.toString()} readOnly />
       </div>
@@ -103,7 +103,7 @@ function HttpRequestBlockParameters({
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={followRedirects} disabled />
-          <span className="text-sm text-slate-400">
+          <span className="text-sm text-muted-foreground">
             {followRedirects ? "Enabled" : "Disabled"}
           </span>
         </div>
@@ -123,7 +123,7 @@ function HttpRequestBlockParameters({
           </div>
           <div className="flex w-full items-center gap-3">
             <Switch checked={true} disabled />
-            <span className="text-sm text-slate-400">Enabled</span>
+            <span className="text-sm text-muted-foreground">Enabled</span>
           </div>
         </div>
       ) : null}

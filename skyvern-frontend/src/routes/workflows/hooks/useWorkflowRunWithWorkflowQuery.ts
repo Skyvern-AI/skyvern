@@ -1,19 +1,20 @@
 import { getClient } from "@/api/AxiosClient";
 import { WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import {
-  statusIsNotFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import { getRunStatusRefetchInterval } from "./useWorkflowRunQuery";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
   useActiveOrgId,
 } from "@/store/ActiveOrgContext";
 
-function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
+function useWorkflowRunWithWorkflowQuery(options?: {
+  workflowRunId?: string;
+  enabled?: boolean;
+}) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
   const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
@@ -31,15 +32,7 @@ function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
         .get(`/workflows/runs/${workflowRunId}`, { signal })
         .then((response) => response.data);
     },
-    refetchInterval: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      if (statusIsNotFinalized(query.state.data)) {
-        return 5000;
-      }
-      return false;
-    },
+    refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
     // required for OS-level notifications to work (workflow run completion)
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
@@ -55,7 +48,7 @@ function useWorkflowRunWithWorkflowQuery(options?: { workflowRunId?: string }) {
       }
       return statusIsRunningOrQueued(query.state.data);
     },
-    enabled: !!workflowRunId,
+    enabled: (options?.enabled ?? true) && !!workflowRunId,
   });
 }
 

@@ -6,6 +6,7 @@ failure-modes (missing encryption, missing credential, refresh failure)
 so a regression doesn't silently break Sheets blocks in OSS.
 """
 
+import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -97,6 +98,64 @@ async def test_get_google_sheets_credentials_returns_none_on_refresh_failure(
         credential_id="goac_1",
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_google_sheets_credentials_marks_expired_on_dead_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected refresh token flips the credential to needs-reconnect so the UI reflects it."""
+    credential_version = datetime.datetime(2026, 4, 20)
+    secrets = google_oauth_service.GoogleCredentialSecrets(
+        refresh_token="rt",
+        scopes=[],
+        credential_version=credential_version,
+    )
+    monkeypatch.setattr(
+        google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(return_value=secrets),
+    )
+
+    async def raise_expired(*_args, **_kwargs):
+        raise google_oauth_service.ExpiredRefreshTokenError("Google rejected the refresh token")
+
+    monkeypatch.setattr(google_oauth_service, "access_token_from_secrets", raise_expired)
+    mark_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_service, "mark_credential_expired", mark_mock)
+
+    result = await AgentFunction().get_google_sheets_credentials(
+        organization_id="org_1",
+        credential_id="goac_1",
+    )
+    assert result is None
+    mark_mock.assert_awaited_once_with("org_1", "goac_1", expected_version=credential_version)
+
+
+@pytest.mark.asyncio
+async def test_get_google_workspace_credentials_marks_expired_on_dead_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = google_oauth_service.GoogleCredentialSecrets(refresh_token="rt", scopes=[])
+    monkeypatch.setattr(
+        google_oauth_service,
+        "load_credential_secrets",
+        AsyncMock(return_value=secrets),
+    )
+
+    async def raise_expired(*_args, **_kwargs):
+        raise google_oauth_service.ExpiredRefreshTokenError("Google rejected the refresh token")
+
+    monkeypatch.setattr(google_oauth_service, "credentials_from_secrets", raise_expired)
+    mark_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_service, "mark_credential_expired", mark_mock)
+
+    result = await AgentFunction().get_google_workspace_credentials(
+        organization_id="org_1",
+        credential_id="goac_1",
+    )
+    assert result is None
+    mark_mock.assert_awaited_once_with("org_1", "goac_1", expected_version=None)
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from fastapi import Depends, HTTPException, Query, status
 
 from skyvern.forge import app
 from skyvern.forge.sdk.core.permissions.schedule_limit_checker import ScheduleLimitCheckerFactory
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.agent_db import ScheduleLimitExceededError
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -245,6 +246,7 @@ async def create_workflow_schedule(
         request_data=body.parameters,
     )
     stored_parameters = _strip_none_parameters(body.parameters)
+    enabled = body.enabled if body.enabled is not None else True
 
     max_schedules = await ScheduleLimitCheckerFactory.get_instance().get_schedule_limit(
         organization,
@@ -257,7 +259,7 @@ async def create_workflow_schedule(
             max_schedules=max_schedules,
             cron_expression=body.cron_expression,
             timezone=body.timezone,
-            enabled=body.enabled,
+            enabled=enabled,
             parameters=stored_parameters,
             name=body.name,
             description=body.description,
@@ -324,7 +326,7 @@ async def create_workflow_schedule(
             workflow_schedule_id=schedule.workflow_schedule_id,
             cron_expression=body.cron_expression,
             timezone=body.timezone,
-            enabled=body.enabled,
+            enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
         )
@@ -356,7 +358,7 @@ async def create_workflow_schedule(
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=schedule.workflow_schedule_id,
         cron_expression=body.cron_expression,
-        enabled=body.enabled,
+        enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
 
@@ -466,12 +468,23 @@ async def update_workflow_schedule(
     old_name = existing.name
     old_description = existing.description
 
+    # A missing `enabled` means "leave the enable/disable state as-is", so an
+    # edit never reverts a pause/resume that the dedicated endpoints applied.
+    # The schema default is True (for create), so an omitted field must be
+    # detected via model_fields_set, not `is not None`, or every edit would
+    # silently re-enable a paused schedule. An explicit `"enabled": null` is
+    # treated the same as omitted, since null isn't a valid enabled value.
+    # Pass _UNSET (not existing.enabled) when omitted so this write can't clobber
+    # a concurrent pause/resume that lands between the read above and this write.
+    enabled_explicit = "enabled" in body.model_fields_set and body.enabled is not None
+    enabled_for_write = body.enabled if enabled_explicit else _UNSET
+
     schedule = await app.DATABASE.schedules.update_workflow_schedule(
         workflow_schedule_id=workflow_schedule_id,
         organization_id=organization.organization_id,
         cron_expression=body.cron_expression,
         timezone=body.timezone,
-        enabled=body.enabled,
+        enabled=enabled_for_write,
         parameters=stored_parameters,
         backend_schedule_id=backend_schedule_id,
         name=body.name,
@@ -483,6 +496,10 @@ async def update_workflow_schedule(
             detail=f"Schedule {workflow_schedule_id} not found",
         )
 
+    # Read back the persisted value instead of reusing enabled_for_write: when the
+    # field was omitted, the row may hold a value a concurrent request just wrote.
+    enabled = schedule.enabled
+
     try:
         await app.AGENT_FUNCTION.upsert_workflow_schedule(
             backend_schedule_id=backend_schedule_id,
@@ -491,7 +508,7 @@ async def update_workflow_schedule(
             workflow_schedule_id=workflow_schedule_id,
             cron_expression=body.cron_expression,
             timezone=body.timezone,
-            enabled=body.enabled,
+            enabled=enabled,
             parameters=stored_parameters,
             max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
         )
@@ -508,7 +525,7 @@ async def update_workflow_schedule(
                 organization_id=organization.organization_id,
                 cron_expression=old_cron,
                 timezone=old_timezone,
-                enabled=old_enabled,
+                enabled=old_enabled if enabled_explicit else _UNSET,
                 parameters=old_parameters,
                 backend_schedule_id=backend_schedule_id,
                 name=old_name,
@@ -530,7 +547,7 @@ async def update_workflow_schedule(
         workflow_permanent_id=workflow_permanent_id,
         workflow_schedule_id=workflow_schedule_id,
         cron_expression=body.cron_expression,
-        enabled=body.enabled,
+        enabled=enabled,
     )
     return WorkflowScheduleResponse(schedule=schedule, next_runs=_next_runs(schedule))
 

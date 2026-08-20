@@ -1,8 +1,9 @@
 import { TriggerType } from "@/api/types";
 import {
   CalendarIcon,
+  CodeIcon,
+  CubeIcon,
   CursorArrowIcon,
-  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { Tip } from "@/components/Tip";
 
@@ -18,8 +19,12 @@ const triggerConfig: Record<
     icon: <CursorArrowIcon className="size-3.5 text-slate-400" />,
     label: "Manual",
   },
+  [TriggerType.Mcp]: {
+    icon: <CubeIcon className="size-3.5 text-emerald-400" />,
+    label: "MCP",
+  },
   [TriggerType.Api]: {
-    icon: <LightningBoltIcon className="size-3.5 text-amber-400" />,
+    icon: <CodeIcon className="size-3.5 text-amber-400" />,
     label: "API",
   },
   [TriggerType.Scheduled]: {

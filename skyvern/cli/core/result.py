@@ -29,6 +29,19 @@ _DATA_KEEP_NONE_KEYS = frozenset(
     }
 )
 
+# (action, key) pairs whose None value is meaningful only for that specific
+# action, not globally — e.g. a session has no recordings yet. Scoped rather
+# than added to _DATA_KEEP_NONE_KEYS so it doesn't change unrelated tools
+# (skyvern_run_task/skyvern_login also have a recording_url field).
+_ACTION_DATA_KEEP_NONE_KEYS = frozenset(
+    {
+        ("skyvern_browser_session_get", "recording_url"),
+        ("skyvern_browser_session_close", "recording_url"),
+        # None is the terminal page marker; the client needs it to stop paginating.
+        ("skyvern_page", "cursor_next"),
+    }
+)
+
 
 def set_concise_responses(enabled: bool) -> None:
     global _concise_responses  # noqa: PLW0603
@@ -37,6 +50,7 @@ def set_concise_responses(enabled: bool) -> None:
 
 class ErrorCode:
     NO_ACTIVE_BROWSER = "NO_ACTIVE_BROWSER"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
     BROWSER_NOT_FOUND = "BROWSER_NOT_FOUND"
     SELECTOR_NOT_FOUND = "SELECTOR_NOT_FOUND"
     ACTION_FAILED = "ACTION_FAILED"
@@ -103,7 +117,8 @@ def make_result(
             concise_data = {
                 k: v
                 for k, v in data.items()
-                if k not in _DATA_STRIP_KEYS and (v is not None or k in _DATA_KEEP_NONE_KEYS)
+                if k not in _DATA_STRIP_KEYS
+                and (v is not None or k in _DATA_KEEP_NONE_KEYS or (action, k) in _ACTION_DATA_KEEP_NONE_KEYS)
             }
             if concise_data:
                 result["data"] = concise_data

@@ -9,9 +9,15 @@ type CmMockProps = {
   onChange?: unknown;
   onBlur?: unknown;
   value?: string;
+  theme?: unknown;
 };
 
 const cmMockCalls: CmMockProps[] = [];
+
+const themeModeMock = vi.hoisted(() => vi.fn());
+vi.mock("@/components/useThemeAsDarkOrLight", () => ({
+  useThemeAsDarkOrLight: () => themeModeMock(),
+}));
 
 vi.mock("@uiw/react-codemirror", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@uiw/react-codemirror")>();
@@ -26,9 +32,12 @@ vi.mock("@uiw/react-codemirror", async (importOriginal) => {
 
 beforeEach(() => {
   cmMockCalls.length = 0;
+  themeModeMock.mockReturnValue("dark");
 });
 
 import { CodeEditor } from "./CodeEditor";
+import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
+import { tokyoNightDay } from "@uiw/codemirror-theme-tokyo-night-day";
 
 // Drive the IntersectionObserver mock so we can flip visibility deterministically.
 let observerCallback: IntersectionObserverCallback | null = null;
@@ -154,5 +163,29 @@ describe("CodeEditor callback identity (SKY-9051)", () => {
 
     expect(finalOnCreate).toBe(initialOnCreate);
     expect(finalOnUpdate).toBe(initialOnUpdate);
+  });
+});
+
+describe("CodeEditor theme (SKY-12414)", () => {
+  function mountAndReadTheme() {
+    render(<CodeEditor value="print('hi')" language="python" />);
+    observerCallback!(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    );
+    return waitFor(() => {
+      expect(cmMockCalls.length).toBeGreaterThan(0);
+      return cmMockCalls[cmMockCalls.length - 1]!.theme;
+    });
+  }
+
+  test("uses the light Tokyo Night Day theme in light mode", async () => {
+    themeModeMock.mockReturnValue("light");
+    expect(await mountAndReadTheme()).toBe(tokyoNightDay);
+  });
+
+  test("uses the dark Tokyo Night Storm theme in dark mode", async () => {
+    themeModeMock.mockReturnValue("dark");
+    expect(await mountAndReadTheme()).toBe(tokyoNightStorm);
   });
 });

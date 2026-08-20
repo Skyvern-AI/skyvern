@@ -1,4 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
+import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
 import { getRecordingURL } from "./artifactUtils";
@@ -41,10 +42,6 @@ function TaskRecording() {
     return <div>Error loading recording</div>;
   }
 
-  if (recordingData?.url) {
-    return <video width={800} height={450} src={recordingData.url} controls />;
-  }
-
   if (recordingData?.archived) {
     return (
       <div className="text-muted-foreground">
@@ -52,6 +49,17 @@ function TaskRecording() {
         support@skyvern.com
         {/* TODO: add a "Request Restore" button */}
       </div>
+    );
+  }
+
+  if (recordingData?.url) {
+    return (
+      <ArtifactVideo
+        width={800}
+        height={450}
+        src={recordingData.url}
+        controls
+      />
     );
   }
 

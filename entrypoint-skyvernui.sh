@@ -22,63 +22,83 @@ VITE_ARTIFACT_API_BASE_URL="${VITE_ARTIFACT_API_BASE_URL:-http://localhost:9090}
 VITE_BROWSER_STREAMING_MODE="${VITE_BROWSER_STREAMING_MODE:-vnc}"
 VITE_ENABLE_LOG_ARTIFACTS="${VITE_ENABLE_LOG_ARTIFACTS:-false}"
 VITE_ENABLE_CODE_BLOCK="${VITE_ENABLE_CODE_BLOCK:-false}"
+VITE_ENVIRONMENT="${VITE_ENVIRONMENT:-local}"
+VITE_API_PATH_PREFIX="${VITE_API_PATH_PREFIX:-}"
 VITE_ENABLE_2FA_NOTIFICATIONS="${VITE_ENABLE_2FA_NOTIFICATIONS:-false}"
+VITE_CLERK_PUBLISHABLE_KEY="${VITE_CLERK_PUBLISHABLE_KEY:-}"
+VITE_PUBLIC_POSTHOG_HOST="${VITE_PUBLIC_POSTHOG_HOST:-}"
+VITE_PUBLIC_POSTHOG_KEY="${VITE_PUBLIC_POSTHOG_KEY:-}"
 
-# Priority for VITE_SKYVERN_API_KEY:
-# 1. Environment variable (from .env file or docker-compose environment),
-#    but only if it's not a placeholder/sentinel value. Both the Dockerfile
-#    default (__SKYVERN_API_KEY_PLACEHOLDER__) and the .env.example default
-#    (YOUR_API_KEY) can leak through if users skip configuration. Keep these
-#    sentinels aligned with the frontend's placeholder check in
-#    skyvern-frontend/src/util/env.ts (which matches the Docker sentinel by
-#    its _PLACEHOLDER__ suffix — the sed below rewrites every occurrence of
-#    the full sentinel in the bundle, so the frontend must never spell it out).
-# 2. Generated credentials file from the backend first-run setup
-#    (volume-mounted at /app/.skyvern/credentials.toml in docker-compose)
+# Priority for the server-side organization key:
+# 1. SKYVERN_API_KEY environment variable
+# 2. VITE_SKYVERN_API_KEY environment variable
+# 3. Generated credentials file mounted by the open-source deployment
+# 4. Fallback to .streamlit/secrets.toml (only available in self-hosted
+#    docker-compose deployments where the file is volume-mounted; not
+#    present in K8s deployments)
+SKYVERN_API_KEY="${SKYVERN_API_KEY:-}"
 VITE_SKYVERN_API_KEY="${VITE_SKYVERN_API_KEY:-}"
 SKYVERN_CREDENTIALS_FILE="${SKYVERN_CREDENTIALS_FILE:-/app/.skyvern/credentials.toml}"
-GENERATED_KEY=$(sed -n 's/.*cred\s*=\s*"\([^"]*\)".*/\1/p' "$SKYVERN_CREDENTIALS_FILE" 2>/dev/null || echo "")
-if [ -n "$VITE_SKYVERN_API_KEY" ] \
-    && [ "$VITE_SKYVERN_API_KEY" != "__SKYVERN_API_KEY_PLACEHOLDER__" ] \
-    && [ "$VITE_SKYVERN_API_KEY" != "YOUR_API_KEY" ]; then
+if [ -n "$SKYVERN_API_KEY" ]; then
+    SKYVERN_API_KEY="${SKYVERN_API_KEY#"${SKYVERN_API_KEY%%[![:space:]]*}"}"
+    SKYVERN_API_KEY="${SKYVERN_API_KEY%"${SKYVERN_API_KEY##*[![:space:]]}"}"
+    echo "Using SKYVERN_API_KEY from environment variable"
+elif [ -n "$VITE_SKYVERN_API_KEY" ]; then
     VITE_SKYVERN_API_KEY="${VITE_SKYVERN_API_KEY#"${VITE_SKYVERN_API_KEY%%[![:space:]]*}"}"
     VITE_SKYVERN_API_KEY="${VITE_SKYVERN_API_KEY%"${VITE_SKYVERN_API_KEY##*[![:space:]]}"}"
+    SKYVERN_API_KEY="$VITE_SKYVERN_API_KEY"
     echo "Using VITE_SKYVERN_API_KEY from environment variable"
-elif [ -n "$GENERATED_KEY" ]; then
-    VITE_SKYVERN_API_KEY="$GENERATED_KEY"
-    echo "Using VITE_SKYVERN_API_KEY from $SKYVERN_CREDENTIALS_FILE"
 else
-    echo "WARNING: No VITE_SKYVERN_API_KEY found in environment or $SKYVERN_CREDENTIALS_FILE"
-    VITE_SKYVERN_API_KEY=""
+    SKYVERN_API_KEY=$(sed -n 's/.*cred[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$SKYVERN_CREDENTIALS_FILE" 2>/dev/null || echo "")
+    if [ -n "$SKYVERN_API_KEY" ]; then
+        echo "Using SKYVERN_API_KEY from $SKYVERN_CREDENTIALS_FILE"
+    else
+        SKYVERN_API_KEY=$(sed -n 's/.*cred[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .streamlit/secrets.toml 2>/dev/null || echo "")
+        if [ -n "$SKYVERN_API_KEY" ]; then
+            echo "Using SKYVERN_API_KEY from .streamlit/secrets.toml"
+        else
+            echo "WARNING: No organization key found in environment, $SKYVERN_CREDENTIALS_FILE, or .streamlit/secrets.toml"
+        fi
+    fi
 fi
+export SKYVERN_API_KEY
+export VITE_API_BASE_URL
 
 echo "Injecting runtime environment variables into pre-built assets..."
 
-# Rebuild from the pristine template each start so sed sees fresh placeholders
-# and `docker restart` re-applies current env values (e.g. rotated API key).
-rm -rf /app/dist
-cp -r /app/dist.template /app/dist
+if [ -d /app/dist.template ]; then
+    rm -rf /app/dist
+    cp -r /app/dist.template /app/dist
+fi
 
 # Escape all values for safe use in sed replacement patterns
 ESC_API_BASE_URL=$(escape_sed "$VITE_API_BASE_URL")
 ESC_WSS_BASE_URL=$(escape_sed "$VITE_WSS_BASE_URL")
 ESC_ARTIFACT_API_BASE_URL=$(escape_sed "$VITE_ARTIFACT_API_BASE_URL")
-ESC_SKYVERN_API_KEY=$(escape_sed "$VITE_SKYVERN_API_KEY")
 ESC_BROWSER_STREAMING_MODE=$(escape_sed "$VITE_BROWSER_STREAMING_MODE")
 ESC_ENABLE_LOG_ARTIFACTS=$(escape_sed "$VITE_ENABLE_LOG_ARTIFACTS")
 ESC_ENABLE_CODE_BLOCK=$(escape_sed "$VITE_ENABLE_CODE_BLOCK")
+ESC_ENVIRONMENT=$(escape_sed "$VITE_ENVIRONMENT")
+ESC_API_PATH_PREFIX=$(escape_sed "$VITE_API_PATH_PREFIX")
 ESC_ENABLE_2FA_NOTIFICATIONS=$(escape_sed "$VITE_ENABLE_2FA_NOTIFICATIONS")
+ESC_CLERK_PUBLISHABLE_KEY=$(escape_sed "$VITE_CLERK_PUBLISHABLE_KEY")
+ESC_PUBLIC_POSTHOG_HOST=$(escape_sed "$VITE_PUBLIC_POSTHOG_HOST")
+ESC_PUBLIC_POSTHOG_KEY=$(escape_sed "$VITE_PUBLIC_POSTHOG_KEY")
 
 # Replace placeholder strings in pre-built JS and HTML files with actual runtime values
 find /app/dist \( -name "*.js" -o -name "*.html" \) -exec sed -i \
     -e "s|__VITE_API_BASE_URL_PLACEHOLDER__|${ESC_API_BASE_URL}|g" \
     -e "s|__VITE_WSS_BASE_URL_PLACEHOLDER__|${ESC_WSS_BASE_URL}|g" \
     -e "s|__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__|${ESC_ARTIFACT_API_BASE_URL}|g" \
-    -e "s|__SKYVERN_API_KEY_PLACEHOLDER__|${ESC_SKYVERN_API_KEY}|g" \
     -e "s|__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__|${ESC_BROWSER_STREAMING_MODE}|g" \
     -e "s|__VITE_ENABLE_LOG_ARTIFACTS_PLACEHOLDER__|${ESC_ENABLE_LOG_ARTIFACTS}|g" \
     -e "s|__VITE_ENABLE_CODE_BLOCK_PLACEHOLDER__|${ESC_ENABLE_CODE_BLOCK}|g" \
+    -e "s|__VITE_ENVIRONMENT_PLACEHOLDER__|${ESC_ENVIRONMENT}|g" \
+    -e "s|__VITE_API_PATH_PREFIX_PLACEHOLDER__|${ESC_API_PATH_PREFIX}|g" \
     -e "s|__VITE_ENABLE_2FA_NOTIFICATIONS_PLACEHOLDER__|${ESC_ENABLE_2FA_NOTIFICATIONS}|g" \
+    -e "s|__VITE_CLERK_PUBLISHABLE_KEY_PLACEHOLDER__|${ESC_CLERK_PUBLISHABLE_KEY}|g" \
+    -e "s|__VITE_PUBLIC_POSTHOG_HOST_PLACEHOLDER__|${ESC_PUBLIC_POSTHOG_HOST}|g" \
+    -e "s|__VITE_PUBLIC_POSTHOG_KEY_PLACEHOLDER__|${ESC_PUBLIC_POSTHOG_KEY}|g" \
     {} +
 
 # Sanity check: ensure ALL placeholders were actually replaced.
@@ -87,10 +107,10 @@ find /app/dist \( -name "*.js" -o -name "*.html" \) -exec sed -i \
 # Scoped to *.js and *.html (the files sed modifies above) so unmodified
 # sourcemaps don't trigger false positives.
 if grep -rqE --include='*.js' --include='*.html' \
-    '__VITE_[A-Z0-9_]+_PLACEHOLDER__|__SKYVERN_API_KEY_PLACEHOLDER__' /app/dist/; then
+    '__VITE_[A-Z0-9_]+_PLACEHOLDER__' /app/dist/; then
     echo "ERROR: Placeholder replacement incomplete in dist/. Unreplaced placeholders:" >&2
     grep -rhoE --include='*.js' --include='*.html' \
-        '__VITE_[A-Z0-9_]+_PLACEHOLDER__|__SKYVERN_API_KEY_PLACEHOLDER__' /app/dist/ \
+        '__VITE_[A-Z0-9_]+_PLACEHOLDER__' /app/dist/ \
         | sort -u | sed 's/^/  /' >&2
     exit 1
 fi

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
+from tests.unit._fingerprint_expectations import expected_fingerprint
+
+
+@pytest.fixture(autouse=True)
+def _keyed_fingerprint(fingerprint_secret_key: str) -> str:
+    return fingerprint_secret_key
+
+
+def _finalize_events(cap: list[dict]) -> list[dict]:
+    return [e for e in cap if e.get("event") == "download_suffix_finalize_rename"]
 
 
 def _make_task(
@@ -54,6 +67,137 @@ async def test_finalize_downloaded_files_renames_with_download_suffix(tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_finalize_excludes_incomplete_file_created_during_discovery(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    rename_mock = MagicMock()
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch(
+            "skyvern.forge.agent.list_files_in_directory",
+            return_value=[str(download_dir / "late.txt.crdownload")],
+        ),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+    ):
+        discovered = await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert discovered == []
+    rename_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_rename_for_session_file_already_named_by_suffix(tmp_path) -> None:
+    # A session download is named at download time by download_suffix, so the watcher syncs it as
+    # ``s3://.../req-123.pdf``. Finalize must NOT re-suffix it (which would bump it to req-123_1.pdf).
+    agent = ForgeAgent()
+    task = _make_task()
+    task.browser_session_id = "pbs-1"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(return_value=b"data")
+    rename_mock = MagicMock()
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
+            return_value=["s3://bucket/o/pbs-1/req-123.pdf"]
+        )
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_not_called()
+    assert (download_dir / "req-123.pdf").exists()
+    assert not (download_dir / "req-123_1.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_dedupes_two_session_files_sharing_one_suffix(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    task.browser_session_id = "pbs-1"
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+
+    aws_client = MagicMock()
+    aws_client.download_file = AsyncMock(side_effect=[b"a", b"b"])
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(
+            return_value=[
+                "s3://bucket/o/pbs-1/aaaa.pdf",
+                "s3://bucket/o/pbs-1/bbbb.pdf",
+            ]
+        )
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    assert {path.name for path in download_dir.iterdir()} == {"req-123.pdf", "req-123_1.pdf"}
+    assert not (download_dir / "aaaa.pdf").exists()
+    assert not (download_dir / "bbbb.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_rename_for_local_file_already_named_by_suffix(tmp_path) -> None:
+    # A run-directory download named at download time by download_suffix arrives as an absolute path
+    # from list_files_in_directory; finalize must not re-suffix it to req-123_1.pdf.
+    agent = ForgeAgent()
+    task = _make_task()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    (download_dir / "req-123.pdf").write_bytes(b"x")
+
+    rename_mock = MagicMock()
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.rename_file", rename_mock),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="req-123",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    rename_mock.assert_not_called()
+    assert (download_dir / "req-123.pdf").exists()
+    assert not (download_dir / "req-123_1.pdf").exists()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
     agent = ForgeAgent()
     task = _make_task()
@@ -70,7 +214,6 @@ async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.otel_trace.get_current_span", return_value=MagicMock()),
         patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
         patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
         patch("skyvern.forge.agent.app") as mock_app,
@@ -87,6 +230,110 @@ async def test_cleanup_task_finalizes_downloads_before_saving(tmp_path) -> None:
         )
 
     assert call_order == ["rename", "save"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_task_settles_browser_download_before_finalize_and_save(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    last_step = MagicMock(step_id="step-1")
+    release = asyncio.Event()
+    handler_published = asyncio.Event()
+    interceptor = MagicMock()
+
+    class _Settle:
+        async def __aenter__(self) -> None:
+            await release.wait()
+            handler_published.set()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    interceptor.settle_browser_downloads.return_value = _Settle()
+    browser_context = MagicMock()
+    browser_context._skyvern_cdp_download_interceptor = interceptor
+    browser_state = MagicMock(browser_context=browser_context)
+
+    async def finalize_side_effect(*args: object, **kwargs: object) -> list[str]:
+        assert handler_published.is_set()
+        return ["final.txt"]
+
+    async def save_side_effect(**kwargs: object) -> None:
+        assert handler_published.is_set()
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(side_effect=finalize_side_effect)),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = AsyncMock(side_effect=save_side_effect)
+        cleanup = asyncio.create_task(
+            agent.clean_up_task(
+                task,
+                last_step=last_step,
+                need_final_screenshot=False,
+                download_suffix="req-123",
+                list_files_before=[],
+            )
+        )
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        release.set()
+        await asyncio.wait_for(cleanup, timeout=2)
+
+    interceptor.settle_browser_downloads.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_bounds_browser_download_handler_drain() -> None:
+    agent = ForgeAgent()
+    task = _make_task()
+    last_step = MagicMock(step_id="step-1")
+    never_release = asyncio.Event()
+    interceptor = MagicMock()
+
+    class _HangingSettle:
+        async def __aenter__(self) -> None:
+            await never_release.wait()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    interceptor.settle_browser_downloads.return_value = _HangingSettle()
+    browser_context = MagicMock()
+    browser_context._skyvern_cdp_download_interceptor = interceptor
+    browser_state = MagicMock(browser_context=browser_context)
+    finalize = AsyncMock()
+    save = AsyncMock()
+    started_at = asyncio.get_running_loop().time()
+
+    with (
+        patch("skyvern.forge.agent.SAVE_DOWNLOADED_FILES_TIMEOUT", 0.01),
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch.object(agent, "_finalize_downloaded_files_for_task", finalize),
+        patch("skyvern.forge.agent.app") as mock_app,
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.STORAGE.save_downloaded_files = save
+        await asyncio.wait_for(
+            agent.clean_up_task(
+                task,
+                last_step=last_step,
+                need_final_screenshot=False,
+                download_suffix="req-123",
+                list_files_before=[],
+            ),
+            timeout=0.5,
+        )
+
+    assert asyncio.get_running_loop().time() - started_at < 0.2
+    finalize.assert_not_awaited()
+    save.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -150,7 +397,6 @@ async def test_execute_step_complete_on_download_does_not_double_finalize(tmp_pa
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.otel_trace.get_current_span", return_value=MagicMock()),
         patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=MagicMock()),
         patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
@@ -270,7 +516,6 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
 
     with (
         patch("skyvern.forge.agent.analytics.capture"),
-        patch("skyvern.forge.agent.otel_trace.get_current_span", return_value=MagicMock()),
         patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=MagicMock()),
         patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
@@ -315,3 +560,182 @@ async def test_execute_step_reuses_initial_download_baseline_across_recursive_st
 
     assert (download_dir / "req-123.zip").exists()
     assert not (download_dir / "uuid-file.zip").exists()
+
+
+@pytest.mark.asyncio
+async def test_finalize_emits_lineage_with_correlation_fields(tmp_path) -> None:
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-A", workflow_run_id="wr-A")
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    stale_ctx = SkyvernContext(task_id="task-0", download_suffix="AllDataExport_ACCT_STALE")
+
+    with (
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_files_in_directory", return_value=["uuid-file.zip"]),
+        patch("skyvern.forge.agent.rename_file", MagicMock()),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=stale_ctx),
+        capture_logs() as cap,
+    ):
+        await agent._finalize_downloaded_files_for_task(
+            task,
+            organization_id=task.organization_id,
+            download_suffix="AllDataExport_ACCT_CURRENT",
+            list_files_before=[],
+            randomize_if_missing=False,
+        )
+
+    events = _finalize_events(cap)
+    assert len(events) == 1
+    event = events[0]
+    assert event["finalize_task_id"] == "task-A"
+    assert event["finalize_workflow_run_id"] == "wr-A"
+    assert event["pre_rename_filename_fp"] == expected_fingerprint("uuid-file.zip")
+    assert event["passed_download_suffix_fp"] == expected_fingerprint("AllDataExport_ACCT_CURRENT")
+    assert event["desired_name_fp"] == expected_fingerprint("AllDataExport_ACCT_CURRENT.zip")
+    assert event["will_rename"] is True
+    # The contextvar suffix is captured alongside the task_block suffix so a divergence (stale context vs
+    # late-download) is attributable; here they intentionally differ.
+    assert event["context_download_suffix_fp"] == expected_fingerprint("AllDataExport_ACCT_STALE")
+    assert event["context_task_id"] == "task-0"
+    # Bare task_id/workflow_run_id must NOT be emitted: the forge_log processor overwrites them with the
+    # ambient context's values, which under a stale/shared context would mask the finalize target.
+    assert "task_id" not in event
+    assert "workflow_run_id" not in event
+
+
+@pytest.mark.asyncio
+async def test_finalize_lineage_distinguishes_two_tasks(tmp_path) -> None:
+    agent = ForgeAgent()
+    records: list[dict] = []
+    for account, task_id in (("ACCT_AAA", "task-A"), ("ACCT_BBB", "task-B")):
+        download_dir = tmp_path / task_id
+        download_dir.mkdir()
+        task = _make_task(task_id=task_id, workflow_run_id=f"wr-{task_id}")
+        with (
+            patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+            patch("skyvern.forge.agent.list_files_in_directory", return_value=["uuid-file.zip"]),
+            patch("skyvern.forge.agent.rename_file", MagicMock()),
+            patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+            capture_logs() as cap,
+        ):
+            await agent._finalize_downloaded_files_for_task(
+                task,
+                organization_id=task.organization_id,
+                download_suffix=f"Export_{account}",
+                list_files_before=[],
+                randomize_if_missing=False,
+            )
+        records.extend(_finalize_events(cap))
+
+    assert len(records) == 2
+    assert {r["finalize_task_id"] for r in records} == {"task-A", "task-B"}
+    assert len({r["passed_download_suffix_fp"] for r in records}) == 2  # two iterations distinguishable
+
+
+@pytest.mark.asyncio
+async def test_execute_step_complete_on_download_emits_finalize_lineage(tmp_path) -> None:
+    agent = ForgeAgent()
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    suffix = "AllDataExport_ACCT_ZZZ"
+    real_ctx = SkyvernContext(task_id="task-1", workflow_run_id="wr-1")
+
+    task = _make_task()
+    task.status = SimpleNamespace(value="running")
+    task.navigation_goal = "Download invoice"
+    task.data_extraction_goal = None
+    task.complete_criterion = None
+    task.terminate_criterion = None
+    task.browser_address = None
+    task.max_steps_per_run = None
+    task.url = "https://example.com"
+    task.proxy_location = None
+    task.llm_key = None
+    task.task_type = "general"
+
+    step = MagicMock()
+    step.step_id = "step-1"
+    step.order = 0
+    step.retry_index = 0
+    step.status = "created"
+
+    organization = MagicMock()
+    organization.organization_id = task.organization_id
+    organization.max_steps_per_run = None
+
+    task_block = MagicMock()
+    task_block.label = "bill_usage_download"
+    task_block.complete_on_download = True
+    task_block.download_timeout = None
+    task_block.download_suffix = suffix
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    async def agent_step_side_effect(*args, **kwargs):
+        (download_dir / "uuid-file.zip").write_text("dummy")
+        return step, DetailedAgentStepOutput(
+            scraped_page=None,
+            extract_action_prompt=None,
+            llm_response=None,
+            actions=None,
+            action_results=None,
+            actions_and_results=None,
+            cua_response=None,
+        )
+
+    async def update_step_side_effect(step_obj, *args, **kwargs):
+        if "status" in kwargs:
+            step_obj.status = kwargs["status"]
+        if "is_last" in kwargs:
+            step_obj.is_last = kwargs["is_last"]
+        return step_obj
+
+    async def update_task_side_effect(task_obj, *args, **kwargs):
+        return task_obj
+
+    with (
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.ensure_context", return_value=real_ctx),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=real_ctx),
+        patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
+        patch("skyvern.forge.agent.list_downloading_files_in_directory", return_value=[]),
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch.object(agent, "initialize_execution_state", AsyncMock(return_value=(step, browser_state, None))),
+        patch.object(agent, "agent_step", AsyncMock(side_effect=agent_step_side_effect)),
+        patch.object(agent, "update_step", AsyncMock(side_effect=update_step_side_effect)),
+        patch.object(agent, "update_task", AsyncMock(side_effect=update_task_side_effect)),
+        patch.object(agent, "update_task_errors_from_detailed_output", AsyncMock(return_value=task)),
+        capture_logs() as cap,
+    ):
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        mock_app.AGENT_FUNCTION.post_step_execution = AsyncMock()
+        mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+        mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+        mock_app.STORAGE.save_downloaded_files = AsyncMock()
+        mock_app.STORAGE.list_downloaded_files_in_browser_session = AsyncMock(return_value=[])
+
+        await agent.execute_step(
+            organization=organization,
+            task=task,
+            step=step,
+            task_block=task_block,
+            close_browser_on_completion=True,
+            complete_verification=True,
+            engine=RunEngine.skyvern_v1,
+        )
+
+    finalize_events = _finalize_events(cap)
+    assert finalize_events, "finalize lineage was not emitted through the real complete_on_download path"
+
+    event = finalize_events[0]
+    assert event["finalize_task_id"] == "task-1"
+    # The finalize lineage consumes the task_block-derived suffix and records the contextvar value too,
+    # so a task_block-vs-context divergence is attributable at the point the filename is decided.
+    assert event["passed_download_suffix_fp"] == expected_fingerprint(suffix)
+    assert event["context_download_suffix_fp"] == expected_fingerprint(suffix)
+    assert (download_dir / f"{suffix}.zip").exists()

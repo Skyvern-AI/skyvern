@@ -1,13 +1,12 @@
-"""Typed terminal outcome for an edited extraction schema whose fields map to no
-output the workflow produces.
+"""Typed finding for an edited extraction schema whose fields map to no output the
+workflow produces.
 
 When a user edits a code block's confirmed ``extraction_schema`` to add fields that
 overlap none of the block's known output contract (its top-level return keys plus
 confirmed ``goal_value_paths``), re-authoring cannot reconcile the mismatch: there is
-nothing on the page or in the return for the new field to bind to. Surfacing it as a
-typed, non-repairable schema-incompatibility outcome — rather than letting the agent
-churn until the repair ceiling — preserves the existing draft and tells the user
-exactly which fields do not map.
+nothing on the page or in the return for the new field to bind to. The draft persists
+and the finding names the fields that do not map, because a test-run cannot: the run
+succeeds and silently omits them.
 """
 
 from __future__ import annotations
@@ -17,12 +16,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    CopilotToolBlockerSignal,
+    SCHEMA_INCOMPATIBILITY_REASON_CODE as SCHEMA_INCOMPATIBILITY_REASON_CODE,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
 )
 
-SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
-SCHEMA_INCOMPATIBILITY_FAILURE_TYPE = "schema_incompatibility"
 SCHEMA_INCOMPATIBILITY_BLOCKED_TOOL = "update_and_run_blocks"
 
 _DEFAULT_NEXT_ACTIONS: tuple[str, ...] = (
@@ -32,9 +31,8 @@ _DEFAULT_NEXT_ACTIONS: tuple[str, ...] = (
 )
 
 _GENERIC_USER_REASON = (
-    "I couldn't apply the edited extraction schema because some of its fields don't match "
-    "any value this workflow currently produces. Tell me what they should map to and I'll try again. "
-    "Your current draft is unchanged."
+    "I saved the workflow, but some fields in the edited extraction schema don't match any value it "
+    "produces, so those fields will come back empty. Tell me what they should map to and I'll wire them up."
 )
 
 
@@ -60,8 +58,8 @@ class SchemaIncompatibility(BaseModel):
 
 
 def merge_schema_incompatibilities(items: list[SchemaIncompatibility]) -> SchemaIncompatibility | None:
-    """Fold per-block incompatibilities into a single terminal record. The merged
-    paths are de-duplicated and ordered; the first block label anchors the record."""
+    """Fold per-block incompatibilities into a single record. The merged paths are
+    de-duplicated and ordered; the first block label anchors the record."""
     real = [item for item in items if item is not None]
     if not real:
         return None
@@ -101,16 +99,16 @@ def render_schema_incompatibility_user_reason(incompat: SchemaIncompatibility) -
     """Product-language reply rendered from the structured incompatibility. Falls back
     to a field-free message if an exotic field name trips the user-facing safety gate."""
     fields = _field_list_phrase(incompat.incompatible_paths)
-    verb = "doesn't" if len(incompat.incompatible_paths) == 1 else "don't"
+    single = len(incompat.incompatible_paths) == 1
+    verb = "doesn't" if single else "don't"
+    subject = "it will" if single else "they will"
     sentences = [
-        f"I couldn't apply the edited extraction schema: the field {fields} {verb} match any value this workflow currently produces."
+        f"I saved the workflow, but the field {fields} {verb} match any value it produces, so {subject} come back empty."
     ]
     if incompat.known_output_paths:
         outputs = ", ".join(incompat.known_output_paths)
         sentences.append(f"This workflow's data currently covers {outputs}.")
-    sentences.append(
-        "Tell me which existing output it should map to, or remove it, and I'll try again. Your current draft is unchanged."
-    )
+    sentences.append("Tell me which existing output it should map to, or remove it, and I'll wire it up.")
     candidate = " ".join(sentences)
     try:
         assert_clean_user_facing_text(candidate, blocked_tool=SCHEMA_INCOMPATIBILITY_BLOCKED_TOOL)
@@ -123,23 +121,7 @@ def render_schema_incompatibility_agent_steer(incompat: SchemaIncompatibility) -
     incompatible = ", ".join(incompat.incompatible_paths) or "(unknown)"
     known = ", ".join(incompat.known_output_paths) or "(none recorded)"
     return (
-        f"STOP: the edited extraction_schema declares field(s) [{incompatible}] that map to no output block "
-        f"`{incompat.block_label}` produces [{known}]. This is not repairable by re-authoring the same draft. "
-        "Report the mismatch to the user and ask which existing output the field should map to. "
-        "The prior draft is preserved; do not rerun the blocks."
-    )
-
-
-def build_schema_incompatibility_blocker_signal(incompat: SchemaIncompatibility) -> CopilotToolBlockerSignal:
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=render_schema_incompatibility_agent_steer(incompat),
-        user_facing_reason=render_schema_incompatibility_user_reason(incompat),
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=incompat.preserves_workflow_draft,
-        renders_final_reply=True,
-        internal_reason_code=SCHEMA_INCOMPATIBILITY_REASON_CODE,
-        blocked_tool=SCHEMA_INCOMPATIBILITY_BLOCKED_TOOL,
-        extra={"schema_incompatibility": incompat.to_summary_dict()},
+        f"The edited extraction_schema declares field(s) [{incompatible}] that map to no output block "
+        f"`{incompat.block_label}` produces [{known}]. Re-authoring the same draft will not resolve it; "
+        "ask the user which existing output the field should map to."
     )

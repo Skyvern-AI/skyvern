@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LiteLLMParams, LLMConfig
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.agent_db import AgentDB
+    from skyvern.forge.sdk.schemas.organizations import Organization
 
 LOG = structlog.get_logger()
 
@@ -31,8 +36,15 @@ class CustomLLMRegistryEntry:
 _custom_llm_configs: dict[str, CustomLLMRegistryEntry] = {}
 
 
+CUSTOM_LLM_KEY_PREFIX = "CUSTOM_LLM_"
+
+
 def custom_llm_key(custom_llm_id: str) -> str:
-    return f"CUSTOM_LLM_{custom_llm_id}"
+    return f"{CUSTOM_LLM_KEY_PREFIX}{custom_llm_id}"
+
+
+def is_custom_llm_key(llm_key: str) -> bool:
+    return llm_key.startswith(CUSTOM_LLM_KEY_PREFIX)
 
 
 def custom_llm_model_name(custom_llm_id: str) -> str:
@@ -62,19 +74,42 @@ def _litellm_model_name(config: CustomLLMConfig) -> str:
         return f"openai/{_strip_provider_prefix(config.model_name, ('openai/',))}"
     if config.provider is CustomLLMProvider.OPENROUTER:
         return f"openrouter/{_strip_provider_prefix(config.model_name, ('openrouter/',))}"
+    if config.provider is CustomLLMProvider.GEMINI:
+        return f"gemini/{_strip_provider_prefix(config.model_name, ('gemini/',))}"
     if config.model_name.startswith(("ollama/", "ollama_chat/")):
         return config.model_name
     return f"ollama_chat/{config.model_name}"
 
 
+# Keys _build_litellm_params derives from the config; everything else in litellm_params is
+# customer-supplied passthrough. Kept here so dispatch paths can recover the passthrough set.
+_CONNECTION_PARAM_KEYS = frozenset({"api_key", "api_base", "api_version", "model_info"})
+
+
 def _build_litellm_params(config: CustomLLMConfig, litellm_model_name: str) -> LiteLLMParams:
-    params: LiteLLMParams = {
+    params: dict[str, Any] = {
         "api_key": config.api_key,
         "api_base": config.api_base,
         "api_version": config.api_version,
         "model_info": {"model_name": litellm_model_name},
     }
-    return {key: value for key, value in params.items() if value is not None}  # type: ignore[return-value]
+    merged = {key: value for key, value in params.items() if value is not None}
+    # Provider-specific passthrough (e.g. service_tier, thinking, extra_headers). Applied last so it
+    # rides through the same litellm_params merge that reaches the completion call; reserved keys are
+    # rejected at config validation, so nothing here can clobber api_key/api_base/model.
+    merged.update(config.extra_parameters)
+    return merged  # type: ignore[return-value]
+
+
+def custom_llm_passthrough_parameters(litellm_params: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return the customer-supplied passthrough params from a registered config's litellm_params.
+
+    Dispatch paths that rebuild the request kwargs from a fixed allowlist (e.g. the custom
+    OpenRouter branch) use this to forward provider-specific params they would otherwise drop.
+    """
+    if not litellm_params:
+        return {}
+    return {key: value for key, value in litellm_params.items() if key not in _CONNECTION_PARAM_KEYS}
 
 
 def _build_llm_config(config: CustomLLMConfig) -> LLMConfig:
@@ -157,6 +192,27 @@ async def load_custom_llm_configs_for_organization(database: AgentDB, organizati
             )
             continue
         register_custom_llm_config(token.id, token.organization_id, config)
+
+
+async def prepare_org_llm_runtime(
+    database: AgentDB,
+    organization_id: str,
+    organization: Organization | None = None,
+) -> None:
+    if organization is None:
+        organization, _ = await asyncio.gather(
+            database.organizations.get_organization(organization_id),
+            load_custom_llm_configs_for_organization(database, organization_id),
+        )
+    else:
+        await load_custom_llm_configs_for_organization(database, organization_id)
+
+    context = skyvern_context.current()
+    if context is None:
+        context = SkyvernContext(organization_id=organization_id)
+        skyvern_context.set(context)
+    context.org_default_llm_key = organization.default_llm_key if organization is not None else None
+    context.org_default_secondary_llm_key = organization.default_secondary_llm_key if organization is not None else None
 
 
 async def ensure_custom_llm_registered_for_org(

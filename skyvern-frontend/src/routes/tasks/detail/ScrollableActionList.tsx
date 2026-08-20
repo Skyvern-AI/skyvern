@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { Action, ActionsApiResponse, ActionTypes, Status } from "@/api/types";
+import { Action, ActionTypes } from "@/api/types";
 import { StatusPill } from "@/components/ui/status-pill";
 import {
   Tooltip,
@@ -10,8 +10,6 @@ import {
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useWorkflowRunViewingV2 } from "@/hooks/useWorkflowRunViewingV2";
-import { useRunViewingPreferenceStore } from "@/store/RunViewingPreferenceStore";
 import { cn } from "@/util/utils";
 import {
   CheckCircledIcon,
@@ -20,33 +18,8 @@ import {
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useQueryClient } from "@tanstack/react-query";
-import { ReactNode, useRef, useState } from "react";
-import { ActionCardCompact } from "./ActionCardCompact";
+import { ReactNode, useRef } from "react";
 import { ActionTypePill } from "./ActionTypePill";
-import { RunViewingModeToggle } from "./RunViewingModeToggle";
-
-function toActionsApiResponse(
-  action: Action,
-  index: number,
-): ActionsApiResponse {
-  return {
-    action_id: `${action.stepId}-${index}`,
-    action_type: action.type,
-    status: action.success ? Status.Completed : Status.Failed,
-    task_id: null,
-    step_id: action.stepId,
-    step_order: null,
-    action_order: index,
-    confidence_float: action.confidence ?? null,
-    description: null,
-    reasoning: action.reasoning,
-    intention: null,
-    response: null,
-    created_by: action.created_by,
-    text: action.input ?? null,
-    screenshot_artifact_id: action.screenshotArtifactId ?? null,
-  };
-}
 
 type Props = {
   data: Array<Action | null>;
@@ -69,14 +42,9 @@ function ScrollableActionList({
 }: Props) {
   const queryClient = useQueryClient();
   const credentialGetter = useCredentialGetter();
-  const isViewingV2 = useWorkflowRunViewingV2();
-  const viewMode = useRunViewingPreferenceStore((s) => s.viewMode);
-  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
   const refs = useRef<Array<HTMLDivElement | null>>(
     Array.from({ length: data.length + 1 }),
   );
-
-  const useCompact = isViewingV2 && viewMode === "compact";
 
   function prefetchStepArtifacts(stepId: string) {
     queryClient.prefetchQuery({
@@ -98,34 +66,6 @@ function ScrollableActionList({
         continue;
       }
       const selected = activeIndex === i;
-      if (useCompact) {
-        const compactAction = toActionsApiResponse(action, i);
-        elements.push(
-          <div
-            key={i}
-            ref={(element) => {
-              refs.current[i] = element;
-            }}
-            onMouseEnter={() => prefetchStepArtifacts(action.stepId)}
-          >
-            <ActionCardCompact
-              action={compactAction}
-              index={i + 1}
-              active={selected}
-              expanded={expandedActionId === compactAction.action_id}
-              onSelect={() => onActiveIndexChange(i)}
-              onToggleExpanded={() =>
-                setExpandedActionId((current) =>
-                  current === compactAction.action_id
-                    ? null
-                    : compactAction.action_id,
-                )
-              }
-            />
-          </div>,
-        );
-        continue;
-      }
       elements.push(
         <div
           key={i}
@@ -204,7 +144,6 @@ function ScrollableActionList({
         <div className="flex h-8 flex-1 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
           Steps: {taskDetails.steps}
         </div>
-        {isViewingV2 && <RunViewingModeToggle />}
       </div>
       <Separator />
       <ScrollArea className="p-4">
@@ -217,9 +156,7 @@ function ScrollableActionList({
                   refs.current[data.length] = element;
                 }}
                 className={cn(
-                  useCompact
-                    ? "flex cursor-pointer items-center gap-2 rounded-md border-2 bg-slate-elevation3 px-3 py-2 text-xs hover:border-slate-50"
-                    : "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 p-4 hover:border-slate-50",
+                  "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 p-4 hover:border-slate-50",
                   {
                     "border-slate-50": activeIndex === "stream",
                   },
@@ -227,15 +164,8 @@ function ScrollableActionList({
                 onClick={() => onActiveIndexChange("stream")}
               >
                 <div className="flex items-center gap-2">
-                  <DotFilledIcon
-                    className={cn(
-                      "text-destructive",
-                      useCompact ? "h-3 w-3 animate-pulse" : "h-6 w-6",
-                    )}
-                  />
-                  <span className={cn(useCompact && "text-xs text-slate-200")}>
-                    Live
-                  </span>
+                  <DotFilledIcon className="h-6 w-6 text-destructive" />
+                  <span>Live</span>
                 </div>
               </div>
             )}

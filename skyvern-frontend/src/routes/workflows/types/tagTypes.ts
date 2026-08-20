@@ -20,6 +20,11 @@ export interface TagsResponse {
   tags: Array<TagResponse>;
 }
 
+export interface RunTagsResponse {
+  workflow_run_id: string;
+  tags: Array<TagResponse>;
+}
+
 export interface TagKey {
   key: string;
   description: string | null;
@@ -44,6 +49,10 @@ export interface TagValue {
 // metadata). Descriptions come from the tag-key registry (GET /tag-keys).
 export interface WorkflowTagsBatchResponse {
   workflow_tags: Record<string, Array<Tag>>;
+}
+
+export interface RunTagsBatchResponse {
+  run_tags: Record<string, Array<Tag>>;
 }
 
 // Body for POST /workflows/{wpid}/tags. `tags` sets/overwrites ({key?, value});
@@ -74,6 +83,14 @@ export const TAG_KEY_MAX_LENGTH = 64;
 export const TAG_VALUE_MAX_LENGTH = 256;
 export const MAX_AUTOCOMPLETE_SUGGESTIONS = 6;
 
+export function isSystemTagKey(key: string | null | undefined): boolean {
+  return typeof key === "string" && key.startsWith(RESERVED_TAG_KEY_PREFIX);
+}
+
+export function isUserWritableTagKey(key: string | null | undefined): boolean {
+  return !isSystemTagKey(key);
+}
+
 // Returns an error string when `key` (a group) is invalid, or null when valid.
 export function validateTagKey(key: string): string | null {
   const trimmed = key.trim();
@@ -83,7 +100,7 @@ export function validateTagKey(key: string): string | null {
   if (trimmed.length > TAG_KEY_MAX_LENGTH) {
     return `Group must be at most ${TAG_KEY_MAX_LENGTH} characters.`;
   }
-  if (trimmed.startsWith(RESERVED_TAG_KEY_PREFIX)) {
+  if (isSystemTagKey(trimmed)) {
     return `Groups can't start with the reserved "${RESERVED_TAG_KEY_PREFIX}" prefix.`;
   }
   if (!TAG_KEY_REGEX.test(trimmed)) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from enum import Enum
 
 import aiofiles
 import structlog
@@ -11,9 +12,23 @@ from pydantic import BaseModel, PrivateAttr
 LOG = structlog.get_logger()
 
 
+class DownloadBinding(str, Enum):
+    """Where this browser's downloads are bound.
+
+    RUN_DIR (default): the run-scoped directory; downloads are rebound there and read locally. This is
+    the local/default behavior for local runs and any non-provider-owned session.
+    SESSION_DIR: a provider-owned remote download destination. The run-dir rebind must be skipped and a
+    URL replay is forbidden, so the provider-selected destination is preserved.
+    """
+
+    RUN_DIR = "run_dir"
+    SESSION_DIR = "session_dir"
+
+
 class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
+    video_file_extension: str | None = None
     video_data: bytes = b""
 
 
@@ -29,10 +44,43 @@ class BrowserArtifacts(BaseModel):
     needs_cdp_frame_publisher: bool = False
     # Optional opaque identifier for a remote browser session.
     remote_browser_session_id: str | None = None
+    # Download destination binding for this browser. SESSION_DIR (a provider-owned remote destination)
+    # means the run-dir rebind must be skipped and URL replay forbidden; RUN_DIR (default) preserves
+    # local/default delivery. See DownloadBinding.
+    download_binding: DownloadBinding = DownloadBinding.RUN_DIR
+    # The saved browser profile the creator actually applied to this browser's user-data-dir.
+    # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
+    # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
+    applied_browser_profile_id: str | None = None
     _browser_console_log_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
     # Tombstoned synchronously before any await, so set_popup_video_listener can't
     # re-register a page's video after RealBrowserState decides to discard it.
     _discarded_pages: set[Page] = PrivateAttr(default_factory=set)
+    # Freshness-guard state, captured at seed and read at write-back (in-memory only, per browser run).
+    # _seed_cookie_snapshot / _seed_profile_etag record what the profile held when this run seeded it;
+    # _run_performed_fresh_login flips true once a login block types a fresh sign-in.
+    _seed_cookie_snapshot: list[dict] | None = PrivateAttr(default=None)
+    _seed_profile_etag: str | None = PrivateAttr(default=None)
+    _run_performed_fresh_login: bool = PrivateAttr(default=False)
+    # _seed_load_failed flips true when a saved profile failed to launch (corruption/stale lock) and the
+    # run fell back to a blank dir — its end-state is not this profile's, so write-back must be suppressed.
+    _seed_load_failed: bool = PrivateAttr(default=False)
+    # _seed_capture_failed flips true when the seed fingerprint could not be captured — the guard then
+    # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
+    _seed_capture_failed: bool = PrivateAttr(default=False)
+
+    def record_seed_profile_state(self, cookies: list[dict], etag: str | None) -> None:
+        self._seed_cookie_snapshot = cookies
+        self._seed_profile_etag = etag
+
+    def mark_run_performed_fresh_login(self) -> None:
+        self._run_performed_fresh_login = True
+
+    def mark_seed_load_failed(self) -> None:
+        self._seed_load_failed = True
+
+    def mark_seed_capture_failed(self) -> None:
+        self._seed_capture_failed = True
 
     def discard_page_video(self, page: Page) -> None:
         self._discarded_pages.add(page)

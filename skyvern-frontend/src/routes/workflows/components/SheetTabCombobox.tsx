@@ -21,6 +21,7 @@ import {
   type SheetsBlockType,
 } from "@/util/sheetsTelemetry";
 import { InlineCreateRow } from "./InlineCreateRow";
+import { TemplateExpressionRow } from "./TemplateExpressionRow";
 
 type Props = {
   nodeId: string;
@@ -31,6 +32,8 @@ type Props = {
   placeholder?: string;
   allowCreate: boolean;
   blockType: SheetsBlockType;
+  templateMode: boolean;
+  onTemplateModeChange: (enabled: boolean) => void;
   onChange: (value: string) => void;
   onSelect: (tabName: string) => void;
 };
@@ -44,6 +47,8 @@ function SheetTabCombobox({
   placeholder,
   allowCreate,
   blockType,
+  templateMode,
+  onTemplateModeChange,
   onChange,
   onSelect,
 }: Props) {
@@ -51,6 +56,8 @@ function SheetTabCombobox({
   const anchorRef = useRef<HTMLDivElement>(null);
   const postHog = usePostHog();
   const orgId = useCurrentOrgId();
+  // Re-derived locally so the field renders template values correctly even if a caller forgets to OR them into templateMode.
+  const effectiveTemplateMode = templateMode || isTemplateExpression(value);
 
   const isTypeable =
     hasSelectedAccount &&
@@ -59,19 +66,27 @@ function SheetTabCombobox({
     !isTemplateExpression(spreadsheetUrl) &&
     extractSpreadsheetIdFromUrl(spreadsheetUrl) !== null &&
     !isTemplateExpression(value);
+  const canPick = isTypeable && !effectiveTemplateMode;
 
   const handleChange = (nextValue: string) => {
     onChange(nextValue);
   };
 
   const handleFocus = () => {
-    if (isTypeable) {
+    if (canPick) {
       setIsOpen(true);
     }
   };
 
+  const handleUseTemplateExpression = () => {
+    setIsOpen(false);
+    onTemplateModeChange(true);
+  };
+
+  const popoverOpen = isOpen && canPick;
+
   return (
-    <Popover open={isOpen && isTypeable} onOpenChange={setIsOpen}>
+    <Popover open={popoverOpen} onOpenChange={setIsOpen}>
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <WorkflowBlockInputTextarea
@@ -79,7 +94,9 @@ function SheetTabCombobox({
             value={value}
             onChange={handleChange}
             onFocus={handleFocus}
-            placeholder={placeholder}
+            placeholder={
+              effectiveTemplateMode ? "sheet_{{ current_index }}" : placeholder
+            }
             hideActions={!hasSelectedAccount}
             className="nopan text-xs"
           />
@@ -94,7 +111,7 @@ function SheetTabCombobox({
             e.preventDefault();
           }
         }}
-        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-slate-700 bg-slate-900 p-0 shadow-lg"
+        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-border bg-slate-elevation1 p-0 shadow-lg"
       >
         <SheetTabListPanel
           credentialId={credentialId}
@@ -112,6 +129,7 @@ function SheetTabCombobox({
             setIsOpen(false);
           }}
         />
+        <TemplateExpressionRow onClick={handleUseTemplateExpression} />
       </PopoverContent>
     </Popover>
   );
@@ -197,14 +215,14 @@ function SheetTabListPanel({
   if (isReconnectRequired(tabsQuery.error)) {
     return (
       <div className="w-full p-3 text-xs">
-        <p className="mb-2 text-slate-200">
+        <p className="mb-2 text-foreground dark:text-slate-200">
           Reconnect this Google account to enable the sheet picker.
         </p>
         <a
           href="/integrations"
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-slate-300 underline hover:text-slate-100"
+          className="inline-flex items-center gap-1 text-tertiary-foreground underline hover:text-foreground"
         >
           Open integrations <ExternalLinkIcon className="size-3" />
         </a>
@@ -224,7 +242,7 @@ function SheetTabListPanel({
   return (
     <>
       {allowCreate ? (
-        <div className="border-b border-slate-700">
+        <div className="border-b border-border">
           <InlineCreateRow
             label="Create new sheet"
             placeholder="Sheet title"
@@ -241,14 +259,16 @@ function SheetTabListPanel({
             ))}
           </div>
         ) : tabs.length === 0 ? (
-          <div className="px-3 py-3 text-xs text-slate-500">No sheets.</div>
+          <div className="px-3 py-3 text-xs text-muted-foreground dark:text-slate-500">
+            No sheets.
+          </div>
         ) : (
           tabs.map((tab, index) => (
             <button
               key={tab.sheet_id}
               type="button"
               onClick={() => onPick(tab.title, index)}
-              className="flex w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-700"
+              className="flex w-full px-3 py-2 text-left text-xs text-foreground hover:bg-muted dark:text-slate-200 dark:hover:bg-slate-700"
             >
               {tab.title}
             </button>

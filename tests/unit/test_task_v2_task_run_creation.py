@@ -9,7 +9,10 @@ from skyvern.services.task_v2_service import DEFAULT_WORKFLOW_TITLE, initialize_
 
 
 @pytest.mark.asyncio
-async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known() -> None:
+async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.services.task_v2_service.validate_fetch_url", lambda url: url)
     organization = SimpleNamespace(organization_id="org_123")
     user_url = "https://example.com"
 

@@ -15,12 +15,18 @@ import type {
 } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { toast } from "@/components/ui/use-toast";
+
 import { PromptBox } from "./PromptBox";
 
 const { mockNavigate, mockPost, mockSetAutoplay } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
   mockPost: vi.fn(),
   mockSetAutoplay: vi.fn(),
+}));
+
+const { studioState } = vi.hoisted(() => ({
+  studioState: { enabled: false },
 }));
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -31,6 +37,10 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => undefined,
+}));
+
+vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
+  useWorkflowStudioEnabled: () => studioState.enabled,
 }));
 
 vi.mock("@/store/useAutoplayStore", () => ({
@@ -136,10 +146,22 @@ function renderPromptBox(enableCopilotHandoff = false) {
 
 afterEach(() => {
   cleanup();
+  sessionStorage.clear();
+  studioState.enabled = false;
   mockNavigate.mockReset();
   mockPost.mockReset();
   mockSetAutoplay.mockReset();
+  vi.mocked(toast).mockReset();
 });
+
+async function submitPrompt(text: string) {
+  renderPromptBox();
+  fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+    target: { value: text },
+  });
+  fireEvent.click(screen.getByLabelText("submit-prompt"));
+  await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+}
 
 describe("PromptBox", () => {
   test("creates prompt-generated workflows as V1 agent runs", async () => {
@@ -170,7 +192,63 @@ describe("PromptBox", () => {
     expect(body.request.url).toBe("https://google.com");
   });
 
-  test("hands Discover prompts to workflow copilot with agent execution", async () => {
+  // SKY-13154: a 2xx whose body fails JSON.parse arrives as a raw string, so
+  // `data.workflow_definition` was undefined and onSuccess threw a TypeError
+  // after the success toast had already fired.
+  test("rejects a 2xx whose body is not a workflow, without leaking the body", async () => {
+    const interstitial = "<html><body>Sign in to continue</body></html>";
+    mockPost.mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "text/html" },
+      data: interstitial,
+    });
+
+    await submitPrompt("Visit the docs");
+
+    await waitFor(() =>
+      expect(vi.mocked(toast)).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: "destructive" }),
+      ),
+    );
+
+    const descriptions = vi
+      .mocked(toast)
+      .mock.calls.map(([args]) => String(args.description ?? ""));
+    const diagnostic = descriptions.join(" ");
+
+    expect(diagnostic).toContain("status=200");
+    expect(diagnostic).toContain("content_type=text/html");
+    expect(diagnostic).toContain("parsed_as_json=false");
+    expect(diagnostic).toContain(`body_length=${interstitial.length}`);
+    // The body may be an auth interstitial or carry customer data.
+    expect(diagnostic).not.toContain("Sign in to continue");
+
+    expect(
+      vi.mocked(toast).mock.calls.some(([args]) => args.variant === "success"),
+    ).toBe(false);
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  // The agent exists server-side by this point, so an absent first block must
+  // not keep the user on /discover.
+  test("navigates to the new agent even when it has no blocks", async () => {
+    mockPost.mockResolvedValue({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      data: {
+        workflow_permanent_id: "wpid_empty",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    await submitPrompt("Visit the docs");
+
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledTimes(1));
+    expect(mockNavigate).toHaveBeenCalledWith("/agents/wpid_empty/build");
+    expect(mockSetAutoplay).not.toHaveBeenCalled();
+  });
+
+  test("hands Discover prompts to the legacy build path via route state only", async () => {
     mockPost.mockResolvedValue({
       data: {
         workflow_permanent_id: "wpid_copilot",
@@ -199,5 +277,39 @@ describe("PromptBox", () => {
         state: { copilotMessage: "Build this workflow" },
       },
     );
+    // The legacy /build (Debugger) surface never mounts the recovery hook, so
+    // no session-scoped copy is written — writing one would strand a dead entry.
+    expect(
+      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_copilot"),
+    ).toBeNull();
+  });
+
+  test("hands Discover prompts to workflow studio with recoverable prompt state", async () => {
+    studioState.enabled = true;
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_studio",
+        workflow_definition: { blocks: [] },
+      },
+    });
+
+    renderPromptBox(true);
+
+    fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
+      target: { value: "Build this in studio" },
+    });
+    fireEvent.click(screen.getByLabelText("submit-prompt"));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
+
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/agents/wpid_studio/studio?via=discover",
+      {
+        state: { copilotMessage: "Build this in studio" },
+      },
+    );
+    expect(
+      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_studio"),
+    ).toBe("Build this in studio");
   });
 });

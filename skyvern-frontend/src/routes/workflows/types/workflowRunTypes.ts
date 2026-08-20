@@ -35,6 +35,7 @@ export type WorkflowRunBlock = {
   title: string | null;
   status: Status | null;
   failure_reason: string | null;
+  error_codes?: Array<string> | null;
   output: object | Array<unknown> | string | null;
   continue_on_failure: boolean;
   task_id: string | null;

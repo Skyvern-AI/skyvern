@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -57,6 +58,43 @@ def test_workflow_create_yaml_request_accepts_browser_profile_id() -> None:
     assert request.browser_profile_id == "bp_abc123"
 
 
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_rejects_raw_load_balancer_webhook_url() -> None:
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        webhook_callback_url="https://service-123.elb.us-east-1.amazonaws.com/hook",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    with pytest.raises(SkyvernHTTPException, match="stable custom hostname"):
+        await WorkflowService().create_workflow_from_request(
+            organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+            request=request,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_allows_unchanged_legacy_webhook_url() -> None:
+    legacy_url = "https://service-123.elb.us-east-1.amazonaws.com/hook"
+    service, updated_workflow = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_webhook_callback_url=legacy_url,
+    )
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        webhook_callback_url=legacy_url,
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    result = await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+    )
+
+    assert result is updated_workflow
+
+
 def test_workflow_create_yaml_request_masks_cdp_connect_headers_on_dump() -> None:
     request = WorkflowCreateYAMLRequest(
         title="test",
@@ -95,6 +133,32 @@ async def test_create_workflow_from_request_preserves_existing_max_elapsed_time_
     refresh_schedules_mock = service._refresh_workflow_schedule_runtime_limits
     assert isinstance(refresh_schedules_mock, AsyncMock)
     refresh_schedules_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_from_request_preserves_existing_created_by_when_omitted() -> None:
+    service, _ = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_created_by="o_1_user",
+    )
+
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+        edited_by="copilot",
+    )
+
+    create_workflow_mock = service.create_workflow
+    assert isinstance(create_workflow_mock, AsyncMock)
+    assert create_workflow_mock.await_args is not None
+    assert create_workflow_mock.await_args.kwargs["created_by"] == "o_1_user"
+    assert create_workflow_mock.await_args.kwargs["edited_by"] == "copilot"
 
 
 @pytest.mark.asyncio
@@ -243,6 +307,7 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     )
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
             return_value=[schedule_with_backend, schedule_without_backend]
         )
@@ -275,6 +340,8 @@ def _make_workflow_update_service(
     existing_max_elapsed_time_minutes: int | None,
     existing_enable_self_healing: bool = True,
     existing_pin_saved_session_ip: bool = False,
+    existing_webhook_callback_url: str | None = None,
+    existing_created_by: str | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
@@ -286,6 +353,8 @@ def _make_workflow_update_service(
         max_elapsed_time_minutes=existing_max_elapsed_time_minutes,
         enable_self_healing=existing_enable_self_healing,
         pin_saved_session_ip=existing_pin_saved_session_ip,
+        webhook_callback_url=existing_webhook_callback_url,
+        created_by=existing_created_by,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
     updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")
@@ -306,16 +375,37 @@ def _make_workflow_update_service(
 
 def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     service = WorkflowService()
-    workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
+    workflow_run = SimpleNamespace(
+        workflow_run_id="wr_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="org_test",
+        browser_profile_id=None,
+        browser_seed_source=None,
+        proxy_location=None,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)  # type: ignore[method-assign]
     service.create_workflow_run = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
     service.get_workflow_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.create_workflow_run_parameters = AsyncMock(return_value=[])  # type: ignore[method-assign]
     service.mark_workflow_run_as_failed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
+    # These tests assert the request-level browser_profile_id copy, not seed resolution.
+    service._resolve_and_stamp_run_seed = AsyncMock(return_value=workflow_run)  # type: ignore[method-assign]
 
-    organization = SimpleNamespace(organization_id="org_test", organization_name="Test Org")
+    organization = SimpleNamespace(
+        organization_id="org_test",
+        organization_name="Test Org",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
     return service, organization, workflow_run
+
+
+def _configure_setup_app_mocks(mock_app: Any) -> None:
+    mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
+    mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+    mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+    mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock()
 
 
 def _make_workflow_stub(
@@ -326,17 +416,21 @@ def _make_workflow_stub(
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
+        title="test",
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=browser_profile_id,
+        browser_profile_key=None,
         persist_browser_session=False,
+        pin_saved_session_ip=False,
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         run_with="agent",
         code_version=None,
         adaptive_caching=False,
         sequential_key=None,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
 
 
@@ -357,8 +451,7 @@ async def test_setup_workflow_run_falls_back_to_workflow_browser_profile_id() ->
     assert request.browser_profile_id is None
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
-        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
-        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        _configure_setup_app_mocks(mock_app)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -379,8 +472,7 @@ async def test_setup_workflow_run_run_level_value_takes_precedence() -> None:
     request = WorkflowRequestBody(data={}, browser_profile_id="bp_run_specific")
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
-        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
-        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        _configure_setup_app_mocks(mock_app)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -401,8 +493,7 @@ async def test_setup_workflow_run_no_default_no_request_stays_none() -> None:
     request = WorkflowRequestBody(data={})
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
-        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
-        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        _configure_setup_app_mocks(mock_app)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -424,8 +515,7 @@ async def test_setup_workflow_run_session_present_skips_workflow_default() -> No
     assert request.browser_profile_id is None
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
-        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
-        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        _configure_setup_app_mocks(mock_app)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -446,8 +536,7 @@ async def test_setup_workflow_run_prefers_request_max_elapsed_time_over_workflow
     request = WorkflowRequestBody(data={}, max_elapsed_time_minutes=10)
 
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
-        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
-        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+        _configure_setup_app_mocks(mock_app)
 
         await service.setup_workflow_run(
             request_id="req_test",
@@ -461,3 +550,27 @@ async def test_setup_workflow_run_prefers_request_max_elapsed_time_over_workflow
     create_workflow_run_mock.assert_awaited_once()
     assert create_workflow_run_mock.await_args is not None
     assert create_workflow_run_mock.await_args.kwargs["max_elapsed_time_minutes"] == 10
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_without_credentials_writes_no_sequential_credential() -> None:
+    """A credential-less run leaves sequential_credential_id NULL — the MVP never writes a completion
+    sentinel. Readiness is proven from queued status + queued task + parameter equality, so no credential
+    write happens and the column stays NULL for a run that resolves to no sequential credential."""
+    workflow_stub = _make_workflow_stub(browser_profile_id=None)
+    service, organization, _ = _make_setup_service(workflow_stub)
+
+    request = WorkflowRequestBody(data={})
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+        update_mock = mock_app.DATABASE.workflow_runs.update_workflow_run
+        assert all("sequential_credential_id" not in call.kwargs for call in update_mock.await_args_list)

@@ -98,17 +98,17 @@ function OnePasswordItemSelector({
       </SelectTrigger>
       <SelectContent>
         {isError && (
-          <div className="px-2 py-1.5 text-xs text-slate-400">
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
             Couldn&apos;t load 1Password items. Enter a value manually instead.
           </div>
         )}
         {!isError && !data?.configured && (
-          <div className="px-2 py-1.5 text-xs text-slate-400">
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
             Connect 1Password in Settings to list items
           </div>
         )}
         {!isError && data?.configured && visibleItems.length === 0 && (
-          <div className="px-2 py-1.5 text-xs text-slate-400">
+          <div className="px-2 py-1.5 text-xs text-muted-foreground">
             No 1Password items found
           </div>
         )}
@@ -122,7 +122,7 @@ function OnePasswordItemSelector({
               <span className="min-w-0 flex-1 truncate text-sm font-medium">
                 <SelectItemText>{item.title}</SelectItemText>
               </span>
-              <span className="shrink-0 rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400">
+              <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                 {item.vault_name}
               </span>
             </div>

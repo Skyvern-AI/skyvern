@@ -1,338 +1,406 @@
-from __future__ import annotations
-
-import textwrap
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.copilot.context import CredentialCheck, StructuredContext
-from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound, build_request_policy
+from skyvern.forge import app
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy_trust_floor
+from skyvern.forge.sdk.copilot.tools.credentials import _list_credentials, _serialize_credential
+from skyvern.forge.sdk.schemas.credentials import CredentialType
 
 
-def _yaml(body: str) -> str:
-    return textwrap.dedent(body).strip() + "\n"
-
-
-def test_detects_workflow_level_credential_referencing_empty_workflow_param() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: username_key_vault_id
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: ''
-          - key: password_key_vault_id
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: null
-          - key: azure_credentials
-            parameter_type: azure_vault_credential
-            azure_vault_credential_parameter_id: azcp_528000000000000000
-            vault_name: skyvern-secret-store
-            username_key: '{{username_key_vault_id}}'
-            password_key: '{{password_key_vault_id}}'
-          blocks:
-          - block_type: login
-            label: login
-            parameters: []
-        """
-    )
-
-    findings = _workflow_credential_inputs_unbound(yaml)
-    kinds = {(f["location"], f["field"], f["kind"]) for f in findings}
-
-    assert ("workflow", "username_key", "credential_template_unbound") in kinds
-    assert ("workflow", "password_key", "credential_template_unbound") in kinds
-
-
-def test_resolves_when_workflow_param_has_non_empty_default_value() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: username_key_vault_id
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: user@example.com
-          - key: password_key_vault_id
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: stored
-          - key: azure_credentials
-            parameter_type: azure_vault_credential
-            azure_vault_credential_parameter_id: azcp_real
-            vault_name: skyvern-secret-store
-            username_key: '{{username_key_vault_id}}'
-            password_key: '{{password_key_vault_id}}'
-          blocks: []
-        """
-    )
-
-    assert _workflow_credential_inputs_unbound(yaml) == []
-
-
-def test_jinja_reference_to_undefined_workflow_param_is_flagged() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: azure_credentials
-            parameter_type: azure_vault_credential
-            azure_vault_credential_parameter_id: azcp_real
-            vault_name: skyvern-secret-store
-            username_key: '{{not_a_parameter}}'
-            password_key: literal
-          blocks: []
-        """
-    )
-
-    findings = _workflow_credential_inputs_unbound(yaml)
-
-    assert any(f["kind"] == "credential_template_undefined" and f["missing"] == "not_a_parameter" for f in findings)
-
-
-def test_empty_literal_credential_key_flagged() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: azure_credentials
-            parameter_type: azure_vault_credential
-            azure_vault_credential_parameter_id: azcp_real
-            vault_name: skyvern-secret-store
-            username_key: ''
-            password_key: '   '
-          blocks: []
-        """
-    )
-
-    findings = _workflow_credential_inputs_unbound(yaml)
-
-    assert {(f["field"], f["kind"]) for f in findings} == {
-        ("username_key", "credential_empty"),
-        ("password_key", "credential_empty"),
-    }
-
-
-def test_mock_eval_keys_with_placeholder_suffix_are_not_false_flagged() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: username_key_placeholder
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: mock-user
-          - key: password_key_placeholder
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: mock-pass
-          - key: azure_credentials
-            parameter_type: azure_vault_credential
-            azure_vault_credential_parameter_id: azcp_placeholder
-            vault_name: skyvern-secret-store
-            username_key: '{{ username_key_placeholder }}'
-            password_key: '{{ password_key_placeholder }}'
-          blocks: []
-        """
-    )
-
-    assert _workflow_credential_inputs_unbound(yaml) == []
-
-
-def test_block_level_credential_inside_loop_blocks_is_walked() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters: []
-          blocks:
-          - block_type: for_loop
-            label: outer
-            loop_blocks:
-            - block_type: login
-              label: inner_login
-              parameters:
-              - parameter_type: azure_vault_credential
-                key: azure_credentials
-                azure_vault_credential_parameter_id: azcp_real
-                vault_name: skyvern-secret-store
-                username_key: '{{missing_key}}'
-                password_key: '{{missing_key}}'
-        """
-    )
-
-    findings = _workflow_credential_inputs_unbound(yaml)
-
-    assert any(
-        f["location"] == "inner_login" and f["field"] == "username_key" and f["kind"] == "credential_template_undefined"
-        for f in findings
+def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        credential_id=credential_id,
+        tested_url=tested_url,
+        credential_type=CredentialType.PASSWORD,
+        username="user@example.test",
+        totp_type=None,
+        totp_identifier=None,
+        card_last4=None,
+        card_brand=None,
+        secret_label=None,
     )
 
 
-def test_non_login_credential_types_are_out_of_scope() -> None:
-    """Only login-credential types have username/password key fields; secret-only
-    types (AWS_SECRET, AZURE_SECRET, Bitwarden Sensitive/CreditCard) use different
-    schemas and fall outside this guardrail."""
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters:
-          - key: my_secret
-            parameter_type: aws_secret
-            aws_key: '{{ some_unbound_key }}'
-          blocks: []
-        """
+def _ctx(policy: RequestPolicy, *credential_targets: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        organization_id="org-1",
+        user_message="expanded agent input",
+        request_policy=policy,
     )
-
-    assert _workflow_credential_inputs_unbound(yaml) == []
-
-
-def test_workflow_without_credentials_returns_empty() -> None:
-    yaml = _yaml(
-        """
-        title: example
-        workflow_definition:
-          parameters: []
-          blocks:
-          - block_type: navigation
-            label: visit
-            url: https://example.com/
-            navigation_goal: open
-        """
-    )
-
-    assert _workflow_credential_inputs_unbound(yaml) == []
-
-
-def test_malformed_or_empty_yaml_is_inert() -> None:
-    assert _workflow_credential_inputs_unbound("") == []
-    assert _workflow_credential_inputs_unbound("- not a workflow yaml\n") == []
-    assert _workflow_credential_inputs_unbound(":: broken yaml ::") == []
-
-
-def _discovered_context(*credential_ids: str) -> str:
-    structured = StructuredContext(
-        credentials_checked=[
-            CredentialCheck(credential_name=cid, credential_id=cid, found=True) for cid in credential_ids
-        ]
-    )
-    return structured.to_json_str()
 
 
 @pytest.mark.asyncio
-async def test_discovered_credentials_seed_approved_set_on_none_turn() -> None:
-    org_credentials = [
-        SimpleNamespace(credential_id="cred_amazon"),
-        SimpleNamespace(credential_id="cred_quicken"),
-    ]
-    with patch(
-        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
-        new=AsyncMock(return_value=org_credentials),
-    ):
-        policy = await build_request_policy(
-            user_message="yes, use both of those",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context=_discovered_context("cred_amazon", "cred_quicken"),
-            organization_id="o_test",
-            handler=None,
-        )
+async def test_request_policy_trust_floor_makes_only_the_narrow_safety_call() -> None:
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "handling": "none", "citations": []})
 
-    assert policy.credential_input_kind == "none"
-    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon", "cred_quicken"]
-
-
-@pytest.mark.asyncio
-async def test_discovered_credential_absent_from_org_is_not_approved() -> None:
-    with patch(
-        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
-        new=AsyncMock(return_value=[SimpleNamespace(credential_id="cred_amazon")]),
-    ):
-        policy = await build_request_policy(
-            user_message="yes",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context=_discovered_context("cred_amazon", "cred_ghost"),
-            organization_id="o_test",
-            handler=None,
-        )
-
-    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon"]
-
-
-@pytest.mark.asyncio
-async def test_no_discovered_credentials_leaves_approved_set_empty() -> None:
-    get_by_ids = AsyncMock(return_value=[])
-    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=get_by_ids):
-        policy = await build_request_policy(
-            user_message="add a step to download the report",
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="o_test",
-            handler=None,
-        )
-
-    assert policy.discovered_credentials == []
-    get_by_ids.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_fallback_code_block_credential_request_saves_draft_without_running() -> None:
-    credential = SimpleNamespace(
-        credential_id="cred_email_otp",
-        name="mock-portal-login-email-otp",
-        tested_url="http://localhost:8900/telco_billing/northwind/?mfa=email",
-    )
-    with patch(
-        "skyvern.forge.app.DATABASE.credentials.get_credentials",
-        new=AsyncMock(return_value=[credential]),
-    ):
-        policy = await build_request_policy(
-            user_message=(
-                "Build this as a Code block credential test using the saved credential named "
-                "mock-portal-login-email-otp. Do not create a Login block for sign-in or MFA, "
-                "and use await login_credentials.otp() for the email one-time-code."
-            ),
-            workflow_yaml="",
-            chat_history=[],
-            global_llm_context="",
-            organization_id="o_test",
-            handler=None,
-        )
-
-    assert policy.classifier_status == "fallback"
-    assert policy.credential_input_kind == "credential_name"
-    assert policy.credential_refs == ["mock-portal-login-email-otp"]
-    assert policy.resolved_credentials == [credential]
-    assert policy.allow_update_workflow is True
-    assert policy.allow_run_blocks is False
-    assert policy.allow_missing_credentials_in_draft is True
-    assert policy.testing_intent == "skip_test"
-    assert policy.requires_user_clarification is False
-
-
-@pytest.mark.asyncio
-async def test_fallback_code_block_generic_one_time_code_does_not_skip_run() -> None:
-    policy = await build_request_policy(
-        user_message="Build a code block that handles a one time code after sign in.",
+    policy = await build_request_policy_trust_floor(
+        user_message="Build a workflow for https://example.com/report",
         workflow_yaml="",
         chat_history=[],
         global_llm_context="",
-        organization_id="o_test",
-        handler=None,
+        organization_id="org-1",
+        handler=handler,
     )
 
-    assert policy.classifier_status == "fallback"
+    handler.assert_awaited_once()
+    assert handler.await_args.kwargs["prompt_name"] == "workflow-copilot-raw-secret-safety"
+    assert policy.classifier_status == "not_run"
+    assert policy.completion_criteria == []
+    assert policy.user_provided_site_urls == ["https://example.com/report"]
+
+
+@pytest.mark.asyncio
+async def test_request_policy_trust_floor_survives_a_url_with_a_malformed_authority() -> None:
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "handling": "none", "citations": []})
+
+    policy = await build_request_policy_trust_floor(
+        user_message="log into [https://broken.example](https://broken.example) then https://example.com/report",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+    assert policy.user_provided_site_urls == ["https://example.com/report"]
+
+
+@pytest.mark.asyncio
+async def test_request_policy_trust_floor_redacts_raw_secret_in_canonical_message() -> None:
+    literal = "password=hunter2-secret-value"
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "handling": "none", "citations": []})
+
+    policy = await build_request_policy_trust_floor(
+        user_message=f"Make a draft using {literal}",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+    handler.assert_awaited_once()
+    assert policy.raw_secret_detected is False
+    assert policy.raw_secret_handling == "none"
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.raw_secret_safety_citation_count == 0
     assert policy.allow_run_blocks is True
-    assert policy.allow_missing_credentials_in_draft is False
-    assert policy.testing_intent == "unspecified"
+    assert literal not in policy.canonical_user_message
+    assert "hunter2-secret-value" not in policy.canonical_user_message
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_mode_binds_one_grounded_name() -> None:
+    policy = RequestPolicy(canonical_user_message="Use saved-login for this workflow")
+    ctx = _ctx(policy, "saved-login")
+    credential = _cred("saved-login", "cred_one")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": "saved-login"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_one"}
+    assert [item.credential_id for item in policy.resolved_credentials] == ["cred_one"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classifier_targets", [(), ("different-login",)])
+async def test_list_credentials_exact_mode_uses_literal_provenance_not_classifier_targets(
+    classifier_targets: tuple[str, ...],
+) -> None:
+    policy = RequestPolicy(
+        canonical_user_message="Please build the workflow with the saved credential saved-login for this site."
+    )
+    ctx = _ctx(policy, *classifier_targets)
+    credential = _cred("saved-login", "cred_one")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": "saved-login"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_one"}
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_mode_does_not_let_classifier_choose_between_literal_references() -> None:
+    credentials = [_cred("Prod", "cred_prod"), _cred("Backup", "cred_backup")]
+    policy = RequestPolicy(canonical_user_message="Use Prod or Backup for this workflow")
+    ctx = _ctx(policy, "Prod")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=credentials),
+    ):
+        result = await _list_credentials({"exact_reference": "Prod"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_prod"}
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_mode_denies_ungrounded_model_reference() -> None:
+    policy = RequestPolicy(canonical_user_message="Use my saved credential")
+    ctx = _ctx(policy)
+    loader = AsyncMock(return_value=[_cred("invented-login", "cred_one")])
+
+    with patch("skyvern.forge.sdk.copilot.tools.credentials.load_credentials", loader):
+        result = await _list_credentials({"exact_reference": "invented-login"}, ctx)
+
+    assert result["data"]["status"] == "denied"
+    loader.assert_awaited_once()
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("latest_user_message", "reference"),
+    [
+        ("Use Production for this workflow", "Prod"),
+        ("Use cred_shared_backup for this workflow", "cred_shared"),
+        ("Use saved-login-old for this workflow", "saved-login"),
+    ],
+)
+async def test_list_credentials_exact_mode_denies_reference_embedded_in_larger_identifier(
+    latest_user_message: str,
+    reference: str,
+) -> None:
+    policy = RequestPolicy(canonical_user_message=latest_user_message)
+    ctx = _ctx(policy, reference)
+    loader = AsyncMock(return_value=[_cred(reference, "cred_one")])
+
+    with patch("skyvern.forge.sdk.copilot.tools.credentials.load_credentials", loader):
+        result = await _list_credentials({"exact_reference": reference}, ctx)
+
+    assert result["data"]["status"] == "denied"
+    loader.assert_awaited_once()
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("latest_user_message", "reference", "credentials"),
+    [
+        ("Use Prod Login for this workflow", "Prod", [_cred("Prod", "cred_prod"), _cred("Prod Login", "cred_login")]),
+        ("Use prod.example for this workflow", "prod", [_cred("prod", "cred_prod")]),
+    ],
+)
+async def test_list_credentials_exact_mode_prefers_complete_saved_name_over_partial_name(
+    latest_user_message: str,
+    reference: str,
+    credentials: list[SimpleNamespace],
+) -> None:
+    policy = RequestPolicy(canonical_user_message=latest_user_message)
+    ctx = _ctx(policy, reference)
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=credentials),
+    ):
+        result = await _list_credentials({"exact_reference": reference}, ctx)
+
+    assert result["data"]["status"] == "denied"
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ['Use "Prod Login", please', "Use (Prod Login).", "Use `Prod Login`"])
+async def test_list_credentials_exact_mode_accepts_quoted_name_with_sentence_punctuation(message: str) -> None:
+    credential = _cred("Prod Login", "cred_login")
+    policy = RequestPolicy(canonical_user_message=message)
+    ctx = _ctx(policy, "Prod Login")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": "Prod Login"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["Replace Prod with Prod Login", "Do not use Prod; use Prod Login"],
+)
+async def test_list_credentials_exact_mode_leaves_selection_semantics_to_the_agent(message: str) -> None:
+    credentials = [_cred("Prod", "cred_prod"), _cred("Prod Login", "cred_login")]
+    policy = RequestPolicy(canonical_user_message=message)
+    ctx = _ctx(policy, "Prod Login")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=credentials),
+    ):
+        result = await _list_credentials({"exact_reference": "Prod"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert policy.current_turn_named_credential_ids == {"cred_prod"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("latest_user_message", "reference", "credentials", "expected_status"),
+    [
+        ("Use missing-login", "missing-login", [], "not_found"),
+        ("Use Saved-Login", "Saved-Login", [_cred("saved-login", "cred_one")], "not_found"),
+        (
+            "Use duplicate-login",
+            "duplicate-login",
+            [_cred("duplicate-login", "cred_one"), _cred("duplicate-login", "cred_two")],
+            "ambiguous",
+        ),
+        (
+            "Use cred_shared",
+            "cred_shared",
+            [_cred("other", "cred_shared"), _cred("cred_shared", "cred_two")],
+            "ambiguous",
+        ),
+    ],
+)
+async def test_list_credentials_exact_mode_fails_closed_on_non_unique_exact_match(
+    latest_user_message: str,
+    reference: str,
+    credentials: list[SimpleNamespace],
+    expected_status: str,
+) -> None:
+    policy = RequestPolicy(canonical_user_message=latest_user_message)
+    ctx = _ctx(policy, reference)
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=credentials),
+    ):
+        result = await _list_credentials({"exact_reference": reference}, ctx)
+
+    assert result["data"]["status"] == expected_status
+    assert policy.resolved_credentials == []
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_mode_accepts_typed_resume_reference() -> None:
+    credential = _cred("saved-login", "cred_one")
+    policy = RequestPolicy(
+        resolved_credentials=[credential],
+        current_turn_named_credential_ids={"cred_one"},
+        canonical_user_message="continue",
+    )
+    ctx = _ctx(policy)
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": "saved-login"}, ctx)
+
+    assert result["data"]["status"] == "resolved"
+    assert [item.credential_id for item in policy.resolved_credentials] == ["cred_one"]
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_discovery_does_not_grant_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = RequestPolicy()
+    ctx = SimpleNamespace(organization_id="org-1", user_message="List credentials", request_policy=policy)
+    credential = _cred("saved-login", "cred_one")
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=AsyncMock(return_value=[credential])))
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({"page": 1, "page_size": 10}, ctx)
+
+    assert result["ok"] is True
+    assert policy.resolved_credentials == []
+    assert policy.current_turn_named_credential_ids == set()
+    assert [item.credential_id for item in policy.discovered_credentials] == ["cred_one"]
+
+
+@pytest.mark.parametrize("tested_url", ["https://portal.example.test/login", None])
+def test_serialize_credential_includes_tested_url(tested_url: str | None) -> None:
+    serialized = _serialize_credential(_cred("Saved Login", "cred_saved_login", tested_url=tested_url))
+
+    assert "tested_url" in serialized
+    assert serialized["tested_url"] == tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_exact_result_includes_tested_url() -> None:
+    credential = _cred(
+        "Saved Login",
+        "cred_saved_login",
+        tested_url="https://portal.example.test/login",
+    )
+    policy = RequestPolicy(canonical_user_message=f"Use {credential.credential_id}")
+
+    with patch(
+        "skyvern.forge.sdk.copilot.tools.credentials.load_credentials",
+        AsyncMock(return_value=[credential]),
+    ):
+        result = await _list_credentials({"exact_reference": credential.credential_id}, _ctx(policy))
+
+    assert result["data"]["credential"]["tested_url"] == credential.tested_url
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_page_includes_null_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({}, _ctx(policy))
+
+    assert result["data"]["credentials"][0]["tested_url"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("params", "expected_page", "expected_page_size"),
+    [
+        ({"page": 0}, 1, 10),
+        ({"page_size": 0}, 1, 10),
+        ({"page_size": -1}, 1, 1),
+    ],
+)
+async def test_list_credentials_normalizes_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    params: dict[str, int],
+    expected_page: int,
+    expected_page_size: int,
+) -> None:
+    get_credentials = AsyncMock(return_value=[])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials(params, _ctx(policy))
+
+    get_credentials.assert_awaited_once_with(
+        organization_id="org-1",
+        page=expected_page,
+        page_size=expected_page_size,
+    )
+    assert result["data"]["page"] == expected_page
+    assert result["data"]["page_size"] == expected_page_size
+    assert result["data"]["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_credentials_nonempty_full_page_reports_more_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    credential = _cred("Saved Login", "cred_saved_login")
+    get_credentials = AsyncMock(return_value=[credential])
+    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    policy = RequestPolicy(canonical_user_message="List my credentials")
+
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
+    result = await _list_credentials({"page_size": 1}, _ctx(policy))
+
+    assert result["data"]["has_more"] is True

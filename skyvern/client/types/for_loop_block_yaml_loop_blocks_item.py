@@ -11,11 +11,14 @@ from ..core.serialization import FieldMetadata
 from .ai_fallback_mode import AiFallbackMode
 from .branch_condition_yaml import BranchConditionYaml
 from .branch_criteria_yaml import BranchCriteriaYaml
+from .code_block_step_yaml import CodeBlockStepYaml
+from .email_inbox_block_yaml_email_client import EmailInboxBlockYamlEmailClient
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
 from .google_sheets_write_block_yaml_write_mode import GoogleSheetsWriteBlockYamlWriteMode
+from .pdf_fill_block_yaml_payload import PdfFillBlockYamlPayload
 from .pdf_format import PdfFormat
 from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
@@ -118,6 +121,8 @@ class ForLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
+    prompt: typing.Optional[str] = None
+    steps: typing.Optional[typing.List[CodeBlockStepYaml]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -211,6 +216,15 @@ class ForLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
     azure_folder_path: typing.Optional[str] = None
     google_credential_id: typing.Optional[str] = None
     google_drive_folder_id: typing.Optional[str] = None
+    sftp_host: typing.Optional[str] = None
+    sftp_port: typing.Optional[int] = None
+    sftp_username: typing.Optional[str] = None
+    sftp_password: typing.Optional[str] = None
+    sftp_private_key: typing.Optional[str] = None
+    sftp_private_key_passphrase: typing.Optional[str] = None
+    sftp_remote_path: typing.Optional[str] = None
+    sftp_host_key: typing.Optional[str] = None
+    prompt: typing.Optional[str] = None
     path: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
@@ -231,10 +245,14 @@ class ForLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    smtp_host_secret_parameter_key: str
-    smtp_port_secret_parameter_key: str
-    smtp_username_secret_parameter_key: str
-    smtp_password_secret_parameter_key: str
+    smtp_host_secret_parameter_key: typing.Optional[str] = None
+    smtp_port_secret_parameter_key: typing.Optional[str] = None
+    smtp_username_secret_parameter_key: typing.Optional[str] = None
+    smtp_password_secret_parameter_key: typing.Optional[str] = None
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str
@@ -286,6 +304,7 @@ class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
     disable_cache: typing.Optional[bool] = None
+    without_page_information: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -459,11 +478,11 @@ class ForLoopBlockYamlLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
-    timeout_seconds: int
-    sender: str
+    timeout_seconds: typing.Optional[int] = None
+    sender: typing.Optional[str] = None
     recipients: typing.List[str]
-    subject: str
-    body: str
+    subject: typing.Optional[str] = None
+    body: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -591,6 +610,7 @@ class ForLoopBlockYamlLoopBlocksItem_HttpRequest(UniversalBaseModel):
     follow_redirects: typing.Optional[bool] = None
     download_filename: typing.Optional[str] = None
     save_response_as_file: typing.Optional[bool] = None
+    secret_response_paths: typing.Optional[typing.List[str]] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
@@ -648,6 +668,53 @@ class ForLoopBlockYamlLoopBlocksItem_PrintPage(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class ForLoopBlockYamlLoopBlocksItem_PdfFill(UniversalBaseModel):
+    block_type: typing.Literal["pdf_fill"] = "pdf_fill"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    file_url: str
+    prompt: str
+    payload: typing.Optional[PdfFillBlockYamlPayload] = None
+    llm_key: typing.Optional[str] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class ForLoopBlockYamlLoopBlocksItem_SplitPdf(UniversalBaseModel):
+    block_type: typing.Literal["split_pdf"] = "split_pdf"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    file_url: str
+    prompt: str
+    llm_key: typing.Optional[str] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 class ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
     block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
     label: str
@@ -686,6 +753,35 @@ class ForLoopBlockYamlLoopBlocksItem_GoogleSheetsRead(UniversalBaseModel):
     range: typing.Optional[str] = None
     credential_id: typing.Optional[str] = None
     has_header_row: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class ForLoopBlockYamlLoopBlocksItem_EmailInbox(UniversalBaseModel):
+    block_type: typing.Literal["email_inbox"] = "email_inbox"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    email_client: EmailInboxBlockYamlEmailClient
+    credential_id: typing.Optional[str] = None
+    folder: typing.Optional[str] = None
+    prompt: typing.Optional[str] = None
+    sender: typing.Optional[str] = None
+    subject: typing.Optional[str] = None
+    newer_than_days: typing.Optional[int] = None
+    max_results: typing.Optional[int] = None
+    include_body: typing.Optional[bool] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
@@ -751,8 +847,11 @@ ForLoopBlockYamlLoopBlocksItem = typing.Union[
     ForLoopBlockYamlLoopBlocksItem_HttpRequest,
     ForLoopBlockYamlLoopBlocksItem_Conditional,
     ForLoopBlockYamlLoopBlocksItem_PrintPage,
+    ForLoopBlockYamlLoopBlocksItem_PdfFill,
+    ForLoopBlockYamlLoopBlocksItem_SplitPdf,
     ForLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
     ForLoopBlockYamlLoopBlocksItem_GoogleSheetsRead,
+    ForLoopBlockYamlLoopBlocksItem_EmailInbox,
     ForLoopBlockYamlLoopBlocksItem_GoogleSheetsWrite,
 ]
 from .while_loop_block_yaml_loop_blocks_item import WhileLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001

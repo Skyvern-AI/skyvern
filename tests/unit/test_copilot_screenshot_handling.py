@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import base64
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from tests.unit.copilot_test_helpers import make_model_input_data
 
 
 def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> None:
@@ -170,6 +176,36 @@ class TestConsumePendingScreenshots:
         assert _consume_pending_screenshots(ctx) is None
 
 
+class TestNudgeDrainAndFilterExclusivity:
+    def test_nudge_delivery_binds_the_frame_and_the_next_filter_pass_adds_nothing(self) -> None:
+        ctx = SimpleNamespace(
+            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            supports_vision=True,
+        )
+
+        nudge_msg = _consume_pending_screenshots(ctx)
+
+        assert nudge_msg is not None
+        assert [part["type"] for part in nudge_msg["content"]] == ["input_text", "input_image"]
+        assert ctx.pending_screenshots == []
+
+        items = [{"role": "user", "content": "clear the modal on this page"}]
+        result = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
+
+        assert result.input == items
+
+    def test_the_nudge_path_also_withholds_the_frame_from_a_non_vision_model(self) -> None:
+        # The vision check lives in the shared builder so every delivery path inherits it;
+        # the drain still empties the queue.
+        ctx = SimpleNamespace(
+            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            supports_vision=False,
+        )
+
+        assert _consume_pending_screenshots(ctx) is None
+        assert ctx.pending_screenshots == []
+
+
 class TestExtractScreenshotB64:
     @staticmethod
     def _extract(result: dict) -> Any:
@@ -199,7 +235,14 @@ class TestAttachActionTraces:
 
     @staticmethod
     def _make_action(
-        task_id: str, action_type: str, status: str, reasoning: str | None, element_id: str | None
+        task_id: str,
+        action_type: str,
+        status: str,
+        reasoning: str | None,
+        element_id: str | None,
+        *,
+        description: str | None = None,
+        output: dict[str, Any] | list | str | None = None,
     ) -> MagicMock:
         action = MagicMock()
         action.task_id = task_id
@@ -207,6 +250,8 @@ class TestAttachActionTraces:
         action.status = status
         action.reasoning = reasoning
         action.element_id = element_id
+        action.description = description
+        action.output = output
         return action
 
     @pytest.mark.asyncio
@@ -238,6 +283,90 @@ class TestAttachActionTraces:
         assert trace[0]["reasoning"] == long_reasoning[: len(trace[0]["reasoning"])]
         assert trace[0]["element"] == "elem-42"
         assert trace[1]["reasoning"] == "typed email"
+
+    @pytest.mark.asyncio
+    async def test_attach_action_traces_projects_only_valid_code_failure_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
+
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "step1", "status": "failed"}
+        actions = [
+            self._make_action(
+                "task-1",
+                "null_action",
+                "failed",
+                None,
+                None,
+                description="code error at line 18",
+                output={"code_line": 18, "arbitrary": "must-not-survive"},
+            ),
+            self._make_action(
+                "task-1",
+                "click",
+                "failed",
+                None,
+                "button-1",
+                description="ordinary action description must not survive",
+                output={"code_line": 17},
+            ),
+            self._make_action(
+                "task-1",
+                "click",
+                "failed",
+                None,
+                "button-2",
+                description="bool is not an integer line",
+                output={"code_line": True},
+            ),
+            self._make_action(
+                "task-1",
+                "input_text",
+                "failed",
+                None,
+                "input-1",
+                description="string is not an integer line",
+                output={"code_line": "7"},
+            ),
+            self._make_action(
+                "task-1",
+                "input_text",
+                "failed",
+                None,
+                "input-2",
+                description="non-dict output",
+                output=[{"code_line": 7}],
+            ),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        trace = result["action_trace"]
+        assert [entry["action"] for entry in trace] == [
+            "null_action",
+            "click",
+            "click",
+            "input_text",
+            "input_text",
+        ]
+        assert trace[0]["description"] == "code error at line 18"
+        assert trace[0]["code_line"] == 18
+        assert "output" not in trace[0]
+        assert "arbitrary" not in trace[0]
+        assert "description" not in trace[1]
+        assert "code_line" not in trace[1]
+        assert "description" not in trace[2]
+        assert "code_line" not in trace[2]
+        assert "description" not in trace[3]
+        assert "code_line" not in trace[3]
+        assert "description" not in trace[4]
+        assert "code_line" not in trace[4]
 
     @pytest.mark.asyncio
     async def test_attach_action_traces_skips_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -296,6 +425,43 @@ class TestAttachActionTraces:
             assert "action_trace" in r, f"Missing action_trace for status={r['status']}"
 
 
+class TestSummarizeActionTrace:
+    def test_selects_six_newest_entries_then_renders_them_chronologically(self) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+
+        newest_first = [
+            {"action": "click", "status": "completed", "element": f"newest-{index}"} for index in range(8, 0, -1)
+        ]
+
+        summary = _summarize_action_trace(newest_first)
+
+        assert summary == [
+            "click newest-3 completed",
+            "click newest-4 completed",
+            "click newest-5 completed",
+            "click newest-6 completed",
+            "click newest-7 completed",
+            "click newest-8 completed",
+        ]
+
+    def test_retains_projected_failure_description_and_code_line(self) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+
+        summary = _summarize_action_trace(
+            [
+                {
+                    "action": "goto_url",
+                    "status": "failed",
+                    "element": None,
+                    "description": "code error at line 9",
+                    "code_line": 9,
+                }
+            ]
+        )
+
+        assert summary == ["goto_url failed description=code error at line 9 code_line=9"]
+
+
 class TestSyntheticScreenshotPlaceholders:
     def test_placeholder_counts_as_synthetic_user_message(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import SCREENSHOT_PLACEHOLDER, is_synthetic_user_message
@@ -336,3 +502,196 @@ class TestSyntheticScreenshotPlaceholders:
         ]
 
         assert _find_real_user_boundary(items, recent_turns=2) == 2
+
+
+class TestAttachFailedBlockScreenshots:
+    """A failed CODE block must surface its at-failure page, not just exception text (SKY-13250)."""
+
+    PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    @staticmethod
+    def _make_block(
+        *,
+        workflow_run_block_id: str | None,
+        task_id: str | None,
+        final_url: str | None = None,
+    ) -> MagicMock:
+        block = MagicMock()
+        block.workflow_run_block_id = workflow_run_block_id
+        block.task_id = task_id
+        block.final_url = final_url
+        return block
+
+    def _install_app(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        run_block_artifact: object | None,
+        task_v2_artifacts: list[object],
+    ) -> None:
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        artifacts = MagicMock()
+        artifacts.get_artifact_by_entity_id = AsyncMock(return_value=run_block_artifact)
+        artifacts.get_artifacts_for_task_v2 = AsyncMock(return_value=task_v2_artifacts)
+
+        class _AppStub:
+            DATABASE = MagicMock(artifacts=artifacts)
+            ARTIFACT_MANAGER = MagicMock(retrieve_artifact=AsyncMock(return_value=self.PNG_BYTES))
+
+        monkeypatch.setattr(run_execution_module, "app", _AppStub())
+
+    @pytest.mark.asyncio
+    async def test_failed_code_block_carries_screenshot_and_final_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression: a code block's screenshot lives on the workflow_run_block.
+
+        Its container task is a task v1, so the task_v2 lookup returns nothing — before this
+        fix the failed block's result carried neither the screenshot nor the URL.
+        """
+        from skyvern.forge.sdk.copilot.tools.run_execution import _attach_failed_block_screenshots
+
+        block = self._make_block(
+            workflow_run_block_id="wrb-1",
+            task_id="tsk-v1-container",
+            final_url="https://auth.example.com/otp",
+        )
+        result: dict[str, Any] = {"label": "login", "status": "failed", "failure_reason": "Timeout 30000ms"}
+
+        self._install_app(monkeypatch, run_block_artifact=MagicMock(), task_v2_artifacts=[])
+
+        await _attach_failed_block_screenshots([block], [result], "org-1")
+
+        assert result["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert result["final_url"] == "https://auth.example.com/otp"
+
+    @pytest.mark.asyncio
+    async def test_legacy_task_v2_lookup_still_resolves_when_run_block_has_no_artifact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _attach_failed_block_screenshots
+
+        block = self._make_block(workflow_run_block_id="wrb-2", task_id="tsk-v2")
+        result: dict[str, Any] = {"label": "extract", "status": "failed"}
+
+        self._install_app(monkeypatch, run_block_artifact=None, task_v2_artifacts=[MagicMock()])
+
+        await _attach_failed_block_screenshots([block], [result], "org-1")
+
+        assert result["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert "final_url" not in result
+
+    @pytest.mark.asyncio
+    async def test_successful_block_gets_no_evidence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _attach_failed_block_screenshots
+
+        block = self._make_block(
+            workflow_run_block_id="wrb-3",
+            task_id="tsk-3",
+            final_url="https://example.com/done",
+        )
+        result: dict[str, Any] = {"label": "login", "status": "completed"}
+
+        self._install_app(monkeypatch, run_block_artifact=MagicMock(), task_v2_artifacts=[MagicMock()])
+
+        await _attach_failed_block_screenshots([block], [result], "org-1")
+
+        assert "screenshot_b64" not in result
+        assert "final_url" not in result
+
+
+class TestRunScreenshotResolution:
+    """Only data.screenshot_base64 becomes a model-visible image, so choosing it correctly
+    decides what the repair loop actually sees (SKY-13250)."""
+
+    VALID_PNG_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
+    )
+
+    @staticmethod
+    def _resolve(live_capture: str | None, results: list[dict[str, Any]], run_ok: bool) -> str | None:
+        from skyvern.forge.sdk.copilot.tools.run_execution import _resolve_run_screenshot_b64
+
+        return _resolve_run_screenshot_b64(live_capture=live_capture, results=results, run_ok=run_ok)
+
+    def test_live_capture_wins_when_present(self) -> None:
+        results = [{"status": "failed", "screenshot_b64": "block-b64"}]
+        assert self._resolve("live-b64", results, run_ok=False) == "live-b64"
+
+    def test_failed_run_promotes_first_failed_block(self) -> None:
+        """The dispatched path: no live capture, so the block's at-failure shot is all there is."""
+        results = [
+            {"label": "start", "status": "completed"},
+            {"label": "login", "status": "failed", "screenshot_b64": "first-b64"},
+            {"label": "extract", "status": "failed", "screenshot_b64": "second-b64"},
+        ]
+        assert self._resolve(None, results, run_ok=False) == "first-b64"
+
+    def test_successful_run_never_promotes_a_failure_screenshot(self) -> None:
+        """A healed or continue_on_failure block leaves a failure screenshot behind on a run
+        that succeeded; showing it would put a stale, contradicted page in front of the model."""
+        results = [
+            {"label": "login", "status": "failed", "screenshot_b64": "healed-failure-b64"},
+            {"label": "extract", "status": "completed"},
+        ]
+        assert self._resolve(None, results, run_ok=True) is None
+
+    def test_failed_run_with_no_block_screenshot_resolves_none(self) -> None:
+        assert self._resolve(None, [{"label": "login", "status": "failed"}], run_ok=False) is None
+
+    def test_promoted_screenshot_reaches_the_image_enqueue_path(self) -> None:
+        """End of the chain: the promoted bytes must arrive as a pending image, not as text."""
+        from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+
+        results = [{"label": "login", "status": "failed", "screenshot_b64": self.VALID_PNG_B64}]
+        promoted = self._resolve(None, results, run_ok=False)
+        result = {"ok": False, "data": {"screenshot_base64": promoted}}
+
+        ctx = MagicMock()
+        ctx.supports_vision = True
+        ctx.pending_screenshots = []
+        enqueue_screenshot_from_result(ctx, result)
+
+        assert len(ctx.pending_screenshots) == 1
+
+
+class TestSanitizerStripsPerBlockScreenshots:
+    """Raw base64 in the text channel crowds out the fields beside it. The image reaches the
+    model through data.screenshot_base64, so the per-block copy is stripped on every tool that
+    carries failed blocks — including the primary repair tool (SKY-13250)."""
+
+    @staticmethod
+    def _sanitize(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+        from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+
+        return sanitize_tool_result_for_llm(tool_name, result)
+
+    @pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "get_run_results"])
+    def test_strips_base64_but_keeps_final_url(self, tool_name: str) -> None:
+        from skyvern.forge.sdk.copilot.output_utils import _BASE64_IMAGE_OMITTED_MESSAGE
+
+        result = {
+            "ok": False,
+            "data": {
+                "blocks": [
+                    {
+                        "label": "login",
+                        "status": "failed",
+                        "screenshot_b64": "A" * 5000,
+                        "final_url": "https://portal.example.com/mfa",
+                    }
+                ]
+            },
+        }
+
+        block = self._sanitize(tool_name, result)["data"]["blocks"][0]
+
+        assert block["screenshot_b64"] == _BASE64_IMAGE_OMITTED_MESSAGE
+        # final_url is the only URL evidence on the dispatched path; it must survive.
+        assert block["final_url"] == "https://portal.example.com/mfa"
+
+    def test_leaves_blocks_without_screenshots_untouched(self) -> None:
+        result = {"ok": True, "data": {"blocks": [{"label": "login", "status": "completed"}]}}
+        assert self._sanitize("run_blocks_and_collect_debug", result)["data"]["blocks"][0] == {
+            "label": "login",
+            "status": "completed",
+        }

@@ -7,9 +7,11 @@ import gc
 import json
 import typing as t
 import weakref
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource,
@@ -56,6 +58,8 @@ def _make_page(url: str = "https://example.com") -> MagicMock:
     page.add_init_script = AsyncMock()
     page.evaluate = AsyncMock()
     page.expose_binding = AsyncMock()
+    # The page stands in as its own (single) main frame so frame-level draining resolves to page.evaluate.
+    page.frames = [page]
     return page
 
 
@@ -99,7 +103,15 @@ class TestExfiltrationChannelEvents:
 
     def test_page_tracking_releases_collected_pages(self) -> None:
         channel, _ = _make_channel()
-        page = _make_page()
+
+        # A real MagicMock page carries internal reference cycles, forcing a
+        # full-heap gc.collect() to reclaim it (seconds late in the suite). A
+        # cycle-free stand-in is reclaimed by refcounting the moment the last
+        # strong reference drops, so the weak trackers clear without a collect.
+        class _Page:
+            pass
+
+        page = _Page()
         page_ref = weakref.ref(page)
 
         ExfiltrationChannel._active_binding_channels[page] = channel
@@ -107,7 +119,6 @@ class TestExfiltrationChannelEvents:
         channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
 
         del page
-        gc.collect()
 
         assert page_ref() is None
         assert not ExfiltrationChannel._active_binding_channels
@@ -208,7 +219,8 @@ class TestExfiltrationChannelEvents:
         page.expose_binding.assert_awaited_once_with(channel.BINDING_NAME, channel._handle_binding_event)
         page.on.assert_called_once()
         assert page.add_init_script.await_count == 2
-        assert page.evaluate.await_count == 2
+        # binding script + exfiltrate script + stale-queue discard
+        assert page.evaluate.await_count == 3
         assert channel._page_console_captures[page].cdp_session is cdp_session
         cdp_session.send.assert_awaited_once_with("Runtime.enable")
         cdp_session.on.assert_called_once()
@@ -275,6 +287,36 @@ class TestExfiltrationChannelEvents:
         assert channel._network_activity_flush_task is None
         await asyncio.sleep(0.1)
         assert len(events) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_survives_closed_page_during_undecorate(self) -> None:
+        """SKY-12366: a closed browser target must not crash channel teardown.
+
+        In production the browser target churns mid-recording (take-control toggles,
+        navigations, bot-detection pages), so when stop() calls undecorate() on a page
+        whose target is already gone, page.add_init_script raises TargetClosedError.
+        That must be swallowed: otherwise it propagates out of stop() -> handle_data ->
+        the message-channel loop and tears down the whole recording pipeline, which is
+        what dropped users' clicks/typing and produced empty workflows.
+        """
+        channel, _ = _make_channel()
+
+        closed_page = _make_page(url="https://example.com")
+        closed_page.add_init_script = AsyncMock(
+            side_effect=TargetClosedError("Page.add_init_script: Target page, context or browser has been closed")
+        )
+
+        browser_context = MagicMock()
+        browser_context.pages = [closed_page]
+        channel.browser_context = browser_context
+
+        # Must not raise: TargetClosedError from undecorate() would otherwise escape
+        # stop() -> handle_data -> the message-channel loop.
+        result = await channel.stop()
+
+        assert result is channel
+        # The undecorate path genuinely ran and hit the closed-target error.
+        closed_page.add_init_script.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_exfiltrate_rearms_existing_page_without_duplicate_listeners(self) -> None:
@@ -366,6 +408,191 @@ class TestExfiltrationChannelEvents:
 
         assert channel._should_emit_console_event(first) is True
         assert channel._should_emit_console_event(distinct) is True
+
+
+def _make_stamped_event_data(seq: int = 0, doc_id: str = "doc-a") -> dict[str, object]:
+    return {**_make_event_data(), "exfilDocId": doc_id, "exfilSeq": seq}
+
+
+def _adopt_page(channel: ExfiltrationChannel, page: MagicMock) -> None:
+    channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
+
+
+class TestQueueTransport:
+    """The in-page queue drained via evaluate() carries events when consoleAPICalled/bindingCalled delivery is dropped, deduped by (exfilDocId, exfilSeq)."""
+
+    @pytest.mark.asyncio
+    async def test_drain_emits_queued_events_and_dedups_redelivery(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        first = _make_stamped_event_data(seq=0)
+        second = _make_stamped_event_data(seq=1)
+        page.evaluate = AsyncMock(return_value=[first, second])
+
+        await channel._drain_page_queue(page)
+
+        assert on_event.call_count == 2
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        assert all(event.source == ExfiltratedEventSource.CONSOLE for event in emitted)
+        assert [event.params["exfilSeq"] for event in emitted] == [0, 1]
+
+        # A redelivery of the same stamped events must not produce duplicate steps.
+        await channel._drain_page_queue(page)
+        assert on_event.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_drain_skips_unadopted_page(self) -> None:
+        # An unadopted page may still be owned by a previous channel; draining it would destructively steal that channel's events.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0)])
+
+        await channel._drain_page_queue(page)
+
+        page.evaluate.assert_not_awaited()
+        on_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exfiltrate_discards_stale_queue_before_capturing(self) -> None:
+        # Adopting a page must discard the between-recordings backlog or it replays as phantom steps.
+        channel, _ = _make_channel()
+        page = _make_page()
+        page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await channel.exfiltrate(page)
+
+        evaluated = [call.args[0] for call in page.evaluate.await_args_list]
+        assert channel._DISCARD_QUEUE_JS in evaluated
+        # The discard happens before the exfiltration script (re)install.
+        install_index = next(i for i, expr in enumerate(evaluated) if "exfil_owner" in expr)
+        assert evaluated.index(channel._DISCARD_QUEUE_JS) < install_index
+
+    @pytest.mark.asyncio
+    async def test_console_then_drain_delivery_emits_once(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        event_data = _make_stamped_event_data(seq=7)
+        message = MagicMock()
+        message.args = []
+        message.text = f"[EXFIL] {json.dumps(event_data)}"
+
+        await channel._handle_console_event_async(message, 0)
+        page.evaluate = AsyncMock(return_value=[event_data])
+        await channel._drain_page_queue(page)
+
+        on_event.assert_called_once()
+
+    def test_stamped_identical_rapid_interactions_both_emit(self) -> None:
+        # Distinct interactions can serialize identically except for the sequence stamp; exact dedup must keep both.
+        channel, _ = _make_channel()
+        first = {**_make_stamped_event_data(seq=1), "timestamp": 1000.0}
+        second = {**_make_stamped_event_data(seq=2), "timestamp": 1000.0}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(second) is True
+
+    @pytest.mark.asyncio
+    async def test_nav_start_drains_before_emitting_nav_event(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=3)])
+        channel.page = page
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.evaluate.assert_awaited_once_with(
+            channel._DRAIN_QUEUE_JS, [channel._drain_token, channel.QUEUE_DRAIN_MAX_ITEMS]
+        )
+        # The drained click must order before the navigation it caused (interpreter sorts by capture_seq).
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        assert [event.event_name for event in emitted] == ["user_interaction", "nav:frame_started_navigating"]
+        assert emitted[0].capture_seq < emitted[1].capture_seq
+
+    @pytest.mark.asyncio
+    async def test_commit_event_orders_after_pending_nav_start(self) -> None:
+        # frame_navigated arriving while the nav-start drain is in flight must still take a higher capture_seq than
+        # the nav-start, or url_change.py sees the commit set last_url first and drops the URL-change step.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        release = asyncio.Event()
+
+        async def slow_drain(expression: object, arg: object) -> list:
+            await release.wait()
+            return [_make_stamped_event_data(seq=0)]
+
+        page.evaluate = AsyncMock(side_effect=slow_drain)
+        channel.page = page
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+        # Commit arrives before the (blocked) nav-start drain resolves.
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+        release.set()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        by_name = {e.event_name: e.capture_seq for e in emitted}
+        assert by_name["user_interaction"] < by_name["nav:frame_started_navigating"]
+        assert by_name["nav:frame_started_navigating"] < by_name["nav:frame_navigated"]
+
+    @pytest.mark.asyncio
+    async def test_drains_child_frames(self) -> None:
+        # Each frame has its own per-document queue; iframe events would otherwise never be collected.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        child = _make_page("https://example.com/iframe")
+        child.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0, doc_id="child-doc")])
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0, doc_id="main-doc")])
+        page.frames = [page, child]
+
+        await channel._drain_page_queue(page)
+
+        child.evaluate.assert_awaited_once()
+        doc_ids = {call.args[0][0].params["exfilDocId"] for call in on_event.call_args_list}
+        assert doc_ids == {"main-doc", "child-doc"}
+
+    @pytest.mark.asyncio
+    async def test_drained_queue_size_is_bounded(self) -> None:
+        # The drained list is page-controlled input; a hostile page must not push an unbounded batch into the API worker.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        oversized = [_make_stamped_event_data(seq=i) for i in range(channel.QUEUE_DRAIN_MAX_ITEMS + 500)]
+        page.evaluate = AsyncMock(return_value=oversized)
+
+        await channel._drain_page_queue(page)
+
+        assert on_event.call_count == channel.QUEUE_DRAIN_MAX_ITEMS
+
+    @pytest.mark.asyncio
+    async def test_stop_flushes_remaining_queue(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        tail_event = _make_stamped_event_data(seq=9)
+
+        async def evaluate(expression: str, *args: object) -> object:
+            if expression == channel._DRAIN_QUEUE_JS:
+                return [tail_event]
+            return None
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        _adopt_page(channel, page)
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        channel.browser_context = browser_context
+
+        await channel.stop()
+
+        emitted = [call.args[0][0].params for call in on_event.call_args_list]
+        assert tail_event in emitted
 
 
 class TestNavigationReExfiltration:
@@ -464,3 +691,252 @@ class TestNavigationReExfiltration:
         on_event.assert_called_once()
         channel.exfiltrate.assert_not_called()
         channel.adorn.assert_not_called()
+
+
+class _FakeCdpSession:
+    def __init__(self) -> None:
+        self.detached = False
+
+    async def send(self, method: str, params: dict | None = None) -> None:
+        return None
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class _FakePwPage:
+    def __init__(self, context: _FakeContext) -> None:
+        self.url = "https://example.com"
+        self.context = context
+
+    async def add_init_script(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    async def evaluate(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def on(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def remove_listener(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self.pages: list[_FakePwPage] = [_FakePwPage(self)]
+
+    async def new_cdp_session(self, page: object) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+
+class _FakePwBrowser:
+    """A stand-in for a Playwright Browser obtained via connect_over_cdp."""
+
+    def __init__(self, *, fire_disconnect_on_close: bool) -> None:
+        self._connected = True
+        self._fire_disconnect_on_close = fire_disconnect_on_close
+        self.handlers: dict[str, t.Callable[[], None]] = {}
+        self.context = _FakeContext()
+        self.contexts = [self.context]
+        self.close_calls = 0
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def on(self, event: str, callback: t.Callable[[], None]) -> None:
+        self.handlers[event] = callback
+
+    async def new_browser_cdp_session(self) -> _FakeCdpSession:
+        return _FakeCdpSession()
+
+    async def new_context(self) -> _FakeContext:
+        return self.context
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self._connected = False
+        # Real playwright fires "disconnected" when a connected browser is closed;
+        # this reproduces that so the reconnect-guard can be exercised end-to-end.
+        if self._fire_disconnect_on_close:
+            handler = self.handlers.get("disconnected")
+            if handler is not None:
+                handler()
+
+
+class _FakePw:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakePwManager:
+    def __init__(self, on_start: t.Callable[[], _FakePw]) -> None:
+        self._on_start = on_start
+
+    async def start(self) -> _FakePw:
+        return self._on_start()
+
+
+def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close: bool = False) -> SimpleNamespace:
+    """Replace the Playwright driver + CDP connect helper with counting fakes.
+
+    `start_calls` counts local Playwright driver spawns, so a reconnect (which starts
+    a fresh driver) is observable without launching a real Node subprocess.
+    """
+    import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
+
+    state = SimpleNamespace(start_calls=0, pws=[], browsers=[])
+
+    def _make_pw() -> _FakePw:
+        state.start_calls += 1
+        pw = _FakePw()
+        state.pws.append(pw)
+        return pw
+
+    def _fake_async_playwright() -> _FakePwManager:
+        return _FakePwManager(_make_pw)
+
+    async def _fake_connect(pw: object, url: str, headers: dict | None = None, **kwargs: object) -> _FakePwBrowser:
+        browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
+        state.browsers.append(browser)
+        return browser
+
+    monkeypatch.setattr(cdp_mod, "async_playwright", _fake_async_playwright)
+    monkeypatch.setattr(cdp_mod, "connect_over_cdp_with_diagnostics", _fake_connect)
+    return state
+
+
+class TestExfiltrationChannelLifecycle:
+    def test_js_asset_cache_is_keyed_by_file_not_instance(self) -> None:
+        from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
+
+        _load_js_asset.cache_clear()
+
+        channel_a, _ = _make_channel()
+        channel_b, _ = _make_channel()
+
+        assert channel_a.js("exfiltrate") == channel_b.js("exfiltrate")
+        # Two instances, one asset -> a single cache entry keyed by file name, not one
+        # entry per (self, file_name) as the old bound-method lru_cache produced.
+        assert _load_js_asset.cache_info().currsize == 1
+
+        channel_a.js("adorn")
+        assert _load_js_asset.cache_info().currsize == 2
+
+    def test_using_js_does_not_pin_channel_instance(self) -> None:
+        # A cycle-free vnc stand-in so the channel is reclaimed by refcounting the
+        # moment the JS cache stops pinning it (a MagicMock carries internal cycles).
+        vnc_channel = SimpleNamespace(identity={"client_id": "c"}, browser_session=None, x_api_key=None)
+        channel = ExfiltrationChannel(on_event=lambda _events: None, vnc_channel=vnc_channel)  # type: ignore[arg-type]
+
+        channel.js("exfiltrate")
+        ref = weakref.ref(channel)
+
+        del channel
+        gc.collect()
+
+        assert ref() is None
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_playwright_driver(self) -> None:
+        channel, _ = _make_channel()
+        browser = _FakePwBrowser(fire_disconnect_on_close=False)
+        pw = _FakePw()
+        channel.browser = browser  # type: ignore[assignment]
+        channel.pw = pw  # type: ignore[assignment]
+        channel.browser_context = browser.context  # type: ignore[assignment]
+        channel.page = browser.context.pages[0]  # type: ignore[assignment]
+
+        await channel.stop()
+
+        assert browser.close_calls == 1
+        assert pw.stopped is True
+        assert channel.browser is None
+        assert channel.pw is None
+
+    @pytest.mark.asyncio
+    async def test_repeated_stop_is_idempotent(self) -> None:
+        channel, _ = _make_channel()
+        browser = _FakePwBrowser(fire_disconnect_on_close=False)
+        pw = _FakePw()
+        channel.browser = browser  # type: ignore[assignment]
+        channel.pw = pw  # type: ignore[assignment]
+        channel.browser_context = browser.context  # type: ignore[assignment]
+        channel.page = browser.context.pages[0]  # type: ignore[assignment]
+
+        await channel.stop()
+        await channel.stop()
+
+        assert browser.close_calls == 1
+        assert pw.stopped is True
+        assert channel.browser is None
+        assert channel.pw is None
+
+    @pytest.mark.asyncio
+    async def test_intentional_stop_does_not_reconnect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=True)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+
+        await channel.stop()
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        # The browser's "disconnected" event fires during the intentional close, but
+        # the guard must keep it from spawning a replacement driver.
+        assert state.start_calls == 1
+        assert state.browsers[0].close_calls >= 1
+        assert state.pws[0].stopped is True
+
+    @pytest.mark.asyncio
+    async def test_connect_is_suppressed_after_intentional_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A reconnect task scheduled by a genuine mid-recording disconnect, arriving just
+        # after teardown, must not resurrect the driver once the channel is marked closing.
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=False)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+
+        channel._closing = True
+        await channel.close()
+        await channel.connect()
+
+        assert state.start_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_unexpected_disconnect_reconnects_when_not_closing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=False)
+        channel, _ = _make_channel()
+
+        await channel.connect()
+        assert state.start_calls == 1
+        on_close = state.browsers[0].handlers["disconnected"]
+
+        # An unexpected drop (channel not intentionally closed) must still reconnect.
+        on_close()
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if state.start_calls >= 2:
+                break
+
+        assert state.start_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_adorn_loads_asset_through_shared_cache(self) -> None:
+        from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
+
+        _load_js_asset.cache_clear()
+        channel, _ = _make_channel()
+        page = _make_page()
+
+        await channel.adorn(page)
+
+        page.evaluate.assert_awaited()
+        page.add_init_script.assert_awaited()
+        assert _load_js_asset.cache_info().currsize == 1

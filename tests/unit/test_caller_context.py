@@ -59,7 +59,7 @@ def patched_app(monkeypatch: pytest.MonkeyPatch):
     prior_user_auth = (
         getattr(app, "authenticate_user_function", None) if hasattr(app, "authenticate_user_function") else None
     )
-    app.authentication_function = lambda token: _async_return(_org())
+    app.authentication_function = lambda token, attribution_header=None: _async_return(_org())
     app.authenticate_user_function = lambda token: _async_return("user_42")
 
     async def fakeget_current_org_cached(x_api_key: str, db) -> Organization:

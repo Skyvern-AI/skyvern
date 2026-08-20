@@ -7,6 +7,8 @@ import type * as Skyvern from "../../index.js";
  *     {}
  */
 export interface CreateBrowserSessionRequest {
+    /** Optional URL to open when the standalone browser session starts. */
+    url?: string;
     /** Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60. */
     timeout?: number;
     /**
@@ -46,6 +48,8 @@ export interface CreateBrowserSessionRequest {
      *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
      */
     proxy_location?: CreateBrowserSessionRequest.ProxyLocation;
+    /** Opaque Skyvern-managed proxy sticky-session id for pinned Residential ISP sessions. */
+    proxy_session_id?: string;
     /** A list of extensions to install in the browser session. */
     extensions?: Skyvern.Extensions[];
     /** The type of browser to use for the session. */

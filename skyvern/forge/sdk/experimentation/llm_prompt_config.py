@@ -7,20 +7,38 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.core import skyvern_context
 
 LOG = structlog.get_logger()
 
 
+def _org_defaults_suppress_experiments() -> bool:
+    context = skyvern_context.current()
+    return context is not None and bool(context.org_default_llm_key or context.org_default_secondary_llm_key)
+
+
+def _prompt_type_flag_properties(organization_id: str | None) -> dict[str, str | bool | None]:
+    properties: dict[str, str | bool | None] = {"organization_id": organization_id}
+    context = skyvern_context.current()
+    if context and (context.workflow_run_id or context.workflow_permanent_id):
+        properties["workflow_permanent_id"] = context.workflow_permanent_id
+        properties["script_mode"] = context.script_mode
+    return properties
+
+
 async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str | None = None) -> dict[str, str] | None:
     """Return PostHog-configured LLM mapping for each prompt type."""
-    llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value(
-        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
+    if _org_defaults_suppress_experiments():
+        return None
+    properties = _prompt_type_flag_properties(organization_id)
+    llm_config_experiment = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties=properties
     )
     if llm_config_experiment in (False, "False") or not llm_config_experiment:
         return None
 
-    payload = await app.EXPERIMENTATION_PROVIDER.get_payload(
-        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties={"organization_id": organization_id}
+    payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
+        "LLM_CONFIG_BY_PROMPT_TYPE", distinct_id, properties=properties
     )
     if not payload:
         LOG.warning(
@@ -100,6 +118,9 @@ async def get_check_user_goal_llm_override(
     distinct_id: str, organization_id: str | None = None
 ) -> LLMAPIHandler | None:
     """Resolve the CHECK_USER_GOAL_LLM_NAME multivariate flag to an LLM handler."""
+    if _org_defaults_suppress_experiments():
+        return None
+
     try:
         variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
             "CHECK_USER_GOAL_LLM_NAME",
@@ -165,3 +186,43 @@ async def resolve_check_user_goal_handler(
     if override is None:
         return default_handler
     return LLMAPIHandlerFactory.wrap_for_flex_routing(override)
+
+
+async def resolve_prompt_type_handler(
+    prompt_type: str,
+    distinct_id: str,
+    organization_id: str | None,
+    default_handler: LLMAPIHandler,
+) -> LLMAPIHandler:
+    """Return the LLM_CONFIG_BY_PROMPT_TYPE handler for prompt_type if configured; else default_handler."""
+    try:
+        override = await get_llm_handler_for_prompt_type(prompt_type, distinct_id, organization_id)
+    except Exception:
+        LOG.warning(
+            "Failed to resolve LLM_CONFIG_BY_PROMPT_TYPE; using default handler",
+            prompt_type=prompt_type,
+            distinct_id=distinct_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return default_handler
+    if override is None:
+        return default_handler
+    return LLMAPIHandlerFactory.wrap_for_flex_routing(override)
+
+
+async def resolve_prompt_type_handler_with_override(
+    prompt_type: str,
+    override_llm_key: str | None,
+    distinct_id: str,
+    organization_id: str | None,
+    default_handler: LLMAPIHandler,
+) -> LLMAPIHandler:
+    """Payload-first routing unless an explicit override_llm_key opts the call out entirely.
+
+    default_handler must be the call site's full non-payload resolution (e.g. the
+    get_override_llm_api_handler(...) result) so both non-payload branches preserve it exactly.
+    """
+    if override_llm_key:
+        return default_handler
+    return await resolve_prompt_type_handler(prompt_type, distinct_id, organization_id, default_handler)

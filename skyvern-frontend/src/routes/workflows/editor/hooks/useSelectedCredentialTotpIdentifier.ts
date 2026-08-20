@@ -1,6 +1,7 @@
-import { useContext, useMemo } from "react";
-import CloudContext from "@/store/CloudContext";
+import { useMemo } from "react";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
+import { useCredentialQuery } from "@/routes/workflows/hooks/useCredentialQuery";
+import { useSkyvernCredentialSourceAvailable } from "@/routes/workflows/hooks/useSkyvernCredentialSourceAvailable";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { parameterIsSkyvernCredential } from "../types";
 
@@ -17,45 +18,49 @@ import { parameterIsSkyvernCredential } from "../types";
 export function useSelectedCredentialTotpIdentifier(
   parameterKey: string | undefined,
 ): string | null {
-  const isCloud = useContext(CloudContext);
+  const skyvernCredentialSourceAvailable =
+    useSkyvernCredentialSourceAvailable();
   const { parameters: workflowParameters } = useWorkflowParametersStore();
   const { data: credentials = [] } = useCredentialsQuery({
-    enabled: isCloud,
+    enabled: skyvernCredentialSourceAvailable,
     page_size: 100,
   });
 
-  return useMemo(() => {
+  const credentialId = useMemo(() => {
     if (!parameterKey) {
-      return null;
+      return undefined;
     }
 
-    let credentialId: string | undefined;
     const credentialParam = workflowParameters
       .filter((p) => p.parameterType === "credential")
       .find((p) => p.key === parameterKey);
     if (credentialParam && parameterIsSkyvernCredential(credentialParam)) {
-      credentialId = credentialParam.credentialId;
-    } else {
-      const workflowParam = workflowParameters.find(
-        (p) =>
-          p.parameterType === "workflow" &&
-          p.key === parameterKey &&
-          p.dataType === "credential_id" &&
-          typeof p.defaultValue === "string" &&
-          p.defaultValue,
-      );
-      if (workflowParam && workflowParam.parameterType === "workflow") {
-        credentialId = workflowParam.defaultValue as string;
-      }
+      return credentialParam.credentialId;
     }
 
-    if (!credentialId) {
-      return null;
-    }
-
-    const credential = credentials.find(
-      (c) => c.credential_id === credentialId,
+    const workflowParam = workflowParameters.find(
+      (p) =>
+        p.parameterType === "workflow" &&
+        p.key === parameterKey &&
+        p.dataType === "credential_id" &&
+        typeof p.defaultValue === "string" &&
+        p.defaultValue,
     );
+    if (workflowParam && workflowParam.parameterType === "workflow") {
+      return workflowParam.defaultValue as string;
+    }
+    return undefined;
+  }, [parameterKey, workflowParameters]);
+
+  const credentialFromList = credentials.find(
+    (credential) => credential.credential_id === credentialId,
+  );
+  const credentialQuery = useCredentialQuery(credentialId, {
+    enabled: skyvernCredentialSourceAvailable && !credentialFromList,
+  });
+  const credential = credentialFromList ?? credentialQuery.data;
+
+  return useMemo(() => {
     if (
       credential &&
       credential.credential_type === "password" &&
@@ -64,5 +69,5 @@ export function useSelectedCredentialTotpIdentifier(
       return credential.credential.totp_identifier ?? null;
     }
     return null;
-  }, [parameterKey, workflowParameters, credentials]);
+  }, [credential]);
 }

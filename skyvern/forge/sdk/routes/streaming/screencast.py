@@ -6,10 +6,12 @@ over a WebSocket connection.
 """
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 
 import structlog
 from fastapi import WebSocket
+from opentelemetry import metrics
 from playwright.async_api import CDPSession
 
 from skyvern.forge import app
@@ -20,6 +22,47 @@ LOG = structlog.get_logger()
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 ACTIVE_PAGE_POLL_INTERVAL = 0.5
+LATENCY_BUCKETS_SECONDS: tuple[float, ...] = (
+    0.001,
+    0.002,
+    0.005,
+    0.01,
+    0.02,
+    0.03,
+    0.045,
+    0.06,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+)
+
+_meter = metrics.get_meter("skyvern.live_view")
+_frame_forward_seconds = _meter.create_histogram(
+    "skyvern.live_view.frame_forward_seconds",
+    unit="s",
+    description="Screencast frame: CDP event received by the API -> client websocket send returned",
+    explicit_bucket_boundaries_advisory=list(LATENCY_BUCKETS_SECONDS),
+)
+_frame_queue_seconds = _meter.create_histogram(
+    "skyvern.live_view.frame_queue_seconds",
+    unit="s",
+    description="Screencast frame queue dwell until forwarding or eviction",
+    explicit_bucket_boundaries_advisory=list(LATENCY_BUCKETS_SECONDS),
+)
+_frame_send_seconds = _meter.create_histogram(
+    "skyvern.live_view.frame_send_seconds",
+    unit="s",
+    description="Screencast frame: websocket.send_json duration",
+    explicit_bucket_boundaries_advisory=list(LATENCY_BUCKETS_SECONDS),
+)
+_frames_evicted = _meter.create_counter(
+    "skyvern.live_view.frames_evicted",
+    unit="{frame}",
+    description="Screencast frames dropped from the forwarding queue because the client was behind",
+)
 
 
 async def wait_for_browser_state(
@@ -31,23 +74,44 @@ async def wait_for_browser_state(
     poll_interval: float = 0.25,
 ) -> BrowserState | None:
     elapsed = 0.0
-    while elapsed < timeout:
-        browser_state = await _resolve_browser_state(
-            entity_id,
-            entity_type,
-            workflow_run_id,
-            organization_id=organization_id,
-        )
+    observed: BrowserState | None = None
+    try:
+        while elapsed < timeout:
+            browser_state = observed or await _resolve_browser_state(
+                entity_id,
+                entity_type,
+                workflow_run_id,
+                organization_id=organization_id,
+            )
 
-        if browser_state is not None:
-            page = await browser_state.get_working_page()
-            if page is not None:
-                return browser_state
+            if browser_state is not None:
+                # An observer connection belongs to this websocket, so it is held across polls
+                # rather than re-dialed while the session's first page comes up.
+                if entity_type == "browser_session":
+                    observed = browser_state
+                page = await browser_state.get_working_page()
+                if page is not None:
+                    # Ownership passes to the caller, who releases it when the websocket ends.
+                    observed = None
+                    return browser_state
 
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
 
-    return None
+        return None
+    finally:
+        # Whatever is still held here was never handed to a caller, so nobody else will give it back.
+        await release_browser_state(observed, entity_type, entity_id)
+
+
+async def release_browser_state(browser_state: BrowserState | None, entity_type: str, entity_id: str) -> None:
+    """Give back whatever watching adopted. Only the manager knows whether that is anything."""
+    if browser_state is None or entity_type != "browser_session":
+        return
+    try:
+        await app.PERSISTENT_SESSIONS_MANAGER.release_observer_browser_state(entity_id, browser_state)
+    except Exception:
+        LOG.warning("Could not release the live-view browser connection", browser_session_id=entity_id, exc_info=True)
 
 
 async def _resolve_browser_state(
@@ -61,7 +125,7 @@ async def _resolve_browser_state(
     if entity_type == "task":
         return app.BROWSER_MANAGER.get_for_task(entity_id, workflow_run_id)
     if entity_type == "browser_session":
-        return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(entity_id, organization_id)
+        return await app.PERSISTENT_SESSIONS_MANAGER.get_observer_browser_state(entity_id, organization_id)
     return None
 
 
@@ -73,6 +137,13 @@ async def _resolve_working_page(
     organization_id: str | None = None,
     fall_back_to_captured: bool = True,
 ) -> object | None:
+    # The viewer's own connection outlives every page the session opens, so following the active page
+    # needs no re-resolution here — and re-resolving would dial a second connection every poll.
+    if entity_type == "browser_session":
+        try:
+            return await browser_state.get_working_page()
+        except Exception:
+            return None
     # Re-resolve each poll so the screencast follows a BrowserState the run swaps in post-connect (skyvern#6703).
     try:
         state = await _resolve_browser_state(entity_id, entity_type, workflow_run_id, organization_id)
@@ -105,9 +176,10 @@ async def start_screencast_loop(
     organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
+    metric_attributes = {"entity_type": entity_type}
     cdp_session: CDPSession | None = None
     attached_page: object | None = None
-    frame_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=2)
+    frame_queue: asyncio.Queue[tuple[str, float]] = asyncio.Queue(maxsize=2)
     viewport_info: dict[str, int] = {"width": DEFAULT_WIDTH, "height": DEFAULT_HEIGHT}
 
     async def _ack_frame(session: CDPSession, session_id: int) -> None:
@@ -135,16 +207,18 @@ async def start_screencast_loop(
         if isinstance(device_height, (int, float)) and device_height > 0:
             viewport_info["height"] = int(device_height)
 
-    def _queue_frame(data: str) -> None:
+    def _queue_frame(data: str, received_at: float) -> None:
         if not data:
             return
         if frame_queue.full():
             try:
-                frame_queue.get_nowait()
+                _, evicted_received_at = frame_queue.get_nowait()
+                _frame_queue_seconds.record(time.monotonic() - evicted_received_at, metric_attributes)
+                _frames_evicted.add(1, metric_attributes)
             except asyncio.QueueEmpty:
                 pass
         try:
-            frame_queue.put_nowait(data)
+            frame_queue.put_nowait((data, received_at))
         except asyncio.QueueFull:
             pass
 
@@ -155,7 +229,7 @@ async def start_screencast_loop(
             except asyncio.QueueEmpty:
                 break
 
-    async def _on_frame(session: CDPSession, params: dict) -> None:
+    async def _on_frame(session: CDPSession, params: dict, received_at: float) -> None:
         if session is not cdp_session:
             return
         data = params.get("data", "")
@@ -164,7 +238,7 @@ async def start_screencast_loop(
         if metadata:
             _update_viewport_from_metadata(metadata)
         asyncio.create_task(_ack_frame(session, session_id))
-        _queue_frame(data)
+        _queue_frame(data, received_at)
 
     async def _stop_current_screencast() -> None:
         nonlocal cdp_session, attached_page
@@ -195,7 +269,7 @@ async def start_screencast_loop(
             )
             data = result.get("data", "") if isinstance(result, dict) else ""
             _update_viewport_from_page(page)
-            _queue_frame(data)
+            _queue_frame(data, time.monotonic())
         except Exception:
             LOG.debug(
                 "Could not prime CDP screencast frame",
@@ -213,7 +287,10 @@ async def start_screencast_loop(
         _drain_frame_queue()
         next_session = await page.context.new_cdp_session(page)  # type: ignore[attr-defined]
         cdp_session = next_session
-        next_session.on("Page.screencastFrame", lambda params: asyncio.create_task(_on_frame(next_session, params)))
+        next_session.on(
+            "Page.screencastFrame",
+            lambda params: asyncio.create_task(_on_frame(next_session, params, time.monotonic())),
+        )
         try:
             await next_session.send(
                 "Page.startScreencast",
@@ -238,7 +315,9 @@ async def start_screencast_loop(
 
     async def _frame_forwarding_loop() -> None:
         while True:
-            data = await frame_queue.get()
+            data, received_at = await frame_queue.get()
+            dequeued_at = time.monotonic()
+            _frame_queue_seconds.record(dequeued_at - received_at, metric_attributes)
             current_url = ""
             if attached_page is not None:
                 try:
@@ -259,6 +338,9 @@ async def start_screencast_loop(
                 )
             except Exception:
                 break
+            sent_at = time.monotonic()
+            _frame_send_seconds.record(sent_at - dequeued_at, metric_attributes)
+            _frame_forward_seconds.record(sent_at - received_at, metric_attributes)
 
     async def _completion_polling_loop() -> None:
         while True:

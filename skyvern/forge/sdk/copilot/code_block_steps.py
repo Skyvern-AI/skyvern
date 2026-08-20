@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import ast
 import re
+import textwrap
 from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 import structlog
 import yaml
+
+from skyvern.forge.sdk.copilot.code_block_synthesis import _RESERVED_PARAM_NAMES
 
 LOG = structlog.get_logger()
 
@@ -36,8 +39,8 @@ _METHOD_ACTION_TYPES: dict[str, str] = {
     "reload": "reload_page",
     "evaluate": "execute_js",
     "wait_for_timeout": "wait",
-    # SkyvernPage @action_wrap high-level API (mirrors skyvern_page.py)
-    "extract": "extract",
+    # SkyvernPage @action_wrap high-level API (mirrors skyvern_page.py). `extract` is excluded:
+    # code blocks run on a raw Playwright page and must not reach the LLM extraction path.
     "fill_autocomplete": "input_text",
     "upload_file": "upload_file",
     "complete": "complete",
@@ -68,7 +71,7 @@ _READ_METHODS: dict[str, str] = {
 }
 # Methods whose natural-language `prompt` is the first positional argument (it is keyword-only on the
 # interaction methods, which the keyword scan below already covers).
-_PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
+_PROMPT_POSITIONAL_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
 # Awaited calls that are sync/no-op helpers — never surfaced as their own step.
 _IGNORED_METHODS: frozenset[str] = frozenset(
     {"wait_for_load_state", "wait_for_selector", "wait_for_url", "wait_for_function"}
@@ -265,7 +268,7 @@ def _describe(span: CodeActionSpan) -> str:
 
 
 def _consolidate_read_spans(spans: list[CodeActionSpan]) -> list[CodeActionSpan]:
-    """Merge adjacent raw DOM reads into one extract span; an explicit page.extract() is not a read and stays separate."""
+    """Merge adjacent raw DOM reads into one extract span."""
     consolidated: list[CodeActionSpan] = []
     for span in spans:
         prev = consolidated[-1] if consolidated else None
@@ -376,6 +379,44 @@ def fill_code_block_prompts_in_yaml(
     return yaml.safe_dump(data, sort_keys=False)
 
 
+def fill_code_block_error_code_mappings_in_yaml(workflow_yaml: str, *, prior_yaml: str | None = None) -> str:
+    """Preserve omitted code-block manifests by label while honoring explicit removal.
+
+    An absent key means regeneration omitted the manifest. ``null`` and ``{}``
+    are deliberate values and therefore remain untouched.
+    """
+    try:
+        data = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml
+    if not isinstance(data, (dict, list)) or not prior_yaml:
+        return workflow_yaml
+
+    try:
+        prior_data = yaml.safe_load(prior_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml
+    if not isinstance(prior_data, (dict, list)):
+        return workflow_yaml
+
+    prior_mappings: dict[str, Any] = {}
+    for block in _iter_code_block_dicts(prior_data):
+        label = block.get("label")
+        if isinstance(label, str) and "error_code_mapping" in block:
+            prior_mappings[label] = block["error_code_mapping"]
+
+    changed = False
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        if "error_code_mapping" not in block and isinstance(label, str) and label in prior_mappings:
+            block["error_code_mapping"] = prior_mappings[label]
+            changed = True
+
+    if not changed:
+        return workflow_yaml
+    return yaml.safe_dump(data, sort_keys=False)
+
+
 async def apply_derived_code_block_steps(workflow_yaml: str) -> str:
     """Return workflow_yaml with each code block's `steps` recomputed from its `code`."""
     try:
@@ -388,6 +429,77 @@ async def apply_derived_code_block_steps(workflow_yaml: str) -> str:
     changed = False
     for block in _iter_code_block_dicts(data):
         block["steps"] = derive_code_block_steps(block["code"], block.get("prompt"))
+        changed = True
+
+    if not changed:
+        return workflow_yaml
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def _declared_parameter_keys(data: Any) -> set[str]:
+    definition = data.get("workflow_definition") if isinstance(data, dict) else None
+    parameters = definition.get("parameters") if isinstance(definition, dict) else None
+    if not isinstance(parameters, list):
+        return set()
+    return {
+        key
+        for parameter in parameters
+        if isinstance(parameter, dict)
+        for key in [str(parameter.get("key") or "").strip()]
+        if key
+    }
+
+
+def _referenced_names(code: str) -> set[str]:
+    """Identifiers the code actually reads.
+
+    Read from the syntax rather than the text: a parameter named in a docstring or a string
+    literal is not a reference, and binding on one would put a credential in the scope of a
+    block that never asked for it. Unparseable code names nothing rather than everything.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(code or "").strip())
+    except SyntaxError:
+        return set()
+    # Load context only: a block that assigns the name defines its own, and binding the real
+    # value there would widen a credential's scope to code that never read the parameter.
+    return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+
+def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
+    """Return workflow_yaml with each code block's ``parameter_keys`` covering the declared
+    parameters its own code names.
+
+    A block's runtime scope is built from ``parameter_keys``; a name the code uses but the
+    block never lists is absent at runtime, and the block dies on ``NameError`` after the
+    browser work is already done. The reference in the code is the intent, so bind from it
+    rather than require the submission to repeat itself. Only keys the workflow already
+    declares can be added, so this cannot invent a binding.
+    """
+    try:
+        data = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml
+    if not isinstance(data, (dict, list)):
+        return workflow_yaml
+
+    declared = _declared_parameter_keys(data)
+    if not declared:
+        return workflow_yaml
+
+    changed = False
+    for block in _iter_code_block_dicts(data):
+        code = block["code"]
+        # A key colliding with an executor-reserved name is dropped at bind time, and the
+        # credential-field names resolve to a bound credential's secret instead of the
+        # parameter, so binding one would hand the block the wrong value entirely.
+        referenced = (declared & _referenced_names(code)) - _RESERVED_PARAM_NAMES
+        raw_keys = block.get("parameter_keys")
+        existing = [key for key in raw_keys if isinstance(key, str)] if isinstance(raw_keys, list) else []
+        missing = [key for key in sorted(referenced) if key not in existing]
+        if not missing:
+            continue
+        block["parameter_keys"] = existing + missing
         changed = True
 
     if not changed:

@@ -71,6 +71,21 @@ class Parameter(BaseModel, abc.ABC):
         return tuple(cls.__subclasses__())
 
 
+# Sentinel aws_key for AWSSecretParameter stubs synthesized for custom-SMTP-only send email
+# blocks: the model requires the platform-sender parameters structurally, but the custom path
+# never reads them and they must never be registered for secret resolution.
+UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY = "UNUSED_CUSTOM_SMTP_PLACEHOLDER"
+
+# Parameter key -> AWS Secrets Manager key for the platform SMTP sender. The parameter keys
+# must match the ones the workflow editor declares, or synthesis would duplicate them.
+PLATFORM_SMTP_AWS_KEYS = {
+    "smtp_host": "SKYVERN_SMTP_HOST_AWS_SES",
+    "smtp_port": "SKYVERN_SMTP_PORT_AWS_SES",
+    "smtp_username": "SKYVERN_SMTP_USERNAME_SES",
+    "smtp_password": "SKYVERN_SMTP_PASSWORD_SES",
+}
+
+
 class AWSSecretParameter(Parameter):
     parameter_type: Literal[ParameterType.AWS_SECRET] = ParameterType.AWS_SECRET
 
@@ -127,6 +142,8 @@ class CredentialParameter(Parameter):
     credential_id: str
     credential_ids: list[str] | None = None
     selection_strategy: str | None = None
+    fallback_credential_ids: list[str] | None = None
+    fallback_trigger: str | None = None
 
     created_at: datetime
     modified_at: datetime

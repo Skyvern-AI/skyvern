@@ -1,4 +1,5 @@
 import { usePostHog } from "posthog-js/react";
+import { ArtifactVideo } from "@/components/ArtifactVideo";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRecordingUrls } from "./recordingUrls";
 
@@ -32,10 +33,11 @@ function WorkflowRunRecording() {
     });
   }
 
-  if (recordingUrls.length === 1) {
+  const singleUrl = recordingUrls.length === 1 ? recordingUrls[0] : undefined;
+  if (singleUrl) {
     return (
-      <video
-        src={recordingUrls[0]}
+      <ArtifactVideo
+        src={singleUrl}
         controls
         preload="metadata"
         className="w-full rounded-md"
@@ -51,10 +53,10 @@ function WorkflowRunRecording() {
           key={index} // presigned URLs change on refetch; list order is stable
           className="flex flex-col gap-2"
         >
-          <div className="text-sm text-slate-400">
+          <div className="text-sm text-muted-foreground">
             Recording {index + 1} of {recordingUrls.length}
           </div>
-          <video
+          <ArtifactVideo
             src={url}
             controls
             preload="metadata"

@@ -76,7 +76,7 @@ function ExtractionEditorBody({
               <div className="space-y-2">
                 <div className="flex justify-between">
                   <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-tertiary-foreground">
                       Data Extraction Goal
                     </Label>
                     <HelpTooltip
@@ -84,7 +84,7 @@ function ExtractionEditorBody({
                     />
                   </div>
                   {isFirstWorkflowBlock ? (
-                    <div className="flex justify-end text-xs text-slate-400">
+                    <div className="flex justify-end text-xs text-muted-foreground">
                       Tip: Use the {"+"} button to add inputs!
                     </div>
                   ) : null}
@@ -144,7 +144,7 @@ function ExtractionEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Engine
                   </Label>
                 </div>
@@ -156,7 +156,7 @@ function ExtractionEditorBody({
               </div>
               <div className="flex items-center justify-between">
                 <div className="flex gap-2">
-                  <Label className="text-xs font-normal text-slate-300">
+                  <Label className="text-xs font-normal text-tertiary-foreground">
                     Max Steps Override
                   </Label>
                   <HelpTooltip

@@ -5,18 +5,25 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
 from pydantic import (
     AliasChoices,
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    WebsocketUrl,
     field_serializer,
     field_validator,
     model_validator,
 )
 
+from skyvern.forge.sdk.db.enums import BrowserSeedSource, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -59,27 +66,50 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunType,
 )
 from skyvern.utils.secret_headers import mask_header_values
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
+_BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
+BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
     TaskRunTypeField: TypeAlias = Literal[
-        "task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
+        "task_v1", "task_v2", "task_v3", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
     ]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
         RunType.task_v1,
         RunType.task_v2,
+        RunType.task_v3,
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
         RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
+
+
+def _validate_browser_address(browser_address: str | None) -> str | None:
+    if not browser_address:
+        return browser_address
+
+    try:
+        parsed = _BROWSER_ADDRESS_ADAPTER.validate_python(browser_address)
+    except ValidationError as exc:
+        raise ValueError("browser_address must be an HTTP(S) or WebSocket URL with a host") from exc
+
+    if not parsed.host:
+        raise ValueError("browser_address must include a host")
+
+    validate_browser_host(parsed.host)
+    return browser_address
+
+
+def _browser_address_is_server_assigned(info: ValidationInfo) -> bool:
+    return bool(info.context and info.context.get(BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY))
 
 
 class TaskRunRequest(BaseModel):
@@ -138,6 +168,18 @@ class TaskRunRequest(BaseModel):
         description=BROWSER_SESSION_ID_DOC_STRING,
         examples=BROWSER_SESSION_ID_EXAMPLES,
     )
+    browser_profile_id: str | None = Field(
+        default=None,
+        description="ID of a browser profile to reuse for this task",
+    )
+    start_fresh_browser: bool = Field(
+        default=False,
+        description=(
+            "When true, start this run from a fresh, empty browser and ignore any saved browser "
+            "memory — no memory is read or written. A verified sign-in during the run still updates "
+            "the credential's saved login."
+        ),
+    )
     model: dict[str, Any] | None = Field(
         default=None,
         description=MODEL_CONFIG,
@@ -168,7 +210,7 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
-    max_screenshot_scrolls: int | None = Field(
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
@@ -190,9 +232,21 @@ class TaskRunRequest(BaseModel):
             return None
         return normalize_run_with(v)
 
-    @field_validator("url", "webhook_url", "totp_url")
+    @field_validator("url")
     @classmethod
-    def validate_urls(cls, url: str | None) -> str | None:
+    def validate_task_url(cls, url: str | None) -> str | None:
+        if not url:
+            return url
+        return validate_url(url)
+
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
+
+    @field_validator("webhook_url", "totp_url")
+    @classmethod
+    def validate_callback_urls(cls, url: str | None) -> str | None:
         """
         Validates that URLs provided to Skyvern are properly formatted.
 
@@ -215,6 +269,33 @@ class TaskRunRequest(BaseModel):
     def _route_publish_workflow_to_v2(self) -> TaskRunRequest:
         if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
             self.engine = RunEngine.skyvern_v2
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> TaskRunRequest:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
         return self
 
 
@@ -255,11 +336,23 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    reuse_browser_session: bool | None = Field(
+        default=None,
+        description="Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account.",
+    )
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
     )
-    max_screenshot_scrolls: int | None = Field(
+    start_fresh_browser: bool = Field(
+        default=False,
+        description=(
+            "When true, start this run from a fresh, empty browser and ignore any saved browser "
+            "memory — no memory is read or written. A verified sign-in during the run still updates "
+            "the credential's saved login."
+        ),
+    )
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
@@ -322,6 +415,13 @@ class WorkflowRunRequest(BaseModel):
     def _validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return normalize_run_metadata(v)
 
+    @field_validator("browser_address")
+    @classmethod
+    def validate_browser_address(cls, browser_address: str | None, info: ValidationInfo) -> str | None:
+        if _browser_address_is_server_assigned(info):
+            return browser_address
+        return _validate_browser_address(browser_address)
+
     @field_validator("webhook_url", "totp_url")
     @classmethod
     def validate_urls(cls, url: str | None) -> str | None:
@@ -333,8 +433,39 @@ class WorkflowRunRequest(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> WorkflowRunRequest:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
+        return self
+
 
 class BlockRunRequest(WorkflowRunRequest):
+    webhook_url: WebhookUrl | None = Field(
+        default=None,
+        description="URL to send workflow status updates to after the run finishes.",
+    )
     block_labels: list[str] = Field(
         description="Labels of the blocks to execute",
         examples=["block_1", "block_2"],
@@ -353,6 +484,19 @@ class BlockRunRequest(WorkflowRunRequest):
         default=None,
         description="ID of the debug session to use for this block run",
     )
+
+
+def should_suppress_memory_write(start_fresh_browser: bool | None) -> bool:
+    # Governs own-memory / healthy-run write-back only. Credential banking is unaffected
+    # (a verified fresh sign-in still banks), so do not consult this at the credential-write path.
+    return bool(start_fresh_browser)
+
+
+def resolve_start_fresh(start_fresh_browser: bool | None, override_browser_profile_id: str | None) -> bool:
+    # An explicit per-run browser_profile_id override wins over the fresh flag (the flag suppresses
+    # only BELOW the run-override level). The seed resolver ranks a raw start_fresh above the override,
+    # so this gate is the deliberate reconciliation of the two layers.
+    return bool(start_fresh_browser) and not override_browser_profile_id
 
 
 class ScriptRunResponse(BaseModel):
@@ -388,6 +532,17 @@ class ScriptRunResponse(BaseModel):
 class UploadFileResponse(BaseModel):
     s3_uri: str = Field(description="S3 URI where the file was uploaded")
     presigned_url: str = Field(description="Presigned URL to access the uploaded file")
+    file_id: str | None = Field(
+        default=None,
+        description="Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file.",
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the file will be deleted, if a retention_days was supplied. "
+            "Null means the file has no expiry of its own and follows the organization's data retention policy."
+        ),
+    )
 
 
 class BaseRunResponse(BaseModel):
@@ -397,7 +552,17 @@ class BaseRunResponse(BaseModel):
     )
     status: RunStatus = Field(
         description="Current status of the run",
-        examples=["created", "queued", "running", "timed_out", "failed", "terminated", "completed", "canceled"],
+        examples=[
+            "created",
+            "queued",
+            "running",
+            "paused",
+            "timed_out",
+            "failed",
+            "terminated",
+            "completed",
+            "canceled",
+        ],
     )
     output: dict | list | str | None = Field(
         default=None,
@@ -482,6 +647,11 @@ class WorkflowRunResponse(BaseRunResponse):
         default=None,
         description="ID of the cached script used for this workflow run, if any.",
     )
+    browser_seed_source: BrowserSeedSource | None = Field(
+        default=None,
+        description="Which layer of the seed-precedence chain seeded this run's browser (provenance).",
+        examples=["credential", "own_memory", "fresh"],
+    )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
@@ -514,6 +684,7 @@ class TaskRunListItem(BaseModel):
     workflow_permanent_id: str | None = None
     workflow_deleted: bool = False
     script_run: bool = False
+    trigger_type: WorkflowRunTriggerType | None = None
     searchable_text: str | None = Field(default=None, exclude=True)
 
     @field_validator("script_run", mode="before")

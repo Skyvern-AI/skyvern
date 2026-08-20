@@ -23,7 +23,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WorkflowTriggerBlock,
     jinja_sandbox_env,
 )
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
@@ -252,12 +252,16 @@ class TestPayloadJsonSerialization:
         block: WorkflowTriggerBlock,
         payload: dict[str, Any],
         values: dict[str, Any],
+        credential_ids: dict[str, str] | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ctx = MagicMock()
         ctx.values = values
+        ctx.parameters = parameters or {}
         ctx.secrets = {}
         ctx.include_secrets_in_templates = False
         ctx.get_block_metadata = MagicMock(return_value={})
+        ctx.get_resolved_credential_parameter_id.side_effect = lambda key: (credential_ids or {}).get(key)
         return block._render_templates_in_payload(payload, ctx)
 
     def test_list_value_renders_as_json(self) -> None:
@@ -295,6 +299,55 @@ class TestPayloadJsonSerialization:
             {"file_number": "ABC-123"},
         )
         assert result == {"file_number": "ABC-123"}
+
+    def test_credential_id_value_renders_as_raw_id(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId }}"},
+            {
+                "credentialId": {
+                    "context": "placeholder",
+                    "username": "secret_username",
+                    "password": "secret_password",
+                }
+            },
+            credential_ids={"credentialId": "cred_selected"},
+        )
+        assert result == {"credentialId": "cred_selected"}
+
+    def test_credential_id_json_filter_renders_as_raw_id(self) -> None:
+        block = _make_block()
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId | json }}"},
+            {"credentialId": {"context": "placeholder"}},
+            credential_ids={"credentialId": "cred_selected"},
+        )
+        assert result == {"credentialId": "cred_selected"}
+
+    def test_at_will_credential_renders_as_empty_not_none(self) -> None:
+        # An at-will credential (credential_id type, no default) that was not provided has no
+        # resolved id and a None value. Forwarding it must render "" — not the literal "None",
+        # which the child would then try to validate as a credential id.
+        block = _make_block()
+        now = datetime.now(timezone.utc)
+        at_will = WorkflowParameter(
+            workflow_parameter_id="wp_cred",
+            workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+            workflow_id="wf",
+            key="credentialId",
+            default_value=None,
+            created_at=now,
+            modified_at=now,
+        )
+        result = self._render_payload_live(
+            block,
+            {"credentialId": "{{ credentialId }}"},
+            {"credentialId": None},
+            parameters={"credentialId": at_will},
+        )
+        assert result == {"credentialId": ""}
 
     def test_int_value_renders_as_decimal_string(self) -> None:
         block = _make_block()
@@ -416,6 +469,7 @@ async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: p
         workflow_run = MagicMock()
         workflow_run.workflow_run_id = "wr_child"
         workflow_run.workflow_permanent_id = "wfp_child"
+        workflow_run.sequential_credential_id = None
         return workflow_run
 
     async def _execute_workflow(**_: Any) -> Any:
@@ -471,6 +525,149 @@ async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: p
         "PARENT_AFTER": False,
         "PARENT_BEFORE": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_fails_closed_when_child_resolves_sequential_credential() -> None:
+    # A synchronous trigger child runs inline via execute_workflow — it never queues, never gets a
+    # queued_at, and never reaches the Temporal V2 serialization gate. setup_workflow_run still stamps
+    # its sequential_credential_id, so a concurrent run sharing that credential would not see it as a
+    # blocker (the gate filters queued_at IS NOT NULL). The child must fail closed before it uses the
+    # credential — mirroring the scheduled-run fence — instead of running unserialized.
+    block = _make_block(browser_session_id="pbs_child")
+
+    child_run = MagicMock()
+    child_run.workflow_run_id = "wr_child"
+    child_run.workflow_permanent_id = "wfp_child"
+    child_run.sequential_credential_id = "cred_a"
+
+    organization = MagicMock()
+    organization.organization_id = "org_parent"
+
+    captured: dict[str, Any] = {}
+
+    async def _build_result(**kwargs: Any) -> Any:
+        captured["success"] = kwargs.get("success")
+        captured["failure_reason"] = kwargs.get("failure_reason")
+        return MagicMock()
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
+        patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
+        patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
+    ):
+        mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=child_run)
+        mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock()
+        mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
+
+        await block.execute(
+            workflow_run_id="wr_parent",
+            workflow_run_block_id="wrb_parent",
+            organization_id="org_parent",
+            browser_session_id=None,
+        )
+
+    mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
+    assert (
+        mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.await_args.kwargs["workflow_run_id"]
+        == "wr_child"
+    )
+    assert captured["success"] is False
+
+
+async def _run_sync_trigger_fence(
+    block: WorkflowTriggerBlock,
+    *,
+    created_session_id: str | None,
+    setup_raises: bool = False,
+) -> tuple[MagicMock, dict[str, Any]]:
+    child_run = MagicMock()
+    child_run.workflow_run_id = "wr_child"
+    child_run.workflow_permanent_id = "wfp_child"
+    child_run.sequential_credential_id = "cred_a"
+
+    organization = MagicMock()
+    organization.organization_id = "org_parent"
+
+    captured: dict[str, Any] = {}
+
+    async def _build_result(**kwargs: Any) -> Any:
+        captured["success"] = kwargs.get("success")
+        captured["failure_reason"] = kwargs.get("failure_reason")
+        return MagicMock()
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
+        patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
+        patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
+    ):
+        mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(proxy_location=None))
+        created_session = MagicMock()
+        created_session.persistent_browser_session_id = created_session_id
+        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+        if setup_raises:
+            mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(side_effect=RuntimeError("setup boom"))
+        else:
+            mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=child_run)
+        mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock()
+        mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
+
+        await block.execute(
+            workflow_run_id="wr_parent",
+            workflow_run_block_id="wrb_parent",
+            organization_id="org_parent",
+            browser_session_id=None,
+        )
+
+    return mock_app, captured
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
+    # A sync trigger with no configured/inherited session creates a fresh 30-minute persistent
+    # session before setup. When the child resolves a sequential credential, the fail-closed fence
+    # must still close that self-created session before returning; otherwise it strands until timeout.
+    block = _make_block()
+
+    mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh")
+
+    mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
+    assert captured["success"] is False
+    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_parent", "pbs_fresh")
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_does_not_close_configured_session_on_fence() -> None:
+    # A block-configured session is owned by the caller, not created here: the fence must not close it.
+    block = _make_block(browser_session_id="pbs_child")
+
+    mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh")
+
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
+    assert captured["success"] is False
+    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_closes_fresh_session_when_setup_raises() -> None:
+    # The pre-existing setup-failure early return shares the leak: cleanup must run there too.
+    block = _make_block()
+
+    mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh", setup_raises=True)
+
+    assert captured["success"] is False
+    mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_parent", "pbs_fresh")
 
 
 class TestBlockMetadata:

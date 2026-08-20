@@ -81,7 +81,31 @@ describe("useCreateBrowserSessionMutation proxy pin payloads", () => {
       extensions: [],
       browser_type: null,
       generate_browser_profile: true,
+      browser_profile_id: null,
+      needs_live_view: true,
     });
     expect(mockNavigate).toHaveBeenCalledWith("/browser-session/pbs_123");
+  });
+
+  it("declares that the session will be watched, whatever the caller asked for", async () => {
+    // Sessions started from the app are watched in it; the hint is what keeps them on
+    // infrastructure that can serve a live view. Dropping it fails on click, not on create.
+    mockPost.mockResolvedValue({ data: { browser_session_id: "pbs_456" } });
+    const { result } = renderHook(() => useCreateBrowserSessionMutation(), {
+      wrapper,
+    });
+
+    act(() => {
+      result.current.mutate({
+        proxyLocation: PINNED_RESIDENTIAL_ISP_PROXY_LOCATION,
+        proxySessionId: null,
+        timeout: null,
+      });
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mockPost.mock.calls[0]?.[1]).toMatchObject({
+      needs_live_view: true,
+    });
   });
 });

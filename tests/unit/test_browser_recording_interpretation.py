@@ -613,7 +613,14 @@ def test_start_session_same_recording_attempt_id_reuses_session() -> None:
     assert registry._sessions[PBS_ID].session_revision == 5
 
 
-def test_start_session_new_recording_attempt_id_forces_fresh_session() -> None:
+def test_start_session_new_recording_attempt_id_continues_unfinished_session() -> None:
+    """SKY-12429: a new attempt id on an unfinished recording continues it.
+
+    The client mints the attempt id per recording and keeps it stable across
+    reconnects, so a different id on the same unfinished session means the client
+    lost its in-memory state (e.g. page reload). The accumulated drafts must be
+    carried forward and resynced to the reconnecting client, not wiped.
+    """
     from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 
     registry = RecordingInterpretationSessionRegistry()
@@ -624,9 +631,51 @@ def test_start_session_new_recording_attempt_id_forces_fresh_session() -> None:
         on_update=lambda _: None,
         recording_attempt_id="attempt-1",
     )
-    stale = registry._sessions[PBS_ID]
-    stale.session_revision = 42
-    stale.steps = [
+    session = registry._sessions[PBS_ID]
+    session.session_revision = 42
+    session.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+        )
+    ]
+
+    resynced: list[RecordingInterpretationUpdate] = []
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=resynced.append,
+        recording_attempt_id="attempt-2",
+    )
+
+    # Same session, drafts intact, the new attempt id adopted, and the
+    # reconnecting client resynced with the accumulated steps.
+    continued = registry._sessions[PBS_ID]
+    assert continued is session
+    assert continued.recording_attempt_id == "attempt-2"
+    assert [s.step_id for s in continued.steps] == ["step-1"]
+    assert resynced and [s.step_id for s in resynced[-1].steps] == ["step-1"]
+
+
+def test_start_session_after_finalized_recording_starts_fresh() -> None:
+    """Done/Discard finalize and pop the session; a lingering finalized session
+    must not leak its steps into the next recording."""
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+        recording_attempt_id="attempt-1",
+    )
+    finalized = registry._sessions[PBS_ID]
+    finalized.finalized = True
+    finalized.steps = [
         RecordingDraftStep(
             step_id="step-1",
             action_kind=ActionKind.CLICK,
@@ -643,12 +692,8 @@ def test_start_session_new_recording_attempt_id_forces_fresh_session() -> None:
         recording_attempt_id="attempt-2",
     )
 
-    # A new recording gets a fresh session: not the stale object, revision reset,
-    # no carried-over steps.
     fresh = registry._sessions[PBS_ID]
-    assert fresh is not stale
-    assert fresh.recording_attempt_id == "attempt-2"
-    assert fresh.session_revision == 0
+    assert fresh is not finalized
     assert fresh.steps == []
 
 
@@ -743,3 +788,83 @@ async def test_resume_capture_emits_resync_snapshot(monkeypatch: pytest.MonkeyPa
     assert len(updates) == 1
     assert updates[0].is_snapshot is True
     session.cancel()
+
+
+@pytest.mark.asyncio
+async def test_new_attempt_id_mid_recording_continues_session_and_keeps_drafts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SKY-12429: a reconnect with a new attempt id continues the same recording.
+
+    The client only presents a different recording_attempt_id for an unfinished
+    recording when it lost its in-memory state (e.g. page reload). The registry
+    must continue the populated session: resync the panel with the accumulated
+    drafts instead of blanking it, keep interpreting new events, and let the
+    finished recording build blocks from everything captured.
+    """
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click the submit button."}
+
+    monkeypatch.setattr(app, "LLM_API_HANDLER", fake_llm)
+
+    registry = RecordingInterpretationSessionRegistry()
+    panel: list[RecordingInterpretationUpdate] = []
+
+    # Attempt 1: the user interacts and drafts accumulate.
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=panel.append,
+        recording_attempt_id="attempt-1",
+    )
+    session_one = registry._sessions[PBS_ID]
+    registry.ingest_events(
+        PBS_ID,
+        [
+            _click_streaming_event(timestamp=1000.0, capture_seq=0, sky_id="sky-a", target_id="a"),
+            _click_streaming_event(timestamp=1010.0, capture_seq=1, sky_id="sky-b", target_id="b"),
+        ],
+    )
+    await session_one._interpret(finalized=False)
+
+    # The panel shows those drafts (full snapshot with a non-empty step list).
+    populated_snapshots = [u for u in panel if u.is_snapshot and u.steps]
+    assert populated_snapshots, "expected the panel to display the interpreted drafts"
+    accumulated_step_count = len(session_one.steps)
+    assert accumulated_step_count >= 1
+
+    # A reconnect arrives with a NEW attempt id (same browser session, not finalized).
+    panel.clear()
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=panel.append,
+        recording_attempt_id="attempt-2",
+    )
+    session_two = registry._sessions[PBS_ID]
+
+    # The recording continues: same session, drafts intact, new attempt id adopted,
+    # and the reconnecting client immediately resynced with the accumulated steps.
+    assert session_two is session_one
+    assert len(session_two.steps) == accumulated_step_count
+    assert session_two.recording_attempt_id == "attempt-2"
+    assert panel and panel[-1].is_snapshot and len(panel[-1].steps) == accumulated_step_count
+
+    # New interactions after the reconnect keep extending the same draft list.
+    registry.ingest_events(
+        PBS_ID,
+        [_click_streaming_event(timestamp=2000.0, capture_seq=2, sky_id="sky-c", target_id="c")],
+    )
+    await session_two._interpret(finalized=False)
+    assert len(session_two.steps) > accumulated_step_count
+
+    # Finishing builds blocks from everything captured across the reconnect.
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    blocks = processor.drafts_to_blocks(session_two.steps)
+    assert len(blocks) == len(session_two.steps)
+
+    registry.discard_session(PBS_ID)

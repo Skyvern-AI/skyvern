@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge.sdk.routes.event_source_stream import (
+from skyvern.forge.sdk.core.event_source_stream import (
     _BACKGROUND_HANDLER_TASKS,
     FastAPIEventSourceStream,
 )

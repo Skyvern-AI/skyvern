@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import sys
 import time
+from dataclasses import dataclass
 from os import PathLike, fspath
 from types import FrameType
 from typing import Any, Awaitable, Callable
@@ -9,6 +12,9 @@ from typing import Any, Awaitable, Callable
 import pydantic
 import structlog
 
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.db.id import generate_action_id
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
 
@@ -17,6 +23,8 @@ LOG = structlog.get_logger()
 CODE_BLOCK_FILENAME = "<code_block>"
 # full_code = "\nasync def wrapper(...):\n<user code from line 3>"; user line = frame line - 2
 CODE_LINE_OFFSET = 2
+MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
+PENDING_NAVIGATION_DELAY_SECONDS = 20.0
 
 _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "goto": ActionType.GOTO_URL,
@@ -30,6 +38,7 @@ _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "dblclick": ActionType.CLICK,
     "fill": ActionType.INPUT_TEXT,
     "type": ActionType.INPUT_TEXT,
+    "press_sequentially": ActionType.INPUT_TEXT,
     "press": ActionType.KEYPRESS,
     "select_option": ActionType.SELECT_OPTION,
     "check": ActionType.CHECKBOX,
@@ -50,14 +59,16 @@ _LOCATOR_FACTORY_METHODS = frozenset(
         "filter",
     }
 )
+_RECORDABLE_HANDLE_TYPE_NAMES = frozenset({"ElementHandle", "FrameLocator", "Locator"})
 # SkyvernPage high-level API (page.extract / page.complete / ...). These are not raw
 # Playwright calls, so they fall through the maps above and used to execute unrecorded —
 # a navigate+extract block then rendered as only repeated "Goto URL" on the timeline.
 # Mirror skyvern_page.py's @action_wrap table and the editor deriver
 # (code_block_steps._METHOD_ACTION_TYPES) so extraction and the rest of the surface
 # record as distinct, reader-facing steps.
+# `extract` is absent on purpose: code blocks run on a raw Playwright page and must not reach
+# the LLM extraction path, so nothing may author or record a page.extract call.
 _HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
-    "extract": ActionType.EXTRACT,
     "complete": ActionType.COMPLETE,
     "terminate": ActionType.TERMINATE,
     "wait": ActionType.WAIT,
@@ -75,9 +86,21 @@ _HIGH_LEVEL_ACTION_MAP: dict[str, ActionType] = {
 }
 # High-level methods whose natural-language `prompt` (positional or keyword) is the
 # reader-facing description; mirrors code_block_steps._PROMPT_POSITIONAL_METHODS.
-_PROMPT_METHODS: frozenset[str] = frozenset({"extract", "complete", "solve_captcha", "verification_code"})
+_PROMPT_METHODS: frozenset[str] = frozenset({"complete", "solve_captcha", "verification_code"})
 
 OnAction = Callable[[Action], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAction:
+    action_type: ActionType
+    action_order: int
+    code_line: int | None
+    call_name: str
+    threshold_seconds: float
+
+
+OnPendingAction = Callable[[PendingAction], Awaitable[None]]
 
 
 def _frame_user_line() -> int | None:
@@ -92,13 +115,16 @@ def _frame_user_line() -> int | None:
 
 
 def user_code_line_from_exception(exc: BaseException) -> int | None:
-    tb = exc.__traceback__
-    line: int | None = None
-    while tb is not None:
-        if tb.tb_frame.f_code.co_filename == CODE_BLOCK_FILENAME:
-            line = max(tb.tb_lineno - CODE_LINE_OFFSET, 1)
-        tb = tb.tb_next
-    return line
+    try:
+        tb = BaseException.__getattribute__(exc, "__traceback__")
+        line: int | None = None
+        while tb is not None:
+            if tb.tb_frame.f_code.co_filename == CODE_BLOCK_FILENAME:
+                line = max(tb.tb_lineno - CODE_LINE_OFFSET, 1)
+            tb = tb.tb_next
+        return line
+    except BaseException:
+        return None
 
 
 def _describe(name: str, target: str | None, args: tuple[Any, ...]) -> str:
@@ -235,11 +261,21 @@ def _action_from_fields(
     try:
         return action_class(**fields)
     except pydantic.ValidationError as exc:
+        error_count = exc.error_count()
+        error_fields = []
+        # errors() materializes a dict per failure, so only call it when every entry fits. Retain
+        # only loc/type because input/msg can echo the value that failed validation.
+        if error_count <= MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS:
+            for error in exc.errors():
+                field_path = ".".join(str(part) for part in error["loc"])
+                error_fields.append((field_path, error["type"]))
         LOG.warning(
             warning,
             action_type=action_type,
             subclass=action_class.__name__,
-            errors=exc.errors(),
+            error_count=error_count,
+            error_fields=error_fields,
+            error_fields_truncated=error_count > MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS,
         )
         return Action(**fields)
 
@@ -254,10 +290,42 @@ def recorded_action_from_payload(raw: dict[str, Any]) -> Action:
 
 
 class _Recorder:
-    def __init__(self, on_action: OnAction | None = None) -> None:
+    def __init__(
+        self,
+        on_action: OnAction | None = None,
+        credential_release_guard: CredentialReleaseGuard | None = None,
+        on_pending_action: OnPendingAction | None = None,
+    ) -> None:
         self.actions: list[Action] = []
         self.last_exception: BaseException | None = None
         self._on_action = on_action
+        self._on_pending_action = on_pending_action
+        self.credential_release_guard = credential_release_guard
+
+    async def _emit_pending_action(self, pending_action: PendingAction) -> None:
+        await asyncio.sleep(pending_action.threshold_seconds)
+        if self._on_pending_action is None:
+            return
+        try:
+            await self._on_pending_action(pending_action)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning(
+                "Code block pending action sink failed",
+                action_type=pending_action.action_type,
+                call_name=pending_action.call_name,
+            )
+
+    async def enforce_credential_release(
+        self,
+        target: Any,
+        name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        if self.credential_release_guard is not None:
+            await self.credential_release_guard.enforce(target, name, args, kwargs)
 
     async def record(
         self,
@@ -270,32 +338,68 @@ class _Recorder:
         description: str | None = None,
     ) -> Any:
         started = time.monotonic()
+        started_wall = naive_utc_now()
+        code_line = _frame_user_line()
+        action_order = len(self.actions)
         # Input values may be credentials (incl. derived TOTP codes); never describe them.
         describe_args = () if action_type == ActionType.INPUT_TEXT else args
         common_fields = dict(
+            # Stable id assigned once so the streamed write and the end-of-block batch upsert the same row.
+            action_id=generate_action_id(),
             action_type=action_type,
             status=ActionStatus.completed,
-            action_order=len(self.actions),
+            action_order=action_order,
             # A reader-facing prompt (page.extract/complete) is the action's own copy; prefer it over
             # the "page.method arg" form so the timeline reads as plain language even when the editor's
             # derived step is missing or stale and the UI falls back to this description.
             description=description if description is not None else _describe(name, target, describe_args),
-            output={"code_line": _frame_user_line()},
+            output={"code_line": code_line},
         )
         action = _action_from_fields(
             action_type,
             {**common_fields, **_recorded_action_fields(action_type, name, target, args, kwargs)},
             warning="Failed to instantiate recorded action subclass, falling back to base Action",
         )
+        pending_task: asyncio.Task[None] | None = None
+        cleanup_cancelled = False
+        if name == "page.goto" and self._on_pending_action is not None:
+            pending_task = asyncio.create_task(
+                self._emit_pending_action(
+                    PendingAction(
+                        action_type=action_type,
+                        action_order=action_order,
+                        code_line=code_line,
+                        call_name=name,
+                        threshold_seconds=PENDING_NAVIGATION_DELAY_SECONDS,
+                    )
+                ),
+                name="code-block-navigation-pending",
+            )
         try:
             result = await call()
         except BaseException as exc:
             action.status = ActionStatus.failed
-            action.response = str(exc)[:500]
+            action.response = "Browser operation failed."
             self.last_exception = exc
             raise
         finally:
+            if pending_task is not None:
+                current_task = asyncio.current_task()
+                cancellation_count = current_task.cancelling() if current_task is not None else 0
+                pending_task.cancel()
+                while not pending_task.done():
+                    try:
+                        await asyncio.shield(pending_task)
+                    except asyncio.CancelledError:
+                        if current_task is not None and current_task.cancelling() > cancellation_count:
+                            cleanup_cancelled = True
+                if pending_task.cancelled():
+                    cleanup_cancelled = cleanup_cancelled or (
+                        current_task is not None and current_task.cancelling() > cancellation_count
+                    )
             duration_ms = int((time.monotonic() - started) * 1000)
+            action.started_at = started_wall
+            action.finished_at = naive_utc_now()
             if isinstance(action.output, dict):
                 action.output["duration_ms"] = duration_ms
             self.actions.append(action)
@@ -303,15 +407,42 @@ class _Recorder:
                 try:
                     await self._on_action(action)
                 except Exception:
-                    LOG.warning("Code block action sink failed", action_type=action_type, exc_info=True)
+                    LOG.warning("Code block action sink failed", action_type=action_type)
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
         return result
 
 
+def _wrap_recording_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+    if isinstance(value, list):
+        return [_wrap_recording_result(item, recorder, selector) for item in value]
+    if type(value).__module__.startswith("playwright.") and type(value).__name__ in _RECORDABLE_HANDLE_TYPE_NAMES:
+        return RecordingLocator(value, recorder, selector)
+    return value
+
+
+def _wrap_call_result(value: Any, recorder: _Recorder, selector: str | None) -> Any:
+    if inspect.isawaitable(value):
+
+        async def resolve() -> Any:
+            return _wrap_recording_result(await value, recorder, selector)
+
+        return resolve()
+    return _wrap_recording_result(value, recorder, selector)
+
+
 class RecordingLocator:
+    # Private worker-side hooks consumed by PlaywrightPageOperationBroker. The sandbox only
+    # receives opaque markers, never this proxy instance.
+    _skyvern_brokerable_handle = True
+
     def __init__(self, locator: Any, recorder: _Recorder, selector: str | None) -> None:
         self.__locator = locator
         self.__recorder = recorder
         self.__selector = selector
+
+    def _skyvern_page_operation_argument(self) -> Any:
+        return self.__locator
 
     def locator(self, selector: str, **kwargs: Any) -> RecordingLocator:
         return RecordingLocator(self.__locator.locator(selector, **kwargs), self.__recorder, selector)
@@ -319,6 +450,10 @@ class RecordingLocator:
     @property
     def first(self) -> RecordingLocator:
         return RecordingLocator(self.__locator.first, self.__recorder, self.__selector)
+
+    @property
+    def last(self) -> RecordingLocator:
+        return RecordingLocator(self.__locator.last, self.__recorder, self.__selector)
 
     def nth(self, index: int) -> RecordingLocator:
         return RecordingLocator(self.__locator.nth(index), self.__recorder, self.__selector)
@@ -332,25 +467,43 @@ class RecordingLocator:
 
             return factory
         action_type = _LOCATOR_ACTION_MAP.get(name)
-        if action_type is None or not callable(attr):
+        if not callable(attr):
             return attr
+        if action_type is None:
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, self.__selector)
+
+            return forwarded
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
-            return await self.__recorder.record(
-                action_type, f"locator.{name}", self.__selector, lambda: attr(*args, **kwargs), args, kwargs
-            )
+            async def call() -> Any:
+                await self.__recorder.enforce_credential_release(self.__locator, f"locator.{name}", args, kwargs)
+                return await attr(*args, **kwargs)
+
+            return await self.__recorder.record(action_type, f"locator.{name}", self.__selector, call, args, kwargs)
 
         return recorded
 
 
 class RecordingKeyboard:
-    def __init__(self, keyboard: Any, recorder: _Recorder) -> None:
+    def __init__(self, keyboard: Any, recorder: _Recorder, page: Any = None) -> None:
         self.__keyboard = keyboard
         self.__recorder = recorder
+        self.__page = page
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__keyboard, name)
-        if name != "press" or not callable(attr):
+        if not callable(attr):
+            return attr
+        if name in ("type", "insert_text"):
+
+            async def guarded(*args: Any, **kwargs: Any) -> Any:
+                await self.__recorder.enforce_credential_release(self.__page, f"keyboard.{name}", args, kwargs)
+                return await attr(*args, **kwargs)
+
+            return guarded
+        if name != "press":
             return attr
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
@@ -369,9 +522,15 @@ class RecordingPage:
     treat recordings as telemetry, not a tamper-proof audit trail.
     """
 
-    def __init__(self, page: Any, on_action: OnAction | None = None) -> None:
+    def __init__(
+        self,
+        page: Any,
+        on_action: OnAction | None = None,
+        credential_release_guard: CredentialReleaseGuard | None = None,
+        on_pending_action: OnPendingAction | None = None,
+    ) -> None:
         self.__page = page
-        self.__recorder = _Recorder(on_action)
+        self.__recorder = _Recorder(on_action, credential_release_guard, on_pending_action)
 
     def recorded_actions(self) -> list[Action]:
         return list(self.__recorder.actions)
@@ -384,7 +543,7 @@ class RecordingPage:
 
     @property
     def keyboard(self) -> RecordingKeyboard:
-        return RecordingKeyboard(self.__page.keyboard, self.__recorder)
+        return RecordingKeyboard(self.__page.keyboard, self.__recorder, page=self.__page)
 
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self.__page, name)
@@ -397,8 +556,14 @@ class RecordingPage:
         # Record direct page-level interactions (page.click/fill/press/...) and the high-level
         # SkyvernPage API (page.extract/complete/...) with the same redaction as the locator path.
         action_type = _LOCATOR_ACTION_MAP.get(name) or _PAGE_ACTION_MAP.get(name) or _HIGH_LEVEL_ACTION_MAP.get(name)
-        if action_type is None or not callable(attr):
+        if not callable(attr):
             return attr
+        if action_type is None:
+
+            def forwarded(*args: Any, **kwargs: Any) -> Any:
+                return _wrap_call_result(attr(*args, **kwargs), self.__recorder, _factory_selector(name, args))
+
+            return forwarded
         record_prompt = name in _PROMPT_METHODS
 
         async def recorded(*args: Any, **kwargs: Any) -> Any:
@@ -407,14 +572,39 @@ class RecordingPage:
                 prompt = kwargs.get("prompt", args[0] if args else None)
                 if isinstance(prompt, str) and prompt.strip():
                     description = " ".join(prompt.split())[:200]
+
+            async def call() -> Any:
+                await self.__recorder.enforce_credential_release(self.__page, f"page.{name}", args, kwargs)
+                return await attr(*args, **kwargs)
+
             return await self.__recorder.record(
                 action_type,
                 f"page.{name}",
                 None,
-                lambda: attr(*args, **kwargs),
+                call,
                 args,
                 kwargs,
                 description=description,
             )
 
         return recorded
+
+
+def json_safe_recorder_output(value: Any) -> Any:
+    """Recursively replace leaked recorder proxies with a JSON-safe marker before a code block's
+    output is registered. A raw RecordingLocator/RecordingKeyboard/RecordingPage reaching JSON
+    serialization raises TypeError at the output-registration boundary, which drops the whole
+    output payload and starves downstream evidence consumers.
+
+    A leaked proxy is a generated-code defect with no meaningful serializable value, so it collapses
+    to a type marker rather than its selector: a selector is only a lossy display fragment and can
+    embed a resolved credential, which mask_secrets_in_data does not scrub out of a dict key."""
+    if isinstance(value, (RecordingLocator, RecordingKeyboard, RecordingPage)):
+        return f"<{type(value).__name__}>"
+    if isinstance(value, dict):
+        # Normalize keys too: json.dumps rejects a non-primitive key outright (it never consults
+        # default=), so a proxy used as a mapping key would crash serialization all the same.
+        return {json_safe_recorder_output(key): json_safe_recorder_output(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe_recorder_output(item) for item in value]
+    return value

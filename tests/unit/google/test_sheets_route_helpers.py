@@ -31,6 +31,21 @@ def _patch_session(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mint_access_token_forwards_organization_id_to_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    secrets = MagicMock()
+    load_mock = AsyncMock(return_value=secrets)
+    access_mock = AsyncMock(return_value="access-token")
+    monkeypatch.setattr(sheets_routes.google_oauth_service, "load_credential_secrets", load_mock)
+    monkeypatch.setattr(sheets_routes.google_oauth_service, "access_token_from_secrets", access_mock)
+
+    token = await sheets_routes._mint_access_token("org_1", "cred_1")
+
+    assert token == "access-token"
+    load_mock.assert_awaited_once_with(organization_id="org_1", credential_id="cred_1")
+    access_mock.assert_awaited_once_with(secrets, organization_id="org_1")
+
+
+@pytest.mark.asyncio
 async def test_mint_access_token_returns_503_on_database_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "skyvern.forge.sdk.services.google_oauth_service.load_credential_secrets",

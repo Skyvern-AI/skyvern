@@ -7,16 +7,23 @@ import json
 import socket
 import subprocess
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from playwright.async_api import async_playwright
 
+from skyvern.exceptions import (
+    BrowserStateDiagnostic,
+    MissingBrowserState,
+    MissingBrowserStatePage,
+    get_user_facing_exception_message,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.real_browser_state import RealBrowserState
 
 
@@ -66,114 +73,119 @@ class _FakeWorkflowRun:
 @pytest.mark.asyncio
 async def test_reused_persistent_session_is_reconnected_when_disconnected(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _make_code_block()
+    workflow_run = _FakeWorkflowRun()
+    recovered_state = MagicMock()
+    recovered_state.reconnect = AsyncMock()
+    attach = AsyncMock(return_value=recovered_state)
 
-    fake_state = MagicMock()
-    fake_state.is_connected = MagicMock(return_value=False)
-    fake_state.reconnect = AsyncMock(return_value=None)
-
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=fake_state), raising=False
-    )
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER,
-        "get_browser_address_if_ready",
-        AsyncMock(return_value="ws://session-browser"),
-        raising=False,
-    )
-    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=_FakeWorkflowRun()))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", attach)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=workflow_run))
 
     result = await block.get_or_create_browser_state(
         workflow_run_id="wr_test", organization_id="o_test", browser_session_id="pbs_1"
     )
 
-    assert result is fake_state
-    fake_state.reconnect.assert_awaited_once()
-    # The session's own remote browser is the reconnect target, not the run's pooled address.
-    assert fake_state.reconnect.await_args.kwargs["browser_address"] == "ws://session-browser"
-    # CDP handshake headers must survive the rebuild or remote browsers needing them fail to reattach.
-    assert "cdp_connect_headers" in fake_state.reconnect.await_args.kwargs
+    assert result is recovered_state
+    attach.assert_awaited_once_with(
+        workflow_run=workflow_run,
+        url=None,
+        browser_session_id="pbs_1",
+        browser_profile_id=None,
+        browser_session_runnable_id=None,
+        browser_session_runnable_generation_id=None,
+    )
+    # Recovery belongs to the browser manager. The block must not run a second reconnect.
+    recovered_state.reconnect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_disconnected_session_without_resolvable_address_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _make_code_block()
+    workflow_run = _FakeWorkflowRun()
+    attach = AsyncMock(return_value=None)
 
-    fake_state = MagicMock()
-    fake_state.is_connected = MagicMock(return_value=False)
-    fake_state.reconnect = AsyncMock(return_value=None)
-
-    # The run still carries a (pooled) address, but a session-backed block must never reconnect
-    # to it — only the session's own browser is correct, so an unresolved session address is fatal.
-    class _PooledAddressRun(_FakeWorkflowRun):
-        browser_address = "ws://pooled-wrong-browser"
-
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=fake_state), raising=False
-    )
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER,
-        "get_browser_address_if_ready",
-        AsyncMock(return_value=None),
-        raising=False,
-    )
-    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=_PooledAddressRun()))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", attach)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=workflow_run))
 
     result = await block.get_or_create_browser_state(
         workflow_run_id="wr_test", organization_id="o_test", browser_session_id="pbs_1"
     )
 
     assert result is None
-    fake_state.reconnect.assert_not_awaited()
+    attach.assert_awaited_once_with(
+        workflow_run=workflow_run,
+        url=None,
+        browser_session_id="pbs_1",
+        browser_profile_id=None,
+        browser_session_runnable_id=None,
+        browser_session_runnable_generation_id=None,
+    )
 
 
 @pytest.mark.asyncio
 async def test_connected_reused_session_is_not_reconnected(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _make_code_block()
+    workflow_run = _FakeWorkflowRun()
+    connected_state = MagicMock()
+    connected_state.reconnect = AsyncMock()
+    attach = AsyncMock(return_value=connected_state)
+    get_run = AsyncMock(return_value=workflow_run)
 
-    fake_state = MagicMock()
-    fake_state.is_connected = MagicMock(return_value=True)
-    fake_state.reconnect = AsyncMock(return_value=None)
-
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=fake_state), raising=False
-    )
-    get_run = AsyncMock(return_value=_FakeWorkflowRun())
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", attach)
     monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", get_run)
 
     result = await block.get_or_create_browser_state(
         workflow_run_id="wr_test", organization_id="o_test", browser_session_id="pbs_1"
     )
 
-    assert result is fake_state
-    fake_state.reconnect.assert_not_awaited()
-    # A healthy reused state never needs the workflow run looked up for a rebuild.
-    get_run.assert_not_awaited()
+    assert result is connected_state
+    connected_state.reconnect.assert_not_awaited()
+    get_run.assert_awaited_once_with(workflow_run_id="wr_test", organization_id="o_test")
+    attach.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_reconnect_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     block = _make_code_block()
+    workflow_run = _FakeWorkflowRun()
+    attach = AsyncMock(return_value=None)
 
-    fake_state = MagicMock()
-    fake_state.is_connected = MagicMock(return_value=False)
-    fake_state.reconnect = AsyncMock(side_effect=RuntimeError("driver gone"))
-
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=fake_state), raising=False
-    )
-    monkeypatch.setattr(
-        app.PERSISTENT_SESSIONS_MANAGER,
-        "get_browser_address_if_ready",
-        AsyncMock(return_value="ws://session-browser"),
-        raising=False,
-    )
-    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=_FakeWorkflowRun()))
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", attach)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock(return_value=workflow_run))
 
     result = await block.get_or_create_browser_state(
         workflow_run_id="wr_test", organization_id="o_test", browser_session_id="pbs_1"
     )
 
     assert result is None
+    attach.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_code_block_preserves_missing_browser_state_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    exception = MissingBrowserState(workflow_run_id="wr_test", failure_reason="reconnect_failed:RuntimeError")
+    monkeypatch.setattr(CodeBlock, "_execute", AsyncMock(side_effect=exception))
+
+    with pytest.raises(MissingBrowserState) as exc_info:
+        await _make_code_block().execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test")
+
+    assert "reconnect_failed:RuntimeError" in str(exc_info.value)
+
+
+def test_missing_browser_state_user_message_hides_disconnect_diagnostic() -> None:
+    detected_at = datetime.now(timezone.utc)
+    exception = MissingBrowserState(
+        workflow_run_id="wr_test",
+        diagnostic=BrowserStateDiagnostic(
+            reason="browser_context_disconnected",
+            disconnect_observed_at=detected_at - timedelta(seconds=2),
+            browser_session_id="pbs_test",
+        ),
+        detected_at=detected_at,
+    )
+
+    assert "browser_session_id=pbs_test" in str(exception)
+    assert "browser_session_id=pbs_test" not in get_user_facing_exception_message(exception)
 
 
 def _state_with_context(context: object | None) -> RealBrowserState:
@@ -202,6 +214,96 @@ def test_is_connected_false_when_browser_disconnected() -> None:
     assert _state_with_context(context).is_connected() is False
 
 
+def test_disconnected_browser_state_latches_diagnostic() -> None:
+    browser = MagicMock()
+    browser.is_connected = MagicMock(return_value=False)
+    context = MagicMock()
+    context.browser = browser
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=context,
+        browser_artifacts=BrowserArtifacts(remote_browser_session_id="pbs_test"),
+    )
+
+    assert state.is_connected() is False
+    diagnostic = state.get_browser_state_diagnostic()
+    assert diagnostic is not None
+    assert diagnostic.reason == "browser_context_disconnected"
+    assert diagnostic.browser_session_id == "pbs_test"
+    assert diagnostic.observation_source == "liveness_probe"
+
+    assert state.is_connected() is False
+    assert state.get_browser_state_diagnostic() is diagnostic
+
+
+@pytest.mark.asyncio
+async def test_missing_page_includes_disconnect_timestamp_and_gap() -> None:
+    browser = MagicMock()
+    browser.is_connected = MagicMock(return_value=False)
+    context = MagicMock()
+    context.browser = browser
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=context,
+        browser_artifacts=BrowserArtifacts(remote_browser_session_id="pbs_test"),
+    )
+    await state.set_working_page(MagicMock())
+    state.list_valid_pages = AsyncMock(return_value=[])
+
+    with pytest.raises(MissingBrowserStatePage) as exc_info:
+        await state.must_get_working_page()
+
+    message = str(exc_info.value)
+    assert "browser_context_disconnected" in message
+    assert "browser_session_id=pbs_test" in message
+    assert "disconnect_observed_at=" in message
+    assert "detected_at=" in message
+    assert "observation_gap_seconds=" in message
+    assert "observation_source=liveness_probe" in message
+    assert "browser_session_id=pbs_test" not in get_user_facing_exception_message(exc_info.value)
+
+
+def test_stale_browser_disconnect_event_does_not_latch_replacement_state() -> None:
+    old_browser = MagicMock()
+    old_context = MagicMock(browser=old_browser)
+    new_browser = MagicMock()
+    new_context = MagicMock(browser=new_browser)
+    state = RealBrowserState(pw=MagicMock(), browser_context=old_context)
+
+    state.browser_context = new_context
+    state._register_disconnect_listeners(new_context)
+    state._on_browser_context_closed(old_context)
+    state._on_browser_disconnected(old_browser)
+
+    assert state.get_browser_state_diagnostic() is None
+
+
+def test_browser_disconnect_event_latches_event_observation() -> None:
+    browser = MagicMock()
+    context = MagicMock()
+    context.browser = browser
+    state = RealBrowserState(
+        pw=MagicMock(),
+        browser_context=context,
+        browser_artifacts=BrowserArtifacts(remote_browser_session_id="pbs_test"),
+    )
+
+    context_close_handler = context.on.call_args_list[0].args[1]
+    browser_disconnect_handler = browser.on.call_args_list[0].args[1]
+    assert context.on.call_args_list[0].args[0] == "close"
+    assert browser.on.call_args_list[0].args[0] == "disconnected"
+    assert context_close_handler == state._on_browser_context_closed
+    browser_disconnect_handler(browser)
+
+    diagnostic = state.get_browser_state_diagnostic()
+    assert diagnostic is not None
+    assert diagnostic.reason == "browser_disconnected_event"
+    assert diagnostic.event == "browser_disconnected"
+    assert diagnostic.observation_source == "browser_event"
+
+
 def test_is_connected_false_when_context_close_was_called() -> None:
     browser = MagicMock()
     browser.is_connected = MagicMock(return_value=True)
@@ -224,6 +326,18 @@ def test_is_connected_false_when_driver_connection_closed() -> None:
         _connection=MagicMock(_closed_error=RuntimeError("Target page, context or browser has been closed")),
     )
     assert _state_with_context(context).is_connected() is False
+
+
+def test_is_connected_true_when_context_browser_is_none() -> None:
+    # A CDP-connected context can expose ``browser is None``; is_connected() then reports True from
+    # cached impl flags alone, with no transport round-trip. This passive True is exactly why the
+    # page-less inheritance seam actively probes the transport before same-context recovery
+    # (RealBrowserManager._inherited_browser_transport_alive) rather than trusting is_connected()
+    # (SKY-13389).
+    context = MagicMock()
+    context.browser = None
+    context._impl_obj = MagicMock(_close_was_called=False, _closed=False, _connection=MagicMock(_closed_error=None))
+    assert _state_with_context(context).is_connected() is True
 
 
 def _free_port() -> int:

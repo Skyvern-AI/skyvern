@@ -14,6 +14,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 _BLOCK_PATH = "skyvern.forge.sdk.workflow.models.block.app"
 _MANAGER_PATH = "skyvern.forge.sdk.artifact.manager.app"
@@ -308,9 +310,15 @@ class TestUpdateArtifactDataScopeFallback:
             patch(f"{_MANAGER_PATH}.STORAGE.store_artifact", AsyncMock()),
         ):
             await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
-            await asyncio.gather(*manager.upload_aiotasks_map["wrb_1"])
 
-        assert list(manager.upload_aiotasks_map.keys()) == ["wrb_1"]
+            # Observe the keying while the upload is still pending: completed tasks
+            # self-discard from the map (SKY-12524).
+            assert list(manager.upload_aiotasks_map.keys()) == ["wrb_1"]
+
+            await asyncio.gather(*list(manager.upload_aiotasks_map["wrb_1"]))
+            await asyncio.sleep(0)
+
+        assert "wrb_1" not in manager.upload_aiotasks_map
 
     @pytest.mark.asyncio
     async def test_prefers_task_id_when_present(self) -> None:
@@ -321,10 +329,14 @@ class TestUpdateArtifactDataScopeFallback:
             patch(f"{_MANAGER_PATH}.STORAGE.store_artifact", AsyncMock()),
         ):
             await manager.update_artifact_data(artifact_id="a_recording", organization_id="o_1", data=b"video")
-            await asyncio.gather(*manager.upload_aiotasks_map["tsk_1"])
 
-        assert "tsk_1" in manager.upload_aiotasks_map
-        assert "wrb_1" not in manager.upload_aiotasks_map
+            assert "tsk_1" in manager.upload_aiotasks_map
+            assert "wrb_1" not in manager.upload_aiotasks_map
+
+            await asyncio.gather(*list(manager.upload_aiotasks_map["tsk_1"]))
+            await asyncio.sleep(0)
+
+        assert "tsk_1" not in manager.upload_aiotasks_map
 
     @pytest.mark.asyncio
     async def test_raises_when_no_scope_id_available(self) -> None:
@@ -547,3 +559,39 @@ class TestPersistVideoDataPathFallback:
         update_data.assert_awaited_once()
         wait_for_uploads.assert_awaited_once_with(["wrb_1"])
         assert video_artifacts[0].video_artifact_id == "a_existing"
+
+
+@pytest.mark.asyncio
+async def test_at_failure_url_masks_registered_secrets() -> None:
+    """A failing MFA step can leave the generated OTP in the query string.
+
+    The at-failure URL is persisted and logged, so registered secrets must be masked before
+    it leaves the page (SKY-13250).
+    """
+
+    class _MaskingContext(FakeWorkflowRunContext):
+        def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
+            return data.replace("123456", mask) if isinstance(data, str) else data
+
+    page = SimpleNamespace(url="https://portal.example.com/mfa?token=123456&step=verify")
+    browser_state = SimpleNamespace(take_fullpage_screenshot=AsyncMock(return_value=b"png-bytes"))
+    fake_block = SimpleNamespace(workflow_run_block_id="wrb_1", workflow_run_id="wr_1", organization_id="o_1")
+    update_block = AsyncMock(return_value=fake_block)
+
+    with (
+        patch(f"{_BLOCK_PATH}.DATABASE.observer.update_workflow_run_block", update_block),
+        patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", AsyncMock()),
+    ):
+        await _code_block()._capture_failure_evidence(
+            workflow_run_context=_MaskingContext(values={}, secrets={"otp": "123456"}),
+            workflow_run_id="wr_1",
+            workflow_run_block_id="wrb_1",
+            organization_id="o_1",
+            browser_state=browser_state,
+            page=page,
+        )
+
+    persisted_url = update_block.call_args.kwargs["final_url"]
+    assert "123456" not in persisted_url
+    # The rest of the URL is the diagnostic payload and must survive masking.
+    assert persisted_url == "https://portal.example.com/mfa?token=*****&step=verify"

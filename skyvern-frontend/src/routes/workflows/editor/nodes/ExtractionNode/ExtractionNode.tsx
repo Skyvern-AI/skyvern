@@ -56,8 +56,8 @@ function ExtractionNode({ id, data, type }: NodeProps<ExtractionNode>) {
             "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
             open ? "shadow-md" : "shadow-sm",
             {
-              "pointer-events-none bg-slate-950": thisBlockIsPlaying,
-              "outline outline-2 outline-slate-300": thisBlockIsTargetted,
+              "pointer-events-none bg-background": thisBlockIsPlaying,
+              "outline outline-2 outline-ring": thisBlockIsTargetted,
             },
             data.comparisonColor,
           )}

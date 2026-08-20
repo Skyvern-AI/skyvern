@@ -37,7 +37,7 @@ function URLEditorBody({
   return (
     <div data-testid="url-block-form" className="space-y-4">
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">URL</Label>
+        <Label className="text-xs text-tertiary-foreground">URL</Label>
         <WorkflowBlockInputTextarea
           nodeId={blockId}
           onChange={(next) => update({ url: next })}

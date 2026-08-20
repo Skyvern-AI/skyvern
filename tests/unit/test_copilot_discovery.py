@@ -2,24 +2,39 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from skyvern.forge.agent_functions import CopilotAliasResolution
+from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION,
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
     _discovery_walk,
     _inspect_page_for_composition_impl,
+    _rank_discovery_entrypoint_candidates,
     _resolve_discovery_entry_url,
-    discovery,
 )
+from skyvern.forge.sdk.copilot.tools.discovery import (
+    _credential_entry_url,
+    _discovery_build_result,
+    _user_provided_entry_url,
+)
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
     def __init__(self, server: object) -> None:
+        self.turn_origin = TurnOrigin.interactive
         self.discovery_mcp_server = server
         self.discovery_started_monotonic = None
         self.discovery_step_count = 0
@@ -30,6 +45,39 @@ class _Ctx:
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.browser_session_id = None
+        self.last_run_blocks_browser_session_id = None
+        self.request_policy = None
+        self.org_credentials_for_turn = None
+
+
+def _structured_search_page(*, with_obstruction: bool = False) -> dict[str, Any]:
+    return {
+        "page_title": "Results",
+        "body_has_markup": True,
+        "forms": [
+            {
+                "selector": "form",
+                "fields": [
+                    {
+                        "name": "firstName",
+                        "type": "text",
+                        "selector": 'input[name="firstName"]',
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "type": "submit", "selector": "button"}],
+            }
+        ],
+        "visual_obstruction_candidates": [
+            {
+                "source": "computed_style",
+                "position": "fixed",
+                "coverage": "viewport",
+                "has_visible_controls": True,
+            }
+        ]
+        if with_obstruction
+        else [],
+    }
 
 
 class _FailingNavigateServer:
@@ -188,8 +236,8 @@ class _CurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -227,20 +275,8 @@ class _GenericBarrierServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {
-                "ok": True,
-                "data": {
-                    "result": [
-                        {
-                            "source": "computed_style",
-                            "position": "fixed",
-                            "coverage": "viewport",
-                            "has_visible_controls": True,
-                        }
-                    ]
-                },
-            }
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page(with_obstruction=True)}}
         if tool_name == "skyvern_screenshot":
             assert arguments == {"inline": True}
             return {"ok": True, "data": {"screenshot_base64": "aGVsbG8="}}
@@ -266,45 +302,27 @@ class _TargetThenCurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
-class _AliasAgentFunction:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
-
-    def resolve_copilot_entrypoint_alias(
-        self,
-        *,
-        site_or_url: str,
-        normalized_alias: str,
-    ) -> CopilotAliasResolution | None:
-        self.calls.append((site_or_url, normalized_alias))
-        if normalized_alias == "publicalias":
-            return CopilotAliasResolution(url="https://public-alias.test/start")
-        return None
-
-
 @pytest.mark.parametrize(
-    "site_or_url",
+    ("site_or_url", "expected"),
     [
-        "public-alias",
-        "public alias",
-        "PUBLIC_ALIAS",
+        ("https://example.com/login", ("https://example.com/login", "url")),
+        ("HTTP://example.com/login", ("HTTP://example.com/login", "url")),
+        ("example.com", ("https://example.com", "domain")),
+        ("example.com/login?x=y", ("https://example.com/login?x=y", "domain")),
+        ("example", (None, "bare_word")),
+        ("example search portal", (None, "unresolved")),
     ],
 )
-def test_resolve_discovery_entry_url_uses_configured_alias_hook(
-    monkeypatch: pytest.MonkeyPatch,
+def test_resolve_discovery_entry_url_classifies_without_guessing(
     site_or_url: str,
+    expected: tuple[str | None, str],
 ) -> None:
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", _AliasAgentFunction())
-
-    assert _resolve_discovery_entry_url(site_or_url) == (
-        "https://public-alias.test/start",
-        "canonical_alias",
-    )
+    assert _resolve_discovery_entry_url(site_or_url) == expected
 
 
 @pytest.mark.parametrize(
@@ -317,35 +335,114 @@ def test_resolve_discovery_entry_url_uses_configured_alias_hook(
     ],
 )
 def test_resolve_discovery_entry_url_preserves_url_and_domain_inputs(
-    monkeypatch: pytest.MonkeyPatch,
     site_or_url: str,
     expected: tuple[str, str],
 ) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
-
     assert _resolve_discovery_entry_url(site_or_url) == expected
-    assert agent_function.calls == []
 
 
-def test_resolve_discovery_entry_url_unknown_bare_word_still_falls_back_to_www(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+def test_legacy_url_domain_result_envelope_has_no_bare_word_contract_version() -> None:
+    result = _discovery_build_result(
+        candidate_url="https://example.com/",
+        candidate_form_fields=[],
+        evidence_trail=[],
+        confidence=0.6,
+        failure_reason=None,
+    )
 
-    assert _resolve_discovery_entry_url("example") == ("https://www.example.com", "word")
-    assert agent_function.calls == [("example", "example")]
+    assert result == {
+        "ok": True,
+        "data": {
+            "candidate_url": "https://example.com/",
+            "candidate_form_fields": [],
+            "evidence_trail": [],
+            "confidence": 0.6,
+            "failure_reason": None,
+        },
+        "error": None,
+    }
 
 
-def test_resolve_discovery_entry_url_unknown_spaced_phrase_remains_unresolved(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_function = _AliasAgentFunction()
-    monkeypatch.setattr(discovery.app, "AGENT_FUNCTION", agent_function)
+def test_rank_discovery_entrypoint_candidates_accepts_provider_association_with_different_entity_label() -> None:
+    candidates = [
+        CopilotEntrypointCandidate(
+            url="https://irrelevant.example/news",
+            source_rank=1,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q1",
+                entity_label="Unrelated result",
+                official_site_url="https://irrelevant.example/news",
+                origin="https://irrelevant.example",
+                source="provider_official_site",
+                provider_relation_type="label",
+                provider_relation_text="public alias",
+            ),
+        ),
+        CopilotEntrypointCandidate(
+            url="https://attacker.example/start",
+            source_rank=2,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q2",
+                entity_label="Public Alias",
+                official_site_url="https://public-alias.test/start",
+                origin="https://public-alias.test",
+                source="provider_official_site",
+                provider_relation_type="alias",
+                provider_relation_text="public alias",
+            ),
+        ),
+        CopilotEntrypointCandidate(
+            url="https://public-alias.test/start",
+            source_rank=3,
+            association=CopilotSiteOriginAssociation(
+                requested_name="public alias",
+                entity_id="Q3",
+                entity_label="Public Alias",
+                official_site_url="https://public-alias.test/start",
+                origin="https://public-alias.test",
+                source="provider_official_site",
+                provider_relation_type="alias",
+                provider_relation_text="public alias",
+            ),
+        ),
+    ]
 
-    assert _resolve_discovery_entry_url("example search portal") == (None, "unresolved")
-    assert agent_function.calls == [("example search portal", "examplesearchportal")]
+    assert _rank_discovery_entrypoint_candidates("public alias", candidates) == [candidates[0], candidates[2]]
+
+
+def test_rank_discovery_entrypoint_candidates_keeps_unassociated_licensee_enforced() -> None:
+    licensor = CopilotEntrypointCandidate(
+        url="https://licensor.example/",
+        source_rank=1,
+        association=CopilotSiteOriginAssociation(
+            requested_name="Public Alias",
+            entity_id="Q1",
+            entity_label="Public Alias",
+            official_site_url="https://licensor.example/",
+            origin="https://licensor.example",
+            source="provider_official_site",
+            provider_relation_type="label",
+            provider_relation_text="Other Licensor",
+        ),
+    )
+    licensee = CopilotEntrypointCandidate(
+        url="https://licensee.example/",
+        source_rank=2,
+        association=CopilotSiteOriginAssociation(
+            requested_name="Public Alias",
+            entity_id="Q2",
+            entity_label="Unrelated Licensee",
+            official_site_url="https://licensee.example/",
+            origin="https://licensee.example",
+            source="provider_official_site",
+            provider_relation_type="alias",
+            provider_relation_text="Other Licensee",
+        ),
+    )
+
+    assert _rank_discovery_entrypoint_candidates("public alias", [licensor, licensee]) == []
 
 
 @pytest.mark.asyncio
@@ -450,7 +547,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -458,8 +555,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    # structured extractor probe (None on the [] mock) -> get_html fallback -> obstruction-candidates probe
-    assert server.calls == ["skyvern_evaluate", "skyvern_get_html", "skyvern_evaluate"]
+    assert server.calls == ["skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
@@ -477,7 +573,7 @@ async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_c
     ctx.last_test_ok = True  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -498,7 +594,7 @@ async def test_current_page_inspection_without_earned_interaction_is_not_click_r
     server = _CurrentPageServer()
     ctx = _Ctx(server)
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -521,7 +617,7 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
         url="https://www.example.com/results",
     )
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -534,20 +630,23 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
     assert ctx.pending_browser_interaction_observation is None
 
 
+class _EmptyPageServer:
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": "<html><body></body></html>"}}
+        return {"ok": True, "data": {"result": None}}
+
+
 @pytest.mark.asyncio
-async def test_inspection_budget_steers_progress_check_instead_of_authoring() -> None:
-    ctx = _Ctx(server=object())
+async def test_repeated_structured_inspection_is_not_rationed() -> None:
+    """Understanding a page should not get harder the more inspection it needs; a prior per-turn
+    cap rejected further structured looks and steered the agent onto hand-rolled probes."""
+    ctx = _Ctx(server=_EmptyPageServer())
     ctx.page_inspection_calls_this_turn = 999
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
-    assert result["ok"] is False
-    assert "not evidence that scouting is complete" in result["error"]
-    assert "evaluate" in result["error"]
-    assert "get_browser_screenshot" in result["error"]
-    assert "browser action on the current page" in result["error"]
-    assert "Do not author downstream result" in result["error"]
-    assert "Compose from existing evidence" not in result["error"]
+    assert "budget" not in str(result.get("error") or "")
 
 
 @pytest.mark.asyncio
@@ -618,7 +717,7 @@ async def test_target_url_inspection_clears_pending_interaction_credit(
     assert target_result["reached_via"] == "navigate"
     assert ctx.pending_browser_interaction_observation is None
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -684,7 +783,13 @@ class _StrippedHtmlServer:
         if tool_name == "skyvern_get_html":
             return {"ok": True, "data": {"size_capped": True}}
         if tool_name == "skyvern_evaluate":
-            return {"ok": True, "data": {"result": self._stripped}}
+            expression = arguments["expression"]
+            if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                return {"ok": True, "data": {"result": {"page_title": "Loading", "forms": []}}}
+            if expression == COMPOSITION_STRIPPED_HTML_EXPRESSION:
+                return {"ok": True, "data": {"result": self._stripped}}
+            assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
+            return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -704,7 +809,7 @@ async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap
 
 
 @pytest.mark.asyncio
-async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> None:
+async def test_capture_composition_evidence_warns_when_html_sliced_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _capture_composition_evidence
 
     # A real form near the top yields bounded schema (no hollow-recapture loop); the trailing
@@ -713,6 +818,7 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
         "<body><form><input name='firstName'><button>Search</button></form>"
         + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
     )
+    monkeypatch.setattr(tools_module.composition_capture.asyncio, "sleep", AsyncMock())
     evidence, error = await _capture_composition_evidence(
         _Ctx(_StrippedHtmlServer(body)),
         inspected_url="https://www.example.com/search",
@@ -721,3 +827,80 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
     assert error is None
     assert evidence is not None
     assert "html_sliced_at_cap" in evidence["inspection_warnings"]
+
+
+class TestUserProvidedEntryUrl:
+    """Name lookup asks the world; this asks the conversation, so a URL the user already pasted is
+    not answered with a request for a URL."""
+
+    @staticmethod
+    def _ctx(user_message: str) -> SimpleNamespace:
+        policy = RequestPolicy()
+        _ground_user_provided_sites(policy, user_message, [])
+        return SimpleNamespace(request_policy=policy)
+
+    def test_the_only_site_the_user_gave_is_opened(self) -> None:
+        ctx = self._ctx("go to https://us.example.com/reports and pull the numbers")
+
+        assert _user_provided_entry_url(ctx) == "https://us.example.com/reports"
+
+    def test_several_sites_resolve_nothing(self) -> None:
+        ctx = self._ctx("check https://a.example.com and https://b.example.net")
+
+        assert _user_provided_entry_url(ctx) is None
+
+    def test_nothing_the_user_provided_resolves_nothing(self) -> None:
+        assert _user_provided_entry_url(self._ctx("no addresses here")) is None
+
+
+class TestCredentialEntryUrl:
+    """The org already recorded where a credential signs in, so a site named in words whose
+    credential carries a login page is opened rather than answered with a request for its URL."""
+
+    @staticmethod
+    def _ctx(*tested_urls: str | None) -> SimpleNamespace:
+        policy = RequestPolicy()
+        policy.resolved_credentials = [
+            SimpleNamespace(credential_id=f"cred_{index}", name=f"credential {index}", tested_url=tested_url)
+            for index, tested_url in enumerate(tested_urls)
+        ]
+        return SimpleNamespace(request_policy=policy)
+
+    def test_the_credential_naming_the_requested_site_is_opened(self) -> None:
+        ctx = self._ctx("https://apps.hydroco.example/portal/Login.jsp")
+
+        assert _credential_entry_url(ctx, "hydroco") == "https://apps.hydroco.example/portal/Login.jsp"
+
+    def test_a_multi_word_site_name_resolves_its_credential(self) -> None:
+        ctx = self._ctx("https://apps.guelphhydro.example/portal/Login.jsp")
+
+        assert _credential_entry_url(ctx, "guelph hydro") == "https://apps.guelphhydro.example/portal/Login.jsp"
+
+    def test_the_credential_whose_host_names_the_site_wins_among_several(self) -> None:
+        ctx = self._ctx("https://us5.other.example.net/account/login", "https://us.chosen.example/login")
+
+        assert _credential_entry_url(ctx, "chosen") == "https://us.chosen.example/login"
+
+    def test_a_lone_credential_for_another_site_resolves_nothing(self) -> None:
+        """Approvals persist across turns, so a later request for a different site must not open this one."""
+        ctx = self._ctx("https://payroll.example.net/login")
+
+        assert _credential_entry_url(ctx, "zephyrmart") is None
+
+    def test_a_label_extending_the_requested_name_resolves(self) -> None:
+        ctx = self._ctx("https://us5.metricsdog.example/account/login")
+
+        assert _credential_entry_url(ctx, "metrics") == "https://us5.metricsdog.example/account/login"
+
+    def test_a_name_buried_inside_a_label_resolves_nothing(self) -> None:
+        ctx = self._ctx("https://groupsupport.example.net/login")
+
+        assert _credential_entry_url(ctx, "ups") is None
+
+    def test_several_unrelated_credentials_resolve_nothing(self) -> None:
+        ctx = self._ctx("https://a.example.net/login", "https://b.example.org/login")
+
+        assert _credential_entry_url(ctx, "unrelated") is None
+
+    def test_credentials_without_a_login_page_resolve_nothing(self) -> None:
+        assert _credential_entry_url(self._ctx(None), "example") is None

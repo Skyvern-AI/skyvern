@@ -4,13 +4,17 @@ import {
   DialogContent,
   DialogHeader,
   DialogFooter,
+  DialogClose,
 } from "@/components/ui/dialog";
 import {
   useCredentialModalState,
   CredentialModalTypes,
   type CredentialModalType,
 } from "./useCredentialModalState";
-import { PasswordCredentialContent } from "./PasswordCredentialContent";
+import {
+  PasswordCredentialContent,
+  type PasswordCredentialContentValues,
+} from "./PasswordCredentialContent";
 import { SecretCredentialContent } from "./SecretCredentialContent";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
@@ -31,6 +35,7 @@ import {
   type TestCredentialStatusResponse,
   type TestLoginResponse,
   type ProxyLocation,
+  type PasswordCredential,
 } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -46,6 +51,30 @@ import {
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
+import { useBrowserProfileUsageQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileUsageQuery";
+import { credentialAttachWarning } from "@/routes/workflows/components/browserProfileControlModel";
+import { useInfiniteBrowserProfilesQuery } from "@/routes/workflows/hooks/useInfiniteBrowserProfilesQuery";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -57,15 +86,47 @@ import {
   getCredentialErrorMessage,
   type AuthenticatorSaveError,
 } from "./authenticatorSaveError";
+import {
+  type CredentialAdditionalTwoFactorMethod,
+  type CredentialAdditionalTwoFactorState,
+  useCredentialAuthenticatorSupport,
+} from "./CredentialAuthenticatorSupportContext";
 
 const PASSWORD_CREDENTIAL_INITIAL_VALUES = {
   name: "",
   username: "",
   password: "",
   totp: "",
-  totp_type: "none" as "none" | "authenticator" | "email" | "text",
+  totp_type: "none",
   totp_identifier: "",
 };
+
+function createAdditionalTwoFactorStates(
+  methods: CredentialAdditionalTwoFactorMethod[],
+): Record<string, CredentialAdditionalTwoFactorState> {
+  return Object.fromEntries(
+    methods.map((method) => [method.value, { ...method.initialState }]),
+  );
+}
+
+function toPasswordCredentialTotpType(
+  value: string,
+  selectedAdditionalTwoFactorMethod?: CredentialAdditionalTwoFactorMethod,
+): PasswordCredential["totp_type"] {
+  if (selectedAdditionalTwoFactorMethod?.value === value) {
+    return selectedAdditionalTwoFactorMethod.requestType;
+  }
+
+  switch (value) {
+    case "authenticator":
+    case "email":
+    case "text":
+    case "none":
+      return value;
+    default:
+      return "none";
+  }
+}
 
 function createCreditCardCredentialInitialValues(): CreditCardCredentialValues {
   return {
@@ -108,6 +169,9 @@ const TEST_STATUS_MESSAGES = [
 ];
 // Delays (ms) before advancing to the next message (last message stays forever)
 const TEST_MESSAGE_DELAYS = [15_000, 30_000, 75_000, 60_000];
+
+// Radix Select forbids an empty value, so "Automatic" (browser_profile_id = null) needs a sentinel.
+const AUTO_PROFILE_VALUE = "__automatic__";
 
 // Function to generate a unique credential name
 function generateDefaultCredentialName(existingNames: string[]): string {
@@ -182,7 +246,7 @@ function buildMetadata(values: CreditCardCredentialValues) {
 }
 
 type Props = {
-  onCredentialCreated?: (id: string) => void;
+  onCredentialCreated?: (id: string, name?: string) => void;
   /** Optional controlled mode: pass isOpen and onOpenChange to control modal state locally */
   isOpen?: boolean;
   onOpenChange?: (open: boolean) => void;
@@ -190,6 +254,10 @@ type Props = {
   editingCredential?: CredentialApiResponse;
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
+  // Copilot-only: seed the login URL so a quick-added credential carries a
+  // tested_url and matches later hostname-keyed asks. Create mode only; leaving
+  // it undefined (every non-copilot caller) keeps the field empty as before.
+  defaultTestUrl?: string;
   /** Called after a credential is saved with "Save browser session" checked to trigger an async test */
   onStartBackgroundTest?: (
     credentialId: string,
@@ -211,12 +279,22 @@ function formatProxyIdentity(value?: string | null) {
   return `${value.slice(0, 3)}...${value.slice(-2)}`;
 }
 
+// The session id IS the sticky-network identity — no literal IP exists until
+// connect — so surface a recognizable prefix rather than fabricate an address.
+function formatSessionPrefix(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  return value.length > 10 ? `${value.slice(0, 10)}…` : value;
+}
+
 function CredentialsModal({
   onCredentialCreated,
   isOpen: controlledIsOpen,
   onOpenChange: controlledOnOpenChange,
   editingCredential,
   overrideType,
+  defaultTestUrl,
   onStartBackgroundTest,
 }: Props) {
   const credentialGetter = useCredentialGetter();
@@ -230,6 +308,8 @@ function CredentialsModal({
     useCustomCredentialServiceConfig();
   const hasCustomCredentialService = !!customCredentialServiceConfig;
   const [vaultType, setVaultType] = useState<"default" | "custom">("default");
+  const { additionalTwoFactorMethods = [] } =
+    useCredentialAuthenticatorSupport();
 
   const isEditMode = !!editingCredential;
 
@@ -242,6 +322,9 @@ function CredentialsModal({
   });
   const [passwordCredentialValues, setPasswordCredentialValues] = useState(
     PASSWORD_CREDENTIAL_INITIAL_VALUES,
+  );
+  const [additionalTwoFactorStates, setAdditionalTwoFactorStates] = useState(
+    () => createAdditionalTwoFactorStates(additionalTwoFactorMethods),
   );
   const [creditCardCredentialValues, setCreditCardCredentialValues] = useState(
     createCreditCardCredentialInitialValues,
@@ -257,9 +340,15 @@ function CredentialsModal({
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
     useState<AuthenticatorSaveError | null>(null);
+  // In-app confirmation shown before a save that would remove/replace a saved 2FA
+  // method. The ref lets the Remove button re-enter handleSave past this gate.
+  const [removalConfirmationMessage, setRemovalConfirmationMessage] = useState<
+    string | null
+  >(null);
+  const removalConfirmedRef = useRef(false);
 
   const handlePasswordCredentialChange = useCallback(
-    (next: typeof PASSWORD_CREDENTIAL_INITIAL_VALUES) => {
+    (next: PasswordCredentialContentValues) => {
       setPasswordCredentialValues((prev) => {
         if (next.totp !== prev.totp || next.totp_type !== prev.totp_type) {
           setAuthenticatorSaveError(null);
@@ -269,6 +358,33 @@ function CredentialsModal({
     },
     [],
   );
+
+  const editingPasswordCredentialData =
+    editingCredential && isPasswordCredential(editingCredential.credential)
+      ? editingCredential.credential
+      : undefined;
+  const configuredAdditionalTwoFactorMethod = editingPasswordCredentialData
+    ? additionalTwoFactorMethods.find(
+        ({ value }) => value === editingPasswordCredentialData.totp_type,
+      )
+    : undefined;
+  const selectedAdditionalTwoFactorMethod = additionalTwoFactorMethods.find(
+    ({ value }) => value === passwordCredentialValues.totp_type,
+  );
+  const supportsInlineTest =
+    selectedAdditionalTwoFactorMethod?.supportsInlineTest !== false;
+  const configuredAdditionalTwoFactorFlagEnabled = useFeatureFlag(
+    configuredAdditionalTwoFactorMethod?.flagName ?? "",
+  );
+  const selectedAdditionalTwoFactorFlagEnabled = useFeatureFlag(
+    selectedAdditionalTwoFactorMethod?.flagName ?? "",
+  );
+  const configuredAdditionalTwoFactorMethodEnabled =
+    !configuredAdditionalTwoFactorMethod?.flagName ||
+    configuredAdditionalTwoFactorFlagEnabled === true;
+  const selectedAdditionalTwoFactorMethodEnabled =
+    !selectedAdditionalTwoFactorMethod?.flagName ||
+    selectedAdditionalTwoFactorFlagEnabled === true;
 
   const reportCredentialSaveError = useCallback(
     (error: unknown, title = "Error"): string => {
@@ -301,6 +417,34 @@ function CredentialsModal({
     setEditingGroups((prev) => ({ ...prev, values: true }));
   }, []);
 
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
+  // Quick-win: optional browser profile + per-credential IP pin (flag-on).
+  const [browserProfileId, setBrowserProfileId] = useState<string | null>(null);
+  const [autoProfileDisabled, setAutoProfileDisabled] = useState(false);
+  const [pinIp, setPinIp] = useState(false);
+  const [runSequentially, setRunSequentially] = useState(false);
+  // The inline profile Select has no scroll pagination, so pull a large first
+  // page (unowned profiles are a small subset).
+  const { data: plainProfilesPages } = useInfiniteBrowserProfilesQuery({
+    managed: false,
+    page_size: 100,
+    enabled: browserMemoryEnabled && isEditMode,
+  });
+  const { data: attachedProfile } = useBrowserProfileQuery(
+    browserProfileId ?? undefined,
+    {
+      enabled: browserMemoryEnabled && isEditMode && Boolean(browserProfileId),
+    },
+  );
+  // F7: warn when attaching a profile agents already pick — the credential
+  // becomes its only writer and their runs stop saving into it.
+  const { data: attachUsage } = useBrowserProfileUsageQuery(
+    browserProfileId ?? undefined,
+    {
+      enabled: browserMemoryEnabled && isEditMode && Boolean(browserProfileId),
+    },
+  );
+  const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
   const [testUrl, setTestUrl] = useState("");
@@ -308,6 +452,9 @@ function CredentialsModal({
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
   const [rotateProxyPin, setRotateProxyPin] = useState(false);
   const existingProxyIdentity = formatProxyIdentity(
+    editingCredential?.proxy_session_id,
+  );
+  const existingSessionPrefix = formatSessionPrefix(
     editingCredential?.proxy_session_id,
   );
   const [testStatus, setTestStatus] = useState<
@@ -368,6 +515,12 @@ function CredentialsModal({
     proxyLocation: ProxyLocation | null;
     proxySessionId?: string | null;
     proxyPinChanged: boolean;
+    additionalTwoFactor?: {
+      selectedValue?: string;
+      configuredValue?: string;
+      enabledValues: Record<string, boolean>;
+      states: Record<string, CredentialAdditionalTwoFactorState>;
+    };
   }>({
     shouldTestAfterSave: false,
     saveBrowserSessionIntent: false,
@@ -378,6 +531,47 @@ function CredentialsModal({
     proxySessionId: null,
     proxyPinChanged: false,
   });
+
+  const runAdditionalTwoFactorSave = useCallback(
+    async (credentialId: string): Promise<boolean> => {
+      const snapshot = saveIntentRef.current.additionalTwoFactor;
+      if (!snapshot) {
+        return true;
+      }
+
+      const affectedValues = [
+        ...(snapshot.configuredValue ? [snapshot.configuredValue] : []),
+        ...(snapshot.selectedValue !== snapshot.configuredValue &&
+        snapshot.selectedValue
+          ? [snapshot.selectedValue]
+          : []),
+      ];
+
+      try {
+        for (const value of affectedValues) {
+          const method = additionalTwoFactorMethods.find(
+            (candidate) => candidate.value === value,
+          );
+          if (!method) {
+            continue;
+          }
+          await method.onSaved({
+            credentialId,
+            state: snapshot.states[value] ?? method.initialState ?? {},
+            wasSelected: snapshot.selectedValue === value,
+            previouslyConfigured: snapshot.configuredValue === value,
+            enabled: snapshot.enabledValues[value] ?? true,
+            credentialGetter,
+          });
+        }
+        return true;
+      } catch (error) {
+        reportCredentialSaveError(error, "Partial save");
+        return false;
+      }
+    },
+    [additionalTwoFactorMethods, credentialGetter, reportCredentialSaveError],
+  );
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -445,6 +639,10 @@ function CredentialsModal({
       ) {
         setTestAndSave(true);
       }
+      setBrowserProfileId(editingCredential.browser_profile_id ?? null);
+      setAutoProfileDisabled(editingCredential.auto_profile_disabled ?? false);
+      setPinIp(editingCredential.pin_saved_session_ip ?? false);
+      setRunSequentially(editingCredential.run_sequentially ?? false);
       if (editingCredential.user_context) {
         setUserContext(editingCredential.user_context);
       }
@@ -496,16 +694,29 @@ function CredentialsModal({
         ...prev,
         name: defaultName,
       }));
+      if (defaultTestUrl) {
+        setTestUrl(defaultTestUrl);
+      }
     }
-  }, [isOpen, credentials, isEditMode, editingCredential]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ref-guarded one-time init; reset and the setters are intentionally omitted so a background refetch can't re-run it
+  }, [isOpen, credentials, isEditMode, editingCredential, defaultTestUrl]);
 
   function reset() {
     setVaultType("default");
     setPasswordCredentialValues(PASSWORD_CREDENTIAL_INITIAL_VALUES);
+    setAdditionalTwoFactorStates(
+      createAdditionalTwoFactorStates(additionalTwoFactorMethods),
+    );
     setCreditCardCredentialValues(createCreditCardCredentialInitialValues());
     setSecretCredentialValues(SECRET_CREDENTIAL_INITIAL_VALUES);
     setEditingGroups({ name: false, values: false });
     setAuthenticatorSaveError(null);
+    setRemovalConfirmationMessage(null);
+    removalConfirmedRef.current = false;
+    setBrowserProfileId(null);
+    setAutoProfileDisabled(false);
+    setPinIp(false);
+    setRunSequentially(false);
     setTestAndSave(false);
     setTestUrl("");
     setTestStatus("idle");
@@ -674,7 +885,10 @@ function CredentialsModal({
           username: passwordCredentialValues.username.trim(),
           password: passwordCredentialValues.password.trim(),
           totp: passwordCredentialValues.totp.trim() || null,
-          totp_type: passwordCredentialValues.totp_type,
+          totp_type: toPasswordCredentialTotpType(
+            passwordCredentialValues.totp_type,
+            selectedAdditionalTwoFactorMethod,
+          ),
           totp_identifier:
             passwordCredentialValues.totp_identifier.trim() || null,
           user_context: userContext.trim() || null,
@@ -720,6 +934,7 @@ function CredentialsModal({
     credentialGetter,
     testUrl,
     passwordCredentialValues,
+    selectedAdditionalTwoFactorMethod,
     userContext,
     pollTestStatus,
     getProxyPinPayload,
@@ -754,10 +969,37 @@ function CredentialsModal({
           // Best-effort — credential was created, URL is just metadata
         }
       }
+      const additionalTwoFactorSaved = await runAdditionalTwoFactorSave(
+        data.credential_id,
+      );
+
+      if (!additionalTwoFactorSaved) {
+        // The 2FA type is already persisted; roll the credential back rather than strand a passkey with no material.
+        let rollbackSucceeded = true;
+        try {
+          const client = await getClient(credentialGetter);
+          await client.delete(`/credentials/${data.credential_id}`);
+        } catch {
+          rollbackSucceeded = false;
+        }
+        if (rollbackSucceeded) {
+          reset();
+          setIsOpen(false);
+        } else {
+          toast({
+            title: "Couldn't finish saving the credential",
+            description:
+              "The additional two-factor method couldn't be saved and the incomplete credential couldn't be removed automatically. Please delete it from the credentials list and try again.",
+            variant: "destructive",
+          });
+        }
+        return;
+      }
+
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      onCredentialCreated?.(data.credential_id);
+      onCredentialCreated?.(data.credential_id, data.name);
       reset();
       setIsOpen(false);
 
@@ -813,7 +1055,12 @@ function CredentialsModal({
       } = saveIntentRef.current;
 
       // Persist metadata (tested_url, user_context, save_browser_session_intent) via PATCH
+      let metadataSaved = true;
       if (editingCredential?.credential_id) {
+        // The partial-save copy below must name exactly the fields in this PATCH,
+        // so gate both on the same condition — flag-off it omits browser/IP.
+        const includesBrowserMemoryFields =
+          browserMemoryEnabled && type === CredentialModalTypes.PASSWORD;
         try {
           const client = await getClient(credentialGetter, "sans-api-v1");
           await client.patch(
@@ -823,23 +1070,52 @@ function CredentialsModal({
               ...(capturedTestUrl && { tested_url: capturedTestUrl }),
               user_context: capturedUserContext?.trim() || null,
               save_browser_session_intent: saveBrowserSessionIntent,
+              run_sequentially: runSequentially,
+              // The /update vault path drops these; persist them here so a
+              // profile/IP change made alongside credential values isn't lost.
+              // PASSWORD-only, matching the picker UI and the bmPatch guard.
+              ...(includesBrowserMemoryFields
+                ? {
+                    browser_profile_id: browserProfileId,
+                    auto_profile_disabled: autoProfileDisabled,
+                    pin_saved_session_ip: pinIp,
+                  }
+                : {}),
             },
           );
         } catch {
+          metadataSaved = false;
           toast({
             title: "Partial save",
-            description:
-              "Credential updated, but login instructions could not be saved. Please try editing again.",
+            description: includesBrowserMemoryFields
+              ? "Credential updated, but the login instructions, sequential settings, browser profile, and IP settings could not be saved. Please try editing again."
+              : "Credential updated, but login instructions and sequential settings could not be saved. Please try editing again.",
             variant: "destructive",
           });
         }
       }
 
-      reset();
-      setIsOpen(false);
+      const additionalTwoFactorSaved = editingCredential?.credential_id
+        ? await runAdditionalTwoFactorSave(editingCredential.credential_id)
+        : true;
+
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
+
+      // The additional 2FA save owns the passkey material; if it failed, keep the modal open so the
+      // entered material stays available for correction instead of leaving a passkey type with no key.
+      if (!additionalTwoFactorSaved) {
+        return;
+      }
+
+      reset();
+      setIsOpen(false);
+
+      // A destructive "Partial save" toast already surfaced; don't contradict it with a success toast.
+      if (!metadataSaved) {
+        return;
+      }
 
       if (
         shouldTestAfterSave &&
@@ -881,6 +1157,10 @@ function CredentialsModal({
       proxy_location,
       proxy_session_id,
       rotate_proxy_session_id,
+      browser_profile_id,
+      auto_profile_disabled,
+      pin_saved_session_ip,
+      run_sequentially,
     }: {
       id: string;
       name: string;
@@ -890,6 +1170,10 @@ function CredentialsModal({
       proxy_location?: ProxyLocation | null;
       proxy_session_id?: string | null;
       rotate_proxy_session_id?: boolean;
+      browser_profile_id?: string | null;
+      auto_profile_disabled?: boolean;
+      pin_saved_session_ip?: boolean;
+      run_sequentially?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const body: Record<string, string | boolean | ProxyLocation | null> = {
@@ -913,6 +1197,18 @@ function CredentialsModal({
       if (rotate_proxy_session_id !== undefined) {
         body.rotate_proxy_session_id = rotate_proxy_session_id;
       }
+      if (browser_profile_id !== undefined) {
+        body.browser_profile_id = browser_profile_id;
+      }
+      if (auto_profile_disabled !== undefined) {
+        body.auto_profile_disabled = auto_profile_disabled;
+      }
+      if (pin_saved_session_ip !== undefined) {
+        body.pin_saved_session_ip = pin_saved_session_ip;
+      }
+      if (run_sequentially !== undefined) {
+        body.run_sequentially = run_sequentially;
+      }
       const response = await client.patch<CredentialApiResponse>(
         `/credentials/${id}`,
         body,
@@ -923,7 +1219,7 @@ function CredentialsModal({
       queryClient.invalidateQueries({
         queryKey: ["credentials"],
       });
-      onCredentialCreated?.(data.credential_id);
+      onCredentialCreated?.(data.credential_id, data.name);
       reset();
       setIsOpen(false);
       toast({
@@ -962,9 +1258,40 @@ function CredentialsModal({
     const credentialSaveProxyPinPayload =
       !isEditMode || proxyPinChanged ? proxyPinPayload : {};
 
+    // Only PASSWORD credentials expose the browser-memory UI; card/secret must
+    // not carry these fields (they use proxy-session pinning instead).
+    const browserMemoryFields =
+      browserMemoryEnabled && type === CredentialModalTypes.PASSWORD;
+    // Browser-memory fields (flag-on) count as edits even when secrets aren't
+    // touched, so a profile-only change persists via the PATCH path instead of
+    // being dropped as a rename-only save.
+    const bmChanged =
+      browserMemoryFields &&
+      (browserProfileId !== (editingCredential?.browser_profile_id ?? null) ||
+        autoProfileDisabled !==
+          (editingCredential?.auto_profile_disabled ?? false) ||
+        pinIp !== (editingCredential?.pin_saved_session_ip ?? false));
+    const bmPatch = browserMemoryFields
+      ? {
+          browser_profile_id: browserProfileId,
+          auto_profile_disabled: autoProfileDisabled,
+          pin_saved_session_ip: pinIp,
+        }
+      : {};
+
+    const runSequentiallyChanged =
+      isEditMode &&
+      runSequentially !== (editingCredential?.run_sequentially ?? false);
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
-      if (!editingGroups.name && !editingGroups.values && !proxyPinChanged) {
+      if (
+        !editingGroups.name &&
+        !editingGroups.values &&
+        !proxyPinChanged &&
+        !bmChanged &&
+        !runSequentiallyChanged
+      ) {
         // Nothing was edited — close silently
         reset();
         setIsOpen(false);
@@ -975,6 +1302,10 @@ function CredentialsModal({
           id: editingCredential.credential_id,
           name,
           ...(proxyPinChanged ? proxyPinPayload : {}),
+          ...bmPatch,
+          ...(runSequentiallyChanged
+            ? { run_sequentially: runSequentially }
+            : {}),
         });
         return;
       }
@@ -997,15 +1328,47 @@ function CredentialsModal({
       if (authenticatorKeyError) {
         return;
       }
+      if (additionalTwoFactorError) {
+        toast({
+          title: "Error",
+          description: additionalTwoFactorError,
+          variant: "destructive",
+        });
+        return;
+      }
+      // Removing or replacing any saved 2FA method (authenticator/email/text/passkey) destroys its
+      // stored material on save; confirm first so an accidental collapse can't silently delete it.
+      const savedTotpType = editingPasswordCredentialData?.totp_type;
+      const removalConfirmation =
+        isEditMode &&
+        savedTotpType &&
+        savedTotpType !== "none" &&
+        savedTotpType !== passwordCredentialValues.totp_type
+          ? (configuredAdditionalTwoFactorMethod?.removalConfirmation ??
+            "Remove two-factor authentication? The saved 2FA settings will be permanently deleted.")
+          : null;
+      if (removalConfirmation && !removalConfirmedRef.current) {
+        setRemovalConfirmationMessage(removalConfirmation);
+        return;
+      }
+      removalConfirmedRef.current = false;
       setAuthenticatorSaveError(null);
 
       const hasCompletedInlineTest =
-        testAndSave && testStatus === "completed" && !!testCredentialId;
+        supportsInlineTest &&
+        testAndSave &&
+        testStatus === "completed" &&
+        !!testCredentialId;
 
       // Create mode: the temp credential created by the inline test already holds
       // the entered secret and the saved browser profile, so rename it in place
       // instead of creating a duplicate.
-      if (!isEditMode && hasCompletedInlineTest && testCredentialId) {
+      if (
+        !isEditMode &&
+        hasCompletedInlineTest &&
+        testCredentialId &&
+        !selectedAdditionalTwoFactorMethod
+      ) {
         const url = testUrl.trim();
         const ctx = userContext.trim();
         renameCredentialMutation.mutate({
@@ -1045,18 +1408,47 @@ function CredentialsModal({
         testUrl.trim() !== (editingCredential?.tested_url ?? "");
       saveIntentRef.current = {
         shouldTestAfterSave:
+          supportsInlineTest &&
+          !browserMemoryEnabled &&
           testAndSave &&
           (testStatus !== "completed" ||
             (isEditMode && hasCompletedInlineTest)) &&
           testUrl.trim() !== "" &&
           hasEditModeChanges,
-        saveBrowserSessionIntent: testAndSave,
+        saveBrowserSessionIntent: supportsInlineTest && testAndSave,
         testUrl: testUrl.trim(),
         userContext: userContext.trim(),
         name,
         proxyLocation: proxyPinPayload.proxy_location,
         proxySessionId: proxyPinPayload.proxy_session_id,
         proxyPinChanged,
+        additionalTwoFactor:
+          selectedAdditionalTwoFactorMethod ||
+          configuredAdditionalTwoFactorMethod
+            ? {
+                selectedValue: selectedAdditionalTwoFactorMethod?.value,
+                configuredValue: configuredAdditionalTwoFactorMethod?.value,
+                enabledValues: {
+                  ...(selectedAdditionalTwoFactorMethod
+                    ? {
+                        [selectedAdditionalTwoFactorMethod.value]:
+                          selectedAdditionalTwoFactorMethodEnabled,
+                      }
+                    : {}),
+                  ...(configuredAdditionalTwoFactorMethod
+                    ? {
+                        [configuredAdditionalTwoFactorMethod.value]:
+                          configuredAdditionalTwoFactorMethodEnabled,
+                      }
+                    : {}),
+                },
+                states: Object.fromEntries(
+                  Object.entries(additionalTwoFactorStates).map(
+                    ([value, state]) => [value, { ...state }],
+                  ),
+                ),
+              }
+            : undefined,
       };
 
       activeMutation.mutate({
@@ -1065,12 +1457,30 @@ function CredentialsModal({
         credential: {
           username,
           password,
-          totp: totp === "" ? null : totp,
-          totp_type: passwordCredentialValues.totp_type,
+          totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
+          // When newly selecting an additional method, stage "none" so the dedicated endpoint sets type
+          // and material atomically; a rejection then can't leave a 2FA type with no material behind.
+          // For an already-configured replacement, keep the type so the old material survives a failure.
+          totp_type:
+            selectedAdditionalTwoFactorMethod &&
+            selectedAdditionalTwoFactorMethod.value !==
+              configuredAdditionalTwoFactorMethod?.value
+              ? "none"
+              : toPasswordCredentialTotpType(
+                  passwordCredentialValues.totp_type,
+                  selectedAdditionalTwoFactorMethod,
+                ),
           totp_identifier: totpIdentifier === "" ? null : totpIdentifier,
         },
         ...(vaultType === "custom" ? { vault_type: "custom" } : {}),
         ...credentialSaveProxyPinPayload,
+        ...(browserMemoryEnabled
+          ? {
+              browser_profile_id: browserProfileId,
+              auto_profile_disabled: autoProfileDisabled,
+              pin_saved_session_ip: pinIp,
+            }
+          : {}),
       });
     } else if (type === CredentialModalTypes.CREDIT_CARD) {
       const cardNumber = creditCardCredentialValues.cardNumber.trim();
@@ -1248,6 +1658,24 @@ function CredentialsModal({
   const authenticatorKeyError = shouldValidateAuthenticatorKey
     ? getAuthenticatorKeyError(passwordCredentialValues)
     : null;
+  const shouldValidateAdditionalTwoFactor =
+    type === CredentialModalTypes.PASSWORD &&
+    (!isEditMode || editingGroups.values);
+  const additionalTwoFactorError =
+    shouldValidateAdditionalTwoFactor && selectedAdditionalTwoFactorMethod
+      ? selectedAdditionalTwoFactorMethod.validate(
+          additionalTwoFactorStates[selectedAdditionalTwoFactorMethod.value] ??
+            selectedAdditionalTwoFactorMethod.initialState ??
+            {},
+          {
+            isEditMode,
+            configured:
+              configuredAdditionalTwoFactorMethod?.value ===
+              selectedAdditionalTwoFactorMethod.value,
+            enabled: selectedAdditionalTwoFactorMethodEnabled,
+          },
+        )
+      : null;
 
   const proxyPinContent = (
     <div className="space-y-3 border-t border-slate-700 pt-4">
@@ -1309,6 +1737,143 @@ function CredentialsModal({
     </div>
   );
 
+  const plainProfiles = (
+    plainProfilesPages?.pages.flatMap((p) => p) ?? []
+  ).filter((p) => !p.deleted_at && !p.is_managed && !p.linked_credential_name);
+  // The attached profile becomes credential-linked once saved, so it drops out
+  // of the plain list — surface it explicitly so the Select shows the real pick.
+  const profileOptions =
+    attachedProfile &&
+    !plainProfiles.some(
+      (p) => p.browser_profile_id === attachedProfile.browser_profile_id,
+    )
+      ? [attachedProfile, ...plainProfiles]
+      : plainProfiles;
+
+  const browserProfileModalSection = (
+    <div className="space-y-3">
+      {!isEditMode && (
+        <p className="text-xs text-muted-foreground">
+          Skyvern saves this login’s browser state after the first sign-in and
+          keeps it fresh automatically. You can opt out in Advanced below.
+        </p>
+      )}
+      {isEditMode && (
+        <div className="space-y-1.5">
+          <Label className="text-sm font-medium">Browser profile</Label>
+          <Select
+            value={browserProfileId ?? AUTO_PROFILE_VALUE}
+            onValueChange={(value) =>
+              setBrowserProfileId(value === AUTO_PROFILE_VALUE ? null : value)
+            }
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={AUTO_PROFILE_VALUE}>
+                Automatic (created at first sign-in)
+              </SelectItem>
+              {profileOptions.map((p) => (
+                <SelectItem
+                  key={p.browser_profile_id}
+                  value={p.browser_profile_id}
+                >
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {browserProfileId && attachAgentCount > 0 && (
+            <p className="text-xs text-amber-500">
+              ⚠︎ {credentialAttachWarning(attachAgentCount)}
+            </p>
+          )}
+        </div>
+      )}
+      <Accordion type="single" collapsible>
+        <AccordionItem value="advanced" className="border-b-0">
+          <AccordionTrigger className="py-2">Advanced</AccordionTrigger>
+          <AccordionContent className="space-y-3">
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <Checkbox
+                checked={pinIp}
+                onCheckedChange={(checked) => setPinIp(checked === true)}
+              />
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      tabIndex={0}
+                      className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Keep the same IP for this credential
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[260px]">
+                    Sign-ins with this credential use one dedicated IP, so the
+                    saved session stays valid on sites that check for network
+                    changes.
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </label>
+            <p className="ml-6 text-xs text-muted-foreground">
+              Helps avoid extra 2FA, captchas, and temporary locks on sites that
+              check for network changes.
+            </p>
+            {pinIp && existingSessionPrefix && (
+              <div className="ml-6 space-y-2">
+                <div className="flex items-center gap-2">
+                  <p className="text-xs text-muted-foreground">
+                    IP session:{" "}
+                    <span className="font-mono text-foreground">
+                      {existingSessionPrefix}
+                    </span>
+                  </p>
+                  <HelpTooltip content="This credential reuses one saved network identity so logins stay valid. Rotate to force a fresh one on the next sign-in." />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setRotateProxyPin(true)}
+                    disabled={rotateProxyPin}
+                  >
+                    Rotate
+                  </Button>
+                  {rotateProxyPin && (
+                    <span className="text-xs text-muted-foreground">
+                      A new IP session is created when you save.
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <Checkbox
+                id="auto-profile-disabled"
+                checked={autoProfileDisabled}
+                onCheckedChange={(checked) =>
+                  setAutoProfileDisabled(checked === true)
+                }
+              />
+              <span>
+                Don't automatically save or reuse a browser profile for this
+                credential
+              </span>
+            </label>
+            <p className="ml-6 text-xs text-muted-foreground">
+              A profile already linked to this credential stays linked — it just
+              stops being used or updated automatically.
+            </p>
+          </AccordionContent>
+        </AccordionItem>
+      </Accordion>
+    </div>
+  );
+
   const credentialContent = (() => {
     if (type === CredentialModalTypes.PASSWORD) {
       return (
@@ -1317,115 +1882,138 @@ function CredentialsModal({
           onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
-          urlRequired={testAndSave}
+          urlRequired={supportsInlineTest && testAndSave}
           urlDisabled={isTestInProgress}
           editMode={isEditMode}
+          configuredAdditionalTwoFactorMethod={
+            configuredAdditionalTwoFactorMethod?.value
+          }
+          additionalTwoFactorStates={additionalTwoFactorStates}
+          onAdditionalTwoFactorStateChange={(methodValue, next) =>
+            setAdditionalTwoFactorStates((previous) => ({
+              ...previous,
+              [methodValue]: next,
+            }))
+          }
+          additionalTwoFactorError={additionalTwoFactorError}
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
           beforeCredentialFields={customVaultCheckbox}
+          afterPassword={
+            browserMemoryEnabled ? browserProfileModalSection : null
+          }
           afterUrl={
-            <div className="space-y-3">
-              <div className="flex items-center gap-3">
-                <Checkbox
-                  id="test-and-save"
-                  checked={testAndSave}
-                  onCheckedChange={(checked) =>
-                    setTestAndSave(checked === true)
-                  }
-                  disabled={isTestInProgress}
-                />
-                <Label
-                  htmlFor="test-and-save"
-                  className="cursor-pointer text-sm font-medium"
-                >
-                  Save browser session for future logins
-                </Label>
-                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
-              </div>
-
-              {testAndSave && (
-                <div className="space-y-1 pl-7">
-                  <Label
-                    htmlFor="user-context"
-                    className="text-xs text-muted-foreground"
-                  >
-                    Login instructions (optional)
-                  </Label>
-                  {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
-                  <Textarea
-                    id="user-context"
-                    value={userContext}
-                    onChange={(e) => setUserContext(e.target.value)}
-                    placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
-                    disabled={isTestInProgress}
-                    className="min-h-[60px] resize-y"
-                    rows={2}
-                    maxLength={500}
+            browserMemoryEnabled ? null : (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <Checkbox
+                    id="test-and-save"
+                    checked={testAndSave}
+                    onCheckedChange={(checked) =>
+                      setTestAndSave(checked === true)
+                    }
+                    disabled={isTestInProgress || !supportsInlineTest}
                   />
+                  <Label
+                    htmlFor="test-and-save"
+                    className="cursor-pointer text-sm font-medium"
+                  >
+                    Save browser session for future logins
+                  </Label>
+                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
                 </div>
-              )}
 
-              {isTestInProgress && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <ReloadIcon className="size-4 animate-spin" />
-                    <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
-                  </div>
-                  {testWorkflowRunId && (
-                    <a
-                      href={`/runs/${testWorkflowRunId}/overview`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                {!supportsInlineTest && (
+                  <p className="pl-7 text-sm text-muted-foreground">
+                    Inline login testing is not available for this two-factor
+                    method.
+                  </p>
+                )}
+
+                {supportsInlineTest && testAndSave && (
+                  <div className="space-y-1 pl-7">
+                    <Label
+                      htmlFor="user-context"
+                      className="text-xs text-muted-foreground"
                     >
-                      <ExternalLinkIcon className="size-3" />
-                      Watch Skyvern test login live
-                    </a>
-                  )}
-                </div>
-              )}
-              {testStatus === "completed" && (
-                <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
-                  <CheckCircledIcon className="size-4" />
-                  <span>
-                    {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
-                  </span>
-                </div>
-              )}
-              {testStatus === "profile_failed" && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-destructive">
-                    <CrossCircledIcon className="size-4" />
-                    <span>Browser profile was not saved</span>
+                      Login instructions (optional)
+                    </Label>
+                    {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+                    <Textarea
+                      id="user-context"
+                      value={userContext}
+                      onChange={(e) => setUserContext(e.target.value)}
+                      placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+                      disabled={isTestInProgress}
+                      className="min-h-[60px] resize-y"
+                      rows={2}
+                      maxLength={500}
+                    />
                   </div>
-                  {testFailureReason && (
-                    <p className="text-xs text-destructive/70">
-                      {testFailureReason}
-                    </p>
-                  )}
-                </div>
-              )}
-              {testStatus === "failed" && (
-                <div className="space-y-1 pl-7">
-                  <div className="flex items-center gap-2 text-sm text-destructive">
-                    <CrossCircledIcon className="size-4" />
+                )}
+
+                {supportsInlineTest && isTestInProgress && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <ReloadIcon className="size-4 animate-spin" />
+                      <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                    </div>
+                    {testWorkflowRunId && (
+                      <a
+                        href={`/runs/${testWorkflowRunId}/overview`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                      >
+                        <ExternalLinkIcon className="size-3" />
+                        Watch Skyvern test login live
+                      </a>
+                    )}
+                  </div>
+                )}
+                {supportsInlineTest && testStatus === "completed" && (
+                  <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                    <CheckCircledIcon className="size-4" />
                     <span>
-                      {testUrl
-                        ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
-                        : "Unable to save browser session"}
+                      {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
                     </span>
                   </div>
-                  {testFailureReason && (
-                    <p className="text-xs text-destructive/70">
-                      {testFailureReason}
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
+                )}
+                {supportsInlineTest && testStatus === "profile_failed" && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-destructive">
+                      <CrossCircledIcon className="size-4" />
+                      <span>Browser profile was not saved</span>
+                    </div>
+                    {testFailureReason && (
+                      <p className="text-xs text-destructive/70">
+                        {testFailureReason}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {supportsInlineTest && testStatus === "failed" && (
+                  <div className="space-y-1 pl-7">
+                    <div className="flex items-center gap-2 text-sm text-destructive">
+                      <CrossCircledIcon className="size-4" />
+                      <span>
+                        {testUrl
+                          ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                          : "Unable to save browser session"}
+                      </span>
+                    </div>
+                    {testFailureReason && (
+                      <p className="text-xs text-destructive/70">
+                        {testFailureReason}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
           }
         />
       );
@@ -1490,6 +2078,9 @@ function CredentialsModal({
     if (authenticatorKeyError) {
       return;
     }
+    if (additionalTwoFactorError) {
+      return;
+    }
 
     // Set testing state immediately to avoid button flash
     pollCancelledRef.current = false;
@@ -1532,9 +2123,13 @@ function CredentialsModal({
     });
   }, [credentialGetter]);
 
-  // Whether the Test button should be shown
+  // Whether the Test button should be shown. Gated off under browser memory —
+  // the flag-on UI has no test-login flow, so legacy test state (restored from an
+  // existing credential) must not resurface the button or run a background test.
   const showTestButton =
+    !browserMemoryEnabled &&
     testAndSave &&
+    supportsInlineTest &&
     type === CredentialModalTypes.PASSWORD &&
     (!isEditMode || editingGroups.values);
 
@@ -1545,96 +2140,158 @@ function CredentialsModal({
     passwordCredentialValues.username.trim() !== "" &&
     passwordCredentialValues.password.trim() !== "" &&
     !authenticatorKeyError &&
+    !additionalTwoFactorError &&
     !isTestInProgress;
 
   return (
-    <Dialog
-      open={isOpen}
-      onOpenChange={(open) => {
-        if (!open) {
-          // Prevent in-flight poll responses from updating state after close
-          pollCancelledRef.current = true;
-          // Cancel any in-progress test before closing — use refs for latest IDs
-          const credId = testCredentialIdRef.current;
-          const wrId = testWorkflowRunIdRef.current;
-          if (isTestInProgress && credId && wrId) {
-            getClient(credentialGetter, "sans-api-v1")
-              .then((client) =>
-                client.post(`/credentials/${credId}/test/${wrId}/cancel`),
-              )
-              .catch(() => {
-                // Best-effort cleanup
-              });
-          } else if (credId && !isTestInProgress) {
-            // Test completed but user closed without saving — delete orphaned temp credential
-            getClient(credentialGetter)
-              .then((client) => client.delete(`/credentials/${credId}`))
-              .catch(() => {});
+    <>
+      <Dialog
+        open={isOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            // Prevent in-flight poll responses from updating state after close
+            pollCancelledRef.current = true;
+            // Cancel any in-progress test before closing — use refs for latest IDs
+            const credId = testCredentialIdRef.current;
+            const wrId = testWorkflowRunIdRef.current;
+            if (isTestInProgress && credId && wrId) {
+              getClient(credentialGetter, "sans-api-v1")
+                .then((client) =>
+                  client.post(`/credentials/${credId}/test/${wrId}/cancel`),
+                )
+                .catch(() => {
+                  // Best-effort cleanup
+                });
+            } else if (credId && !isTestInProgress) {
+              // Test completed but user closed without saving — delete orphaned temp credential
+              getClient(credentialGetter)
+                .then((client) => client.delete(`/credentials/${credId}`))
+                .catch(() => {});
+            }
+            testCredentialIdRef.current = null;
+            testWorkflowRunIdRef.current = null;
+            if (pollIntervalRef.current) {
+              clearTimeout(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+            }
+            reset();
           }
-          testCredentialIdRef.current = null;
-          testWorkflowRunIdRef.current = null;
-          if (pollIntervalRef.current) {
-            clearTimeout(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-          }
-          reset();
-        }
-        setIsOpen(open);
-      }}
-    >
-      <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
-        <DialogHeader>
-          <DialogTitle className="font-bold">
-            {isEditMode ? "Edit Credential" : "Add Credential"}
-          </DialogTitle>
-        </DialogHeader>
-        {isEditMode && editingGroups.values && (
-          <Alert variant="warning">
-            <ExclamationTriangleIcon className="size-4" />
-            <AlertDescription>
-              For security, saved values are never retrieved. Changing any field
-              other than the credential name requires re-entering all fields,
-              including passwords and 2FA settings.
-            </AlertDescription>
-          </Alert>
-        )}
-        {credentialContent}
-        {proxyPinContent}
+          setIsOpen(open);
+        }}
+      >
+        <DialogContent className="max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2">
+          <DialogHeader>
+            <DialogTitle className="font-bold">
+              {isEditMode ? "Edit Credential" : "Add Credential"}
+            </DialogTitle>
+          </DialogHeader>
+          {isEditMode && editingGroups.values && (
+            <Alert variant="warning">
+              <ExclamationTriangleIcon className="size-4" />
+              <AlertDescription>
+                For security, saved values are never retrieved. Changing any
+                field other than the credential name requires re-entering all
+                fields, including passwords and 2FA settings.
+              </AlertDescription>
+            </Alert>
+          )}
+          {credentialContent}
+          {isEditMode && (
+            <div className="space-y-1">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <Checkbox
+                  checked={runSequentially}
+                  onCheckedChange={(checked) =>
+                    setRunSequentially(checked === true)
+                  }
+                  disabled={
+                    activeMutation.isPending ||
+                    renameCredentialMutation.isPending
+                  }
+                />
+                <span>Run workflows sequentially for this credential</span>
+              </label>
+              <p className="ml-6 text-xs text-muted-foreground">
+                Serializes new workflow runs that share this credential so at
+                most one runs at a time. Runs created before this is enabled are
+                not serialized, and scheduled or sync-triggered runs are not yet
+                supported and fail closed.
+              </p>
+            </div>
+          )}
+          {/* The browser-memory IP checkbox only replaces this for PASSWORD
+            credentials; card/secret keep the proxy-pin UI under the flag. */}
+          {(!browserMemoryEnabled || type !== CredentialModalTypes.PASSWORD) &&
+            proxyPinContent}
 
-        <DialogFooter>
-          <div className="flex w-full items-center justify-end gap-2">
-            {showTestButton &&
-              (isTestInProgress ? (
-                <Button variant="destructive" onClick={cancelTest}>
-                  Cancel Test
-                </Button>
-              ) : (
-                <Button
-                  variant="secondary"
-                  onClick={handleTest}
-                  disabled={!canTest}
-                >
-                  {isTestComplete ? "Retest" : "Test"}
-                </Button>
-              ))}
-            <Button
-              onClick={handleSave}
-              disabled={
-                activeMutation.isPending ||
-                renameCredentialMutation.isPending ||
-                isTestInProgress
-              }
-            >
-              {activeMutation.isPending ||
-              renameCredentialMutation.isPending ? (
-                <ReloadIcon className="mr-2 size-4 animate-spin" />
-              ) : null}
-              {isEditMode ? "Update" : "Save"}
-            </Button>
+          <DialogFooter>
+            <div className="flex w-full items-center justify-end gap-2">
+              {showTestButton &&
+                (isTestInProgress ? (
+                  <Button variant="destructive" onClick={cancelTest}>
+                    Cancel Test
+                  </Button>
+                ) : (
+                  <Button
+                    variant="secondary"
+                    onClick={handleTest}
+                    disabled={!canTest}
+                  >
+                    {isTestComplete ? "Retest" : "Test"}
+                  </Button>
+                ))}
+              <Button
+                onClick={handleSave}
+                disabled={
+                  activeMutation.isPending ||
+                  renameCredentialMutation.isPending ||
+                  isTestInProgress ||
+                  Boolean(additionalTwoFactorError)
+                }
+              >
+                {activeMutation.isPending ||
+                renameCredentialMutation.isPending ? (
+                  <ReloadIcon className="mr-2 size-4 animate-spin" />
+                ) : null}
+                {isEditMode ? "Update" : "Save"}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={removalConfirmationMessage !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRemovalConfirmationMessage(null);
+          }
+        }}
+      >
+        <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
+          <DialogHeader>
+            <DialogTitle>Remove two-factor authentication?</DialogTitle>
+          </DialogHeader>
+          <div className="text-sm text-slate-400">
+            {removalConfirmationMessage}
           </div>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setRemovalConfirmationMessage(null);
+                removalConfirmedRef.current = true;
+                handleSave();
+              }}
+            >
+              Remove
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

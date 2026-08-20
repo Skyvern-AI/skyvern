@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { resolveCopilotLiveBrowserReady } from "./browserReadiness";
@@ -21,9 +24,20 @@ describe("resolveSendAction", () => {
     expect(resolveSendAction(sendInput({ candidate: "   " }))).toBe("noop");
   });
 
-  it("returns noop when a prompt is already queued and this is not a drain", () => {
+  // A parked turn (awaiting the user) never ends, so a swallowed second send
+  // left the composer permanently dead. Rewriting the parked prompt keeps the
+  // one-queued-prompt invariant without the dead end.
+  it("rewrites the parked prompt when a second send arrives", () => {
     expect(
       resolveSendAction(sendInput({ hasQueuedPrompt: true, isDrain: false })),
+    ).toBe("replace_queued");
+  });
+
+  it("still returns noop for an empty candidate while a prompt is queued", () => {
+    expect(
+      resolveSendAction(
+        sendInput({ hasQueuedPrompt: true, isDrain: false, candidate: "  " }),
+      ),
     ).toBe("noop");
   });
 
@@ -105,6 +119,11 @@ const drainInput = (
   inFlight: false,
   hasLiveBrowserSession: false,
   hasWorkflowPermanentId: true,
+  queuedContent: null,
+  turnOpeningContent: null,
+  turnCompletedNormally: false,
+  turnWorkflowMatches: false,
+  turnRequestMatches: false,
   ...overrides,
 });
 
@@ -166,6 +185,76 @@ describe("resolveDrainAction", () => {
     ).toBe("drain_skip_queue");
   });
 
+  const duplicateInput = (
+    overrides: Partial<Parameters<typeof resolveDrainAction>[0]> = {},
+  ) =>
+    drainInput({
+      queuedReason: "working",
+      queuedContent: "  build me a workflow  ",
+      turnOpeningContent: "build me a workflow",
+      turnCompletedNormally: true,
+      turnWorkflowMatches: true,
+      turnRequestMatches: true,
+      ...overrides,
+    });
+
+  it("drops a queued prompt identical to the message that opened the finished turn", () => {
+    expect(resolveDrainAction(duplicateInput())).toBe("drop_duplicate");
+  });
+
+  it("drains an identical queued prompt when the turn did not complete normally", () => {
+    expect(
+      resolveDrainAction(duplicateInput({ turnCompletedNormally: false })),
+    ).toBe("drain_requeue");
+  });
+
+  it("drains a queued prompt whose text differs from the turn-opening message", () => {
+    expect(
+      resolveDrainAction(duplicateInput({ queuedContent: "something else" })),
+    ).toBe("drain_requeue");
+  });
+
+  it("drains a queued prompt that only nearly repeats the turn-opening message", () => {
+    expect(
+      resolveDrainAction(
+        duplicateInput({ queuedContent: "build me a workflow." }),
+      ),
+    ).toBe("drain_requeue");
+    expect(
+      resolveDrainAction(
+        duplicateInput({ queuedContent: "Build me a workflow" }),
+      ),
+    ).toBe("drain_requeue");
+    expect(
+      resolveDrainAction(
+        duplicateInput({ queuedContent: "build me  a workflow" }),
+      ),
+    ).toBe("drain_requeue");
+  });
+
+  it("drains an identical queued prompt when the queued send would not be the same request", () => {
+    expect(
+      resolveDrainAction(duplicateInput({ turnRequestMatches: false })),
+    ).toBe("drain_requeue");
+  });
+
+  it("drains an identical queued prompt when the turn opened on another workflow", () => {
+    expect(
+      resolveDrainAction(duplicateInput({ turnWorkflowMatches: false })),
+    ).toBe("drain_requeue");
+  });
+
+  it("leaves a live_browser prompt on the skip-queue path even when it is identical", () => {
+    expect(
+      resolveDrainAction(
+        duplicateInput({
+          queuedReason: "live_browser",
+          hasLiveBrowserSession: true,
+        }),
+      ),
+    ).toBe("drain_skip_queue");
+  });
+
   it("waits for the session before draining a live_browser prompt", () => {
     expect(
       resolveDrainAction(
@@ -177,3 +266,113 @@ describe("resolveDrainAction", () => {
     ).toBe("wait");
   });
 });
+
+// Offline replay of the recorded duplicate-send incident (SKY-12192). Runs
+// only when DUP_SEND_DUMP points at the captured evidence root.
+const dumpRoot = process.env.DUP_SEND_DUMP;
+
+type ChatPostEvent = { t: string; kind: string; message: string };
+
+type ChatHistoryEntry = {
+  sender: "user" | "ai";
+  content: string;
+  audio_artifact_id: string | null;
+  created_at: string;
+  narrative_payload: { cancelled?: boolean; terminal?: string } | null;
+};
+
+function readJson<T>(root: string, name: string): T {
+  return JSON.parse(readFileSync(join(root, name), "utf8")) as T;
+}
+
+// Rebuilds the drain inputs from the captured duplicate-send run: the two
+// chat_post payloads, and the narrative the first turn ended on.
+function drainInputFromDump(root: string) {
+  const events = readJson<ChatPostEvent[]>(root, "network_events.json");
+  const posts = events.filter((event) => event.kind === "chat_post");
+  expect(posts).toHaveLength(2);
+
+  const history = readJson<{ chat_history: ChatHistoryEntry[] }>(
+    root,
+    "chat_history.json",
+  ).chat_history;
+  const userEntries = history.filter((entry) => entry.sender === "user");
+  expect(userEntries.map((entry) => entry.content)).toEqual(
+    posts.map((post) => post.message),
+  );
+  const noAudio = userEntries.every(
+    (entry) => entry.audio_artifact_id === null,
+  );
+
+  const narrative = history.find(
+    (entry) => entry.sender === "ai",
+  )?.narrative_payload;
+  if (!narrative) {
+    throw new Error("captured run has no ai narrative payload");
+  }
+
+  // The stored rows are the independent record that the reply landed before the
+  // duplicate post; the narrative is what the browser itself saw.
+  const dbRows = readFileSync(join(root, "db_rows.txt"), "utf8");
+  const messageRows = dbRows
+    .split("\n")
+    .filter((row) => /^ wccm_/.test(row))
+    .map((row) => row.split("|").map((cell) => cell.trim()));
+  expect(messageRows).toHaveLength(4);
+  const chatIds = new Set(messageRows.map((cells) => cells[1]));
+  expect(chatIds.size).toBe(1);
+
+  const secondPostAt = Date.parse(posts[1]!.t);
+  const aiRowBeforeSecondPost = dbRows
+    .split("\n")
+    .filter((row) => / \| ai +\| /.test(row))
+    .some((row) => {
+      const stamp = row.split("|")[3]?.trim();
+      return (
+        stamp !== undefined &&
+        Date.parse(`${stamp.replace(" ", "T")}Z`) <= secondPostAt
+      );
+    });
+  expect(aiRowBeforeSecondPost).toBe(true);
+
+  return {
+    queuedReason: "working" as const,
+    inFlight: false,
+    hasLiveBrowserSession: false,
+    hasWorkflowPermanentId: true,
+    queuedContent: posts[1]!.message,
+    turnOpeningContent: posts[0]!.message,
+    turnCompletedNormally:
+      narrative.cancelled === false && narrative.terminal !== "error",
+    // Both posts landed on the one chat id asserted above, which the frontend
+    // only opens per workflow.
+    turnWorkflowMatches: chatIds.size === 1,
+    // Only the audio leg is recoverable here; the packet records no mode, fix
+    // origin, block target or code_block, so the component tests cover those.
+    turnRequestMatches: noAudio,
+  };
+}
+
+describe.skipIf(!dumpRoot)(
+  "resolveDrainAction — captured duplicate send",
+  () => {
+    it("records the duplicate the captured run fired", () => {
+      const events = readJson<ChatPostEvent[]>(
+        dumpRoot!,
+        "network_events.json",
+      );
+      const posts = events.filter((event) => event.kind === "chat_post");
+      expect(posts.map((post) => post.message)).toEqual([
+        posts[0]!.message,
+        posts[0]!.message,
+      ]);
+    });
+
+    it("drops the second chat_post the captured run fired", () => {
+      const input = drainInputFromDump(dumpRoot!);
+      expect(input.turnCompletedNormally).toBe(true);
+      expect(input.queuedContent).toBe(input.turnOpeningContent);
+      expect(resolveDrainAction(input)).toBe("drop_duplicate");
+    });
+  },
+);

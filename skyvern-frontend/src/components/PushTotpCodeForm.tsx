@@ -15,6 +15,7 @@ import {
 import { useToast } from "@/components/ui/use-toast";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { containsHttpUrl } from "@/util/httpUrl";
 import { cn } from "@/util/utils";
 import {
   buildSendTotpCodeRequest,
@@ -27,9 +28,14 @@ type Props = {
   defaultWorkflowRunId?: string | null;
   defaultWorkflowId?: string | null;
   defaultTaskId?: string | null;
+  fixedOtpType?: OtpTypeValue;
   showAdvancedFields?: boolean;
+  onOtpTypeChange?: (otpType: OtpTypeValue) => void;
   onSuccess?: () => void;
 };
+
+const MAGIC_LINK_CONTENT_ERROR =
+  "Paste the full magic link message — no http(s) link found.";
 
 function PushTotpCodeForm({
   className,
@@ -37,7 +43,9 @@ function PushTotpCodeForm({
   defaultWorkflowRunId,
   defaultWorkflowId,
   defaultTaskId,
+  fixedOtpType,
   showAdvancedFields = false,
+  onOtpTypeChange,
   onSuccess,
 }: Props) {
   const [identifier, setIdentifier] = useState(defaultIdentifier?.trim() ?? "");
@@ -49,6 +57,10 @@ function PushTotpCodeForm({
   const [taskId, setTaskId] = useState(defaultTaskId?.trim() ?? "");
   const [otpType, setOtpType] = useState<OtpTypeValue>(OtpType.Totp);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [contentError, setContentError] = useState<string | null>(null);
+  const effectiveOtpType = fixedOtpType ?? otpType;
+  const isMagicLink = effectiveOtpType === OtpType.MagicLink;
+  const requiresMagicLinkUrl = fixedOtpType === OtpType.MagicLink;
 
   const credentialGetter = useCredentialGetter();
   const { toast } = useToast();
@@ -111,7 +123,7 @@ function PushTotpCodeForm({
     },
     onSuccess: () => {
       toast({
-        title: "2FA code sent",
+        title: isMagicLink ? "Magic link sent" : "2FA code sent",
         description: "Skyvern will process it shortly.",
       });
       setContent("");
@@ -120,7 +132,9 @@ function PushTotpCodeForm({
     onError: () => {
       toast({
         variant: "destructive",
-        title: "Failed to send code",
+        title: isMagicLink
+          ? "Failed to send magic link"
+          : "Failed to send code",
         description: "Check the identifier and message format, then retry.",
       });
     },
@@ -131,11 +145,16 @@ function PushTotpCodeForm({
     if (!canSubmit || mutation.isPending) {
       return;
     }
+    if (requiresMagicLinkUrl && !containsHttpUrl(trimmedContent)) {
+      setContentError(MAGIC_LINK_CONTENT_ERROR);
+      return;
+    }
 
+    setContentError(null);
     const payload = buildSendTotpCodeRequest({
       identifier: trimmedIdentifier,
       content: trimmedContent,
-      otpType,
+      otpType: effectiveOtpType,
       workflowRunId: trimmedWorkflowRunId,
       workflowId: trimmedWorkflowId,
       taskId: trimmedTaskId,
@@ -154,7 +173,11 @@ function PushTotpCodeForm({
         <Label htmlFor="totp-identifier-input">Identifier</Label>
         <Input
           id="totp-identifier-input"
-          placeholder="Email or phone receiving the code"
+          placeholder={
+            effectiveOtpType === OtpType.MagicLink
+              ? "Email receiving the magic link"
+              : "Email or phone receiving the code"
+          }
           autoComplete="off"
           value={identifier}
           onChange={(event) => setIdentifier(event.target.value)}
@@ -166,36 +189,60 @@ function PushTotpCodeForm({
         <AutoResizingTextarea
           id="totp-content-input"
           placeholder={
-            otpType === OtpType.MagicLink
+            effectiveOtpType === OtpType.MagicLink
               ? "Paste the full email body or magic link"
               : "Paste the full email/SMS body or the 6-digit code"
           }
           value={content}
-          onChange={(event) => setContent(event.target.value)}
+          onChange={(event) => {
+            setContent(event.target.value);
+            setContentError(null);
+          }}
           readOnly={mutation.isPending}
+          aria-invalid={requiresMagicLinkUrl && contentError !== null}
+          aria-describedby={
+            requiresMagicLinkUrl && contentError
+              ? "totp-content-error"
+              : undefined
+          }
           className="min-h-[4.5rem]"
         />
+        {requiresMagicLinkUrl && contentError && (
+          <p
+            id="totp-content-error"
+            role="alert"
+            className="text-xs text-destructive"
+          >
+            {contentError}
+          </p>
+        )}
         <p className="text-xs text-slate-400">
           We only store this to help the current login. Avoid pasting unrelated
           sensitive data.
         </p>
       </div>
-      <div className="space-y-1">
-        <Label htmlFor="totp-type-input">OTP Type</Label>
-        <Select
-          value={otpType}
-          onValueChange={(value: OtpTypeValue) => setOtpType(value)}
-          disabled={mutation.isPending}
-        >
-          <SelectTrigger id="totp-type-input" className="w-48">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={OtpType.Totp}>Numeric code</SelectItem>
-            <SelectItem value={OtpType.MagicLink}>Magic link</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
+      {fixedOtpType === undefined && (
+        <div className="space-y-1">
+          <Label htmlFor="totp-type-input">OTP Type</Label>
+          <Select
+            value={otpType}
+            onValueChange={(value: OtpTypeValue) => {
+              setOtpType(value);
+              setContentError(null);
+              onOtpTypeChange?.(value);
+            }}
+            disabled={mutation.isPending}
+          >
+            <SelectTrigger id="totp-type-input" className="w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={OtpType.Totp}>Numeric code</SelectItem>
+              <SelectItem value={OtpType.MagicLink}>Magic link</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      )}
 
       {showAdvancedFields && (
         <div className="space-y-2">
@@ -247,7 +294,11 @@ function PushTotpCodeForm({
       )}
 
       <Button type="submit" disabled={!canSubmit || mutation.isPending}>
-        {mutation.isPending ? "Sending…" : "Send 2FA Code"}
+        {mutation.isPending
+          ? "Sending…"
+          : isMagicLink
+            ? "Send Magic Link"
+            : "Send 2FA Code"}
       </Button>
     </form>
   );

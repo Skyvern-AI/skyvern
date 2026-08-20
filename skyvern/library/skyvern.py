@@ -21,12 +21,30 @@ from skyvern.schemas.proxy_location import ProxyLocationInput, proxy_location_to
 from skyvern.schemas.run_enums import RunEngine, RunStatus
 
 LOG = structlog.get_logger()
+_DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 2.0
 
 if TYPE_CHECKING:
     from playwright.async_api import Playwright
 
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
+
+
+async def _read_devtools_active_port(user_data_dir: pathlib.Path) -> int:
+    active_port_file = user_data_dir / "DevToolsActivePort"
+    deadline = asyncio.get_running_loop().time() + _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS
+    last_error: OSError | ValueError | IndexError | None = None
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            port = int(active_port_file.read_text().splitlines()[0])
+            if not 1 <= port <= 65535:
+                raise ValueError(f"invalid CDP port: {port}")
+            return port
+        except (OSError, ValueError, IndexError) as exc:
+            last_error = exc
+            await asyncio.sleep(0.01)
+    raise RuntimeError(f"Chromium did not publish a valid CDP port in {active_port_file}") from last_error
 
 
 def _get_browser_session_url(browser_session: BrowserSessionResponse) -> str:
@@ -467,7 +485,7 @@ class Skyvern(AsyncSkyvern):
         self,
         *,
         headless: bool = False,
-        port: int = DEFAULT_CDP_PORT,
+        port: int | None = None,
         args: list[str] | None = None,
         user_data_dir: str | None = None,
     ) -> SkyvernBrowser:
@@ -478,7 +496,8 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             headless: Whether to run the browser in headless mode. Defaults to False.
-            port: The port number for the CDP endpoint. Defaults to DEFAULT_CDP_PORT.
+            port: The port number for the CDP endpoint. Anonymous launches use an
+                OS-assigned port; explicitly configured launches retain DEFAULT_CDP_PORT.
             args: Additional command-line arguments to pass to Chromium. Defaults to None.
                 Example: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
 
@@ -486,28 +505,71 @@ class Skyvern(AsyncSkyvern):
             SkyvernBrowser: A browser instance with Skyvern capabilities.
         """
 
+        from skyvern.library import local_browser_profile  # noqa: PLC0415
         from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
 
         playwright = await self._get_playwright()
 
-        if user_data_dir:
+        use_instance_defaults = user_data_dir is None and port is None
+        managed_profile: local_browser_profile.LocalBrowserProfile | None = None
+        if use_instance_defaults:
+            managed_profile = local_browser_profile.create_local_browser_profile()
+            user_data_path = (
+                managed_profile.path
+                if managed_profile is not None
+                else pathlib.Path(tempfile.mkdtemp(prefix="skyvern-browser-"))
+            )
+            launch_port = 0
+        elif user_data_dir:
             user_data_path = pathlib.Path(user_data_dir)
+            launch_port = port if port is not None else DEFAULT_CDP_PORT
         else:
             user_data_path = pathlib.Path(tempfile.gettempdir()) / "skyvern-browser"
+            launch_port = port if port is not None else DEFAULT_CDP_PORT
 
         launch_args = [
-            f"--remote-debugging-port={port}",
+            f"--remote-debugging-port={launch_port}",
         ]
         if args:
             launch_args.extend(args)
 
-        browser_context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_path),
-            headless=headless,
-            args=launch_args,
-        )
-        browser_address = f"http://localhost:{port}"
-        return SkyvernBrowser(self, browser_context, browser_address=browser_address)
+        if managed_profile is not None and not managed_profile.revalidate():
+            deleted = await asyncio.to_thread(local_browser_profile.cleanup_local_browser_profile, managed_profile)
+            if not deleted:
+                LOG.warning("local_browser_profile_cleanup_deferred", user_data_dir=str(user_data_path))
+            raise RuntimeError("Local browser profile identity changed before Chromium launch")
+
+        browser_context = None
+        try:
+            browser_context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_path),
+                headless=headless,
+                args=launch_args,
+            )
+            resolved_port = await _read_devtools_active_port(user_data_path) if use_instance_defaults else launch_port
+            browser_address = f"http://localhost:{resolved_port}"
+            return SkyvernBrowser(
+                self,
+                browser_context,
+                browser_address=browser_address,
+                local_cdp_port=resolved_port,
+                local_user_data_dir=str(user_data_path),
+                local_user_data_dir_owned=use_instance_defaults,
+                local_browser_profile=managed_profile,
+            )
+        except BaseException:
+            if browser_context is not None:
+                try:
+                    await browser_context.close()
+                except BaseException:
+                    LOG.warning("local_browser_context_close_rollback_failed", exc_info=True)
+            if use_instance_defaults:
+                deleted = await asyncio.to_thread(
+                    local_browser_profile.cleanup_local_browser_profile, managed_profile or user_data_path
+                )
+                if not deleted:
+                    LOG.warning("local_browser_profile_cleanup_deferred", user_data_dir=str(user_data_path))
+            raise
 
     async def connect_to_browser_over_cdp(self, cdp_url: str) -> SkyvernBrowser:
         """Connect to an existing browser instance via Chrome DevTools Protocol (CDP).
@@ -527,6 +589,14 @@ class Skyvern(AsyncSkyvern):
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=cdp_url)
+
+    async def connect_to_browser_extension(self, runtime: BrowserExtensionRuntime) -> SkyvernBrowser:
+        from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
+
+        playwright = await self._get_playwright()
+        browser = await playwright.chromium.connect_over_cdp(runtime.cdp_ws_url)
+        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        return SkyvernBrowser(self, browser_context)
 
     async def connect_to_cloud_browser_session(self, browser_session_id: str) -> SkyvernBrowser:
         """Connect to an existing cloud-hosted browser session by ID.
@@ -564,7 +634,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60.
+                Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
@@ -606,7 +676,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+                Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. Only used when creating a new session.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud. Only used when creating a new session.
 
@@ -662,7 +732,12 @@ class Skyvern(AsyncSkyvern):
             browser_session.browser_address, headers={"x-api-key": self._api_key}
         )
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        return SkyvernBrowser(self, browser_context, browser_session_id=browser_session.browser_session_id)
+        return SkyvernBrowser(
+            self,
+            browser_context,
+            browser_session_id=browser_session.browser_session_id,
+            app_url=browser_session.app_url,
+        )
 
     async def _get_playwright(self) -> Playwright:
         if self._playwright is None:

@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
     ForLoopBlock,
     NavigationBlock,
+    SplitPdfBlock,
     TaskV2Block,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -157,6 +158,19 @@ def test_ignores_stale_model_on_task_v2_block() -> None:
     assert _collect_enterprise_gated_workflow_features(workflow) == set()
 
 
+def test_collects_gated_model_on_split_pdf_block() -> None:
+    split_block = SplitPdfBlock(
+        label="split",
+        file_url="{{ source }}",
+        prompt="Split by document.",
+        output_parameter=_output_parameter("split_output"),
+        model={"model_name": "claude-opus-4-6"},
+    )
+    workflow = _workflow([split_block])
+
+    assert _collect_enterprise_gated_workflow_features(workflow) == {"Anthropic Claude 4.6 Opus"}
+
+
 @pytest.mark.parametrize(
     ("model_name", "feature_name"),
     [
@@ -166,6 +180,7 @@ def test_ignores_stale_model_on_task_v2_block() -> None:
         ("claude-opus-4-7", "Anthropic Claude 4.7 Opus"),
         ("claude-opus-4-8", "Anthropic Claude 4.8 Opus"),
         ("claude-fable-5", "Anthropic Claude Fable 5"),
+        ("claude-opus-5", "Anthropic Claude Opus 5"),
     ],
 )
 def test_collects_enterprise_model_alias_features(model_name: str, feature_name: str) -> None:
@@ -189,13 +204,19 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         workflow_run_id="wr_1",
         workflow_id=workflow.workflow_id,
         workflow_permanent_id=workflow.workflow_permanent_id,
+        browser_session_id=None,
         browser_profile_id=None,
         browser_address=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=WorkflowRunStatus.created,
     )
     failed_workflow_run = SimpleNamespace(
         workflow_run_id="wr_1",
         workflow_permanent_id=workflow.workflow_permanent_id,
+        browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=WorkflowRunStatus.failed,
     )
     organization = SimpleNamespace(organization_id="org")

@@ -8,6 +8,7 @@ export type WorkflowStartNodeData = {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
   browserProfileId: string | null;
   browserProfileKey: string | null;
@@ -22,6 +23,7 @@ export type WorkflowStartNodeData = {
   scriptCacheKey: string | null;
   aiFallback: boolean;
   enableSelfHealing: boolean;
+  maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;

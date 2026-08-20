@@ -1,42 +1,82 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 from multidict import CIMultiDict, CIMultiDictProxy
 
 from skyvern.config import settings
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api import files
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.signing import (
+    parse_artifact_content_url,
+    parse_keyring,
+    sign_artifact_url,
+    verify_artifact_signature,
+)
 
 
 class _FakeDownloadResponse:
-    def __init__(self, data: bytes, headers: dict[str, str] | None = None, advertise_length: bool = True) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        headers: dict[str, str] | None = None,
+        advertise_length: bool = True,
+        status: int = 200,
+    ) -> None:
         self._data = data
         # aiohttp exposes headers as a case-insensitive CIMultiDictProxy; mirror that.
         self.headers = CIMultiDictProxy(CIMultiDict(headers or {}))
+        self.status = status
+        self.reason = "Unknown Error" if status >= 400 else "OK"
+        self.history = ()
+        self.request_info = MagicMock(real_url="https://example.com/files/rate-limited.png")
         self.content_length = len(data) if advertise_length else None
         self.content = self
         self.body_read = False
+        self.auto_raise_for_status = False
 
     async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
         self.body_read = True
         yield self._data
 
     async def __aenter__(self) -> _FakeDownloadResponse:
+        if self.auto_raise_for_status:
+            self.raise_for_status()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
         return None
 
+    def raise_for_status(self) -> None:
+        if self.status < 400:
+            return
+        raise aiohttp.ClientResponseError(
+            request_info=self.request_info,
+            history=self.history,
+            status=self.status,
+            message=self.reason,
+            headers=self.headers,
+        )
+
 
 class _FakeDownloadSession:
-    def __init__(self, response: _FakeDownloadResponse) -> None:
+    def __init__(self, response: _FakeDownloadResponse, *, raise_for_status: bool = False) -> None:
         self._response = response
+        self._raise_for_status = raise_for_status
 
-    def get(self, url: object, headers: dict[str, str] | None = None) -> _FakeDownloadResponse:
+    def get(
+        self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
+    ) -> _FakeDownloadResponse:
+        self._response.auto_raise_for_status = self._raise_for_status
         return self._response
 
     async def __aenter__(self) -> _FakeDownloadSession:
@@ -51,9 +91,17 @@ def _patch_download_session(
     data: bytes,
     headers: dict[str, str] | None = None,
     advertise_length: bool = True,
+    status: int = 200,
+    captured_session_kwargs: dict[str, object] | None = None,
 ) -> _FakeDownloadResponse:
-    response = _FakeDownloadResponse(data, headers, advertise_length=advertise_length)
-    monkeypatch.setattr(files.aiohttp, "ClientSession", lambda **kwargs: _FakeDownloadSession(response))
+    response = _FakeDownloadResponse(data, headers, advertise_length=advertise_length, status=status)
+
+    def make_session(**kwargs: object) -> _FakeDownloadSession:
+        if captured_session_kwargs is not None:
+            captured_session_kwargs.update(kwargs)
+        return _FakeDownloadSession(response, raise_for_status=kwargs.get("raise_for_status") is True)
+
+    monkeypatch.setattr(files.aiohttp, "ClientSession", make_session)
     return response
 
 
@@ -193,3 +241,135 @@ async def test_download_file_cleans_up_temp_file_when_max_size_exceeded_mid_stre
         await files.download_file("https://example.com/files/big.bin", output_dir=str(tmp_path), max_size_mb=1)
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_file_raises_http_error_without_aiohttp_auto_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_session_kwargs: dict[str, object] = {}
+    response = _patch_download_session(
+        monkeypatch,
+        b"",
+        status=429,
+        captured_session_kwargs=captured_session_kwargs,
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+        await files.download_file("https://example.com/files/rate-limited.png", output_dir=str(tmp_path))
+
+    assert exc_info.value.status == 429
+    assert captured_session_kwargs.get("raise_for_status") is not True
+    assert not response.body_read
+    assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# First-party artifact URL recovery (SKY-13575)
+# ---------------------------------------------------------------------------
+
+_BASE_URL = "https://api.example.com"
+_KEYRING_JSON = json.dumps({"current_kid": "k1", "keys": {"k1": {"secret": "0" * 64}}})
+
+
+def _artifact(artifact_id: str = "a_1", organization_id: str = "org-1") -> Artifact:
+    now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    return Artifact(
+        artifact_id=artifact_id,
+        artifact_type=ArtifactType.DOWNLOAD,
+        uri="s3://bucket/downloads/docs_5.pdf",
+        organization_id=organization_id,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _patch_artifact_lookup(monkeypatch: pytest.MonkeyPatch, artifact: Artifact | None) -> AsyncMock:
+    """Wire a real ArtifactManager against fake artifact/organization repositories."""
+    monkeypatch.setattr(settings, "SKYVERN_BASE_URL", _BASE_URL)
+    monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _KEYRING_JSON)
+    get_artifact_by_id = AsyncMock(return_value=artifact)
+    database = MagicMock()
+    database.artifacts.get_artifact_by_id = get_artifact_by_id
+    database.organizations.get_organization = AsyncMock(return_value=None)
+    monkeypatch.setattr(forge_app, "DATABASE", database)
+    monkeypatch.setattr(forge_app, "ARTIFACT_MANAGER", ArtifactManager())
+    return get_artifact_by_id
+
+
+def _corrupt_signature(url: str, drop_index: int = 13) -> str:
+    """Drop a single character from the middle of the URL's signature."""
+    head, sig = url.split("&sig=")
+    return f"{head}&sig={sig[:drop_index]}{sig[drop_index + 1 :]}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_remints_first_party_url_with_corrupted_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_artifact_by_id = _patch_artifact_lookup(monkeypatch, _artifact())
+    download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
+    monkeypatch.setattr(files, "download_file", download_mock)
+    signed = sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON))
+    corrupted = _corrupt_signature(signed)
+
+    await files.resolve_local_or_download_file(corrupted, "wr_1", organization_id="org-1")
+
+    get_artifact_by_id.assert_awaited_once_with(artifact_id="a_1", organization_id="org-1")
+    downloaded_url = download_mock.await_args.args[0]
+    assert downloaded_url != corrupted
+    parsed = parse_artifact_content_url(downloaded_url, _BASE_URL)
+    assert parsed is not None
+    assert verify_artifact_signature(
+        "a_1", parsed.expiry or "", parsed.kid or "", parsed.sig or "", parse_keyring(_KEYRING_JSON)
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_remints_expired_first_party_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_artifact_lookup(monkeypatch, _artifact())
+    download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
+    monkeypatch.setattr(files, "download_file", download_mock)
+    expired = sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON), expiry_seconds=-60)
+
+    await files.resolve_local_or_download_file(expired, "wr_1", organization_id="org-1")
+
+    assert download_mock.await_args.args[0] != expired
+
+
+@pytest.mark.asyncio
+async def test_resolve_leaves_valid_first_party_url_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_artifact_by_id = _patch_artifact_lookup(monkeypatch, _artifact())
+    download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
+    monkeypatch.setattr(files, "download_file", download_mock)
+    signed = sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON))
+
+    await files.resolve_local_or_download_file(signed, "wr_1", organization_id="org-1")
+
+    assert download_mock.await_args.args[0] == signed
+    get_artifact_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_leaves_foreign_url_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_artifact_by_id = _patch_artifact_lookup(monkeypatch, _artifact())
+    download_mock = AsyncMock(return_value="/tmp/file.pdf")
+    monkeypatch.setattr(files, "download_file", download_mock)
+    foreign = "https://evil.example.com/v1/artifacts/a_1/content?expiry=1&kid=k1&sig=short"
+
+    await files.resolve_local_or_download_file(foreign, "wr_1", organization_id="org-1")
+
+    assert download_mock.await_args.args[0] == foreign
+    get_artifact_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_does_not_remint_artifact_owned_by_another_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_artifact_lookup(monkeypatch, None)
+    download_mock = AsyncMock(return_value="/tmp/docs_5.pdf")
+    monkeypatch.setattr(files, "download_file", download_mock)
+    corrupted = _corrupt_signature(sign_artifact_url(_BASE_URL, "a_1", parse_keyring(_KEYRING_JSON)))
+
+    await files.resolve_local_or_download_file(corrupted, "wr_1", organization_id="org-1")
+
+    assert download_mock.await_args.args[0] == corrupted

@@ -1,6 +1,6 @@
 import { useReactFlow } from "@xyflow/react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useCallback } from "react";
 
 import { toast } from "@/components/ui/use-toast";
@@ -15,7 +15,7 @@ import { getWorkflowErrors } from "../workflowEditorUtils";
 import type { AppNode } from "../nodes";
 
 export function useSaveWorkflow(): () => Promise<void> {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const reactFlow = useReactFlow<AppNode>();
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const setFilter = useCacheKeyValueStore((s) => s.setFilter);

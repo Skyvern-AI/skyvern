@@ -2,15 +2,22 @@ import { useCallback, useState } from "react";
 import {
   ActivityLogIcon,
   CodeIcon,
+  DotsHorizontalIcon,
   FileTextIcon,
   ListBulletIcon,
   ReloadIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
   TooltipContent,
@@ -38,14 +45,15 @@ import { useStudioPanes } from "../useStudioPanes";
 import { ViewToggle } from "../ViewToggle";
 
 /**
- * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs /
- * Code view toggles, plus the Live handoff chip while the run executes. The
- * selected view lives in useRunPaneViewStore; RunView renders the body.
+ * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs
+ * view toggles plus a "…" overflow menu holding the Code view, and the Live
+ * handoff chip while the run executes. The selected view lives in
+ * useRunPaneViewStore; RunView renders the body.
  */
 export function RunPaneViewToggles() {
   const compact = useStudioPaneCompact();
   const { runId } = useStudioInspectedRun();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     runId ? { workflowRunId: runId } : undefined,
   );
@@ -127,25 +135,51 @@ export function RunPaneViewToggles() {
           label="Outputs"
           icon={<FileTextIcon className="h-3 w-3" />}
         />
-        <ViewToggle
-          active={view === "code"}
-          onClick={() => setView("code")}
-          compact={compact}
-          label="Code"
-          title={
-            codeGenerating ? "Generating cached code for this run" : undefined
-          }
-          icon={
-            codeGenerating ? (
-              <ReloadIcon
-                data-testid="code-generating-spinner"
-                className="h-3 w-3 animate-spin"
-              />
-            ) : (
+        <DropdownMenu>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="More views"
+                  aria-pressed={view === "code"}
+                  className={cn(
+                    "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
+                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    view === "code"
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                  )}
+                >
+                  {codeGenerating ? (
+                    <ReloadIcon
+                      data-testid="code-generating-spinner"
+                      className="h-3 w-3 animate-spin"
+                    />
+                  ) : (
+                    <DotsHorizontalIcon className="h-3 w-3" />
+                  )}
+                </button>
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {codeGenerating
+                ? "Generating cached code for this run"
+                : "More views"}
+            </TooltipContent>
+          </Tooltip>
+          {/* Sized to the pane-header control grammar (11px, h-7 rows) so the
+              menu reads as part of the toggle cluster, not a full-size menu. */}
+          <DropdownMenuContent align="start" sideOffset={6} className="min-w-0">
+            <DropdownMenuItem
+              onSelect={() => setView("code")}
+              className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-[11px] font-medium text-muted-foreground focus:text-foreground"
+            >
               <CodeIcon className="h-3 w-3" />
-            )
-          }
-        />
+              Code
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
       {showLive
         ? (() => {
@@ -154,7 +188,7 @@ export function RunPaneViewToggles() {
                 type="button"
                 onClick={focusBrowserPane}
                 aria-label="Live"
-                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 text-[11px] font-medium text-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
                 {compact ? null : "Live"}
@@ -207,7 +241,7 @@ export function RunPaneActions() {
             type="button"
             aria-label="API & Webhooks"
             className={cn(
-              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border text-[11px] font-medium",
+              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md text-[11px] font-medium",
               compact ? "w-7 justify-center px-0" : "px-2",
               "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",

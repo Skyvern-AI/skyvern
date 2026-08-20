@@ -27,6 +27,11 @@ add_type("text/plain", ".log")
 add_type("application/zstd", ".zst")
 
 _S3_OPERATION_RETRIES = 2
+# get_object on a missing key raises NoSuchKey; head-style paths use 404/NotFound.
+S3_NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "NotFound", "404"})
+# Long-lived holders (e.g. the storage singleton on persistent-sessions workers) must not reuse a
+# session past the 1-hour projected web-identity token expiry (SKY-8743, SKY-13210).
+_SESSION_TTL_SECONDS: float = 45 * 60
 LOG = structlog.get_logger()
 
 
@@ -70,6 +75,7 @@ class AsyncAWSClient:
         self._aws_secret_access_key = aws_secret_access_key
         self._profile_name = profile_name
         self._session: aioboto3.Session | None = None
+        self._session_created_at: float = 0.0
 
     @property
     def session(self) -> aioboto3.Session:
@@ -78,6 +84,7 @@ class AsyncAWSClient:
     @session.setter
     def session(self, session: aioboto3.Session) -> None:
         self._session = session
+        self._session_created_at = time.monotonic()
 
     def _create_session(self, client_type_hint: AWSClientType | None = None) -> None:
         try:
@@ -86,6 +93,7 @@ class AsyncAWSClient:
                 aws_secret_access_key=self._aws_secret_access_key,
                 profile_name=self._profile_name,
             )
+            self._session_created_at = time.monotonic()
         except ProfileNotFound as e:
             profile_name = self._profile_name or os.environ.get("AWS_PROFILE") or "default"
             client_scope = f" while creating the {client_type_hint.value} client" if client_type_hint else ""
@@ -97,6 +105,9 @@ class AsyncAWSClient:
     def _get_session(self, client_type_hint: AWSClientType | None = None) -> aioboto3.Session:
         if self._session is None:
             self._create_session(client_type_hint)
+        elif (time.monotonic() - self._session_created_at) > _SESSION_TTL_SECONDS:
+            LOG.info("Recreating AWS session (TTL expired)", ttl_seconds=_SESSION_TTL_SECONDS)
+            self._create_session(client_type_hint)
         return self._session
 
     def refresh_session(self) -> None:
@@ -107,6 +118,12 @@ class AsyncAWSClient:
     def _is_expired_token_error(self, error: Exception) -> bool:
         """Check if an exception is an AWS ExpiredTokenException."""
         return isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") == "ExpiredTokenException"
+
+    def _is_not_found_error(self, error: Exception) -> bool:
+        """Check if an exception is a missing-object (terminal not-found) error."""
+        return (
+            isinstance(error, ClientError) and error.response.get("Error", {}).get("Code") in S3_NOT_FOUND_ERROR_CODES
+        )
 
     def _error_code(self, error: Exception) -> str:
         if isinstance(error, ClientError):
@@ -331,7 +348,14 @@ class AsyncAWSClient:
 
         try:
             return await self._s3_with_retry("download", _op, uri=uri)
-        except Exception:
+        except Exception as e:
+            # A missing object is terminal not-found, not a transient failure (e.g. first-run
+            # profile restore before any archive exists). Log once without a traceback so callers
+            # fall back immediately instead of surfacing repeated ERROR tracebacks.
+            if self._is_not_found_error(e):
+                if log_exception:
+                    LOG.info("S3 object not found", uri=uri)
+                return None
             if log_exception:
                 LOG.exception("S3 download failed", uri=uri)
             return None
@@ -385,8 +409,10 @@ class AsyncAWSClient:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
-    async def create_presigned_urls(self, uris: list[str]) -> list[str] | None:
+    async def create_presigned_urls(self, uris: list[str], expires_in: int | None = None) -> list[str] | None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
+        expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
+
         async def _op() -> list[str]:
             presigned_urls = []
             async with self._s3_client() as client:
@@ -395,7 +421,7 @@ class AsyncAWSClient:
                     url = await client.generate_presigned_url(
                         "get_object",
                         Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
-                        ExpiresIn=settings.PRESIGNED_URL_EXPIRATION,
+                        ExpiresIn=expiration,
                     )
                     presigned_urls.append(url)
                 return presigned_urls
@@ -652,7 +678,7 @@ def tag_set_to_dict(tag_set: list[dict[str, str]]) -> dict[str, str]:
 
 _aws_client: AsyncAWSClient | None = None
 _aws_client_created_at: float = 0.0
-_AWS_CLIENT_TTL_SECONDS: float = 45 * 60  # 45 mins - before the 1-hour projected token expiry
+_AWS_CLIENT_TTL_SECONDS: float = _SESSION_TTL_SECONDS
 
 
 def get_aws_client() -> AsyncAWSClient:

@@ -1,12 +1,14 @@
 import asyncio
 import json
+import os
 import random
 import time
 import unicodedata
+from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import structlog
 import yaml
@@ -14,6 +16,7 @@ from fastapi import (
     BackgroundTasks,
     Body,
     Depends,
+    Form,
     Header,
     HTTPException,
     Path,
@@ -41,13 +44,20 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_for_organization
+from skyvern.forge.sdk.api.crypto import calculate_sha256
+from skyvern.forge.sdk.api.llm.custom_llm_registry import (
+    CUSTOM_LLM_KEY_PREFIX,
+    ensure_custom_llm_registered_for_org,
+    is_custom_llm_key,
+    load_custom_llm_configs_for_organization,
+)
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactSignedUrl, ArtifactType
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
     ARTIFACT_URL_EXPIRY_SECONDS_MAX,
     ARTIFACT_URL_EXPIRY_SECONDS_MIN,
+    ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
     parse_keyring,
     verify_artifact_signature,
 )
@@ -56,7 +66,13 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.db.repositories.tags import TagValueRenameCollision, TagValueRenameResult
+from skyvern.forge.sdk.db.repositories.tags import (
+    RunTagWorkflowRunMismatch,
+    TagValueAlreadyExists,
+    TagValueRenameCollision,
+    TagValueRenameResult,
+)
+from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
 from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
@@ -87,7 +103,10 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
-from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
+from skyvern.forge.sdk.routes.trigger_type import (
+    caps_run_response_values,
+    workflow_run_trigger_type_from_user_agent,
+)
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -118,7 +137,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
-from skyvern.forge.sdk.workflow.models.tags import TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource, TagWriteContext
+from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -128,9 +148,11 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowRunWithWorkflowResponse,
 )
+from skyvern.forge.sdk.workflow.service import capped_task_v1_response, capped_task_v2
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
 from skyvern.schemas.runs import (
+    BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
     CUA_ENGINES,
     MAX_SEARCH_FETCH_LIMIT,
     BlockRunRequest,
@@ -149,6 +171,11 @@ from skyvern.schemas.runs import (
     WorkflowRunResponse,
 )
 from skyvern.schemas.tags import (
+    RunTagHistoryResponse,
+    RunTagsBatchRequest,
+    RunTagsBatchResponse,
+    RunTagsResponse,
+    RunTagSuggestionsResponse,
     TagApplyRequest,
     TagHistoryItem,
     TagHistoryResponse,
@@ -159,6 +186,7 @@ from skyvern.schemas.tags import (
     TagResponse,
     TagsResponse,
     TagValue,
+    TagValueCreate,
     TagValueDelete,
     TagValueDeleteResponse,
     TagValueRename,
@@ -176,8 +204,16 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
     sanitize_workflow_yaml_with_references,
 )
-from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
+from skyvern.services import (
+    block_service,
+    run_service,
+    task_v1_service,
+    task_v2_service,
+    uploaded_file_service,
+    workflow_service,
+)
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
 
@@ -208,6 +244,23 @@ async def _validate_enterprise_gated_task_run_features(
             status_code=http_status.HTTP_403_FORBIDDEN,
             detail=get_user_facing_exception_message(e),
         ) from e
+
+
+def _schedule_task_run_created(
+    background_tasks: BackgroundTasks,
+    *,
+    organization_id: str,
+    run_id: str,
+    run_type: RunType,
+    caller_type: CallerType,
+) -> None:
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=organization_id,
+        run_id=run_id,
+        run_type=run_type,
+        caller_type=caller_type,
+    )
 
 
 class AISuggestionType(str, Enum):
@@ -242,10 +295,13 @@ async def run_task(
     request: Request,
     background_tasks: BackgroundTasks,
     run_request: TaskRunRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TaskRunResponse:
+    current_org = caller.organization
+    if run_request.webhook_url:
+        run_request.webhook_url = validate_webhook_url(run_request.webhook_url)
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
@@ -253,6 +309,7 @@ async def run_task(
     skyvern_ctx = skyvern_context.current()
     # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
     # price of true %-rollout randomization on a flag that's only checked once per request.
+    forced_to_v1 = False
     force_task_v1_distinct_id = (
         skyvern_ctx.request_id if skyvern_ctx and skyvern_ctx.request_id else current_org.organization_id
     )
@@ -280,6 +337,7 @@ async def run_task(
             **log_extra,
         )
         run_request.engine = RunEngine.skyvern_v1
+        forced_to_v1 = True
         if not run_request.max_steps or run_request.max_steps > cap:
             run_request.max_steps = cap
 
@@ -289,7 +347,20 @@ async def run_task(
         model=run_request.model,
     )
 
-    if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
+    if run_request.engine in CUA_ENGINES or run_request.engine in (RunEngine.skyvern_v1, RunEngine.skyvern_v3):
+        # The V1 / CUA task engines build a legacy TaskRequest that carries no browser-memory controls,
+        # so these run-level fields would silently no-op. Reject them explicitly rather than accept-and-
+        # ignore; skyvern_v2 honors both via initialize_task_v2. V1/CUA parity is deferred (SKY-12644).
+        if run_request.browser_profile_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="browser_profile_id is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
+        if run_request.start_fresh_browser:
+            raise HTTPException(
+                status_code=400,
+                detail="start_fresh_browser is not supported for the skyvern_v1 or CUA task engines; use engine=skyvern_v2.",
+            )
         # create task v1
         # if there's no url, call task generation first to generate the url, data schema if any
         url = run_request.url
@@ -332,10 +403,11 @@ async def run_task(
             browser_address=run_request.browser_address,
         )
         try:
-            task_v1_response = await task_v1_service.run_task(
+            task_v1_response, resolved_engine = await task_v1_service.run_task(
                 task=task_v1_request,
                 organization=current_org,
                 engine=run_request.engine,
+                ab_routing_eligible=not forced_to_v1,
                 x_max_steps_override=run_request.max_steps,
                 x_api_key=x_api_key,
                 request=request,
@@ -347,15 +419,26 @@ async def run_task(
             span = trace.get_current_span()
             if span and task_v1_response.task_id:
                 span.set_attribute("task_id", task_v1_response.task_id)
+        # Report the run_type that will actually execute: the A/B hook may reroute a default
+        # request to v3, so derive from the resolved engine, not the original request engine.
         run_type = RunType.task_v1
-        if run_request.engine == RunEngine.openai_cua:
+        if resolved_engine == RunEngine.openai_cua:
             run_type = RunType.openai_cua
-        elif run_request.engine == RunEngine.anthropic_cua:
+        elif resolved_engine == RunEngine.anthropic_cua:
             run_type = RunType.anthropic_cua
-        elif run_request.engine == RunEngine.ui_tars:
+        elif resolved_engine == RunEngine.ui_tars:
             run_type = RunType.ui_tars
-        elif run_request.engine == RunEngine.yutori_navigator:
+        elif resolved_engine == RunEngine.yutori_navigator:
             run_type = RunType.yutori_navigator
+        elif resolved_engine == RunEngine.skyvern_v3:
+            run_type = RunType.task_v3
+        _schedule_task_run_created(
+            background_tasks,
+            organization_id=current_org.organization_id,
+            run_id=task_v1_response.task_id,
+            run_type=run_type,
+            caller_type=caller.caller_type,
+        )
         # build the task run response
         return TaskRunResponse(
             run_id=task_v1_response.task_id,
@@ -378,6 +461,7 @@ async def run_task(
                 data_extraction_schema=task_v1_response.extracted_information_schema,
                 error_code_mapping=task_v1_response.error_code_mapping,
                 browser_session_id=run_request.browser_session_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             ),
         )
@@ -403,6 +487,8 @@ async def run_task(
                 extra_http_headers=run_request.extra_http_headers,
                 cdp_connect_headers=run_request.cdp_connect_headers,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
             )
@@ -434,6 +520,13 @@ async def run_task(
             task_v2_id=task_v2.observer_cruise_id, organization_id=current_org.organization_id
         )
         task_v2 = refreshed_task_v2 if refreshed_task_v2 else task_v2
+        _schedule_task_run_created(
+            background_tasks,
+            organization_id=current_org.organization_id,
+            run_id=task_v2.observer_cruise_id,
+            run_type=RunType.task_v2,
+            caller_type=caller.caller_type,
+        )
         return TaskRunResponse(
             run_id=task_v2.observer_cruise_id,
             run_type=RunType.task_v2,
@@ -453,6 +546,8 @@ async def run_task(
                 proxy_location=task_v2.proxy_location,
                 max_steps=run_request.max_steps,
                 browser_session_id=run_request.browser_session_id,
+                browser_profile_id=run_request.browser_profile_id,
+                start_fresh_browser=run_request.start_fresh_browser,
                 error_code_mapping=task_v2.error_code_mapping,
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
@@ -472,6 +567,8 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         totp_verification_url=workflow_run_request.totp_url,
         browser_session_id=workflow_run_request.browser_session_id,
         browser_profile_id=workflow_run_request.browser_profile_id,
+        start_fresh_browser=workflow_run_request.start_fresh_browser,
+        reuse_browser_session=workflow_run_request.reuse_browser_session,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         max_elapsed_time_minutes=workflow_run_request.max_elapsed_time_minutes,
         extra_http_headers=workflow_run_request.extra_http_headers,
@@ -480,6 +577,14 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
         run_metadata=workflow_run_request.run_metadata,
+    )
+
+
+def _tag_write_context_from_caller(caller: org_auth_service.CallerContext) -> TagWriteContext:
+    return TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
     )
 
 
@@ -513,13 +618,16 @@ async def run_workflow(
     request: Request,
     background_tasks: BackgroundTasks,
     workflow_run_request: WorkflowRunRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
+    if workflow_run_request.webhook_url:
+        workflow_run_request.webhook_url = validate_webhook_url(workflow_run_request.webhook_url)
     analytics.capture("skyvern-oss-run-workflow")
+    current_org = caller.organization
     await PermissionCheckerFactory.get_instance().check(
         current_org, browser_session_id=workflow_run_request.browser_session_id
     )
@@ -543,9 +651,17 @@ async def run_workflow(
             request=request,
             background_tasks=background_tasks,
             trigger_type=trigger_type,
+            tag_write_context=_tag_write_context_from_caller(caller),
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     if settings.OTEL_ENABLED:
         span = trace.get_current_span()
@@ -578,6 +694,7 @@ async def run_workflow(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -615,8 +732,13 @@ async def get_run(
         ..., description="The id of the task run or the workflow run.", examples=["tsk_123", "tsk_v2_123", "wr_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> RunResponse:
-    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    run_response = await run_service.get_run_response(
+        run_id,
+        organization_id=current_org.organization_id,
+        cap_output_values=caps_run_response_values(x_user_agent),
+    )
     if not run_response:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -742,6 +864,30 @@ async def create_workflow_legacy(
         raise FailedToCreateWorkflow(str(e))
 
 
+IDEMPOTENCY_KEY_MAX_BYTES = 255
+IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+
+
+def validate_idempotency_key(
+    value: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", description=IDEMPOTENCY_KEY_CONTRACT),
+    ] = None,
+) -> str | None:
+    # Visible ASCII encodes one byte per character, so the character count is the byte count.
+    if value is None:
+        return None
+    if not 1 <= len(value) <= IDEMPOTENCY_KEY_MAX_BYTES or not all("\x21" <= char <= "\x7e" for char in value):
+        raise HTTPException(status_code=422, detail=IDEMPOTENCY_KEY_CONTRACT)
+    return value
+
+
+# The only way to read the header: a route cannot take the key without the bound check.
+# Depends() resolves only inside the request cycle — calling create_workflow directly in-process
+# bypasses this entirely. No such caller exists outside tests/; keep it that way.
+IdempotencyKey = Annotated[str | None, Depends(validate_idempotency_key)]
+
+
 @base_router.post(
     "/agents",
     response_model=Workflow,
@@ -762,6 +908,7 @@ async def create_workflow_legacy(
     summary="Create a new agent",
     responses={
         200: {"description": "Successfully created agent"},
+        409: {"description": "A create with this idempotency key is still in progress"},
         422: {"description": "Invalid agent definition"},
     },
 )
@@ -774,6 +921,7 @@ async def create_workflow(
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
+    idempotency_key: IdempotencyKey = None,
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
     try:
@@ -792,6 +940,30 @@ async def create_workflow(
         # Override folder_id if provided as query parameter
         if folder_id is not None:
             workflow_definition.folder_id = folder_id
+        if idempotency_key is not None:
+            digest = calculate_sha256(f"create_workflow\0{current_org.organization_id}\0{idempotency_key}")
+            workflow_permanent_id = f"wpid_{digest}"
+            try:
+                return await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+                    workflow_permanent_id=workflow_permanent_id,
+                    organization_id=current_org.organization_id,
+                    version=1,
+                    filter_deleted=False,
+                )
+            except WorkflowNotFound:
+                pass
+            resolved_title = await app.WORKFLOW_SERVICE.resolve_workflow_creation_title(
+                current_org.organization_id,
+                workflow_definition,
+            )
+            return await app.WORKFLOW_SERVICE.create_workflow_from_request(
+                organization=current_org,
+                request=workflow_definition,
+                new_workflow_permanent_id=workflow_permanent_id,
+                created_by=user_id,
+                edited_by=user_id,
+                resolved_title=resolved_title,
+            )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
@@ -800,6 +972,11 @@ async def create_workflow(
         )
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
+    except WorkflowCreationLockTimeout as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Workflow creation with this idempotency key is still in progress.",
+        ) from exc
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -872,6 +1049,8 @@ async def create_workflow_from_prompt(
             run_with=request.run_with,
             ai_fallback=request.ai_fallback if request.ai_fallback is not None else True,
             task_version=task_version,
+            extracted_information_schema=request.extracted_information_schema,
+            generate_script=bool(request.generate_script),
         )
     except Exception as e:
         LOG.error("Failed to create workflow from prompt", exc_info=True, organization_id=organization.organization_id)
@@ -1225,7 +1404,7 @@ async def update_workflow(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
-    except (SkyvernHTTPException, ValidationError) as e:
+    except (HTTPException, SkyvernHTTPException, ValidationError) as e:
         # Bubble up well-formed client errors so they are not converted to 500s
         raise e
     except Exception as e:
@@ -1557,6 +1736,18 @@ async def _assert_workflow_in_org(workflow_permanent_id: str, organization_id: s
         )
 
 
+async def _assert_workflow_run_in_org(workflow_run_id: str, organization_id: str) -> None:
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    if workflow_run is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run {workflow_run_id} not found",
+        )
+
+
 def _tag_event_to_response(row: Any) -> TagResponse:
     return TagResponse(key=row.key, value=row.value, source=row.source, set_at=row.set_at, set_by=row.set_by)
 
@@ -1598,6 +1789,47 @@ async def _apply_tag_changes_with_retry(
                 colors=colors,
             )
             return
+        except IntegrityError:
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.01, 0.05))
+                continue
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Tag write conflicted with a concurrent update; please retry",
+            )
+
+
+async def _apply_run_tag_changes_with_retry(
+    *,
+    workflow_run_id: str,
+    organization_id: str,
+    sets: dict[str, str],
+    deletes: set[str],
+    context: TagWriteContext,
+    label_sets: list[str] | None = None,
+    label_deletes: list[str] | None = None,
+    colors: dict[str, str] | None = None,
+) -> None:
+    """Wrap ``apply_run_tag_changes`` with the same concurrency behavior as
+    workflow tags. Org-mismatch is mapped to the route-level 404 contract."""
+    for attempt in range(2):
+        try:
+            await app.DATABASE.tags.apply_run_tag_changes(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                sets=sets,
+                deletes=deletes,
+                context=context,
+                label_sets=label_sets,
+                label_deletes=label_deletes,
+                colors=colors,
+            )
+            return
+        except RunTagWorkflowRunMismatch as e:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=f"Workflow run {workflow_run_id} not found",
+            ) from e
         except IntegrityError:
             if attempt == 0:
                 await asyncio.sleep(random.uniform(0.01, 0.05))
@@ -1664,7 +1896,7 @@ async def require_workflow_tagging(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
     summary="Apply agent tags",
@@ -1685,11 +1917,7 @@ async def apply_workflow_tags(
     organization_id = caller.organization.organization_id
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
 
-    write_ctx = TagWriteContext(
-        caller_id=caller.caller_id,
-        source=TagSource.MANUAL,
-        caller_type=caller.caller_type,
-    )
+    write_ctx = _tag_write_context_from_caller(caller)
     # A tag's key is its group; grouped tags are keyed (last-wins per group),
     # standalone labels (no key) are addressed by value.
     grouped_sets: dict[str, str] = {tag.key: tag.value for tag in data.tags if tag.key is not None}
@@ -1724,7 +1952,7 @@ async def apply_workflow_tags(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
     summary="Delete agent tag",
     responses={
@@ -1746,11 +1974,7 @@ async def delete_workflow_tag(
     _validate_path_key(key)
     await _assert_workflow_in_org(workflow_permanent_id, organization_id)
 
-    write_ctx = TagWriteContext(
-        caller_id=caller.caller_id,
-        source=TagSource.MANUAL,
-        caller_type=caller.caller_type,
-    )
+    write_ctx = _tag_write_context_from_caller(caller)
     await _apply_tag_changes_with_retry(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
@@ -1774,7 +1998,7 @@ async def delete_workflow_tag(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
     summary="Get agent tags",
     responses={
@@ -1821,7 +2045,7 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
     summary="Get agent tag history",
     responses={
@@ -1857,13 +2081,197 @@ async def get_workflow_tag_history(
     )
 
 
+@legacy_base_router.post(
+    "/runs/{workflow_run_id}/tags",
+    response_model=RunTagsResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.post("/runs/{workflow_run_id}/tags/", response_model=RunTagsResponse, include_in_schema=False)
+@base_router.post(
+    "/runs/{workflow_run_id}/tags",
+    response_model=RunTagsResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "apply_run_tags"},
+    description="Atomically apply tag changes to a workflow run. Sets and deletes happen in one transaction; "
+    "same-key collisions resolve set-wins.",
+    summary="Apply run tags",
+    responses={
+        200: {"description": "Successfully applied tag changes"},
+        404: {"description": "Workflow run not found"},
+        422: {"description": "Invalid tag key or value"},
+    },
+)
+@base_router.post("/runs/{workflow_run_id}/tags/", response_model=RunTagsResponse, include_in_schema=False)
+async def apply_run_tags(
+    workflow_run_id: str = Path(..., description="Workflow run ID", examples=["wr_123"]),
+    data: TagApplyRequest = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagsResponse:
+    analytics.capture("skyvern-oss-run-tags-apply")
+    organization_id = caller.organization.organization_id
+
+    write_ctx = _tag_write_context_from_caller(caller)
+    grouped_sets: dict[str, str] = {tag.key: tag.value for tag in data.tags if tag.key is not None}
+    label_sets: list[str] = [tag.value for tag in data.tags if tag.key is None]
+    grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
+    label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
+    try:
+        await _apply_run_tag_changes_with_retry(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            sets=grouped_sets,
+            deletes=grouped_deletes,
+            context=write_ctx,
+            label_sets=label_sets,
+            label_deletes=label_deletes,
+            colors=data.colors,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    return await _build_run_tags_response(workflow_run_id, organization_id)
+
+
+@legacy_base_router.delete(
+    "/runs/{workflow_run_id}/tags/{key}",
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.delete("/runs/{workflow_run_id}/tags/{key}/", include_in_schema=False)
+@base_router.delete(
+    "/runs/{workflow_run_id}/tags/{key}",
+    response_model=RunTagsResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_run_tag"},
+    description="Soft-delete a single grouped tag from a workflow run. Writes a DELETE event row.",
+    summary="Delete run tag",
+    responses={
+        200: {"description": "Successfully deleted tag (or no-op if absent)"},
+        404: {"description": "Workflow run not found"},
+    },
+)
+@base_router.delete("/runs/{workflow_run_id}/tags/{key}/", response_model=RunTagsResponse, include_in_schema=False)
+async def delete_run_tag(
+    workflow_run_id: str = Path(..., description="Workflow run ID", examples=["wr_123"]),
+    key: str = Path(..., description="Tag key to delete", examples=["env"]),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagsResponse:
+    analytics.capture("skyvern-oss-run-tags-delete")
+    organization_id = caller.organization.organization_id
+    _validate_path_key(key)
+
+    write_ctx = _tag_write_context_from_caller(caller)
+    await _apply_run_tag_changes_with_retry(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        sets={},
+        deletes={key},
+        context=write_ctx,
+    )
+    return await _build_run_tags_response(workflow_run_id, organization_id)
+
+
+@legacy_base_router.get(
+    "/runs/{workflow_run_id}/tags",
+    response_model=RunTagsResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get("/runs/{workflow_run_id}/tags/", response_model=RunTagsResponse, include_in_schema=False)
+@base_router.get(
+    "/runs/{workflow_run_id}/tags",
+    response_model=RunTagsResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tags"},
+    description="Get the current tag state for a workflow run.",
+    summary="Get run tags",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        404: {"description": "Workflow run not found"},
+    },
+)
+@base_router.get("/runs/{workflow_run_id}/tags/", response_model=RunTagsResponse, include_in_schema=False)
+async def get_run_tags(
+    workflow_run_id: str = Path(..., description="Workflow run ID", examples=["wr_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagsResponse:
+    organization_id = current_org.organization_id
+    await _assert_workflow_run_in_org(workflow_run_id, organization_id)
+    return await _build_run_tags_response(workflow_run_id, organization_id)
+
+
+async def _build_run_tags_response(workflow_run_id: str, organization_id: str) -> RunTagsResponse:
+    rows = await app.DATABASE.tags.get_active_tag_events_for_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+    )
+    tags = [_tag_event_to_response(row) for row in rows if row.value is not None]
+    tags.sort(key=lambda t: (t.key is not None, t.key or "", t.value))
+    return RunTagsResponse(workflow_run_id=workflow_run_id, tags=tags)
+
+
+@legacy_base_router.get(
+    "/runs/{workflow_run_id}/tags/history",
+    response_model=RunTagHistoryResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get(
+    "/runs/{workflow_run_id}/tags/history/",
+    response_model=RunTagHistoryResponse,
+    include_in_schema=False,
+)
+@base_router.get(
+    "/runs/{workflow_run_id}/tags/history",
+    response_model=RunTagHistoryResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_history"},
+    description="Chronological tag-event log for a workflow run (newest first). Includes SET and DELETE events.",
+    summary="Get run tag history",
+    responses={
+        200: {"description": "Successfully retrieved tag history"},
+        404: {"description": "Workflow run not found"},
+    },
+)
+@base_router.get(
+    "/runs/{workflow_run_id}/tags/history/",
+    response_model=RunTagHistoryResponse,
+    include_in_schema=False,
+)
+async def get_run_tag_history(
+    workflow_run_id: str = Path(..., description="Workflow run ID", examples=["wr_123"]),
+    limit: int = Query(100, ge=1, le=500, description="Max events to return"),
+    since: datetime | None = Query(None, description="Only return events at or after this timestamp"),
+    key: str | None = Query(None, description="Filter to events for a single tag key"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagHistoryResponse:
+    organization_id = current_org.organization_id
+    await _assert_workflow_run_in_org(workflow_run_id, organization_id)
+    rows = await app.DATABASE.tags.get_run_tag_event_history(
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        limit=limit,
+        since=since,
+        key=key,
+    )
+    return RunTagHistoryResponse(
+        workflow_run_id=workflow_run_id,
+        events=[TagHistoryItem.model_validate(r) for r in rows],
+    )
+
+
 @legacy_base_router.get("/tag-keys", response_model=list[TagKey], tags=["agent"], include_in_schema=False)
 @legacy_base_router.get("/tag-keys/", response_model=list[TagKey], include_in_schema=False)
 @base_router.get(
     "/tag-keys",
     response_model=list[TagKey],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
     responses={200: {"description": "Successfully retrieved tag keys"}},
@@ -1885,7 +2293,7 @@ async def list_tag_keys(
     "/tag-keys/{key}",
     response_model=TagKey,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
     responses={
@@ -1922,7 +2330,7 @@ async def update_tag_key(
     "/tag-keys/{key}",
     response_model=TagKeyDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_key"},
     description="Delete a tag key from the organization registry and remove that tag from every workflow that "
     "currently has it (cascade). Returns how many workflows the tag was removed from.",
     summary="Delete tag key",
@@ -1939,19 +2347,21 @@ async def delete_tag_key(
 ) -> TagKeyDeleteResponse:
     analytics.capture("skyvern-oss-tag-key-delete")
     _validate_path_key(key)
-    context = TagWriteContext(
-        caller_id=caller.caller_id,
-        source=TagSource.MANUAL,
-        caller_type=caller.caller_type,
-    )
-    removed_count = await app.DATABASE.tags.delete_tag_key(
-        organization_id=caller.organization.organization_id,
+    context = _tag_write_context_from_caller(caller)
+    organization_id = caller.organization.organization_id
+    delete_result = await app.DATABASE.tags.delete_tag_key(
+        organization_id=organization_id,
         key=key,
         context=context,
     )
-    if removed_count is None:
+    if delete_result is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
-    return TagKeyDeleteResponse(key=key, removed_from_workflow_count=removed_count)
+    return TagKeyDeleteResponse(
+        key=key,
+        removed_from_workflow_count=delete_result.removed_from_workflow_count,
+        removed_from_run_count=delete_result.removed_from_run_count,
+        removed_count=delete_result.removed_count,
+    )
 
 
 @legacy_base_router.get("/tag-values", response_model=list[TagValue], tags=["agent"], include_in_schema=False)
@@ -1960,7 +2370,7 @@ async def delete_tag_key(
     "/tag-values",
     response_model=list[TagValue],
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "list_tag_values"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "list_tag_values"},
     description="List the palette color and current workflow usage count for each grouped tag (key, value) "
     "for the organization. The frontend joins these onto tags by (key, value); workflow_count is the number "
     "of non-deleted workflows carrying the label and powers the per-label usage and delete blast-radius warnings.",
@@ -1969,11 +2379,12 @@ async def delete_tag_key(
 )
 @base_router.get("/tag-values/", response_model=list[TagValue], include_in_schema=False)
 async def list_tag_values(
+    key: str | None = Query(None, description="Filter to values for a single tag key"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     _tagging_gate: None = Depends(require_workflow_tagging),
 ) -> list[TagValue]:
     organization_id = current_org.organization_id
-    rows = await app.DATABASE.tags.list_tag_values(organization_id=organization_id)
+    rows = await app.DATABASE.tags.list_tag_values(organization_id=organization_id, key=key)
     counts = await app.DATABASE.tags.count_active_workflows_per_value(organization_id=organization_id)
     return [
         TagValue(
@@ -1986,13 +2397,48 @@ async def list_tag_values(
     ]
 
 
+@legacy_base_router.post("/tag-values", response_model=TagValue, tags=["agent"], include_in_schema=False)
+@legacy_base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+@base_router.post(
+    "/tag-values",
+    response_model=TagValue,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "create_tag_value"},
+    description="Register a grouped tag (key, value) with a palette color before any workflow uses it. "
+    "The label shows a zero workflow count until applied to a workflow.",
+    summary="Create tag value",
+    responses={
+        200: {"description": "Successfully registered tag value"},
+        409: {"description": "Tag value already exists"},
+        422: {"description": "Invalid key, value, or color"},
+    },
+)
+@base_router.post("/tag-values/", response_model=TagValue, include_in_schema=False)
+async def create_tag_value(
+    data: TagValueCreate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> TagValue:
+    analytics.capture("skyvern-oss-tag-value-create")
+    try:
+        row = await app.DATABASE.tags.register_tag_value(
+            organization_id=current_org.organization_id,
+            key=data.key,
+            value=data.value,
+            color=data.color,
+        )
+    except TagValueAlreadyExists as e:
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=str(e)) from e
+    return TagValue(key=row.key, value=row.value, color=row.color, workflow_count=0)
+
+
 @legacy_base_router.patch("/tag-values/{key}", response_model=TagValue, tags=["agent"], include_in_schema=False)
 @legacy_base_router.patch("/tag-values/{key}/", response_model=TagValue, include_in_schema=False)
 @base_router.patch(
     "/tag-values/{key}",
     response_model=TagValue,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "update_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "update_tag_value"},
     description="Recolor a grouped tag (key, value). The value is supplied in the body so values "
     "containing '/' stay addressable. The new color must be a palette name.",
     summary="Update tag value color",
@@ -2034,7 +2480,7 @@ async def update_tag_value(
     "/tag-values/{key}/rename",
     response_model=TagValueRenameResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "rename_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "rename_tag_value"},
     description="Rename a grouped tag (key, value) to (key, new_value). The cascade re-tags every workflow "
     "carrying the old label; the new label inherits the old color. Both values ride in the body so values "
     "containing '/' stay addressable. Rejects with 409 when the new value already exists for the key.",
@@ -2055,11 +2501,7 @@ async def rename_tag_value(
 ) -> TagValueRenameResponse:
     analytics.capture("skyvern-oss-tag-value-rename")
     _validate_path_key(key)
-    context = TagWriteContext(
-        caller_id=caller.caller_id,
-        source=TagSource.MANUAL,
-        caller_type=caller.caller_type,
-    )
+    context = _tag_write_context_from_caller(caller)
     try:
         result = await _rename_tag_value_with_retry(
             organization_id=caller.organization.organization_id,
@@ -2089,7 +2531,7 @@ async def rename_tag_value(
     "/tag-values/{key}",
     response_model=TagValueDeleteResponse,
     tags=["Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "delete_tag_value"},
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "delete_tag_value"},
     description="Soft-delete a grouped tag (key, value) and remove that label from every workflow carrying it "
     "(cascade). The value rides in the body so values containing '/' stay addressable. Returns how many "
     "workflows the label was removed from.",
@@ -2108,28 +2550,32 @@ async def delete_tag_value(
 ) -> TagValueDeleteResponse:
     analytics.capture("skyvern-oss-tag-value-delete")
     _validate_path_key(key)
-    context = TagWriteContext(
-        caller_id=caller.caller_id,
-        source=TagSource.MANUAL,
-        caller_type=caller.caller_type,
-    )
-    removed_count = await app.DATABASE.tags.delete_tag_value(
-        organization_id=caller.organization.organization_id,
+    context = _tag_write_context_from_caller(caller)
+    organization_id = caller.organization.organization_id
+    delete_result = await app.DATABASE.tags.delete_tag_value(
+        organization_id=organization_id,
         key=key,
         value=data.value,
         context=context,
     )
-    if removed_count is None:
+    if delete_result is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Tag value '{key}:{data.value}' not found",
         )
-    return TagValueDeleteResponse(key=key, value=data.value, removed_from_workflow_count=removed_count)
+    return TagValueDeleteResponse(
+        key=key,
+        value=data.value,
+        removed_from_workflow_count=delete_result.removed_from_workflow_count,
+        removed_from_run_count=delete_result.removed_from_run_count,
+        removed_count=delete_result.removed_count,
+    )
 
 
 # Keep in sync with BATCH_TAGS_MAX_WPIDS in the frontend
 # useWorkflowTagsBatchQuery hook, which chunks requests to this size.
 _BATCH_TAGS_MAX_WPIDS = 200
+_BATCH_TAGS_MAX_RUN_IDS = _BATCH_TAGS_MAX_WPIDS
 
 
 def _parse_batch_wpids(raw: str | None) -> list[str]:
@@ -2139,18 +2585,37 @@ def _parse_batch_wpids(raw: str | None) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
+def _parse_batch_run_ids(raw: str | None) -> list[str]:
+    """Parse the comma-separated workflow_run_id list from the GET query string."""
+    if not raw:
+        return []
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _sorted_tag_items(pairs: list[tuple[str | None, str]]) -> list[TagItem]:
+    ordered = sorted(pairs, key=lambda kv: (kv[0] is not None, kv[0] or "", kv[1]))
+    return [TagItem(key=key, value=value) for key, value in ordered]
+
+
 def _build_batch_response(
     requested_wpids: list[str], tag_map: dict[str, list[tuple[str | None, str]]]
 ) -> WorkflowTagsBatchResponse:
     """Echo every requested wpid (empty list if no tags). Each list is sorted
     standalone-first, then by key, then value — the repo SELECT has no ORDER BY."""
 
-    def _sorted(pairs: list[tuple[str | None, str]]) -> list[TagItem]:
-        ordered = sorted(pairs, key=lambda kv: (kv[0] is not None, kv[0] or "", kv[1]))
-        return [TagItem(key=key, value=value) for key, value in ordered]
-
-    workflow_tags: dict[str, list[TagItem]] = {wpid: _sorted(tag_map.get(wpid, [])) for wpid in requested_wpids}
+    workflow_tags: dict[str, list[TagItem]] = {
+        wpid: _sorted_tag_items(tag_map.get(wpid, [])) for wpid in requested_wpids
+    }
     return WorkflowTagsBatchResponse(workflow_tags=workflow_tags)
+
+
+def _build_run_batch_response(
+    requested_run_ids: list[str], tag_map: dict[str, list[tuple[str | None, str]]]
+) -> RunTagsBatchResponse:
+    run_tags: dict[str, list[TagItem]] = {
+        run_id: _sorted_tag_items(tag_map.get(run_id, [])) for run_id in requested_run_ids
+    }
+    return RunTagsBatchResponse(run_tags=run_tags)
 
 
 async def _resolve_active_batch_wpids(
@@ -2186,6 +2651,32 @@ async def _resolve_active_batch_wpids(
         organization_id=organization_id,
     )
     return {wpid: tags for wpid, tags in tag_map.items() if wpid in active_wpids_post}
+
+
+async def _resolve_active_batch_run_ids(
+    requested_run_ids: list[str], organization_id: str
+) -> dict[str, list[tuple[str | None, str]]]:
+    if not requested_run_ids:
+        return {}
+    active_runs_pre = await app.DATABASE.workflow_runs.get_workflow_runs_by_ids(
+        workflow_run_ids=requested_run_ids,
+        organization_id=organization_id,
+    )
+    active_run_ids_pre = {run.workflow_run_id for run in active_runs_pre}
+    if not active_run_ids_pre:
+        return {}
+    tag_map = await app.DATABASE.tags.get_active_tags_for_runs(
+        workflow_run_ids=list(active_run_ids_pre),
+        organization_id=organization_id,
+    )
+    if not tag_map:
+        return {}
+    active_runs_post = await app.DATABASE.workflow_runs.get_workflow_runs_by_ids(
+        workflow_run_ids=list(tag_map.keys()),
+        organization_id=organization_id,
+    )
+    active_run_ids_post = {run.workflow_run_id for run in active_runs_post}
+    return {run_id: tags for run_id, tags in tag_map.items() if run_id in active_run_ids_post}
 
 
 @legacy_base_router.get(
@@ -2254,6 +2745,108 @@ async def batch_get_workflow_tags_post(
         )
     tag_map = await _resolve_active_batch_wpids(wpids, current_org.organization_id)
     return _build_batch_response(wpids, tag_map)
+
+
+@legacy_base_router.get("/run-tags", response_model=RunTagsBatchResponse, tags=["agent"], include_in_schema=False)
+@legacy_base_router.get("/run-tags/", response_model=RunTagsBatchResponse, include_in_schema=False)
+@base_router.get(
+    "/run-tags",
+    response_model=RunTagsBatchResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_run_tags"},
+    description="Batch fetch current tags for many workflow runs. Avoids N+1 on run-list pages.",
+    summary="Batch get run tags",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        400: {"description": "Too many workflow run IDs requested"},
+    },
+)
+@base_router.get("/run-tags/", response_model=RunTagsBatchResponse, include_in_schema=False)
+async def batch_get_run_tags(
+    workflow_run_ids: str | None = Query(
+        None,
+        description="Comma-separated workflow run IDs",
+        examples=["wr_123,wr_456"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagsBatchResponse:
+    run_ids = _parse_batch_run_ids(workflow_run_ids)
+    if len(run_ids) > _BATCH_TAGS_MAX_RUN_IDS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {_BATCH_TAGS_MAX_RUN_IDS} workflow run IDs may be requested at once",
+        )
+    tag_map = await _resolve_active_batch_run_ids(run_ids, current_org.organization_id)
+    return _build_run_batch_response(run_ids, tag_map)
+
+
+@legacy_base_router.post("/run-tags", response_model=RunTagsBatchResponse, tags=["agent"], include_in_schema=False)
+@legacy_base_router.post("/run-tags/", response_model=RunTagsBatchResponse, include_in_schema=False)
+@base_router.post(
+    "/run-tags",
+    response_model=RunTagsBatchResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_run_tags_post"},
+    description="Batch fetch current tags for many workflow runs (POST variant for id lists exceeding URL length).",
+    summary="Batch get run tags (POST)",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        400: {"description": "Too many workflow run IDs requested"},
+    },
+)
+@base_router.post("/run-tags/", response_model=RunTagsBatchResponse, include_in_schema=False)
+async def batch_get_run_tags_post(
+    data: RunTagsBatchRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagsBatchResponse:
+    run_ids = [run_id.strip() for run_id in data.workflow_run_ids if run_id and run_id.strip()]
+    if len(run_ids) > _BATCH_TAGS_MAX_RUN_IDS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {_BATCH_TAGS_MAX_RUN_IDS} workflow run IDs may be requested at once",
+        )
+    tag_map = await _resolve_active_batch_run_ids(run_ids, current_org.organization_id)
+    return _build_run_batch_response(run_ids, tag_map)
+
+
+@legacy_base_router.get(
+    "/run-tag-suggestions", response_model=RunTagSuggestionsResponse, tags=["agent"], include_in_schema=False
+)
+@legacy_base_router.get("/run-tag-suggestions/", response_model=RunTagSuggestionsResponse, include_in_schema=False)
+@base_router.get(
+    "/run-tag-suggestions",
+    response_model=RunTagSuggestionsResponse,
+    tags=["Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "get_run_tag_suggestions"},
+    description="List distinct (key, value) pairs ever set on a run for the organization, sourced from the "
+    "run-tag event log rather than the tag-key/tag-value registry. Surfaces reserved 'skyvern.*' system keys "
+    "(which are never registered) so pickers can offer them alongside user-defined tags.",
+    summary="List run tag suggestions",
+    responses={200: {"description": "Successfully retrieved run tag suggestions"}},
+)
+@base_router.get("/run-tag-suggestions/", response_model=RunTagSuggestionsResponse, include_in_schema=False)
+async def get_run_tag_suggestions(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    _tagging_gate: None = Depends(require_workflow_tagging),
+) -> RunTagSuggestionsResponse:
+    organization_id = current_org.organization_id
+    pairs = await app.DATABASE.tags.get_run_tag_suggestions(organization_id=organization_id)
+    keys: list[str] = []
+    values_by_key: dict[str, list[str]] = {}
+    labels: list[str] = []
+    for key, value in pairs:
+        if value is None:
+            continue
+        if key is None:
+            labels.append(value)
+            continue
+        if key not in values_by_key:
+            keys.append(key)
+            values_by_key[key] = []
+        values_by_key[key].append(value)
+    return RunTagSuggestionsResponse(keys=keys, values_by_key=values_by_key, labels=labels)
 
 
 @legacy_base_router.post(
@@ -2569,6 +3162,15 @@ async def get_artifact_content(
             sig=sig,
             keyring=keyring,
         ):
+            # Signature length is the tell that separates a corrupted URL from an expired
+            # one: sign_artifact_url always emits exactly 43 base64url characters.
+            LOG.warning(
+                "Rejected artifact content request with an unverifiable signature",
+                artifact_id=artifact_id,
+                kid=kid,
+                expiry=expiry,
+                signature_length=len(sig),
+            )
             raise HTTPException(
                 status_code=http_status.HTTP_403_FORBIDDEN,
                 detail="Invalid or expired artifact URL",
@@ -2632,6 +3234,47 @@ async def get_artifact_content(
         media_type=media_type,
         headers=headers,
     )
+
+
+@base_router.get(
+    "/artifacts/{artifact_id}/signed-url",
+    tags=["Artifacts"],
+    response_model=ArtifactSignedUrl,
+    description="Mint a fresh short-lived URL for the artifact's content, for use at the point of consumption.",
+    summary="Mint a short-lived artifact content URL",
+    responses={
+        200: {"description": "Freshly minted content URL"},
+        404: {"description": "Artifact not found or content unavailable"},
+    },
+    # Kept out of the public OpenAPI schema until the Fern SDK deliberately adopts it.
+    include_in_schema=False,
+)
+@base_router.get("/artifacts/{artifact_id}/signed-url/", response_model=ArtifactSignedUrl, include_in_schema=False)
+async def get_artifact_signed_url(
+    artifact_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ArtifactSignedUrl:
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+        artifact_id=artifact_id,
+        organization_id=current_org.organization_id,
+    )
+    if not artifact:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Artifact not found {artifact_id}",
+        )
+    signed_url = await app.ARTIFACT_MANAGER.resolve_share_url(
+        artifact,
+        expiry_seconds=ARTIFACT_URL_ON_DEMAND_EXPIRY_SECONDS,
+    )
+    if not signed_url:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Artifact content not available",
+        )
+    expiry_values = parse_qs(urlparse(signed_url).query).get("expiry")
+    expires_at = int(expiry_values[0]) if expiry_values else None
+    return ArtifactSignedUrl(artifact_id=artifact_id, signed_url=signed_url, expires_at=expires_at)
 
 
 @base_router.get(
@@ -2737,11 +3380,16 @@ async def get_run_timeline(
         ..., description="The id of the workflow run or task_v2 run.", examples=["wr_123", "tsk_v2_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
     analytics.capture("skyvern-oss-run-timeline-get")
+    cap_output_values = caps_run_response_values(x_user_agent)
 
-    # Check if the run exists
-    run_response = await run_service.get_run_response(run_id, organization_id=current_org.organization_id)
+    # Check if the run exists. Capped even though the response is discarded: building it
+    # uncapped walks and URL-refreshes the full output for nothing.
+    run_response = await run_service.get_run_response(
+        run_id, organization_id=current_org.organization_id, cap_output_values=cap_output_values
+    )
     if not run_response:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
@@ -2750,7 +3398,9 @@ async def get_run_timeline(
 
     # Handle workflow runs directly
     if run_response.run_type == RunType.workflow_run:
-        return await _flatten_workflow_run_timeline(current_org.organization_id, run_id)
+        return await _flatten_workflow_run_timeline(
+            current_org.organization_id, run_id, cap_output_values=cap_output_values
+        )
 
     # Handle task_v2 runs by getting their associated workflow_run_id
     if run_response.run_type == RunType.task_v2:
@@ -2769,7 +3419,9 @@ async def get_run_timeline(
                 detail=f"Task v2 {run_id} has no associated workflow run",
             )
 
-        return await _flatten_workflow_run_timeline(current_org.organization_id, task_v2.workflow_run_id)
+        return await _flatten_workflow_run_timeline(
+            current_org.organization_id, task_v2.workflow_run_id, cap_output_values=cap_output_values
+        )
 
     # Timeline not available for other run types
     raise HTTPException(
@@ -2793,9 +3445,10 @@ async def run_block(
     x_api_key: Annotated[str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> BlockRunResponse:
-    """
-    Kick off the execution of one or more blocks in a workflow. Returns the
-    workflow_run_id.
+    """Run workflow-editor debugger blocks and return the workflow run ID.
+
+    This is intentionally UI-only: ``get_current_user_id`` preserves per-user
+    output continuity and maps the self-hosted UI's API key to its organization user.
     """
 
     # NOTE(jdo): if you're running debugger locally, and you want to see the
@@ -2820,7 +3473,7 @@ async def run_block(
             trigger_type=block_trigger_type,
         )
 
-        browser_session_id = block_run_request.browser_session_id
+        browser_session_id = workflow_run.browser_session_id
 
         await block_service.execute_blocks(
             request=request,
@@ -2857,6 +3510,7 @@ async def run_block(
         run_request=block_run_request,
         downloaded_files=None,
         recording_url=None,
+        browser_session_id=workflow_run.browser_session_id,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
     )
 
@@ -2884,7 +3538,7 @@ async def webhook(
             "Webhook signature or timestamp missing",
             x_skyvern_signature=x_skyvern_signature,
             x_skyvern_timestamp=x_skyvern_timestamp,
-            payload=payload,
+            payload_length=len(payload),
         )
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
@@ -2900,7 +3554,7 @@ async def webhook(
         "Webhook received",
         x_skyvern_signature=x_skyvern_signature,
         x_skyvern_timestamp=x_skyvern_timestamp,
-        payload=payload,
+        payload_length=len(payload),
         generated_signature=generated_signature,
         valid_signature=x_skyvern_signature == generated_signature,
     )
@@ -2980,11 +3634,12 @@ async def run_task_v1(
     request: Request,
     background_tasks: BackgroundTasks,
     task: TaskRequest,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> CreateTaskResponse:
+    current_org = caller.organization
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
@@ -2995,7 +3650,7 @@ async def run_task_v1(
     )
 
     try:
-        created_task = await task_v1_service.run_task(
+        created_task, _ = await task_v1_service.run_task(
             task=task,
             organization=current_org,
             x_max_steps_override=x_max_steps_override,
@@ -3005,6 +3660,13 @@ async def run_task_v1(
         )
     except task_v1_service.InvalidTaskV1ModelError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    _schedule_task_run_created(
+        background_tasks,
+        organization_id=current_org.organization_id,
+        run_id=created_task.task_id,
+        run_type=RunType.task_v1,
+        caller_type=caller.caller_type,
+    )
     return CreateTaskResponse(task_id=created_task.task_id)
 
 
@@ -3020,9 +3682,15 @@ async def run_task_v1(
 async def get_task_v1(
     task_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-get")
-    return await task_v1_service.get_task_v1_response(task_id=task_id, organization_id=current_org.organization_id)
+    task_response = await task_v1_service.get_task_v1_response(
+        task_id=task_id, organization_id=current_org.organization_id
+    )
+    if caps_run_response_values(x_user_agent):
+        return capped_task_v1_response(task_response)
+    return task_response
 
 
 @legacy_base_router.post(
@@ -3063,7 +3731,11 @@ async def _cancel_workflow_run(workflow_run_id: str, organization_id: str, x_api
         )
 
     if workflow_run.browser_session_id:
-        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(workflow_run.browser_session_id, organization_id)
+        await app.PERSISTENT_SESSIONS_MANAGER.release_browser_session(
+            workflow_run.browser_session_id,
+            organization_id,
+            expected_runnable_id=workflow_run.workflow_run_id,
+        )
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
@@ -3101,55 +3773,43 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
 
 
-def _workflow_request_body_from_existing_run(
-    workflow_run: WorkflowRun,
-    parameters: dict[str, Any] | None = None,
-    run_metadata: dict[str, str] | None = None,
-) -> WorkflowRequestBody:
-    return WorkflowRequestBody(
-        data=parameters,
-        proxy_location=workflow_run.proxy_location,
-        webhook_callback_url=workflow_run.webhook_callback_url,
-        totp_verification_url=workflow_run.totp_verification_url,
-        totp_identifier=workflow_run.totp_identifier,
-        browser_session_id=workflow_run.browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
-        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_run, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_run.extra_http_headers,
-        cdp_connect_headers=workflow_run.cdp_connect_headers,
-        browser_address=workflow_run.browser_address,
-        run_with=workflow_run.run_with,
-        ai_fallback=workflow_run.ai_fallback,
-        run_metadata=run_metadata,
-    )
-
-
 def _workflow_run_request_from_workflow_request(
     *,
     workflow_id: str,
     title: str | None,
     workflow_request: WorkflowRequestBody,
 ) -> WorkflowRunRequest:
-    return WorkflowRunRequest(
-        workflow_id=workflow_id,
-        title=title,
-        parameters=workflow_request.data,
-        proxy_location=workflow_request.proxy_location,
-        webhook_url=workflow_request.webhook_callback_url,
-        totp_url=workflow_request.totp_verification_url,
-        totp_identifier=workflow_request.totp_identifier,
-        browser_session_id=workflow_request.browser_session_id,
-        browser_profile_id=workflow_request.browser_profile_id,
-        max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
-        max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
-        extra_http_headers=workflow_request.extra_http_headers,
-        cdp_connect_headers=workflow_request.cdp_connect_headers,
-        browser_address=workflow_request.browser_address,
-        run_with=workflow_request.run_with,
-        ai_fallback=workflow_request.ai_fallback,
-        run_metadata=workflow_request.run_metadata,
+    return WorkflowRunRequest.model_validate(
+        {
+            "workflow_id": workflow_id,
+            "title": title,
+            "parameters": workflow_request.data,
+            "proxy_location": workflow_request.proxy_location,
+            "webhook_url": workflow_request.webhook_callback_url,
+            "totp_url": workflow_request.totp_verification_url,
+            "totp_identifier": workflow_request.totp_identifier,
+            "browser_session_id": workflow_request.browser_session_id,
+            "browser_profile_id": workflow_request.browser_profile_id,
+            "start_fresh_browser": workflow_request.start_fresh_browser,
+            "max_screenshot_scrolls": workflow_request.max_screenshot_scrolls,
+            "max_elapsed_time_minutes": getattr(workflow_request, "max_elapsed_time_minutes", None),
+            "extra_http_headers": workflow_request.extra_http_headers,
+            "cdp_connect_headers": workflow_request.cdp_connect_headers,
+            "browser_address": workflow_request.browser_address,
+            "run_with": workflow_request.run_with,
+            "ai_fallback": workflow_request.ai_fallback,
+            "run_metadata": workflow_request.run_metadata,
+        },
+        context={BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY: True},
     )
+
+
+def _user_writable_run_metadata(run_metadata: dict[str, str] | None) -> dict[str, str] | None:
+    if not run_metadata:
+        return None
+
+    filtered = {key: value for key, value in run_metadata.items() if not is_reserved_tag_key(key)}
+    return filtered or None
 
 
 @base_router.post(
@@ -3172,12 +3832,13 @@ async def retry_workflow_run(
     request: Request,
     background_tasks: BackgroundTasks,
     workflow_run_id: str = Path(..., description="The id of the workflow run to retry.", examples=["wr_123"]),
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> WorkflowRunResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-retry")
+    current_org = caller.organization
     original_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
@@ -3233,18 +3894,20 @@ async def retry_workflow_run(
     }
     original_run_metadata = None
     try:
-        original_run_metadata = await app.AGENT_FUNCTION.get_workflow_run_metadata(
-            workflow_run_id=original_workflow_run.workflow_run_id,
-            organization_id=current_org.organization_id,
+        original_run_metadata = _user_writable_run_metadata(
+            await app.DATABASE.tags.get_active_grouped_tags_for_run(
+                workflow_run_id=original_workflow_run.workflow_run_id,
+                organization_id=current_org.organization_id,
+            )
         )
     except Exception:
         LOG.warning(
-            "Failed to fetch workflow run metadata for retry; continuing without metadata",
+            "Failed to fetch workflow run tags for retry; continuing without metadata",
             workflow_run_id=original_workflow_run.workflow_run_id,
             organization_id=current_org.organization_id,
             exc_info=True,
         )
-    legacy_workflow_request = _workflow_request_body_from_existing_run(
+    legacy_workflow_request = workflow_service.workflow_request_body_from_existing_run(
         workflow_run=original_workflow_run,
         parameters=original_workflow_run_parameters,
         run_metadata=original_run_metadata,
@@ -3266,9 +3929,17 @@ async def retry_workflow_run(
             background_tasks=background_tasks,
             trigger_type=trigger_type,
             ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
+            tag_write_context=_tag_write_context_from_caller(caller),
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     if settings.OTEL_ENABLED:
         span = trace.get_current_span()
@@ -3298,6 +3969,7 @@ async def retry_workflow_run(
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
         browser_session_id=workflow_run.browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
+        browser_seed_source=workflow_run.browser_seed_source,
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
@@ -3482,6 +4154,76 @@ async def get_runs(
     return ORJSONResponse([run.model_dump() for run in runs])
 
 
+_MAX_TAG_FILTER_TERMS = 20
+
+
+def _parse_tag_filter_terms(tags: list[str] | None) -> list[tuple[str | None, str | None]]:
+    """Parse a repeated/comma-separated ``tags`` query param into (key, value) filter terms.
+
+    Shared by ``get_runs_v2``, ``get_workflow_runs_by_id``, and ``get_workflows``. Each term is a
+    label (``production`` -> ``(None, "production")``), a group wildcard (``env:*`` -> ``("env", None)``),
+    or an exact group:label (``env:prod`` -> ``("env", "prod")``); malformed terms raise a 400.
+
+    Terms are deduplicated, then capped at ``_MAX_TAG_FILTER_TERMS`` (400 beyond it): the
+    ``Query(max_length=20)`` on callers only bounds repeated params, not the comma-split
+    expansion, and each distinct term becomes its own AND'd subquery.
+    """
+    # A lone empty value (?tags= with nothing else) is a no-op for backward
+    # compat; any blank segment alongside real ones — comma (env:prod,) or
+    # repeated (tags=env:prod&tags=) — is malformed, so both encodings 400 alike.
+    tag_groups = tags or []
+    if tag_groups == [""]:
+        tag_groups = []
+    # Split on the FIRST colon: no colon -> value-only (None, value); value `*` ->
+    # group-only (key, None); else exact (key, value), whose value may contain colons.
+    invalid_term_detail = "expected 'label', 'key:*', or 'key:value'"
+    parsed_tags: list[tuple[str | None, str | None]] = []
+    for raw_group in tag_groups:
+        for raw_term in raw_group.split(","):
+            term = raw_term.strip()
+            if not term:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid tag filter; empty term.",
+                )
+            tag_key, sep, tag_value = term.partition(":")
+            if not sep:
+                parsed_tags.append((None, term))
+                continue
+            tag_key, tag_value = tag_key.strip(), tag_value.strip()
+            if not tag_key:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            if tag_value == "*":
+                parsed_tags.append((tag_key, None))
+            elif not tag_value:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            else:
+                parsed_tags.append((tag_key, tag_value))
+    deduped_tags = list(dict.fromkeys(parsed_tags))
+    if len(deduped_tags) > _MAX_TAG_FILTER_TERMS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Too many tag filter terms; at most {_MAX_TAG_FILTER_TERMS} distinct terms are allowed.",
+        )
+    return deduped_tags
+
+
+async def _parse_and_gate_tag_filter_terms(
+    tags: list[str] | None,
+    current_org: Organization,
+) -> list[tuple[str | None, str | None]]:
+    parsed_tags = _parse_tag_filter_terms(tags)
+    if parsed_tags:
+        await require_workflow_tagging(current_org)
+    return parsed_tags
+
+
 # NOTE: v2 returns TaskRunListItem from the unified task_runs table,
 # replacing the v1 response type (list[WorkflowRun | Task]) which
 # merged two separate queries. The v1 endpoint is preserved for
@@ -3511,13 +4253,38 @@ async def get_runs_v2(
         description="Case-insensitive substring search (min 3 chars for trigram index).",
         examples=["login_url", "wr_abc123"],
     ),
+    run_type: Annotated[list[RunType] | None, Query()] = None,
+    workflow_permanent_id: Annotated[
+        list[str] | None,
+        Query(
+            max_length=50,
+            description="Filter to runs of these workflows (agents). Repeat the param to include multiple.",
+        ),
+    ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
 ) -> Response:
     analytics.capture("skyvern-oss-agent-runs-v2-get")
-    if search_key and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
+    if (search_key or workflow_permanent_id) and (page - 1) * page_size >= MAX_SEARCH_FETCH_LIMIT:
         raise HTTPException(
             status_code=http_status.HTTP_400_BAD_REQUEST,
             detail=f"Search pagination is limited to the first {MAX_SEARCH_FETCH_LIMIT} matches. Use a narrower search.",
         )
+
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
         current_org.organization_id,
@@ -3525,6 +4292,9 @@ async def get_runs_v2(
         page_size=page_size,
         status=[s.value for s in status] if status else None,
         search_key=search_key,
+        run_type=[r.value for r in run_type] if run_type else None,
+        workflow_permanent_ids=workflow_permanent_id,
+        run_tags=run_tags or None,
     )
     items = [TaskRunListItem.model_validate(row) for row in rows]
     return ORJSONResponse([item.model_dump(mode="json") for item in items])
@@ -3691,13 +4461,16 @@ async def run_workflow_legacy(
     workflow_id: str,  # this is the workflow_permanent_id internally
     workflow_request: WorkflowRequestBody,
     version: int | None = None,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     template: bool = Query(False),
     x_api_key: Annotated[str | None, Header()] = None,
     x_max_steps_override: Annotated[int | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
 ) -> RunWorkflowResponse:
+    if workflow_request.webhook_callback_url:
+        workflow_request.webhook_callback_url = validate_webhook_url(workflow_request.webhook_callback_url)
     analytics.capture("skyvern-oss-agent-workflow-execute")
+    current_org = caller.organization
     context = skyvern_context.ensure_context()
     request_id = context.request_id
     await PermissionCheckerFactory.get_instance().check(
@@ -3720,9 +4493,17 @@ async def run_workflow_legacy(
             request=request,
             background_tasks=background_tasks,
             trigger_type=legacy_trigger_type,
+            tag_write_context=_tag_write_context_from_caller(caller),
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    background_tasks.add_task(
+        app.AGENT_FUNCTION.on_run_created,
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        caller_type=caller.caller_type,
+    )
 
     return RunWorkflowResponse(
         workflow_id=workflow_id,
@@ -3868,6 +4649,7 @@ async def _get_workflow_runs_by_id(
     exclude_child_runs: bool,
     created_at_start: datetime | None = None,
     created_at_end: datetime | None = None,
+    run_tags: Sequence[tuple[str | None, str | None]] | None = None,
 ) -> list[WorkflowRun]:
     analytics.capture("skyvern-oss-agent-workflow-runs-get")
     return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
@@ -3881,6 +4663,7 @@ async def _get_workflow_runs_by_id(
         exclude_child_runs=exclude_child_runs,
         created_at_start=created_at_start,
         created_at_end=created_at_end,
+        run_tags=run_tags,
     )
 
 
@@ -3933,14 +4716,31 @@ async def get_workflow_runs_by_id(
         datetime | None,
         Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     List runs for a specific workflow permanent id.
 
     The public API excludes child workflow runs so workflow histories only show top-level runs.
-    All filters (**status**, **search_key**, **error_code**) are combined with AND logic.
+    All filters (**status**, **search_key**, **error_code**, **tags**) are combined with AND logic.
     """
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
+
     return await _get_workflow_runs_by_id(
         workflow_id=workflow_id,
         organization_id=current_org.organization_id,
@@ -3952,6 +4752,7 @@ async def get_workflow_runs_by_id(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
         exclude_child_runs=True,
+        run_tags=run_tags or None,
     )
 
 
@@ -4004,13 +4805,31 @@ async def get_workflow_runs_by_id_legacy(
         datetime | None,
         Query(description="Only include runs created strictly before this UTC timestamp (ISO 8601)."),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by run tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
+                "Matches current tag values only."
+            ),
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     List runs for a specific workflow permanent id using legacy endpoint behavior.
 
-    Legacy callers keep seeing child workflow runs to avoid changing existing API behavior.
+    Legacy callers keep seeing child workflow runs to avoid changing existing API behavior,
+    including when a ``tags`` filter is active (child runs matching the filter stay visible).
     """
+    run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
+
     return await _get_workflow_runs_by_id(
         workflow_id=workflow_id,
         organization_id=current_org.organization_id,
@@ -4022,6 +4841,7 @@ async def get_workflow_runs_by_id_legacy(
         created_at_start=created_at_start,
         created_at_end=created_at_end,
         exclude_child_runs=False,
+        run_tags=run_tags or None,
     )
 
 
@@ -4040,6 +4860,7 @@ async def get_workflow_run_with_workflow_id(
     workflow_id: str,
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
@@ -4047,6 +4868,7 @@ async def get_workflow_run_with_workflow_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
         include_cost=True,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
     return_dict = workflow_run_status_response.model_dump(by_alias=True)
 
@@ -4073,6 +4895,7 @@ async def get_workflow_run_with_workflow_id(
 async def get_workflow_and_run_from_workflow_run_id(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_workflow_run_id(
@@ -4087,6 +4910,7 @@ async def get_workflow_and_run_from_workflow_run_id(
         organization_id=current_org.organization_id,
         include_cost=True,
         allow_deleted=True,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
     workflow_run_status_api_response = workflow_run_status_response.model_dump(by_alias=True)
 
@@ -4122,8 +4946,11 @@ async def get_workflow_run_timeline(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
-    return await _flatten_workflow_run_timeline(current_org.organization_id, workflow_run_id)
+    return await _flatten_workflow_run_timeline(
+        current_org.organization_id, workflow_run_id, cap_output_values=caps_run_response_values(x_user_agent)
+    )
 
 
 @legacy_base_router.get(
@@ -4142,11 +4969,13 @@ async def get_workflow_run_timeline(
 async def get_workflow_run(
     workflow_run_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
     return await app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id(
         workflow_run_id=workflow_run_id,
         organization_id=current_org.organization_id,
+        cap_output_values=caps_run_response_values(x_user_agent),
     )
 
 
@@ -4241,49 +5070,7 @@ async def get_workflows(
     # Default to published and draft if no status filter provided
     effective_statuses = status if status else [WorkflowStatus.published, WorkflowStatus.draft]
 
-    # A lone empty value (?tags= with nothing else) is a no-op for backward
-    # compat; any blank segment alongside real ones — comma (env:prod,) or
-    # repeated (tags=env:prod&tags=) — is malformed, so both encodings 400 alike.
-    tag_groups = tags or []
-    if tag_groups == [""]:
-        tag_groups = []
-    # Split on the FIRST colon: no colon -> value-only (None, value); value `*` ->
-    # group-only (key, None); else exact (key, value), whose value may contain colons.
-    invalid_term_detail = "expected 'label', 'key:*', or 'key:value'"
-    workflow_tags: list[tuple[str | None, str | None]] = []
-    for raw_group in tag_groups:
-        for raw_term in raw_group.split(","):
-            term = raw_term.strip()
-            if not term:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid tag filter; empty term.",
-                )
-            tag_key, sep, tag_value = term.partition(":")
-            if not sep:
-                workflow_tags.append((None, term))
-                continue
-            tag_key, tag_value = tag_key.strip(), tag_value.strip()
-            if not tag_key:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
-                )
-            if tag_value == "*":
-                workflow_tags.append((tag_key, None))
-            elif not tag_value:
-                raise HTTPException(
-                    status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
-                )
-            else:
-                workflow_tags.append((tag_key, tag_value))
-
-    if workflow_tags and not await app.AGENT_FUNCTION.is_workflow_tagging_enabled(current_org.organization_id):
-        raise HTTPException(
-            status_code=http_status.HTTP_403_FORBIDDEN,
-            detail="Workflow tagging is not enabled for this organization.",
-        )
+    workflow_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.
@@ -4653,6 +5440,9 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
+    if org_update.webhook_callback_url and org_update.webhook_callback_url != current_org.webhook_callback_url:
+        org_update.webhook_callback_url = validate_webhook_url(org_update.webhook_callback_url)
+
     # Validate the per-org artifact URL expiry against the same bounds the
     # signing helper clamps to. Reject out-of-range values at the API edge so
     # users see a clear 400 instead of a silently clamped value persisting in
@@ -4686,6 +5476,32 @@ async def update_organization(
                 "max_steps_per_workflow_run — pick one"
             ),
         )
+    for field_name, llm_key, clear_llm_key in [
+        ("default_llm_key", org_update.default_llm_key, org_update.clear_default_llm_key),
+        (
+            "default_secondary_llm_key",
+            org_update.default_secondary_llm_key,
+            org_update.clear_default_secondary_llm_key,
+        ),
+    ]:
+        if clear_llm_key and llm_key is not None:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"clear_{field_name} cannot be combined with a non-null {field_name} — pick one",
+            )
+        if llm_key is not None and (
+            not is_custom_llm_key(llm_key)
+            or not await ensure_custom_llm_registered_for_org(
+                llm_key.removeprefix(CUSTOM_LLM_KEY_PREFIX),
+                current_org.organization_id,
+                app.DATABASE,
+            )
+        ):
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must reference a valid custom LLM for this organization",
+            )
+
     updated = await app.DATABASE.organizations.update_organization(
         current_org.organization_id,
         max_steps_per_run=org_update.max_steps_per_run,
@@ -4695,6 +5511,10 @@ async def update_organization(
         webhook_callback_url=org_update.webhook_callback_url,
         artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
         clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
+        default_llm_key=org_update.default_llm_key,
+        clear_default_llm_key=org_update.clear_default_llm_key,
+        default_secondary_llm_key=org_update.default_secondary_llm_key,
+        clear_default_secondary_llm_key=org_update.clear_default_secondary_llm_key,
     )
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
@@ -4748,7 +5568,7 @@ async def get_current_organization(
 )
 async def get_api_keys(
     organization_id: str,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
+    current_org: Organization = Depends(org_auth_service.get_current_org_with_api_token),
 ) -> GetOrganizationAPIKeysResponse:
     if organization_id != current_org.organization_id:
         raise HTTPException(status_code=403, detail="You do not have permission to access this organization")
@@ -4775,15 +5595,75 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
     file: UploadFile = Depends(_validate_file_size),
+    retention_days: Annotated[
+        int | None,
+        Form(
+            description=(
+                "Number of days to keep the file before it is deleted automatically. "
+                "Omit to keep the file until the organization's data retention policy removes it."
+            ),
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> UploadFileResponse:
+    # Validated before the upload so a rejected retention period never leaves bytes behind.
+    try:
+        uploaded_file_service.resolve_expires_at(retention_days)
+    except uploaded_file_service.InvalidRetentionPeriod as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    file_id = uploaded_file_service.generate_upload_id()
+    # The id is embedded in the stored filename (not the record) so two uploads of the same
+    # original filename on the same day get distinct storage keys instead of overwriting
+    # each other's object; record_upload still stores the caller's original filename.
+    storage_filename = f"{file_id}_{os.path.basename(file.filename)}" if file.filename else file_id
     uris = await app.STORAGE.save_legacy_file(
-        organization_id=current_org.organization_id, filename=file.filename, fileObj=file.file
+        organization_id=current_org.organization_id, filename=storage_filename, fileObj=file.file
     )
     if not uris:
         raise HTTPException(status_code=500, detail="Failed to upload file to S3.")
     presigned_url, uploaded_s3_uri = uris
-    return UploadFileResponse(s3_uri=uploaded_s3_uri, presigned_url=presigned_url)
+    uploaded_file = await uploaded_file_service.record_upload(
+        file_id=file_id,
+        organization_id=current_org.organization_id,
+        storage_uri=uploaded_s3_uri,
+        filename=file.filename or "",
+        size_bytes=file.size,
+        retention_days=retention_days,
+    )
+    return UploadFileResponse(
+        s3_uri=uploaded_s3_uri,
+        presigned_url=presigned_url,
+        file_id=uploaded_file.file_id,
+        expires_at=uploaded_file.expires_at,
+    )
+
+
+@base_router.delete(
+    "/files/{file_id}",
+    tags=["Files"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "delete_file",
+    },
+    status_code=204,
+)
+@base_router.delete("/files/{file_id}/", include_in_schema=False)
+async def delete_file(
+    file_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> Response:
+    """Delete a previously uploaded file.
+
+    A file that does not exist, was already deleted, or belongs to another organization all
+    answer 404 alike — the endpoint must not tell a caller whether someone else's file id
+    exists.
+    """
+    deleted = await uploaded_file_service.delete_uploaded_file(
+        file_id=file_id, organization_id=current_org.organization_id
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+    return Response(status_code=204)
 
 
 @legacy_v2_router.post(
@@ -4801,11 +5681,13 @@ async def run_task_v2(
     request: Request,
     background_tasks: BackgroundTasks,
     data: TaskV2Request,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     x_max_iterations_override: Annotated[int | str | None, Header()] = None,
     x_max_steps_override: Annotated[int | str | None, Header()] = None,
     x_user_agent: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
 ) -> dict[str, Any]:
+    organization = caller.organization
     if x_max_iterations_override or x_max_steps_override:
         LOG.info(
             "Overriding max steps for task v2",
@@ -4858,6 +5740,13 @@ async def run_task_v2(
         max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
     )
+    _schedule_task_run_created(
+        background_tasks,
+        organization_id=organization.organization_id,
+        run_id=task_v2.observer_cruise_id,
+        run_type=RunType.task_v2,
+        caller_type=caller.caller_type,
+    )
     return task_v2.model_dump(by_alias=True)
 
 
@@ -4875,16 +5764,22 @@ async def run_task_v2(
 async def get_task_v2(
     task_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     task_v2 = await task_v2_service.get_task_v2(task_id, organization.organization_id)
     if not task_v2:
         raise HTTPException(status_code=404, detail=f"Task v2 {task_id} not found")
+    # RunRouter resolves a tsk_v2_* URL through this endpoint before redirecting, so an
+    # uncapped output freezes the tab on exactly the payloads the run-detail reads bound.
+    if caps_run_response_values(x_user_agent):
+        task_v2 = capped_task_v2(task_v2)
     return task_v2.model_dump(by_alias=True)
 
 
 async def _flatten_workflow_run_timeline_recursive(
     timeline: WorkflowRunTimeline,
     organization_id: str,
+    cap_output_values: bool = False,
 ) -> list[WorkflowRunTimeline]:
     """
     Recursively flatten a timeline item and its children, handling TaskV2 blocks.
@@ -4901,6 +5796,7 @@ async def _flatten_workflow_run_timeline_recursive(
             nested_timeline = await _flatten_workflow_run_timeline(
                 organization_id=organization_id,
                 workflow_run_id=timeline.block.block_workflow_run_id,
+                cap_output_values=cap_output_values,
             )
             result.extend(nested_timeline)
         else:
@@ -4918,6 +5814,7 @@ async def _flatten_workflow_run_timeline_recursive(
                 child_results = await _flatten_workflow_run_timeline_recursive(
                     timeline=child,
                     organization_id=organization_id,
+                    cap_output_values=cap_output_values,
                 )
                 new_children.extend(child_results)
 
@@ -4935,7 +5832,9 @@ async def _flatten_workflow_run_timeline_recursive(
     return result
 
 
-async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: str) -> list[WorkflowRunTimeline]:
+async def _flatten_workflow_run_timeline(
+    organization_id: str, workflow_run_id: str, cap_output_values: bool = False
+) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
     """
@@ -4949,6 +5848,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
     workflow_run_block_timeline = await app.WORKFLOW_SERVICE.get_workflow_run_timeline(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
+        cap_output_values=cap_output_values,
     )
 
     # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
@@ -4960,6 +5860,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         flattened = await _flatten_workflow_run_timeline_recursive(
             timeline=timeline,
             organization_id=organization_id,
+            cap_output_values=cap_output_values,
         )
         final_workflow_run_block_timeline.extend(flattened)
 
@@ -4967,6 +5868,7 @@ async def _flatten_workflow_run_timeline(organization_id: str, workflow_run_id: 
         thought_timeline = await task_v2_service.get_thought_timelines(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
+            cap_output_values=cap_output_values,
         )
         final_workflow_run_block_timeline.extend(thought_timeline)
     final_workflow_run_block_timeline.sort(key=lambda x: x.created_at, reverse=True)

@@ -18,12 +18,13 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_na
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput, _validate_browser_address
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.token_counter import count_tokens
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_url
 
 
 class TaskBase(BaseModel):
@@ -120,7 +121,7 @@ class TaskBase(BaseModel):
         description="Whether to include the action history when verifying the task is complete",
         examples=[True, False],
     )
-    max_screenshot_scrolls: int | None = Field(
+    max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
         examples=[10],
@@ -151,7 +152,7 @@ class TaskRequest(TaskBase):
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
-    webhook_callback_url: str | None = Field(
+    webhook_callback_url: WebhookUrl | None = Field(
         default=None,
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
@@ -189,9 +190,14 @@ class TaskRequest(TaskBase):
             )
         return goal
 
-    @field_validator("webhook_callback_url", "totp_verification_url")
+    @field_validator("browser_address")
     @classmethod
-    def validate_optional_urls(cls, url: str | None) -> str | None:
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
+
+    @field_validator("totp_verification_url")
+    @classmethod
+    def validate_totp_verification_url(cls, url: str | None) -> str | None:
         if not url:
             return url
 
@@ -207,6 +213,11 @@ class PromptedTaskRequest(TaskRequest):
     publish_workflow: bool | None = Field(
         default=False,
         description="Whether to publish the workflow created from the prompt.",
+        examples=[True, False],
+    )
+    generate_script: bool | None = Field(
+        default=None,
+        description="Whether to generate scripts for runs of the workflow created from the prompt.",
         examples=[True, False],
     )
     run_with: str | None = Field(
@@ -330,11 +341,7 @@ class Task(TaskBase):
 
     @property
     def llm_key(self) -> str | None:
-        """
-        If the `Task` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve the task's explicit model mapping, if any."""
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:

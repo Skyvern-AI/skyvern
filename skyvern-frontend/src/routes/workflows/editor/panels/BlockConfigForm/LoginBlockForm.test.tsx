@@ -5,6 +5,29 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { LoginNode } from "../../nodes/LoginNode/types";
 
+const mockEmailCredentials = vi.hoisted(() => ({
+  google: vi.fn(),
+  microsoft: vi.fn(),
+}));
+
+vi.mock("@/hooks/useGoogleOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useGoogleOAuthCredentials")>();
+  return {
+    ...actual,
+    useGoogleOAuthCredentials: mockEmailCredentials.google,
+  };
+});
+
+vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importActual) => {
+  const actual =
+    await importActual<typeof import("@/hooks/useMicrosoftOAuthCredentials")>();
+  return {
+    ...actual,
+    useMicrosoftOAuthCredentials: mockEmailCredentials.microsoft,
+  };
+});
+
 // Heavy subcomponents pull in network/data layers (workflow params store,
 // credentials query, etc.) that are out of scope for a unit test of the
 // form's own composition. Replace each with a typed stub that surfaces the
@@ -88,12 +111,31 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
   BlockExecutionOptions: (props: {
     continueOnFailure: boolean;
     blockType: string;
+    includeActionHistoryInVerification?: boolean;
+    onIncludeActionHistoryInVerificationChange?: (checked: boolean) => void;
+    showOptions?: { includeActionHistoryInVerification?: boolean };
   }) => (
     <div
       data-testid="block-execution-options"
       data-continue={String(props.continueOnFailure)}
       data-block-type={props.blockType}
-    />
+      data-include-action-history={String(
+        props.includeActionHistoryInVerification ?? false,
+      )}
+    >
+      {props.showOptions?.includeActionHistoryInVerification ? (
+        <button
+          type="button"
+          onClick={() =>
+            props.onIncludeActionHistoryInVerificationChange?.(
+              !(props.includeActionHistoryInVerification ?? false),
+            )
+          }
+        >
+          Include Action History
+        </button>
+      ) : null}
+    </div>
   ),
 }));
 
@@ -192,6 +234,7 @@ function makeLoginFixture(
     disableCache: false,
     completeCriterion: "",
     terminateCriterion: "",
+    includeActionHistoryInVerification: false,
     engine: null,
     model: null,
     ...overrides,
@@ -202,6 +245,27 @@ function makeLoginFixture(
 beforeEach(() => {
   mockNodeFixtures.clear();
   mockCredentialTotp.value = null;
+  mockEmailCredentials.google.mockReturnValue({
+    credentials: [
+      {
+        id: "google-mail",
+        organization_id: "org_1",
+        credential_name: "Default",
+        state: "active",
+        scopes_granted: ["https://www.googleapis.com/auth/gmail.readonly"],
+        email_address: "workflow@gmail.test",
+        created_at: "2026-07-30T00:00:00Z",
+        modified_at: "2026-07-30T00:00:00Z",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+  });
+  mockEmailCredentials.microsoft.mockReturnValue({
+    credentials: [],
+    isLoading: false,
+    isFetching: false,
+  });
   usePendingCommitsStore.setState({ commits: {} });
   updateNodeDataMock.mockReset();
   useDebouncedSidebarSaveMock.mockReset();
@@ -252,9 +316,29 @@ describe("LoginBlockForm (SKY-9374)", () => {
       screen.getByRole("button", { name: "Add two-factor authentication" }),
     );
 
-    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(4);
+    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(3);
     expect(screen.getByText("2FA Identifier")).toBeDefined();
     expect(screen.getByText("2FA Verification URL")).toBeDefined();
+    expect(
+      screen.getByRole("combobox", { name: "Connected email account" }),
+    ).toBeDefined();
+  });
+
+  test("picking a connected account updates the block's 2FA identifier", () => {
+    mockNodeFixtures.set("b1", makeLoginFixture("b1"));
+    render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    );
+    fireEvent.click(
+      screen.getByRole("combobox", { name: "Connected email account" }),
+    );
+    fireEvent.click(screen.getByText("workflow@gmail.test"));
+
+    expect(updateNodeDataMock).toHaveBeenCalledWith("b1", {
+      totpIdentifier: "workflow@gmail.test",
+    });
   });
 
   test("auto-expands 2FA when the block already has a totp value", () => {
@@ -337,6 +421,30 @@ describe("LoginBlockForm (SKY-9374)", () => {
     expect(screen.queryByTestId("error-code-mapping-editor")).toBeNull();
   });
 
+  test("shows Include Action History and updates the login block", () => {
+    mockNodeFixtures.set(
+      "b1",
+      makeLoginFixture("b1", {
+        includeActionHistoryInVerification: true,
+      } as never),
+    );
+    render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(screen.getByText("Advanced Settings"));
+
+    expect(screen.getByText("Include Action History")).toBeDefined();
+    expect(
+      screen
+        .getByTestId("block-execution-options")
+        .getAttribute("data-include-action-history"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByText("Include Action History"));
+    expect(updateNodeDataMock).toHaveBeenCalledWith("b1", {
+      includeActionHistoryInVerification: false,
+    });
+  });
+
   test("renders the error-code-mapping editor when mapping is non-null", () => {
     mockNodeFixtures.set(
       "b1",
@@ -372,6 +480,7 @@ describe("LoginBlockForm (SKY-9374)", () => {
       errorCodeMapping: "null",
       parameterKeys: [],
       continueOnFailure: false,
+      includeActionHistoryInVerification: false,
       disableCache: false,
     });
   });

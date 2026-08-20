@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import NoIncrementalElementFoundForAutoCompletion
+from skyvern.exceptions import InvalidElementForTextInput, NoIncrementalElementFoundForAutoCompletion
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
@@ -22,7 +22,7 @@ from skyvern.webeye.actions.handler import (
     choose_auto_completion_dropdown,
     input_or_auto_complete_input,
 )
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
 
 # ---------------------------------------------------------------------------
@@ -362,6 +362,45 @@ async def test_location_fast_path_element_not_in_dom_falls_through() -> None:
         )
 
         mock_app.AUTO_COMPLETION_LLM_API_HANDLER.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dropdown_cleanup_clear_failure_does_not_clobber_result() -> None:
+    """SKY-14330: the finally block's best-effort clear of the probe text must not let its
+    own failure (e.g. InvalidElementForTextInput, a real Playwright guard when the live node
+    no longer matches the scraped tag) replace the ActionFailure the try/except already
+    produced -- every other input_clear() call site in this file already guards this way."""
+    frame = _mock_frame(locator_count=1)
+    skyvern_el = _mock_skyvern_element(frame)
+    skyvern_el.press_fill = AsyncMock(side_effect=RuntimeError("press_fill boom"))
+    skyvern_el.input_clear = AsyncMock(side_effect=InvalidElementForTextInput(element_id="elem-1", tag_name="button"))
+    inc_scrape = _mock_incremental_scrape([])
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch(
+            "skyvern.webeye.actions.handler.IncrementalScrapePage",
+            return_value=inc_scrape,
+        ),
+    ):
+        result = await choose_auto_completion_dropdown(
+            context=_make_non_location_context(),
+            page=MagicMock(),
+            scraped_page=MagicMock(),
+            dom=MagicMock(),
+            text="foo",
+            skyvern_element=skyvern_el,
+            step=_STEP,
+            task=_TASK,
+        )
+
+    skyvern_el.input_clear.assert_awaited_once()
+    assert isinstance(result.action_result, ActionFailure)
+    assert result.action_result.exception_type == "RuntimeError"
+    assert "press_fill boom" in (result.action_result.exception_message or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1042,7 @@ async def test_reset_autocomplete_empty_incremental_rescrapes_page_elements() ->
     skyvern_el.input_clear.assert_awaited_once()
     skyvern_el.press_fill.assert_awaited_once_with("Oakland")
     skyvern_frame.safe_wait_for_animation_end.assert_awaited_once()
-    scrape_factory.assert_called_once_with(skyvern_frame=skyvern_frame)
+    scrape_factory.assert_called_once_with(skyvern_frame=skyvern_frame, engine_selection=None)
     fallback_scrape.get_incremental_element_tree.assert_awaited_once()
     scraped_page.generate_scraped_page_without_screenshots.assert_awaited_once()
     dom_after_open.get_skyvern_element_by_id.assert_awaited_once_with("FRESH")

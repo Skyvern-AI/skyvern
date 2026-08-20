@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Literal, overload
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -158,6 +159,10 @@ class OrganizationsRepository(BaseRepository):
         max_retries_per_step: int | None = None,
         artifact_url_expiry_seconds: int | None = None,
         clear_artifact_url_expiry_seconds: bool = False,
+        default_llm_key: str | None = None,
+        clear_default_llm_key: bool = False,
+        default_secondary_llm_key: str | None = None,
+        clear_default_secondary_llm_key: bool = False,
     ) -> Organization:
         async with self.Session() as session:
             organization = (
@@ -185,6 +190,14 @@ class OrganizationsRepository(BaseRepository):
                 organization.artifact_url_expiry_seconds = None
             elif artifact_url_expiry_seconds is not None:
                 organization.artifact_url_expiry_seconds = artifact_url_expiry_seconds
+            if clear_default_llm_key:
+                organization.default_llm_key = None
+            elif default_llm_key is not None:
+                organization.default_llm_key = default_llm_key
+            if clear_default_secondary_llm_key:
+                organization.default_secondary_llm_key = None
+            elif default_secondary_llm_key is not None:
+                organization.default_secondary_llm_key = default_secondary_llm_key
             await session.commit()
             await session.refresh(organization)
             return Organization.model_validate(organization)
@@ -193,7 +206,13 @@ class OrganizationsRepository(BaseRepository):
     async def get_valid_org_auth_token(
         self,
         organization_id: str,
-        token_type: Literal["api", "onepassword_service_account", "custom_credential_service", "custom_llm"],
+        token_type: Literal[
+            "api",
+            "onepassword_service_account",
+            "custom_credential_service",
+            "custom_llm",
+            "google_oauth_client_config",
+        ],
     ) -> OrganizationAuthToken | None: ...
 
     @overload
@@ -221,6 +240,7 @@ class OrganizationsRepository(BaseRepository):
             "bitwarden_credential",
             "custom_credential_service",
             "custom_llm",
+            "google_oauth_client_config",
         ],
     ) -> OrganizationAuthToken | AzureOrganizationAuthToken | BitwardenOrganizationAuthToken | None:
         async with self.Session() as session:
@@ -304,6 +324,24 @@ class OrganizationsRepository(BaseRepository):
                 )
             ).all()
             return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
+
+    @db_operation("delete_org_auth_tokens")
+    async def delete_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_ids: Sequence[str],
+    ) -> None:
+        if not token_ids:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                delete(OrganizationAuthTokenModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .where(OrganizationAuthTokenModel.id.in_(token_ids))
+            )
+            await session.commit()
 
     @db_operation("get_valid_org_auth_tokens_by_type")
     async def get_valid_org_auth_tokens_by_type(

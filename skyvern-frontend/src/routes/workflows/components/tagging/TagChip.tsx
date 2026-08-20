@@ -17,6 +17,9 @@ type Props = {
   // Palette color name for grouped tags. Ignored for standalone labels (which
   // stay neutral) and for names outside the curated palette.
   color?: string | null;
+  // Hide the `key: ` prefix while keeping grouped-tag color semantics — for
+  // surfaces that already display the group (e.g. rows under a group heading).
+  hideKey?: boolean;
   onRemove?: () => void;
   className?: string;
 };
@@ -28,6 +31,7 @@ function TagChip({
   value,
   description,
   color,
+  hideKey = false,
   onRemove,
   className,
 }: Props) {
@@ -59,7 +63,7 @@ function TagChip({
         />
       ) : null}
       <span className="truncate">
-        {tagKey !== null ? (
+        {tagKey !== null && !hideKey ? (
           <>
             <span className="font-medium">{tagKey}</span>
             <span className="text-muted-foreground">: </span>

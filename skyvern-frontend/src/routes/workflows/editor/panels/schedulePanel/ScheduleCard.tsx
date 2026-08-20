@@ -18,18 +18,18 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
   const nextRun = nextRuns[0];
 
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-slate-700 px-3.5 pb-0.5 pt-3.5">
+    <div className="flex flex-col gap-2 rounded-md border border-border px-3.5 pb-0.5 pt-3.5">
       <div className="flex items-start justify-between">
         <div className="flex flex-col gap-0.5">
           {schedule.name && (
-            <span className="text-sm font-medium text-slate-50">
+            <span className="text-sm font-medium text-foreground">
               {schedule.name}
             </span>
           )}
           <span
             className={cn(
               "text-sm",
-              schedule.name ? "text-slate-400" : "text-slate-50",
+              schedule.name ? "text-muted-foreground" : "text-foreground",
             )}
           >
             {humanReadable}
@@ -37,7 +37,9 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
         </div>
       </div>
       <div className="flex items-center justify-between">
-        <span className="text-xs text-slate-400">{schedule.timezone}</span>
+        <span className="text-xs text-muted-foreground">
+          {schedule.timezone}
+        </span>
         <div className="flex items-center gap-2">
           <Switch
             checked={schedule.enabled}
@@ -57,7 +59,7 @@ function ScheduleCard({ schedule, isToggling, onToggle, onDelete }: Props) {
         </div>
       </div>
       {nextRun && (
-        <div className="text-xs text-slate-500">
+        <div className="text-xs text-muted-foreground dark:text-slate-500">
           Next: {formatNextRun(nextRun, schedule.timezone)}
         </div>
       )}

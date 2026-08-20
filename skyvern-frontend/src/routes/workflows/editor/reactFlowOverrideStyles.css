@@ -123,38 +123,6 @@
   color: hsl(var(--foreground));
 }
 
-html:not(.dark) .workflow-editor-shell .text-slate-300 {
-  color: rgb(51 65 85);
-}
-
-html:not(.dark) .workflow-editor-shell .text-slate-400 {
-  color: rgb(71 85 105);
-}
-
-html:not(.dark)
-  .workflow-editor-shell
-  :is(
-    .bg-slate-800,
-    .bg-slate-800\/50,
-    .bg-slate-900\/30,
-    .bg-slate-900\/40
-  ):not(.workflow-editor-tip)
-  .text-slate-300 {
-  color: rgb(203 213 225);
-}
-
-html:not(.dark)
-  .workflow-editor-shell
-  :is(
-    .bg-slate-800,
-    .bg-slate-800\/50,
-    .bg-slate-900\/30,
-    .bg-slate-900\/40
-  ):not(.workflow-editor-tip)
-  .text-slate-400 {
-  color: rgb(148 163 184);
-}
-
 html:not(.dark) .workflow-editor-shell .workflow-editor-tip {
   background-color: rgb(248 250 252);
   border: 1px solid rgb(226 232 240);

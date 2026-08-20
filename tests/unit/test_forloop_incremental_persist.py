@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, LoopBlockExecutedResult, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 INTERVAL_PATCH = "skyvern.forge.sdk.workflow.models.block.PERSIST_LOOP_OUTPUT_INTERVAL"
 
@@ -399,3 +401,161 @@ class TestPersistIntervalBatching:
             )
 
             assert mock_db_upsert.call_count == 0
+
+
+class TestResetBrowserTabsBetweenIterations:
+    """RESET_BROWSER_TABS_BETWEEN_LOOP_ITERATIONS: between iterations close only tabs opened during
+    an iteration, preserving the pre-loop baseline (e.g. a deliverable tab) and the working page."""
+
+    def _loop_block(self) -> ForLoopBlock:
+        return ForLoopBlock(
+            label="test_loop",
+            output_parameter=_make_output_param("test_loop"),
+            loop_blocks=[TaskBlock(label="inner", output_parameter=_make_output_param("inner"))],
+        )
+
+    @pytest.mark.asyncio
+    async def test_baseline_snapshot_once_and_reset_between_iterations(self) -> None:
+        loop_block = self._loop_block()
+        inner_result = _make_block_result(loop_block.loop_blocks[0].output_parameter)
+        mock_context = MagicMock()
+        mock_context.has_value.return_value = False
+        mock_context.set_value = MagicMock()
+        mock_context.update_block_metadata = MagicMock()
+        sentinel_baseline = {MagicMock()}
+
+        with (
+            patch.object(Block, "execute_safe", new_callable=AsyncMock, return_value=inner_result),
+            patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch.object(
+                ForLoopBlock, "_snapshot_loop_baseline_pages", new_callable=AsyncMock, return_value=sentinel_baseline
+            ) as mock_snapshot,
+            patch.object(ForLoopBlock, "_reset_browser_tabs_for_iteration", new_callable=AsyncMock) as mock_reset,
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+
+            await loop_block.execute_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=mock_context,
+                loop_over_values=["a", "b", "c"],
+                organization_id="org_test",
+                browser_session_id="pbs_test",
+            )
+
+            mock_snapshot.assert_awaited_once()
+            # 3 iterations -> reset only for idx 1 and 2, each with the captured baseline
+            assert mock_reset.call_count == 2
+            for call in mock_reset.call_args_list:
+                assert call.args[0] == "wr_test"
+                assert call.args[3] is sentinel_baseline
+
+    @pytest.mark.asyncio
+    async def test_reset_helper_delta_closes_with_session(self) -> None:
+        loop_block = self._loop_block()
+        mock_bs = MagicMock(spec=RealBrowserState)
+        mock_bs.close_pages_opened_after = AsyncMock()
+        baseline = {MagicMock()}
+        reset_browser_tabs = AsyncMock(return_value=True)
+        with (
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        ):
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=mock_bs)
+            await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", baseline)
+            reset_browser_tabs.assert_awaited_once_with("org_test")
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with("pbs_test", "org_test")
+            mock_bs.close_pages_opened_after.assert_awaited_once_with(baseline)
+
+    @pytest.mark.asyncio
+    async def test_reset_helper_noop_when_flag_off(self) -> None:
+        loop_block = self._loop_block()
+        with (
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        ):
+            await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", set())
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_not_called()
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_none_when_flag_off(self) -> None:
+        loop_block = self._loop_block()
+        reset_browser_tabs = AsyncMock(return_value=False)
+        with (
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        ):
+            result = await loop_block._snapshot_loop_baseline_pages("wr_test", "org_test", None)
+            assert result is None
+            reset_browser_tabs.assert_awaited_once_with("org_test")
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_returns_none_when_it_fails(self) -> None:
+        loop_block = self._loop_block()
+        with (
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        ):
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(side_effect=Exception("boom"))
+            assert await loop_block._snapshot_loop_baseline_pages("wr_test", "org_test", "pbs_test") is None
+
+    @pytest.mark.asyncio
+    async def test_reset_helper_noop_when_baseline_unknown(self) -> None:
+        """A failed snapshot must suppress the reset — an empty baseline would close every tab."""
+        loop_block = self._loop_block()
+        reset_browser_tabs = AsyncMock(return_value=True)
+        with (
+            patch.object(
+                block_module.planner_levers,
+                "reset_browser_tabs_between_loop_iterations",
+                reset_browser_tabs,
+            ),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        ):
+            await loop_block._reset_browser_tabs_for_iteration("wr_test", "org_test", "pbs_test", None)
+            reset_browser_tabs.assert_not_awaited()
+            mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_not_called()
+            mock_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_pages_opened_after_preserves_baseline_and_working(self) -> None:
+        deliverable = MagicMock(url="https://pad/sheet", close=AsyncMock())
+        pre_ref = MagicMock(url="https://ref", close=AsyncMock())
+        research_old = MagicMock(url="https://r1", close=AsyncMock())
+        research_cur = MagicMock(url="https://r2", close=AsyncMock())
+
+        bs = RealBrowserState.__new__(RealBrowserState)
+        bs.browser_context = MagicMock()
+        bs.browser_context.pages = [deliverable, pre_ref, research_old, research_cur]
+        bs.get_working_page = AsyncMock(return_value=research_cur)
+
+        await bs.close_pages_opened_after({deliverable, pre_ref})
+
+        deliverable.close.assert_not_called()
+        pre_ref.close.assert_not_called()
+        research_cur.close.assert_not_called()
+        research_old.close.assert_awaited_once()

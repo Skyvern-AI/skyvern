@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_lint
+
+
+@pytest.fixture(autouse=True)
+def _stub_mypy_for_non_mypy_lint_contracts(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_mypy = ModuleType("mypy")
+    fake_mypy.__dict__["api"] = SimpleNamespace(run=lambda _args: ("", "", 0))
+    monkeypatch.setitem(sys.modules, "mypy", fake_mypy)
 
 
 def _has_security_error(result: dict, *, reason_code: str, surface: str | None = None) -> bool:
@@ -29,8 +39,19 @@ async def test_clean_code_block_lints_ok() -> None:
     assert result["data"]["code_safety_errors"] == []
     assert result["data"]["security_errors"] == []
     assert result["data"]["preflight_diagnostics"] == []
-    assert result["data"]["sandbox_diagnostics"] == []
+    assert "sandbox_diagnostics" not in result["data"]
     assert result["data"]["author_time_diagnostics"] == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_runtime_name_and_builtin_exception_are_not_lint_failures() -> None:
+    result = await skyvern_code_block_lint(
+        code="try:\n    value = unavailable_at_runtime\nexcept ValueError:\n    value = None",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["lint_ok"] is True
+    assert "sandbox_diagnostics" not in result["data"]
 
 
 @pytest.mark.asyncio
@@ -54,12 +75,10 @@ async def test_import_is_blocked_by_code_safety_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_page_evaluate_is_blocked_by_security_denylist() -> None:
+async def test_page_evaluate_is_not_blocked_by_security_denylist() -> None:
     result = await skyvern_code_block_lint(code='await page.evaluate("1+1")')
 
-    assert result["ok"] is False
-    assert result["data"]["lint_ok"] is False
-    assert _has_security_error(result, reason_code="AUTHOR_PAGE_EVALUATE", surface="page.evaluate")
+    assert result["data"]["security_errors"] == []
 
 
 @pytest.mark.asyncio
@@ -72,25 +91,21 @@ async def test_page_request_is_blocked_by_security_denylist() -> None:
 
 
 @pytest.mark.asyncio
-async def test_undefined_name_is_caught_by_sandbox_analyzer() -> None:
-    result = await skyvern_code_block_lint(code="x = undefined_thing + 1\nreturn {}")
-
-    assert result["ok"] is False
-    assert result["data"]["lint_ok"] is False
-    assert _has_diagnostic(result, section="sandbox_diagnostics", code="SANDBOX_UNRESOLVED_NAME")
-
-
-@pytest.mark.asyncio
-async def test_parameter_key_is_treated_as_defined_by_sandbox_analyzer() -> None:
-    result = await skyvern_code_block_lint(code="x = query + 1\nreturn {}", parameter_keys=["query"])
-
-    assert not any("query" in diagnostic["message"] for diagnostic in result["data"]["sandbox_diagnostics"])
-
-
-@pytest.mark.asyncio
 async def test_syntax_error_is_caught_by_preflight() -> None:
     result = await skyvern_code_block_lint(code="await page.goto(  # unbalanced paren")
 
     assert result["ok"] is False
     assert result["data"]["lint_ok"] is False
     assert _has_diagnostic(result, section="preflight_diagnostics", code="SYNTAX_ERROR")
+
+
+@pytest.mark.asyncio
+async def test_body_readiness_advisory_warns_without_failing_the_lint_gate() -> None:
+    code = 'body = page.locator("body")\nawait body.wait_for(state="visible", timeout=30000)\nreturn {"ok": True}'
+
+    result = await skyvern_code_block_lint(code=code)
+
+    assert result["ok"] is True
+    assert result["data"]["lint_ok"] is True
+    assert result["data"]["preflight_diagnostics"] == []
+    assert _has_diagnostic(result, section="author_time_diagnostics", code="ROOT_CONTAINER_READINESS_WAIT")
