@@ -12,11 +12,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
+import httpx
 import structlog
 
 from skyvern.config import settings
+from skyvern.exceptions import get_user_facing_exception_message
 from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
 from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
+from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
@@ -663,19 +666,59 @@ async def resolve_browser(
             )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
-    except Exception:
+    except Exception as exc:
         if browser is not None:
             try:
                 await browser.close()
             except Exception:
                 pass
         set_current_session(SessionState())
-        raise
+        wrapped = _wrap_browser_connection_failure(exc)
+        if wrapped is None:
+            # Not a recognized connect/CDP failure -- e.g. an explicit PermissionError from a
+            # cross-organization ownership check. Callers scope-check on the real exception
+            # class, so reclassifying it here would turn a 403-shaped denial into a generic
+            # "retry" story.
+            raise
+        raise wrapped from exc
 
     if current.browser is not None and current.context is not None:
-        return current.browser, current.context
+        if current.context.mode != "extension" or _extension_browser_is_connected(current.browser):
+            return current.browser, current.context
+        # The extension-mode CDP link died (extension reload, broker restart, session
+        # churn). Heal through the live runtime instead of handing back a dead browser
+        # or dead-ending targetless tools on NO_ACTIVE_BROWSER.
+        healed = await _reconnect_extension_session(current, active_api_key_hash)
+        if healed is not None:
+            return healed
 
     raise BrowserNotAvailableError()
+
+
+async def _reconnect_extension_session(
+    current: SessionState,
+    active_api_key_hash: str | None,
+) -> tuple[SkyvernBrowser, BrowserContext] | None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    runtime = BrowserExtensionRuntime.instance()
+    if runtime is None:
+        return None
+    try:
+        await _close_session_state(current, close_via_active_client=False)
+    except Exception:
+        pass
+    finally:
+        set_current_session(SessionState())
+    skyvern = get_skyvern()
+    try:
+        browser = await skyvern.connect_to_browser_extension(runtime)
+    except Exception:
+        LOG.warning("browser_extension_session_reconnect_failed", exc_info=True)
+        return None
+    ctx = BrowserContext(mode="extension", can_access_localhost=True)
+    set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+    return browser, ctx
 
 
 async def _close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
@@ -771,22 +814,30 @@ async def get_page(
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     state = get_current_session()
 
-    # Use explicitly set active page if still valid
-    if state._active_page is not None and not state._active_page.is_closed():
-        try:
-            context_pages = browser._browser_context.pages
-            if state._active_page in context_pages:
-                page = await browser.get_page_for(state._active_page)
-            else:
+    try:
+        # Use explicitly set active page if still valid
+        if state._active_page is not None and not state._active_page.is_closed():
+            try:
+                context_pages = browser._browser_context.pages
+                if state._active_page in context_pages:
+                    page = await browser.get_page_for(state._active_page)
+                else:
+                    state._active_page = None
+                    page = await browser.get_working_page()
+            except Exception:
                 state._active_page = None
                 page = await browser.get_working_page()
-        except Exception:
-            state._active_page = None
+        else:
+            if state._active_page is not None:
+                state._active_page = None
             page = await browser.get_working_page()
-    else:
-        if state._active_page is not None:
-            state._active_page = None
-        page = await browser.get_working_page()
+    except Exception as exc:
+        # The connect above can succeed and the target still die before this command
+        # reaches it -- same failure family as resolve_browser's connect attempt.
+        wrapped = _wrap_browser_connection_failure(exc)
+        if wrapped is None:
+            raise
+        raise wrapped from exc
 
     # Register inspection hooks on all pages in the context.
     # Import here to avoid circular imports.
@@ -911,7 +962,94 @@ class BrowserNotAvailableError(Exception):
     """Raised when no browser session is available."""
 
 
-def no_browser_error() -> dict[str, Any]:
+class BrowserSessionConnectionError(BrowserNotAvailableError):
+    """A browser/session was resolvable but connecting to it (or its page) failed.
+
+    Subclasses BrowserNotAvailableError so every existing MCP tool's
+    ``except BrowserNotAvailableError`` clause already handles it without modification.
+    ``raw_detail`` keeps the original driver/CDP text -- which can carry an internal
+    hostname or a raw proxy response body -- available to server-side classifiers
+    without exposing it in ``str(self)``.
+
+    ``session_gone`` is true only once we are sure the session itself is gone (not
+    just this particular connect attempt), via two independent signals OR'd together:
+    an engine-neutral "target already closed" message taxonomy, and the session
+    router's own expiry close code paired with its reason text (the code alone is
+    reused by an unrelated subsystem for a different meaning, and the taxonomy alone
+    is not guaranteed to match every message shape that close can take).
+    """
+
+    def __init__(self, raw_detail: str) -> None:
+        self.raw_detail = raw_detail
+        lowered = raw_detail.lower()
+        self.session_gone = is_target_closed_message(raw_detail) or (
+            "code=4408" in lowered and "reason=session expired" in lowered
+        )
+        super().__init__("Browser session connection failed")
+
+
+_BROWSER_CONNECT_MESSAGE_MARKERS = (
+    "connect_over_cdp",
+    "websocket error",
+    "websocket was closed",
+    "ws connecting",
+    "ws unexpected response",
+    "ws error",
+)
+
+
+def _looks_like_browser_connection_failure(exc: Exception) -> bool:
+    """Recognize a failure that belongs to the connect/resolve-a-page boundary.
+
+    Deliberately narrow: resolve_browser()'s try block and get_page()'s page-resolution
+    step can also surface an exception that exists precisely so a CALLER can key off its
+    real type -- e.g. a cross-organization PermissionError. Only convert what is
+    unambiguously a browser/CDP/session-router failure; anything else re-raises unchanged.
+    """
+    if isinstance(exc, httpx.TransportError):
+        # A network-level failure talking to our own API while fetching session
+        # metadata; str(exc) is often empty for this class (e.g. httpx.ReadError).
+        return True
+    message = str(exc).lower()
+    if not message.strip():
+        # A typed authorization denial always carries a message; a message-less
+        # exception at this exact boundary has nothing else to go on and nothing to
+        # leak either way, so treat it as a connection failure rather than let an
+        # uninformative, uncaught ToolError reach the client.
+        return True
+    return (
+        is_target_closed_message(message)
+        or is_context_lost_message(message)
+        or any(marker in message for marker in _BROWSER_CONNECT_MESSAGE_MARKERS)
+    )
+
+
+def _wrap_browser_connection_failure(exc: Exception) -> BrowserSessionConnectionError | None:
+    if not _looks_like_browser_connection_failure(exc):
+        return None
+    LOG.warning("Browser session connection failed", exc_info=True)
+    # str(exc) can be empty (e.g. httpx.ReadError, asyncio TimeoutError) -- fall back to the
+    # original exception's type name so raw_detail is never blank.
+    return BrowserSessionConnectionError(str(exc) or type(exc).__name__)
+
+
+def no_browser_error(exc: BrowserNotAvailableError | None = None) -> dict[str, Any]:
+    if isinstance(exc, BrowserSessionConnectionError):
+        if exc.session_gone:
+            return make_error(
+                ErrorCode.SESSION_EXPIRED,
+                "Browser session expired or closed.",
+                "Create a new browser session and retry this operation.",
+            )
+        return make_error(
+            ErrorCode.SDK_ERROR,
+            # get_user_facing_exception_message already strips CDP/session-router hostnames,
+            # raw proxy response bodies, and driver call logs for anything connect_over_cdp-
+            # shaped; anything else degrades to a generic "Unexpected error: <text>", also safe.
+            get_user_facing_exception_message(Exception(exc.raw_detail)),
+            "This is often transient. Retry with the same session_id/cdp_url; "
+            "if it keeps failing, create a new browser session.",
+        )
     return make_error(
         ErrorCode.NO_ACTIVE_BROWSER,
         "No browser session available",

@@ -242,6 +242,16 @@ class PhoneNumberInputMismatch(SkyvernException):
         )
 
 
+class PhoneNumberInputBrowserValidityMismatch(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input failed the browser validity check.")
+
+
+class PhoneNumberInputBrowserInteractionFailed(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input browser interaction failed.")
+
+
 class CardNumberInputMismatch(SkyvernException):
     def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
         self.expected_digit_count = expected_digit_count
@@ -948,6 +958,16 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
     def __init__(self, max_size: int) -> None:
         self.max_size = max_size
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+
+
+class GoogleDriveFileNotAccessible(SkyvernException):
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(
+            f"Google Drive returned a sign-in or permission page instead of the file content for {url}. "
+            "The file is not publicly accessible. Share it so anyone with the link can view it, "
+            "or use a direct-download link."
+        )
 
 
 class UploadFileMaxSizeExceeded(SkyvernException):

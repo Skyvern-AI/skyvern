@@ -30,6 +30,8 @@ export const OPS = Object.freeze({
 
 export const EVENTS = Object.freeze({
   EXTENSION_HELLO: "extension.hello",
+  PAIRING_APPROVED: "pairing.approved",
+  PAIRING_APPROVED_ACK: "pairing.approved_ack",
   DEBUGGER_EVENT: "debugger.event",
   DEBUGGER_DETACHED: "debugger.detached",
   SCOPE_TAB_ADDED: "scope.tabAdded",

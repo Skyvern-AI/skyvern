@@ -1,6 +1,5 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
 import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { Status } from "@/api/types";
 import {
@@ -95,20 +94,16 @@ export function StudioPaneToggles() {
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
 
   const { runId, runStatus } = useStudioRunSignals();
-  const workflowPermanentId = useWorkflowPermanentId();
   const labelsCollapsed = useLabelsCollapsed();
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
   const [runLinkCopied, setRunLinkCopied] = useState(false);
 
-  // Copies the run's shareable deep link (?wr= names the run) — the thing
-  // people actually paste around — not just the raw id.
+  // Copies the run's shareable link — not just the raw id.
   const copyRunLink = async () => {
     if (!runId || runLinkCopied) {
       return;
     }
-    await copyText(
-      `${window.location.origin}/agents/${workflowPermanentId}/studio?wr=${runId}`,
-    );
+    await copyText(`${window.location.origin}/runs/${runId}`);
     setRunLinkCopied(true);
     setTimeout(() => setRunLinkCopied(false), 1500);
   };

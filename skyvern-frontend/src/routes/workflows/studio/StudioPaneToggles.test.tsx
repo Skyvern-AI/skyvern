@@ -257,7 +257,7 @@ describe("StudioPaneToggles run tab label", () => {
 
     await waitFor(() =>
       expect(copyTextMock).toHaveBeenCalledWith(
-        `${window.location.origin}/agents/wpid_abc/studio?wr=wr_556219201027773764`,
+        `${window.location.origin}/runs/wr_556219201027773764`,
       ),
     );
     // The click must not bubble into the popover trigger.

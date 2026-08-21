@@ -52,7 +52,7 @@ from skyvern.webeye.actions.handler import (
     get_actual_value_of_parameter_if_secret,
     handle_click_action,
     handle_hover_action,
-    handle_input_text_action,
+    handle_input_text_action_direct,
     handle_select_option_action,
     handle_upload_file_action,
 )
@@ -527,7 +527,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.exception("Failed to adapt value for input text action", selector=selector)
 
         if action and organization_id and task and step:
-            result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
+            result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
                 raise Exception(result[-1].exception_message)
             await self._record_element_fallback_episode(
@@ -1888,7 +1888,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if action_type == "CLICK" and isinstance(action, ClickAction):
                 result = await handle_click_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "INPUT_TEXT" and isinstance(action, InputTextAction):
-                result = await handle_input_text_action(action, self.page, self.scraped_page, task, step)
+                result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
             elif action_type == "UPLOAD_FILE" and isinstance(action, UploadFileAction):
                 result = await handle_upload_file_action(action, self.page, self.scraped_page, task, step)
             elif action_type == "SELECT_OPTION" and isinstance(action, SelectOptionAction):

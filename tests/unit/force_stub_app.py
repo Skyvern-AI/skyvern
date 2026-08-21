@@ -53,6 +53,9 @@ def create_forge_stub_app() -> ForgeApp:
     # and route copilot block runs down the worker-dispatch path. Match the real OSS base
     # default (False) so unit tests exercise the unavailable-worker path.
     fake_app_module.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
+    # Advisory scanner hook — _LazyNamespace would auto-mock this as an AsyncMock returning a
+    # non-iterable MagicMock, silently exercising the fail-open path instead of the OSS no-op.
+    fake_app_module.AGENT_FUNCTION.scan_code_block_source = AsyncMock(return_value=[])
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)

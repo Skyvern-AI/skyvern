@@ -83,7 +83,7 @@ _OBSERVATION_TOOLS = {
     "wait_for_either_state",
 }
 
-_AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "update_workflow"})
+_AUTHORING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "update_workflow"})
 # Pure substring heuristic over raw (unparsed) JSON text: a free-text field (e.g. navigation_goal)
 # that happens to contain the literal "label:" would also match. Accepted trade-off of not
 # json.loads-ing the partial buffer; worst case is a spurious drafted-block entry.
@@ -511,7 +511,7 @@ async def _emit_code_repair_progress(
     )
 
 
-_BLOCK_RUNNING_TOOL_NAMES = frozenset({"update_and_run_blocks", "run_blocks_and_collect_debug"})
+_BLOCK_RUNNING_TOOL_NAMES = frozenset({"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug"})
 
 
 def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str | None:
@@ -662,10 +662,14 @@ def _update_enforcement_from_tool(
     data = output.get("data")
     has_blocks = isinstance(data, dict) and data.get("block_count", 0) > 0
 
-    if tool_name in ("update_workflow", "update_and_run_blocks") and output.get("ok") and has_blocks:
+    if (
+        tool_name in ("update_workflow", "update_and_run_blocks", "edit_block_and_run")
+        and output.get("ok")
+        and has_blocks
+    ):
         ctx.update_workflow_called = True
         ctx.test_after_update_done = False
-    if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks"):
+    if tool_name in ("run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"):
         ctx.test_after_update_done = True
 
     if tool_name == "navigate_browser" and output.get("ok"):

@@ -13,7 +13,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,6 +24,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.code_block_recorder import CODE_BLOCK_FILENAME, RecordingPage
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye.actions.actions import (
@@ -272,44 +273,115 @@ async def test_a_page_whose_url_carried_a_secret_is_not_recorded_as_an_anchor() 
     assert update_block.await_args is None
 
 
-@pytest.mark.asyncio
-async def test_pending_navigation_fact_is_secret_safe(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_NAVIGATION_DELAY_SECONDS", 0.0)
-    release = asyncio.Event()
+_PENDING_SECRET = "credential-value-never-log"
 
-    async def goto(url: str, **kwargs: object) -> None:
+_PENDING_EVENT_BASE = {
+    "block_label": "sink_block",
+    "code_line": None,
+    "threshold_seconds": 0.0,
+    "event": "codeblock.page_call_still_pending",
+    "log_level": "warning",
+    "workflow_run_block_id": "wrb_1",
+    "workflow_run_id": "wr_1",
+}
+
+
+def _stalled_page(release: asyncio.Event) -> SimpleNamespace:
+    async def stall(*args: object, **kwargs: object) -> None:
         await release.wait()
 
-    secret = "credential-value-never-log"
-    page = SimpleNamespace(url="about:blank", goto=goto)
-    recording = _recording(page)
+    return SimpleNamespace(
+        url="about:blank",
+        goto=stall,
+        wait_for_url=stall,
+        locator=lambda selector, **kwargs: SimpleNamespace(click=stall),
+    )
+
+
+@pytest.mark.parametrize(
+    ("invoke", "expected"),
+    [
+        pytest.param(
+            lambda page: page.wait_for_url(f"https://example.com/private?token={_PENDING_SECRET}"),
+            {"call_name": "page.wait_for_url", "action_type": None, "action_order": None},
+            id="unmapped-page-call",
+        ),
+        pytest.param(
+            lambda page: page.locator(f"#pay-{_PENDING_SECRET}").click(),
+            {"call_name": "locator.click", "action_type": ActionType.CLICK.value, "action_order": 0},
+            id="mapped-non-goto-call",
+        ),
+        pytest.param(
+            lambda page: page.goto(f"https://example.com/private?token={_PENDING_SECRET}"),
+            {"call_name": "page.goto", "action_type": ActionType.GOTO_URL.value, "action_order": 0},
+            id="goto-call",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pending_page_call_fact_is_secret_safe(
+    invoke: Callable[[RecordingPage], Awaitable[object]],
+    expected: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.0)
+    release = asyncio.Event()
+
+    recording = _recording(_stalled_page(release))
     recording._recording_enabled = False
-    recording._code_block.code = f"private_value = {secret!r}"
+    recording._code_block.code = f"private_value = {_PENDING_SECRET!r}"
 
     with capture_logs() as logs:
-        call = asyncio.create_task(recording.recording_page.goto(f"https://example.com/private?token={secret}"))
+        call = asyncio.create_task(invoke(recording.recording_page))
         try:
-            for _ in range(20):
-                pending = [log for log in logs if log["event"] == "codeblock.navigation_still_pending"]
+            for _ in range(200):
+                pending = [log for log in logs if log["event"] == "codeblock.page_call_still_pending"]
                 if pending:
                     break
                 await asyncio.sleep(0.001)
 
             assert len(pending) == 1
             event = pending[0]
-            assert event == {
-                "action_order": 0,
-                "action_type": ActionType.GOTO_URL.value,
-                "block_label": "sink_block",
-                "call_name": "page.goto",
-                "code_line": None,
-                "threshold_seconds": 0.0,
-                "event": "codeblock.navigation_still_pending",
-                "log_level": "warning",
-                "workflow_run_block_id": "wrb_1",
-                "workflow_run_id": "wr_1",
-            }
-            assert secret not in repr(event)
+            assert event == {**_PENDING_EVENT_BASE, **expected}
+            assert _PENDING_SECRET not in repr(event)
+        finally:
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+
+
+@pytest.mark.asyncio
+async def test_unmapped_page_call_pending_fact_carries_code_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.0)
+    release = asyncio.Event()
+
+    # Compiled under the code block filename so the recorder's frame walk resolves a real authored
+    # line (the await sits on source line 4, which reports as authored line 2).
+    stalled_wait_source = (
+        "\nasync def authored_wait(recording_page):\n"
+        "    selector = '**/never-loaded'\n"
+        "    return await recording_page.wait_for_url(selector)\n"
+    )
+    namespace: dict[str, Any] = {}
+    exec(compile(stalled_wait_source, CODE_BLOCK_FILENAME, "exec"), namespace)
+
+    stalled_page = SimpleNamespace(url="about:blank", wait_for_url=lambda *args, **kwargs: release.wait())
+    recording = _recording(stalled_page)
+    recording._recording_enabled = False
+
+    with capture_logs() as logs:
+        call = asyncio.create_task(namespace["authored_wait"](recording.recording_page))
+        try:
+            for _ in range(200):
+                pending = [log for log in logs if log["event"] == "codeblock.page_call_still_pending"]
+                if pending:
+                    break
+                await asyncio.sleep(0.001)
+
+            assert len(pending) == 1
+            event = pending[0]
+            assert event["call_name"] == "page.wait_for_url"
+            assert event["code_line"] == 2
         finally:
             call.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -318,8 +390,8 @@ async def test_pending_navigation_fact_is_secret_safe(monkeypatch: pytest.Monkey
 
 @pytest.mark.asyncio
 @_requires_chromium
-async def test_real_playwright_stalled_navigation_emits_pending_fact(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_NAVIGATION_DELAY_SECONDS", 0.05)
+async def test_real_playwright_stalled_calls_emit_pending_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.05)
     release_connections = asyncio.Event()
 
     async def accept_without_response(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -330,7 +402,7 @@ async def test_real_playwright_stalled_navigation_emits_pending_fact(monkeypatch
     server = await asyncio.start_server(accept_without_response, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     try:
-        async with asyncio.timeout(10), async_playwright() as playwright:
+        async with asyncio.timeout(30), async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             try:
                 page = await browser.new_page()
@@ -342,8 +414,13 @@ async def test_real_playwright_stalled_navigation_emits_pending_fact(monkeypatch
                     organization_id="o_1",
                     workflow_run_context=FakeWorkflowRunContext(values={}, secrets={}),
                 )
-                with capture_logs() as logs, pytest.raises(PlaywrightTimeoutError):
-                    await recording.recording_page.goto(f"http://127.0.0.1:{port}/", timeout=250)
+                with capture_logs() as logs:
+                    with pytest.raises(PlaywrightTimeoutError):
+                        await recording.recording_page.goto(f"http://127.0.0.1:{port}/", timeout=250)
+                    with pytest.raises(PlaywrightTimeoutError):
+                        await recording.recording_page.wait_for_url("**/never-reached", timeout=250)
+                    with pytest.raises(PlaywrightTimeoutError):
+                        await recording.recording_page.locator("#never-rendered").click(timeout=250)
             finally:
                 await browser.close()
     finally:
@@ -351,7 +428,6 @@ async def test_real_playwright_stalled_navigation_emits_pending_fact(monkeypatch
         server.close()
         await server.wait_closed()
 
-    pending = [log for log in logs if log["event"] == "codeblock.navigation_still_pending"]
-    assert len(pending) == 1
-    assert pending[0]["call_name"] == "page.goto"
-    assert pending[0]["workflow_run_block_id"] == "wrb_1"
+    pending = [log for log in logs if log["event"] == "codeblock.page_call_still_pending"]
+    assert [log["call_name"] for log in pending] == ["page.goto", "page.wait_for_url", "locator.click"]
+    assert {log["workflow_run_block_id"] for log in pending} == {"wrb_1"}

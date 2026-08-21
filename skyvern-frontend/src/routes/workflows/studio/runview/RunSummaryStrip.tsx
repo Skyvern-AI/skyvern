@@ -22,7 +22,7 @@ type RunSummaryStripProps = {
  * (still running, or finalized without both endpoints) fall back to the raw
  * started/finished chips. The run id itself lives in the top bar's "View Run"
  * tab, the browser session/profile ids in the Inputs view, and the counts
- * (blocks/actions/steps/credits) in the timeline's own header.
+ * (blocks/actions/credits) in the timeline's own header.
  */
 export function RunSummaryStrip({ workflowRun }: RunSummaryStripProps) {
   const finalized = statusIsFinalized(workflowRun);

@@ -12,10 +12,12 @@ import { TabScope } from "./tab_scope.js";
 
 const PENDING_PAIRING_STORAGE_KEY = "pendingPairingOffer";
 const PAIRING_CONFIRM_PATH = "pairing_confirm.html";
+const PAIRING_APPROVAL_TIMEOUT_MS = 15_000;
 
 let debuggerRouter;
 let pendingPairingOffer = null;
 let pairingOfferQueue = Promise.resolve();
+const pendingPairingApprovals = new Map();
 let resetQueue = Promise.resolve();
 let lastResetEpoch = null;
 let lastResetGeneration = -1;
@@ -23,8 +25,12 @@ let lastResetOk = null;
 
 const bridge = new BridgeConnection({
   onRequest: (op, args) => dispatchRequest(op, args),
-  onAuthenticated: () => sendHello(),
+  onAuthenticated: async () => {
+    await sendHello();
+    resendPendingPairingApprovals();
+  },
   onReset: (epoch, generation) => enqueueReset(epoch, generation),
+  onEvent: (event, params) => handleBrokerEvent(event, params),
   onStateChange: () => updateActionState(),
 });
 
@@ -70,7 +76,68 @@ async function sendHello() {
   bridge.sendEvent(EVENTS.EXTENSION_HELLO, {
     protocolVersion: PROTOCOL_VERSION,
     extensionVersion: chrome.runtime.getManifest().version,
+    scopeEventOrigins: true,
     scopedTabs: await tabScope.helloTabs(),
+  });
+}
+function handleBrokerEvent(event, params) {
+  if (
+    event !== EVENTS.PAIRING_APPROVED_ACK ||
+    typeof params?.approvalNonce !== "string" ||
+    params.approved !== true
+  ) {
+    return;
+  }
+  const pending = pendingPairingApprovals.get(params.approvalNonce);
+  if (pending === undefined) {
+    return;
+  }
+  pendingPairingApprovals.delete(params.approvalNonce);
+  clearTimeout(pending.timeout);
+  pending.resolve();
+}
+
+function resendPendingPairingApprovals() {
+  for (const approvalNonce of pendingPairingApprovals.keys()) {
+    bridge.sendEvent(EVENTS.PAIRING_APPROVED, { approvalNonce });
+  }
+}
+
+async function waitForBridgeConnection() {
+  const deadline = Date.now() + PAIRING_APPROVAL_TIMEOUT_MS;
+  while (!bridge.getStatus().connected) {
+    if (Date.now() >= deadline) {
+      throw new ProtocolError(
+        ERROR_CODES.INTERNAL,
+        "The local broker did not connect before approval expired.",
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+function approveBrokerClient(approvalNonce) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pendingPairingApprovals.delete(approvalNonce);
+      reject(
+        new ProtocolError(
+          ERROR_CODES.INTERNAL,
+          "The local broker did not confirm this agent approval.",
+        ),
+      );
+    }, PAIRING_APPROVAL_TIMEOUT_MS);
+    pendingPairingApprovals.set(approvalNonce, { resolve, timeout });
+    if (!bridge.sendEvent(EVENTS.PAIRING_APPROVED, { approvalNonce })) {
+      pendingPairingApprovals.delete(approvalNonce);
+      clearTimeout(timeout);
+      reject(
+        new ProtocolError(
+          ERROR_CODES.INTERNAL,
+          "The local broker disconnected before approval.",
+        ),
+      );
+    }
   });
 }
 
@@ -90,11 +157,12 @@ function enqueueReset(epoch, generation) {
       }
       await tabScope.prepareForReset();
       try {
-        const { failedTabCount } = await debuggerRouter.reset();
-        const ok = failedTabCount === 0;
-        if (ok) {
-          await tabScope.reset();
+        let { failedTabCount } = await debuggerRouter.reset();
+        if (failedTabCount === 0) {
+          const scopeReset = await tabScope.reset();
+          failedTabCount += scopeReset.failedTabCount;
         }
+        const ok = failedTabCount === 0;
         lastResetEpoch = epoch;
         lastResetGeneration = generation;
         lastResetOk = ok;
@@ -122,7 +190,46 @@ async function popupStatus() {
   };
 }
 
+function isTrustedPairingSender(sender, port) {
+  let senderUrl;
+  try {
+    senderUrl = new URL(sender.url);
+  } catch {
+    return false;
+  }
+  return (
+    senderUrl.protocol === "http:" &&
+    (senderUrl.hostname === "127.0.0.1" ||
+      senderUrl.hostname === "localhost") &&
+    senderUrl.port !== "" &&
+    Number(senderUrl.port) === port
+  );
+}
+
+function isPairingProbe(message, sender) {
+  return (
+    message !== null &&
+    typeof message === "object" &&
+    !Array.isArray(message) &&
+    message.type === "skyvern.pairingProbe" &&
+    message.v === 1 &&
+    Number.isInteger(message.port) &&
+    message.port >= 1 &&
+    message.port <= 65_535 &&
+    isTrustedPairingSender(sender, message.port)
+  );
+}
+
 function parsePairingOffer(message, sender) {
+  const approvalFieldsPresent =
+    message?.approvalNonce !== undefined ||
+    message?.requestFingerprint !== undefined;
+  const validApproval =
+    !approvalFieldsPresent ||
+    (typeof message.approvalNonce === "string" &&
+      message.approvalNonce.length > 0 &&
+      typeof message.requestFingerprint === "string" &&
+      message.requestFingerprint.length > 0);
   if (
     message === null ||
     typeof message !== "object" ||
@@ -133,27 +240,18 @@ function parsePairingOffer(message, sender) {
     message.port < 1 ||
     message.port > 65_535 ||
     typeof message.token !== "string" ||
-    message.token.length === 0
+    message.token.length === 0 ||
+    !validApproval ||
+    !isTrustedPairingSender(sender, message.port)
   ) {
     return null;
   }
-
-  let senderUrl;
-  try {
-    senderUrl = new URL(sender.url);
-  } catch {
-    return null;
-  }
-  if (
-    senderUrl.protocol !== "http:" ||
-    (senderUrl.hostname !== "127.0.0.1" &&
-      senderUrl.hostname !== "localhost") ||
-    senderUrl.port === "" ||
-    Number(senderUrl.port) !== message.port
-  ) {
-    return null;
-  }
-  return { port: message.port, token: message.token };
+  return {
+    port: message.port,
+    token: message.token,
+    approvalNonce: message.approvalNonce,
+    requestFingerprint: message.requestFingerprint,
+  };
 }
 
 async function focusPairingConfirmation() {
@@ -201,11 +299,14 @@ async function readPendingPairingOffer() {
     offer.port < 1 ||
     offer.port > 65_535 ||
     typeof offer.token !== "string" ||
-    offer.token.length === 0
+    offer.token.length === 0 ||
+    (offer.approvalNonce !== undefined &&
+      (typeof offer.approvalNonce !== "string" ||
+        typeof offer.requestFingerprint !== "string"))
   ) {
     return null;
   }
-  pendingPairingOffer = { port: offer.port, token: offer.token };
+  pendingPairingOffer = offer;
   return pendingPairingOffer;
 }
 
@@ -226,8 +327,13 @@ async function applyPendingPairing() {
     bridgePort: offer.port,
     pairingToken: offer.token,
   });
+  await bridge.connect();
+  if (typeof offer.approvalNonce === "string") {
+    await waitForBridgeConnection();
+    await approveBrokerClient(offer.approvalNonce);
+  }
   await clearPendingPairingOffer();
-  return bridge.connect();
+  return {};
 }
 
 async function handlePopupMessage(message) {
@@ -270,6 +376,10 @@ async function handlePopupMessage(message) {
 
 chrome.runtime.onMessageExternal.addListener(
   (message, sender, sendResponse) => {
+    if (isPairingProbe(message, sender)) {
+      sendResponse({ ok: true, available: true });
+      return false;
+    }
     const offer = parsePairingOffer(message, sender);
     if (offer === null) {
       sendResponse({ ok: false, error: "invalid_offer" });

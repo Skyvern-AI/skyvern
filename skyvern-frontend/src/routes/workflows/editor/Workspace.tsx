@@ -117,7 +117,11 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -726,11 +730,13 @@ function Workspace({
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
+    enabled: isGeneratingCode,
     workflowPermanentId,
     pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "pending",
@@ -770,7 +776,7 @@ function Workspace({
               detail:
                 getAxiosErrorDetail(debugSessionError) ??
                 "More credits are required to start a browser session.",
-              hint: "Add credits or enable overage in Billing, then return here to start the browser session.",
+              hint: "Upgrade your plan in Billing, then return here to start the browser session.",
             }
           : {
               title: "Could not start browser session",

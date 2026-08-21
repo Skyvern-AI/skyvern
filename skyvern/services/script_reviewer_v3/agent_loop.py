@@ -30,10 +30,9 @@ import json
 import time
 from typing import Any, Awaitable, Callable
 
-import litellm
 import structlog
 
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop,
     detect_tool_loop,
@@ -131,10 +130,11 @@ def _extract_usage(response: Any) -> tuple[int, int, float]:
     the v3 router workaround sometimes
     returns responses without ``_hidden_params['response_cost']`` populated
     (raw_response=True path bypasses litellm.completion_cost). When that
-    happens we fall back to ``litellm.completion_cost(completion_response=response)``
-    just like the main Skyvern handler does (see
-    ``skyvern/forge/sdk/api/llm/api_handler_factory.py:1110``). Final fallback
-    is 0 — never raises.
+    happens we fall back to the main Skyvern handler's own cost helper, which applies the
+    provider-side corrections litellm omits. That fallback is rarely taken — litellm populates
+    ``response_cost`` on ordinary completions — so this narrows a disagreement rather than
+    removing it; the preference for ``response_cost`` is tracked separately.
+    Final fallback is 0 — never raises.
     """
     try:
         usage = getattr(response, "usage", None) or response.get("usage", {})  # type: ignore[union-attr]
@@ -150,13 +150,9 @@ def _extract_usage(response: Any) -> tuple[int, int, float]:
         cost_usd = float(hidden.get("response_cost", 0.0) or 0.0)
     except Exception:
         cost_usd = 0.0
-    # Fallback: when response_cost is 0/missing, ask litellm to compute it
-    # from the model+usage. This is the same call the main Skyvern LLM
-    # handler uses, so cost numbers stay comparable across v2 and v3.
     if cost_usd == 0.0:
         try:
-            computed = litellm.completion_cost(completion_response=response)
-            cost_usd = float(computed or 0.0)
+            cost_usd = float(LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0)
         except Exception:
             cost_usd = 0.0
     return input_tokens, output_tokens, cost_usd

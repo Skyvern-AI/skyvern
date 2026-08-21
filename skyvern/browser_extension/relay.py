@@ -11,6 +11,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from typing import Any
 from urllib.parse import urlsplit
 
 import structlog
@@ -373,10 +374,10 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
         </div>
 
         <div id="approval-controls" class="approval-controls">
-          <button id="approve" class="approve-button" type="button">
+          <div class="approve-button" role="status">
             <span class="spinner" aria-hidden="true"></span>
-            <span id="approve-label">Approve connection</span>
-          </button>
+            <span id="approve-label">Connecting to Skyvern Agent…</span>
+          </div>
           <p class="fine-print">Secure pairing links expire after 2 minutes and can be used once.</p>
         </div>
 
@@ -402,8 +403,6 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
     (() => {
       const nonce = location.hash.slice(1);
       const approvalControls = document.getElementById("approval-controls");
-      const button = document.getElementById("approve");
-      const buttonLabel = document.getElementById("approve-label");
       const serverAddress = document.getElementById("server-address");
       const status = document.getElementById("status");
       const statusTitle = document.getElementById("status-title");
@@ -439,26 +438,53 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
         showState(
           "error",
           "Skyvern Agent isn’t available",
-          "Install or enable the Skyvern Agent Chrome extension, then retry the browser session request.",
+          "Install or enable the Skyvern Agent Chrome extension. Keep this page open; pairing will continue automatically.",
         );
       }
 
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        button.setAttribute("aria-busy", "true");
-        buttonLabel.textContent = "Approving…";
-        document.body.dataset.state = "approving";
+      function extensionAvailable() {
+        if (!globalThis.chrome?.runtime?.sendMessage) {
+          return Promise.resolve(false);
+        }
+        return new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            "__EXTENSION_ID__",
+            {type: "skyvern.pairingProbe", v: 1, port: Number(location.port)},
+            (result) => {
+              resolve(
+                !chrome.runtime.lastError &&
+                  result?.ok === true &&
+                  result?.available === true,
+              );
+            },
+          );
+        });
+      }
+
+      let claimed = false;
+      async function claim() {
+        if (claimed) {
+          return;
+        }
+        claimed = true;
         if (!nonce) {
           showMissingRequest();
           return;
         }
+        if (!(await extensionAvailable())) {
+          claimed = false;
+          showInstallHint();
+          setTimeout(() => void claim(), 1000);
+          return;
+        }
+        document.body.dataset.state = "approving";
         try {
           const response = await fetch("/pair/claim", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({v: 1, nonce}),
           });
-          if (response.status === 403) {
+          if (response.status === 403 || response.status === 409) {
             showExpired();
             return;
           }
@@ -466,21 +492,26 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
             throw new Error("claim failed");
           }
           const offer = await response.json();
-          if (!globalThis.chrome?.runtime?.sendMessage) {
-            showInstallHint();
-            return;
-          }
+          // Availability was verified before the single-use offer was claimed. A missing
+          // extension never reaches this point and therefore cannot consume the nonce.
           chrome.runtime.sendMessage(
             "__EXTENSION_ID__",
-            {type: "skyvern.pairingOffer", v: 1, port: offer.port, token: offer.token},
+            {
+              type: "skyvern.pairingOffer",
+              v: 1,
+              port: offer.port,
+              token: offer.token,
+              approvalNonce: offer.approvalNonce,
+              requestFingerprint: offer.requestFingerprint,
+            },
             (result) => {
               if (chrome.runtime.lastError) {
                 showInstallHint();
               } else if (result?.ok === true && result?.pending === true) {
                 showState(
                   "success",
-                  "Approved — finish in the Skyvern Agent tab",
-                  "Review the local server details in the confirmation tab that just opened.",
+                  "Approve in the Skyvern Agent tab",
+                  "One approval left: review the local server details in the Skyvern Agent tab that just opened and click Approve pairing.",
                 );
               } else {
                 showState(
@@ -498,10 +529,15 @@ _PAIR_PAGE_TEMPLATE = """<!doctype html>
             "Check that the local MCP server is running, then retry the browser session request or run skyvern browser extension-pair again.",
           );
         }
-      });
+      }
 
-      if (!nonce) {
-        showMissingRequest();
+      // Claim automatically on the first real foreground load. The prerendering guard
+      // keeps Chrome's speculative loads from consuming the single-use nonce; the user's
+      // one explicit approval happens in the extension-owned confirmation tab.
+      if (document.prerendering) {
+        document.addEventListener("prerenderingchange", () => void claim(), {once: true});
+      } else {
+        void claim();
       }
     })();
   </script>
@@ -520,7 +556,7 @@ class ExtensionRelayServer:
         on_disconnect: Callable[[], Awaitable[None]] | None = None,
         *,
         control_pairing_only: bool = False,
-        on_pairing_complete: Callable[[], Awaitable[None]] | None = None,
+        on_pairing_complete: Callable[[], Awaitable[dict[str, str] | None]] | None = None,
     ) -> None:
         self._token = token
         self._port = port
@@ -533,6 +569,7 @@ class ExtensionRelayServer:
         self._app.router.add_get("/pair", self._handle_pair_page)
         self._app.router.add_post("/pair/begin", self._handle_pair_begin)
         self._app.router.add_post("/pair/claim", self._handle_pair_claim)
+        self._app.router.add_get("/health", self._handle_health)
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._websocket: web.WebSocketResponse | None = None
@@ -546,6 +583,7 @@ class ExtensionRelayServer:
         self._pending_empty.set()
         self._pairing_nonce: str | None = None
         self._pairing_nonce_created_at: float | None = None
+        self._pairing_claim_lock = asyncio.Lock()
         self.bound_port = port
         self.scoped_tabs: list[dict] = []
         self.extension_protocol_version: int | None = None
@@ -568,6 +606,28 @@ class ExtensionRelayServer:
     def cancel_pairing_nonce(self) -> None:
         self._pairing_nonce = None
         self._pairing_nonce_created_at = None
+
+    async def ensure_root_lease(self) -> dict | None:
+        """Embedded single-owner relay: the whole scoped snapshot belongs to this process."""
+        if not self.scoped_tabs:
+            return None
+        return dict(self.scoped_tabs[0])
+
+    async def release_tab(self, tab_id: int) -> None:
+        """Embedded single-owner relay keeps user tabs open when its CDP client closes."""
+        await self.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
+
+    async def _handle_health(self, _request: web.Request) -> web.Response:
+        # Sanitized identity probe so a PORT_IN_USE diagnosis can name the port owner.
+        # It must never expose state, credentials, tab data, or pairing material.
+        return web.json_response(
+            {
+                "v": 1,
+                "service": "skyvern-browser-extension-relay",
+                "role": "broker" if self._control_pairing_only else "embedded",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _is_interactive_pairing_request(self, request: web.Request) -> bool:
         try:
@@ -679,6 +739,29 @@ class ExtensionRelayServer:
             return False
         return True
 
+    async def send_event(self, event: str, params: dict[str, Any]) -> bool:
+        websocket = self._websocket
+        if (
+            not self.connected
+            or self.extension_protocol_version != PROTOCOL_VERSION
+            or websocket is None
+            or websocket.closed
+        ):
+            return False
+        try:
+            await self._send_json(
+                websocket,
+                {
+                    "v": PROTOCOL_VERSION,
+                    "type": "event",
+                    "event": event,
+                    "params": params,
+                },
+            )
+        except (ConnectionError, RuntimeError):
+            return False
+        return True
+
     @property
     def pending_request_count(self) -> int:
         return len(self._pending)
@@ -696,7 +779,7 @@ class ExtensionRelayServer:
         self,
         op: str,
         args: dict,
-        timeout: float = 30.0,
+        timeout: float | None = 30.0,
         *,
         retain_until_terminal: bool = False,
         on_registered: Callable[[], None] | None = None,
@@ -786,11 +869,6 @@ class ExtensionRelayServer:
             LOG.info("browser_extension_pair_claim", outcome="invalid_source")
             return web.json_response({"error": "invalid_source"}, status=403, headers={"Cache-Control": "no-store"})
 
-        active_nonce = self._pairing_nonce
-        created_at = self._pairing_nonce_created_at
-        self._pairing_nonce = None
-        self._pairing_nonce_created_at = None
-
         payload = await _read_json_object(request)
         supplied_nonce = payload.get("nonce") if payload is not None else None
         valid_payload = (
@@ -799,23 +877,38 @@ class ExtensionRelayServer:
             and payload["v"] == LEGACY_PROTOCOL_VERSION
             and isinstance(supplied_nonce, str)
         )
-        nonce_matches = secrets.compare_digest(
-            active_nonce or ("0" * 43),
-            supplied_nonce if isinstance(supplied_nonce, str) else "",
-        )
-        expired = created_at is None or time.monotonic() - created_at >= _PAIRING_NONCE_TTL_SECONDS
         if not valid_payload:
             LOG.info("browser_extension_pair_claim", outcome="bad_payload")
             return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
-        if not nonce_matches or expired:
-            LOG.info("browser_extension_pair_claim", outcome="expired_or_unknown_nonce")
-            return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
+        assert isinstance(supplied_nonce, str)
+
+        async with self._pairing_claim_lock:
+            active_nonce = self._pairing_nonce
+            created_at = self._pairing_nonce_created_at
+            nonce_matches = secrets.compare_digest(active_nonce or ("0" * 43), supplied_nonce)
+            expired = created_at is None or time.monotonic() - created_at >= _PAIRING_NONCE_TTL_SECONDS
+            if not nonce_matches or expired:
+                LOG.info("browser_extension_pair_claim", outcome="expired_or_unknown_nonce")
+                return web.json_response({"error": "invalid_nonce"}, status=403, headers={"Cache-Control": "no-store"})
+            self._pairing_nonce = None
+            self._pairing_nonce_created_at = None
         LOG.info("browser_extension_pair_claim", outcome="ok")
-        await self._call_on_pairing_complete()
-        return web.json_response(
-            {"v": LEGACY_PROTOCOL_VERSION, "port": self.bound_port, "token": self._token},
-            headers={"Cache-Control": "no-store"},
-        )
+        response: dict[str, Any] = {
+            "v": LEGACY_PROTOCOL_VERSION,
+            "port": self.bound_port,
+            "token": self._token,
+        }
+        pairing_metadata = await self._call_on_pairing_complete()
+        if self._control_pairing_only and pairing_metadata is None:
+            LOG.info("browser_extension_pair_claim", outcome="approval_offer_expired")
+            return web.json_response(
+                {"error": "approval_offer_expired"},
+                status=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        if pairing_metadata is not None:
+            response.update(pairing_metadata)
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
 
     async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         websocket = web.WebSocketResponse(max_msg_size=_MAX_WS_MESSAGE_BYTES)
@@ -1047,12 +1140,14 @@ class ExtensionRelayServer:
             except Exception:
                 LOG.exception("browser extension disconnect callback failed")
 
-    async def _call_on_pairing_complete(self) -> None:
-        if self._on_pairing_complete is not None:
-            try:
-                await self._on_pairing_complete()
-            except Exception:
-                LOG.exception("browser extension pairing-complete callback failed")
+    async def _call_on_pairing_complete(self) -> dict[str, str] | None:
+        if self._on_pairing_complete is None:
+            return None
+        try:
+            return await self._on_pairing_complete()
+        except Exception:
+            LOG.exception("browser extension pairing-complete callback failed")
+            return None
 
     def _pop_pending(self, request_id: str) -> asyncio.Future[dict] | None:
         future = self._pending.pop(request_id, None)

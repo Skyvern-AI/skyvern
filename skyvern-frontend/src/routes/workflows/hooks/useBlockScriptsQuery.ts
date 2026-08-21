@@ -6,6 +6,7 @@ import { ScriptBlocksResponse } from "../types/scriptTypes";
 type Props = {
   cacheKey?: string;
   cacheKeyValue?: string;
+  enabled?: boolean;
   workflowPermanentId?: string;
   pollIntervalMs?: number;
   status?: "pending" | "published";
@@ -15,6 +16,7 @@ type Props = {
 function useBlockScriptsQuery({
   cacheKey,
   cacheKeyValue,
+  enabled = true,
   workflowPermanentId,
   pollIntervalMs,
   status,
@@ -49,7 +51,7 @@ function useBlockScriptsQuery({
       }
       return Math.max(2000, pollIntervalMs);
     },
-    enabled: !!workflowPermanentId,
+    enabled: enabled && !!workflowPermanentId,
   });
 }
 

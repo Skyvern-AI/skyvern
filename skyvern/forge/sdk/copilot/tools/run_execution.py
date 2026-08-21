@@ -63,6 +63,8 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
+    _blocks_by_label,
+    block_shape_hashes_by_label,
 )
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
@@ -166,8 +168,6 @@ from .credentials import (
     _server_verified_google_account_choices,
 )
 from .frontier import (
-    _blocks_by_label,
-    _frontier_label_shape_hashes,
     _workflow_with_runtime_block_goal_context,
     _workflow_with_runtime_frontier_anchor,
     _workflow_with_runtime_frontier_starter_url_seed,
@@ -802,26 +802,6 @@ async def _watchdog_error_message(
     return message
 
 
-def _watchdog_user_failure_reason(
-    exit_reason: WatchdogExitReason,
-    workflow_run_id: str,
-    budget_seconds: int,
-    run: WorkflowRun | None,
-) -> str:
-    if exit_reason == "paused":
-        return "The run is paused, waiting for a person to approve or reject it."
-    if exit_reason == "stagnation":
-        body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
-    elif exit_reason == "per_tool_budget":
-        body = f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
-    elif exit_reason == "ceiling":
-        body = f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
-    else:
-        status = f" Last observed status: {run.status}." if run is not None else ""
-        body = "The run ended before recording a trustworthy terminal status." + status
-    return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
-
-
 def _watchdog_user_facing_summary(
     exit_reason: WatchdogExitReason,
     budget_seconds: int,
@@ -832,12 +812,28 @@ def _watchdog_user_facing_summary(
     if exit_reason == "paused":
         return "The run is paused, waiting for a person to approve or reject it."
     if exit_reason == "per_tool_budget":
-        return f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+        return (
+            f"The run was still making progress but ran longer than the {budget_seconds}s "
+            "allowed for a single step, so it was stopped."
+        )
     if exit_reason == "ceiling":
         return f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
     if run is not None:
         return f"The run ended before recording a trustworthy terminal status. Last observed status: {run.status}."
     return "The run ended before recording a trustworthy terminal status."
+
+
+def _per_tool_budget_failure_category(budget_seconds: int) -> dict[str, Any]:
+    # Stable entry so consecutive budget trips hash to the same streak signature; the
+    # run id in ``error_msg`` would otherwise make every trip unique.
+    return {
+        "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+        "confidence_float": 1.0,
+        "reasoning": (
+            f"The run was making progress but ran past the {budget_seconds}s "
+            "allowed for a single step, so it cannot fit in one call."
+        ),
+    }
 
 
 def _workflow_covers_labels(workflow: Workflow | None, labels: list[str]) -> bool:
@@ -933,6 +929,13 @@ def _runtime_code_security_failure_for_selected_labels(
     }
 
 
+_INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON = (
+    "This test run uses a credential that is set to be used by one run at a time, and the copilot's "
+    "in-process test run cannot hold that ordering. The run stopped instead of using the credential "
+    "alongside another run."
+)
+
+
 def _inline_sequential_credential_fence_failure(
     *,
     workflow_run_id: str,
@@ -950,14 +953,14 @@ def _inline_sequential_credential_fence_failure(
     # through the executor (stamped queued_at, gated), so it is exempt.
     if dispatch_to_worker or not sequential_credential_id:
         return None
-    failure_reason = str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id))
     return {
         "ok": False,
-        "error": failure_reason,
+        "error": str(CopilotInlineSequentialCredentialUnsupported(workflow_run_id)),
         "data": {
             "workflow_run_id": workflow_run_id,
             "overall_status": "failed",
-            "failure_reason": failure_reason,
+            "failure_reason": _INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON,
+            "user_facing_summary": _INLINE_SEQUENTIAL_CREDENTIAL_USER_REASON,
             "requested_block_labels": list(block_labels),
             "executed_block_labels": [],
             "planned_block_labels": list(labels_to_execute),
@@ -1899,7 +1902,9 @@ async def _run_blocks_and_collect_debug(
             debug_session_id=debug_session_id,
         )
     else:
-        session_err = await ensure_browser_session(ctx)
+        # This id is dispatched into a workflow run without ever being attached here, so an
+        # unverified session cannot be discovered later and must fail now instead.
+        session_err = await ensure_browser_session(ctx, require_verified_session=True)
         if session_err is not None:
             return session_err
         run_session_id = ctx.browser_session_id
@@ -2267,9 +2272,6 @@ async def _run_blocks_and_collect_debug(
                 error_msg = await _watchdog_error_message(
                     exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds, dispatch_to_worker
                 )
-                user_failure_reason = _watchdog_user_failure_reason(
-                    exit_reason, workflow_run.workflow_run_id, budget_seconds, run
-                )
                 user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
                 # Dispatched runs: the worker owns the run session, so do not attach to it over CDP.
                 current_url, page_title = (
@@ -2283,7 +2285,7 @@ async def _run_blocks_and_collect_debug(
                     "data": {
                         "workflow_run_id": workflow_run.workflow_run_id,
                         "overall_status": run.status if run is not None else None,
-                        "failure_reason": user_failure_reason,
+                        "failure_reason": user_facing_summary,
                         "current_url": current_url,
                         "page_title": page_title,
                         # Omitting this reads downstream as "run session unknown", which grants a
@@ -2307,19 +2309,7 @@ async def _run_blocks_and_collect_debug(
                 }
                 result["data"]["user_facing_summary"] = user_facing_summary
                 if exit_reason == "per_tool_budget":
-                    # Stable failure_categories entry so consecutive budget trips
-                    # hash to the same streak signature; without it the run_id in
-                    # ``error_msg`` would make every trip unique.
-                    result["data"]["failure_categories"] = [
-                        {
-                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
-                            "confidence_float": 1.0,
-                            "reasoning": (
-                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
-                                "the run was making progress but cannot fit in a single tool call."
-                            ),
-                        }
-                    ]
+                    result["data"]["failure_categories"] = [_per_tool_budget_failure_category(budget_seconds)]
                 if run_cancelled_by_watchdog:
                     result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
                 return result
@@ -3283,7 +3273,7 @@ def _record_build_test_outcome(
         else (result_requested_block_labels if isinstance(result_requested_block_labels, list) else [])
     )
     requested_block_labels = [label for label in raw_requested_values if isinstance(label, str)]
-    block_shape_hashes = _frontier_label_shape_hashes(
+    block_shape_hashes = block_shape_hashes_by_label(
         requested_block_labels,
         workflow_definition,
     )
@@ -3304,7 +3294,7 @@ def _record_build_test_outcome(
                 workflow_yaml,
                 code_artifact_metadata,
             ),
-            block_shape_hashes=block_shape_hashes or {},
+            block_shape_hashes=block_shape_hashes,
         ),
     )
 
@@ -3357,6 +3347,11 @@ async def _send_run_outcome_update(
         return
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    browser_session_id = data.get("browser_session_id") if isinstance(data, dict) else None
+    overall_status = data.get("overall_status") if isinstance(data, dict) else None
+    control_signal = data.get("control_signal") if isinstance(data, dict) else None
+    control_kind = control_signal.get("kind") if isinstance(control_signal, dict) else None
+    terminal_disposition = control_kind if isinstance(control_kind, str) else overall_status
     narrator_state = getattr(copilot_ctx, "narrator_state", None)
     iteration = narrator_state.current_iteration if narrator_state is not None else 0
     try:
@@ -3370,6 +3365,12 @@ async def _send_run_outcome_update(
                 role=role,
                 reason_code=reason_code,
                 display_reason=display_reason,
+                browser_session_id=browser_session_id if isinstance(browser_session_id, str) else None,
+                workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+                turn_id=copilot_ctx.turn_id,
+                workflow_copilot_chat_id=copilot_ctx.workflow_copilot_chat_id,
+                continuity_source="workflow_run",
+                terminal_disposition=terminal_disposition if isinstance(terminal_disposition, str) else None,
                 iteration=iteration,
                 timestamp=datetime.now(timezone.utc),
             )

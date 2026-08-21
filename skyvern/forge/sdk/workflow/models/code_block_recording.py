@@ -104,7 +104,7 @@ class CodeBlockActionRecording:
         self.recording_page = RecordingPage(
             page,
             on_action=self._recorded_action_sink,
-            on_pending_action=self._navigation_still_pending,
+            on_pending_action=self._page_call_still_pending,
             credential_release_guard=credential_release_guard,
         )
 
@@ -121,13 +121,13 @@ class CodeBlockActionRecording:
     def last_recorded_exception(self) -> BaseException | None:
         return self.recording_page.last_recorded_exception()
 
-    async def _navigation_still_pending(self, pending_action: PendingAction) -> None:
+    async def _page_call_still_pending(self, pending_action: PendingAction) -> None:
         LOG.warning(
-            "codeblock.navigation_still_pending",
+            "codeblock.page_call_still_pending",
             workflow_run_id=self._workflow_run_id,
             workflow_run_block_id=self._workflow_run_block_id,
             block_label=self._code_block.label,
-            action_type=pending_action.action_type.value,
+            action_type=pending_action.action_type.value if pending_action.action_type is not None else None,
             action_order=pending_action.action_order,
             code_line=pending_action.code_line,
             call_name=pending_action.call_name,

@@ -487,9 +487,11 @@ export function parseGoogleConnectionNotices(
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
+  "edit_block_and_run",
 ]);
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
+  "edit_block_and_run",
   "run_blocks_and_collect_debug",
 ]);
 
@@ -505,6 +507,7 @@ const ACTIVITY_TOOL_DENYLIST = new Set([
 const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   update_workflow: "Updating workflow",
   update_and_run_blocks: "Testing workflow",
+  edit_block_and_run: "Editing and testing block",
   run_blocks_and_collect_debug: "Testing workflow",
   evaluate: "Inspecting page",
   click: "Interacting with page",

@@ -574,11 +574,13 @@ async def _navigate_post_hook(
             result_url=result["url"],
         )
         await _bind_login_credential_for_observed_url(ctx, result["url"], result)
+        staged = await _capture_post_interaction_screenshot(ctx)
+        attached = " A screenshot is attached." if staged else ""
         result["next_step"] = (
-            "Page loaded, and a screenshot of it is attached. Use evaluate or "
-            "inspect_page_for_composition when you need the page's structure or selectors "
-            "before responding."
+            f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
+            "page's structure or selectors before responding."
         )
+    else:
         await _capture_post_interaction_screenshot(ctx)
     return result
 
@@ -729,7 +731,10 @@ async def _click_post_hook(
                     "The page observation did not change after the click; no post-click page evidence was attached."
                 ),
             }
-    await _capture_post_interaction_screenshot(ctx)
+    # Fresh page evidence already described the change, so the round-trip buys little. Accepted
+    # cost: a blocker only a frame can show goes unseen until the next action fails and captures.
+    if ctx.last_scout_act_observe_outcome != "attached":
+        await _capture_post_interaction_screenshot(ctx)
     return result
 
 
@@ -796,7 +801,10 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
         return None, None
     try:
         result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_evaluate", {"expression": scout_control_state_expression(selector)}),
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": scout_control_state_expression(selector), "verbosity": "full"},
+            ),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -810,49 +818,38 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
     return bool(state.get("readonly")), bool(state.get("disabled"))
 
 
-def _significant_character_count(value: str) -> int:
-    return sum(1 for character in value if character.isalnum())
+class ScoutReadbackOutcome(StrEnum):
+    """Factual readback outcome: what was observed in the field, not a verdict about where it belongs."""
 
-
-class ScoutTypeVerdict(StrEnum):
-    """What a fill did to the field, decided by whoever still holds the value that was typed."""
-
-    LANDED = "landed"
+    EXACT_MATCH = "exact_match"
     EMPTY = "empty"
-    MISMATCH = "mismatch"
-    UNKNOWN = "unknown"
+    DIFFERENT = "different"
+    UNAVAILABLE = "unavailable"
 
 
-def _scout_type_verdict(readback: str | None, typed_length: int) -> ScoutTypeVerdict:
-    """Classify a field readback against the length that was typed into it.
-
-    Only sound for a readback taken from the page itself. A value read back through the tool
-    layer has any registered secret replaced by a placeholder, so its length describes the
-    scrubber, not the field — see `GOTCHAS.md` §28.
+def _scout_readback_outcome(readback: str | None, typed_value: str) -> ScoutReadbackOutcome:
+    """Report the factual readback outcome for a fill, sound only for a readback taken from the page
+    itself: a value read back through the tool layer has any registered secret replaced by a
+    placeholder, so its content describes the scrubber and not the field (`GOTCHAS.md` §28).
     """
     if not isinstance(readback, str):
-        return ScoutTypeVerdict.UNKNOWN
+        return ScoutReadbackOutcome.UNAVAILABLE
+    # Equality is tested first so a typed value that is itself blank and lands exactly reads as a
+    # match rather than as the empty field the fill lost.
+    if readback == typed_value:
+        return ScoutReadbackOutcome.EXACT_MATCH
     if readback.strip() == "":
-        return ScoutTypeVerdict.EMPTY
-    # A field holding more than was typed means the text joined a value already there — a re-render
-    # can move a selector onto a neighbouring input, so a second fill appends to the wrong field and
-    # leaves the intended one empty. Count only alphanumerics: a phone/card/date input that inserts
-    # its own separators grows past the typed length without anything having landed in the wrong
-    # field, and rejecting those would fail every auto-formatting form.
-    if _significant_character_count(readback) > typed_length:
-        return ScoutTypeVerdict.MISMATCH
-    return ScoutTypeVerdict.LANDED
+        return ScoutReadbackOutcome.EMPTY
+    return ScoutReadbackOutcome.DIFFERENT
 
 
 def _scout_type_landing_failure(
-    verdict: ScoutTypeVerdict,
+    outcome: ScoutReadbackOutcome,
     *,
     tool_name: str,
     selector: str,
-    typed_length: int,
-    significant_count: int,
 ) -> dict[str, Any] | None:
-    if verdict is ScoutTypeVerdict.EMPTY:
+    if outcome is ScoutReadbackOutcome.EMPTY:
         return {
             "ok": False,
             "error": (
@@ -860,17 +857,6 @@ def _scout_type_landing_failure(
                 f"Re-inspect the current page and retry {tool_name} on the target field. "
                 "If an overlay (cookie/marketing popup) consumed the focus, the first "
                 "interaction usually dismisses it."
-            ),
-        }
-    if verdict is ScoutTypeVerdict.MISMATCH:
-        return {
-            "ok": False,
-            "error": (
-                f"{tool_name} landed in a field that already held a value: {selector!r} now holds "
-                f"{significant_count} characters after typing {typed_length}. The selector "
-                "likely resolved to a different input than intended, leaving the target field empty. "
-                "Re-inspect the current page, confirm which input each value belongs in, clear the field, "
-                f"and retry {tool_name}."
             ),
         }
     return None
@@ -912,13 +898,13 @@ async def _verify_scout_type_landed(
         # transiently empty; settle briefly and re-read once before declaring the type lost.
         await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
         value = await _read_scout_field_value(ctx, selector)
-    return _scout_type_landing_failure(
-        _scout_type_verdict(value, typed_length),
-        tool_name="type_text",
-        selector=selector,
-        typed_length=typed_length,
-        significant_count=_significant_character_count(value) if isinstance(value, str) else 0,
-    )
+    if isinstance(value, str) and value.strip() == "":
+        return _scout_type_landing_failure(
+            ScoutReadbackOutcome.EMPTY,
+            tool_name="type_text",
+            selector=selector,
+        )
+    return None
 
 
 async def _type_text_post_hook(

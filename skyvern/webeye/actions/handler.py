@@ -75,6 +75,8 @@ from skyvern.exceptions import (
     NoSuitableAutoCompleteOption,
     NoTOTPSecretFound,
     OptionIndexOutOfBound,
+    PhoneNumberInputBrowserInteractionFailed,
+    PhoneNumberInputBrowserValidityMismatch,
     PhoneNumberInputMismatch,
     SecretInputMismatch,
     SkyvernException,
@@ -198,6 +200,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    is_element_detached_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
@@ -212,6 +215,14 @@ from skyvern.webeye.utils.page import (
 )
 
 LOG = structlog.get_logger()
+_DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
+    MissingElement,
+    MultipleElementsFound,
+    LLMProviderError,
+    ImaginarySecretValue,
+    CaptchaSolveError,
+    asyncio.TimeoutError,
+)
 
 
 async def _totp_window_sleep(delay: float) -> None:
@@ -1968,15 +1979,30 @@ async def check_phone_number_format(
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
-        action=action,
         element_id=skyvern_element.get_id(),
-        recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
+        source_digit_count=len(_phone_digits(value)),
+        recommended_digit_count=len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
+        digit_count_changed=len(_phone_digits(value))
+        != len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
     )
     return check_phone_number_format_response.recommended_phone_number
 
 
 def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
+
+
+def _input_target_log_fields(*, is_tel: bool, text: str) -> dict[str, str | int]:
+    if is_tel:
+        return {"target_digit_count": len(_phone_digits(text))}
+    return {"target_value": text}
+
+
+def _browser_error_log_fields(exc: Exception, *, is_tel: bool) -> dict[str, str]:
+    fields = {"error_type": type(exc).__name__}
+    if not is_tel:
+        fields["error_message"] = str(exc)
+    return fields
 
 
 def _phone_readback_digits_match(
@@ -2228,6 +2254,14 @@ async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
     )
 
 
+async def _probe_tel_browser_validity(locator: Locator) -> bool | None:
+    try:
+        result = await locator.evaluate("(element) => element.validity?.valid ?? null")
+    except Exception:
+        return None
+    return result if isinstance(result, bool) else None
+
+
 async def verify_phone_input_digits(
     *,
     tag_name: str,
@@ -2237,7 +2271,7 @@ async def verify_phone_input_digits(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
+) -> int:
     # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator, engine_selection=engine_selection)
     expected_digits = _phone_digits(expected_value)
@@ -2262,6 +2296,7 @@ async def verify_phone_input_digits(
         expected_digit_count=len(expected_digits),
         actual_digit_count=len(actual_digits),
     )
+    return len(actual_digits)
 
 
 async def _verify_tel_input_after_fill(
@@ -2273,8 +2308,8 @@ async def _verify_tel_input_after_fill(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
-    await verify_phone_input_digits(
+) -> int:
+    return await verify_phone_input_digits(
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
@@ -2294,7 +2329,15 @@ async def _fill_nanp_tel_with_readback(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> PhoneNumberInputMismatch | None:
+    outcome: actions.TelInputOutcome | None = None,
+    enforce_browser_validity: bool = False,
+) -> (
+    PhoneNumberInputMismatch
+    | PhoneNumberInputBrowserValidityMismatch
+    | PhoneNumberInputBrowserInteractionFailed
+    | InvalidElementForTextInput
+    | None
+):
     """Fill affirmative NANP digits and verify every attempt.
     Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
     """
@@ -2303,14 +2346,25 @@ async def _fill_nanp_tel_with_readback(
         attempts.append(("atomic_e164", e164_fallback))
 
     for attempt_index, (strategy, value) in enumerate(attempts):
-        if strategy == "sequential_national":
-            await skyvern_element.input_sequentially(text=value)
-        else:
-            await skyvern_element.input_clear()
-            await skyvern_element.input_fill(text=value)
+        strategy_enum = actions.TelInputStrategy(strategy)
+        if outcome is not None:
+            outcome.strategy = strategy_enum
+            outcome.attempt_count = attempt_index + 1
 
         try:
-            await _verify_tel_input_after_fill(
+            if strategy == "sequential_national":
+                await skyvern_element.input_sequentially(text=value)
+            else:
+                await skyvern_element.input_clear()
+                await skyvern_element.input_fill(text=value)
+        except InvalidElementForTextInput as exc:
+            return exc
+        except Exception as exc:
+            LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+            return PhoneNumberInputBrowserInteractionFailed()
+
+        try:
+            actual_digit_count = await _verify_tel_input_after_fill(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=national_digits,
@@ -2320,6 +2374,10 @@ async def _fill_nanp_tel_with_readback(
                 engine_selection=engine_selection,
             )
         except PhoneNumberInputMismatch as mismatch:
+            browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if outcome is not None:
+                outcome.actual_digit_count = mismatch.actual_digit_count
+                outcome.browser_valid = browser_valid
             if attempt_index == len(attempts) - 1:
                 return mismatch
             LOG.info(
@@ -2330,8 +2388,30 @@ async def _fill_nanp_tel_with_readback(
                 expected_digit_count=mismatch.expected_digit_count,
                 actual_digit_count=mismatch.actual_digit_count,
             )
-        else:
-            return None
+            continue
+        except InvalidElementForTextInput as exc:
+            return exc
+        except Exception as exc:
+            LOG.warning("Phone input read-back failed", error_type=type(exc).__name__)
+            return PhoneNumberInputBrowserInteractionFailed()
+
+        browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+        if outcome is not None:
+            outcome.actual_digit_count = actual_digit_count
+            outcome.browser_valid = browser_valid
+        if enforce_browser_validity and browser_valid is False:
+            if attempt_index == len(attempts) - 1:
+                return PhoneNumberInputBrowserValidityMismatch()
+            LOG.info(
+                "Phone input failed browser validity; trying next fill strategy",
+                element_id=skyvern_element.get_id(),
+                failed_strategy=strategy,
+                next_strategy=attempts[attempt_index + 1][0],
+                expected_digit_count=len(_phone_digits(national_digits)),
+                actual_digit_count=actual_digit_count,
+            )
+            continue
+        return None
     return None
 
 
@@ -2343,16 +2423,16 @@ async def _log_tel_fallback_fill_digit_counts(
     task_id: str | None,
     step_id: str | None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
+) -> tuple[int, int | None]:
     # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
     # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+    expected_digit_count = len(_phone_digits(expected_value))
     try:
         actual_value = await get_input_value(
             tag_name=tag_name,
             locator=skyvern_element.get_locator(),
             engine_selection=engine_selection,
         )
-        expected_digit_count = len(_phone_digits(expected_value))
         actual_digit_count = len(_phone_digits(actual_value))
         LOG.info(
             "Tel fallback fill digit counts",
@@ -2363,13 +2443,15 @@ async def _log_tel_fallback_fill_digit_counts(
             task_id=task_id,
             step_id=step_id,
         )
-    except Exception:
+        return expected_digit_count, actual_digit_count
+    except Exception as exc:
         LOG.warning(
             "Failed to read back tel fallback fill",
             task_id=task_id,
             step_id=step_id,
-            exc_info=True,
+            error_type=type(exc).__name__,
         )
+        return expected_digit_count, None
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -4384,6 +4466,7 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        action.tel_input_outcome = None
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
         LOG.info(
             "Handling action",
@@ -4499,6 +4582,8 @@ class ActionHandler:
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
+
+            _emit_tel_input_outcome(action, actions_result)
 
             if llm_caller and action.tool_call_id:
                 tool_call_result = {
@@ -5996,6 +6081,40 @@ async def _retarget_wrapper_for_input_text(
     return child_element
 
 
+def _emit_tel_input_outcome(
+    action: actions.Action,
+    results: list[ActionResult],
+    *,
+    exception_type: str | None = None,
+) -> None:
+    outcome = action.tel_input_outcome
+    if outcome is None:
+        return
+
+    try:
+        final_result = results[-1] if results else None
+        if isinstance(final_result, ActionSuccess):
+            terminal_result = ActionStatus.completed.value
+        elif isinstance(final_result, ActionAbort):
+            terminal_result = ActionStatus.skipped.value
+        else:
+            terminal_result = ActionStatus.failed.value
+        if exception_type is None and final_result is not None:
+            exception_type = final_result.exception_type
+        LOG.info(
+            "tel_input_outcome",
+            sampling=False,
+            **outcome.model_dump(mode="json"),
+            terminal_result=terminal_result,
+            exception_type=exception_type,
+        )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            LOG.warning("Failed to emit tel input outcome", error_type=type(exc).__name__)
+    finally:
+        action.tel_input_outcome = None
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -6004,6 +6123,40 @@ async def handle_input_text_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    action.tel_input_outcome = None
+    return await _handle_input_text_action(
+        action=action,
+        page=page,
+        scraped_page=scraped_page,
+        task=task,
+        step=step,
+    )
+
+
+async def handle_input_text_action_direct(
+    action: actions.InputTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    try:
+        results = await handle_input_text_action(action, page, scraped_page, task, step)
+    except Exception as exc:
+        _emit_tel_input_outcome(action, [], exception_type=type(exc).__name__)
+        raise
+    _emit_tel_input_outcome(action, results)
+    return results
+
+
+async def _handle_input_text_action(
+    action: actions.InputTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    initial_action_target_id = action.element_id
     if not action.element_id:
         # This is a CUA type action
         text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
@@ -6080,15 +6233,53 @@ async def handle_input_text_action(
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
-
-    current_text = await get_input_value(
-        skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
-    )
-    if not is_totp_value and current_text == current_text_target:
-        return [ActionSuccess()]
-
-    # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
+    is_tel = await skyvern_element.get_attr("type") == "tel"
+    candidate_card_digits = _card_number_digits(text)
+    is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
+        skyvern_element
+    )
+    phone_bearing = is_tel and not is_card_number_input
+    tel_fix_enabled: bool | None = None
+    tel_source_text: str | None = None
+    tel_outcome = action.tel_input_outcome
+    if is_tel and not is_card_number_input:
+        tel_source_text = text
+        tel_fix_enabled = await _is_tel_digit_fix_enabled(task)
+        tel_outcome = actions.TelInputOutcome(
+            flag_enabled=tel_fix_enabled,
+            final_element_id=skyvern_element.get_id(),
+            strategy=actions.TelInputStrategy.legacy_sequential,
+            expected_digit_count=len(_phone_digits(tel_source_text)),
+            attempt_count=0,
+            retargeted=skyvern_element.get_id() != initial_action_target_id,
+        )
+        action.tel_input_outcome = tel_outcome
+
+    try:
+        current_text = await get_input_value(
+            skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
+        )
+    except Exception as exc:
+        if phone_bearing:
+            LOG.warning("Phone input read-back failed", error_type=type(exc).__name__)
+            return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+        raise
+    if not is_totp_value and current_text == current_text_target:
+        if tel_outcome is not None:
+            tel_outcome.actual_digit_count = len(_phone_digits(current_text))
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if tel_outcome.flag_enabled and tel_outcome.browser_valid is False:
+                pattern = await skyvern_element.get_attr("pattern")
+                _, eligible_bare_nanp, _ = _plan_tel_text(
+                    is_tel=True,
+                    is_secret=is_secret_value,
+                    value=tel_source_text or text,
+                    pattern=pattern,
+                )
+                if eligible_bare_nanp:
+                    return [ActionFailure(PhoneNumberInputBrowserValidityMismatch())]
+        return [ActionSuccess()]
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if not await SkyvernElement.wait_until_enabled(skyvern_element):
@@ -6342,41 +6533,16 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
-    is_tel = await skyvern_element.get_attr("type") == "tel"
-    candidate_card_digits = _card_number_digits(text)
-    is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
-        skyvern_element
-    )
     used_bare_nanp = False
     run_phone_format_check = False
-    log_tel_fallback_readback = False
     tel_pattern: str | None = None
     tel_maxlength: str | None = None
     tel_e164_fallback: str | None = None
-    tel_source_text: str | None = None
-    if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
-        # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
-        # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
-        # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
-        tel_source_text = text
-        tel_pattern = await skyvern_element.get_attr("pattern")
-        tel_maxlength = await skyvern_element.get_attr("maxlength")
-        tel_e164_fallback = _nanp_e164_fallback(text, pattern=tel_pattern, maxlength=tel_maxlength)
-        text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
-            is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
-        )
-        log_tel_fallback_readback = run_phone_format_check
-        if used_bare_nanp:
-            LOG.info(
-                "Tel bare-digit fill using national digits",
-                used_bare_nanp=True,
-                expected_digit_count=len(text),
-                element_id=skyvern_element.get_id(),
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-    elif is_tel and not is_card_number_input and not is_secret_value:
+
+    if is_tel and not is_card_number_input and tel_fix_enabled is False and not is_secret_value:
         run_phone_format_check = True
+        if tel_outcome is not None:
+            tel_outcome.strategy = actions.TelInputStrategy.legacy_sequential
     if run_phone_format_check:
         try:
             action.set_has_mini_agent()
@@ -6388,13 +6554,11 @@ async def handle_input_text_action(
                 task=task,
                 step=step,
             )
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "Failed to check the phone number format, using the original text",
-                action=action,
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
-
     await _apply_secret_visual_mask_if_needed(
         skyvern_element,
         workflow_run_id=task.workflow_run_id,
@@ -6407,13 +6571,86 @@ async def handle_input_text_action(
     # we need find a better way to detect the attribute in the future
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name.lower():
+        if tel_outcome is not None and is_tel and tel_outcome.flag_enabled:
+            assert tel_source_text is not None
+            tel_pattern = await skyvern_element.get_attr("pattern")
+            tel_maxlength = await skyvern_element.get_attr("maxlength")
+            tel_e164_fallback = _nanp_e164_fallback(
+                tel_source_text,
+                pattern=tel_pattern,
+                maxlength=tel_maxlength,
+            )
+            text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
+                is_tel=True,
+                is_secret=is_secret_value,
+                value=tel_source_text,
+                pattern=tel_pattern,
+            )
+            if used_bare_nanp:
+                tel_outcome.strategy = actions.TelInputStrategy.sequential_national
+                phone_mismatch = await _fill_nanp_tel_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    national_digits=text,
+                    e164_fallback=tel_e164_fallback,
+                    pattern=tel_pattern,
+                    maxlength=tel_maxlength,
+                    engine_selection=engine_selection,
+                    outcome=tel_outcome,
+                    enforce_browser_validity=True,
+                )
+                if phone_mismatch is not None:
+                    if isinstance(phone_mismatch, PhoneNumberInputMismatch):
+                        LOG.warning(
+                            "Phone input read-back mismatch after retry",
+                            element_id=skyvern_element.get_id(),
+                            expected_digit_count=phone_mismatch.expected_digit_count,
+                            actual_digit_count=phone_mismatch.actual_digit_count,
+                        )
+                    return [ActionFailure(phone_mismatch)]
+                return [ActionSuccess()]
+            tel_outcome.strategy = actions.TelInputStrategy.formatted_sequential
+            if run_phone_format_check:
+                try:
+                    action.set_has_mini_agent()
+                    text = await check_phone_number_format(
+                        value=text,
+                        action=action,
+                        skyvern_element=skyvern_element,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to check the phone number format, using the original text",
+                        error_type=type(exc).__name__,
+                    )
         if is_totp_value:
             try:
                 text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
             _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
-        await skyvern_element.press_fill(text=text)
+        try:
+            await skyvern_element.press_fill(text=text)
+        except Exception as exc:
+            if phone_bearing:
+                LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+                return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+            raise
+        if tel_outcome is not None and is_tel:
+            expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                expected_value=tel_source_text or text,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                engine_selection=engine_selection,
+            )
+            tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
+            tel_outcome.actual_digit_count = actual_digit_count
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
         return [ActionSuccess()]
 
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
@@ -6430,6 +6667,9 @@ async def handle_input_text_action(
         try:
             await skyvern_element.input_clear()
         except Exception as exc:
+            if phone_bearing:
+                LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+                return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
             if _is_selected_engine_timeout(exc, engine_selection):
                 LOG.info("None input tag clear timeout", action=action)
             else:
@@ -6442,42 +6682,117 @@ async def handle_input_text_action(
                 )
             ]
 
-    # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
+    retargeted = skyvern_element.get_id() != initial_action_target_id
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
         )
-        if blocking_element and exist:
+        if blocking_element and exist and await blocking_element.is_editable():
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            if await blocking_element.is_editable():
-                skyvern_element = blocking_element
-                tag_name = blocking_element.get_tag_name()
-                # The fill/type gate below reads is_tel from the element actually being filled; re-derive it
-                # from the blocker so a retarget to a different type cannot pick the wrong write strategy.
-                is_tel = await skyvern_element.get_attr("type") == "tel"
-                if used_bare_nanp:
-                    # The tel plan read constraints from the original element; re-derive them from
-                    # the element actually being filled.
-                    tel_pattern = await skyvern_element.get_attr("pattern")
-                    tel_maxlength = await skyvern_element.get_attr("maxlength")
-                    tel_e164_fallback = _nanp_e164_fallback(
-                        tel_source_text or "", pattern=tel_pattern, maxlength=tel_maxlength
-                    )
-                await _apply_secret_visual_mask_if_needed(
-                    skyvern_element,
-                    workflow_run_id=task.workflow_run_id,
-                    is_secret_value=is_secret_value,
-                    is_totp_value=is_totp_value,
-                    is_totp_sequence=is_multi_field_totp,
-                )
+            skyvern_element = blocking_element
+            tag_name = blocking_element.get_tag_name().lower()
+            retargeted = True
+            is_tel = await skyvern_element.get_attr("type") == "tel"
+            is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
+                skyvern_element
+            )
+            phone_bearing = is_tel and not is_card_number_input
+            await _apply_secret_visual_mask_if_needed(
+                skyvern_element,
+                workflow_run_id=task.workflow_run_id,
+                is_secret_value=is_secret_value,
+                is_totp_value=is_totp_value,
+                is_totp_sequence=is_multi_field_totp,
+            )
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
             exc_info=True,
         )
+
+    if is_card_number_input:
+        if tel_outcome is not None:
+            text = tel_source_text or text
+            action.tel_input_outcome = None
+            tel_outcome = None
+            tel_fix_enabled = None
+            tel_source_text = None
+        used_bare_nanp = False
+        run_phone_format_check = False
+        tel_pattern = None
+        tel_maxlength = None
+        tel_e164_fallback = None
+    elif not is_tel:
+        if tel_outcome is not None:
+            text = tel_source_text or text
+            action.tel_input_outcome = None
+            tel_outcome = None
+            tel_fix_enabled = None
+            tel_source_text = None
+        used_bare_nanp = False
+        run_phone_format_check = False
+        tel_pattern = None
+        tel_maxlength = None
+        tel_e164_fallback = None
+    else:
+        if tel_outcome is None:
+            tel_source_text = text
+            tel_fix_enabled = await _is_tel_digit_fix_enabled(task)
+            tel_outcome = actions.TelInputOutcome(
+                flag_enabled=tel_fix_enabled,
+                final_element_id=skyvern_element.get_id(),
+                strategy=actions.TelInputStrategy.legacy_sequential,
+                expected_digit_count=len(_phone_digits(tel_source_text)),
+                attempt_count=0,
+                retargeted=retargeted,
+            )
+            action.tel_input_outcome = tel_outcome
+        else:
+            tel_outcome.final_element_id = skyvern_element.get_id()
+            tel_outcome.retargeted = retargeted
+
+        if tel_fix_enabled:
+            assert tel_source_text is not None
+            tel_pattern = await skyvern_element.get_attr("pattern")
+            tel_maxlength = await skyvern_element.get_attr("maxlength")
+            tel_e164_fallback = _nanp_e164_fallback(tel_source_text, pattern=tel_pattern, maxlength=tel_maxlength)
+            text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
+                is_tel=True,
+                is_secret=is_secret_value,
+                value=tel_source_text,
+                pattern=tel_pattern,
+            )
+            if used_bare_nanp:
+                tel_outcome.strategy = actions.TelInputStrategy.sequential_national
+                LOG.info(
+                    "Tel bare-digit fill using national digits",
+                    used_bare_nanp=True,
+                    expected_digit_count=len(text),
+                    element_id=skyvern_element.get_id(),
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+            else:
+                tel_outcome.strategy = actions.TelInputStrategy.formatted_sequential
+            if run_phone_format_check:
+                try:
+                    action.set_has_mini_agent()
+                    text = await check_phone_number_format(
+                        value=text,
+                        action=action,
+                        skyvern_element=skyvern_element,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to check the phone number format, using the original text",
+                        error_type=type(exc).__name__,
+                    )
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
@@ -6658,14 +6973,17 @@ async def handle_input_text_action(
                     pattern=tel_pattern,
                     maxlength=tel_maxlength,
                     engine_selection=engine_selection,
+                    outcome=tel_outcome,
+                    enforce_browser_validity=tel_fix_enabled is True,
                 )
                 if phone_mismatch is not None:
-                    LOG.warning(
-                        "Phone input read-back mismatch after retry",
-                        element_id=skyvern_element.get_id(),
-                        expected_digit_count=phone_mismatch.expected_digit_count,
-                        actual_digit_count=phone_mismatch.actual_digit_count,
-                    )
+                    if isinstance(phone_mismatch, PhoneNumberInputMismatch):
+                        LOG.warning(
+                            "Phone input read-back mismatch after retry",
+                            element_id=skyvern_element.get_id(),
+                            expected_digit_count=phone_mismatch.expected_digit_count,
+                            actual_digit_count=phone_mismatch.actual_digit_count,
+                        )
                     return [ActionFailure(phone_mismatch)]
             elif verify_secret_input:
                 secret_failure = await _fill_secret_with_readback(
@@ -6716,15 +7034,18 @@ async def handle_input_text_action(
                     )
                     if isinstance(truncation_failure, ActionFailure):
                         return [truncation_failure]
-                if log_tel_fallback_readback:
-                    await _log_tel_fallback_fill_digit_counts(
+                if tel_outcome is not None and is_tel and not verify_tel_input_after_fill:
+                    expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
-                        expected_value=text,
+                        expected_value=tel_source_text or text,
                         task_id=task.task_id,
                         step_id=step.step_id,
                         engine_selection=engine_selection,
                     )
+                    tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
+                    tel_outcome.actual_digit_count = actual_digit_count
+                    tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
@@ -6745,7 +7066,7 @@ async def handle_input_text_action(
                     LOG.info(
                         "Detected target-matching dropdown after search-bar input; attempting custom selection",
                         element_id=skyvern_element.get_id(),
-                        target_value=text,
+                        **_input_target_log_fields(is_tel=phone_bearing, text=text),
                     )
                     action.set_has_mini_agent()
                     select_result = await sequentially_select_from_dropdown(
@@ -6787,7 +7108,7 @@ async def handle_input_text_action(
                     LOG.info(
                         "Detected target-matching option after typing into an invalid combobox; committing selection",
                         element_id=skyvern_element.get_id(),
-                        target_value=text,
+                        **_input_target_log_fields(is_tel=phone_bearing, text=text),
                     )
                     action.set_has_mini_agent()
                     select_result = await sequentially_select_from_dropdown(
@@ -6849,14 +7170,12 @@ async def handle_input_text_action(
                     # These are expected during page navigation/auto-submit, silently continue
                     LOG.debug(
                         "Engine error during incremental element processing (likely page navigation)",
-                        error_type=type(inc_error).__name__,
-                        error_message=error_message,
+                        **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                     )
                 else:
                     LOG.warning(
                         "Unexpected engine error during incremental element processing",
-                        error_type=type(inc_error).__name__,
-                        error_message=str(inc_error),
+                        **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                     )
                     raise inc_error
             elif isinstance(inc_error, PlaywrightError):
@@ -6867,28 +7186,43 @@ async def handle_input_text_action(
                 # instead of falling through to a false ActionSuccess.
                 LOG.warning(
                     "Foreign driver error during incremental element processing under a pinned engine",
-                    error_type=type(inc_error).__name__,
-                    error_message=str(inc_error),
+                    **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                 )
                 raise inc_error
             else:
                 # Handle any other unexpected errors during incremental element processing
                 LOG.warning(
                     "Unexpected error during incremental element processing",
-                    error_type=type(inc_error).__name__,
-                    error_message=str(inc_error),
+                    **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                 )
         finally:
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
 
         return [ActionSuccess()]
-    except Exception as e:
-        # Handle any other unexpected errors during text input
-
+    except (SkyvernPageAnalysisTimeout, InvalidElementForTextInput):
+        raise
+    except _DISPATCHER_OWNED_INPUT_EXCEPTIONS:
+        raise
+    except Exception as exc:
+        if phone_bearing:
+            LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+            return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
         LOG.exception("Failed to input the value or finish the auto completion")
-        raise e
+        raise
     finally:
+        if tel_outcome is not None and is_tel and tel_outcome.actual_digit_count is None:
+            try:
+                actual_value = await get_input_value(
+                    tag_name=tag_name,
+                    locator=skyvern_element.get_locator(),
+                    engine_selection=engine_selection,
+                )
+                tel_outcome.actual_digit_count = len(_phone_digits(actual_value))
+            except Exception:
+                pass
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+
         # HACK: force to finish missing auto completion input
         if (
             auto_complete_hacky_flag
@@ -9923,10 +10257,19 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     Native ``<select>`` options live on the element's ``options`` field
     (``[{text, value, optionIndex}, ...]``); the scraper skips their child
     ``<option>`` nodes, so this walker must inspect that field directly.
+    Radio/checkbox-based custom selects (e.g. ``role="radiogroup"``) have no
+    ``<option>``/``<li>`` nodes either; they're recognized the same way
+    ``_custom_select_candidates_from_elements`` recognizes them so a
+    radio-group miss doesn't misreport zero observed options.
     """
     queue: deque[dict] = deque(elements)
     seen: set[str] = set()
     out: list[str] = []
+    # Mirrors _custom_select_candidates_from_elements' covered_choice_input_ids: a <label>
+    # wrapping a radio/checkbox is recorded once via its own label text, so the descendant
+    # input(s) it already covers must be skipped when the BFS reaches them directly — otherwise
+    # a labelled radio's raw `value` attribute is recorded again as an unrelated second entry.
+    covered_choice_input_ids: set[str] = set()
 
     def _record(text: str) -> None:
         if text and text not in seen:
@@ -9940,8 +10283,22 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
         attrs = node.get("attributes") or {}
         role = str(attrs.get("role") or "").lower()
         tag = str(node.get("tagName") or "").lower()
+        input_type = str(attrs.get("type") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
+        # Only compute the descendant walk for <label> nodes (its one consumer below) — calling
+        # it unconditionally for every queued node makes this walker quadratic on large DOMs.
         if role == "option" or tag in ("li", "option"):
             _record(str(node.get("text") or "").strip())
+        elif is_choice_input and element_id in covered_choice_input_ids:
+            pass
+        elif is_choice_input or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES:
+            _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+        elif tag == "label":
+            choice_input_ids, contains_choice_input = _custom_select_descendant_choice_inputs(node)
+            if contains_choice_input:
+                _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+                covered_choice_input_ids.update(choice_input_ids)
         for option in node.get("options") or []:
             if not isinstance(option, dict):
                 continue
@@ -11218,18 +11575,9 @@ async def select_from_emerging_elements(
             use_strict_verification=True,
             settle_outcomes=initial_settles,
         )
-        if verified:
-            final_settle = await _wait_custom_select_render_settle(readback_scope_element or selected_element)
-            if isinstance(final_settle, _CustomSelectRenderSettle):
-                initial_settles.append(final_settle)
-            verified, verification_branch = await _verify_custom_select_option(
-                matched_element=selected_element,
-                readback_scope_element=readback_scope_element,
-                anchor_is_combobox_input=anchor_is_combobox_input,
-                matched_element_id=element_id,
-                matched_label=requested_value,
-                use_strict_verification=True,
-            )
+        # The settle preceding each read-back inside _verify_custom_select_option_with_settle already
+        # spans the render turn on which frameworks reconcile, so a next-render reset lands as a
+        # non-committed read-back there and routes to recovery without a second confirming round.
     except Exception:
         LOG.info(
             "Custom-select primary commit verification exception",
@@ -11970,7 +12318,21 @@ async def scroll_down_to_load_all_options(
         LOG.info("element handle is None, using focus to move the cursor", element_id=scrollable_element.get_id())
         await scrollable_element.get_locator().focus(timeout=timeout)
     else:
-        await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        try:
+            await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        except Exception as exc:
+            if not _is_selected_engine_timeout(exc, skyvern_frame.engine_selection) and not is_element_detached_error(
+                exc
+            ):
+                raise
+            # A detached handle can't be reused below either, so null it out to take the
+            # existing None-handle fallback path for the rest of this function.
+            LOG.info(
+                "Dropdown-menu element detached mid-scroll, falling back to focus",
+                element_id=scrollable_element.get_id(),
+            )
+            await scrollable_element.get_locator().focus(timeout=timeout)
+            dropdown_menu_element_handle = None
 
     await scrollable_element.move_mouse_to_safe(page=page)
 

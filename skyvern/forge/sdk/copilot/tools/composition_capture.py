@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_evidence import (
     CONSENT_OBSTRUCTION_KIND,
     has_bounded_page_schema,
+    has_satisfiable_collapsed_disclosure_path,
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
@@ -460,7 +461,9 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
 
 
 def _composition_capture_settled(evidence: dict[str, Any]) -> bool:
-    return has_bounded_page_schema(evidence) and not challenge_evidence_unsettled(evidence)
+    return (
+        has_bounded_page_schema(evidence) or has_satisfiable_collapsed_disclosure_path(evidence)
+    ) and not challenge_evidence_unsettled(evidence)
 
 
 async def _capture_composition_evidence(

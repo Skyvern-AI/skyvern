@@ -137,7 +137,9 @@ def _credential_deferred_draft_requires_skipped_run(ctx: AgentContext) -> bool:
 
 
 def _update_and_run_requires_skipped_run(ctx: AgentContext, tool_name: str) -> bool:
-    return tool_name == "update_and_run_blocks" and _credential_deferred_draft_requires_skipped_run(ctx)
+    return tool_name in {"update_and_run_blocks", "edit_block_and_run"} and (
+        _credential_deferred_draft_requires_skipped_run(ctx)
+    )
 
 
 def _authority_tool_error(
@@ -165,6 +167,7 @@ def _authority_tool_error(
         tool_name
         in {
             "run_blocks_and_collect_debug",
+            "edit_block_and_run",
             "discover_workflow_entrypoint",
         }
         and isinstance(policy, RequestPolicy)

@@ -57,7 +57,11 @@ def _execute_workflow() -> SimpleNamespace:
         organization_id="o_test",
         generate_script_on_terminal=False,
         model=None,
-        workflow_definition=SimpleNamespace(parameters=[], finally_block_label=None, blocks=[]),
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            finally_block_label=None,
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+        ),
     )
 
 

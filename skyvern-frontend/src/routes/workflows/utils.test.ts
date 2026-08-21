@@ -4,13 +4,18 @@ import {
   ProxyLocation,
   type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
-import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
+import type {
+  Parameter,
+  WorkflowApiResponse,
+  WorkflowParameter,
+} from "./types/workflowTypes";
 import {
   getInitialValues,
   getOrderedRunParameters,
   getRerunNavigationState,
   normalizeJsonParameterFormValue,
   parseJsonWorkflowParameterValue,
+  shouldPollForGeneratedCode,
   validateJsonWorkflowParameterValue,
 } from "./utils";
 
@@ -28,6 +33,42 @@ function buildWorkflowRun(
     ...overrides,
   } as WorkflowRunStatusApiResponseWithWorkflow;
 }
+
+function buildWorkflow(
+  blockLabels: string[],
+  finallyBlockLabel: string | null = null,
+): WorkflowApiResponse {
+  return {
+    workflow_definition: {
+      blocks: blockLabels.map((label) => ({ label })),
+      finally_block_label: finallyBlockLabel,
+    },
+  } as WorkflowApiResponse;
+}
+
+describe("shouldPollForGeneratedCode", () => {
+  it("polls only while an executable workflow can still produce code", () => {
+    expect(shouldPollForGeneratedCode(buildWorkflow([]), false, false)).toBe(
+      false,
+    );
+    expect(
+      shouldPollForGeneratedCode(
+        buildWorkflow(["cleanup"], "cleanup"),
+        false,
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      shouldPollForGeneratedCode(buildWorkflow(["body"]), false, false),
+    ).toBe(true);
+    expect(
+      shouldPollForGeneratedCode(buildWorkflow(["body"]), true, false),
+    ).toBe(false);
+    expect(
+      shouldPollForGeneratedCode(buildWorkflow(["body"]), false, true),
+    ).toBe(false);
+  });
+});
 
 describe("getRerunNavigationState", () => {
   it("maps exactly the six legacy rerun fields", () => {

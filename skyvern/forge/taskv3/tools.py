@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 from typing import Any, Awaitable, Callable
 
 import structlog
 
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
 from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 
@@ -211,10 +214,72 @@ _OBSERVE_JS = (
         if (gt && gt.length > label.length && gt !== lastGroup) { rec.group = gt; lastGroup = gt; }
       }
     }
+    const pressed = el.getAttribute('aria-pressed');
+    if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     out.push(rec);
     if (++i > 250) break;
   }
-  return JSON.stringify({ url: location.href, title: document.title, elements: out });
+  // Page-text digest: outcome states (submission confirmations, rejection banners, validation
+  // summaries) live in non-interactive nodes the element list can never carry. Sources are
+  // structural only — ARIA status channels first, then headings — never a body-text dump, so the
+  // digest stays bounded and can't regrow the context that transcript compaction bounds.
+  const texts = [];
+  let textTotal = 0;
+  let textFull = false;
+  const pushText = (t) => {
+    t = (t || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+    if (!t) return;
+    // Containment dedupe, richer message wins: an alert's text re-surfaces inside its heading's
+    // parent text, and a terse early entry ("Saved") must not suppress a later superset
+    // ("Saved — confirmation #A1B2") — supersets REPLACE their contained entries.
+    if (texts.some((s) => s.includes(t))) return;
+    const kept = texts.filter((s) => !t.includes(s));
+    const keptTotal = kept.reduce((total, s) => total + s.length, 0);
+    if (keptTotal + t.length > 900) { textFull = true; return; }
+    texts.length = 0; texts.push(...kept, t); textTotal = keptTotal + t.length;
+  };
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // Isolated: a hostile page's throwing accessor (fingerprinting scripts poison innerText and
+  // friends) must degrade to "no digest", never take element perception down with it.
+  try {
+    // ~= matches ARIA fallback role lists like role="alert status"; = would silently skip them.
+    for (const el of document.querySelectorAll('[role~=alert],[role~=status],[aria-live=polite],[aria-live=assertive],output')) {
+      if (textFull) break;
+      if (visible(el)) pushText(el.innerText);
+    }
+    for (const h of document.querySelectorAll('h1,h2,h3')) {
+      if (textFull) break;
+      if (!visible(h)) continue;
+      // A short parent is a banner/panel whose body text carries the message; a large parent would
+      // drag in unrelated content, so the heading stands alone.
+      const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
+      pushText(pt && pt.length <= 300 ? pt : h.innerText);
+    }
+  } catch (e) { texts.length = 0; }
+  // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
+  // perception can never list its contents — record host + signature so the model can see the gate
+  // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
+  // and rejected: presence is the contract here, not cross-frame reach). Same visibility rule as
+  // elements, so hidden tracking pixels stay out. Isolated like the digest above.
+  const iframeInfo = { total: 0, entries: [] };
+  try {
+    const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
+    for (const f of document.querySelectorAll('iframe')) {
+      const r = f.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
+      if (f.hasAttribute('srcdoc')) continue;
+      const src = f.getAttribute('src') || '';
+      let u;
+      try { u = new URL(src, location.href); } catch (e) { continue; }
+      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
+      iframeInfo.total++;
+      if (iframeInfo.entries.length >= 8) continue;
+      const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
+    }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, elements: out });
 }
 """
 )
@@ -281,6 +346,23 @@ def build_browser_tools(
         elements = data.get("elements", [])
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
         lines = [f"url={data.get('url')} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        for t in data.get("text") or []:
+            lines.append(f"text: {t!r}")
+        iframe_info = data.get("iframes") or {}
+        iframe_entries = iframe_info.get("entries") or []
+        if iframe_entries:
+            total = iframe_info.get("total", len(iframe_entries))
+            parts = []
+            for f in iframe_entries:
+                flag = "[captcha] " if f.get("captcha") else ""
+                title = f" {f['title']!r}" if f.get("title") else ""
+                parts.append(f"{flag}{f.get('host', '?')}{title}")
+            overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
+            lines.append(
+                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector): "
+                + "; ".join(parts)
+                + overflow
+            )
         for e in elements:
             extra = ""
             if e.get("value"):
@@ -289,6 +371,8 @@ def build_browser_tools(
                 extra += f" options={e['options']}"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
+            if e.get("pressed") is not None:
+                extra += f" pressed={e['pressed']}"
             if e.get("required"):
                 extra += " *required"
             if e.get("autocomplete"):
@@ -310,9 +394,19 @@ def build_browser_tools(
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}")
             html = await el.inner_html()
+            if not html:
+                # Void/leaf elements have no inner HTML; their own tag+attributes are the answer,
+                # not an empty string the model can't distinguish from a missing element. Best
+                # effort: a navigation between the two reads must not turn "" into a tool error.
+                try:
+                    html = await el.evaluate("el => el.outerHTML")
+                except Exception:
+                    html = ""
         else:
             html = await page.content()
-        return ToolResult.ok(html[:20000])
+        if len(html) > 20000:
+            return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
+        return ToolResult.ok(html)
 
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -528,8 +622,13 @@ def build_browser_tools(
         if error is not None:
             return error
         url = await asyncio.to_thread(validate_fetch_url, args["url"])
-        await page.goto(url, timeout=60000, wait_until="load")
-        return ToolResult.ok(f"navigated to {await _url(page)}")
+        response = await page.goto(url, timeout=60000, wait_until="load")
+        # Surface the HTTP status: an error page otherwise reads as a successful navigation, hiding
+        # dead URLs and blank shells from the model.
+        status = f" (HTTP {response.status})" if response is not None else ""
+        # page_state_changed tells the loop's action-loop guard the world moved: a re-attempt after
+        # a navigation is a fresh attempt, not a repeat against unchanged state.
+        return ToolResult.ok(f"navigated to {await _url(page)}{status}", data={"page_state_changed": True})
 
     async def file_upload(args: dict[str, Any]) -> ToolResult:
         # Lazy import: keeps this module importable for unit tests without the full forge/storage graph.
@@ -541,12 +640,16 @@ def build_browser_tools(
         selector = args["selector"]
         source = _resolve_text(args["file"])
         local_path = await download_file(source, output_dir=downloads_dir, organization_id=organization_id)
+        # For http(s) sources download_file stages into downloads_dir; naming the file lets the
+        # download-signal wrapper suppress it without swallowing unrelated downloads that complete
+        # during this call (for other schemes the key is inert — nothing in the dir matches).
+        staged = {"staged_download": os.path.basename(local_path)}
         paths = [local_path]
         el = await page.query_selector(selector)
         if el is None:
-            return ToolResult.error(f"no file input for selector {selector!r}")
+            return ToolResult("error", f"no file input for selector {selector!r}", staged)
         await el.set_input_files(paths)
-        return ToolResult.ok(f"uploaded 1 file to {selector}")
+        return ToolResult.ok(f"uploaded 1 file to {selector}", staged)
 
     async def select_combobox(args: dict[str, Any]) -> ToolResult:
         # Explicit typeahead fill (type() also drives this automatically): type the value, WAIT for the
@@ -571,7 +674,7 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Call once per page, then act by selector.",
+            "Snapshot the page's visible interactive elements (raw DOM) with a CSS selector, label, type, value, and options for each. Also reports cross-origin iframes present (host + captcha signature); their contents cannot be observed or reached by selector. Call once per page, then act by selector.",
             _obj({}),
             observe,
         ),
@@ -582,7 +685,11 @@ def build_browser_tools(
             get_html,
         ),
         _spec(
-            "click", "Click an element by CSS selector.", _obj({"selector": {"type": "string"}}, ["selector"]), click
+            "click",
+            "Click an element by CSS selector. If the click triggers a file download, the tool result "
+            "reports it when detected.",
+            _obj({"selector": {"type": "string"}}, ["selector"]),
+            click,
         ),
         _spec(
             "hover",
@@ -677,7 +784,132 @@ def build_browser_tools(
             _tool_spec.compactable = True
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
+    _apply_download_signal(tools, downloads_dir)
     return tools
+
+
+_DOWNLOAD_UUID_INFIX_RE = re.compile(r"\.[0-9a-f]{32}$")
+_DOWNLOAD_SIGNAL_MAX_LINES = 5
+# Filenames are server-controlled and get surfaced into the LLM transcript: strip control chars plus
+# Unicode line/paragraph separators, zero-width, and bidi-control characters from the DISPLAYED name
+# (seen-set tracking keeps the raw filesystem name).
+_DOWNLOAD_NOTICE_SANITIZE_RE = re.compile(
+    "[\\x00-\\x1f\\x7f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]"
+)
+
+
+def _download_signal_identity(name: str) -> str:
+    """`report.pdf.<32-hex-uuid>.crdownload` -> `report.pdf` (see cdp_download_interceptor's temp
+    naming), so an in-progress file and its completed rename are recognized as the same download.
+    The uuid strip applies only to suffix-carrying temp names — a completed file legitimately named
+    `export.<32hex>` must keep its full identity."""
+    if name.endswith(BROWSER_DOWNLOADING_SUFFIX):
+        name = name[: -len(BROWSER_DOWNLOADING_SUFFIX)]
+        return _DOWNLOAD_UUID_INFIX_RE.sub("", name)
+    return name
+
+
+def _human_download_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    size = num_bytes / 1024
+    for unit in ("KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _apply_download_signal(tools: list[ToolSpec], downloads_dir: str | None) -> None:
+    """Wrap every tool in the given list so a file landing in `downloads_dir` during (or between)
+    calls is reported in the next tool result, without a dedicated tool call. Tools assembled later
+    (finish, auth/captcha extras) are not wrapped; a download landing during those surfaces on the
+    next wrapped call. State (seen files, pending re-delivery lines) is shared across all wrapped
+    tools via this closure, one instance per build_browser_tools call. No-op without downloads_dir."""
+    if not downloads_dir:
+        return
+
+    seen_completed: set[str] = set()
+    seen_started: set[str] = set()
+    pending: list[str] = []
+    baseline = {"done": False}
+
+    def _list_split() -> tuple[list[str], list[str]]:
+        try:
+            names = sorted(os.listdir(downloads_dir))
+        except OSError:
+            return [], []
+        completed = [n for n in names if not n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        in_progress = [n for n in names if n.endswith(BROWSER_DOWNLOADING_SUFFIX)]
+        return completed, in_progress
+
+    for tool_spec in tools:
+
+        async def wrapped(
+            args: dict[str, Any],
+            _handler: Callable[[dict[str, Any]], Awaitable[ToolResult]] = tool_spec.handler,
+            _compactable: bool = tool_spec.compactable,
+            _tool_name: str = tool_spec.name,
+        ) -> ToolResult:
+            if not baseline["done"]:
+                baseline["done"] = True
+                try:
+                    # Snapshot BEFORE the first handler runs, so a download triggered by the very
+                    # first tool call is reported rather than absorbed into the baseline.
+                    completed0, in_progress0 = _list_split()
+                    seen_completed.update(completed0)
+                    seen_started.update(_download_signal_identity(n) for n in in_progress0)
+                except Exception:
+                    LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
+            result = await _handler(args)
+            try:
+                # A tool that stages its own file into downloads_dir (file_upload) names it in
+                # result.data; only that exact file is absorbed silently — an unrelated download
+                # completing during the same call still gets reported.
+                staged_name = (result.data or {}).get("staged_download")
+                completed, in_progress = _list_split()
+                new_lines: list[str] = []
+                for name in completed:
+                    if name in seen_completed:
+                        continue
+                    seen_completed.add(name)
+                    seen_started.add(_download_signal_identity(name))
+                    if name == staged_name:
+                        continue
+                    try:
+                        size = os.path.getsize(os.path.join(downloads_dir, name))
+                    except OSError:
+                        size = 0
+                    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)
+                    new_lines.append(f"Downloaded: {display} ({_human_download_size(size)})")
+                for name in in_progress:
+                    identity = _download_signal_identity(name)
+                    if identity in seen_started or identity in seen_completed:
+                        continue
+                    seen_started.add(identity)
+                    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", identity)
+                    new_lines.append(f"Download started: {display} (in progress — not yet complete)")
+                deliver = list(dict.fromkeys(pending + new_lines))
+                if not deliver:
+                    pending[:] = []
+                    return result
+                capped = deliver[:_DOWNLOAD_SIGNAL_MAX_LINES]
+                overflow = len(deliver) - len(capped)
+                if overflow > 0:
+                    capped = capped + [f"+{overflow} more files downloaded"]
+                pending[:] = deliver if _compactable else []
+                # The flag lets the loop's action-loop guard treat the download as progress without
+                # sniffing the notice lines back out of the content string.
+                return ToolResult(
+                    result.status,
+                    result.content + "\n" + "\n".join(capped),
+                    {**(result.data or {}), "download_notice": True},
+                )
+            except Exception:
+                LOG.warning("taskv3 download signal computation failed", tool=_tool_name, exc_info=True)
+                return result
+
+        tool_spec.handler = wrapped
 
 
 def _with_preflight(

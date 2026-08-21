@@ -6,6 +6,7 @@ from typing import Any
 
 import structlog
 import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
 from skyvern.constants import DEFAULT_LOGIN_PROMPT, DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import WorkflowNotFound
@@ -28,7 +29,7 @@ from skyvern.schemas.workflows import (
     WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
 )
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.utils.yaml_loader import NoDatesSafeLoader, safe_load_no_dates
 
 LOG = structlog.get_logger()
 
@@ -650,6 +651,77 @@ class BlockEditError(Exception):
     """A block-scoped edit that could not be applied as asked."""
 
 
+def _mapping_node_value(node: Node | None, key: str) -> tuple[ScalarNode, Node] | None:
+    if not isinstance(node, MappingNode):
+        return None
+    for key_node, value_node in node.value:
+        if isinstance(key_node, ScalarNode) and key_node.value == key:
+            return key_node, value_node
+    return None
+
+
+def _compose_workflow_yaml(stored_yaml: str) -> Node | None:
+    loader = NoDatesSafeLoader(stored_yaml)
+    try:
+        return loader.get_single_node()
+    finally:
+        loader.dispose()  # type: ignore[no-untyped-call]
+
+
+def _code_scalar_source(stored_yaml: str, label: str) -> tuple[ScalarNode, int]:
+    """Locate one existing block's code using PyYAML's parser-owned source marks."""
+    root = _compose_workflow_yaml(stored_yaml)
+    workflow_definition_pair = _mapping_node_value(root, "workflow_definition")
+    blocks_pair = _mapping_node_value(workflow_definition_pair[1], "blocks") if workflow_definition_pair else None
+    blocks_node = blocks_pair[1] if blocks_pair else None
+    if not isinstance(blocks_node, SequenceNode):
+        raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
+
+    matches: list[MappingNode] = []
+    for block_node in blocks_node.value:
+        label_pair = _mapping_node_value(block_node, "label")
+        if label_pair and isinstance(label_pair[1], ScalarNode) and label_pair[1].value == label:
+            if isinstance(block_node, MappingNode):
+                matches.append(block_node)
+    if not matches:
+        raise BlockEditError(f"No block labelled {label!r}.")
+    if len(matches) > 1:
+        raise BlockEditError(f"{len(matches)} blocks share the label {label!r}; labels must be unique to edit one.")
+
+    code_pair = _mapping_node_value(matches[0], "code")
+    if code_pair is None or not isinstance(code_pair[1], ScalarNode):
+        raise BlockEditError(f"Block {label!r} has no code to edit.")
+    return code_pair[1], code_pair[0].start_mark.column + 2
+
+
+def _render_code_scalar(code: str, *, content_indent: int, source_style: str | None) -> str:
+    """Serialize model-authored code as one YAML scalar without touching surrounding bytes."""
+    if not code:
+        return "''\n"
+    if source_style not in {"|", ">"}:
+        dumped = yaml.safe_dump(code, allow_unicode=True, default_flow_style=True, width=_YAML_NO_FOLD_WIDTH)
+        if dumped.endswith("\n...\n"):
+            return dumped[: -len("\n...\n")]
+        return dumped.removesuffix("\n")
+
+    trailing_newlines = len(code) - len(code.rstrip("\n"))
+    chomp = "+" if trailing_newlines > 1 else "" if trailing_newlines == 1 else "-"
+    first_nonempty = next((line for line in code.splitlines() if line), "")
+    indentation_indicator = "2" if first_nonempty[:1].isspace() else ""
+    indicator = f"|{indentation_indicator}{chomp}"
+    indentation = " " * content_indent
+    body = "".join(f"{indentation}{line}" for line in code.splitlines(keepends=True))
+    if not code.endswith("\n"):
+        body += "\n"
+    return f"{indicator}\n{body}"
+
+
+def _replace_code_scalar_source(stored_yaml: str, label: str, code: str) -> str:
+    scalar, content_indent = _code_scalar_source(stored_yaml, label)
+    replacement = _render_code_scalar(code, content_indent=content_indent, source_style=scalar.style)
+    return stored_yaml[: scalar.start_mark.index] + replacement + stored_yaml[scalar.end_mark.index :]
+
+
 def _workflow_blocks(parsed: Any) -> list[Any] | None:
     if not isinstance(parsed, dict):
         return None
@@ -724,6 +796,7 @@ def apply_block_edit(
         raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
     block = _block_by_label(blocks, label)
 
+    edited_code: str | None = None
     if expected_code is not None or replacement_code is not None:
         if expected_code is None or replacement_code is None:
             raise BlockEditError("A code edit needs both expected_code and replacement_code.")
@@ -742,11 +815,14 @@ def apply_block_edit(
                 f"expected_code appears {occurrences} times in block {label!r}; include enough "
                 f"surrounding lines to identify one occurrence. Its code is now:\n{current}"
             )
-        block["code"] = current.replace(expected_code, replacement_code, 1)
+        edited_code = current.replace(expected_code, replacement_code, 1)
+        block["code"] = edited_code
 
     for key, value in (fields or {}).items():
         block[key] = value
 
+    if edited_code is not None and not fields:
+        return _replace_code_scalar_source(stored_yaml, label, edited_code)
     return yaml.safe_dump(parsed, sort_keys=False)
 
 

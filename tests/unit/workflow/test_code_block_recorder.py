@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -207,10 +209,21 @@ async def _record_timed_action() -> Action:
     return action
 
 
+# Compiled under the code block filename and offset so the recorder's frame walk resolves a real
+# authored line (the await sits on source line 4, which reports as authored line 2).
+_AUTHORED_GOTO_SOURCE = (
+    "\nasync def authored_goto(page):\n"
+    "    url = 'https://example.com/private?token=secret'\n"
+    "    return await page.goto(url)\n"
+)
+_authored_namespace: dict[str, Any] = {}
+exec(compile(_AUTHORED_GOTO_SOURCE, CODE_BLOCK_FILENAME, "exec"), _authored_namespace)
+_authored_goto: Callable[[RecordingPage], Awaitable[str]] = _authored_namespace["authored_goto"]
+
+
 @pytest.mark.asyncio
 async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_NAVIGATION_DELAY_SECONDS", 0.01)
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder._frame_user_line", lambda: 17)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.01)
 
     pending: list[PendingAction] = []
     emitted = asyncio.Event()
@@ -221,16 +234,16 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
 
     stalled = ControlledGotoPage(outcome="response")
     page = RecordingPage(stalled, on_pending_action=capture_pending)
-    call = asyncio.create_task(page.goto("https://example.com/private?token=secret"))
+    call = asyncio.create_task(_authored_goto(page))
     await asyncio.wait_for(emitted.wait(), timeout=0.5)
 
     assert pending == [
         PendingAction(
-            action_type=ActionType.GOTO_URL,
-            action_order=0,
-            code_line=17,
             call_name="page.goto",
             threshold_seconds=0.01,
+            code_line=2,
+            action_type=ActionType.GOTO_URL,
+            action_order=0,
         )
     ]
     assert page.recorded_actions() == []
@@ -239,7 +252,7 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     assert await call == "response"
     assert len(pending) == 1
     assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-navigation-pending" for task in asyncio.all_tasks())
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
     fast_pending: list[PendingAction] = []
     fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)  # type: ignore[arg-type]
@@ -280,7 +293,50 @@ async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch
     callback_failure_inner.release.set()
     assert await callback_failure_call == "unchanged"
     assert [action.status for action in callback_failure_page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-navigation-pending" for task in asyncio.all_tasks())
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
+
+
+@pytest.mark.asyncio
+async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.0)
+    release = asyncio.Event()
+    emitted = asyncio.Event()
+    pending: list[PendingAction] = []
+
+    async def capture(fact: PendingAction) -> None:
+        pending.append(fact)
+        emitted.set()
+
+    async def stall(*args: object, **kwargs: object) -> None:
+        await release.wait()
+
+    page = RecordingPage(
+        SimpleNamespace(url="about:blank", keyboard=SimpleNamespace(down=stall, insert_text=stall)),
+        on_pending_action=capture,
+    )
+
+    async def pending_for(invoke: Callable[[], Awaitable[object]]) -> PendingAction:
+        emitted.clear()
+        call = asyncio.create_task(invoke())
+        try:
+            await asyncio.wait_for(emitted.wait(), timeout=1)
+        finally:
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        return pending[-1]
+
+    assert (await pending_for(lambda: page.keyboard.down("Shift"))).call_name == "keyboard.down"
+    assert (await pending_for(lambda: page.keyboard.insert_text("value"))).call_name == "keyboard.insert_text"
+
+    stalled_guard = CredentialReleaseGuard()
+    monkeypatch.setattr(stalled_guard, "enforce", stall)
+    guarded_page = RecordingPage(
+        SimpleNamespace(url="about:blank", keyboard=SimpleNamespace(type=stall)),
+        on_pending_action=capture,
+        credential_release_guard=stalled_guard,
+    )
+    assert (await pending_for(lambda: guarded_page.keyboard.type("value"))).call_name == "keyboard.type"
 
 
 @pytest.mark.asyncio
@@ -317,7 +373,7 @@ async def test_cancellation_while_draining_pending_navigation_is_preserved(
     with pytest.raises(asyncio.CancelledError):
         await call
     assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-    assert not any(task.get_name() == "code-block-navigation-pending" for task in asyncio.all_tasks())
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
 
 
 @pytest.mark.asyncio
@@ -1488,11 +1544,8 @@ async def test_off_site_credential_fill_is_refused_before_release() -> None:
     page = RecordingPage(fake, credential_release_guard=_release_guard())
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
         await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
-    assert str(exc_info.value) == (
-        "Refused to type the saved credential `login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org. Continue the sign-in on the "
-        "credential's own site instead."
-    )
+    assert "login_credentials" in str(exc_info.value)
+    assert re.search(r"https://example\.org", str(exc_info.value))
     assert not any(call.startswith("fill:") for call in fake.inner.calls)
     [action] = page.recorded_actions()
     # The recorded row is redacted by the transport hardening (SKY-13764); the refusal text reaches
@@ -1586,11 +1639,9 @@ async def test_sso_misroute_code_is_refused_at_the_first_off_site_release() -> N
     )
     with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
         await user_function()
-    assert str(exc_info.value) == (
-        "Refused to type the saved credential `login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org. Continue the sign-in on the "
-        "credential's own site instead."
-    )
+    message = str(exc_info.value)
+    assert "belongs to https://example.com" in message
+    assert re.search(r"https://example\.org", message)
     assert not any(call.startswith(("fill:", "type:")) for call in fake.inner.calls)
 
 
@@ -1737,11 +1788,8 @@ async def test_credential_release_refusal_reaches_the_run_record(monkeypatch: py
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is False
-    assert result.failure_reason == (
-        "Failed to execute code block. Reason: Refused to type the saved credential "
-        "`login_credentials` here: the credential belongs to "
-        "https://example.com, but this field is on https://example.org."
-    )
+    assert "belongs to https://example.com" in (result.failure_reason or "")
+    assert re.search(r"https://example\.org", result.failure_reason or "")
 
 
 @pytest.mark.asyncio

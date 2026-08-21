@@ -67,6 +67,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     parse_final_response,
 )
+from skyvern.forge.sdk.copilot.pending_operation import (
+    install_pending_operation_slot,
+    pending_operation,
+    pending_operation_fields,
+)
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
@@ -536,6 +541,7 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
         "copilot_turn_deadline_expired",
         elapsed_seconds=round(elapsed_seconds, 3),
         iteration=iteration,
+        **pending_operation_fields(),
     )
 
 
@@ -559,6 +565,27 @@ def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteratio
     elapsed = _elapsed_run_seconds(ctx, start_time)
     if elapsed >= TOTAL_TIMEOUT_SECONDS:
         _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
+
+
+def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
+    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+
+    Synchronous and never raising, so the caller's ``raise`` re-raises the original
+    cancellation neither masked nor delayed.
+    """
+    try:
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+        ctx.copilot_turn_cancelled_iteration = iteration
+        LOG.warning(
+            "copilot_turn_cancelled",
+            elapsed_seconds=round(elapsed, 3),
+            iteration=iteration,
+            deadline_exceeded=ctx.copilot_total_timeout_exceeded is True,
+            **pending_operation_fields(),
+        )
+    except Exception:
+        LOG.exception("Failed to record a copilot turn cancellation", iteration=iteration)
 
 
 class CopilotNonRetriableNavError(Exception):
@@ -1008,6 +1035,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     if not items:
         return items
 
+    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
     tail: list[Any] = []
     for item in reversed(items[1:]):
         if is_screenshot_message(item):
@@ -1040,7 +1068,12 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         retained_tail=[_item_field(item, "type") for item in retained_tail],
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    return [opening, *retained_tail]
+    retained_items = [opening, *retained_tail]
+    screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
+    signal_content = _item_field(screenshot_dropped_signal[0], "content")
+    if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):
+        screenshot_dropped_signal = []
+    return [*retained_items, *screenshot_dropped_signal]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
@@ -1113,10 +1146,11 @@ async def _recover_from_context_overflow(session: Any, current_input: str | list
         stripped_input = current_input
 
     if session is not None:
-        all_items = await session.get_items()
-        pruned = aggressive_prune(all_items)
-        await session.clear_session()
-        await session.add_items(pruned)
+        with pending_operation("session.prune"):
+            all_items = await session.get_items()
+            pruned = aggressive_prune(all_items)
+            await session.clear_session()
+            await session.add_items(pruned)
         return stripped_input, stripped_any
     if isinstance(stripped_input, list):
         return stripped_input, stripped_any
@@ -1199,15 +1233,16 @@ async def _run_streamed_with_deadline(
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
-    result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
-    try:
+    with pending_operation("turn.stream", span=True):
+        result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
         try:
-            await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
-        finally:
-            _accumulate_usage(result, ctx)
-    except TimeoutError:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
-        raise CopilotTotalTimeoutError() from None
+            try:
+                await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+            finally:
+                _accumulate_usage(result, ctx)
+        except TimeoutError:
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
+            raise CopilotTotalTimeoutError() from None
     return result
 
 
@@ -1729,6 +1764,7 @@ async def run_with_enforcement(
     current_input: str | list = initial_input
     start_time = time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
+    install_pending_operation_slot(ctx)
     iteration = 0
     pending_recovery_nudge: str | None = None
 
@@ -1774,7 +1810,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -1796,7 +1832,7 @@ async def run_with_enforcement(
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
                 # Unconditional: the staged frame never reaches current_input, so images_stripped
                 # cannot see it, and the filter would re-append it to the retry we just shrank.
@@ -1818,7 +1854,7 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
                 except Exception:
                     # Never retry twice; even a second overflow surfaces as a

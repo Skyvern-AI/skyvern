@@ -298,8 +298,10 @@ function ConvoAggregatePill({
     earliestMs !== null && latestMs !== null && latestMs > earliestMs
       ? formatElapsedSeconds(latestMs - earliestMs)
       : null;
+  // An interrupted or user-cancelled turn carries terminal "error" without having
+  // failed, so the session pill applies the same guard as the per-turn chip.
   const anyError = turnsWithNarrative.some(
-    (m) => m.narrative?.terminal === "error",
+    (m) => m.narrative?.terminal === "error" && !m.narrative?.cancelled,
   );
   const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
   const dotClass = isInFlight

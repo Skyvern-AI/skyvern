@@ -96,7 +96,10 @@ import {
   WorkflowBlockNode,
 } from "./nodes";
 import { GlobalCollapseControl } from "./collapse/GlobalCollapseControl";
-import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
+import {
+  isBlockCollapsedAt,
+  useNodeCollapseStore,
+} from "./collapse/useNodeCollapseStore";
 import { isHeightCollapseAnimation } from "./collapse/collapseRelayoutAnimations";
 import {
   isMeaningfulPaneResize,
@@ -711,6 +714,12 @@ function FlowRenderer({
   // Track if we're currently in a layout operation to prevent infinite loops
   const isLayoutingRef = useRef(false);
 
+  // An expand schedules its container effect before FlowRenderer sees the
+  // header-resized event. Keep search settling blocked through that gap and
+  // the event handler's 10ms timer; the debounce's own isPending() covers the
+  // remainder once it is invoked.
+  const collapseRelayoutBeforeDebounceRef = useRef(false);
+
   // Bounds the dimension->layout feedback cycle (React error #185) when a
   // ResizeObserver oscillation re-arms layout faster than the rAF guard resets.
   const dimensionConvergenceRef = useRef(createDimensionConvergenceState());
@@ -901,6 +910,7 @@ function FlowRenderer({
       current: null,
     };
     const handleLoopHeaderResized = () => {
+      collapseRelayoutBeforeDebounceRef.current = true;
       // Delay to let React process the updateNodeData state change
       if (timerRef.current !== null) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
@@ -908,6 +918,7 @@ function FlowRenderer({
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
         debouncedLayoutForDimensions(currentNodes, currentEdges);
+        collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
 
@@ -927,6 +938,7 @@ function FlowRenderer({
       current: null,
     };
     const handleConditionalHeaderResized = () => {
+      collapseRelayoutBeforeDebounceRef.current = true;
       // Delay to let React process the updateNodeData state change
       if (timerRef.current !== null) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
@@ -934,6 +946,7 @@ function FlowRenderer({
         const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
         const currentEdges = reactFlowInstance.getEdges();
         debouncedLayoutForDimensions(currentNodes, currentEdges);
+        collapseRelayoutBeforeDebounceRef.current = false;
       }, 10);
     };
 
@@ -1905,6 +1918,18 @@ function FlowRenderer({
           }, options.duration + 50);
         },
         selectBlock: setSelectedBlockId,
+        beforeExpand: (label) => {
+          const workflowId = workflow.workflow_permanent_id ?? "__global__";
+          if (
+            isBlockCollapsedAt(
+              useNodeCollapseStore.getState().collapsed,
+              workflowId,
+              label,
+            )
+          ) {
+            collapseRelayoutBeforeDebounceRef.current = true;
+          }
+        },
         expandBlock: (label) =>
           useNodeCollapseStore
             .getState()
@@ -1931,10 +1956,18 @@ function FlowRenderer({
           waitForNodeSettle(settleNodeId, {
             getNodes,
             getInternalNode: (id) => reactFlowInstance.getInternalNode(id),
+            isRelayoutPending: () =>
+              collapseRelayoutBeforeDebounceRef.current ||
+              debouncedLayoutForDimensions.isPending(),
           }),
       });
     },
-    [reactFlowInstance, setSelectedBlockId, workflow.workflow_permanent_id],
+    [
+      reactFlowInstance,
+      setSelectedBlockId,
+      workflow.workflow_permanent_id,
+      debouncedLayoutForDimensions,
+    ],
   );
 
   // Registered here (not in shell chrome) because the jump needs this

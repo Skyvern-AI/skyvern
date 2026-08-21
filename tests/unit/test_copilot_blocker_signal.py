@@ -11,6 +11,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     build_llm_tool_error_payload,
     clear_blocker_signal_for_reason_codes,
+    contains_internal_machinery_leak,
     maybe_clear_blocker_signal_on_tool_success,
     stash_blocker_signal,
     to_trace_data,
@@ -292,3 +293,25 @@ def test_stash_keeps_non_loop_held_signal_unrefreshed() -> None:
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     stash_blocker_signal(ctx, _make(internal_reason_code="second"))
     assert ctx.blocker_signal is held
+
+
+def test_inline_sequential_credential_fence_relays_an_id_free_reason() -> None:
+    from skyvern.forge.sdk.copilot.tools.run_execution import _inline_sequential_credential_fence_failure
+
+    result = _inline_sequential_credential_fence_failure(
+        workflow_run_id="wr_1234567890",
+        sequential_credential_id="cred_1",
+        dispatch_to_worker=False,
+        block_labels=["b1"],
+        labels_to_execute=["b1"],
+        frontier_start_label=None,
+    )
+
+    assert result is not None
+    for field in ("failure_reason", "user_facing_summary"):
+        text = result["data"][field]
+        assert "wr_1234567890" not in text
+        assert contains_internal_machinery_leak(text) is False
+        assert_clean_user_facing_text(text)
+
+    assert "wr_1234567890" in result["error"]

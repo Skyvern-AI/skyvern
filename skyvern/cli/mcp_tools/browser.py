@@ -115,7 +115,7 @@ from ._session import (
     replace_session_ref_map,
     session_ref_generation,
 )
-from .response import truncate_response_bytes
+from .response import EXTRACTION_DEFAULT_VERBOSITY, truncate_response_bytes
 
 LOG = structlog.get_logger(__name__)
 
@@ -376,11 +376,6 @@ def _exception_message(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _is_expired_browser_session_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "code=4408" in message and "reason=session expired" in message
-
-
 def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
     return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
 
@@ -497,8 +492,8 @@ async def skyvern_navigate(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_navigate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_navigate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -658,8 +653,8 @@ async def skyvern_click(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_click", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_click", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
     source_url = _trajectory_source_url(page)
@@ -888,8 +883,8 @@ async def skyvern_drag(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_drag", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_drag", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=source_selector)
 
@@ -1068,8 +1063,8 @@ async def skyvern_file_upload(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_file_upload", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_file_upload", ok=False, error=no_browser_error(exc))
 
     local_uploads: list[FilePayload] | None = None
     if has_local:
@@ -1182,8 +1177,8 @@ async def skyvern_hover(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_hover", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_hover", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1322,8 +1317,8 @@ async def skyvern_type(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_type", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_type", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(
         ctx=ctx,
@@ -1531,8 +1526,8 @@ async def skyvern_screenshot(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_screenshot", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_screenshot", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1609,8 +1604,8 @@ async def skyvern_scroll(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_scroll", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_scroll", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -1739,8 +1734,8 @@ async def skyvern_select_option(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_select_option", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_select_option", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, value=value)
     source_url = _trajectory_source_url(page)
@@ -2044,8 +2039,8 @@ async def skyvern_press_key(
     intent = _blank_to_none(intent)
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_press_key", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_press_key", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector, key=key)
     source_url = _trajectory_source_url(page)
@@ -2193,8 +2188,8 @@ async def skyvern_wait(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_wait", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_wait", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -2349,8 +2344,8 @@ async def skyvern_wait_for_either_state(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_wait_for_either_state", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_wait_for_either_state", ok=False, error=no_browser_error(exc))
 
     source_url = _trajectory_source_url(page)
     with Timer() as timer:
@@ -2419,9 +2414,24 @@ async def skyvern_evaluate(
     expression: Annotated[str, "JavaScript expression to evaluate"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
-    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE). For multi-line await, use explicit return.
-    Security: executes in page context — use only with trusted expressions."""
+    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE).
+
+    For multi-line await, use an explicit return. Full responses are returned by default; use
+    ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
+    Security: executes in page context — use only with trusted expressions.
+    """
     # Block JS that sets password field values
     if JS_PASSWORD_PATTERN.search(expression):
         return make_result(
@@ -2438,8 +2448,8 @@ async def skyvern_evaluate(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_evaluate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_evaluate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2471,9 +2481,23 @@ async def skyvern_extract(
     schema: Annotated[
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
-    """Extract structured data from the current page using AI with screenshots and a dedicated extraction LLM.
-    Navigate first. Optionally provide a JSON schema to enforce output structure. For visual-only inspection use skyvern_screenshot.
+    """Extract structured data from the current page using AI and a dedicated extraction LLM.
+
+    Navigate first. Optionally provide a JSON schema to enforce output structure. Full extracted data is
+    returned by default; use ``verbosity="summary"`` for an opt-in compact response. The mandatory
+    response-size cap still applies. For visual-only inspection use ``skyvern_screenshot``.
     """
     if schema is not None:
         try:
@@ -2489,8 +2513,8 @@ async def skyvern_extract(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_extract", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_extract", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2540,20 +2564,8 @@ async def _run_paired_capture(
     started_at = time.perf_counter()
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result(action, ok=False, error=no_browser_error())
-    except Exception as exc:
-        if _is_expired_browser_session_error(exc):
-            return make_result(
-                action,
-                ok=False,
-                error=make_error(
-                    ErrorCode.SESSION_EXPIRED,
-                    "Browser session expired.",
-                    "Create a new browser session and retry this operation.",
-                ),
-            )
-        raise
+    except BrowserNotAvailableError as exc:
+        return make_result(action, ok=False, error=no_browser_error(exc))
     action_result = _action_result_factory(ctx=ctx, page=page)
     operation_functions: dict[str, Callable[..., Any]] = {
         "navigate": skyvern_navigate,
@@ -2634,18 +2646,33 @@ async def skyvern_extract_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Extract structured data AND capture a screenshot of the page in ONE call.
 
     Use this to record a finding together with its visual proof in a single step, instead of a
     separate skyvern_extract + skyvern_screenshot. The screenshot is saved to a file path by default
     (pass inline=true for base64) and returned alongside the extracted data, so a reviewer that only
-    credits visible evidence can see it.
+    credits visible evidence can see it. Full extracted data is returned by default; use
+    ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    extract_params: dict[str, Any] = {"prompt": prompt, "schema": schema}
     return await _run_paired_capture(
         "skyvern_extract_and_screenshot",
         [
-            ("extract", {"prompt": prompt, "schema": schema}),
+            ("extract", extract_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,
@@ -2665,19 +2692,35 @@ async def skyvern_evaluate_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Run JavaScript to read the page AND capture a screenshot in ONE call.
 
     A single "do it and prove it" primitive: your JS returns the scraped values and the tool returns
     them together with a screenshot of the page as visual proof, so every fact you read is backed by
     an image without a second tool call. The screenshot is saved to a file path by default (pass
-    inline=true for base64). Supports await (auto-wrapped in an async IIFE); for multi-line await use
-    an explicit return. Security: JS executes in page context — use only with trusted expressions.
+    inline=true for base64). Supports await (auto-wrapped in async IIFE); for multi-line await use an
+    explicit return. Full responses are returned by default; use ``verbosity="summary"`` for an opt-in
+    compact response. The mandatory response-size cap still applies. Security: JS executes in page
+    context — use only with trusted expressions.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    evaluate_params: dict[str, Any] = {"expression": expression}
     return await _run_paired_capture(
         "skyvern_evaluate_and_screenshot",
         [
-            ("evaluate", {"expression": expression}),
+            ("evaluate", evaluate_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,
@@ -2747,18 +2790,34 @@ async def skyvern_navigate_extract_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Open a URL, AI-extract structured data, AND capture a screenshot — all in ONE call.
 
     The most step-efficient way to process one source page: it navigates, extracts the fields you ask
     for, and saves a screenshot as proof, so a whole page becomes a single tool call instead of three.
-    The screenshot is saved to a file path by default (pass inline=true for base64).
+    The screenshot is saved to a file path by default (pass inline=true for base64). Full extracted data
+    is returned by default; use ``verbosity="summary"`` for an opt-in compact response. The mandatory
+    response-size cap still applies.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    extract_params: dict[str, Any] = {"prompt": prompt, "schema": schema}
     return await _run_paired_capture(
         "skyvern_navigate_extract_and_screenshot",
         [
             ("navigate", {"url": url, "timeout": timeout, "wait_until": wait_until}),
-            ("extract", {"prompt": prompt, "schema": schema}),
+            ("extract", extract_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,
@@ -2776,8 +2835,8 @@ async def skyvern_validate(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_validate", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_validate", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2827,8 +2886,8 @@ async def skyvern_act(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_act", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_act", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -2902,8 +2961,8 @@ async def skyvern_run_task(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_run_task", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_run_task", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3058,8 +3117,8 @@ async def skyvern_login(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_login", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_login", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3185,8 +3244,8 @@ async def skyvern_frame_switch(
 
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_switch", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -3246,8 +3305,8 @@ async def skyvern_frame_main(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_main", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_main", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3276,8 +3335,8 @@ async def skyvern_frame_list(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_frame_list", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_frame_list", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3323,8 +3382,8 @@ async def skyvern_find(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_find", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_find", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=value if by == "css" else None)
 
@@ -3383,8 +3442,8 @@ async def skyvern_clipboard_read(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_clipboard_read", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
@@ -3425,8 +3484,8 @@ async def skyvern_clipboard_write(
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("skyvern_clipboard_write", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
 
@@ -3808,10 +3867,10 @@ async def skyvern_observe(
         if v2_enabled:
             clear_session_ref_map(session_id=session_id, cdp_url=cdp_url, generation=lookup_generation)
         raise
-    except BrowserNotAvailableError:
+    except BrowserNotAvailableError as exc:
         if v2_enabled:
             clear_session_ref_map(session_id=session_id, cdp_url=cdp_url, generation=lookup_generation)
-        return make_result("skyvern_observe", ok=False, error=no_browser_error())
+        return make_result("skyvern_observe", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
@@ -4279,14 +4338,14 @@ async def skyvern_execute(
                 generation=operation_generation,
             )
         raise
-    except BrowserNotAvailableError:
+    except BrowserNotAvailableError as exc:
         if observe_v2_enabled():
             clear_session_ref_map(
                 session_id=session_id,
                 cdp_url=cdp_url,
                 generation=operation_generation,
             )
-        return make_result("skyvern_execute", ok=False, error=no_browser_error())
+        return make_result("skyvern_execute", ok=False, error=no_browser_error(exc))
 
     action_result = _action_result_factory(ctx=ctx, page=page)
     operation_generation = (

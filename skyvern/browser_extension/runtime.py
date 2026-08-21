@@ -23,6 +23,7 @@ LOG = structlog.get_logger(__name__)
 _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 _BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
+_PAIRING_BUSY_WAIT_SECONDS = 30.0
 
 
 class _Adapter(Protocol):
@@ -52,6 +53,10 @@ class _Relay(Protocol):
     async def wait_connected(self, timeout: float) -> bool: ...
 
     async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+
+    async def ensure_root_lease(self) -> dict | None: ...
+
+    async def release_tab(self, tab_id: int) -> None: ...
 
 
 _relay_factory: Callable[
@@ -222,6 +227,46 @@ class BrowserExtensionRuntime:
         nonce = embedded_relay.get_or_create_pairing_nonce()
         url = f"http://127.0.0.1:{embedded_relay.bound_port}/pair#{nonce}"
         return self.open_extension_url(url)
+
+    async def begin_pairing(self) -> bool:
+        """Open this client's one-click pairing page after any current approval completes."""
+        if not isinstance(self._relay, BrokerClient):
+            return self.open_pairing_page()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PAIRING_BUSY_WAIT_SECONDS
+        while True:
+            try:
+                result = await self._relay.begin_pairing()
+            except BrowserExtensionError as exc:
+                error_code = getattr(exc, "code", None)
+                if error_code == "EXTENSION_UPGRADE_REQUIRED":
+                    raise
+                if error_code != "PAIRING_BUSY":
+                    LOG.debug("browser_extension_pairing_begin_failed", error_type=type(exc).__name__)
+                    return False
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                try:
+                    status = await self._relay.pairing_status()
+                except Exception as status_exc:
+                    LOG.debug(
+                        "browser_extension_pairing_status_failed",
+                        error_type=type(status_exc).__name__,
+                    )
+                    return False
+                if status.get("owned") is True:
+                    return True
+                if status.get("active") is True:
+                    await asyncio.sleep(min(0.1, remaining))
+                continue
+            except Exception as exc:
+                LOG.debug("browser_extension_pairing_begin_failed", error_type=type(exc).__name__)
+                return False
+            if result.get("opened") is True:
+                return True
+            pairing_url = result.get("pairingUrl")
+            return isinstance(pairing_url, str) and self.open_extension_url(pairing_url)
 
     async def shutdown(self) -> None:
         cls = type(self)

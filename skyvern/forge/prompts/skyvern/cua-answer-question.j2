@@ -9,7 +9,7 @@ Reply in JSON format with the following keys:
     "question_or_decision": str // What is the question to answer or what is the decision to make?
     "thought": str // Think step by step. What kind of feedback can best help the AI assistant move forward and achieve the goal?
     "enough_information": bool // Whether the information provided is enough to answer the question or make the decision.
-    "answer": str // The answer to the question or the decision to make. Give the answer as if you're talking to the assistant.
+    "answer": str // The answer to the question or the decision to make. Give the answer as if you're talking to the assistant. State the decision or answer itself for the assistant to act on; do not write step-by-step UI instructions.
 }
 
 User goal: {{ navigation_goal }}

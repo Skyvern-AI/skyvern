@@ -271,6 +271,42 @@ class TestCollectOptionTexts:
         ]
         assert _collect_option_texts(tree) == ["Alpha", "Bravo"]
 
+    def test_extracts_radiogroup_options_from_label_wrapped_inputs(self) -> None:
+        # SKY-14346: a radiogroup custom-select has no <option>/<li> nodes, so
+        # this must not report zero observed options when radio choices exist.
+        tree = [
+            {
+                "tagName": "div",
+                "attributes": {"role": "radiogroup"},
+                "children": [
+                    {
+                        "tagName": "label",
+                        "text": "Group A",
+                        "children": [
+                            {"tagName": "input", "attributes": {"type": "radio", "value": "a"}, "id": "radio-a"}
+                        ],
+                    },
+                    {
+                        "tagName": "label",
+                        "text": "Group B",
+                        "children": [
+                            {"tagName": "input", "attributes": {"type": "radio", "value": "b"}, "id": "radio-b"}
+                        ],
+                    },
+                ],
+            }
+        ]
+        # A label-wrapped input's own `value` attribute must not surface as a second,
+        # unrelated entry alongside the label's text (regression: ["Group A", "Group B", "a", "b"]).
+        assert _collect_option_texts(tree) == ["Group A", "Group B"]
+
+    def test_extracts_bare_radio_and_checkbox_inputs_via_aria_label(self) -> None:
+        tree = [
+            {"tagName": "input", "attributes": {"type": "radio", "aria-label": "Yes"}},
+            {"tagName": "input", "attributes": {"type": "checkbox", "aria-label": "I agree"}},
+        ]
+        assert _collect_option_texts(tree) == ["Yes", "I agree"]
+
 
 class TestCustomSelectCandidates:
     def test_extracts_role_option_dedupes_checkbox_and_skips_listbox_container(self) -> None:
@@ -1738,6 +1774,43 @@ class TestSelectFromDropdownByValueNoMatch:
         assert result.exception_type == NoElementMatchedForTargetOption.__name__
         assert "after scrolling" in (result.exception_message or "")
         scroll_down_to_load_all_options.assert_awaited_once()
+
+
+class TestScrollDownToLoadAllOptionsDetachedHandle:
+    @pytest.mark.asyncio
+    async def test_falls_back_to_mouse_scroll_after_detached_handle(self) -> None:
+        stale_handle = MagicMock()
+        stale_handle.scroll_into_view_if_needed = AsyncMock(side_effect=Exception("Element is not attached to the DOM"))
+        locator = MagicMock()
+        locator.element_handle = AsyncMock(return_value=stale_handle)
+        locator.focus = AsyncMock()
+        scrollable_element = MagicMock()
+        scrollable_element.get_locator = MagicMock(return_value=locator)
+        scrollable_element.move_mouse_to_safe = AsyncMock()
+
+        page = MagicMock()
+        page.mouse.wheel = AsyncMock()
+
+        skyvern_frame = MagicMock()
+        skyvern_frame.engine_selection = None
+        skyvern_frame.scroll_to_element_bottom = AsyncMock()
+        skyvern_frame.scroll_to_element_top = AsyncMock()
+        skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+
+        incremental_scraped = MagicMock()
+        incremental_scraped.get_incremental_elements_num = AsyncMock(return_value=0)
+
+        await handler.scroll_down_to_load_all_options(
+            scrollable_element=scrollable_element,
+            page=page,
+            skyvern_frame=skyvern_frame,
+            incremental_scraped=incremental_scraped,
+        )
+
+        locator.focus.assert_awaited_once()
+        skyvern_frame.scroll_to_element_bottom.assert_not_awaited()
+        skyvern_frame.scroll_to_element_top.assert_not_awaited()
+        assert page.mouse.wheel.await_count >= 1
 
 
 class TestCustomSelectMissRespectsOptionality:

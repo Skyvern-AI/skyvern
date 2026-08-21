@@ -1,0 +1,2499 @@
+cases:
+  - name: yaml_evaluate_nested_string
+    formatter: browser
+    payload:
+      ok: true
+      error: null
+      action: skyvern_evaluate
+      data:
+        result: |
+          - collection_id: yaml_collection_00
+            title: Synthetic YAML collection 00
+            url: https://yaml.fixture.example/research/collections/0
+            records:
+            - record_id: yaml_record_00_0
+              title: Synthetic YAML record 00-0
+              url: https://yaml.fixture.example/research/records/0-0
+              metadata:
+                rank: 1
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_1
+              title: Synthetic YAML record 00-1
+              url: https://yaml.fixture.example/research/records/0-1
+              metadata:
+                rank: 2
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_2
+              title: Synthetic YAML record 00-2
+              url: https://yaml.fixture.example/research/records/0-2
+              metadata:
+                rank: 3
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_3
+              title: Synthetic YAML record 00-3
+              url: https://yaml.fixture.example/research/records/0-3
+              metadata:
+                rank: 4
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_4
+              title: Synthetic YAML record 00-4
+              url: https://yaml.fixture.example/research/records/0-4
+              metadata:
+                rank: 5
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_5
+              title: Synthetic YAML record 00-5
+              url: https://yaml.fixture.example/research/records/0-5
+              metadata:
+                rank: 6
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_6
+              title: Synthetic YAML record 00-6
+              url: https://yaml.fixture.example/research/records/0-6
+              metadata:
+                rank: 7
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_7
+              title: Synthetic YAML record 00-7
+              url: https://yaml.fixture.example/research/records/0-7
+              metadata:
+                rank: 8
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_01
+            title: Synthetic YAML collection 01
+            url: https://yaml.fixture.example/research/collections/1
+            records:
+            - record_id: yaml_record_01_0
+              title: Synthetic YAML record 01-0
+              url: https://yaml.fixture.example/research/records/1-0
+              metadata:
+                rank: 9
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_1
+              title: Synthetic YAML record 01-1
+              url: https://yaml.fixture.example/research/records/1-1
+              metadata:
+                rank: 10
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_2
+              title: Synthetic YAML record 01-2
+              url: https://yaml.fixture.example/research/records/1-2
+              metadata:
+                rank: 11
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_3
+              title: Synthetic YAML record 01-3
+              url: https://yaml.fixture.example/research/records/1-3
+              metadata:
+                rank: 12
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_4
+              title: Synthetic YAML record 01-4
+              url: https://yaml.fixture.example/research/records/1-4
+              metadata:
+                rank: 13
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_5
+              title: Synthetic YAML record 01-5
+              url: https://yaml.fixture.example/research/records/1-5
+              metadata:
+                rank: 14
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_6
+              title: Synthetic YAML record 01-6
+              url: https://yaml.fixture.example/research/records/1-6
+              metadata:
+                rank: 15
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_7
+              title: Synthetic YAML record 01-7
+              url: https://yaml.fixture.example/research/records/1-7
+              metadata:
+                rank: 16
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_02
+            title: Synthetic YAML collection 02
+            url: https://yaml.fixture.example/research/collections/2
+            records:
+            - record_id: yaml_record_02_0
+              title: Synthetic YAML record 02-0
+              url: https://yaml.fixture.example/research/records/2-0
+              metadata:
+                rank: 17
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_1
+              title: Synthetic YAML record 02-1
+              url: https://yaml.fixture.example/research/records/2-1
+              metadata:
+                rank: 18
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_2
+              title: Synthetic YAML record 02-2
+              url: https://yaml.fixture.example/research/records/2-2
+              metadata:
+                rank: 19
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_3
+              title: Synthetic YAML record 02-3
+              url: https://yaml.fixture.example/research/records/2-3
+              metadata:
+                rank: 20
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_4
+              title: Synthetic YAML record 02-4
+              url: https://yaml.fixture.example/research/records/2-4
+              metadata:
+                rank: 21
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_5
+              title: Synthetic YAML record 02-5
+              url: https://yaml.fixture.example/research/records/2-5
+              metadata:
+                rank: 22
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_6
+              title: Synthetic YAML record 02-6
+              url: https://yaml.fixture.example/research/records/2-6
+              metadata:
+                rank: 23
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_7
+              title: Synthetic YAML record 02-7
+              url: https://yaml.fixture.example/research/records/2-7
+              metadata:
+                rank: 24
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_03
+            title: Synthetic YAML collection 03
+            url: https://yaml.fixture.example/research/collections/3
+            records:
+            - record_id: yaml_record_03_0
+              title: Synthetic YAML record 03-0
+              url: https://yaml.fixture.example/research/records/3-0
+              metadata:
+                rank: 25
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_1
+              title: Synthetic YAML record 03-1
+              url: https://yaml.fixture.example/research/records/3-1
+              metadata:
+                rank: 26
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_2
+              title: Synthetic YAML record 03-2
+              url: https://yaml.fixture.example/research/records/3-2
+              metadata:
+                rank: 27
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_3
+              title: Synthetic YAML record 03-3
+              url: https://yaml.fixture.example/research/records/3-3
+              metadata:
+                rank: 28
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_4
+              title: Synthetic YAML record 03-4
+              url: https://yaml.fixture.example/research/records/3-4
+              metadata:
+                rank: 29
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_5
+              title: Synthetic YAML record 03-5
+              url: https://yaml.fixture.example/research/records/3-5
+              metadata:
+                rank: 30
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_6
+              title: Synthetic YAML record 03-6
+              url: https://yaml.fixture.example/research/records/3-6
+              metadata:
+                rank: 31
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_7
+              title: Synthetic YAML record 03-7
+              url: https://yaml.fixture.example/research/records/3-7
+              metadata:
+                rank: 32
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_04
+            title: Synthetic YAML collection 04
+            url: https://yaml.fixture.example/research/collections/4
+            records:
+            - record_id: yaml_record_04_0
+              title: Synthetic YAML record 04-0
+              url: https://yaml.fixture.example/research/records/4-0
+              metadata:
+                rank: 33
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_1
+              title: Synthetic YAML record 04-1
+              url: https://yaml.fixture.example/research/records/4-1
+              metadata:
+                rank: 34
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_2
+              title: Synthetic YAML record 04-2
+              url: https://yaml.fixture.example/research/records/4-2
+              metadata:
+                rank: 35
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_3
+              title: Synthetic YAML record 04-3
+              url: https://yaml.fixture.example/research/records/4-3
+              metadata:
+                rank: 36
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_4
+              title: Synthetic YAML record 04-4
+              url: https://yaml.fixture.example/research/records/4-4
+              metadata:
+                rank: 37
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_5
+              title: Synthetic YAML record 04-5
+              url: https://yaml.fixture.example/research/records/4-5
+              metadata:
+                rank: 38
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_6
+              title: Synthetic YAML record 04-6
+              url: https://yaml.fixture.example/research/records/4-6
+              metadata:
+                rank: 39
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_7
+              title: Synthetic YAML record 04-7
+              url: https://yaml.fixture.example/research/records/4-7
+              metadata:
+                rank: 40
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_05
+            title: Synthetic YAML collection 05
+            url: https://yaml.fixture.example/research/collections/5
+            records:
+            - record_id: yaml_record_05_0
+              title: Synthetic YAML record 05-0
+              url: https://yaml.fixture.example/research/records/5-0
+              metadata:
+                rank: 41
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_1
+              title: Synthetic YAML record 05-1
+              url: https://yaml.fixture.example/research/records/5-1
+              metadata:
+                rank: 42
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_2
+              title: Synthetic YAML record 05-2
+              url: https://yaml.fixture.example/research/records/5-2
+              metadata:
+                rank: 43
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_3
+              title: Synthetic YAML record 05-3
+              url: https://yaml.fixture.example/research/records/5-3
+              metadata:
+                rank: 44
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_4
+              title: Synthetic YAML record 05-4
+              url: https://yaml.fixture.example/research/records/5-4
+              metadata:
+                rank: 45
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_5
+              title: Synthetic YAML record 05-5
+              url: https://yaml.fixture.example/research/records/5-5
+              metadata:
+                rank: 46
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_6
+              title: Synthetic YAML record 05-6
+              url: https://yaml.fixture.example/research/records/5-6
+              metadata:
+                rank: 47
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_7
+              title: Synthetic YAML record 05-7
+              url: https://yaml.fixture.example/research/records/5-7
+              metadata:
+                rank: 48
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_06
+            title: Synthetic YAML collection 06
+            url: https://yaml.fixture.example/research/collections/6
+            records:
+            - record_id: yaml_record_06_0
+              title: Synthetic YAML record 06-0
+              url: https://yaml.fixture.example/research/records/6-0
+              metadata:
+                rank: 49
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_1
+              title: Synthetic YAML record 06-1
+              url: https://yaml.fixture.example/research/records/6-1
+              metadata:
+                rank: 50
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_2
+              title: Synthetic YAML record 06-2
+              url: https://yaml.fixture.example/research/records/6-2
+              metadata:
+                rank: 51
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_3
+              title: Synthetic YAML record 06-3
+              url: https://yaml.fixture.example/research/records/6-3
+              metadata:
+                rank: 52
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_4
+              title: Synthetic YAML record 06-4
+              url: https://yaml.fixture.example/research/records/6-4
+              metadata:
+                rank: 53
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_5
+              title: Synthetic YAML record 06-5
+              url: https://yaml.fixture.example/research/records/6-5
+              metadata:
+                rank: 54
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_6
+              title: Synthetic YAML record 06-6
+              url: https://yaml.fixture.example/research/records/6-6
+              metadata:
+                rank: 55
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_7
+              title: Synthetic YAML record 06-7
+              url: https://yaml.fixture.example/research/records/6-7
+              metadata:
+                rank: 56
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_07
+            title: Synthetic YAML collection 07
+            url: https://yaml.fixture.example/research/collections/7
+            records:
+            - record_id: yaml_record_07_0
+              title: Synthetic YAML record 07-0
+              url: https://yaml.fixture.example/research/records/7-0
+              metadata:
+                rank: 57
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_1
+              title: Synthetic YAML record 07-1
+              url: https://yaml.fixture.example/research/records/7-1
+              metadata:
+                rank: 58
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_2
+              title: Synthetic YAML record 07-2
+              url: https://yaml.fixture.example/research/records/7-2
+              metadata:
+                rank: 59
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_3
+              title: Synthetic YAML record 07-3
+              url: https://yaml.fixture.example/research/records/7-3
+              metadata:
+                rank: 60
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_4
+              title: Synthetic YAML record 07-4
+              url: https://yaml.fixture.example/research/records/7-4
+              metadata:
+                rank: 61
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_5
+              title: Synthetic YAML record 07-5
+              url: https://yaml.fixture.example/research/records/7-5
+              metadata:
+                rank: 62
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_6
+              title: Synthetic YAML record 07-6
+              url: https://yaml.fixture.example/research/records/7-6
+              metadata:
+                rank: 63
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_7
+              title: Synthetic YAML record 07-7
+              url: https://yaml.fixture.example/research/records/7-7
+              metadata:
+                rank: 64
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_08
+            title: Synthetic YAML collection 08
+            url: https://yaml.fixture.example/research/collections/8
+            records:
+            - record_id: yaml_record_08_0
+              title: Synthetic YAML record 08-0
+              url: https://yaml.fixture.example/research/records/8-0
+              metadata:
+                rank: 65
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_1
+              title: Synthetic YAML record 08-1
+              url: https://yaml.fixture.example/research/records/8-1
+              metadata:
+                rank: 66
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_2
+              title: Synthetic YAML record 08-2
+              url: https://yaml.fixture.example/research/records/8-2
+              metadata:
+                rank: 67
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_3
+              title: Synthetic YAML record 08-3
+              url: https://yaml.fixture.example/research/records/8-3
+              metadata:
+                rank: 68
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_4
+              title: Synthetic YAML record 08-4
+              url: https://yaml.fixture.example/research/records/8-4
+              metadata:
+                rank: 69
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_5
+              title: Synthetic YAML record 08-5
+              url: https://yaml.fixture.example/research/records/8-5
+              metadata:
+                rank: 70
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_6
+              title: Synthetic YAML record 08-6
+              url: https://yaml.fixture.example/research/records/8-6
+              metadata:
+                rank: 71
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_7
+              title: Synthetic YAML record 08-7
+              url: https://yaml.fixture.example/research/records/8-7
+              metadata:
+                rank: 72
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_09
+            title: Synthetic YAML collection 09
+            url: https://yaml.fixture.example/research/collections/9
+            records:
+            - record_id: yaml_record_09_0
+              title: Synthetic YAML record 09-0
+              url: https://yaml.fixture.example/research/records/9-0
+              metadata:
+                rank: 73
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_1
+              title: Synthetic YAML record 09-1
+              url: https://yaml.fixture.example/research/records/9-1
+              metadata:
+                rank: 74
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_2
+              title: Synthetic YAML record 09-2
+              url: https://yaml.fixture.example/research/records/9-2
+              metadata:
+                rank: 75
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_3
+              title: Synthetic YAML record 09-3
+              url: https://yaml.fixture.example/research/records/9-3
+              metadata:
+                rank: 76
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_4
+              title: Synthetic YAML record 09-4
+              url: https://yaml.fixture.example/research/records/9-4
+              metadata:
+                rank: 77
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_5
+              title: Synthetic YAML record 09-5
+              url: https://yaml.fixture.example/research/records/9-5
+              metadata:
+                rank: 78
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_6
+              title: Synthetic YAML record 09-6
+              url: https://yaml.fixture.example/research/records/9-6
+              metadata:
+                rank: 79
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_7
+              title: Synthetic YAML record 09-7
+              url: https://yaml.fixture.example/research/records/9-7
+              metadata:
+                rank: 80
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_10
+            title: Synthetic YAML collection 10
+            url: https://yaml.fixture.example/research/collections/10
+            records:
+            - record_id: yaml_record_10_0
+              title: Synthetic YAML record 10-0
+              url: https://yaml.fixture.example/research/records/10-0
+              metadata:
+                rank: 81
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_1
+              title: Synthetic YAML record 10-1
+              url: https://yaml.fixture.example/research/records/10-1
+              metadata:
+                rank: 82
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_2
+              title: Synthetic YAML record 10-2
+              url: https://yaml.fixture.example/research/records/10-2
+              metadata:
+                rank: 83
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_3
+              title: Synthetic YAML record 10-3
+              url: https://yaml.fixture.example/research/records/10-3
+              metadata:
+                rank: 84
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_4
+              title: Synthetic YAML record 10-4
+              url: https://yaml.fixture.example/research/records/10-4
+              metadata:
+                rank: 85
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_5
+              title: Synthetic YAML record 10-5
+              url: https://yaml.fixture.example/research/records/10-5
+              metadata:
+                rank: 86
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_6
+              title: Synthetic YAML record 10-6
+              url: https://yaml.fixture.example/research/records/10-6
+              metadata:
+                rank: 87
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_7
+              title: Synthetic YAML record 10-7
+              url: https://yaml.fixture.example/research/records/10-7
+              metadata:
+                rank: 88
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_11
+            title: Synthetic YAML collection 11
+            url: https://yaml.fixture.example/research/collections/11
+            records:
+            - record_id: yaml_record_11_0
+              title: Synthetic YAML record 11-0
+              url: https://yaml.fixture.example/research/records/11-0
+              metadata:
+                rank: 89
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_1
+              title: Synthetic YAML record 11-1
+              url: https://yaml.fixture.example/research/records/11-1
+              metadata:
+                rank: 90
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_2
+              title: Synthetic YAML record 11-2
+              url: https://yaml.fixture.example/research/records/11-2
+              metadata:
+                rank: 91
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_3
+              title: Synthetic YAML record 11-3
+              url: https://yaml.fixture.example/research/records/11-3
+              metadata:
+                rank: 92
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_4
+              title: Synthetic YAML record 11-4
+              url: https://yaml.fixture.example/research/records/11-4
+              metadata:
+                rank: 93
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_5
+              title: Synthetic YAML record 11-5
+              url: https://yaml.fixture.example/research/records/11-5
+              metadata:
+                rank: 94
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_6
+              title: Synthetic YAML record 11-6
+              url: https://yaml.fixture.example/research/records/11-6
+              metadata:
+                rank: 95
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_7
+              title: Synthetic YAML record 11-7
+              url: https://yaml.fixture.example/research/records/11-7
+              metadata:
+                rank: 96
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+        expression_id: expr_fixture_yaml
+        page_url: https://yaml.fixture.example/research
+        dataset_id: dataset_fixture_yaml_2026
+        title: Synthetic YAML research index
+        source_url: https://yaml.fixture.example/research
+        count: 12
+      warnings: []
+  - name: yaml_extract_nested_string
+    formatter: browser
+    payload:
+      ok: true
+      error: null
+      action: skyvern_extract
+      data:
+        extracted: |
+          - collection_id: yaml_collection_00
+            title: Synthetic YAML collection 00
+            url: https://yaml.fixture.example/research/collections/0
+            records:
+            - record_id: yaml_record_00_0
+              title: Synthetic YAML record 00-0
+              url: https://yaml.fixture.example/research/records/0-0
+              metadata:
+                rank: 1
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_1
+              title: Synthetic YAML record 00-1
+              url: https://yaml.fixture.example/research/records/0-1
+              metadata:
+                rank: 2
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_2
+              title: Synthetic YAML record 00-2
+              url: https://yaml.fixture.example/research/records/0-2
+              metadata:
+                rank: 3
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_3
+              title: Synthetic YAML record 00-3
+              url: https://yaml.fixture.example/research/records/0-3
+              metadata:
+                rank: 4
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_4
+              title: Synthetic YAML record 00-4
+              url: https://yaml.fixture.example/research/records/0-4
+              metadata:
+                rank: 5
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_5
+              title: Synthetic YAML record 00-5
+              url: https://yaml.fixture.example/research/records/0-5
+              metadata:
+                rank: 6
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_6
+              title: Synthetic YAML record 00-6
+              url: https://yaml.fixture.example/research/records/0-6
+              metadata:
+                rank: 7
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_7
+              title: Synthetic YAML record 00-7
+              url: https://yaml.fixture.example/research/records/0-7
+              metadata:
+                rank: 8
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_01
+            title: Synthetic YAML collection 01
+            url: https://yaml.fixture.example/research/collections/1
+            records:
+            - record_id: yaml_record_01_0
+              title: Synthetic YAML record 01-0
+              url: https://yaml.fixture.example/research/records/1-0
+              metadata:
+                rank: 9
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_1
+              title: Synthetic YAML record 01-1
+              url: https://yaml.fixture.example/research/records/1-1
+              metadata:
+                rank: 10
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_2
+              title: Synthetic YAML record 01-2
+              url: https://yaml.fixture.example/research/records/1-2
+              metadata:
+                rank: 11
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_3
+              title: Synthetic YAML record 01-3
+              url: https://yaml.fixture.example/research/records/1-3
+              metadata:
+                rank: 12
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_4
+              title: Synthetic YAML record 01-4
+              url: https://yaml.fixture.example/research/records/1-4
+              metadata:
+                rank: 13
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_5
+              title: Synthetic YAML record 01-5
+              url: https://yaml.fixture.example/research/records/1-5
+              metadata:
+                rank: 14
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_6
+              title: Synthetic YAML record 01-6
+              url: https://yaml.fixture.example/research/records/1-6
+              metadata:
+                rank: 15
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_7
+              title: Synthetic YAML record 01-7
+              url: https://yaml.fixture.example/research/records/1-7
+              metadata:
+                rank: 16
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_02
+            title: Synthetic YAML collection 02
+            url: https://yaml.fixture.example/research/collections/2
+            records:
+            - record_id: yaml_record_02_0
+              title: Synthetic YAML record 02-0
+              url: https://yaml.fixture.example/research/records/2-0
+              metadata:
+                rank: 17
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_1
+              title: Synthetic YAML record 02-1
+              url: https://yaml.fixture.example/research/records/2-1
+              metadata:
+                rank: 18
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_2
+              title: Synthetic YAML record 02-2
+              url: https://yaml.fixture.example/research/records/2-2
+              metadata:
+                rank: 19
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_3
+              title: Synthetic YAML record 02-3
+              url: https://yaml.fixture.example/research/records/2-3
+              metadata:
+                rank: 20
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_4
+              title: Synthetic YAML record 02-4
+              url: https://yaml.fixture.example/research/records/2-4
+              metadata:
+                rank: 21
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_5
+              title: Synthetic YAML record 02-5
+              url: https://yaml.fixture.example/research/records/2-5
+              metadata:
+                rank: 22
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_6
+              title: Synthetic YAML record 02-6
+              url: https://yaml.fixture.example/research/records/2-6
+              metadata:
+                rank: 23
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_7
+              title: Synthetic YAML record 02-7
+              url: https://yaml.fixture.example/research/records/2-7
+              metadata:
+                rank: 24
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_03
+            title: Synthetic YAML collection 03
+            url: https://yaml.fixture.example/research/collections/3
+            records:
+            - record_id: yaml_record_03_0
+              title: Synthetic YAML record 03-0
+              url: https://yaml.fixture.example/research/records/3-0
+              metadata:
+                rank: 25
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_1
+              title: Synthetic YAML record 03-1
+              url: https://yaml.fixture.example/research/records/3-1
+              metadata:
+                rank: 26
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_2
+              title: Synthetic YAML record 03-2
+              url: https://yaml.fixture.example/research/records/3-2
+              metadata:
+                rank: 27
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_3
+              title: Synthetic YAML record 03-3
+              url: https://yaml.fixture.example/research/records/3-3
+              metadata:
+                rank: 28
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_4
+              title: Synthetic YAML record 03-4
+              url: https://yaml.fixture.example/research/records/3-4
+              metadata:
+                rank: 29
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_5
+              title: Synthetic YAML record 03-5
+              url: https://yaml.fixture.example/research/records/3-5
+              metadata:
+                rank: 30
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_6
+              title: Synthetic YAML record 03-6
+              url: https://yaml.fixture.example/research/records/3-6
+              metadata:
+                rank: 31
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_7
+              title: Synthetic YAML record 03-7
+              url: https://yaml.fixture.example/research/records/3-7
+              metadata:
+                rank: 32
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_04
+            title: Synthetic YAML collection 04
+            url: https://yaml.fixture.example/research/collections/4
+            records:
+            - record_id: yaml_record_04_0
+              title: Synthetic YAML record 04-0
+              url: https://yaml.fixture.example/research/records/4-0
+              metadata:
+                rank: 33
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_1
+              title: Synthetic YAML record 04-1
+              url: https://yaml.fixture.example/research/records/4-1
+              metadata:
+                rank: 34
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_2
+              title: Synthetic YAML record 04-2
+              url: https://yaml.fixture.example/research/records/4-2
+              metadata:
+                rank: 35
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_3
+              title: Synthetic YAML record 04-3
+              url: https://yaml.fixture.example/research/records/4-3
+              metadata:
+                rank: 36
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_4
+              title: Synthetic YAML record 04-4
+              url: https://yaml.fixture.example/research/records/4-4
+              metadata:
+                rank: 37
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_5
+              title: Synthetic YAML record 04-5
+              url: https://yaml.fixture.example/research/records/4-5
+              metadata:
+                rank: 38
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_6
+              title: Synthetic YAML record 04-6
+              url: https://yaml.fixture.example/research/records/4-6
+              metadata:
+                rank: 39
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_7
+              title: Synthetic YAML record 04-7
+              url: https://yaml.fixture.example/research/records/4-7
+              metadata:
+                rank: 40
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_05
+            title: Synthetic YAML collection 05
+            url: https://yaml.fixture.example/research/collections/5
+            records:
+            - record_id: yaml_record_05_0
+              title: Synthetic YAML record 05-0
+              url: https://yaml.fixture.example/research/records/5-0
+              metadata:
+                rank: 41
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_1
+              title: Synthetic YAML record 05-1
+              url: https://yaml.fixture.example/research/records/5-1
+              metadata:
+                rank: 42
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_2
+              title: Synthetic YAML record 05-2
+              url: https://yaml.fixture.example/research/records/5-2
+              metadata:
+                rank: 43
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_3
+              title: Synthetic YAML record 05-3
+              url: https://yaml.fixture.example/research/records/5-3
+              metadata:
+                rank: 44
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_4
+              title: Synthetic YAML record 05-4
+              url: https://yaml.fixture.example/research/records/5-4
+              metadata:
+                rank: 45
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_5
+              title: Synthetic YAML record 05-5
+              url: https://yaml.fixture.example/research/records/5-5
+              metadata:
+                rank: 46
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_6
+              title: Synthetic YAML record 05-6
+              url: https://yaml.fixture.example/research/records/5-6
+              metadata:
+                rank: 47
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_7
+              title: Synthetic YAML record 05-7
+              url: https://yaml.fixture.example/research/records/5-7
+              metadata:
+                rank: 48
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_06
+            title: Synthetic YAML collection 06
+            url: https://yaml.fixture.example/research/collections/6
+            records:
+            - record_id: yaml_record_06_0
+              title: Synthetic YAML record 06-0
+              url: https://yaml.fixture.example/research/records/6-0
+              metadata:
+                rank: 49
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_1
+              title: Synthetic YAML record 06-1
+              url: https://yaml.fixture.example/research/records/6-1
+              metadata:
+                rank: 50
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_2
+              title: Synthetic YAML record 06-2
+              url: https://yaml.fixture.example/research/records/6-2
+              metadata:
+                rank: 51
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_3
+              title: Synthetic YAML record 06-3
+              url: https://yaml.fixture.example/research/records/6-3
+              metadata:
+                rank: 52
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_4
+              title: Synthetic YAML record 06-4
+              url: https://yaml.fixture.example/research/records/6-4
+              metadata:
+                rank: 53
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_5
+              title: Synthetic YAML record 06-5
+              url: https://yaml.fixture.example/research/records/6-5
+              metadata:
+                rank: 54
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_6
+              title: Synthetic YAML record 06-6
+              url: https://yaml.fixture.example/research/records/6-6
+              metadata:
+                rank: 55
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_7
+              title: Synthetic YAML record 06-7
+              url: https://yaml.fixture.example/research/records/6-7
+              metadata:
+                rank: 56
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_07
+            title: Synthetic YAML collection 07
+            url: https://yaml.fixture.example/research/collections/7
+            records:
+            - record_id: yaml_record_07_0
+              title: Synthetic YAML record 07-0
+              url: https://yaml.fixture.example/research/records/7-0
+              metadata:
+                rank: 57
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_1
+              title: Synthetic YAML record 07-1
+              url: https://yaml.fixture.example/research/records/7-1
+              metadata:
+                rank: 58
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_2
+              title: Synthetic YAML record 07-2
+              url: https://yaml.fixture.example/research/records/7-2
+              metadata:
+                rank: 59
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_3
+              title: Synthetic YAML record 07-3
+              url: https://yaml.fixture.example/research/records/7-3
+              metadata:
+                rank: 60
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_4
+              title: Synthetic YAML record 07-4
+              url: https://yaml.fixture.example/research/records/7-4
+              metadata:
+                rank: 61
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_5
+              title: Synthetic YAML record 07-5
+              url: https://yaml.fixture.example/research/records/7-5
+              metadata:
+                rank: 62
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_6
+              title: Synthetic YAML record 07-6
+              url: https://yaml.fixture.example/research/records/7-6
+              metadata:
+                rank: 63
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_7
+              title: Synthetic YAML record 07-7
+              url: https://yaml.fixture.example/research/records/7-7
+              metadata:
+                rank: 64
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_08
+            title: Synthetic YAML collection 08
+            url: https://yaml.fixture.example/research/collections/8
+            records:
+            - record_id: yaml_record_08_0
+              title: Synthetic YAML record 08-0
+              url: https://yaml.fixture.example/research/records/8-0
+              metadata:
+                rank: 65
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_1
+              title: Synthetic YAML record 08-1
+              url: https://yaml.fixture.example/research/records/8-1
+              metadata:
+                rank: 66
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_2
+              title: Synthetic YAML record 08-2
+              url: https://yaml.fixture.example/research/records/8-2
+              metadata:
+                rank: 67
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_3
+              title: Synthetic YAML record 08-3
+              url: https://yaml.fixture.example/research/records/8-3
+              metadata:
+                rank: 68
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_4
+              title: Synthetic YAML record 08-4
+              url: https://yaml.fixture.example/research/records/8-4
+              metadata:
+                rank: 69
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_5
+              title: Synthetic YAML record 08-5
+              url: https://yaml.fixture.example/research/records/8-5
+              metadata:
+                rank: 70
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_6
+              title: Synthetic YAML record 08-6
+              url: https://yaml.fixture.example/research/records/8-6
+              metadata:
+                rank: 71
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_7
+              title: Synthetic YAML record 08-7
+              url: https://yaml.fixture.example/research/records/8-7
+              metadata:
+                rank: 72
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_09
+            title: Synthetic YAML collection 09
+            url: https://yaml.fixture.example/research/collections/9
+            records:
+            - record_id: yaml_record_09_0
+              title: Synthetic YAML record 09-0
+              url: https://yaml.fixture.example/research/records/9-0
+              metadata:
+                rank: 73
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_1
+              title: Synthetic YAML record 09-1
+              url: https://yaml.fixture.example/research/records/9-1
+              metadata:
+                rank: 74
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_2
+              title: Synthetic YAML record 09-2
+              url: https://yaml.fixture.example/research/records/9-2
+              metadata:
+                rank: 75
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_3
+              title: Synthetic YAML record 09-3
+              url: https://yaml.fixture.example/research/records/9-3
+              metadata:
+                rank: 76
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_4
+              title: Synthetic YAML record 09-4
+              url: https://yaml.fixture.example/research/records/9-4
+              metadata:
+                rank: 77
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_5
+              title: Synthetic YAML record 09-5
+              url: https://yaml.fixture.example/research/records/9-5
+              metadata:
+                rank: 78
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_6
+              title: Synthetic YAML record 09-6
+              url: https://yaml.fixture.example/research/records/9-6
+              metadata:
+                rank: 79
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_7
+              title: Synthetic YAML record 09-7
+              url: https://yaml.fixture.example/research/records/9-7
+              metadata:
+                rank: 80
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_10
+            title: Synthetic YAML collection 10
+            url: https://yaml.fixture.example/research/collections/10
+            records:
+            - record_id: yaml_record_10_0
+              title: Synthetic YAML record 10-0
+              url: https://yaml.fixture.example/research/records/10-0
+              metadata:
+                rank: 81
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_1
+              title: Synthetic YAML record 10-1
+              url: https://yaml.fixture.example/research/records/10-1
+              metadata:
+                rank: 82
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_2
+              title: Synthetic YAML record 10-2
+              url: https://yaml.fixture.example/research/records/10-2
+              metadata:
+                rank: 83
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_3
+              title: Synthetic YAML record 10-3
+              url: https://yaml.fixture.example/research/records/10-3
+              metadata:
+                rank: 84
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_4
+              title: Synthetic YAML record 10-4
+              url: https://yaml.fixture.example/research/records/10-4
+              metadata:
+                rank: 85
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_5
+              title: Synthetic YAML record 10-5
+              url: https://yaml.fixture.example/research/records/10-5
+              metadata:
+                rank: 86
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_6
+              title: Synthetic YAML record 10-6
+              url: https://yaml.fixture.example/research/records/10-6
+              metadata:
+                rank: 87
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_7
+              title: Synthetic YAML record 10-7
+              url: https://yaml.fixture.example/research/records/10-7
+              metadata:
+                rank: 88
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_11
+            title: Synthetic YAML collection 11
+            url: https://yaml.fixture.example/research/collections/11
+            records:
+            - record_id: yaml_record_11_0
+              title: Synthetic YAML record 11-0
+              url: https://yaml.fixture.example/research/records/11-0
+              metadata:
+                rank: 89
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_1
+              title: Synthetic YAML record 11-1
+              url: https://yaml.fixture.example/research/records/11-1
+              metadata:
+                rank: 90
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_2
+              title: Synthetic YAML record 11-2
+              url: https://yaml.fixture.example/research/records/11-2
+              metadata:
+                rank: 91
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_3
+              title: Synthetic YAML record 11-3
+              url: https://yaml.fixture.example/research/records/11-3
+              metadata:
+                rank: 92
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_4
+              title: Synthetic YAML record 11-4
+              url: https://yaml.fixture.example/research/records/11-4
+              metadata:
+                rank: 93
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_5
+              title: Synthetic YAML record 11-5
+              url: https://yaml.fixture.example/research/records/11-5
+              metadata:
+                rank: 94
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_6
+              title: Synthetic YAML record 11-6
+              url: https://yaml.fixture.example/research/records/11-6
+              metadata:
+                rank: 95
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_7
+              title: Synthetic YAML record 11-7
+              url: https://yaml.fixture.example/research/records/11-7
+              metadata:
+                rank: 96
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+        prompt_id: prompt_fixture_yaml
+        page_url: https://yaml.fixture.example/research
+        dataset_id: dataset_fixture_yaml_2026
+        title: Synthetic YAML research index
+        source_url: https://yaml.fixture.example/research
+        count: 12
+      warnings: []
+  - name: yaml_network_body_nested_string
+    formatter: network_detail
+    payload:
+      ok: true
+      error: null
+      action: skyvern_network_request_detail
+      data:
+        request:
+          request_id: 77
+          url: https://yaml.fixture.example/api/research
+          method: GET
+          status: 200
+          content_type: application/yaml
+        body: |
+          - collection_id: yaml_collection_00
+            title: Synthetic YAML collection 00
+            url: https://yaml.fixture.example/research/collections/0
+            records:
+            - record_id: yaml_record_00_0
+              title: Synthetic YAML record 00-0
+              url: https://yaml.fixture.example/research/records/0-0
+              metadata:
+                rank: 1
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_1
+              title: Synthetic YAML record 00-1
+              url: https://yaml.fixture.example/research/records/0-1
+              metadata:
+                rank: 2
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_2
+              title: Synthetic YAML record 00-2
+              url: https://yaml.fixture.example/research/records/0-2
+              metadata:
+                rank: 3
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_3
+              title: Synthetic YAML record 00-3
+              url: https://yaml.fixture.example/research/records/0-3
+              metadata:
+                rank: 4
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_4
+              title: Synthetic YAML record 00-4
+              url: https://yaml.fixture.example/research/records/0-4
+              metadata:
+                rank: 5
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_5
+              title: Synthetic YAML record 00-5
+              url: https://yaml.fixture.example/research/records/0-5
+              metadata:
+                rank: 6
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_6
+              title: Synthetic YAML record 00-6
+              url: https://yaml.fixture.example/research/records/0-6
+              metadata:
+                rank: 7
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_00_7
+              title: Synthetic YAML record 00-7
+              url: https://yaml.fixture.example/research/records/0-7
+              metadata:
+                rank: 8
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_01
+            title: Synthetic YAML collection 01
+            url: https://yaml.fixture.example/research/collections/1
+            records:
+            - record_id: yaml_record_01_0
+              title: Synthetic YAML record 01-0
+              url: https://yaml.fixture.example/research/records/1-0
+              metadata:
+                rank: 9
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_1
+              title: Synthetic YAML record 01-1
+              url: https://yaml.fixture.example/research/records/1-1
+              metadata:
+                rank: 10
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_2
+              title: Synthetic YAML record 01-2
+              url: https://yaml.fixture.example/research/records/1-2
+              metadata:
+                rank: 11
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_3
+              title: Synthetic YAML record 01-3
+              url: https://yaml.fixture.example/research/records/1-3
+              metadata:
+                rank: 12
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_4
+              title: Synthetic YAML record 01-4
+              url: https://yaml.fixture.example/research/records/1-4
+              metadata:
+                rank: 13
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_5
+              title: Synthetic YAML record 01-5
+              url: https://yaml.fixture.example/research/records/1-5
+              metadata:
+                rank: 14
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_6
+              title: Synthetic YAML record 01-6
+              url: https://yaml.fixture.example/research/records/1-6
+              metadata:
+                rank: 15
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_01_7
+              title: Synthetic YAML record 01-7
+              url: https://yaml.fixture.example/research/records/1-7
+              metadata:
+                rank: 16
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_02
+            title: Synthetic YAML collection 02
+            url: https://yaml.fixture.example/research/collections/2
+            records:
+            - record_id: yaml_record_02_0
+              title: Synthetic YAML record 02-0
+              url: https://yaml.fixture.example/research/records/2-0
+              metadata:
+                rank: 17
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_1
+              title: Synthetic YAML record 02-1
+              url: https://yaml.fixture.example/research/records/2-1
+              metadata:
+                rank: 18
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_2
+              title: Synthetic YAML record 02-2
+              url: https://yaml.fixture.example/research/records/2-2
+              metadata:
+                rank: 19
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_3
+              title: Synthetic YAML record 02-3
+              url: https://yaml.fixture.example/research/records/2-3
+              metadata:
+                rank: 20
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_4
+              title: Synthetic YAML record 02-4
+              url: https://yaml.fixture.example/research/records/2-4
+              metadata:
+                rank: 21
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_5
+              title: Synthetic YAML record 02-5
+              url: https://yaml.fixture.example/research/records/2-5
+              metadata:
+                rank: 22
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_6
+              title: Synthetic YAML record 02-6
+              url: https://yaml.fixture.example/research/records/2-6
+              metadata:
+                rank: 23
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_02_7
+              title: Synthetic YAML record 02-7
+              url: https://yaml.fixture.example/research/records/2-7
+              metadata:
+                rank: 24
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_03
+            title: Synthetic YAML collection 03
+            url: https://yaml.fixture.example/research/collections/3
+            records:
+            - record_id: yaml_record_03_0
+              title: Synthetic YAML record 03-0
+              url: https://yaml.fixture.example/research/records/3-0
+              metadata:
+                rank: 25
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_1
+              title: Synthetic YAML record 03-1
+              url: https://yaml.fixture.example/research/records/3-1
+              metadata:
+                rank: 26
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_2
+              title: Synthetic YAML record 03-2
+              url: https://yaml.fixture.example/research/records/3-2
+              metadata:
+                rank: 27
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_3
+              title: Synthetic YAML record 03-3
+              url: https://yaml.fixture.example/research/records/3-3
+              metadata:
+                rank: 28
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_4
+              title: Synthetic YAML record 03-4
+              url: https://yaml.fixture.example/research/records/3-4
+              metadata:
+                rank: 29
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_5
+              title: Synthetic YAML record 03-5
+              url: https://yaml.fixture.example/research/records/3-5
+              metadata:
+                rank: 30
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_6
+              title: Synthetic YAML record 03-6
+              url: https://yaml.fixture.example/research/records/3-6
+              metadata:
+                rank: 31
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_03_7
+              title: Synthetic YAML record 03-7
+              url: https://yaml.fixture.example/research/records/3-7
+              metadata:
+                rank: 32
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_04
+            title: Synthetic YAML collection 04
+            url: https://yaml.fixture.example/research/collections/4
+            records:
+            - record_id: yaml_record_04_0
+              title: Synthetic YAML record 04-0
+              url: https://yaml.fixture.example/research/records/4-0
+              metadata:
+                rank: 33
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_1
+              title: Synthetic YAML record 04-1
+              url: https://yaml.fixture.example/research/records/4-1
+              metadata:
+                rank: 34
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_2
+              title: Synthetic YAML record 04-2
+              url: https://yaml.fixture.example/research/records/4-2
+              metadata:
+                rank: 35
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_3
+              title: Synthetic YAML record 04-3
+              url: https://yaml.fixture.example/research/records/4-3
+              metadata:
+                rank: 36
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_4
+              title: Synthetic YAML record 04-4
+              url: https://yaml.fixture.example/research/records/4-4
+              metadata:
+                rank: 37
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_5
+              title: Synthetic YAML record 04-5
+              url: https://yaml.fixture.example/research/records/4-5
+              metadata:
+                rank: 38
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_6
+              title: Synthetic YAML record 04-6
+              url: https://yaml.fixture.example/research/records/4-6
+              metadata:
+                rank: 39
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_04_7
+              title: Synthetic YAML record 04-7
+              url: https://yaml.fixture.example/research/records/4-7
+              metadata:
+                rank: 40
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_05
+            title: Synthetic YAML collection 05
+            url: https://yaml.fixture.example/research/collections/5
+            records:
+            - record_id: yaml_record_05_0
+              title: Synthetic YAML record 05-0
+              url: https://yaml.fixture.example/research/records/5-0
+              metadata:
+                rank: 41
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_1
+              title: Synthetic YAML record 05-1
+              url: https://yaml.fixture.example/research/records/5-1
+              metadata:
+                rank: 42
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_2
+              title: Synthetic YAML record 05-2
+              url: https://yaml.fixture.example/research/records/5-2
+              metadata:
+                rank: 43
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_3
+              title: Synthetic YAML record 05-3
+              url: https://yaml.fixture.example/research/records/5-3
+              metadata:
+                rank: 44
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_4
+              title: Synthetic YAML record 05-4
+              url: https://yaml.fixture.example/research/records/5-4
+              metadata:
+                rank: 45
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_5
+              title: Synthetic YAML record 05-5
+              url: https://yaml.fixture.example/research/records/5-5
+              metadata:
+                rank: 46
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_6
+              title: Synthetic YAML record 05-6
+              url: https://yaml.fixture.example/research/records/5-6
+              metadata:
+                rank: 47
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_05_7
+              title: Synthetic YAML record 05-7
+              url: https://yaml.fixture.example/research/records/5-7
+              metadata:
+                rank: 48
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_06
+            title: Synthetic YAML collection 06
+            url: https://yaml.fixture.example/research/collections/6
+            records:
+            - record_id: yaml_record_06_0
+              title: Synthetic YAML record 06-0
+              url: https://yaml.fixture.example/research/records/6-0
+              metadata:
+                rank: 49
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_1
+              title: Synthetic YAML record 06-1
+              url: https://yaml.fixture.example/research/records/6-1
+              metadata:
+                rank: 50
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_2
+              title: Synthetic YAML record 06-2
+              url: https://yaml.fixture.example/research/records/6-2
+              metadata:
+                rank: 51
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_3
+              title: Synthetic YAML record 06-3
+              url: https://yaml.fixture.example/research/records/6-3
+              metadata:
+                rank: 52
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_4
+              title: Synthetic YAML record 06-4
+              url: https://yaml.fixture.example/research/records/6-4
+              metadata:
+                rank: 53
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_5
+              title: Synthetic YAML record 06-5
+              url: https://yaml.fixture.example/research/records/6-5
+              metadata:
+                rank: 54
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_6
+              title: Synthetic YAML record 06-6
+              url: https://yaml.fixture.example/research/records/6-6
+              metadata:
+                rank: 55
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_06_7
+              title: Synthetic YAML record 06-7
+              url: https://yaml.fixture.example/research/records/6-7
+              metadata:
+                rank: 56
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_07
+            title: Synthetic YAML collection 07
+            url: https://yaml.fixture.example/research/collections/7
+            records:
+            - record_id: yaml_record_07_0
+              title: Synthetic YAML record 07-0
+              url: https://yaml.fixture.example/research/records/7-0
+              metadata:
+                rank: 57
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_1
+              title: Synthetic YAML record 07-1
+              url: https://yaml.fixture.example/research/records/7-1
+              metadata:
+                rank: 58
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_2
+              title: Synthetic YAML record 07-2
+              url: https://yaml.fixture.example/research/records/7-2
+              metadata:
+                rank: 59
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_3
+              title: Synthetic YAML record 07-3
+              url: https://yaml.fixture.example/research/records/7-3
+              metadata:
+                rank: 60
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_4
+              title: Synthetic YAML record 07-4
+              url: https://yaml.fixture.example/research/records/7-4
+              metadata:
+                rank: 61
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_5
+              title: Synthetic YAML record 07-5
+              url: https://yaml.fixture.example/research/records/7-5
+              metadata:
+                rank: 62
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_6
+              title: Synthetic YAML record 07-6
+              url: https://yaml.fixture.example/research/records/7-6
+              metadata:
+                rank: 63
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_07_7
+              title: Synthetic YAML record 07-7
+              url: https://yaml.fixture.example/research/records/7-7
+              metadata:
+                rank: 64
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_08
+            title: Synthetic YAML collection 08
+            url: https://yaml.fixture.example/research/collections/8
+            records:
+            - record_id: yaml_record_08_0
+              title: Synthetic YAML record 08-0
+              url: https://yaml.fixture.example/research/records/8-0
+              metadata:
+                rank: 65
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_1
+              title: Synthetic YAML record 08-1
+              url: https://yaml.fixture.example/research/records/8-1
+              metadata:
+                rank: 66
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_2
+              title: Synthetic YAML record 08-2
+              url: https://yaml.fixture.example/research/records/8-2
+              metadata:
+                rank: 67
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_3
+              title: Synthetic YAML record 08-3
+              url: https://yaml.fixture.example/research/records/8-3
+              metadata:
+                rank: 68
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_4
+              title: Synthetic YAML record 08-4
+              url: https://yaml.fixture.example/research/records/8-4
+              metadata:
+                rank: 69
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_5
+              title: Synthetic YAML record 08-5
+              url: https://yaml.fixture.example/research/records/8-5
+              metadata:
+                rank: 70
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_6
+              title: Synthetic YAML record 08-6
+              url: https://yaml.fixture.example/research/records/8-6
+              metadata:
+                rank: 71
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_08_7
+              title: Synthetic YAML record 08-7
+              url: https://yaml.fixture.example/research/records/8-7
+              metadata:
+                rank: 72
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_09
+            title: Synthetic YAML collection 09
+            url: https://yaml.fixture.example/research/collections/9
+            records:
+            - record_id: yaml_record_09_0
+              title: Synthetic YAML record 09-0
+              url: https://yaml.fixture.example/research/records/9-0
+              metadata:
+                rank: 73
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_1
+              title: Synthetic YAML record 09-1
+              url: https://yaml.fixture.example/research/records/9-1
+              metadata:
+                rank: 74
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_2
+              title: Synthetic YAML record 09-2
+              url: https://yaml.fixture.example/research/records/9-2
+              metadata:
+                rank: 75
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_3
+              title: Synthetic YAML record 09-3
+              url: https://yaml.fixture.example/research/records/9-3
+              metadata:
+                rank: 76
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_4
+              title: Synthetic YAML record 09-4
+              url: https://yaml.fixture.example/research/records/9-4
+              metadata:
+                rank: 77
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_5
+              title: Synthetic YAML record 09-5
+              url: https://yaml.fixture.example/research/records/9-5
+              metadata:
+                rank: 78
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_6
+              title: Synthetic YAML record 09-6
+              url: https://yaml.fixture.example/research/records/9-6
+              metadata:
+                rank: 79
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_09_7
+              title: Synthetic YAML record 09-7
+              url: https://yaml.fixture.example/research/records/9-7
+              metadata:
+                rank: 80
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_10
+            title: Synthetic YAML collection 10
+            url: https://yaml.fixture.example/research/collections/10
+            records:
+            - record_id: yaml_record_10_0
+              title: Synthetic YAML record 10-0
+              url: https://yaml.fixture.example/research/records/10-0
+              metadata:
+                rank: 81
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_1
+              title: Synthetic YAML record 10-1
+              url: https://yaml.fixture.example/research/records/10-1
+              metadata:
+                rank: 82
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_2
+              title: Synthetic YAML record 10-2
+              url: https://yaml.fixture.example/research/records/10-2
+              metadata:
+                rank: 83
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_3
+              title: Synthetic YAML record 10-3
+              url: https://yaml.fixture.example/research/records/10-3
+              metadata:
+                rank: 84
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_4
+              title: Synthetic YAML record 10-4
+              url: https://yaml.fixture.example/research/records/10-4
+              metadata:
+                rank: 85
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_5
+              title: Synthetic YAML record 10-5
+              url: https://yaml.fixture.example/research/records/10-5
+              metadata:
+                rank: 86
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_6
+              title: Synthetic YAML record 10-6
+              url: https://yaml.fixture.example/research/records/10-6
+              metadata:
+                rank: 87
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_10_7
+              title: Synthetic YAML record 10-7
+              url: https://yaml.fixture.example/research/records/10-7
+              metadata:
+                rank: 88
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+          - collection_id: yaml_collection_11
+            title: Synthetic YAML collection 11
+            url: https://yaml.fixture.example/research/collections/11
+            records:
+            - record_id: yaml_record_11_0
+              title: Synthetic YAML record 11-0
+              url: https://yaml.fixture.example/research/records/11-0
+              metadata:
+                rank: 89
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_1
+              title: Synthetic YAML record 11-1
+              url: https://yaml.fixture.example/research/records/11-1
+              metadata:
+                rank: 90
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_2
+              title: Synthetic YAML record 11-2
+              url: https://yaml.fixture.example/research/records/11-2
+              metadata:
+                rank: 91
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_3
+              title: Synthetic YAML record 11-3
+              url: https://yaml.fixture.example/research/records/11-3
+              metadata:
+                rank: 92
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_4
+              title: Synthetic YAML record 11-4
+              url: https://yaml.fixture.example/research/records/11-4
+              metadata:
+                rank: 93
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_5
+              title: Synthetic YAML record 11-5
+              url: https://yaml.fixture.example/research/records/11-5
+              metadata:
+                rank: 94
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_6
+              title: Synthetic YAML record 11-6
+              url: https://yaml.fixture.example/research/records/11-6
+              metadata:
+                rank: 95
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+            - record_id: yaml_record_11_7
+              title: Synthetic YAML record 11-7
+              url: https://yaml.fixture.example/research/records/11-7
+              metadata:
+                rank: 96
+                status: verified
+                notes: Synthetic nested YAML detail repeated for deterministic response savings
+                  and parser coverage.
+        body_available: true
+        dataset_id: dataset_fixture_yaml_2026
+        title: Synthetic YAML research index
+        source_url: https://yaml.fixture.example/research
+        count: 12
+      warnings: []

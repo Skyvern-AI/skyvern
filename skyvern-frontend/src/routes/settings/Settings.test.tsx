@@ -1,8 +1,16 @@
 // @vitest-environment jsdom
-import { cleanup, render, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { persistRuntimeApiKey, clearRuntimeApiKey } from "@/util/env";
 import { Settings } from "./Settings";
 
 const scrollIntoViewMock = vi.fn();
@@ -40,8 +48,52 @@ describe("Settings", () => {
 
   afterEach(() => {
     cleanup();
+    clearRuntimeApiKey();
+    window.sessionStorage.clear();
     scrollIntoViewMock.mockClear();
     Element.prototype.scrollIntoView = originalScrollIntoView;
+  });
+
+  it("shows the session token as soon as it is minted", async () => {
+    // The page renders before the first mint lands, so a value read once at render never updates.
+    const { getByDisplayValue } = render(
+      <MemoryRouter initialEntries={["/settings"]}>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const masked = getByDisplayValue("**** **** **** ****");
+    const revealButton = within(
+      masked.parentElement as HTMLElement,
+    ).getAllByRole("button")[0]!;
+    fireEvent.click(revealButton);
+    getByDisplayValue("Waiting for a browser session token");
+
+    act(() => {
+      persistRuntimeApiKey(
+        "minted-session-canary",
+        Math.floor(Date.now() / 1000) + 3600,
+      );
+    });
+
+    await waitFor(() => {
+      expect(getByDisplayValue("minted-session-canary")).toBeTruthy();
+    });
+  });
+
+  it("says the credential on screen is short-lived", async () => {
+    persistRuntimeApiKey(
+      "short-lived-canary",
+      Math.floor(Date.now() / 1000) + 3600,
+    );
+
+    const { findByText } = render(
+      <MemoryRouter initialEntries={["/settings"]}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    // Copying it into an SDK or a schedule silently breaks an hour later.
+    expect(await findByText(/Short-lived browser session token/)).toBeTruthy();
   });
 
   it("scrolls the linked settings section into view", async () => {

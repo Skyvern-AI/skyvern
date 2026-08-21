@@ -141,8 +141,7 @@ function lastAuthoringToolName(
 
 // Raw designActivity count of tool_calls in `tools` — drives the Draft
 // "N drafts" (AUTHORING_TOOLS) and Test-run "N runs" (RUN_TOOLS) stubs, since
-// each update_workflow / update_and_run_blocks / run_blocks_and_collect_debug
-// call lands in designActivity.
+// each authoring or block-running tool call lands in designActivity.
 function countToolCalls(
   designActivity: ActivityEntry[],
   tools: Set<string>,
@@ -203,7 +202,9 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
   );
   const testReached =
     latestBlocks.length > 0 ||
-    (turn.designEnded && lastAuthoring === "update_and_run_blocks");
+    (turn.designEnded &&
+      lastAuthoring !== undefined &&
+      RUN_TOOLS.has(lastAuthoring));
   // Explore completes only on recorded authoring (authoringCount live /
   // authoringSeen after hydration resets the client-only count) or a run.
   // draftingSignaledAt can fire on a mid-scout pause and designEnded is forced

@@ -34,7 +34,7 @@ LOG = structlog.get_logger()
 # entry as a short preview. This is a hooks-side concern (what to record),
 # not a registry of the tools themselves.
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
-    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks"}
+    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
 )
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
@@ -57,7 +57,7 @@ def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
 
 
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
-    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
+    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}:
         return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False

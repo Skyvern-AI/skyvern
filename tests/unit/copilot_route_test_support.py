@@ -58,6 +58,10 @@ def setup_new_copilot_mocks(
         agent_result.narrative_payload = None
     if not hasattr(agent_result, "executed_block_fingerprints"):
         agent_result.executed_block_fingerprints = {}
+    if not hasattr(agent_result, "cancellation_iteration"):
+        agent_result.cancellation_iteration = None
+    if not hasattr(agent_result, "cancellation_last_recorded_phase"):
+        agent_result.cancellation_last_recorded_phase = None
     if not hasattr(original_workflow, "modified_at"):
         original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
     if not hasattr(original_workflow, "model_dump"):

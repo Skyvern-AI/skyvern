@@ -159,15 +159,17 @@ async def test_get_runs_v2_rejects_workflow_filter_page_beyond_fetch_cap(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("handler", "expected_exclude_child_runs"),
+    ("handler", "extra_kwargs", "expected_exclude_child_runs"),
     [
-        (agent_protocol.get_workflow_runs_by_id, True),
-        (agent_protocol.get_workflow_runs_by_id_legacy, False),
+        (agent_protocol.get_workflow_runs_by_id, {}, True),
+        (agent_protocol.get_workflow_runs_by_id, {"include_child_runs": True}, False),
+        (agent_protocol.get_workflow_runs_by_id_legacy, {}, False),
     ],
 )
 async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
     monkeypatch: pytest.MonkeyPatch,
     handler: Any,
+    extra_kwargs: dict[str, Any],
     expected_exclude_child_runs: bool,
 ) -> None:
     mock_service = SimpleNamespace(
@@ -184,6 +186,7 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         search_key="login",
         error_code="LOGIN_FAILED",
         current_org=SimpleNamespace(organization_id="org_123"),
+        **extra_kwargs,
     )
 
     assert response == []

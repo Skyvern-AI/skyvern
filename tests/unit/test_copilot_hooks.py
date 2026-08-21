@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+import yaml
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -24,8 +26,19 @@ from skyvern.forge.sdk.copilot.tools import (
     _click_post_hook,
     _click_pre_hook,
     _prenav_ambiguity_for_selector,
+    _verify_scout_type_landed,
+)
+from skyvern.forge.sdk.copilot.tools.credential_fill import _fill_observed_effects
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
+    ScoutReadbackOutcome,
+    _scout_readback_outcome,
+    _scout_type_landing_failure,
 )
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+
+READBACK_OUTCOME_CASES = yaml.safe_load((Path(__file__).parent / "credential_readback_outcome_cases.yaml").read_text())[
+    "cases"
+]
 
 
 @dataclass
@@ -514,7 +527,8 @@ class TestMCPFailedStepLoopDetection:
                 calls.append((name, args, in_context))
                 return FakeRawResult()
 
-        async def fake_ensure_browser_session(ctx: Any) -> None:
+        async def fake_ensure_browser_session(ctx: Any, *, require_verified_session: bool = False) -> None:
+            assert require_verified_session is True
             ctx.browser_session_id = "pbs_copilot"
             return None
 
@@ -536,6 +550,9 @@ class TestMCPFailedStepLoopDetection:
         ctx.turn_ownership = None
         ctx.blocker_signal_claimant = None
         ctx.gate_precedence_conflict_events = []
+        ctx.browser_session_id = None
+        ctx.browser_session_continuity_generation = 0
+        ctx.browser_session_recovery_lock = None
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},
@@ -875,6 +892,43 @@ class TestObservationToolsSet:
         assert expected.issubset(_OBSERVATION_TOOLS)
 
 
+class TestScoutReadbackOutcome:
+    """The readback is reported as what was observed; nothing here decides where the value belongs."""
+
+    @pytest.mark.parametrize("case", READBACK_OUTCOME_CASES, ids=[case["name"] for case in READBACK_OUTCOME_CASES])
+    def test_the_shared_case_table_pins_the_outcome_the_failure_and_the_landing_record(
+        self, case: dict[str, Any]
+    ) -> None:
+        outcome = _scout_readback_outcome(case["readback"], case["typed_value"])
+        failure = _scout_type_landing_failure(outcome, tool_name="fill_credential_field", selector="#field")
+        effects = _fill_observed_effects(outcome, landing_inferred_from_navigation=False)
+
+        assert outcome.value == case["outcome"]
+        assert (failure is not None) is case["fails"]
+        assert ("value_landed" in effects) is case["records_value_landed"]
+
+    def test_a_landing_inferred_from_navigation_records_the_inference_and_not_a_sighting(self) -> None:
+        effects = _fill_observed_effects(ScoutReadbackOutcome.EMPTY, landing_inferred_from_navigation=True)
+
+        assert effects == {"landing_inferred_from_navigation": True}
+
+    @pytest.mark.parametrize(
+        "verdict",
+        [ScoutReadbackOutcome.EXACT_MATCH, ScoutReadbackOutcome.DIFFERENT, ScoutReadbackOutcome.UNAVAILABLE],
+    )
+    def test_only_an_empty_field_fails_the_fill(self, verdict: ScoutReadbackOutcome) -> None:
+        assert _scout_type_landing_failure(verdict, tool_name="fill_credential_field", selector="#totp") is None
+
+    def test_an_empty_field_fails_and_names_the_route_back(self) -> None:
+        failure = _scout_type_landing_failure(
+            ScoutReadbackOutcome.EMPTY, tool_name="fill_credential_field", selector="#totp"
+        )
+
+        assert failure is not None
+        assert failure["ok"] is False
+        assert "retry fill_credential_field" in failure["error"]
+
+
 class TestVerifyScoutTypeLanded:
     """A scout type that an overlay silently consumed must surface as a failure."""
 
@@ -885,8 +939,6 @@ class TestVerifyScoutTypeLanded:
 
     @pytest.mark.asyncio
     async def test_empty_field_after_nonempty_type_returns_failure(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
         ctx = self._ctx_with_value("")
         result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
 
@@ -901,8 +953,6 @@ class TestVerifyScoutTypeLanded:
 
     @pytest.mark.asyncio
     async def test_empty_then_filled_on_reread_passes(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
         server = SimpleNamespace()
         server.call_internal_tool = AsyncMock(
             side_effect=[
@@ -918,18 +968,7 @@ class TestVerifyScoutTypeLanded:
         assert server.call_internal_tool.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_nonempty_field_passes(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
-        ctx = self._ctx_with_value("hello world")
-        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
-
-        assert result is None
-
-    @pytest.mark.asyncio
     async def test_no_selector_skips_readback(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
         ctx = self._ctx_with_value("")
         result = await _verify_scout_type_landed(ctx, selector="", typed_length=12)
 
@@ -940,28 +979,31 @@ class TestVerifyScoutTypeLanded:
     async def test_an_auto_formatting_field_passes_despite_growing_past_the_typed_length(self) -> None:
         """A phone/card/date input inserts its own separators, so the readback is longer than what
         was typed with nothing having landed in the wrong field. Rejecting it fails every such form."""
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
         ctx = self._ctx_with_value("(555) 123-4567")
         result = await _verify_scout_type_landed(ctx, selector="#phone", typed_length=len("5551234567"))
 
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_a_value_appended_to_an_occupied_field_still_fails(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
+    async def test_a_field_holding_more_than_was_typed_passes(self) -> None:
+        """type_text does not hold the value it typed, so a longer readback is not an observation
+        that the text joined a value already in the field."""
         ctx = self._ctx_with_value("alreadyherenewvalue")
         result = await _verify_scout_type_landed(ctx, selector="#name", typed_length=len("newvalue"))
 
-        assert result is not None
-        assert result["ok"] is False
-        assert "already held a value" in result["error"]
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unreadable_field_passes(self) -> None:
+        """An unread field is not an observation that the type was lost, so it must not fail the type."""
+        ctx = self._ctx_with_value(None)
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is None
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 1
 
     @pytest.mark.asyncio
     async def test_zero_typed_length_skips_readback(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
-
         ctx = self._ctx_with_value("")
         result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=0)
 
@@ -1330,6 +1372,90 @@ class TestScoutedInteractionCapture:
         assert result["url"] == "https://example.com/dashboard"
         assert ctx.scout_trajectory[0]["tool_name"] == "navigate_browser"
         assert ctx.scout_trajectory[0]["observed_effects"] == {"url_changed": True}
+
+    @pytest.mark.asyncio
+    async def test_navigate_post_hook_next_step_claims_no_attached_screenshot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+
+        ctx = self._ctx(source_url="https://example.com/login")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert "screenshot" not in result["next_step"]
+        assert "attached" not in result["next_step"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_post_hook_claims_only_the_screenshot_it_staged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+
+        ctx = self._ctx(source_url="https://example.com/login")
+        monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
+
+        result = await mcp_hooks._navigate_post_hook(
+            {"ok": True, "data": {"url": "https://example.com/dashboard"}},
+            {},
+            ctx,
+        )
+
+        assert "A screenshot is attached." in result["next_step"]
+
+    @pytest.mark.asyncio
+    async def test_failed_navigate_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        ctx = self._ctx(source_url="https://example.com/login")
+        result = await mcp_hooks._navigate_post_hook({"ok": False, "error": "navigation timed out"}, {}, ctx)
+
+        capture.assert_awaited_once()
+        assert "next_step" not in result
+
+    @pytest.mark.asyncio
+    async def test_click_that_attached_page_evidence_stages_no_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        async def attach_observation(ctx: SimpleNamespace, **kwargs: Any) -> tuple[int | None, dict[str, Any] | None]:
+            ctx.last_scout_act_observe_outcome = "attached"
+            return None, None
+
+        monkeypatch.setattr(mcp_hooks, "_register_scout_interaction_observation", attach_observation)
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+
+        capture.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_click_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+
+        capture = AsyncMock(return_value=True)
+        monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        await mcp_hooks._click_post_hook({"ok": False, "error": "click timed out"}, {}, ctx)
+
+        capture.assert_awaited_once()
 
     def test_post_action_observation_step_is_attached_to_both_fact_views(self) -> None:
         from skyvern.forge.sdk.copilot.tools.scouting import _attach_scout_observation_step

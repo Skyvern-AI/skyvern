@@ -13,6 +13,12 @@ import {
 } from "@/components/ui/popover";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { DotFilledIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
@@ -392,8 +398,12 @@ function WorkflowRunTimeline({
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
+  const numberOfBlocks = workflowRunTimeline.filter(isBlockItem).length;
   const totalBlocks = definedBlocks.length;
   const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
+  const blockCountLabel = `· ${numberOfBlocks} ${
+    numberOfBlocks === 1 ? "block" : "blocks"
+  }`;
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
@@ -409,25 +419,34 @@ function WorkflowRunTimeline({
             · {elapsed}
           </span>
         ) : null}
-        {totalBlocks > 0 && (
-          <span
-            className="text-muted-foreground dark:text-slate-500"
-            title="Top-level blocks completed out of the total defined for this workflow"
-          >
-            · {completedBlocks}/{totalBlocks} blocks
+        {totalBlocks > 0 ? (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="cursor-default text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-500"
+                  tabIndex={0}
+                >
+                  {blockCountLabel}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-left">
+                {completedBlocks}/{totalBlocks} blocks
+                <span className="block">
+                  Top-level blocks completed out of the total defined for this
+                  workflow
+                </span>
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          <span className="text-muted-foreground dark:text-slate-500">
+            {blockCountLabel}
           </span>
         )}
         {numberOfActions > 0 && (
           <span className="text-muted-foreground dark:text-slate-500">
             · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
-          </span>
-        )}
-        {/* total_steps counts task steps only, so a code-first run has none however many
-            actions it fires; a literal "0 steps" beside live rows reads as "nothing ran". */}
-        {(workflowRun.total_steps ?? 0) > 0 && (
-          <span className="text-muted-foreground dark:text-slate-500">
-            · {workflowRun.total_steps}{" "}
-            {workflowRun.total_steps === 1 ? "step" : "steps"}
           </span>
         )}
         <span

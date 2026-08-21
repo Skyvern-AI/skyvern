@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import keyword
 import re
 import sys
@@ -26,12 +27,28 @@ from skyvern.utils.templating import get_missing_variables
 
 RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
 RENDER_UNDEFINED_NAME_REASON_CODE = "RENDER_UNDEFINED_NAME"
+SCANNER_ADVISORY_REASON_CODE = "SCANNER_ADVISORY"
+SCANNER_ADVISORY_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
 class CodeBlockPreflightDiagnostic:
     code: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodeBlockScanFinding:
+    """One advisory finding from the deployment's code scanner.
+
+    ``message`` must come from scanner rule metadata only — never from the matched
+    snippet, which can carry user PII/secrets and attacker-authored text that would
+    otherwise flow into a copilot context.
+    """
+
+    rule_id: str
+    line: int
+    message: str = ""
 
 
 @dataclass(frozen=True)
@@ -438,6 +455,37 @@ def advisory_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnos
         for diagnostic in author_time_code_block_diagnostics(code)
         if diagnostic.code in _ADVISORY_DIAGNOSTIC_CODES
     ]
+
+
+async def scanner_advisory_diagnostics(
+    code: str, *, organization_id: str | None = None
+) -> list[CodeBlockPreflightDiagnostic]:
+    """Advisory diagnostics from the deployment's code scanner, via the AgentFunction hook.
+
+    Bounded and fail-open by construction: a missing forge app, a scanner error, or a scan
+    that outlives the timeout silently yields no diagnostics, so an author never waits on
+    the scanner or sees it fail. Findings never gate a save, dispatch, or lint verdict.
+    """
+    # Deferred so this module stays importable on lightweight installs (MCP lint CLI).
+    from skyvern.forge import app  # noqa: PLC0415
+
+    try:
+        async with asyncio.timeout(SCANNER_ADVISORY_TIMEOUT_SECONDS):
+            findings = await app.AGENT_FUNCTION.scan_code_block_source(
+                code,
+                organization_id=organization_id,
+                timeout_seconds=SCANNER_ADVISORY_TIMEOUT_SECONDS,
+            )
+        return [_scanner_finding_diagnostic(finding) for finding in findings]
+    except Exception:
+        return []
+
+
+def _scanner_finding_diagnostic(finding: CodeBlockScanFinding) -> CodeBlockPreflightDiagnostic:
+    text = f"Flagged by scanner rule `{finding.rule_id}` at line {finding.line}."
+    if finding.message:
+        text = f"{text} {finding.message}"
+    return CodeBlockPreflightDiagnostic(code=SCANNER_ADVISORY_REASON_CODE, message=text)
 
 
 def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:

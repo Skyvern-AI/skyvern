@@ -456,6 +456,103 @@ describe("UI session refresh", () => {
       refreshedToken,
     );
   });
+
+  it("holds the first request until the session token is minted", async () => {
+    const token = "boot-race-session-canary";
+    let releaseMint: (response: Response) => void = () => {};
+    const mint = new Promise<Response>((resolve) => {
+      releaseMint = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => mint),
+    );
+
+    const { getClient, initializeUiSession } = await import("./AxiosClient");
+    // The entrypoints deliberately do not await this — they render first.
+    void initializeUiSession();
+
+    const clientPromise = getClient(null);
+    let settled = false;
+    void clientPromise.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseMint(
+      new Response(
+        JSON.stringify({
+          token,
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const client = await clientPromise;
+
+    expect(client.defaults.headers.common["X-API-Key"]).toBe(token);
+  });
+
+  it("clears the unauthorized banner once a request succeeds", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(htmlCatchAll()));
+
+    const { getClient } = await import("./AxiosClient");
+    const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+    useAuthIssueStore.getState().reportAuthIssue({
+      statusCode: 403,
+      detail: "Invalid authentication method",
+      path: "/workflows",
+    });
+
+    const client = await getClient(null);
+    client.defaults.adapter = vi.fn<AxiosAdapter>(async (config) => ({
+      data: [],
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+    }));
+    await client.get("/workflows");
+
+    // A boot-race 403 otherwise pinned this banner for the life of the tab.
+    expect(useAuthIssueStore.getState().issue).toBeNull();
+  });
+
+  it("reports why the UI server refused to mint a session", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail:
+              "The UI server could not reach the Skyvern API to mint a browser session. Check SKYVERN_API_BASE_URL on the UI server and its network path to the API.",
+            reason: "upstream_unreachable",
+          }),
+          { status: 502, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const { initializeUiSession } = await import("./AxiosClient");
+    const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+    await initializeUiSession();
+
+    expect(useAuthIssueStore.getState().uiSessionFailure).toMatchObject({
+      statusCode: 502,
+      detail: expect.stringContaining("SKYVERN_API_BASE_URL"),
+    });
+  });
+
+  it("does not report a deployment that simply has no mint endpoint", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(htmlCatchAll()));
+
+    const { initializeUiSession } = await import("./AxiosClient");
+    const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+    await initializeUiSession();
+
+    expect(useAuthIssueStore.getState().uiSessionFailure).toBeNull();
+  });
 });
 
 describe("open-source application entrypoint", () => {

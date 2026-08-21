@@ -64,7 +64,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedSelectorCandidate,
     resolve_browser_state_for_context,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.screenshot_utils import stage_screenshot_from_artifact
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -504,28 +504,29 @@ async def _capture_element_fingerprint(
 
 async def _capture_post_interaction_screenshot(
     ctx: AgentContext, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
-) -> None:
-    """Attach a look at the page after a state-changing action. Reading the DOM answers "what is
-    on the page" but not "did that work" -- a filled password reads as empty, and a dialog covering
-    the content reads as an ordinary node. Only the most recent screenshot is retained.
+) -> bool:
+    """Attach a look at the page after a state-changing action, reporting whether a frame staged.
+    Reading the DOM answers "what is on the page" but not "did that work" -- a filled password reads
+    as empty, and a dialog covering the content reads as an ordinary node.
     """
     if getattr(ctx, "codeblock_redaction_parameters", None):
-        return
+        return False
     # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
     if not getattr(ctx, "supports_vision", False):
-        return
+        return False
     server = getattr(ctx, "discovery_mcp_server", None)
     if server is None:
-        return
+        return False
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_screenshot", {}),
             timeout=timeout_seconds,
         )
     except Exception:
-        return
-    if isinstance(result, dict) and result.get("ok"):
-        enqueue_screenshot_from_result(ctx, result)
+        return False
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    return stage_screenshot_from_artifact(ctx, result)
 
 
 async def _capture_enclosing_form_submits(
@@ -880,6 +881,7 @@ _PAGE_EVIDENCE_STATE_KEYS = (
     "page_title",
     "forms",
     "navigation_targets",
+    "navigation_targets_truncated",
     "result_containers",
     "result_containers_truncated",
     "key_value_relations",
@@ -1155,6 +1157,7 @@ _PAGE_SUMMARY_MAX_FIELDS = 8
 _PAGE_SUMMARY_MAX_SUBMITS = 4
 _PAGE_SUMMARY_MAX_NAV_TEXTS = 8
 _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
+_PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
 
 
 def _summary_text(value: Any) -> str:
@@ -1167,6 +1170,23 @@ def _summary_field_name(field: dict[str, Any]) -> str:
         if text:
             return text
     return ""
+
+
+def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(control.get("expanded"), bool):
+        return None
+    summary: dict[str, Any] = {"expanded": control["expanded"]}
+    for key in ("text", "selector", "controls"):
+        value = _summary_text(control.get(key))
+        if value:
+            summary[key] = value
+    if "controls" in summary and isinstance(control.get("controlled_region_visible"), bool):
+        summary["controlled_region_visible"] = control["controlled_region_visible"]
+    if control.get("disabled") is True:
+        summary["disabled"] = True
+    if control.get("visible") is False:
+        summary["visible"] = False
+    return summary
 
 
 def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1209,16 +1229,41 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
     challenge_detected = bool(evidence.get("challenge_controls")) or (
         isinstance(challenge_state, dict) and challenge_state.get("detected") is True
     )
+    disclosure_controls: list[dict[str, Any]] = []
+    seen_disclosures: set[tuple[str, str]] = set()
+    controls_for_summary: list[dict[str, Any]] = []
+    if settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+        controls_for_summary.extend(evidence.get("clickable_controls") or [])
+        controls_for_summary.extend(
+            control
+            for form in evidence.get("forms") or []
+            if isinstance(form, dict)
+            for control in form.get("submit_controls") or []
+            if isinstance(control, dict) and isinstance(control.get("expanded"), bool)
+        )
+    for control in controls_for_summary:
+        if not isinstance(control, dict) or len(disclosure_controls) >= _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS:
+            continue
+        summary = _summary_disclosure_control(control)
+        if summary is None:
+            continue
+        identity = (str(summary.get("selector") or ""), str(summary.get("controls") or ""))
+        if identity in seen_disclosures:
+            continue
+        seen_disclosures.add(identity)
+        disclosure_controls.append(summary)
     return {
         "page_title": _summary_text(evidence.get("page_title")),
         "forms": forms_summary,
         "navigation_target_count": len(nav_targets),
+        "navigation_targets_truncated": evidence.get("navigation_targets_truncated") is True,
         "navigation_targets": [
             text
             for text in (_summary_text(target.get("text")) for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS])
             if text
         ],
         "result_container_count": len(evidence.get("result_containers") or []),
+        "disclosure_controls": disclosure_controls,
         "challenge_detected": challenge_detected,
         "modal_dismiss_controls": dismiss_texts,
     }
@@ -1250,6 +1295,9 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
         return True
     if len(forms) > 1:
         summary["forms"] = forms[:1]
+        return True
+    if summary.get("disclosure_controls"):
+        summary["disclosure_controls"] = []
         return True
     return False
 

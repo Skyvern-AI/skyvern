@@ -1410,14 +1410,16 @@ class SkyvernElement:
 
         # Step 2: Playwright actionability confirmation. After Step 1, the element should
         # already be in the viewport so this check passes quickly.
+        # Confirm via the Locator, not a resolved ElementHandle: a Locator re-resolves the
+        # selector on every internal actionability retry, so a mid-wait DOM re-render can't
+        # leave it holding a stale, detached handle.
         try:
-            element_handler = await self.get_element_handler(timeout=timeout)
-            await element_handler.scroll_into_view_if_needed(timeout=timeout)
+            await self.get_locator().scroll_into_view_if_needed(timeout=timeout)
         except Exception as exc:
-            if not is_engine_timeout_error(exc, self._engine_selection):
+            if not is_engine_timeout_error(exc, self._engine_selection) and not is_element_detached_error(exc):
                 raise
             LOG.warning(
-                "Scroll into view timed out",
+                "Scroll into view timed out or element detached mid-scroll",
                 element_id=self.get_id(),
             )
             await self.blur()

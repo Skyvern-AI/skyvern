@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -45,23 +46,39 @@ def resize_screenshot_b64(b64_png: str) -> ScreenshotEntry:
     )
 
 
-def enqueue_screenshot(ctx: Any, b64_png: str) -> None:
-    """Resize, compress, and store a screenshot for later LLM injection.
-
-    Replaces any previously pending screenshot (cap to 1).
-    No-op if the context does not support vision.
+def enqueue_screenshot(ctx: Any, b64_png: str) -> bool:
+    """Resize, compress, and store a screenshot for later LLM injection, reporting whether this call
+    left an entry on the queue. Replaces any previously pending screenshot (cap to 1).
     """
     if not getattr(ctx, "supports_vision", False):
-        return
+        return False
     try:
         entry = resize_screenshot_b64(b64_png)
     except Exception:
         LOG.warning("Failed to resize copilot screenshot", exc_info=True)
-        return
+        return False
     pending = getattr(ctx, "pending_screenshots", None)
-    if isinstance(pending, list):
-        pending.clear()
-        pending.append(entry)
+    if not isinstance(pending, list):
+        return False
+    pending.clear()
+    pending.append(entry)
+    return True
+
+
+def stage_screenshot_from_artifact(ctx: Any, result: dict[str, Any]) -> bool:
+    """Stage the frame a non-inline screenshot tool call wrote to disk, reporting whether this call
+    left an entry on the queue rather than whether the queue is merely non-empty.
+    """
+    data = result.get("data")
+    path = data.get("path") if isinstance(data, dict) else None
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        raw = Path(path).read_bytes()
+    except (OSError, ValueError):
+        LOG.info("Copilot screenshot artifact could not be read", path=path)
+        return False
+    return enqueue_screenshot(ctx, base64.b64encode(raw).decode("ascii"))
 
 
 def enqueue_screenshot_from_result(ctx: Any, result: dict[str, Any]) -> None:

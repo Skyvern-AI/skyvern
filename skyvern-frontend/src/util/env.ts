@@ -59,6 +59,32 @@ const runsApiBaseUrl = (() => {
 
 let runtimeApiKey: string | null | undefined;
 
+// Self-hosted mints the browser credential after boot, so callers that authenticate a request
+// must wait for the first mint to land instead of sending it unauthenticated.
+let runtimeCredentialReady: Promise<unknown> = Promise.resolve();
+const runtimeCredentialListeners = new Set<() => void>();
+
+function setRuntimeCredentialReady(ready: Promise<unknown>): void {
+  runtimeCredentialReady = ready;
+}
+
+function whenRuntimeCredentialReady(): Promise<unknown> {
+  return runtimeCredentialReady;
+}
+
+function subscribeToRuntimeCredential(listener: () => void): () => void {
+  runtimeCredentialListeners.add(listener);
+  return () => {
+    runtimeCredentialListeners.delete(listener);
+  };
+}
+
+function notifyRuntimeCredentialChanged(): void {
+  for (const listener of runtimeCredentialListeners) {
+    listener();
+  }
+}
+
 function readPersistedApiKey(): string | null {
   if (typeof window === "undefined") {
     return null;
@@ -100,6 +126,7 @@ function persistRuntimeApiKey(value: string, expiresAt?: number): void {
       window.sessionStorage.removeItem(API_KEY_EXPIRES_AT_STORAGE_KEY);
     }
   }
+  notifyRuntimeCredentialChanged();
 }
 
 function clearRuntimeApiKey(): void {
@@ -108,11 +135,15 @@ function clearRuntimeApiKey(): void {
     window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
     window.sessionStorage.removeItem(API_KEY_EXPIRES_AT_STORAGE_KEY);
   }
+  notifyRuntimeCredentialChanged();
 }
 
 async function getCredentialParam(
   credentialGetter: (() => Promise<string | null>) | null,
 ): Promise<string> {
+  if (!credentialGetter) {
+    await whenRuntimeCredentialReady();
+  }
   const params = new URLSearchParams();
   const apiKey = getRuntimeApiKey();
   if (apiKey) {
@@ -149,6 +180,9 @@ export {
   getRuntimeApiKeyExpiresAt,
   persistRuntimeApiKey,
   clearRuntimeApiKey,
+  setRuntimeCredentialReady,
+  whenRuntimeCredentialReady,
+  subscribeToRuntimeCredential,
   useNewRunsUrl,
   enable2faNotifications,
 };

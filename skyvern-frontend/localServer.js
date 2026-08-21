@@ -13,6 +13,23 @@ const UI_SESSION_CACHE_EXPIRY_BUFFER_MS = 30_000;
 const UI_SESSION_NONCE_COOKIE = "skyvern_ui_session_nonce";
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
+const UI_SESSION_NOT_CONFIGURED = "not_configured";
+const UI_SESSION_UPSTREAM_UNREACHABLE = "upstream_unreachable";
+const UI_SESSION_UPSTREAM_REJECTED = "upstream_rejected";
+const UI_SESSION_UPSTREAM_INVALID = "upstream_invalid_response";
+
+// Reaches the browser, so it names the variable to change but never the upstream address.
+const UI_SESSION_FAILURE_DETAIL = {
+  [UI_SESSION_NOT_CONFIGURED]:
+    "The UI server has no organization API key, so it cannot mint a browser session. Set SKYVERN_API_KEY on the UI server.",
+  [UI_SESSION_UPSTREAM_UNREACHABLE]:
+    "The UI server could not reach the Skyvern API to mint a browser session. Check SKYVERN_API_BASE_URL on the UI server and its network path to the API.",
+  [UI_SESSION_UPSTREAM_REJECTED]:
+    "The Skyvern API rejected the UI server's organization API key. Check that SKYVERN_API_KEY on the UI server matches a valid key for this deployment.",
+  [UI_SESSION_UPSTREAM_INVALID]:
+    "The Skyvern API returned an unexpected response to the session-token request. Check that SKYVERN_API_BASE_URL points at the Skyvern API and not at a proxy or the UI itself.",
+};
+
 function resolveOrganizationApiKey(env = process.env) {
   const key = env.SKYVERN_API_KEY?.trim() || env.VITE_SKYVERN_API_KEY?.trim();
   return key || null;
@@ -160,31 +177,28 @@ function getCookie(request, name) {
   return null;
 }
 
-function getRequestOrigin(request) {
-  const forwardedProtocol = request.headers["x-forwarded-proto"]
-    ?.split(",", 1)[0]
-    ?.trim();
-  const protocol =
-    forwardedProtocol || (request.socket.encrypted ? "https" : "http");
+function getRequestHost(request) {
   const host = request.headers.host;
   if (!host) {
     return null;
   }
   try {
-    return new URL(`${protocol}://${host}`).origin;
+    return new URL(`http://${host}`).host;
   } catch {
     return null;
   }
 }
 
-function hasCrossOriginSignal(request) {
-  const requestOrigin = getRequestOrigin(request);
+// Hosts, not full origins: a TLS-terminating proxy that forwards plain HTTP without
+// x-forwarded-proto makes every same-origin request look like a scheme mismatch.
+function hasCrossSiteSignal(request) {
+  const requestHost = getRequestHost(request);
   for (const header of [request.headers.origin, request.headers.referer]) {
     if (!header) {
       continue;
     }
     try {
-      if (!requestOrigin || new URL(header).origin !== requestOrigin) {
+      if (!requestHost || new URL(header).host !== requestHost) {
         return true;
       }
     } catch {
@@ -192,6 +206,17 @@ function hasCrossOriginSignal(request) {
     }
   }
   return false;
+}
+
+// Sec-Fetch-Site is computed by the browser and cannot be set by page script, so it survives
+// proxies that rewrite Host. The header comparison below cannot, so it is only the fallback
+// for clients that omit Sec-Fetch-Site.
+function isCrossSiteRequest(request) {
+  const secFetchSite = request.headers["sec-fetch-site"];
+  if (secFetchSite) {
+    return secFetchSite !== "same-origin";
+  }
+  return hasCrossSiteSignal(request);
 }
 
 function isUiSessionResponse(value) {
@@ -206,6 +231,12 @@ function isUiSessionResponse(value) {
   );
 }
 
+function mintFailure(reason) {
+  const error = new Error(reason);
+  error.reason = reason;
+  return error;
+}
+
 function createUiSessionHandler({
   apiBaseUrl,
   organizationApiKey,
@@ -215,17 +246,21 @@ function createUiSessionHandler({
   nonceManager = createUiSessionNonceManager(organizationApiKey),
 } = {}) {
   let cachedUiSession = null;
-  let mintFailureLogged = false;
+  const loggedMintFailures = new Set();
   let mintInFlight = null;
 
-  const logMintFailureOnce = () => {
-    if (!mintFailureLogged) {
-      const loggableApiBaseUrl = formatApiBaseUrlForLogging(apiBaseUrl);
-      logger.error(
-        `UI session minting failed against ${loggableApiBaseUrl}: upstream request failed. Set SKYVERN_API_BASE_URL to override the upstream.`,
-      );
-      mintFailureLogged = true;
+  // Never interpolate the upstream error: its message can echo back a credentialed upstream URL.
+  const logMintFailureOnce = (reason) => {
+    if (loggedMintFailures.has(reason)) {
+      return;
     }
+    loggedMintFailures.add(reason);
+    const loggableApiBaseUrl = formatApiBaseUrlForLogging(apiBaseUrl);
+    logger.error(
+      `UI session minting failed against ${loggableApiBaseUrl} (${reason}): ${UI_SESSION_FAILURE_DETAIL[reason]} ` +
+        "Set SKYVERN_API_BASE_URL to an API address the UI server itself can reach — the browser-facing " +
+        "VITE_API_BASE_URL is often routed through an external load balancer that the UI server cannot use.",
+    );
   };
 
   const mintUiSession = async () => {
@@ -235,23 +270,33 @@ function createUiSessionHandler({
       requestTimeoutMs,
     );
     try {
-      const upstream = await fetchImpl(
-        `${apiBaseUrl.replace(/\/+$/, "")}/ui-session`,
-        {
-          method: "POST",
-          headers: {
-            accept: "application/json",
-            "x-api-key": organizationApiKey,
+      let upstream;
+      try {
+        upstream = await fetchImpl(
+          `${apiBaseUrl.replace(/\/+$/, "")}/ui-session`,
+          {
+            method: "POST",
+            headers: {
+              accept: "application/json",
+              "x-api-key": organizationApiKey,
+            },
+            signal: abortController.signal,
           },
-          signal: abortController.signal,
-        },
-      );
-      if (!upstream.ok) {
-        throw new Error(`backend returned HTTP ${upstream.status}`);
+        );
+      } catch {
+        throw mintFailure(UI_SESSION_UPSTREAM_UNREACHABLE);
       }
-      const payload = await upstream.json();
+      if (!upstream.ok) {
+        throw mintFailure(UI_SESSION_UPSTREAM_REJECTED);
+      }
+      let payload;
+      try {
+        payload = await upstream.json();
+      } catch {
+        throw mintFailure(UI_SESSION_UPSTREAM_INVALID);
+      }
       if (!isUiSessionResponse(payload)) {
-        throw new Error("backend returned an invalid response");
+        throw mintFailure(UI_SESSION_UPSTREAM_INVALID);
       }
       return {
         token: payload.token,
@@ -289,13 +334,8 @@ function createUiSessionHandler({
       sendJson(response, 405, { detail: "Method not allowed" });
       return;
     }
-    const secFetchSite = request.headers["sec-fetch-site"];
     const nonce = getCookie(request, UI_SESSION_NONCE_COOKIE);
-    if (
-      (secFetchSite && secFetchSite !== "same-origin") ||
-      hasCrossOriginSignal(request) ||
-      !nonceManager.validate(nonce)
-    ) {
+    if (isCrossSiteRequest(request) || !nonceManager.validate(nonce)) {
       sendJson(response, 403, {
         detail: "Cross-site requests are not allowed",
       });
@@ -305,17 +345,22 @@ function createUiSessionHandler({
       request.headers["x-skyvern-ui-session-refresh"] === "auth-failure";
     if (!organizationApiKey) {
       sendJson(response, 503, {
-        detail: "UI session minting is not configured",
+        detail: UI_SESSION_FAILURE_DETAIL[UI_SESSION_NOT_CONFIGURED],
+        reason: UI_SESSION_NOT_CONFIGURED,
       });
       return;
     }
 
     try {
       sendJson(response, 200, await getUiSession(bypassCache));
-    } catch {
-      logMintFailureOnce();
+    } catch (error) {
+      const reason = UI_SESSION_FAILURE_DETAIL[error?.reason]
+        ? error.reason
+        : UI_SESSION_UPSTREAM_INVALID;
+      logMintFailureOnce(reason);
       sendJson(response, 502, {
-        detail: "Unable to mint a UI session token",
+        detail: UI_SESSION_FAILURE_DETAIL[reason],
+        reason,
       });
     }
   };

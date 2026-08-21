@@ -1560,6 +1560,7 @@ async def test_converted_route_reports_input_text_converted(monkeypatch: pytest.
         get_selectable=AsyncMock(return_value=True),
         supports_text_input=AsyncMock(return_value=True),
     )
+    element.get_attr = AsyncMock(return_value=None)
     element.get_tag_name.return_value, element.get_id.return_value = "input", "field"
     monkeypatch.setattr(
         handler, "DomUtil", Mock(return_value=MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element)))

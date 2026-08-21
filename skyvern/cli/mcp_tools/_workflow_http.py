@@ -102,6 +102,7 @@ async def list_workflow_runs_raw(
     status: list[str] | None,
     search_key: str | None,
     error_code: str | None,
+    include_child_runs: bool = False,
 ) -> list[dict[str, Any]]:
     """GET /v1/workflows/{id}/runs — returns raw workflow run dicts for one workflow."""
     skyvern = get_skyvern()
@@ -109,6 +110,8 @@ async def list_workflow_runs_raw(
         "page": page,
         "page_size": page_size,
     }
+    if include_child_runs:
+        params["include_child_runs"] = True
     if status:
         params["status"] = status
     if search_key is not None:

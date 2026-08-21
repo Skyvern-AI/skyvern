@@ -4636,6 +4636,14 @@ _WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
     "A run matches if any of its tasks contains an error with a matching `error_code`."
 )
 
+_PUBLIC_WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
+    _WORKFLOW_RUNS_BY_ID_DESCRIPTION + "\n\n"
+    "### include_child_runs\n\n"
+    "Child runs — runs this workflow started from inside another workflow run — are **excluded by "
+    "default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them "
+    "as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs."
+)
+
 
 async def _get_workflow_runs_by_id(
     *,
@@ -4671,7 +4679,7 @@ async def _get_workflow_runs_by_id(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
     tags=["Runs"],
-    description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
+    description=_PUBLIC_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
     summary="Get all runs by agent",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
@@ -4731,12 +4739,22 @@ async def get_workflow_runs_by_id(
             examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
         ),
     ] = None,
+    include_child_runs: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include child workflow runs — runs started from inside another workflow run. "
+                "Excluded by default so the history shows only top-level runs."
+            ),
+        ),
+    ] = False,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
     """
     List runs for a specific workflow permanent id.
 
-    The public API excludes child workflow runs so workflow histories only show top-level runs.
+    The public API excludes child workflow runs so workflow histories only show top-level runs;
+    ``include_child_runs=true`` opts back into them.
     All filters (**status**, **search_key**, **error_code**, **tags**) are combined with AND logic.
     """
     run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
@@ -4751,7 +4769,7 @@ async def get_workflow_runs_by_id(
         error_code=error_code,
         created_at_start=created_at_start,
         created_at_end=created_at_end,
-        exclude_child_runs=True,
+        exclude_child_runs=not include_child_runs,
         run_tags=run_tags or None,
     )
 
