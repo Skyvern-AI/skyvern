@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
@@ -219,6 +221,7 @@ class _FakeCdpSession:
     def __init__(self) -> None:
         self.handlers: dict[str, object] = {}
         self.sent: list[tuple[str, dict]] = []
+        self.detached = False
 
     def on(self, event: str, handler: object) -> None:
         self.handlers[event] = handler
@@ -230,7 +233,10 @@ class _FakeCdpSession:
         return {}
 
     async def detach(self) -> None:
-        return None
+        self.detached = True
+
+    def methods_sent(self) -> list[str]:
+        return [method for method, _ in self.sent]
 
 
 class _FakePage:
@@ -238,6 +244,14 @@ class _FakePage:
         self.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=session))
         self.url = "https://example.test/"
         self.viewport_size = {"width": 800, "height": 600}
+
+
+async def _wait_for(predicate: Callable[[], bool]) -> bool:
+    for _ in range(500):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
 
 
 @pytest.mark.asyncio
@@ -339,3 +353,311 @@ async def test_evicted_frame_records_queue_dwell(monkeypatch: pytest.MonkeyPatch
         await asyncio.wait_for(loop_task, timeout=5)
 
     assert [payload["screenshot"] for payload in sent] == ["primed", "frame-2", "frame-3"]
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_cannot_be_attached_does_not_kill_the_running_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_session = _FakeCdpSession()
+    current_page = _FakePage(current_session)
+    next_session = _FakeCdpSession()
+    next_page = _FakePage(next_session)
+    attach_fails = True
+
+    async def _new_cdp_session(_page: object) -> _FakeCdpSession:
+        if attach_fails:
+            raise RuntimeError("Target closed")
+        return next_session
+
+    next_page.context.new_cdp_session = AsyncMock(side_effect=_new_cdp_session)
+    monkeypatch.setattr(screencast, "ACTIVE_PAGE_POLL_INTERVAL", 0.01)
+    # Cap the backoff too: a slow runner could otherwise spend long enough failing to attach
+    # that the poll interval grows past this test's own wait budget.
+    monkeypatch.setattr(screencast, "ACTIVE_PAGE_MAX_POLL_INTERVAL", 0.05)
+
+    pages = iter([current_page])
+
+    async def _resolve_working_page(*_args: object, **_kwargs: object) -> object:
+        return next(pages, next_page)
+
+    monkeypatch.setattr(screencast, "_resolve_working_page", _resolve_working_page)
+
+    sent: list[dict] = []
+
+    async def _send_json(payload: dict) -> None:
+        sent.append(payload)
+        if payload["screenshot"] == "frame-from-next-page":
+            raise RuntimeError("client gone")
+
+    websocket = SimpleNamespace(send_json=_send_json)
+
+    async def _never_finalized() -> bool:
+        return False
+
+    loop_task = asyncio.create_task(
+        screencast.start_screencast_loop(websocket, object(), "pbs_1", "browser_session", _never_finalized)
+    )
+    assert await _wait_for(lambda: bool(next_page.context.new_cdp_session.await_count))
+
+    assert current_session.detached is False
+    assert "Page.stopScreencast" not in current_session.methods_sent()
+    current_session.handlers["Page.screencastFrame"](
+        {"data": "frame-from-current-page", "sessionId": 7, "metadata": {}}
+    )
+    assert await _wait_for(lambda: any(payload["screenshot"] == "frame-from-current-page" for payload in sent))
+
+    attach_fails = False
+    assert await _wait_for(lambda: "Page.startScreencast" in next_session.methods_sent())
+    assert await _wait_for(lambda: current_session.detached)
+    next_session.handlers["Page.screencastFrame"]({"data": "frame-from-next-page", "sessionId": 9, "metadata": {}})
+    await asyncio.wait_for(loop_task, timeout=5)
+
+    assert [payload["screenshot"] for payload in sent] == [
+        "primed",
+        "frame-from-current-page",
+        "primed",
+        "frame-from-next-page",
+    ]
+
+
+class _FramesDuringStartSession(_FakeCdpSession):
+    """Emits a frame before Page.startScreencast returns, i.e. before the loop can adopt it."""
+
+    async def send(self, method: str, params: dict | None = None) -> dict:
+        result = await super().send(method, params)
+        if method == "Page.startScreencast":
+            self.handlers["Page.screencastFrame"]({"data": "mid-swap", "sessionId": 11, "metadata": {}})
+            await asyncio.sleep(0)
+        return result
+
+
+@pytest.mark.asyncio
+async def test_a_frame_that_lands_mid_swap_is_still_acked(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _FramesDuringStartSession()
+    page = _FakePage(session)
+    monkeypatch.setattr(screencast, "_resolve_working_page", AsyncMock(return_value=page))
+
+    sent: list[dict] = []
+
+    async def _send_json(payload: dict) -> None:
+        sent.append(payload)
+        raise RuntimeError("client gone")
+
+    async def _never_finalized() -> bool:
+        return False
+
+    await asyncio.wait_for(
+        screencast.start_screencast_loop(
+            SimpleNamespace(send_json=_send_json), object(), "pbs_1", "browser_session", _never_finalized
+        ),
+        timeout=5,
+    )
+
+    # Chrome stops producing frames for a session whose frames go unacked, so the ack has to happen
+    # even though the frame arrived too early to be forwarded.
+    assert ("Page.screencastFrameAck", {"sessionId": 11}) in session.sent
+    assert [payload["screenshot"] for payload in sent] == ["primed"]
+
+
+_REAL_SLEEP = asyncio.sleep
+
+
+class _VirtualClock:
+    """Instant sleeps over a virtual monotonic clock, recorded per calling task.
+
+    Grouping by task keeps the completion poller's one sleep out of the page monitor's sequence.
+    """
+
+    def __init__(self, stop_after: int) -> None:
+        self.by_task: dict[int, list[float]] = {}
+        self.now = 0.0
+        self._stop_after = stop_after
+        self.parked = asyncio.Event()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        recorded = self.by_task.setdefault(id(asyncio.current_task()), [])
+        recorded.append(delay)
+        self.now += delay
+        if len(recorded) >= self._stop_after:
+            self.parked.set()
+            await asyncio.Event().wait()
+        await _REAL_SLEEP(0)
+
+    @property
+    def poll_delays(self) -> list[float]:
+        return max(self.by_task.values(), key=len, default=[])
+
+
+def _scripted_pages(*script: object):
+    """Resolve pages in order, then hold the final entry forever."""
+    remaining = list(script)
+
+    async def _resolve(*args: object, **kwargs: object) -> object:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return _resolve
+
+
+async def _drive_page_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _VirtualClock,
+    *script: object,
+    entity_id: str = "pbs_1",
+    entity_type: str = "browser_session",
+    **loop_kwargs: object,
+) -> asyncio.Task:
+    monkeypatch.setattr(screencast, "_resolve_working_page", _scripted_pages(*script))
+    monkeypatch.setattr(screencast.asyncio, "sleep", clock.sleep)
+    monkeypatch.setattr(screencast, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    async def _never_finalized() -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    task = asyncio.create_task(
+        screencast.start_screencast_loop(
+            SimpleNamespace(send_json=AsyncMock()),
+            object(),
+            entity_id,
+            entity_type,
+            _never_finalized,
+            **loop_kwargs,
+        )
+    )
+    await asyncio.wait_for(clock.parked.wait(), timeout=5)
+    return task
+
+
+async def _stop(task: asyncio.Task) -> None:
+    # Cancelling start_screencast_loop mid-wait leaves its child tasks running, so drain them too.
+    task.cancel()
+    for pending in asyncio.all_tasks() - {asyncio.current_task()}:
+        pending.cancel()
+        with contextlib.suppress(BaseException):
+            await pending
+
+
+def _messages(calls: list, message: str) -> list:
+    return [call for call in calls if call.args and call.args[0] == message]
+
+
+@pytest.mark.asyncio
+async def test_page_poll_holds_the_fast_cadence_then_backs_off_and_clamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordinary page-less gaps clear in a few seconds, so the fast cadence is held past them; only a
+    wedged viewer reaches the backoff, and it must stop doubling at the ceiling rather than growing."""
+    clock = _VirtualClock(stop_after=16)
+    task = await _drive_page_monitor(monkeypatch, clock, _FakePage(_FakeCdpSession()), None)
+
+    try:
+        assert clock.poll_delays == [0.5] * 9 + [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+    finally:
+        await _stop(task)
+
+
+@pytest.mark.asyncio
+async def test_degraded_entry_is_reported_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point of the bound: one wedged viewer used to log on every poll."""
+    log = Mock()
+    monkeypatch.setattr(screencast, "LOG", log)
+    clock = _VirtualClock(stop_after=60)
+    task = await _drive_page_monitor(
+        monkeypatch,
+        clock,
+        _FakePage(_FakeCdpSession()),
+        None,
+        entity_id="pbs_1",
+        entity_type="browser_session",
+        organization_id="o_1",
+    )
+
+    try:
+        entries = _messages(log.warning.call_args_list, "Live view cannot follow the active page; backing off")
+        assert len(clock.poll_delays) == 60
+        assert len(entries) == 1
+        assert entries[0].kwargs["browser_session_id"] == "pbs_1"
+        assert entries[0].kwargs["entity_id"] == "pbs_1"
+        assert entries[0].kwargs["entity_type"] == "browser_session"
+        assert entries[0].kwargs["organization_id"] == "o_1"
+        assert entries[0].kwargs["degraded_for_seconds"] == 4.0
+    finally:
+        await _stop(task)
+
+
+@pytest.mark.asyncio
+async def test_a_page_appearing_mid_backoff_recovers_and_reports_the_degraded_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = Mock()
+    monkeypatch.setattr(screencast, "LOG", log)
+    clock = _VirtualClock(stop_after=15)
+    recovered = _FakePage(_FakeCdpSession())
+    task = await _drive_page_monitor(
+        monkeypatch,
+        clock,
+        _FakePage(_FakeCdpSession()),
+        *([None] * 12),
+        recovered,
+    )
+
+    try:
+        recoveries = _messages(log.info.call_args_list, "Live view is following the active page again")
+        assert len(recoveries) == 1
+        # Empty from t=0.5 until the page came back at t=19.5, across the 0.5->8.0 backoff.
+        assert recoveries[0].kwargs["degraded_for_seconds"] == 19.0
+        assert recoveries[0].kwargs["browser_session_id"] == "pbs_1"
+        # The screencast re-attached to the page that came back, and the fast cadence resumed.
+        assert ("Page.startScreencast", ANY) in recovered.context.new_cdp_session.return_value.sent
+        assert clock.poll_delays[13:] == [0.5, 0.5]
+    finally:
+        await _stop(task)
+
+
+@pytest.mark.asyncio
+async def test_the_page_monitor_survives_a_long_degraded_stretch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Backing off is not giving up: the viewer stays connected so a page that returns is followed."""
+    clock = _VirtualClock(stop_after=200)
+    task = await _drive_page_monitor(monkeypatch, clock, _FakePage(_FakeCdpSession()), None)
+
+    try:
+        assert not task.done()
+        assert len(clock.poll_delays) == 200
+        assert set(clock.poll_delays[20:]) == {30.0}
+    finally:
+        await _stop(task)
+
+
+class _UnattachablePage:
+    """Resolves fine, but every attempt to open a CDP session on it fails."""
+
+    def __init__(self) -> None:
+        self.context = SimpleNamespace(new_cdp_session=AsyncMock(side_effect=RuntimeError("cdp session refused")))
+        self.url = "https://example.test/"
+        self.viewport_size = {"width": 800, "height": 600}
+
+
+@pytest.mark.asyncio
+async def test_a_page_that_never_attaches_backs_off_like_a_missing_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page the viewer cannot attach to is as dead as no page: without this the loop would sit at
+    2 Hz forever on a failing attach, which is the pathology the backoff exists to stop."""
+    log = Mock()
+    monkeypatch.setattr(screencast, "LOG", log)
+    clock = _VirtualClock(stop_after=12)
+    task = await _drive_page_monitor(
+        monkeypatch,
+        clock,
+        _FakePage(_FakeCdpSession()),
+        _UnattachablePage(),
+    )
+
+    try:
+        assert clock.poll_delays == [0.5] * 9 + [1.0, 2.0, 4.0]
+        entries = _messages(log.warning.call_args_list, "Live view cannot follow the active page; backing off")
+        assert len(entries) == 1
+    finally:
+        await _stop(task)
