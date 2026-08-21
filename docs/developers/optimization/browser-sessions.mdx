@@ -82,7 +82,7 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours) — requests above 240 are rejected. Default: `60` |
+| `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours). Requests above 240 are capped at 240; the response `warning` field explains the cap. Default: `60`. |
 | `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for available options |
 | `browser_type` | string | Browser type: `chrome` or `msedge`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
