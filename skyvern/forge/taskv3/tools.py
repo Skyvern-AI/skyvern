@@ -32,6 +32,11 @@ PageProvider = Callable[[], Awaitable[Any]]
 
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
+# The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
+# click menu probe. Either exists only where we set it, so one that matches nothing now cannot
+# reappear without a fresh observe / menu-opening click.
+_TV3_MARKER_SELECTOR_RE = re.compile(r'^\[data-tv3(?:-menu)?="[^"\\]+"\]$')
+
 # ARIA combobox signals — used by observe() only to add a hint that a field is a typeahead. This is a
 # nudge for the model, not load-bearing: type() handles typeaheads behaviorally (see _FIND_SUGGESTION_JS),
 # so a field with no ARIA (a plain <input> backed by a custom dropdown) is still handled correctly.
@@ -156,6 +161,180 @@ _VERIFY_COMMIT_JS = r"""(args) => {
     }
   }
   return '';
+}"""
+
+# Whether a selector currently resolves. `true` on a broken selector: existence is only ever used to
+# soften/enrich behavior, so an unparseable selector must take the normal (unenriched) path.
+_SELECTOR_EXISTS_JS = r"""(sel) => { try { return !!document.querySelector(sel); } catch (e) { return true; } }"""
+
+# Pre-click state for the dropdown-commit path: whether a click-opened menu (rows tagged
+# data-tv3-menu by _FIND_MENU_JS) is currently open, whether the click target IS one of its rows, and
+# that row's state fingerprint — aria checked/selected/pressed, class, child count, text — so an option
+# click on a multi-select menu (which commits WITHOUT closing) can be verified by its state change.
+# Also takes the visible-DOM pre-snapshot (data-tv3-pre) so a menu the click opens reads as a reaction.
+_CLICK_PRECHECK_JS = r"""(clicked) => {
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    // A menu mid-close (opacity fade, pointer-events cut) still has a nonzero rect; reading it as
+    // "open" would turn a healthy committed selection into a false "did not commit" error.
+    try {
+      const s = getComputedStyle(el);
+      if (s.visibility === 'hidden' || Number(s.opacity) < 0.05 || s.pointerEvents === 'none') return false;
+    } catch (e) {}
+    return true;
+  };
+  const state = (el) => {
+    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
+    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
+    let kids = '';
+    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+      el.className, el.children.length, (el.innerText || '').trim(),
+      el.getAttribute('style'), kids,
+    ].join('|');
+  };
+  const openRows = [];
+  for (const el of document.querySelectorAll('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
+  let target = null;
+  try { target = document.querySelector(clicked); } catch (e) { target = null; }
+  let isOption = false;
+  let containsMenu = false;
+  let optText = '';
+  let optState = '';
+  if (target && openRows.length) {
+    for (const el of openRows) {
+      // The target being the row or inside it is an option pick. The target merely CONTAINING rows
+      // (the card around the menu) is not — and since a center-point click on the card can land on
+      // an arbitrary row, that case is flagged so the handler makes no claims about it at all.
+      if (el === target || el.contains(target)) {
+        isOption = true;
+        optText = (el.innerText || '').trim().slice(0, 80);
+        optState = state(el);
+        break;
+      }
+      if (target.contains(el)) containsMenu = true;
+    }
+  }
+  document.querySelectorAll('[data-tv3-pre]').forEach((e) => e.removeAttribute('data-tv3-pre'));
+  for (const el of document.querySelectorAll('body *')) if (vis(el)) el.setAttribute('data-tv3-pre', '1');
+  return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState };
+}"""
+
+# Post-click menu state: how many previously-tagged menu rows are still visible (a closed menu — nodes
+# destroyed or hidden — reads 0), plus the clicked row's current state fingerprint for the multi-select
+# commit check. Field names are distinct from _CLICK_PRECHECK_JS's on purpose (tests dispatch on them).
+_MENU_AFTER_JS = r"""(clicked) => {
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    try {
+      const s = getComputedStyle(el);
+      if (s.visibility === 'hidden' || Number(s.opacity) < 0.05 || s.pointerEvents === 'none') return false;
+    } catch (e) {}
+    return true;
+  };
+  const state = (el) => {
+    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
+    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
+    let kids = '';
+    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+      el.className, el.children.length, (el.innerText || '').trim(),
+      el.getAttribute('style'), kids,
+    ].join('|');
+  };
+  let stillOpen = 0;
+  const rows = [];
+  for (const el of document.querySelectorAll('[data-tv3-menu]')) if (vis(el)) { stillOpen++; rows.push(el); }
+  let target = null;
+  try { target = document.querySelector(clicked); } catch (e) { target = null; }
+  let optState = '';
+  if (target) {
+    for (const el of rows) {
+      if (el === target || el.contains(target)) { optState = state(el); break; }
+    }
+  }
+  return { stillOpen, optState };
+}"""
+
+# Behavioral, site-agnostic menu finder: after a click (with the pre-snapshot taken first),
+# look for the option list the page rendered IN REACTION — a NEW container (not data-tv3-pre: a
+# pre-existing visible container whose rows merely changed, e.g. pagination refreshing a results list,
+# is never a menu) holding >=2 new, visible, row-sized, mostly-clickable leaf rows, positioned adjacent
+# to the clicked element. Keys off reaction + geometry — no CSS-class/ARIA/site vocabulary — mirroring
+# _FIND_SUGGESTION_JS. Unlike the typeahead finder this only REPORTS (the model does the clicking), so
+# navigational rows are listed too. Tags rows data-tv3-menu="1..N" (top-to-bottom) — in-DOM tags that
+# stay valid until the menu re-renders, so the model can pick an option without a re-observe re-minting
+# ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
+_FIND_MENU_JS = r"""(clicked) => {
+  const vis = (r) => r.width > 0 && r.height > 0;
+  let trigger = null;
+  try { trigger = document.querySelector(clicked); } catch (e) { return null; }
+  if (!trigger) return null;
+  const tr = trigger.getBoundingClientRect();
+  const rows = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (el.hasAttribute('data-tv3-pre')) continue;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
+    if (el.children.length > 8) continue;
+    const r = el.getBoundingClientRect();
+    if (!vis(r) || r.height > 90) continue;
+    const txt = (el.innerText || '').trim();
+    if (!txt || txt.length > 80) continue;
+    // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
+    // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
+    // the stacked-rows check below).
+    const role = el.getAttribute('role');
+    let ptr = false;
+    try { ptr = getComputedStyle(el).cursor === 'pointer'; } catch (e) { ptr = false; }
+    const clickable = tag === 'BUTTON' || tag === 'A' || role === 'option' || role === 'menuitem' || role === 'menuitemcheckbox' || role === 'menuitemradio' || ptr;
+    if (!clickable) continue;
+    rows.push({ el, r, txt });
+  }
+  if (rows.length < 2) return null;
+  const leaves = rows.filter((c) => !rows.some((o) => o.el !== c.el && c.el.contains(o.el)));
+  if (leaves.length < 2) return null;
+  // Group by parent AND grandparent so both flat menus (card > button*N) and nested ones
+  // (ul > li > button) find their shared container.
+  const groups = new Map();
+  for (const c of leaves) {
+    const p1 = c.el.parentElement;
+    for (const p of [p1, p1 ? p1.parentElement : null]) {
+      if (!p || p === document.body || p === document.documentElement) continue;
+      if (!groups.has(p)) groups.set(p, new Set());
+      groups.get(p).add(c);
+    }
+  }
+  let best = null;
+  for (const [p, set] of groups) {
+    const g = Array.from(set);
+    if (g.length < 2) continue;
+    if (p.hasAttribute('data-tv3-pre')) continue;
+    // A dialog is a page mode, not a menu — mislabeling it invites a wrong "pick an option" move.
+    try { if (p.closest('dialog,[role~="dialog"],[aria-modal="true"]')) continue; } catch (e) {}
+    const pr = p.getBoundingClientRect();
+    if (!vis(pr) || pr.height > 500) continue;
+    if (pr.top < tr.top - 200 || pr.top > tr.bottom + 400) continue;
+    if (pr.right < tr.left - 100 || pr.left > tr.right + 100) continue;
+    const tops = new Set(g.map((c) => Math.round(c.r.top)));
+    if (tops.size < 2) continue;
+    if (!best || g.length > best.g.length || (g.length === best.g.length && pr.height < best.h)) best = { p, g, h: pr.height };
+  }
+  if (!best) return null;
+  document.querySelectorAll('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
+  best.g.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
+  const options = [];
+  let n = 0;
+  for (const c of best.g) {
+    n++;
+    c.el.setAttribute('data-tv3-menu', String(n));
+    if (options.length < 15) options.push({ n, text: c.txt.slice(0, 60) });
+  }
+  return { count: n, options };
 }"""
 
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
@@ -285,6 +464,21 @@ _OBSERVE_JS = (
 )
 
 
+def _menu_open_note(found: dict[str, Any], selector: str) -> str:
+    count = int(found.get("count") or 0)
+    parts = []
+    for o in (found.get("options") or [])[:15]:
+        # option texts are page-controlled and land in the LLM transcript — same sanitation as filenames
+        text = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(o.get("text", "")))
+        parts.append(f'[data-tv3-menu="{o.get("n")}"] {text!r}')
+    overflow = f" (+{count - len(parts)} more — re-observe for the full list)" if count > len(parts) else ""
+    return (
+        f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
+        f'its [data-tv3-menu="N"] selector NOW — clicking {selector} again or elsewhere closes the menu '
+        "and destroys these options."
+    )
+
+
 def _spec(
     name: str, description: str, params: dict[str, Any], handler: Callable[[dict[str, Any]], Awaitable[ToolResult]]
 ) -> ToolSpec:
@@ -404,17 +598,170 @@ def build_browser_tools(
                     html = ""
         else:
             html = await page.content()
+        # The click/type reaction gate stamps data-tv3-pre on every visible element; it is internal
+        # bookkeeping, and left in place it costs a third of the truncation budget below in noise.
+        html = html.replace(' data-tv3-pre="1"', "")
         if len(html) > 20000:
             return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
         return ToolResult.ok(html)
+
+    async def _click_reaction(
+        page: Any, selector: str, pre: dict[str, Any], url_before: str
+    ) -> tuple[str | None, str | None]:
+        # Returns (note, commit_error) — at most one set. Raises are the caller's to swallow (fail-open:
+        # a probe failure must degrade to the bare pre-feature ok, never fail the click).
+        opt = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(pre.get("optText") or "")) or selector
+        if pre.get("isOption"):
+            # Commit evidence, any one suffices: navigation, the menu closing, the option's own state
+            # changing vs the post-hover baseline (multi-select menus commit WITHOUT closing), or a
+            # submenu opening (a cascading option commits nothing yet — reporting the child menu beats
+            # a false error).
+            baseline = pre.get("optState") or ""
+
+            def _committed_state(after: dict[str, Any]) -> bool:
+                return bool(after.get("optState")) and after.get("optState") != baseline
+
+            async def _state_holds(state: str) -> bool:
+                # A real commit settles into its new state; self-updating row content (a countdown,
+                # a live price) keeps moving. Only a state that holds across two reads is evidence.
+                await asyncio.sleep(0.15)
+                try:
+                    again_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+                except Exception:
+                    return True
+                again = again_raw if isinstance(again_raw, dict) else {}
+                return bool(again.get("optState") == state)
+
+            url_now = await _url(page)
+            if url_before and url_now and url_now != url_before:
+                return f"Selected option {opt!r} — the page navigated.", None
+            try:
+                after_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+            except Exception:
+                # the page tearing down right after an option click is a navigation — commit evidence
+                return f"Selected option {opt!r} — the page navigated.", None
+            after = after_raw if isinstance(after_raw, dict) else {}
+            if not after.get("stillOpen"):
+                return f"Selected option {opt!r} — the menu closed.", None
+            if _committed_state(after) and await _state_holds(after.get("optState") or ""):
+                return f"Selected option {opt!r} — its state changed (the menu stayed open).", None
+            # Menus routinely close through a fade or an async server ack; declaring "did not commit"
+            # off the instantaneous read would turn those healthy commits into false errors. One
+            # bounded settle, only on this would-be-error path.
+            await asyncio.sleep(0.6)
+            try:
+                settled_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+            except Exception:
+                return f"Selected option {opt!r} — the page navigated.", None
+            settled = settled_raw if isinstance(settled_raw, dict) else {}
+            if not settled.get("stillOpen"):
+                return f"Selected option {opt!r} — the menu closed.", None
+            if _committed_state(settled) and await _state_holds(settled.get("optState") or ""):
+                return f"Selected option {opt!r} — its state changed (the menu stayed open).", None
+            # No-commit evidence is already established: a crash of this last informational probe must
+            # not fall through to the caller's fail-open bare ok.
+            try:
+                submenu = await page.evaluate(_FIND_MENU_JS, selector)
+            except Exception:
+                submenu = None
+            if isinstance(submenu, dict) and submenu.get("count"):
+                return _menu_open_note(submenu, selector), None
+            return None, (
+                f"clicked option {opt!r} ({selector}) but the selection did not commit — the menu is "
+                "still open and unchanged. Do not repeat this click; press Enter on the option, or "
+                "re-observe and try a different control."
+            )
+        if pre.get("menuOpen"):
+            if pre.get("containsMenu"):
+                # Clicked the card AROUND the menu: the center-point click may have landed on an
+                # arbitrary row, so any open/closed/selected claim could be false. Say nothing.
+                return None, None
+            try:
+                after_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+            except Exception:
+                return None, None
+            found = await page.evaluate(_FIND_MENU_JS, selector)
+            if isinstance(found, dict) and found.get("count"):
+                return _menu_open_note(found, selector), None
+            if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
+                return (
+                    "Note: this click CLOSED the open menu — no option was selected. To select, click "
+                    'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
+                ), None
+            return None, None
+        found = await page.evaluate(_FIND_MENU_JS, selector)
+        if isinstance(found, dict) and found.get("count"):
+            return _menu_open_note(found, selector), None
+        return None, None
 
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
             return error
         selector = args["selector"]
-        await page.click(selector, timeout=15000)
-        return ToolResult.ok(f"clicked {selector} — now at {await _url(page)}")
+        if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
+            missing = False
+            try:
+                missing = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+            except Exception:
+                missing = False
+            if missing:
+                # An absent marker cannot reappear without a re-observe, so Playwright's full 15s
+                # actionability wait is pure loss (4x in the specimen trace). Short attach grace
+                # tolerates a framework re-attaching the same node mid-render.
+                try:
+                    await page.wait_for_selector(selector, state="attached", timeout=1200)
+                except Exception:
+                    return ToolResult.error(
+                        f"{selector} no longer exists on the page — element markers vanish when the "
+                        "page re-renders (a closed menu destroys its options). Re-observe and act on "
+                        "fresh selectors from the new observation."
+                    )
+        pre: dict[str, Any] | None = None
+        try:
+            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, selector)
+            if isinstance(pre_raw, dict):
+                pre = pre_raw
+        except Exception:
+            pre = None
+        if pre is not None and pre.get("isOption"):
+            # Playwright's click hovers first, and menus routinely restyle a row on hover — so the
+            # commit baseline must be the POST-hover fingerprint, or a mere highlight would read as
+            # "its state changed" commit evidence on a no-op click.
+            try:
+                await page.hover(selector, timeout=2000)
+                hovered = await page.evaluate(_MENU_AFTER_JS, selector)
+                if isinstance(hovered, dict) and hovered.get("optState"):
+                    pre["optState"] = hovered["optState"]
+            except Exception:
+                pass
+        url_before = await _url(page)
+        try:
+            await page.click(selector, timeout=15000)
+        except Exception as e:
+            gone = False
+            try:
+                gone = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+            except Exception:
+                gone = False
+            if gone:
+                return ToolResult.error(
+                    f"click on {selector} failed: the element no longer exists on the page — it was "
+                    "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
+                    f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})"
+                )
+            raise
+        base = f"clicked {selector} — now at {await _url(page)}"
+        if pre is None:
+            return ToolResult.ok(base)
+        try:
+            note, commit_error = await _click_reaction(page, selector, pre, url_before)
+        except Exception:
+            LOG.debug("taskv3 click reaction probe failed", selector=selector, exc_info=True)
+            return ToolResult.ok(base)
+        if commit_error is not None:
+            return ToolResult.error(commit_error)
+        return ToolResult.ok(base + "\n" + note if note else base)
 
     async def hover(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
@@ -686,8 +1033,11 @@ def build_browser_tools(
         ),
         _spec(
             "click",
-            "Click an element by CSS selector. If the click triggers a file download, the tool result "
-            "reports it when detected.",
+            "Click an element by CSS selector. If the click opens a menu of options, the result lists "
+            'them with [data-tv3-menu="N"] selectors — click one of those to select (verified: you get '
+            "a loud error, not a silent no-op, if the selection does not commit; do not blindly repeat "
+            "a failed click). If the click triggers a file download, the tool result reports it when "
+            "detected.",
             _obj({"selector": {"type": "string"}}, ["selector"]),
             click,
         ),

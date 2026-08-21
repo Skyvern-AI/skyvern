@@ -182,15 +182,21 @@ from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
     ActionStatus,
+    ClickAction,
     CompleteAction,
     CompleteVerifyResult,
     DecisiveAction,
     DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
+    HoverAction,
+    InputTextAction,
     KeypressAction,
     ReloadPageAction,
+    SelectOption,
+    SelectOptionAction,
     TerminateAction,
+    UploadFileAction,
     VerificationStatus,
     WaitAction,
     WebAction,
@@ -279,6 +285,64 @@ def mark_pdf_source_downloaded(pdf_src: str) -> None:
     context = skyvern_context.current()
     if context:
         context.downloaded_pdf_sources.add(hashlib.sha256(pdf_src.encode()).hexdigest())
+
+
+_TASKV3_TOOL_ACTION_TYPES = {
+    "click": ActionType.CLICK,
+    "hover": ActionType.HOVER,
+    "type": ActionType.INPUT_TEXT,
+    "select_option": ActionType.SELECT_OPTION,
+    "select_combobox": ActionType.SELECT_OPTION,
+    "press_key": ActionType.KEYPRESS,
+    "file_upload": ActionType.UPLOAD_FILE,
+    "navigate": ActionType.GOTO_URL,
+    "scroll": ActionType.SCROLL,
+    "wait": ActionType.WAIT,
+    "solve_captcha": ActionType.SOLVE_CAPTCHA,
+}
+
+
+def _redact_tool_args(args: dict[str, Any], secret_values: set[str]) -> dict[str, Any]:
+    if not secret_values:
+        return args
+    return {key: _redact_tool_arg(value, secret_values) for key, value in args.items()}
+
+
+def _redact_tool_arg(value: Any, secret_values: set[str]) -> Any:
+    # Tool args are bare json.loads output and the builder stringifies scalars, so numbers and nested
+    # values are matched as text too (bool/None are left alone). Selector/url are scrubbed as well: a
+    # persisted element_id that diverges from the live action beats a secret at rest in the row.
+    if isinstance(value, dict):
+        return {key: _redact_tool_arg(item, secret_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_tool_arg(item, secret_values) for item in value]
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return redact_secrets_from_text(str(value), secret_values, boundary_all_lengths=True)
+    return value
+
+
+def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields: Any) -> Action:
+    """Build the Action a v3 tool call persists as, carrying the fields its typed subclass requires so
+    the row hydrates as that subclass instead of falling back to base Action on every read."""
+    selector = str(args.get("selector") or "")
+    if tool_name == "click":
+        return ClickAction(element_id=selector, **fields)
+    if tool_name == "hover":
+        return HoverAction(element_id=selector, **fields)
+    if tool_name == "type":
+        return InputTextAction(element_id=selector, text=str(args.get("text") or ""), **fields)
+    if tool_name in ("select_option", "select_combobox"):
+        label, value = args.get("label"), args.get("value")
+        option = SelectOption(label=None if label is None else str(label), value=None if value is None else str(value))
+        return SelectOptionAction(element_id=selector, option=option, **fields)
+    if tool_name == "press_key":
+        key = args.get("key")
+        return KeypressAction(keys=[str(key)] if key else [], **fields)
+    if tool_name == "file_upload":
+        return UploadFileAction(element_id=selector, file_url=str(args.get("file") or ""), **fields)
+    if tool_name == "navigate":
+        return GotoUrlAction(url=str(args.get("url") or ""), **fields)
+    return Action(action_type=_TASKV3_TOOL_ACTION_TYPES.get(tool_name, ActionType.CLICK), **fields)
 
 
 class _PromptCeilingExceeded(Exception):
@@ -1243,19 +1307,6 @@ class ForgeAgent:
         # action round, and we persist one DB row per action + one screenshot per round, so the Task
         # API's action_screenshot_urls and GET /tasks/{id}/actions are populated for v3. Additive and
         # best-effort — billing still meters off outcome.billable_actions below.
-        _tool_action_types = {
-            "click": ActionType.CLICK,
-            "hover": ActionType.HOVER,
-            "type": ActionType.INPUT_TEXT,
-            "select_option": ActionType.SELECT_OPTION,
-            "select_combobox": ActionType.SELECT_OPTION,
-            "press_key": ActionType.KEYPRESS,
-            "file_upload": ActionType.UPLOAD_FILE,
-            "navigate": ActionType.GOTO_URL,
-            "scroll": ActionType.SCROLL,
-            "wait": ActionType.WAIT,
-            "solve_captcha": ActionType.SOLVE_CAPTCHA,
-        }
         _billable_tool_names = frozenset(
             {"click", "hover", "type", "select_option", "select_combobox", "press_key", "file_upload"}
         )
@@ -1272,11 +1323,16 @@ class ForgeAgent:
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
+            secret_values: set[str] = set()
+            if app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(task.workflow_run_id):
+                secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(task.workflow_run_id)
             for name, args, succeeded in round_actions:
                 try:
-                    selector = args.get("selector", "") if isinstance(args, dict) else ""
-                    action = Action(
-                        action_type=_tool_action_types.get(name, ActionType.CLICK),
+                    tool_args = _redact_tool_args(args if isinstance(args, dict) else {}, secret_values)
+                    selector = tool_args.get("selector", "")
+                    action = _taskv3_action_for_tool_call(
+                        name,
+                        tool_args,
                         status=ActionStatus.completed if succeeded else ActionStatus.failed,
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
@@ -1459,11 +1515,11 @@ class ForgeAgent:
                 extracted_information = _redact_extracted_information(extracted_information, secret_values)
         # Emit one action-result per billable browser action so the per-step billing hook meters a
         # task_v3 run per action, exactly like the step engine — no billing-model change. (Reuses the
-        # _tool_action_types map defined above for per-action persistence.)
+        # _TASKV3_TOOL_ACTION_TYPES map for per-action persistence.)
         billable_action_results: list[tuple[Action, list[ActionResult]]] = [
             (
                 Action(
-                    action_type=_tool_action_types.get(name, ActionType.CLICK),
+                    action_type=_TASKV3_TOOL_ACTION_TYPES.get(name, ActionType.CLICK),
                     task_id=task.task_id,
                     step_id=step.step_id,
                     description=f"task_v3 {name}",
