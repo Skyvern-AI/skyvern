@@ -15,6 +15,7 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
         browser_session_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
+        discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         secret_scrub_values=["known-vault-value"],
     )
@@ -40,6 +41,7 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
         browser_session_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
+        discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         workflow_persisted=True,
         last_full_workflow_test_ok=True,

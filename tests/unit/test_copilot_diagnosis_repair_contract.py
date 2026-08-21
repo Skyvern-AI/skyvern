@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot.agent import _code_authoring_repair_context_prompt
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
 from skyvern.forge.sdk.copilot.challenge_evidence import (
@@ -18,8 +20,10 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     ChallengeKind,
     composition_challenge_carrier,
 )
+from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    has_bounded_page_schema,
     merge_visual_composition_evidence,
     parse_composition_html,
 )
@@ -43,6 +47,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
@@ -3312,3 +3317,350 @@ def test_vision_challenge_without_a_blocked_submit_claim_still_terminalizes_over
     assert carrier is ChallengeEvidenceSource.VISION
     assert signal is not None
     assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+
+
+_NAMED_CONTROL_OVERLAY_HTML = (Path(__file__).parent / "data" / "click_overlay_named_dismiss.html").read_text()
+
+_LONG_OVERLAY_SELECTOR_ID = "overlay-" + "notice-gate-region-" * 5
+
+_LONG_SELECTOR_OVERLAY_HTML = f"""
+<html><body>
+  <main><button id="btn-open-statements">Continue to statements</button></main>
+  <div class="overlay" id="{_LONG_OVERLAY_SELECTOR_ID}">
+    <div class="modal" id="inner-modal" role="dialog" aria-modal="true">
+      <h2>Notice</h2>
+      <button id="btn-one">Accept</button>
+      <button id="btn-two">Decline</button>
+      <button id="btn-three">Manage</button>
+      <button id="btn-four">Close</button>
+    </div>
+  </div>
+</body></html>
+"""
+
+
+def _overlay_repair_ctx(evidence: dict[str, Any]) -> CopilotContext:
+    ctx = _ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.composition_page_evidence = {
+        **evidence,
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_overlay",
+    }
+    ctx.pending_code_authoring_runtime_repair_context = CodeAuthoringRepairContext(
+        block_label="click_continue_and_extract_success",
+        reason_code="runtime_block_failure",
+        runtime_failure_reason="TimeoutError: Locator.wait_for: Timeout 10000ms exceeded.",
+        workflow_run_id="wr_overlay",
+    )
+    return ctx
+
+
+def _overlay_page_evidence(html: str) -> dict[str, Any]:
+    return parse_composition_html(html, inspected_url="http://localhost/x", current_url="http://localhost/x")
+
+
+def _obstruction_only_page_evidence() -> dict[str, Any]:
+    return {
+        "page_obstructions": [
+            {
+                "kind": "other",
+                "source": "vision_summary",
+                "visual_location": "Full-page overlay covering the page and its button.",
+                "visible_controls": [],
+                "underlying_page_blocked": True,
+            }
+        ],
+        "modal_overlays": [],
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+    }
+
+
+def test_an_overlay_seen_later_in_the_run_replaces_the_earlier_clean_capture() -> None:
+    ctx = _ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_failed"
+    ctx.last_test_ok = False
+
+    clean, _ = store_post_run_page_evidence(
+        ctx,
+        _bounded_failure_page_evidence(),
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+    ctx.composition_page_evidence = clean
+
+    overlay, _ = store_post_run_page_evidence(
+        ctx,
+        {"source_tool": "inspect_page_for_composition", **_obstruction_only_page_evidence()},
+        run_id="wr_failed",
+        current_url="https://example.test/app/results",
+        source_browser_session_id=None,
+        run_browser_session_id=None,
+    )
+
+    assert overlay.get("page_obstructions"), "the overlay the run actually hit must not be discarded"
+    assert ctx.composition_page_evidence.get("page_obstructions")
+
+
+def test_obstruction_without_dismiss_controls_still_finalizes_a_repair_context() -> None:
+    ctx = _overlay_repair_ctx(_obstruction_only_page_evidence())
+    assert has_bounded_page_schema(ctx.composition_page_evidence) is False
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.observed_after_workflow_run is True
+    assert repair_context.page_form_summaries == []
+    assert repair_context.page_obstruction_summaries == [
+        "other Full-page overlay covering the page and its button. "
+        "obstruction present, no dismiss control found in page evidence"
+    ]
+    rendered_line = (
+        "page_obstructions: other Full-page overlay covering the page and its button. "
+        "obstruction present, no dismiss control found in page evidence"
+    )
+    assert rendered_line in _code_authoring_repair_context_prompt(ctx).splitlines()
+    assert "obstruction present, no dismiss control found" in rendered_line
+
+
+def test_overlay_dismiss_controls_reach_the_repair_prompt_beside_the_runtime_failure() -> None:
+    ctx = _overlay_repair_ctx(_overlay_page_evidence(_NAMED_CONTROL_OVERLAY_HTML))
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summaries = repair_context.page_obstruction_summaries
+    assert [summary.split()[1] for summary in summaries] == ["#terms-overlay", "#terms-modal"]
+    for summary in summaries:
+        assert "#accept-terms" in summary
+        assert "Continue #btn-continue" in summary
+    prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
+    assert "runtime_failure_reason: TimeoutError: Locator.wait_for: Timeout 10000ms exceeded." in prompt_lines
+    assert "observed_after_workflow_run: true" in prompt_lines
+    obstruction_line = next(line for line in prompt_lines if line.startswith("page_obstructions:"))
+    assert "#terms-overlay" in obstruction_line
+    assert "#btn-continue" in obstruction_line
+
+    ctx.last_code_authoring_repair_context = repair_context.model_copy(update={"selector": "#btn-continue"})
+    selector_prompt_lines = _code_authoring_repair_context_prompt(ctx).splitlines()
+    assert "selector: #btn-continue" in selector_prompt_lines
+    assert obstruction_line in selector_prompt_lines
+
+
+def test_overlay_selectors_longer_than_a_summary_field_reach_the_prompt_whole() -> None:
+    ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
+    long_selector = f"#{_LONG_OVERLAY_SELECTOR_ID}"
+    assert len(long_selector) > 100
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summary = repair_context.page_obstruction_summaries[0]
+    assert summary.startswith(f"modal_overlay {long_selector} ")
+    assert summary.endswith("#btn-four")
+    assert f"page_obstructions: modal_overlay {long_selector} " in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_every_obstruction_keeps_dismiss_controls_when_controls_outnumber_the_summary_budget() -> None:
+    ctx = _overlay_repair_ctx(_overlay_page_evidence(_LONG_SELECTOR_OVERLAY_HTML))
+    long_selector = f"#{_LONG_OVERLAY_SELECTOR_ID}"
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    per_obstruction = {
+        selector: [summary for summary in repair_context.page_obstruction_summaries if selector in summary]
+        for selector in (long_selector, "#inner-modal")
+    }
+    assert [len(summaries) for summaries in per_obstruction.values()] == [1, 1]
+    assert [
+        selector
+        for selector in ("#btn-one", "#btn-two", "#btn-three", "#btn-four")
+        if selector in per_obstruction["#inner-modal"][0]
+    ] == ["#btn-one", "#btn-two", "#btn-three", "#btn-four"]
+
+
+def test_dismiss_controls_are_reported_without_an_action_or_a_preference() -> None:
+    ctx = _overlay_repair_ctx(_overlay_page_evidence(_NAMED_CONTROL_OVERLAY_HTML))
+    evidence_before = json.dumps(ctx.composition_page_evidence, sort_keys=True)
+    pending_before = ctx.pending_code_authoring_runtime_repair_context
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    for summary, obstruction in zip(
+        repair_context.page_obstruction_summaries, ctx.composition_page_evidence["page_obstructions"]
+    ):
+        source_control_order = [control.get("selector") for control in obstruction["visible_controls"]]
+        assert sorted(source_control_order, key=summary.index) == source_control_order
+    assert json.dumps(ctx.composition_page_evidence, sort_keys=True) == evidence_before
+    assert pending_before is not None
+    before = pending_before.model_dump()
+    assert {key for key, value in repair_context.model_dump().items() if before[key] != value} <= {
+        "current_origin",
+        "current_url",
+        "current_title",
+        "page_evidence_source",
+        "observed_after_workflow_run",
+        "page_form_summaries",
+        "page_result_summaries",
+        "page_action_summaries",
+        "page_challenge_summaries",
+        "page_obstruction_summaries",
+    }
+
+
+def test_modal_overlay_dismiss_controls_are_read_only_without_page_obstructions() -> None:
+    ctx = _overlay_repair_ctx(
+        {
+            "page_obstructions": [],
+            "modal_overlays": [
+                {
+                    "selector": "#gate-modal",
+                    "dismiss_controls": [{"text": "Accept All", "selector": "button.accept"}],
+                }
+            ],
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+        }
+    )
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_obstruction_summaries == ["#gate-modal Accept All button.accept"]
+
+
+def test_page_free_of_obstructions_renders_no_obstruction_line() -> None:
+    ctx = _overlay_repair_ctx(
+        {
+            "page_obstructions": [],
+            "modal_overlays": [],
+            "forms": [{"fields": [], "submit_controls": [{"text": "Continue", "selector": "#btn-continue"}]}],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+        }
+    )
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    assert repair_context.page_obstruction_summaries == []
+    assert "page_obstructions:" not in _code_authoring_repair_context_prompt(ctx)
+
+
+def test_page_obstruction_summaries_separate_runtime_repair_root_cause_signatures() -> None:
+    def signature(summaries: list[str]) -> str | None:
+        repair_context = CodeAuthoringRepairContext(
+            block_label="click_continue_and_extract_success",
+            reason_code="runtime_block_failure",
+            observed_after_workflow_run=True,
+            page_obstruction_summaries=summaries,
+        )
+        contract = build_diagnosis_repair_contract(
+            source_tool="update_and_run_blocks",
+            result=_authoring_repair_result(repair_context),
+            ctx=_ctx(),
+        )
+        return contract.to_trace_data()["root_cause_signature"]
+
+    named_control_signature = signature(["#terms-overlay Continue #btn-continue"])
+    textless_signature = signature(
+        ["other Full-page overlay obstruction present, no dismiss control found in page evidence"]
+    )
+
+    assert named_control_signature is not None
+    assert named_control_signature != textless_signature
+
+
+@pytest.mark.asyncio
+async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _ctx()
+    packet = _obstruction_only_page_evidence()
+
+    async def _read(
+        _ctx_arg: CopilotContext, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, Any], str, None]:
+        return packet, run_session_id, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", _read)
+
+    await run_execution_module._capture_and_store_post_run_page(
+        ctx, run_session_id="pbs_run", run_id="wr_overlay", current_url="https://example.test/statements"
+    )
+
+    stored = ctx.composition_page_evidence
+    assert stored is not None
+    assert has_bounded_page_schema(stored) is False
+    assert stored["observed_after_workflow_run"] is True
+    assert stored["workflow_run_id"] == "wr_overlay"
+    assert stored["page_obstructions"] == packet["page_obstructions"]
+
+
+def test_dispatched_terminal_capture_admits_an_obstruction_only_packet() -> None:
+    packet = _obstruction_only_page_evidence()
+
+    assert has_bounded_page_schema(packet) is False
+    assert page_evidence_prose_text(packet).strip() != ""
+    assert run_execution_module._dispatched_terminal_page_evidence_is_usable(packet) is True
+
+
+def test_same_run_matcher_keeps_a_stored_obstruction_only_packet() -> None:
+    stored = {
+        **_obstruction_only_page_evidence(),
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+        "workflow_run_id": "wr_overlay",
+    }
+
+    assert has_bounded_page_schema(stored) is False
+    assert post_run_inspection_cleanly_matches(stored, "wr_overlay") is True
+    assert post_run_inspection_cleanly_matches(stored, "wr_other") is False
+
+
+def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> None:
+    control_selector = "#" + "dismiss-the-full-page-notice-" * 5
+    ctx = _overlay_repair_ctx(
+        {
+            "page_obstructions": [
+                {
+                    "kind": "modal_overlay",
+                    "selector": "#" + "notice-gate-region-" * 8,
+                    "visual_location": "Full-viewport notice covering the statements card. " * 4,
+                    "visible_controls": [
+                        {"text": "Accept and continue past this notice. " * 6, "selector": control_selector}
+                    ],
+                }
+            ],
+            "modal_overlays": [],
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+        }
+    )
+
+    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
+
+    assert repair_context is not None
+    summary = repair_context.page_obstruction_summaries[0]
+    assert len(summary) <= OBSTRUCTION_SUMMARY_MAX_CHARS
+    assert summary.endswith(control_selector)
+    obstruction_lines = [
+        line
+        for line in _code_authoring_repair_context_prompt(ctx).splitlines()
+        if line.startswith("page_obstructions:")
+    ]
+    assert obstruction_lines
+    assert control_selector in obstruction_lines[0]

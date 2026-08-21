@@ -142,6 +142,18 @@ def reset_collapse_xp_assignment_memo():
 
 
 @pytest.fixture(autouse=True)
+def restore_interpreter_traceback_hooks() -> Iterator[None]:
+    """setup_logger() replaces the three interpreter hooks process-wide.
+
+    Left installed they outlive the test that configured logging and shadow pytest's own
+    unraisable/thread-exception plugins, which install their hooks per test.
+    """
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    yield
+    sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+
+
+@pytest.fixture(autouse=True)
 def reset_mcp_stateless_http_mode():
     """Keep MCP transport mode from leaking between independently collected test files."""
     from skyvern.cli.core import session_manager

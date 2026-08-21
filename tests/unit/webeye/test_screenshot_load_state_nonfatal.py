@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,6 +13,7 @@ from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import Page
 
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed
+from skyvern.webeye import browser_driver_errors
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserAutomationError, BrowserTargetClosedError
 from skyvern.webeye.utils import page as page_module
@@ -256,3 +259,108 @@ class TestScreenshotTargetClosedClassification:
             await _current_viewpoint_screenshot_helper(page)
 
         assert type(exc_info.value) is FailedToTakeScreenshot
+
+
+@pytest.fixture
+def second_driver_package(monkeypatch: pytest.MonkeyPatch) -> tuple[type[Exception], type[Exception]]:
+    """Model the browser image's two live Playwright-family driver packages: a persistent session's
+    pages are driven by the package this module's imports were NOT rewritten to, so they raise error
+    classes with a different identity."""
+
+    class _ForkError(Exception):
+        pass
+
+    class _ForkTimeout(_ForkError):
+        pass
+
+    api = types.ModuleType("patchright.async_api")
+    api.Error = _ForkError  # type: ignore[attr-defined]
+    api.TimeoutError = _ForkTimeout  # type: ignore[attr-defined]
+    package = types.ModuleType("patchright")
+    package.async_api = api  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "patchright", package)
+    monkeypatch.setitem(sys.modules, "patchright.async_api", api)
+
+    error_types, timeout_types = browser_driver_errors._load_driver_error_types()
+    monkeypatch.setattr(browser_driver_errors, "DRIVER_ERROR_TYPES", error_types)
+    monkeypatch.setattr(browser_driver_errors, "DRIVER_TIMEOUT_ERROR_TYPES", timeout_types)
+    return _ForkError, _ForkTimeout
+
+
+class TestSecondDriverPackageClassification:
+    @pytest.mark.asyncio
+    async def test_timeout_uses_timeout_arm(
+        self, second_driver_package: tuple[type[Exception], type[Exception]]
+    ) -> None:
+        _, fork_timeout = second_driver_package
+        page = _make_page(b"image-bytes")
+        error = fork_timeout("Page.screenshot: Timeout 30000ms exceeded")
+        page.screenshot = AsyncMock(side_effect=error)
+        log = MagicMock()
+
+        with pytest.raises(FailedToTakeScreenshot) as exc_info:
+            with pytest.MonkeyPatch.context() as monkeypatch:
+                monkeypatch.setattr(page_module, "LOG", log)
+                await _current_viewpoint_screenshot_helper(page)
+
+        assert exc_info.value.__cause__ is error
+        log.warning.assert_called_once()
+        log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_target_close_uses_target_closed_arm(
+        self, second_driver_package: tuple[type[Exception], type[Exception]]
+    ) -> None:
+        fork_error, _ = second_driver_package
+        page = _make_page(b"image-bytes")
+        error = fork_error("Page.screenshot: Target page, context or browser has been closed")
+        page.screenshot = AsyncMock(side_effect=error)
+        log = MagicMock()
+
+        with pytest.raises(ScreenshotTargetClosed) as exc_info:
+            with pytest.MonkeyPatch.context() as monkeypatch:
+                monkeypatch.setattr(page_module, "LOG", log)
+                await _current_viewpoint_screenshot_helper(page)
+
+        assert exc_info.value.__cause__ is error
+        log.info.assert_called_once()
+        log.error.assert_not_called()
+
+
+class TestScrollingScreenshotClosedTargetFallback:
+    """``take_scrolling_screenshot`` falls back to a whole-page Playwright capture when the scrolling
+    merge fails. That fallback screenshots the same page, so a closed target can only fail again --
+    once with a WARNING traceback here, once more from the fallback's own classification.
+    """
+
+    def _rig(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[MagicMock, AsyncMock, MagicMock]:
+        page = _make_page(b"image-bytes")
+        monkeypatch.setattr(page_module, "_scrolling_screenshots_helper", AsyncMock(side_effect=error))
+        fallback = AsyncMock(return_value=b"fallback-bytes")
+        monkeypatch.setattr(page_module, "_current_viewpoint_screenshot_helper", fallback)
+        frame = MagicMock()
+        frame.get_scroll_x_y = AsyncMock(return_value=(0, 120))
+        frame.safe_scroll_to_x_y = AsyncMock()
+        monkeypatch.setattr(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
+        return page, fallback, frame
+
+    @pytest.mark.asyncio
+    async def test_closed_target_skips_the_doomed_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = ScreenshotTargetClosed(error_message="Page is closed")
+        page, fallback, frame = self._rig(monkeypatch, error)
+
+        with pytest.raises(ScreenshotTargetClosed) as exc_info:
+            await page_module.SkyvernFrame.take_scrolling_screenshot(page, scrolling_number=2)
+
+        assert exc_info.value is error
+        fallback.assert_not_awaited()
+        frame.safe_scroll_to_x_y.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_failures_still_fall_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        page, fallback, frame = self._rig(monkeypatch, RuntimeError("merge failed"))
+
+        result = await page_module.SkyvernFrame.take_scrolling_screenshot(page, scrolling_number=2)
+
+        assert result == b"fallback-bytes"
+        fallback.assert_awaited_once()

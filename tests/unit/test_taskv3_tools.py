@@ -6,7 +6,9 @@ operations (no task-ecosystem) with the right args, without a live browser.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import html
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -934,6 +936,205 @@ async def test_observe_reports_aria_pressed_state() -> None:
         data = await _observe_data(page)
         by_sel = {e["selector"]: e for e in data["elements"]}
         assert by_sel["#toggle-no"].get("pressed") is True
+
+
+# (id, the selector observe must mint for it). Expected selectors are written out rather than
+# recomputed, so the test pins a format instead of mirroring the implementation's own escaping.
+# "-" is minted today as `#\\-`, which document.querySelectorAll accepts (so the in-page uniqueness
+# guard admits it) but Playwright's parser rejects, breaking every consume site.
+_ID_MATRIX_ESCAPED = [
+    ("1abc", '[id="1abc"]'),
+    ("9f2b1e7a-1c3d-4e5f-8a9b-0c1d2e3f4a5b", '[id="9f2b1e7a-1c3d-4e5f-8a9b-0c1d2e3f4a5b"]'),
+    ("42", '[id="42"]'),
+    ("-1abc", '[id="-1abc"]'),
+    ("-", '[id="-"]'),
+    ("a.b", '[id="a.b"]'),
+    ("a:b", '[id="a:b"]'),
+    ("form:panel:input", '[id="form:panel:input"]'),
+    ("a b", '[id="a b"]'),
+    ("a[0]", '[id="a[0]"]'),
+    ('a"b', '[id="a\\"b"]'),
+    ("a\\b", '[id="a\\\\b"]'),
+    # Playwright trims the selector string, and CSS.escape leaves everything above U+007F alone, so
+    # `#email<NBSP>` arrives as `#email` -- which selects the plain `email` element further down.
+    ("email\u00a0", '[id="email\u00a0"]'),
+    ("\u00a0", '[id="\u00a0"]'),
+    ("trailing ", '[id="trailing "]'),  # escaped by CSS.escape already; pins that branch, not the trim
+]
+# Ids that keep `#id`. Non-ASCII is not by itself a reason to change form -- accented and CJK ids
+# select fine -- so only whitespace at the ends disqualifies an id, and an interior one is harmless.
+_ID_MATRIX_PLAIN = [
+    ("email", "#email"),
+    ("first-name", "#first-name"),
+    ("_field1", "#_field1"),
+    ("--custom", "#--custom"),
+    ("caf\u00e9", "#caf\u00e9"),
+    ("\u767b\u5f55", "#\u767b\u5f55"),
+    ("a\u00a0b", "#a\u00a0b"),
+    ("\u00a0email", "#\u00a0email"),  # behind the `#`, so nothing trims it and the form still works
+]
+_ID_MATRIX = _ID_MATRIX_ESCAPED + _ID_MATRIX_PLAIN
+
+
+def _id_matrix_html() -> str:
+    rows = "".join(
+        f'<input type="text" id="{html.escape(v, quote=True)}" data-probe="{i}">' for i, (v, _) in enumerate(_ID_MATRIX)
+    )
+    return f"<!doctype html><html><body>{rows}</body></html>"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_mints_selectors_that_resolve_for_every_id_shape() -> None:
+    # Minted selectors are copied by the model into its own tool calls, so a selector that only
+    # looks well-formed is worthless: each one has to select its own element through the same query
+    # paths the tools use. A `#id` selector carrying an escape (`#\31 abc`) does not survive that
+    # trip -- drop the space terminating the hex escape and it addresses a different codepoint.
+    async with _content_page(_id_matrix_html()) as page:
+        by_probe = {e["i"]: e["selector"] for e in (await _observe_data(page))["elements"]}
+        assert len(by_probe) == len(_ID_MATRIX)
+        for i, (elem_id, _) in enumerate(_ID_MATRIX):
+            selector = by_probe[i]
+            if selector.startswith("#"):
+                assert "\\" not in selector, (elem_id, selector)
+            handle = await page.query_selector(selector)
+            assert handle is not None, (elem_id, selector)
+            assert await handle.get_attribute("data-probe") == str(i), (elem_id, selector)
+            # click/fill/press go through Playwright's own selector engine, not querySelector.
+            assert await page.locator(selector).count() == 1, (elem_id, selector)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_keeps_plain_id_selectors_unchanged() -> None:
+    # Negative control: ids that need no escaping keep the `#id` form byte for byte. Changing the
+    # selector format for ids that already work would be a far wider blast radius than the bug.
+    async with _content_page(_id_matrix_html()) as page:
+        by_probe = {e["i"]: e["selector"] for e in (await _observe_data(page))["elements"]}
+        for i, (elem_id, expected) in enumerate(_ID_MATRIX):
+            assert by_probe[i] == expected, (elem_id, by_probe[i])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_falls_back_to_a_marker_for_ids_holding_a_raw_line_break() -> None:
+    # A raw line break cannot appear in a CSS string, so these ids get no id selector and take the
+    # marker path. That is the intended trade, not an accident: the `#a\a b` form they used to get
+    # carries the same escape terminator this whole change exists to keep out of the transcript.
+    html_doc = (
+        '<!doctype html><html><body><input type="text" data-probe="0"><input type="text" data-probe="1"></body></html>'
+    )
+    async with _content_page(html_doc) as page:
+        await page.evaluate(
+            "() => document.querySelectorAll('input').forEach((el, i) => { el.id = 'a' + (i ? '\\r' : '\\n') + 'b'; })"
+        )
+        for element in (await _observe_data(page))["elements"]:
+            assert element["selector"].startswith("[data-tv3="), element
+            assert await page.locator(element["selector"]).count() == 1, element
+
+
+# A form exposes its named controls as its own properties, so <input name="X"> inside a form makes
+# form.X that input rather than whatever it normally is. Every one of these is read while building
+# an element record, and the read happens inside page.evaluate.
+_CLOBBERABLE = ["id", "name", "tagName", "getAttribute", "getBoundingClientRect", "innerText", "closest"]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize("clobbered", _CLOBBERABLE)
+@pytest.mark.asyncio
+async def test_observe_survives_a_form_that_clobbers_a_property_it_reads(clobbered: str) -> None:
+    # One such element used to throw out of page.evaluate and take the whole element list with it,
+    # so the agent lost perception entirely -- and on static markup it never got it back.
+    html_doc = (
+        "<!doctype html><html><body>"
+        f'<form role="button" id="real"><input name="{clobbered}" data-probe="0"><span>x</span></form>'
+        '<input id="other" data-probe="1">'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        elements = (await _observe_data(page))["elements"]
+        assert any(e["selector"] == "#other" for e in elements), elements
+        for element in elements:
+            assert await page.locator(element["selector"]).count() == 1, element
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_markers_are_not_collided_by_a_marker_the_page_already_carries() -> None:
+    # Uniqueness alone let a page pre-seed the marker the counter was about to mint, giving two
+    # elements the same selector. Playwright's page-level click takes the first match, so the agent
+    # would act on the wrong control with nothing to indicate it.
+    html_doc = (
+        "<!doctype html><html><body>"
+        '<div role="button" data-tv3="t0" data-probe="0">A</div>'
+        '<div role="button" data-probe="1">B</div>'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        elements = (await _observe_data(page))["elements"]
+        selectors = [e["selector"] for e in elements]
+        assert len(set(selectors)) == len(selectors), selectors
+        for element in elements:
+            handle = await page.query_selector(element["selector"])
+            assert await handle.get_attribute("data-probe") == str(element["i"]), element
+
+
+# Each stops `window.__tv3_next++` from making progress while still looking like a plain integer.
+_FROZEN_COUNTERS = [
+    "window.__tv3_next = 1e21",
+    "window.__tv3_next = 9007199254740992",
+    "Object.defineProperty(window, '__tv3_next', {value: 0, writable: false})",
+]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize("tamper", _FROZEN_COUNTERS)
+@pytest.mark.asyncio
+async def test_observe_still_mints_distinct_markers_when_the_counter_cannot_advance(tamper: str) -> None:
+    # Searching for a free marker used to loop until it found one, so a counter that cannot advance
+    # spun the renderer's main thread forever -- not just failing this observe but killing the page
+    # for the rest of the run, since nothing else on it can run again either.
+    async with _content_page(
+        '<!doctype html><html><body><div role="button">A</div><div role="button">B</div></body></html>'
+    ) as page:
+        await page.evaluate(f"() => {{ {tamper}; }}")
+        selectors = [e["selector"] for e in (await asyncio.wait_for(_observe_data(page), timeout=10))["elements"]]
+        assert len(selectors) == 2, selectors
+        assert len(set(selectors)) == 2, selectors
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_still_sees_elements_when_the_page_removes_css_escape() -> None:
+    # CSS.escape is page-removable and sits on the path of every element carrying an id, so losing
+    # it emptied the whole element list -- and an empty list reads as "this page has no controls"
+    # rather than as a failure. It costs the `#id` shorthand now, not the elements.
+    async with _content_page('<!doctype html><html><body><input id="9start"><input id="a b"></body></html>') as page:
+        await page.evaluate("() => { window.CSS = null; }")
+        data = await _observe_data(page)
+        assert [e["selector"] for e in data["elements"]] == ['[id="9start"]', '[id="a b"]']
+        assert not data.get("dropped")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_selectors_cannot_be_aimed_at_another_element_by_page_markup() -> None:
+    # An unescaped quote in a page-controlled attribute closes the selector and continues it as a
+    # selector list, which still matches exactly one element -- so the uniqueness guard passes and
+    # the agent is handed a selector for the element the page chose.
+    breakout = 'x"] , [id="victim'
+    html_doc = (
+        "<!doctype html><html><body>"
+        f'<input data-testid="{html.escape(breakout, quote=True)}" data-probe="0">'
+        f'<textarea name="{html.escape(breakout, quote=True)}" data-probe="1"></textarea>'
+        '<input id="victim" data-probe="2">'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        for element in (await _observe_data(page))["elements"]:
+            handle = await page.query_selector(element["selector"])
+            assert handle is not None, element
+            assert await handle.get_attribute("data-probe") == str(element["i"]), element
 
 
 @pytest.mark.asyncio

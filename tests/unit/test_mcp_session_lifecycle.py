@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from fastmcp.server.middleware import MiddlewareContext
 
 from skyvern.cli.core import client as client_mod
 from skyvern.cli.core import result as result_mod
@@ -13,6 +16,7 @@ from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
+from skyvern.cli.mcp_tools.telemetry import MCPTelemetryMiddleware
 from skyvern.client.types.extensions import Extensions
 from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
@@ -1704,3 +1708,114 @@ async def test_session_create_persists_active_api_key_hash_in_session_state(
     )
     assert current.api_key_hash == session_manager._api_key_hash("sk_key_create")
     assert current.api_key_hash != "sk_key_create"
+
+
+@pytest.fixture
+def _attach_clock(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[float]]:
+    now = [100.0]
+    monkeypatch.setattr(result_mod, "time", SimpleNamespace(perf_counter=lambda: now[0]))
+    result_mod._pending_attach.set(None)
+    yield now
+    result_mod._pending_attach.set(None)
+
+
+def _reusable_cloud_session(monkeypatch: pytest.MonkeyPatch, clock: list[float], attach_seconds: float) -> None:
+    session_manager.set_current_session(
+        session_manager.SessionState(
+            browser=MagicMock(),
+            context=BrowserContext(mode="cloud_session", session_id="pbs_123"),
+            api_key_hash=session_manager._api_key_hash(client_mod.get_active_api_key()),
+        )
+    )
+
+    def _get_skyvern() -> MagicMock:
+        clock[0] += attach_seconds
+        return MagicMock()
+
+    monkeypatch.setattr(session_manager, "get_skyvern", _get_skyvern)
+
+
+@pytest.mark.asyncio
+async def test_browser_attaches_are_named_on_the_tool_that_opens_its_timer_after_them(
+    monkeypatch: pytest.MonkeyPatch, _attach_clock: list[float]
+) -> None:
+    _reusable_cloud_session(monkeypatch, _attach_clock, 1.5)
+
+    await session_manager.resolve_browser(session_id="pbs_123")
+    await session_manager.resolve_browser(session_id="pbs_123")
+    with result_mod.Timer() as timer:
+        _attach_clock[0] += 0.5
+
+    assert timer.timing_ms == {"attach": 3000, "total": 500}
+
+
+@pytest.mark.asyncio
+async def test_an_attach_resolved_in_a_child_task_is_not_charged_to_the_parents_timer(
+    monkeypatch: pytest.MonkeyPatch, _attach_clock: list[float]
+) -> None:
+    _reusable_cloud_session(monkeypatch, _attach_clock, 1.5)
+
+    await asyncio.create_task(session_manager.resolve_browser(session_id="pbs_123"))
+    with result_mod.Timer() as timer:
+        _attach_clock[0] += 0.5
+
+    assert timer.timing_ms == {"total": 500}
+
+
+@pytest.mark.asyncio
+async def test_an_attach_whose_tool_never_opened_a_timer_is_dropped_before_the_next_tool_runs(
+    monkeypatch: pytest.MonkeyPatch, _attach_clock: list[float]
+) -> None:
+    _reusable_cloud_session(monkeypatch, _attach_clock, 1.5)
+    marks: dict[str, int] = {}
+
+    async def _next_tool(_context: MiddlewareContext[object]) -> object:
+        with result_mod.Timer() as timer:
+            _attach_clock[0] += 0.5
+        marks.update(timer.timing_ms)
+        return MagicMock(content=[], structured_content=None)
+
+    await session_manager.resolve_browser(session_id="pbs_123")
+    _attach_clock[0] += 0.01
+    await MCPTelemetryMiddleware().on_call_tool(
+        MiddlewareContext(message=SimpleNamespace(name="skyvern_click"), fastmcp_context=None),
+        _next_tool,
+    )
+
+    assert marks == {"total": 500}
+
+
+def test_a_tool_that_attached_no_browser_reports_only_the_time_it_spent(_attach_clock: list[float]) -> None:
+    with result_mod.Timer() as timer:
+        _attach_clock[0] += 0.5
+
+    assert timer.timing_ms == {"total": 500}
+
+
+@pytest.mark.asyncio
+async def test_an_attach_inside_a_timer_is_not_charged_again_to_the_next_tool(
+    monkeypatch: pytest.MonkeyPatch, _attach_clock: list[float]
+) -> None:
+    _reusable_cloud_session(monkeypatch, _attach_clock, 1.5)
+
+    with result_mod.Timer() as inside:
+        await session_manager.resolve_browser(session_id="pbs_123")
+    with result_mod.Timer() as next_tool:
+        _attach_clock[0] += 0.5
+
+    assert inside.timing_ms == {"total": 1500}
+    assert next_tool.timing_ms == {"total": 500}
+
+
+@pytest.mark.asyncio
+async def test_an_attach_is_charged_however_long_the_tool_takes_to_open_its_timer(
+    monkeypatch: pytest.MonkeyPatch, _attach_clock: list[float]
+) -> None:
+    _reusable_cloud_session(monkeypatch, _attach_clock, 1.5)
+
+    await session_manager.resolve_browser(session_id="pbs_123")
+    _attach_clock[0] += 0.2
+    with result_mod.Timer() as timer:
+        _attach_clock[0] += 0.5
+
+    assert timer.timing_ms == {"attach": 1500, "total": 500}

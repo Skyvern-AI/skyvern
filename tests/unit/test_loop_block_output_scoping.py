@@ -470,3 +470,22 @@ def test_traced_decorator_owns_execute_safe_not_the_invalidation_helper() -> Non
     # wrapper sets __wrapped__ via functools.wraps.
     assert Block.execute_safe.__wrapped__.__qualname__ == "Block.execute_safe"
     assert not hasattr(Block._invalidate_stale_output_on_failure, "__wrapped__")
+
+
+@pytest.mark.asyncio
+async def test_loop_iteration_reregistration_is_not_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-registering a block's output on the next loop iteration is the designed path (every
+    # iteration overwrites the last), so it must not compete with real warnings in the log stream.
+    from skyvern.forge.sdk.workflow import context_manager as context_manager_module
+
+    log = MagicMock()
+    monkeypatch.setattr(context_manager_module, "LOG", log)
+    ctx = _make_ctx()
+    param = _make_output_parameter("extract_details_output")
+
+    await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-1"})
+    await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-2"})
+
+    assert ctx.values["extract_details_output"] == {"quote": "iteration-2"}
+    log.warning.assert_not_called()
+    assert log.debug.call_count >= 1

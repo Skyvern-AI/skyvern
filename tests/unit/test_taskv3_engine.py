@@ -21,6 +21,7 @@ from skyvern.forge.taskv3.engine import (
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
+from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
@@ -345,3 +346,44 @@ async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.Monk
     )
 
     assert captured["call_kwargs"] == {"step": step}
+
+
+@pytest.mark.asyncio
+async def test_engine_wires_failure_evidence_gate() -> None:
+    # End-to-end wiring: the engine's own ActivityRecency reaches both the loop (which records the
+    # solve_captcha attempt) and the finish tool (which holds the failure verdict for one evidence
+    # turn). Without either half the first finish(failed) would be accepted immediately.
+    async def solve_captcha_handler(args: Any) -> ToolResult:
+        return ToolResult.error("a captcha challenge is present but could not be solved this attempt")
+
+    captcha_tool = ToolSpec(
+        name="solve_captcha",
+        description="solve_captcha",
+        parameters={"type": "object", "properties": {}},
+        handler=solve_captcha_handler,
+        recordable=True,
+    )
+
+    async def page_fingerprint() -> str | None:
+        return "fp"
+
+    async def provider() -> Any:
+        return object()
+
+    script = [
+        [("solve_captcha", {})],
+        [("finish", {"status": "failed", "reason": "could_not_pass_captcha"})],
+        [("finish", {"status": "failed", "reason": "still blocked, re-verified"})],
+    ]
+    caller = _ScriptedCaller(script)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=provider,
+        llm_caller=caller,
+        goal="apply",
+        page_fingerprint=page_fingerprint,
+        extra_tools=[captcha_tool],
+        max_action_steps=4,
+        max_turns=8,
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "still blocked, re-verified"

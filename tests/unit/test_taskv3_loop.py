@@ -20,6 +20,7 @@ from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.taskv3.loop import (
     NO_TOOL_CALL_NUDGE,
+    ActivityRecency,
     ToolHandler,
     ToolResult,
     ToolSpec,
@@ -1466,3 +1467,608 @@ async def test_navigate_resets_action_counters() -> None:
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "completed"
     assert len(clicks) == 10
+
+
+def _captcha_tool(results: list[str]) -> ToolSpec:
+    """solve_captcha fake: recordable, non-billable, returns each result as a tool ERROR (the
+    tri-state's not-solved arm) — the arm the false-negative verdicts followed in production."""
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        content = results[min(calls["n"], len(results) - 1)]
+        calls["n"] += 1
+        return ToolResult.error(content)
+
+    return ToolSpec(
+        name="solve_captcha",
+        description="solve_captcha",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        recordable=True,
+    )
+
+
+def _fingerprint_seq(samples: list[str | None]):
+    """Fingerprint fake returning each sample in order, repeating the last forever."""
+    calls = {"n": 0}
+
+    async def fingerprint() -> str | None:
+        sample = samples[min(calls["n"], len(samples) - 1)]
+        calls["n"] += 1
+        return sample
+
+    return fingerprint, calls
+
+
+@pytest.mark.asyncio
+async def test_finish_failed_after_captcha_defers_for_evidence_then_corrected_verdict() -> None:
+    # The production false-negative shape: solve_captcha reports not-solved, the model immediately
+    # calls finish(failed) — but the captcha protocol completes asynchronously and the submission
+    # lands. The verdict must be held for one evidence turn; the fresh observe shows the
+    # confirmation banner and the corrected verdict is completed.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["mid-flight", "submitted", "submitted"])
+    tools = [
+        _captcha_tool(["a captcha challenge is present but could not be solved this attempt"]),
+        _perception_tool("observe", "url=x text: 'Application submitted!'"),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.01),
+    ]
+    script = [
+        [("solve_captcha", {})],
+        [("finish", {"status": "failed", "reason": "could_not_pass_captcha"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "the page shows the application was submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "completed"
+    assert outcome.reason == "the page shows the application was submitted"
+    deferrals = [
+        m
+        for m in outcome.messages
+        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
+    ]
+    assert len(deferrals) == 1
+    # The quiescence wait must actually compare sample pairs: mid-flight vs submitted (mutating),
+    # then submitted twice (stable exit) = 3 samples; the corrected finish(completed)'s own settle
+    # probe adds 2 more.
+    assert fp_calls["n"] == 5
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_still_fires_when_completed_side_settle_is_disabled() -> None:
+    # The bare-task configuration (SKY-14598): the sampler is supplied so the failure-evidence gate
+    # can run, while max_settle_deferrals=0 keeps the completed-side settle probe off. Disabling one
+    # gate must not disable the other — they share only the sampler.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["mid-flight", "submitted", "submitted"])
+    tools = [
+        _captcha_tool(["a captcha challenge is present but could not be solved this attempt"]),
+        _perception_tool("observe", "url=x text: 'Application submitted!'"),
+        make_finish_tool(
+            page_fingerprint=fingerprint,
+            max_settle_deferrals=0,
+            activity=activity,
+            settle_wait_seconds=0.01,
+        ),
+    ]
+    script = [
+        [("solve_captcha", {})],
+        [("finish", {"status": "failed", "reason": "could_not_pass_captcha"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "the page shows the application was submitted"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "completed"
+    deferrals = [
+        m
+        for m in outcome.messages
+        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
+    ]
+    assert len(deferrals) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_verdict_never_probes_when_settle_is_disabled() -> None:
+    # The other half of the same scoping claim: with max_settle_deferrals=0 a completed verdict is
+    # accepted as-is and the page is never probed for it. Asserting the sampler is untouched (not
+    # merely that no deferral message appeared) is what makes "the completed path is unchanged for
+    # bare tasks" checkable rather than asserted.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["mid-flight", "settled", "settled"])
+    tools = [
+        _recording_tool("click", []),
+        make_finish_tool(
+            page_fingerprint=fingerprint,
+            max_settle_deferrals=0,
+            activity=activity,
+            settle_wait_seconds=0.01,
+        ),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "completed"
+    assert outcome.reason == "done"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_failed_after_submit_click_defers_once_then_stands() -> None:
+    # An honest blocked failure after a submit attempt (e.g. a persistent anti-spam banner) costs
+    # exactly one evidence observe: the re-observe shows the same blocked state, the re-issued
+    # failure is accepted unchanged.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#btn-submit"})],
+        [("finish", {"status": "failed", "reason": "submission rejected"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "submission still rejected after re-observe"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "submission still rejected after re-observe"
+    deferrals = [
+        m
+        for m in outcome.messages
+        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
+    ]
+    assert len(deferrals) == 1
+
+
+@pytest.mark.asyncio
+async def test_dead_posting_real_trace_shape_gains_at_most_one_observe() -> None:
+    # Conservative dead-posting variant: the replayed dead-posting traces contain no trigger
+    # actions at all (zero cost, pinned by the no-recent-trigger test); this pins the worst case
+    # where a probing click lands in-window — the gate fires and the accepted cost is exactly one
+    # deferral cycle, never more, and the verdict stands.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["dead-page"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _perception_tool("get_html", "<h1>Page not found</h1>"),
+        _perception_tool("observe", ["url=x text: 'The page you requested was not found'"] * 4),
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("get_html", {})],
+        [("observe", {})],
+        [("click", {"selector": "#try-anyway"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "posting no longer exists"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "posting no longer exists (re-verified)"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "posting no longer exists (re-verified)"
+    deferrals = [
+        m
+        for m in outcome.messages
+        if m.get("role") == "tool" and "held for one evidence check" in str(m.get("content"))
+    ]
+    assert len(deferrals) == 1
+
+
+@pytest.mark.asyncio
+async def test_finish_failed_without_recent_trigger_is_not_gated() -> None:
+    # A failure with no recent submit-class or captcha activity (missing input data, dead page
+    # never interacted with) needs no page evidence: accepted immediately, page never sampled.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    tools = [
+        _perception_tool("observe", "url=x text: 'Job not found'"),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "the posting does not exist"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.turns == 2
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recency_window_boundary_arms_at_five_turns_and_expires_at_six() -> None:
+    # Trigger activity expires exactly at the window edge: a click 6 turns back is not gated; the
+    # same click 5 turns back still is. Pins FAILURE_EVIDENCE_WINDOW_TURNS in both directions.
+    contents = [f"url=x step={i}" for i in range(10)]
+
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _perception_tool("observe", contents),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = (
+        [[("click", {"selector": "#expand"})]]
+        + [[("observe", {})] for _ in range(5)]
+        + [[("finish", {"status": "failed", "reason": "blocked"})]]
+    )
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert fp_calls["n"] == 0
+
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    tools = [
+        _billable_tool("click", clicks),
+        _perception_tool("observe", contents),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = (
+        [[("click", {"selector": "#expand"})]]
+        + [[("observe", {})] for _ in range(4)]
+        + [
+            [("finish", {"status": "failed", "reason": "blocked"})],
+            [("observe", {})],
+            [("finish", {"status": "failed", "reason": "blocked (re-verified)"})],
+        ]
+    )
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked (re-verified)"
+    assert fp_calls["n"] > 0
+
+
+@pytest.mark.asyncio
+async def test_errored_click_does_not_arm_the_evidence_gate() -> None:
+    # A click that never dispatched cannot have an async tail; only successful clicks (or any
+    # solve_captcha attempt) arm the gate.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    sink: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", sink, raises=True)
+    click.billable = True
+    tools = [click, make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0)]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "could not interact with the page"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_failed_gate_skipped_when_no_page() -> None:
+    # No page to observe (fingerprint samples None): a deferral would burn a turn on an observe
+    # that cannot succeed, so the verdict is accepted as-is.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq([None])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "page lost"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "page lost"
+
+
+@pytest.mark.asyncio
+async def test_finish_failed_gate_respects_remaining_turn_budget() -> None:
+    # The corrected-verdict turn needs two turns (observe + re-finish). With no turn budget left
+    # the gate must accept the honest verdict rather than convert it into budget_exhausted.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked at the buzzer"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_turns=2)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked at the buzzer"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_settle_wait_is_bounded_on_a_never_quiet_page() -> None:
+    # A page that never stops mutating cannot pin the settle wait: the quiescence loop gives up at
+    # its cap and the deferral proceeds, still bounded to one evidence turn overall.
+    activity = ActivityRecency()
+    counter = iter(range(1000))
+
+    async def never_quiet() -> str | None:
+        return f"fp-{next(counter)}"
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(
+            page_fingerprint=never_quiet,
+            activity=activity,
+            settle_wait_seconds=0.01,
+            failure_settle_max_seconds=0.05,
+        ),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "rejected"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "rejected (re-verified)"})],
+    ]
+    started = time.monotonic()
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "rejected (re-verified)"
+    assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.asyncio
+async def test_finish_terminated_after_click_is_never_gated() -> None:
+    # terminate_criterion verdicts stay cheap: terminated never consults the page, even with
+    # trigger activity in the window.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "terminate criterion met"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "terminated"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_off_without_activity_tracker() -> None:
+    # Fenced like the completed-side probe: without an activity tracker (bare callers) the failure
+    # path keeps its pre-gate behavior — first finish(failed) accepted, page never sampled.
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked"})],
+    ]
+    outcome, _ = await _run(script, tools)
+    assert outcome.status == "failed"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_skips_when_deadline_headroom_is_short() -> None:
+    # A deferral issued near the run deadline cannot complete its observe + re-finish cycle: the
+    # loop would convert the honest verdict into budget_exhausted. With thin deadline headroom the
+    # gate accepts the verdict as-is.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(
+            page_fingerprint=fingerprint,
+            activity=activity,
+            settle_wait_seconds=0.0,
+            deadline_at=time.monotonic() + 5.0,
+        ),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked near the deadline"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked near the deadline"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_skips_when_tool_call_budget_is_short() -> None:
+    # Same conversion risk on the tool-call cap: the deferral cycle needs the finish + observe +
+    # re-finish calls, so with fewer remaining the verdict is accepted as-is.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked with two calls left"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_tool_calls=3)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked with two calls left"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_never_trips_the_perception_stall_terminator() -> None:
+    # A deferral-forced observe must never be the identical snapshot that trips the stall
+    # terminator — that would replace the model's accurate failure reason with a generic stall
+    # termination. With the streak one short of the terminator the gate accepts the verdict.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _perception_tool("observe", "url=x frozen behind a gate"),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("observe", {})],
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "page is frozen behind a gate"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, stall_terminate_after=3, stall_nudge_after=2)
+    assert outcome.status == "failed"
+    assert outcome.reason == "page is frozen behind a gate"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_reads_tool_call_budget_per_call_not_per_turn() -> None:
+    # A batched action+finish turn consumes calls after the turn-start snapshot; the gate must read
+    # the refreshed counter or its deferral converts the honest verdict into budget_exhausted.
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#a"}), ("click", {"selector": "#b"})],
+        [("click", {"selector": "#submit"}), ("finish", {"status": "failed", "reason": "blocked at the call cap"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_tool_calls=5)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked at the call cap"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failure_gate_skips_when_token_budget_is_short() -> None:
+    # Near the token ceiling the deferral cycle cannot fund its two extra turns; the verdict is
+    # accepted rather than converted into budget_exhausted (max_tokens).
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked near the token ceiling"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_tokens=35)
+    assert outcome.status == "failed"
+    assert outcome.reason == "blocked near the token ceiling"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_enter_typed_submission_arms_the_evidence_gate_but_plain_typing_does_not() -> None:
+    # An Enter-typed submission (press_enter=true) carries the same async tail as a click; a
+    # plain field fill does not and must stay ungated.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    typed: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("type", typed),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("type", {"selector": "#q", "text": "answer", "press_enter": True})],
+        [("finish", {"status": "failed", "reason": "rejected"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "rejected (re-verified)"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "rejected (re-verified)"
+
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    tools = [
+        _billable_tool("type", typed),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("type", {"selector": "#q", "text": "answer"})],
+        [("finish", {"status": "failed", "reason": "missing required data"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_press_key_enter_arms_the_gate_but_escape_does_not() -> None:
+    # Only submit-shaped key presses carry an async submission tail; Escape/Tab/arrows are
+    # navigation and must not buy an evidence check.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    presses: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("press_key", presses),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("press_key", {"key": "Enter"})],
+        [("finish", {"status": "failed", "reason": "rejected"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "rejected (re-verified)"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert outcome.reason == "rejected (re-verified)"
+
+    activity = ActivityRecency()
+    fingerprint, fp_calls = _fingerprint_seq(["fp"])
+    tools = [
+        _billable_tool("press_key", presses),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("press_key", {"key": "Escape"})],
+        [("finish", {"status": "failed", "reason": "modal would not close"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "failed"
+    assert fp_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_deferral_cycle_with_wait_fits_the_reserved_budget() -> None:
+    # The deferral message invites an optional wait before the evidence observe, so the reserved
+    # cycle is wait + observe + re-finish: a deferral granted at the reservation edge must let all
+    # three calls run instead of converting the verdict into budget_exhausted at the cap.
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    waits: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _recording_tool("wait", waits),
+        _perception_tool("observe", _REJECTION_OBSERVE),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, settle_wait_seconds=0.0),
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "rejected"})],
+        [("wait", {"seconds": 3})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "rejected (re-verified after wait)"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity, max_tool_calls=5)
+    assert outcome.status == "failed"
+    assert outcome.reason == "rejected (re-verified after wait)"
+    assert len(waits) == 1

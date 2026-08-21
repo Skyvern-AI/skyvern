@@ -165,6 +165,30 @@ async def test_sqlite_bootstrap_from_empty_db(sqlite_bootstrap_db, patched_env_w
 
 
 @pytest.mark.asyncio
+async def test_sqlite_bootstrap_upgrades_legacy_organization_table(
+    sqlite_bootstrap_db,
+    patched_env_writes,
+) -> None:
+    """Bootstrap adds the slug column and partial unique index to an existing SQLite database."""
+    from skyvern.forge.api_app import _bootstrap_sqlite
+    from skyvern.forge.sdk.db.models import Base
+
+    async with sqlite_bootstrap_db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.exec_driver_sql("DROP INDEX IF EXISTS uq_organizations_slug")
+        await conn.exec_driver_sql("ALTER TABLE organizations DROP COLUMN slug")
+
+    await _bootstrap_sqlite()
+
+    async with sqlite_bootstrap_db.engine.begin() as conn:
+        columns = {row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info(organizations)")).all()}
+        indexes = {row[1] for row in (await conn.exec_driver_sql("PRAGMA index_list(organizations)")).all()}
+
+    assert "slug" in columns
+    assert "uq_organizations_slug" in indexes
+
+
+@pytest.mark.asyncio
 async def test_sqlite_bootstrap_syncs_existing_env_api_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

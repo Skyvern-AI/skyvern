@@ -397,6 +397,15 @@ class TestActObserveSuccess:
         assert evidence["forms"][0]["fields"][0]["label"] == "NPI number"
 
     @pytest.mark.asyncio
+    async def test_click_issues_one_post_action_packet_and_no_recapture(self) -> None:
+        ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
+
+        await _run_click(ctx)
+
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 1
+        assert ctx.last_scout_act_observe_recapture_attempted is False
+
+    @pytest.mark.asyncio
     async def test_pending_marker_cleared_and_result_carries_summary(self) -> None:
         ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
 
@@ -410,15 +419,18 @@ class TestActObserveSuccess:
         assert page["forms"] == [
             {
                 "field_count": 2,
-                "fields": ["NPI number", "State"],
-                "submit_controls": ["Search"],
+                "fields": [
+                    {"text": "NPI number", "selector": "#npi"},
+                    {"text": "State", "selector": "#state"},
+                ],
+                "submit_controls": [{"text": "Search", "selector": "#go"}],
             }
         ]
         assert page["navigation_target_count"] == 1
-        assert page["navigation_targets"] == ["Provider details"]
+        assert [target["text"] for target in page["navigation_targets"]] == ["Provider details"]
         assert page["result_container_count"] == 1
         assert page["challenge_detected"] is False
-        assert page["modal_dismiss_controls"] == ["Accept"]
+        assert [control["text"] for control in page["modal_dismiss_controls"]] == ["Accept"]
         assert len(json.dumps(result)) <= _SCOUT_RESULT_CHAR_CAP
 
     @pytest.mark.asyncio
@@ -593,7 +605,9 @@ class TestActObserveSuccess:
         assert any(control.get("selector") == "button.primary" for control in parsed_controls)
 
         model_facing_result: dict[str, Any] = {"ok": True, "data": {}}
-        scouting_module._attach_scout_page_summary(model_facing_result, parsed)
+        scouting_module._attach_scout_page_summary(
+            SimpleNamespace(codeblock_redaction_parameters={}), model_facing_result, parsed
+        )
 
         assert model_facing_result["data"]["page"]["disclosure_controls"] == [
             {
@@ -769,6 +783,9 @@ class TestActObserveDegrade:
         assert ctx.flow_evidence[0]["had_bounded_schema"] is True
         assert ctx.flow_evidence[0]["evidence"]["forms"][0]["fields"][0]["label"] == "NPI number"
         assert not hasattr(ctx, "latest_recorded_build_test_outcome")
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 2
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+        assert ctx.last_scout_act_observe_recapture_result == "attached"
 
     @pytest.mark.asyncio
     async def test_persistent_post_interaction_hollow_records_build_test_outcome(self) -> None:

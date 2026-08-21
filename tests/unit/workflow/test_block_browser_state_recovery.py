@@ -439,3 +439,57 @@ async def test_reconnect_stops_fresh_driver_when_state_rebuild_fails(monkeypatch
     # A failed rebuild must stop both drivers so it never orphans the freshly started one.
     fresh_pw.stop.assert_awaited_once()
     stale_pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_requested_close_logs_disconnect_at_info_not_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The end-of-run teardown closes the context on purpose; observing that close is diagnostic
+    # context, not a warning. A close nobody requested still warns.
+    from skyvern.webeye import real_browser_state as real_browser_state_module
+
+    log = MagicMock()
+    monkeypatch.setattr(real_browser_state_module, "LOG", log)
+    monkeypatch.setattr(real_browser_state_module, "disable_download_interceptor_for_context", AsyncMock())
+
+    async def _skip_phase(coro, timeout, description):  # type: ignore[no-untyped-def]
+        coro.close()
+        return True
+
+    context = MagicMock(browser=MagicMock())
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    monkeypatch.setattr(state, "_run_bounded_detachable", _skip_phase)
+    monkeypatch.setattr(state, "_run_browser_cleanup_bounded", AsyncMock())
+    monkeypatch.setattr(state, "_stop_driver_bounded", AsyncMock())
+
+    await state.close()
+    state._on_browser_context_closed(context)
+
+    log.warning.assert_not_called()
+    assert [c for c in log.info.call_args_list if c.args[0] == "Browser state disconnected"]
+    assert state.get_browser_state_diagnostic() is not None
+
+    unrequested = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(browser=MagicMock()))
+    unrequested._on_browser_context_closed(unrequested.browser_context)
+
+    log.warning.assert_called_once()
+    assert log.warning.call_args.args[0] == "Browser state disconnected"
+
+
+@pytest.mark.asyncio
+async def test_keep_alive_close_does_not_downgrade_a_later_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    # close(close_browser_on_completion=False) keeps the browser for reuse, so a disconnect that
+    # follows it is nobody's request and must still warn.
+    from skyvern.webeye import real_browser_state as real_browser_state_module
+
+    log = MagicMock()
+    monkeypatch.setattr(real_browser_state_module, "LOG", log)
+
+    context = MagicMock(browser=MagicMock())
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    monkeypatch.setattr(state, "_stop_driver_bounded", AsyncMock())
+
+    await state.close(close_browser_on_completion=False, release_driver=False)
+    state._on_browser_context_closed(context)
+
+    log.warning.assert_called_once()
+    assert log.warning.call_args.args[0] == "Browser state disconnected"
