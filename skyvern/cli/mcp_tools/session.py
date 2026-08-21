@@ -37,20 +37,25 @@ from ._session import (
 def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
     if pairing_opened:
         return (
-            "Skyvern browser extension is not connected. A secure pairing tab was opened. Approve the connection, "
-            "approve pairing in the Skyvern Agent confirmation tab, and retry."
+            "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
+            "the Skyvern Agent confirmation tab (one click), then retry."
         )
     return (
         "Skyvern browser extension is not connected and the pairing tab could not be opened automatically. Run "
-        "`skyvern browser extension-pair`, approve the connection, approve pairing in the Skyvern Agent confirmation "
-        "tab, and retry."
+        "`skyvern browser extension-pair`, approve pairing in the Skyvern Agent confirmation tab (one click), "
+        "and retry."
     )
 
 
-def _broker_extension_not_connected_guidance() -> str:
+def _broker_extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+    if pairing_opened:
+        return (
+            "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
+            "the Skyvern Agent confirmation tab (one click), then retry."
+        )
     return (
-        "Skyvern browser extension did not reconnect within 35 seconds. Keep Chrome and the Skyvern extension open, "
-        "then retry. To start a new explicit pairing flow, run `skyvern browser extension-pair`."
+        "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
+        "To open the one-click pairing page, run `skyvern browser extension-pair`."
     )
 
 
@@ -159,8 +164,23 @@ async def skyvern_browser_session_create(
             try:
                 broker_mode = broker_mode_enabled()
                 runtime = await BrowserExtensionRuntime.get_or_start()
-                if not await runtime.wait_for_extension(35.0 if broker_mode else 10.0):
-                    if broker_mode:
+                pairing_opened = False
+                if not await runtime.wait_for_extension(8.0):
+                    # One-step pairing: open the approval page now and wait for the
+                    # user's single click instead of failing and demanding a retry.
+                    pairing_opened = await runtime.begin_pairing()
+                    if pairing_opened:
+                        remaining_wait = 30.0
+                    elif broker_mode:
+                        remaining_wait = 27.0
+                    else:
+                        remaining_wait = 2.0
+                    if not await runtime.wait_for_extension(remaining_wait):
+                        guidance = (
+                            _broker_extension_not_connected_guidance(pairing_opened=pairing_opened)
+                            if broker_mode
+                            else _extension_not_connected_guidance(pairing_opened=pairing_opened)
+                        )
                         timer.mark("sdk")
                         return make_result(
                             "skyvern_browser_session_create",
@@ -168,22 +188,10 @@ async def skyvern_browser_session_create(
                             timing_ms=timer.timing_ms,
                             error=make_error(
                                 ErrorCode.BROWSER_NOT_FOUND,
-                                _broker_extension_not_connected_guidance(),
+                                guidance,
                                 "",
                             ),
                         )
-                    pairing_opened = runtime.open_pairing_page()
-                    timer.mark("sdk")
-                    return make_result(
-                        "skyvern_browser_session_create",
-                        ok=False,
-                        timing_ms=timer.timing_ms,
-                        error=make_error(
-                            ErrorCode.BROWSER_NOT_FOUND,
-                            _extension_not_connected_guidance(pairing_opened=pairing_opened),
-                            "",
-                        ),
-                    )
             except Exception as e:
                 return make_result(
                     "skyvern_browser_session_create",
@@ -201,7 +209,7 @@ async def skyvern_browser_session_create(
                 timer.mark("sdk")
             except Exception:
                 guidance = (
-                    _broker_extension_not_connected_guidance()
+                    _broker_extension_not_connected_guidance(pairing_opened=False)
                     if broker_mode
                     else _extension_not_connected_guidance(pairing_opened=False)
                 )

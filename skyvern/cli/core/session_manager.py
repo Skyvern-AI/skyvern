@@ -683,9 +683,42 @@ async def resolve_browser(
         raise wrapped from exc
 
     if current.browser is not None and current.context is not None:
-        return current.browser, current.context
+        if current.context.mode != "extension" or _extension_browser_is_connected(current.browser):
+            return current.browser, current.context
+        # The extension-mode CDP link died (extension reload, broker restart, session
+        # churn). Heal through the live runtime instead of handing back a dead browser
+        # or dead-ending targetless tools on NO_ACTIVE_BROWSER.
+        healed = await _reconnect_extension_session(current, active_api_key_hash)
+        if healed is not None:
+            return healed
 
     raise BrowserNotAvailableError()
+
+
+async def _reconnect_extension_session(
+    current: SessionState,
+    active_api_key_hash: str | None,
+) -> tuple[SkyvernBrowser, BrowserContext] | None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    runtime = BrowserExtensionRuntime.instance()
+    if runtime is None:
+        return None
+    try:
+        await _close_session_state(current, close_via_active_client=False)
+    except Exception:
+        pass
+    finally:
+        set_current_session(SessionState())
+    skyvern = get_skyvern()
+    try:
+        browser = await skyvern.connect_to_browser_extension(runtime)
+    except Exception:
+        LOG.warning("browser_extension_session_reconnect_failed", exc_info=True)
+        return None
+    ctx = BrowserContext(mode="extension", can_access_localhost=True)
+    set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+    return browser, ctx
 
 
 async def _close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:

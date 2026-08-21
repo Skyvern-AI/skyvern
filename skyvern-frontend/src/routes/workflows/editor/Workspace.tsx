@@ -776,7 +776,7 @@ function Workspace({
               detail:
                 getAxiosErrorDetail(debugSessionError) ??
                 "More credits are required to start a browser session.",
-              hint: "Add credits or enable overage in Billing, then return here to start the browser session.",
+              hint: "Upgrade your plan in Billing, then return here to start the browser session.",
             }
           : {
               title: "Could not start browser session",

@@ -427,6 +427,18 @@ class WorkflowCopilotRunOutcomeUpdate(BaseModel):
         None, description="Machine-readable cause for a not_demonstrated verdict"
     )
     display_reason: str | None = Field(None, description="Short product-safe reason for user-facing rendering")
+    browser_session_id: str | None = Field(
+        None, description="Browser session that owned this run's recorded execution state"
+    )
+    workflow_permanent_id: str | None = Field(None, description="Workflow whose Copilot turn created this run")
+    turn_id: str | None = Field(None, description="Parent Copilot turn for this child run")
+    workflow_copilot_chat_id: str | None = Field(None, description="Parent Copilot chat for this child run")
+    continuity_source: Literal["workflow_run"] = Field(
+        "workflow_run", description="Distinguishes authoritative run state from pane-stream presentation state"
+    )
+    terminal_disposition: str | None = Field(
+        None, description="Recorded run status or watchdog disposition that ended this run observation"
+    )
     iteration: int = Field(..., description="Agent loop iteration number")
     timestamp: datetime = Field(..., description="Server timestamp")
 

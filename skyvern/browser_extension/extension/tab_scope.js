@@ -9,6 +9,7 @@ import {
 
 const SCOPED_TAB_IDS_KEY = "scopedTabIds";
 const SCOPED_GROUP_IDS_KEY = "scopedTabGroupIds";
+const CREATED_TAB_IDS_KEY = "createdTabIds";
 const SKYVERN_GROUP_TITLE = "Skyvern Controlled";
 const SKYVERN_GROUP_COLOR = "purple";
 const TAB_GROUP_ID_NONE = -1;
@@ -29,6 +30,7 @@ export class TabScope {
     this.sendEvent = sendEvent;
     this.scopedTabIds = new Set();
     this.scopedGroupIds = new Map();
+    this.createdTabIds = new Set();
     this.expectedGroupTransitions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
@@ -69,14 +71,23 @@ export class TabScope {
     const stored = await chrome.storage.session.get({
       [SCOPED_TAB_IDS_KEY]: [],
       [SCOPED_GROUP_IDS_KEY]: {},
+      [CREATED_TAB_IDS_KEY]: [],
     });
     const storedIds = Array.isArray(stored[SCOPED_TAB_IDS_KEY])
       ? stored[SCOPED_TAB_IDS_KEY]
+      : [];
+    const storedCreatedIds = Array.isArray(stored[CREATED_TAB_IDS_KEY])
+      ? stored[CREATED_TAB_IDS_KEY]
       : [];
     const storedGroups = stored[SCOPED_GROUP_IDS_KEY];
     for (const tabId of storedIds) {
       if (Number.isInteger(tabId) && tabId >= 0) {
         this.scopedTabIds.add(tabId);
+      }
+    }
+    for (const tabId of storedCreatedIds) {
+      if (Number.isInteger(tabId) && tabId >= 0) {
+        this.createdTabIds.add(tabId);
       }
     }
     if (
@@ -124,6 +135,12 @@ export class TabScope {
       SCOPED_TAB_IDS_KEY,
       SCOPED_GROUP_IDS_KEY,
     ]);
+    let failedTabCount = 0;
+    for (const tabId of [...this.createdTabIds]) {
+      if (!(await this.closeCreatedTab(tabId))) {
+        failedTabCount += 1;
+      }
+    }
     await Promise.all(
       scopedGroups.map(async ([tabId, groupId]) => {
         if (!Number.isInteger(groupId)) {
@@ -140,6 +157,7 @@ export class TabScope {
       }),
     );
     this.expectedGroupTransitions.clear();
+    return { failedTabCount };
   }
 
   isScoped(tabId) {
@@ -193,7 +211,10 @@ export class TabScope {
         return {};
       }
       const scopedTab = await this.addToScopeLocked(tab);
-      this.sendEvent(EVENTS.SCOPE_TAB_ADDED, this.publicTab(scopedTab, false));
+      this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+        ...this.publicTab(scopedTab, false),
+        origin: "shared",
+      });
       return {};
     });
   }
@@ -236,9 +257,23 @@ export class TabScope {
       );
     }
     return this.runTabOperation(tab.id, async () => {
-      const scopedTab = await this.addToScopeLocked(tab);
-      this.sendEvent(EVENTS.SCOPE_TAB_ADDED, this.publicTab(scopedTab, false));
-      return { tabId: tab.id };
+      this.createdTabIds.add(tab.id);
+      await this.persistScope();
+      try {
+        const scopedTab = await this.addToScopeLocked(tab);
+        this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+          ...this.publicTab(scopedTab, false),
+          origin: "created",
+        });
+        return { tabId: tab.id };
+      } catch (error) {
+        try {
+          await this.closeCreatedTab(tab.id);
+        } catch {
+          // Preserve the original setup error. The tab-removal event retries persistence.
+        }
+        throw error;
+      }
     });
   }
 
@@ -246,11 +281,32 @@ export class TabScope {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
     return this.runTabOperation(tabId, async () => {
-      await this.assertControllableLocked(tabId);
+      const created = this.createdTabIds.has(tabId);
+      if (this.scopedTabIds.has(tabId)) {
+        await this.assertControllableLocked(tabId);
+      } else if (!created) {
+        throw new ProtocolError(
+          ERROR_CODES.TAB_NOT_SCOPED,
+          "The requested tab is not shared.",
+        );
+      }
       try {
         await chrome.tabs.remove(tabId);
       } catch {
         if (!this.scopedTabIds.has(tabId)) {
+          if (created) {
+            try {
+              await chrome.tabs.get(tabId);
+            } catch {
+              this.createdTabIds.delete(tabId);
+              await this.persistScope();
+              return {};
+            }
+            throw new ProtocolError(
+              ERROR_CODES.INTERNAL,
+              "Chrome could not close the created tab.",
+            );
+          }
           return {};
         }
         throw new ProtocolError(
@@ -258,8 +314,11 @@ export class TabScope {
           "The requested tab was not found.",
         );
       }
+      this.createdTabIds.delete(tabId);
       if (this.scopedTabIds.has(tabId)) {
         await this.removeFromScopeLocked(tabId, "closed", false);
+      } else {
+        await this.persistScope();
       }
       return {};
     });
@@ -313,12 +372,23 @@ export class TabScope {
       if (!this.scopedTabIds.has(tab.openerTabId) || isTabRestricted(tab)) {
         return;
       }
-      const scopedTab = await this.addToScopeLocked(tab);
-      this.sendEvent(EVENTS.TABS_CREATED, {
-        tabId: scopedTab.id,
-        openerTabId: tab.openerTabId,
-        url: tabUrl(scopedTab),
-      });
+      this.createdTabIds.add(tab.id);
+      await this.persistScope();
+      try {
+        const scopedTab = await this.addToScopeLocked(tab);
+        this.sendEvent(EVENTS.TABS_CREATED, {
+          tabId: scopedTab.id,
+          openerTabId: tab.openerTabId,
+          url: tabUrl(scopedTab),
+        });
+      } catch (error) {
+        try {
+          await this.closeCreatedTab(tab.id);
+        } catch {
+          // Preserve the original setup error. The tab-removal event retries persistence.
+        }
+        throw error;
+      }
     });
   }
 
@@ -326,8 +396,11 @@ export class TabScope {
     await this.ready;
     await this.runTabOperation(tabId, async () => {
       this.expectedGroupTransitions.delete(tabId);
+      const ownershipChanged = this.createdTabIds.delete(tabId);
       if (this.scopedTabIds.has(tabId)) {
         await this.removeFromScopeLocked(tabId, "closed", false);
+      } else if (ownershipChanged) {
+        await this.persistScope();
       }
     });
   }
@@ -392,16 +465,35 @@ export class TabScope {
           tab,
           tab.groupId,
         );
-        this.sendEvent(
-          EVENTS.SCOPE_TAB_ADDED,
-          this.publicTab(scopedTab, false),
-        );
+        this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
+          ...this.publicTab(scopedTab, false),
+          origin: "shared",
+        });
       } finally {
         if (expectedGroupTransition !== null) {
           this.clearExpectedGroupTransition(tabId, expectedGroupTransition);
         }
       }
     });
+  }
+
+  async closeCreatedTab(tabId) {
+    let tabExists = true;
+    try {
+      await chrome.tabs.remove(tabId);
+      tabExists = false;
+    } catch {
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        tabExists = false;
+      }
+    }
+    if (!tabExists) {
+      this.createdTabIds.delete(tabId);
+      await this.persistScope();
+    }
+    return !tabExists;
   }
 
   async addToScopeLocked(tab) {
@@ -613,6 +705,18 @@ export class TabScope {
   }
 
   async reconcileStoredTabs() {
+    let ownershipChanged = false;
+    for (const tabId of [...this.createdTabIds]) {
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        this.createdTabIds.delete(tabId);
+        ownershipChanged = true;
+      }
+    }
+    if (ownershipChanged) {
+      await this.persistScope();
+    }
     for (const tabId of [...this.scopedTabIds]) {
       await this.runTabOperation(tabId, async () => {
         let tab;
@@ -675,6 +779,7 @@ export class TabScope {
     await chrome.storage.session.set({
       [SCOPED_TAB_IDS_KEY]: [...this.scopedTabIds],
       [SCOPED_GROUP_IDS_KEY]: groupIds,
+      [CREATED_TAB_IDS_KEY]: [...this.createdTabIds],
     });
   }
 }

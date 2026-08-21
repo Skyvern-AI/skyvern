@@ -26,6 +26,7 @@ RecoveryHint = Literal[
 ]
 
 LOG = structlog.get_logger()
+BROWSER_SESSION_LOST_BLOCKER_REASON_CODE = "tool_error_browser_session_lost"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -73,6 +74,7 @@ _INTERNAL_GUARD_TOKENS: tuple[str, ...] = (
 _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "update_workflow",
     "update_and_run_blocks",
+    "edit_block_and_run",
     "run_blocks_and_collect_debug",
     "get_run_results",
     "inspect_page_for_composition",
@@ -244,6 +246,7 @@ SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
     {
         *TERMINAL_CHALLENGE_BLOCKER_REASON_CODES,
+        BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
         "tool_error_run_output_terminal_blocker",
     }
 )

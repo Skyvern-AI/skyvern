@@ -1143,3 +1143,326 @@ async def test_perception_stall_verdict_reason_carries_facetable_prefix() -> Non
     outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
     assert outcome.status == "terminated"
     assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+
+
+def _billable_tool(
+    name: str, sink: list[tuple[str, dict[str, Any]]], *, data: dict[str, Any] | None = None
+) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append((name, args))
+        return ToolResult.ok(f"{name} done", data=data)
+
+    return ToolSpec(
+        name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, billable=True
+    )
+
+
+_REJECTION_OBSERVE = "url=x text: 'We couldn't submit your application. Please submit your application again.'"
+
+
+def _resubmit_script(submits: int) -> list[list[tuple[str, dict[str, Any]]]]:
+    """The live 12-resubmit signature: same submit click, re-observe shows the same rejection."""
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(submits):
+        script.append([("click", {"selector": "#submit"})])
+        script.append([("observe", {})])
+    return script
+
+
+@pytest.mark.asyncio
+async def test_action_loop_terminates_with_bounded_verdict_on_resubmit_signature() -> None:
+    # The live failure shape: a rejection banner saying "please submit again" drove 12 re-clicks of
+    # the same submit button (132 tool calls) while every observe showed the same unchanged banner.
+    # The perception stream varied enough (interleaved actions) that the stall policy never fired.
+    # Repeating the same action against unchanged observed state must end with a bounded verdict.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    outcome, caller = await _run(_resubmit_script(12), tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert "click" in outcome.reason and "#submit" in outcome.reason
+    assert len(clicks) < 12  # bounded well below the live 12-resubmit runaway
+    assert caller.calls <= 15
+
+
+@pytest.mark.asyncio
+async def test_action_loop_warns_once_naming_action_count_and_unchanged_state() -> None:
+    # Compaction elides superseded observes, so the model cannot see its own repetition in the
+    # transcript. The warn is that lost memory: WHICH action, HOW MANY times, and that the observed
+    # state did not change — specific enough that the model can self-correct instead of dying at
+    # the terminate backstop.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    outcome, _ = await _run(_resubmit_script(12), tools, max_turns=200, max_tool_calls=500)
+    warns = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
+    assert len(warns) == 1
+    content = str(warns[0]["content"])
+    assert "click" in content and "3" in content
+    assert "unchanged" in content
+    assert "finish" in content
+    assert outcome.messages.index(warns[0]) < len(outcome.messages) - 1  # warned before the verdict
+
+
+@pytest.mark.asyncio
+async def test_action_loop_warn_recovery_keeps_verdict_with_the_model() -> None:
+    # The warn is the primary deliverable, the terminate only a backstop: a model that acts on the
+    # warning (finishes honestly with the real rejection) must keep its own verdict — the guard
+    # never takes over.
+    script = _resubmit_script(3) + [[("finish", {"status": "failed", "reason": "submission rejected by the site"})]]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "failed"
+    assert outcome.reason == "submission rejected by the site"
+    assert len(clicks) == 3
+
+
+@pytest.mark.asyncio
+async def test_action_loop_catches_varied_probe_evasion() -> None:
+    # The second live signature's SHAPE, extended past where the production run's token budget
+    # killed it (the real trace reached 4 identical tail clicks — warn territory): fresh-selector
+    # get_html probes each return different content, so every probe resets the per-content stall
+    # streak, while the same click keeps repeating. A first-time probe is evidence of nothing (no
+    # baseline), so it must NOT reset the action counter, and the cap must land.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX, PERCEPTION_STALL_REASON_PREFIX
+
+    probe_contents = [f"<div>fragment {i}</div>" for i in range(12)]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for i in range(12):
+        script.append([("click", {"selector": "#continue"})])
+        script.append([("get_html", {"selector": f"#probe{i}"})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("get_html", probe_contents), make_finish_tool()]
+    outcome, caller = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+    assert len(clicks) < 12
+    assert caller.calls <= 15
+
+
+@pytest.mark.asyncio
+async def test_pagination_with_changing_page_content_never_trips_action_loop() -> None:
+    # Healthy pagination clicks the same Next selector many times, but each page's observe differs —
+    # a repeated probe returning different content is evidence of progress and must clear the guard.
+    contents = [f"url=x page{i} rows for page {i}" for i in range(10)]
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(10):
+        script.append([("click", {"selector": "#next"})])
+        script.append([("observe", {})])
+    script.append([("finish", {"status": "completed", "reason": "all pages read"})])
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 10
+    assert not any(m.get("role") == "user" and "#next" in str(m.get("content")) for m in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_fixing_a_field_never_trips_action_loop() -> None:
+    # Legitimate multi-submit: each retry follows a fix that visibly changed the page (validation
+    # summary shrinks, field value appears), so the guard's state evidence resets between attempts.
+    contents = [
+        "url=x text: 'Error: field A is required' [#a] input ''",
+        "url=x text: 'Error: field A is required' [#a] input value='v1'",
+        "url=x text: 'Error: field B is required' [#a] input value='v1'",
+        "url=x text: 'Error: field B is required' [#b] input value='v2'",
+        "url=x text: 'Application received'",
+    ]
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("observe", {})],
+        [("type", {"selector": "#a", "text": "v1"})],
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("observe", {})],
+        [("type", {"selector": "#b", "text": "v2"})],
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "application received"})],
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    types: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("click", clicks),
+        _billable_tool("type", types),
+        _perception_tool("observe", contents),
+        make_finish_tool(),
+    ]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 3
+
+
+@pytest.mark.asyncio
+async def test_repeated_download_clicks_never_trip_action_loop() -> None:
+    # A "download next file" flow legitimately clicks the same selector many times against a page
+    # that never changes; each click's download notice is the progress evidence.
+    script = [[("click", {"selector": "#download-next"})] for _ in range(10)] + [
+        [("finish", {"status": "completed", "reason": "all files downloaded"})]
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks, data={"download_notice": True}), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 10
+
+
+@pytest.mark.asyncio
+async def test_double_submit_never_trips_or_warns() -> None:
+    # One retry is within policy ("at most one retry, then finish honestly") — two identical
+    # submits against an unchanged banner must produce neither a warning nor a verdict.
+    script = _resubmit_script(2) + [[("finish", {"status": "failed", "reason": "rejected twice, reporting honestly"})]]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "failed"
+    assert len(clicks) == 2
+    assert not any(m.get("role") == "user" and "#submit" in str(m.get("content")) for m in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_action_loop_warn_and_terminate_emit_facetable_logs() -> None:
+    # "Warns followed by recovery" is the metric that proves the guard improves runs rather than
+    # capping them — both the warn and the verdict must be queryable events, like the stall policy's.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", _REJECTION_OBSERVE), make_finish_tool()]
+    with capture_logs() as logs:
+        outcome, _ = await _run(_resubmit_script(12), tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    warned = [entry for entry in logs if entry["event"] == "taskv3 loop action repeat nudged"]
+    terminated = [entry for entry in logs if entry["event"] == "taskv3 loop action repeated"]
+    assert len(warned) == 1 and warned[0]["tool"] == "click" and warned[0]["repeat_count"] == 3
+    assert len(terminated) == 1 and terminated[0]["tool"] == "click" and terminated[0]["repeat_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_interleaved_changing_probe_keeps_stall_policy_from_firing() -> None:
+    # Pins the stall policy's per-tool CONSECUTIVE comparison, which the nine #15621 tests cannot
+    # (they never vary a probe's args): re-reading a static region interleaved with a sibling probe
+    # that changes every read is a LIVE page, and the stall verdict must never fire on it —
+    # accounting keyed per (tool, args) would accumulate the static region to the threshold.
+    calls = {"n": 0}
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        if args.get("selector") == "#status":
+            return ToolResult.ok("<div>processing</div>")
+        return ToolResult.ok(f"<div>log line {calls['n']}</div>")
+
+    probe = ToolSpec(
+        name="get_html",
+        description="g",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = []
+    for _ in range(20):
+        script.append([("get_html", {"selector": "#status"})])
+        script.append([("get_html", {"selector": "#log"})])
+    script.append([("finish", {"status": "completed", "reason": "job finished"})])
+    outcome, _ = await _run(script, [probe, make_finish_tool()], max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_batched_identical_clicks_with_in_batch_change_never_trip_or_warn() -> None:
+    # The system prompt commands batching ("never spend a separate turn on each click"), so eight
+    # date-picker arrow clicks in ONE turn are healthy. The streak must not terminate within a
+    # single turn, and the batched observe that shows the change must also retract the queued warn.
+    contents = ["url=x month=January", "url=x month=September"]
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#next-month"})] * 8 + [("observe", {})],
+        [("finish", {"status": "completed", "reason": "date reached"})],
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), _perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 8
+    assert not any(m.get("role") == "user" and "#next-month" in str(m.get("content")) for m in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_single_batch_repeats_without_feedback_never_warn() -> None:
+    # Five identical clicks batched in ONE turn with no probe at all (a stepper spammed blind) get
+    # no warning either — the warn text claims "the state you last observed is unchanged", which is
+    # false when nothing was observed between attempts. The streak stays armed for later turns.
+    script = [
+        [("click", {"selector": "#add-row"})] * 5,
+        [("finish", {"status": "completed", "reason": "rows added"})],
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 5
+    assert not any(m.get("role") == "user" and "#add-row" in str(m.get("content")) for m in outcome.messages)
+
+
+@pytest.mark.asyncio
+async def test_warn_always_precedes_terminate_even_after_single_batch_burst() -> None:
+    # A burst that crosses the terminate threshold before any warning could be delivered must not
+    # be terminated on the spot: the verdict waits until the model has seen the warning and
+    # repeated anyway.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    script = [
+        [("click", {"selector": "#submit"})] * 5,
+        [("click", {"selector": "#submit"})],
+        [("click", {"selector": "#submit"})],
+    ]
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert len(clicks) == 7  # 5 burst + 1 post-warn-queue + 1 post-warn-delivery
+    warns = [m for m in outcome.messages if m.get("role") == "user" and "#submit" in str(m.get("content"))]
+    assert len(warns) == 1
+    assert outcome.messages.index(warns[0]) < len(outcome.messages) - 1
+
+
+@pytest.mark.asyncio
+async def test_action_loop_counts_errored_attempts() -> None:
+    # A submit whose click errors on every attempt burns budget exactly like one that returns ok —
+    # and a dispatched error already consumes the action-step budget, so the guard counts it too.
+    from skyvern.forge.taskv3.loop import ACTION_LOOP_REASON_PREFIX
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clicks, raises=True)
+    click.billable = True
+    script = [[("click", {"selector": "#dead"})] for _ in range(10)]
+    outcome, _ = await _run(script, [click, make_finish_tool()], max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(ACTION_LOOP_REASON_PREFIX)
+    assert len(clicks) == 6
+
+
+@pytest.mark.asyncio
+async def test_navigate_resets_action_counters() -> None:
+    # A retry AFTER navigating is a fresh attempt against a fresh page (the live trace's re-fill
+    # bursts), not a continuation of the old streak.
+    async def nav_handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("navigated", data={"page_state_changed": True})
+
+    nav = ToolSpec(
+        name="navigate", description="n", parameters={"type": "object", "properties": {}}, handler=nav_handler
+    )
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = (
+        [[("click", {"selector": "#submit"})] for _ in range(5)]
+        + [[("navigate", {"url": "https://forms.example.test/apply"})]]
+        + [[("click", {"selector": "#submit"})] for _ in range(5)]
+        + [[("finish", {"status": "completed", "reason": "second attempt accepted"})]]
+    )
+    tools = [_billable_tool("click", clicks), nav, make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert len(clicks) == 10

@@ -27,6 +27,7 @@ ALLOWED_OPS = frozenset(
 ALLOWED_EVENTS = frozenset(
     {
         "extension.hello",
+        "pairing.approved",
         "debugger.event",
         "debugger.detached",
         "scope.tabAdded",

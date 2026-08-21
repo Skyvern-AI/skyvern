@@ -249,9 +249,9 @@ def _has_meaningful_registered_output_payload(data: Mapping[str, Any]) -> bool:
     )
 
 
-BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"})
 
-WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks", "edit_block_and_run"})
 
 
 CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
@@ -681,7 +681,10 @@ async def _composition_get_stripped_html(copilot_ctx: Any) -> tuple[str | None, 
         return None, False
     try:
         result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_evaluate", {"expression": _COMPOSITION_STRIPPED_HTML_EXPRESSION}),
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _COMPOSITION_STRIPPED_HTML_EXPRESSION, "verbosity": "full"},
+            ),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:

@@ -305,17 +305,30 @@ async def get_current_org_with_authentication(
     return await authenticate_helper(authorization)
 
 
+def _extract_bearer_token(authorization: str) -> str | None:
+    """Return the bearer token, or None for any other scheme.
+
+    Self-hosted deployments commonly gate the UI origin with HTTP basic auth, so the browser
+    attaches ``Authorization: Basic ...`` to same-origin API calls too. Treating that as a
+    Skyvern token rejects the request with an auth-method error that hides the real cause.
+    """
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    return token or None
+
+
 async def authenticate_helper(
     authorization: str,
     attribution_header: str | None = None,
 ) -> Organization:
-    parts = authorization.split(" ", 1)
-    if len(parts) < 2 or not parts[1]:
+    token = _extract_bearer_token(authorization)
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    token = parts[1]
     authentication_function = app.authentication_function
     if not authentication_function:
         raise HTTPException(
@@ -374,11 +387,10 @@ async def get_current_user_id_or_none(
         # Org auth prefers x-api-key while the user comes from the bearer; only stamp verified members of the key org.
         if user_id and authorization and x_api_key and app.authenticate_user_function:
             key_org = await get_current_org_cached(x_api_key, app.DATABASE)
-            bearer_parts = authorization.split(" ", 1)
             is_member = await app.AGENT_FUNCTION.validate_user_organization_membership(
                 user_id=user_id,
                 organization_id=key_org.organization_id,
-                bearer_token=bearer_parts[1] if len(bearer_parts) == 2 else None,
+                bearer_token=_extract_bearer_token(authorization),
             )
             if not is_member:
                 LOG.warning(
@@ -406,13 +418,12 @@ async def get_current_user_id_with_authentication(
 
 
 async def authenticate_user_helper(authorization: str) -> str:
-    parts = authorization.split(" ", 1)
-    if len(parts) < 2 or not parts[1]:
+    token = _extract_bearer_token(authorization)
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    token = parts[1]
     if not app.authenticate_user_function:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

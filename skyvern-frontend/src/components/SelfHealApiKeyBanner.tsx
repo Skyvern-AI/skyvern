@@ -7,6 +7,7 @@ import { useAuthIssueStore } from "@/store/AuthIssueStore";
 
 type BannerStatus =
   | Exclude<AuthStatusValue, "ok">
+  | "ui_session_failed"
   | "request_auth_error"
   | "error";
 
@@ -38,6 +39,12 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
         title: "Local organization missing",
         description: "The backend could not find the local organization.",
       };
+    case "ui_session_failed":
+      return {
+        title: "The UI server could not mint a browser session",
+        description:
+          "The UI holds a short-lived session token rather than the organization API key, and the UI server was unable to issue one. Until it can, every request from this page is unauthenticated.",
+      };
     case "request_auth_error":
       return {
         title: "Skyvern API requests are unauthorized",
@@ -57,17 +64,22 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
   const authIssue = useAuthIssueStore((state) => state.issue);
+  const uiSessionFailure = useAuthIssueStore((state) => state.uiSessionFailure);
 
   const { data, error } = diagnosticsQuery;
 
   const rawStatus = data?.status;
+  // A failed mint is the cause and a rejected request is only its symptom, so it outranks
+  // the generic unauthorized banner.
   const bannerStatus: BannerStatus | null = error
     ? "error"
     : rawStatus && rawStatus !== "ok"
       ? rawStatus
-      : authIssue
-        ? "request_auth_error"
-        : null;
+      : uiSessionFailure
+        ? "ui_session_failed"
+        : authIssue
+          ? "request_auth_error"
+          : null;
 
   if (!bannerStatus) {
     return null;
@@ -75,6 +87,12 @@ function SelfHealApiKeyBanner() {
 
   const copy = getCopy(bannerStatus);
   const queryErrorMessage = error?.message ?? null;
+  // The diagnostics endpoint only exists in a local backend, so its statuses are the only
+  // ones where local-development advice is the right next step.
+  const isLocalDiagnosticsStatus =
+    bannerStatus !== "error" &&
+    bannerStatus !== "ui_session_failed" &&
+    bannerStatus !== "request_auth_error";
 
   return (
     <div className="px-4 pt-4">
@@ -83,30 +101,32 @@ function SelfHealApiKeyBanner() {
           {copy.title}
         </AlertTitle>
         <AlertDescription className="space-y-3 text-center text-sm leading-6">
-          {bannerStatus !== "error" ? (
-            <>
-              <p>
-                {copy.description} For local development, set{" "}
-                <code>SKYVERN_API_KEY</code> in{" "}
+          <p>
+            {copy.description}
+            {isLocalDiagnosticsStatus ? (
+              <>
+                {" "}
+                For local development, set <code>SKYVERN_API_KEY</code> in{" "}
                 <code className="mx-1">skyvern-frontend/.env</code> and restart{" "}
                 <code>npm run dev</code>. Otherwise run{" "}
                 <code>skyvern doctor --fix</code> in the project directory, then
                 restart local services if prompted.
-              </p>
-              {data?.detail ? (
-                <p className="text-xs text-slate-300">{data.detail}</p>
-              ) : null}
-              {authIssue ? (
-                <p className="text-xs text-slate-300">
-                  Last failed request: HTTP {authIssue.statusCode}
-                  {authIssue.path ? ` at ${authIssue.path}` : ""}
-                  {authIssue.detail ? ` (${authIssue.detail})` : ""}
-                </p>
-              ) : null}
-            </>
-          ) : (
-            <p>{copy.description}</p>
-          )}
+              </>
+            ) : null}
+          </p>
+          {data?.detail ? (
+            <p className="text-xs text-slate-300">{data.detail}</p>
+          ) : null}
+          {uiSessionFailure?.detail ? (
+            <p className="text-xs text-slate-300">{uiSessionFailure.detail}</p>
+          ) : null}
+          {authIssue ? (
+            <p className="text-xs text-slate-300">
+              Last failed request: HTTP {authIssue.statusCode}
+              {authIssue.path ? ` at ${authIssue.path}` : ""}
+              {authIssue.detail ? ` (${authIssue.detail})` : ""}
+            </p>
+          ) : null}
           {queryErrorMessage ? (
             <p className="text-xs text-rose-200">{queryErrorMessage}</p>
           ) : null}

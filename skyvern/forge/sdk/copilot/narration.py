@@ -77,7 +77,7 @@ ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"}
 # Their tool_call is recorded before the run flips running_block_label to the
 # running block, so the matching tool_result is pinned to the call's bucket (see
 # NarratorState._activity_bucket_label) rather than routed live.
-_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "run_blocks_and_collect_debug"})
+_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug"})
 
 # Shared classification for a code-authoring reject the streaming adapter renders
 # as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
@@ -89,6 +89,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
     "update_workflow": "Updating workflow",
     "update_and_run_blocks": "Testing workflow",
+    "edit_block_and_run": "Editing and testing block",
     "run_blocks_and_collect_debug": "Testing workflow",
     "evaluate": "Inspecting page",
     "click": "Interacting with page",
@@ -114,7 +115,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
 
 # Tools whose label names the block they operate on, read from the tool's own
 # `label` argument.
-_BLOCK_TARGET_LABEL_TOOLS = frozenset({"edit_block", "delete_block"})
+_BLOCK_TARGET_LABEL_TOOLS = frozenset({"edit_block", "edit_block_and_run", "delete_block"})
 _BLOCK_TARGET_VERSION_SUFFIX_RE = re.compile(r"_v\d+$", re.IGNORECASE)
 
 
@@ -623,6 +624,7 @@ def _build_narrator_prompt(prompt_ctx: _NarratorPromptContext) -> str:
 _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "update_workflow": "revising the workflow draft",
     "update_and_run_blocks": "revising and testing the workflow",
+    "edit_block_and_run": "revising and testing one workflow step",
     "run_blocks_and_collect_debug": "running a test of the workflow",
     "navigate_browser": "opening a page in the browser",
     "get_browser_screenshot": "taking a screenshot",
@@ -685,7 +687,7 @@ def extract_tool_details(tool_name: str, parsed: dict[str, Any], *, success: boo
     if tool_name == "update_workflow" or tool_name == "update_and_run_blocks":
         return _format_step_status(data.get("block_count"), data)
 
-    if tool_name == "run_blocks_and_collect_debug":
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
         executed = data.get("executed_block_labels") or [
             b.get("label") for b in data.get("blocks", []) if isinstance(b, dict)
         ]

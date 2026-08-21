@@ -12,7 +12,7 @@ import {
 const PING_INTERVAL_MS = 20_000;
 const SILENCE_TIMEOUT_MS = 45_000;
 const CONNECT_TIMEOUT_MS = 10_000;
-const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_MAX_MS = 10_000;
 const AUTH_EXT_CONTEXT = "skyvern-ext-v1|";
 const AUTH_SERVER_CONTEXT = "skyvern-srv-v1|";
 
@@ -77,10 +77,17 @@ async function signHmac(key, message) {
 }
 
 export class BridgeConnection {
-  constructor({ onRequest, onAuthenticated, onReset, onStateChange }) {
+  constructor({
+    onRequest,
+    onAuthenticated,
+    onReset,
+    onEvent = async () => undefined,
+    onStateChange,
+  }) {
     this.onRequest = onRequest;
     this.onAuthenticated = onAuthenticated;
     this.onReset = onReset;
+    this.onEvent = onEvent;
     this.onStateChange = onStateChange;
     this.socket = null;
     this.authenticated = false;
@@ -117,7 +124,7 @@ export class BridgeConnection {
     this.token =
       typeof stored.pairingToken === "string" ? stored.pairingToken : "";
     this.enabled = stored.enabled === true;
-    await chrome.alarms.create(BRIDGE_ALARM_NAME, { periodInMinutes: 1 });
+    await chrome.alarms.create(BRIDGE_ALARM_NAME, { periodInMinutes: 0.5 });
     this.notifyState();
     if (this.enabled && this.token) {
       await this.kick();
@@ -286,6 +293,19 @@ export class BridgeConnection {
       }
       if (message.type === MESSAGE_TYPES.REQUEST) {
         await this.handleRequest(message);
+        return;
+      }
+      if (message.type === MESSAGE_TYPES.EVENT) {
+        if (
+          typeof message.event !== "string" ||
+          message.params === null ||
+          typeof message.params !== "object" ||
+          Array.isArray(message.params)
+        ) {
+          this.failConnection("The local bridge sent an invalid event.");
+          return;
+        }
+        await this.onEvent(message.event, message.params);
         return;
       }
       if (message.type === MESSAGE_TYPES.EXTENSION_RESET) {

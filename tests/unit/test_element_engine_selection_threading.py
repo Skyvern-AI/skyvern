@@ -237,6 +237,7 @@ async def test_input_handler_passes_its_selection_snapshot_to_context_parser(
         has_hidden_attr=AsyncMock(return_value=True),
         get_selectable=AsyncMock(return_value=False),
     )
+    element.get_attr = AsyncMock(return_value=None)
     element.get_frame.return_value = MagicMock()
     element.get_tag_name.return_value = "input"
     element.get_id.return_value = "input-1"

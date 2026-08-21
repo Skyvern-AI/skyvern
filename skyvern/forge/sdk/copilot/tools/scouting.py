@@ -1157,6 +1157,7 @@ _PAGE_SUMMARY_MAX_FIELDS = 8
 _PAGE_SUMMARY_MAX_SUBMITS = 4
 _PAGE_SUMMARY_MAX_NAV_TEXTS = 8
 _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
+_PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
 
 
 def _summary_text(value: Any) -> str:
@@ -1169,6 +1170,23 @@ def _summary_field_name(field: dict[str, Any]) -> str:
         if text:
             return text
     return ""
+
+
+def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(control.get("expanded"), bool):
+        return None
+    summary: dict[str, Any] = {"expanded": control["expanded"]}
+    for key in ("text", "selector", "controls"):
+        value = _summary_text(control.get(key))
+        if value:
+            summary[key] = value
+    if "controls" in summary and isinstance(control.get("controlled_region_visible"), bool):
+        summary["controlled_region_visible"] = control["controlled_region_visible"]
+    if control.get("disabled") is True:
+        summary["disabled"] = True
+    if control.get("visible") is False:
+        summary["visible"] = False
+    return summary
 
 
 def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1211,6 +1229,29 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
     challenge_detected = bool(evidence.get("challenge_controls")) or (
         isinstance(challenge_state, dict) and challenge_state.get("detected") is True
     )
+    disclosure_controls: list[dict[str, Any]] = []
+    seen_disclosures: set[tuple[str, str]] = set()
+    controls_for_summary: list[dict[str, Any]] = []
+    if settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+        controls_for_summary.extend(evidence.get("clickable_controls") or [])
+        controls_for_summary.extend(
+            control
+            for form in evidence.get("forms") or []
+            if isinstance(form, dict)
+            for control in form.get("submit_controls") or []
+            if isinstance(control, dict) and isinstance(control.get("expanded"), bool)
+        )
+    for control in controls_for_summary:
+        if not isinstance(control, dict) or len(disclosure_controls) >= _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS:
+            continue
+        summary = _summary_disclosure_control(control)
+        if summary is None:
+            continue
+        identity = (str(summary.get("selector") or ""), str(summary.get("controls") or ""))
+        if identity in seen_disclosures:
+            continue
+        seen_disclosures.add(identity)
+        disclosure_controls.append(summary)
     return {
         "page_title": _summary_text(evidence.get("page_title")),
         "forms": forms_summary,
@@ -1222,6 +1263,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             if text
         ],
         "result_container_count": len(evidence.get("result_containers") or []),
+        "disclosure_controls": disclosure_controls,
         "challenge_detected": challenge_detected,
         "modal_dismiss_controls": dismiss_texts,
     }
@@ -1253,6 +1295,9 @@ def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
         return True
     if len(forms) > 1:
         summary["forms"] = forms[:1]
+        return True
+    if summary.get("disclosure_controls"):
+        summary["disclosure_controls"] = []
         return True
     return False
 

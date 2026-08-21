@@ -60,6 +60,11 @@ describe("AUTHORING_TOOLS / RUN_TOOLS", () => {
     expect(RUN_TOOLS.has("update_and_run_blocks")).toBe(true);
   });
 
+  it("edit_block_and_run is both authoring and a run tool", () => {
+    expect(AUTHORING_TOOLS.has("edit_block_and_run")).toBe(true);
+    expect(RUN_TOOLS.has("edit_block_and_run")).toBe(true);
+  });
+
   it("run_blocks_and_collect_debug is a run tool only, not authoring", () => {
     expect(RUN_TOOLS.has("run_blocks_and_collect_debug")).toBe(true);
     expect(AUTHORING_TOOLS.has("run_blocks_and_collect_debug")).toBe(false);
@@ -99,6 +104,25 @@ describe("derivePhases — bucket split keeps update_workflow in Draft (Codex ca
     const rows = derivePhases(t);
     expect(phase(rows, "draft").entries.map((e) => e.id)).toEqual(["2"]);
     expect(phase(rows, "test").entries).toEqual([]);
+  });
+});
+
+describe("derivePhases — composite scoped edit and run", () => {
+  it("reaches Test on a terminal composite call even before block rows hydrate", () => {
+    const rows = derivePhases(
+      turn({
+        designEnded: true,
+        designActivity: [
+          entry({
+            id: "1",
+            kind: "tool_call",
+            toolName: "edit_block_and_run",
+          }),
+        ],
+      }),
+    );
+
+    expect(phase(rows, "test").status).not.toBe("pending");
   });
 });
 

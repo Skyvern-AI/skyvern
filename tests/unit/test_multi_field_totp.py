@@ -362,6 +362,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
     element.get_selectable = AsyncMock(return_value=True)
     element.is_disabled = AsyncMock(return_value=False)
     element.supports_text_input = AsyncMock(return_value=True)
+    element.get_attr = AsyncMock(return_value=None)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
     dom_type = MagicMock(return_value=dom)

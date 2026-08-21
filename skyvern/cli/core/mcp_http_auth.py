@@ -40,8 +40,10 @@ AUTHORIZATION_HEADER = "authorization"
 BEARER_PREFIX = "Bearer "
 HEALTH_PATHS = {"/health", "/healthz"}
 # Keep in sync with skyvern-frontend/cloud/mcp-auth-constants.ts::SKYVERN_AUTH_TEMPLATE_NAME.
-# Names the JWT template the frontend uses to mint bearer tokens for
-# /oauth/callback and the CLI signup flow. A divergence silently breaks auth.
+# Names the JWT template used for CLI auth and frontend session-token
+# recovery. /mcp-auth mints the default session token instead: template mints
+# ignore getToken's organizationId and resolve the org from session-creation
+# state (SKY-13507). A divergence silently breaks CLI auth.
 # Canonical declaration only — nothing in this Python module currently reads
 # the template name (JWT validation here inspects `iss`/`aud`/`sub` claims,
 # not the template identifier). The constant exists so future Python callers
@@ -277,11 +279,12 @@ def _get_oauth_org_auth_methods(db: object) -> tuple[_OrgEntitiesGetter | None, 
     return None, None
 
 
-def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
-    """Return the Clerk org id from supported org-scoped JWT claim shapes.
+def get_token_org_id(payload: dict[str, object]) -> str | None:
+    """Return the Clerk org id from supported JWT claim shapes, if any.
 
-    Our Clerk template uses `org_id`; Clerk's org-scoped session JWTs can also
-    expose the active organization as compact claim `o.id`.
+    Session tokens carry the organization either as top-level ``org_id`` (v1
+    shape, and our JWT template) or as compact claim ``o.id`` (v2 shape,
+    current since Clerk API version 2025-04-10).
     """
     org_id_claim = payload.get("org_id")
     if isinstance(org_id_claim, str) and org_id_claim:
@@ -293,7 +296,14 @@ def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
         if isinstance(compact_org_id, str) and compact_org_id:
             return compact_org_id
 
-    raise MissingOrgContextError()
+    return None
+
+
+def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
+    org_id = get_token_org_id(payload)
+    if org_id is None:
+        raise MissingOrgContextError()
+    return org_id
 
 
 async def _resolve_oauth_subject_to_org(
@@ -542,8 +552,9 @@ async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
             # OAuth claims, so we have no way to confirm the token was issued
             # for THIS MCP resource rather than another client under the same
             # Clerk tenant. Reject instead of authenticating blindly. Callers
-            # holding a Clerk session should mint a JWT via a template (the
-            # flow used by ``McpAuthPage``) and retry.
+            # holding a Clerk session should mint a session JWT (``McpAuthPage``
+            # mints the default session token with an explicit organizationId)
+            # and retry.
             LOG.info("Rejecting non-JWT Bearer token for MCP OAuth: audience cannot be validated")
             raise HTTPException(status_code=401, detail="Opaque Bearer tokens are not supported")
 

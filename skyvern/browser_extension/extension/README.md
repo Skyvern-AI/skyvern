@@ -30,7 +30,12 @@ To set it up manually:
    skyvern browser extension-pair
    ```
 
-6. Click **Approve** in the pairing page, then approve pairing in the **Skyvern Agent** confirmation tab.
+6. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
+   (the single approval step).
+
+The local pairing page checks that the extension is available before it claims the single-use offer. If pairing starts
+before the extension is loaded, keep the page open. It retains the offer and continues automatically after the
+extension becomes available.
 7. Add controllable tabs to the **Skyvern Controlled** group.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
@@ -38,10 +43,16 @@ initializes its journal and copies an existing legacy credential into the owner-
 matching owner-only legacy and broker credentials. `skyvern browser extension-broker-enable` is still available as an
 explicit idempotent enable/start command, but normal setup does not require it.
 
-The broker keeps the extension-facing port reserved after an MCP process exits. Pairing remains explicit, and a
-disconnected extension receives up to 35 seconds to reconnect before session creation returns guidance. Use
-`skyvern browser extension-broker-status` to inspect sanitized state and `skyvern browser extension-broker-stop` to
-drain the daemon and release the configured port.
+The broker keeps the extension-facing port reserved after an MCP process exits, and multiple MCP agents share one
+daemon concurrently. Each agent receives browser access only after its own **Approve pairing** click. Approval expires
+when that agent disconnects. Each approved agent leases its own tabs, popups follow their opener, and user-shared tabs
+go to the first agent that claims them. A disconnected extension gets a short reconnect window before session creation
+opens the one-click pairing page for you. Use `skyvern browser extension-broker-status` to inspect sanitized state and
+`skyvern browser extension-broker-stop` to drain the daemon and release the configured port.
+
+The extension records broker-created root tabs and popups in Chrome session storage until those tabs close. This lets
+the broker close one of its tabs after an external debugger detach removes it from extension scope. The extension still
+rejects `tabs.remove` for every unscoped tab that it did not create.
 
 To opt into the legacy embedded relay on POSIX, set exactly:
 

@@ -115,7 +115,7 @@ from ._session import (
     replace_session_ref_map,
     session_ref_generation,
 )
-from .response import truncate_response_bytes
+from .response import EXTRACTION_DEFAULT_VERBOSITY, truncate_response_bytes
 
 LOG = structlog.get_logger(__name__)
 
@@ -2414,9 +2414,24 @@ async def skyvern_evaluate(
     expression: Annotated[str, "JavaScript expression to evaluate"],
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
-    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE). For multi-line await, use explicit return.
-    Security: executes in page context — use only with trusted expressions."""
+    """Run JavaScript on the page. Supports await (auto-wrapped in async IIFE).
+
+    For multi-line await, use an explicit return. Full responses are returned by default; use
+    ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
+    Security: executes in page context — use only with trusted expressions.
+    """
     # Block JS that sets password field values
     if JS_PASSWORD_PATTERN.search(expression):
         return make_result(
@@ -2466,9 +2481,23 @@ async def skyvern_extract(
     schema: Annotated[
         str | None, Field(description="JSON Schema string defining the expected output structure")
     ] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
-    """Extract structured data from the current page using AI with screenshots and a dedicated extraction LLM.
-    Navigate first. Optionally provide a JSON schema to enforce output structure. For visual-only inspection use skyvern_screenshot.
+    """Extract structured data from the current page using AI and a dedicated extraction LLM.
+
+    Navigate first. Optionally provide a JSON schema to enforce output structure. Full extracted data is
+    returned by default; use ``verbosity="summary"`` for an opt-in compact response. The mandatory
+    response-size cap still applies. For visual-only inspection use ``skyvern_screenshot``.
     """
     if schema is not None:
         try:
@@ -2617,18 +2646,33 @@ async def skyvern_extract_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Extract structured data AND capture a screenshot of the page in ONE call.
 
     Use this to record a finding together with its visual proof in a single step, instead of a
     separate skyvern_extract + skyvern_screenshot. The screenshot is saved to a file path by default
     (pass inline=true for base64) and returned alongside the extracted data, so a reviewer that only
-    credits visible evidence can see it.
+    credits visible evidence can see it. Full extracted data is returned by default; use
+    ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    extract_params: dict[str, Any] = {"prompt": prompt, "schema": schema}
     return await _run_paired_capture(
         "skyvern_extract_and_screenshot",
         [
-            ("extract", {"prompt": prompt, "schema": schema}),
+            ("extract", extract_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,
@@ -2648,19 +2692,35 @@ async def skyvern_evaluate_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Run JavaScript to read the page AND capture a screenshot in ONE call.
 
     A single "do it and prove it" primitive: your JS returns the scraped values and the tool returns
     them together with a screenshot of the page as visual proof, so every fact you read is backed by
     an image without a second tool call. The screenshot is saved to a file path by default (pass
-    inline=true for base64). Supports await (auto-wrapped in an async IIFE); for multi-line await use
-    an explicit return. Security: JS executes in page context — use only with trusted expressions.
+    inline=true for base64). Supports await (auto-wrapped in async IIFE); for multi-line await use an
+    explicit return. Full responses are returned by default; use ``verbosity="summary"`` for an opt-in
+    compact response. The mandatory response-size cap still applies. Security: JS executes in page
+    context — use only with trusted expressions.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    evaluate_params: dict[str, Any] = {"expression": expression}
     return await _run_paired_capture(
         "skyvern_evaluate_and_screenshot",
         [
-            ("evaluate", {"expression": expression}),
+            ("evaluate", evaluate_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,
@@ -2730,18 +2790,34 @@ async def skyvern_navigate_extract_and_screenshot(
             "a full-resolution inline screenshot can overflow the tool-result size limit."
         ),
     ] = False,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Response detail level. Default is controlled by SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY."),
+    ] = EXTRACTION_DEFAULT_VERBOSITY,
+    response_offset_chars: Annotated[
+        int,
+        Field(
+            description="Character offset into canonical full-response JSON. "
+            "For capped full responses, pass _next_offset_chars to continue."
+        ),
+    ] = 0,
 ) -> dict[str, Any]:
     """Open a URL, AI-extract structured data, AND capture a screenshot — all in ONE call.
 
     The most step-efficient way to process one source page: it navigates, extracts the fields you ask
     for, and saves a screenshot as proof, so a whole page becomes a single tool call instead of three.
-    The screenshot is saved to a file path by default (pass inline=true for base64).
+    The screenshot is saved to a file path by default (pass inline=true for base64). Full extracted data
+    is returned by default; use ``verbosity="summary"`` for an opt-in compact response. The mandatory
+    response-size cap still applies.
     """
+    # verbosity is consumed by the registration-site response_transformed wrapper
+    # (signature binding); the undecorated inner tools ignore it.
+    extract_params: dict[str, Any] = {"prompt": prompt, "schema": schema}
     return await _run_paired_capture(
         "skyvern_navigate_extract_and_screenshot",
         [
             ("navigate", {"url": url, "timeout": timeout, "wait_until": wait_until}),
-            ("extract", {"prompt": prompt, "schema": schema}),
+            ("extract", extract_params),
             ("screenshot", {"full_page": full_page, "inline": inline}),
         ],
         session_id,

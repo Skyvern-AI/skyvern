@@ -3029,6 +3029,78 @@ def test_clickable_controls_surface_grounded_selectors_outside_forms() -> None:
     assert by_selector['div[data-action="selectAddress"]']["text"] == "2468 Peach Orchard Ct"
 
 
+def test_clickable_controls_preserve_disclosure_state_and_controlled_region_visibility() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <button id="more" aria-expanded="false" aria-controls="alternatives">More options</button>
+          <div id="alternatives" hidden><button>Authenticator app</button></div>
+        </body></html>
+        """,
+        inspected_url=_STANDALONE_CONTROLS_URL,
+        current_url=_STANDALONE_CONTROLS_URL,
+    )
+
+    assert parsed["clickable_controls"] == [
+        {
+            "text": "More options",
+            "selector": "#more",
+            "tag": "button",
+            "expanded": False,
+            "controls": "alternatives",
+            "controlled_region_visible": False,
+        }
+    ]
+
+
+def test_structured_clickable_controls_preserve_disclosure_facts() -> None:
+    parsed = parse_composition_structured(
+        {
+            "page_title": "Two-factor authentication",
+            "clickable_controls": [
+                {
+                    "text": "More options",
+                    "selector": "#more",
+                    "tag": "button",
+                    "expanded": False,
+                    "controls": "alternatives",
+                    "controlled_region_visible": False,
+                }
+            ],
+        },
+        inspected_url=_STANDALONE_CONTROLS_URL,
+        current_url=_STANDALONE_CONTROLS_URL,
+    )
+
+    assert parsed is not None
+    assert parsed["clickable_controls"][0] == {
+        "text": "More options",
+        "selector": "#more",
+        "tag": "button",
+        "expanded": False,
+        "controls": "alternatives",
+        "controlled_region_visible": False,
+    }
+
+
+def test_form_submit_controls_preserve_disclosure_facts() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body><form>
+          <button id="more" aria-expanded="false" aria-controls="alternatives">More options</button>
+          <div id="alternatives" hidden><button>Alternate method</button></div>
+        </form></body></html>
+        """,
+        inspected_url=_STANDALONE_CONTROLS_URL,
+        current_url=_STANDALONE_CONTROLS_URL,
+    )
+
+    control = parsed["forms"][0]["submit_controls"][0]
+    assert control["expanded"] is False
+    assert control["controls"] == "alternatives"
+    assert control["controlled_region_visible"] is False
+
+
 def test_clickable_controls_exclude_in_form_buttons() -> None:
     parsed = parse_composition_html(
         "<html><body><form><button id='in-form' data-action='business'>In form</button></form>"
@@ -3083,6 +3155,16 @@ def test_standalone_control_page_splits_steer_content_from_bounded_schema() -> N
     assert has_bounded_page_schema(parsed) is False
     assert has_actionable_steer_content(parsed) is True
     assert parsed["schema_empty_page"] is True
+
+
+def test_ordinary_standalone_control_does_not_settle_composition_capture() -> None:
+    parsed = parse_composition_html(
+        _STANDALONE_CONTROLS_HTML,
+        inspected_url=_STANDALONE_CONTROLS_URL,
+        current_url=_STANDALONE_CONTROLS_URL,
+    )
+
+    assert tools_module.composition_capture._composition_capture_settled(parsed) is False
 
 
 def test_clickable_controls_dedup_against_navigation_and_respect_cap() -> None:
@@ -3199,6 +3281,62 @@ async def _capture_live_dom(url: str, html: str, wait_selector: str) -> tuple[st
         await browser.close()
 
     return raw, content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_browser_packet_reports_collapsed_disclosure_relationship() -> None:
+    raw, _ = await _capture_live_dom(
+        "https://test.example.com/two-factor",
+        """
+        <html><head><style>#alternatives { display: none; }</style></head><body>
+          <button id="more" aria-expanded="false" aria-controls="alternatives">More options</button>
+          <div id="alternatives"><button>Authenticator app</button></div>
+        </body></html>
+        """,
+        "#more",
+    )
+
+    packet = json.loads(raw)
+    assert packet["clickable_controls"][0]["expanded"] is False
+    assert packet["clickable_controls"][0]["controls"] == "alternatives"
+    assert packet["clickable_controls"][0]["controlled_region_visible"] is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_browser_packet_resolves_multi_id_disclosure_relationship() -> None:
+    raw, _ = await _capture_live_dom(
+        "https://test.example.com/two-factor",
+        """
+        <html><head><style>#first, #second { display: none; }</style></head><body>
+          <button id="more" aria-expanded="false" aria-controls="first second">More options</button>
+          <div id="first">Authenticator app</div><div id="second">Recovery code</div>
+        </body></html>
+        """,
+        "#more",
+    )
+
+    disclosure = json.loads(raw)["clickable_controls"][0]
+    assert disclosure["controls"] == "first second"
+    assert disclosure["controlled_region_visible"] is False
+
+
+def test_html_parser_resolves_multi_id_disclosure_relationship() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <button id="more" aria-expanded="false" aria-controls="first second">More options</button>
+          <div id="first" hidden>Authenticator app</div><div id="second" hidden>Recovery code</div>
+        </body></html>
+        """,
+        inspected_url="https://test.example.com/two-factor",
+        current_url="https://test.example.com/two-factor",
+    )
+
+    disclosure = parsed["clickable_controls"][0]
+    assert disclosure["controls"] == "first second"
+    assert disclosure["controlled_region_visible"] is False
 
 
 @_skip_no_browser
@@ -3548,12 +3686,14 @@ class _RecordingCompositionServer:
         structured_json: str | dict[str, Any] | None,
         html: str = "",
         structured_exception: Exception | None = None,
+        reject_html: bool = False,
     ) -> None:
         self.calls: list[str] = []
         self.evaluate_expressions: list[str] = []
         self._structured_json = structured_json
         self._html = html
         self._structured_exception = structured_exception
+        self._reject_html = reject_html
 
     async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(tool_name)
@@ -3570,6 +3710,8 @@ class _RecordingCompositionServer:
                 return {"ok": True, "data": {"result": []}}
             return {"ok": False, "error": "unexpected expression"}
         if tool_name == "skyvern_get_html":
+            if self._reject_html:
+                raise AssertionError("structured disclosure evidence must not fall back to static HTML")
             return {"ok": True, "data": {"html": self._html}}
         return {"ok": False, "error": f"unexpected tool {tool_name}"}
 
@@ -3723,6 +3865,41 @@ async def test_capture_retains_html_fallback_for_a_valid_hollow_structured_packe
     assert evidence is not None
     assert evidence["forms"]
     assert server.calls.count("skyvern_get_html") == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_retains_rendered_disclosure_facts_on_a_standalone_control_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tools_module.composition_capture, "_COMPOSITION_HOLLOW_RECAPTURE_RETRIES", 0)
+    capture_path = Path(__file__).parent / "fixtures/copilot/sky_14419_code_host_collapsed_2fa_structured.json"
+    capture = json.loads(capture_path.read_text())
+    rendered = capture["raw_structured_packet"]
+    html = """
+    <html><head><style>.alts { display: none; }</style></head><body>
+      <button class="primary">Use passkey</button>
+      <button class="secondary" aria-expanded="false" aria-controls="two-factor-alternatives-body">
+        More options
+      </button>
+      <ul class="alts" id="two-factor-alternatives-body">
+        <li><button>Authenticator app</button></li>
+        <li><button>Recovery code</button></li>
+      </ul>
+    </body></html>
+    """
+    server = _RecordingCompositionServer(structured_json=rendered, html=html, reject_html=True)
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx,
+        inspected_url=capture["capture_contract"]["fixture_url"],
+        current_url=capture["capture_contract"]["fixture_url"],
+    )
+
+    assert error is None
+    assert evidence is not None
+    disclosure = next(control for control in evidence["clickable_controls"] if control.get("expanded") is False)
+    assert disclosure["controlled_region_visible"] is False
 
 
 @pytest.mark.asyncio
@@ -4870,6 +5047,62 @@ def test_named_blocked_control_carries_the_gating_claim_without_the_boolean() ->
 
     assert merged["challenge_state"].get("requires_human_verification") is not True
     assert composition_challenge_carrier(merged) is None
+
+
+def test_captured_collapsed_disclosure_does_not_override_a_positive_visual_challenge() -> None:
+    capture_path = Path(__file__).parent / "fixtures/copilot/sky_14419_code_host_collapsed_2fa_structured.json"
+    capture = json.loads(capture_path.read_text())
+    contract = capture["capture_contract"]
+    parsed = parse_composition_structured(
+        capture["raw_structured_packet"],
+        inspected_url=contract["fixture_url"],
+        current_url=contract["fixture_url"],
+    )
+    assert parsed is not None
+
+    visual_claim = merge_visual_composition_evidence(parsed, visual_summary=dict(_VISION_CHALLENGE_SUMMARY))
+    assert visual_claim["challenge_state"]["requires_human_verification"] is True
+    assert composition_challenge_carrier(visual_claim) is ChallengeEvidenceSource.VISION
+
+    carrier_backed_packet = dict(parsed)
+    carrier_backed_packet["challenge_controls"] = [{"tag": "iframe", "visible": True}]
+    carrier_backed = merge_visual_composition_evidence(
+        carrier_backed_packet,
+        visual_summary=dict(_VISION_CHALLENGE_SUMMARY),
+    )
+    assert typed_challenge_kind(carrier_backed) is ChallengeKind.OTHER
+    assert composition_challenge_carrier(carrier_backed) is ChallengeEvidenceSource.CHALLENGE_STATE
+
+    genuine_other = merge_visual_composition_evidence(
+        parse_composition_html(
+            _ACCESS_DENIED_HTML,
+            inspected_url="https://example.test/login",
+            current_url="https://example.test/login",
+        ),
+        visual_summary=dict(_VISION_CHALLENGE_SUMMARY),
+    )
+    assert genuine_other["challenge_state"][CHALLENGE_KIND_KEY] == ChallengeKind.OTHER.value
+    assert typed_challenge_kind(genuine_other) is ChallengeKind.OTHER
+    assert composition_challenge_carrier(genuine_other) is ChallengeEvidenceSource.VISION
+
+
+def test_unrelated_collapsed_disclosure_does_not_refute_a_visual_challenge() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <section><button id="faq" aria-expanded="false" aria-controls="answer">FAQ</button></section>
+          <div id="answer" hidden>Shipping details</div>
+          <main><p>Access denied</p></main>
+        </body></html>
+        """,
+        inspected_url="https://example.test/blocked",
+        current_url="https://example.test/blocked",
+    )
+
+    merged = merge_visual_composition_evidence(parsed, visual_summary=dict(_VISION_CHALLENGE_SUMMARY))
+
+    assert merged["challenge_state"]["requires_human_verification"] is True
+    assert composition_challenge_carrier(merged) is ChallengeEvidenceSource.VISION
 
 
 def test_a_disabled_submit_in_the_same_form_corroborates_the_gating_claim() -> None:

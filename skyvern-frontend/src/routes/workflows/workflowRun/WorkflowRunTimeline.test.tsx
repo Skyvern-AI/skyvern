@@ -434,7 +434,7 @@ describe("WorkflowRunTimeline", () => {
     );
     expect(screen.getByText("· Use alternate path")).toBeDefined();
     expect(screen.getByText("condition false")).toBeDefined();
-    expect(screen.getByText("1 block")).toBeDefined();
+    expect(screen.getByText("· 1 block")).toBeDefined();
     expect(screen.queryByText("skipped")).toBeNull();
     const notReachedBadge = screen.getByText("did not execute");
     expect(notReachedBadge.closest("div.min-w-0")?.textContent).toContain(
@@ -459,7 +459,7 @@ describe("WorkflowRunTimeline", () => {
 });
 
 describe("timeline header elapsed", () => {
-  function seed(totalSteps = 0) {
+  function seed(totalSteps = 0, actions: WorkflowRunBlock["actions"] = null) {
     mocks.workflowRun = {
       status: Status.Completed,
       total_steps: totalSteps,
@@ -471,7 +471,7 @@ describe("timeline header elapsed", () => {
     };
     mocks.timeline = [
       buildBlockItem(
-        buildBlock({ workflow_run_block_id: "wrb_a", label: "A" }),
+        buildBlock({ workflow_run_block_id: "wrb_a", label: "A", actions }),
       ),
     ];
   }
@@ -496,8 +496,7 @@ describe("timeline header elapsed", () => {
     expect(screen.queryByText(/· \d+m/)).toBeNull();
   });
 
-  // total_steps counts task steps, which a code-first run never produces, so the
-  // chip read "0 steps" beside rows that were visibly executing.
+  // The header reports executed timeline blocks, not task steps.
   it("omits the steps chip when the run reports no steps", () => {
     seed();
 
@@ -506,12 +505,15 @@ describe("timeline header elapsed", () => {
     expect(screen.queryByText(/· 0 steps/)).toBeNull();
   });
 
-  it("still shows the steps chip once the run reports steps", () => {
-    seed(3);
+  it("shows the executed block count instead of a steps chip", () => {
+    seed(3, [{ action_id: "act_1" }] as unknown as WorkflowRunBlock["actions"]);
 
     renderTimeline(null);
 
-    expect(screen.getByText("· 3 steps")).toBeTruthy();
+    expect(screen.getByText("· 1 block")).toBeTruthy();
+    expect(screen.getByText("· 1 action")).toBeTruthy();
+    expect(screen.getByText("· 1 block").getAttribute("tabindex")).toBeNull();
+    expect(screen.queryByText(/steps/)).toBeNull();
   });
 });
 

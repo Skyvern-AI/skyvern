@@ -971,3 +971,58 @@ async def test_authenticate_helper_requires_attribution_aware_callback(
         )
 
     assert tokens == []
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_header_is_not_treated_as_a_skyvern_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A self-hosted UI origin gated by HTTP basic auth sends Basic credentials to the API too."""
+    calls: list[str] = []
+
+    async def authentication_callback(token: str, attribution_header: str | None = None) -> Organization:
+        calls.append(token)
+        return _make_org("org-basic")
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await org_auth_service.get_current_org(authorization="Basic dXNlcjpwYXNzd29yZA==")
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.detail == "Invalid credentials"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_header_does_not_shadow_a_valid_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization = _make_org("org-basic-with-key")
+
+    async def resolve(x_api_key: str, db: object) -> Organization:
+        return organization
+
+    monkeypatch.setattr(org_auth_service, "get_current_org_cached", resolve)
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=None, DATABASE=object()),
+    )
+
+    resolved = await org_auth_service.get_current_org(
+        x_api_key="skyvern-api-key",
+        authorization="Basic dXNlcjpwYXNzd29yZA==",
+    )
+
+    assert resolved == organization
+
+
+def test_bearer_scheme_is_matched_case_insensitively() -> None:
+    assert org_auth_service._extract_bearer_token("bearer token-canary") == "token-canary"
+    assert org_auth_service._extract_bearer_token("BEARER token-canary") == "token-canary"
+    assert org_auth_service._extract_bearer_token("Basic token-canary") is None
+    assert org_auth_service._extract_bearer_token("token-canary") is None
+    assert org_auth_service._extract_bearer_token("Bearer ") is None

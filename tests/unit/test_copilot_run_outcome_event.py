@@ -57,6 +57,7 @@ def _run_result(blocks: list[dict[str, Any]], *, ok: bool = True) -> dict[str, A
         "ok": ok,
         "data": {
             "workflow_run_id": "wr_test",
+            "browser_session_id": "pbs_run",
             "overall_status": "completed" if ok else "failed",
             "current_url": "https://registry.example.com/search",
             "blocks": blocks,
@@ -142,6 +143,8 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
         workflow_yaml="blocks: []",
         browser_session_id=None,
         stream=_FakeStream(),  # type: ignore[arg-type]
+        turn_id="turn_test",
+        workflow_copilot_chat_id="chat_test",
         user_message="search the public registry for a person and expand their result rows",
     )
     ctx.request_policy = RequestPolicy(
@@ -426,6 +429,12 @@ async def test_completed_run_emits_factual_ungraded_record() -> None:
     assert [frame.verdict for frame in frames] == ["not_evaluated"]
     assert frames[-1].reason_code is None
     assert frames[-1].role == "recorded"
+    assert frames[-1].browser_session_id == "pbs_run"
+    assert frames[-1].workflow_permanent_id == "wp"
+    assert frames[-1].turn_id == "turn_test"
+    assert frames[-1].workflow_copilot_chat_id == "chat_test"
+    assert frames[-1].continuity_source == "workflow_run"
+    assert frames[-1].terminal_disposition == "completed"
     assert ctx.last_full_workflow_test_ok is True
 
 

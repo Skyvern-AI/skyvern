@@ -70,6 +70,7 @@ from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
     AzureConfigurationError,
     BlockedHost,
+    BlockedNavigationDestination,
     BranchEvaluationContextTooLargeError,
     CodeBlockRunnerSelectionError,
     ConditionalBranchEvaluationError,
@@ -77,6 +78,7 @@ from skyvern.exceptions import (
     DownloadFileMaxSizeExceeded,
     DownloadSaveIncompleteError,
     FailedToGetTOTPVerificationCode,
+    FailedToNavigateToUrl,
     MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -1229,6 +1231,19 @@ class Block(BaseModel, abc.ABC):
                     workflow_run_id=workflow_run_id,
                     block_label=self.label,
                     block_type=self.block_type,
+                )
+                failure_reason = get_user_facing_exception_message(e)
+            elif isinstance(e, FailedToNavigateToUrl) and not isinstance(e, BlockedNavigationDestination):
+                # The target site did not load. Site-caused, and already surfaced on the run through
+                # failure_reason below. BlockedNavigationDestination is excluded on purpose: it is the
+                # SSRF guard tripping, not a site failure, and it stays at error.
+                LOG.warning(
+                    "Block execution failed",
+                    workflow_run_id=workflow_run_id,
+                    block_label=self.label,
+                    block_type=self.block_type,
+                    url=e.url,
+                    exc_info=True,
                 )
                 failure_reason = get_user_facing_exception_message(e)
             elif self.block_type in {BlockType.CODE, BlockType.FOR_LOOP, BlockType.WHILE_LOOP}:

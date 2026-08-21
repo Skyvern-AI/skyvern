@@ -527,7 +527,8 @@ class TestMCPFailedStepLoopDetection:
                 calls.append((name, args, in_context))
                 return FakeRawResult()
 
-        async def fake_ensure_browser_session(ctx: Any) -> None:
+        async def fake_ensure_browser_session(ctx: Any, *, require_verified_session: bool = False) -> None:
+            assert require_verified_session is True
             ctx.browser_session_id = "pbs_copilot"
             return None
 
@@ -549,6 +550,9 @@ class TestMCPFailedStepLoopDetection:
         ctx.turn_ownership = None
         ctx.blocker_signal_claimant = None
         ctx.gate_precedence_conflict_events = []
+        ctx.browser_session_id = None
+        ctx.browser_session_continuity_generation = 0
+        ctx.browser_session_recovery_lock = None
         server = SkyvernOverlayMCPServer(
             transport=MagicMock(),
             overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},

@@ -1,0 +1,76 @@
+{
+  "capture_contract": {
+    "ticket": "SKY-14419",
+    "fixture": "tests/unit/fixtures/copilot/sky_14419_code_host_collapsed_2fa.html",
+    "fixture_sha256": "156172d67f9cd3fdb3d555a79482817ca6569de6e2a27a60211ebe037d20c1e3",
+    "fixture_url": "http://localhost:8900/code_host/skyvern-cloud/",
+    "capture_state": "signed in, passkey-first two-factor page, More options not expanded",
+    "extractor": "COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION"
+  },
+  "raw_structured_packet": {
+    "anti_bot_indicators": [],
+    "body_has_markup": true,
+    "challenge_controls": [],
+    "clickable_controls": [
+      {
+        "disabled": false,
+        "identity": {
+          "label_context": "Use passkey",
+          "role": "button",
+          "tag": "button"
+        },
+        "selector": "button.primary",
+        "selector_candidates": [
+          {
+            "selector": "button.primary",
+            "source": "class"
+          },
+          {
+            "selector": "#app > div:nth-of-type(1) > div:nth-of-type(2) > button:nth-of-type(1)",
+            "source": "structural"
+          }
+        ],
+        "tag": "button",
+        "text": "Use passkey",
+        "visible": true
+      },
+      {
+        "controlled_region_visible": false,
+        "controls": "two-factor-alternatives-body",
+        "disabled": false,
+        "expanded": false,
+        "identity": {
+          "label_context": "More options ▾",
+          "role": "button",
+          "tag": "button"
+        },
+        "selector": "button.secondary",
+        "selector_candidates": [
+          {
+            "selector": "button.secondary",
+            "source": "class"
+          },
+          {
+            "selector": "#app > div:nth-of-type(1) > div:nth-of-type(2) > button:nth-of-type(2)",
+            "source": "structural"
+          }
+        ],
+        "tag": "button",
+        "text": "More options ▾",
+        "visible": true
+      }
+    ],
+    "forms": [],
+    "key_value_relations": [],
+    "key_value_relations_truncated": false,
+    "modal_overlays": [],
+    "navigation_targets": [],
+    "navigation_targets_truncated": false,
+    "page_title": "Two-factor authentication · Wyrmhold Two-factor authentication",
+    "result_containers": [],
+    "result_containers_truncated": false,
+    "reveal_relations_truncated": false,
+    "visible_text_excerpt": "🐉\nTwo-factor authentication\n\nAuthenticate using your passkey.\n\nUse passkey\n\nMore options ▾",
+    "visual_obstruction_candidates": []
+  }
+}

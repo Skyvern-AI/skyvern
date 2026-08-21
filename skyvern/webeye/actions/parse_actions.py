@@ -123,6 +123,8 @@ def parse_action(
     # The prompt exposes EXTRACT as EXTRACT_INFORMATION; map it back to the internal enum name
     if action_type_str == "EXTRACT_INFORMATION":
         action_type_str = "EXTRACT"
+    if action_type_str not in ActionType.__members__:
+        raise UnsupportedActionType(action_type=action_type_str)
     action_type = ActionType[action_type_str]
 
     if not action_type.is_web_action() and action_type != ActionType.SCROLL:
@@ -181,6 +183,8 @@ def parse_action(
         option = action.get("option")
         if option is None:
             raise ValueError("SelectOptionAction requires an 'option' field")
+        if not isinstance(option, dict):
+            raise ValueError("SelectOptionAction requires 'option' to be an object")
 
         context_dict = action.get("context", {})
         if context_dict and len(context_dict) > 0:
