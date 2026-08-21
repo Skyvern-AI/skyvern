@@ -234,6 +234,9 @@ export interface ActivityEntry {
   // Consecutive same-tool retries folded into this row by
   // condenseActivityEntries. Unset outside that transform.
   attempts?: number;
+  // Server clock read for this event, persisted so a hydrated turn reports the
+  // same elapsed as the live one. Undefined against a backend that does not stamp.
+  timestamp?: string;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -549,6 +552,7 @@ function buildActivityFromToolCall(
     toolName: event.tool_name,
     displayLabel,
     id: `tc-${event.tool_call_id}`,
+    timestamp: event.timestamp ?? undefined,
   };
 }
 
@@ -577,6 +581,7 @@ function buildActivityFromToolResult(
     displayLabel,
     success: event.success,
     id: `tr-${event.tool_call_id}`,
+    timestamp: event.timestamp ?? undefined,
   };
 }
 
@@ -588,6 +593,7 @@ function buildActivityFromNarration(
     text: event.narration,
     iteration: event.iteration,
     id: `n-${event.iteration}-${event.timestamp}`,
+    timestamp: event.timestamp,
   };
 }
 
@@ -816,10 +822,10 @@ export function isBlockOk(
   );
 }
 
-// Labels that occur exactly once in the given set — the only labels safe to
-// key recorded actions on when the run-block id is missing (the terminal
-// narrative_payload drops workflowRunBlockId). Loop iterations reuse a label,
-// so an ambiguous label falls back to today's drop rather than mis-attributing.
+// Labels that occur exactly once in the given set — the only labels safe to key
+// recorded actions on when the run-block id is missing (a block that never
+// reported progress, or an older backend). Loop iterations reuse a label, so an
+// ambiguous label falls back to today's drop rather than mis-attributing.
 function uniqueLabelSet(labels: Array<string | undefined>): Set<string> {
   const counts = new Map<string, number>();
   for (const label of labels) {
@@ -1088,13 +1094,10 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
-        // The BE narrative_payload drops workflowRunBlockId and the client-only
-        // recordedActions. Re-associate each hydrated block with the live block
-        // of the same label to restore its real run-block id (and carry any
-        // recordedActions). Restoring the real id keeps this frozen turn keyed
-        // by id, so a later test run that reuses a label matches by id and can't
-        // graft its actions onto this turn. Unique labels only — loop iterations
-        // reuse a label and can't be told apart without the id.
+        // The BE narrative_payload carries no client-only recordedActions, and
+        // omits workflowRunBlockId for a block that never reported progress.
+        // Re-associating by label carries both across, but only for a label that
+        // occurs once — loop iterations reuse one and can't be told apart.
         const liveById = new Map(
           prev.blocks
             .filter((b) => b.workflowRunBlockId !== "")
@@ -1234,6 +1237,7 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       id: o.id,
+      timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });
   }
   return out;

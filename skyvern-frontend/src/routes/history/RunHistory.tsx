@@ -14,7 +14,6 @@ import {
 } from "@/components/ui/select";
 import { Tip } from "@/components/Tip";
 import {
-  Status,
   TaskRunListItem,
   TaskRunType,
   TriggerType,
@@ -95,28 +94,10 @@ import {
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
 import { RunRowActions } from "@/routes/runs/RunRowActions";
-
-const statusValues = new Set<string>(Object.values(Status));
-function isKnownStatus(value: string): value is Status {
-  return statusValues.has(value);
-}
-
-function parseStatusParam(raw: string | null): Array<Status> {
-  if (!raw) {
-    return [];
-  }
-  const seen = new Set<Status>();
-  const out: Array<Status> = [];
-  for (const token of raw.split(",")) {
-    const trimmed = token.trim();
-    if (trimmed === "" || !isKnownStatus(trimmed) || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    out.push(trimmed);
-  }
-  return out;
-}
+import {
+  isKnownStatus,
+  parseStatusParam,
+} from "@/routes/runs/statusFilterParam";
 
 const runTypeGroupValues = new Set<string>(Object.values(RunTypeGroup));
 

@@ -1,7 +1,22 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  RouterProvider,
+  createMemoryRouter,
+  useLocation,
+} from "react-router-dom";
 
 import { Status, type WorkflowRunApiResponse } from "@/api/types";
 import CloudContext from "@/store/CloudContext";
@@ -35,11 +50,38 @@ vi.mock("@/util/env", () => ({
 }));
 
 vi.mock("@/components/StatusFilterDropdown", () => ({
-  StatusFilterDropdown: () => <div data-testid="status-filter" />,
+  StatusFilterDropdown: ({
+    values,
+    onChange,
+  }: {
+    values: Array<Status>;
+    onChange: (values: Array<Status>) => void;
+  }) => (
+    <div data-testid="status-filter" data-values={values.join(",")}>
+      <button type="button" onClick={() => onChange([Status.Failed])}>
+        Filter failed
+      </button>
+      <button type="button" onClick={() => onChange([])}>
+        Clear status filter
+      </button>
+    </div>
+  ),
 }));
 
 vi.mock("@/components/TableSearchInput", () => ({
-  TableSearchInput: () => <input aria-label="Search runs by input" />,
+  TableSearchInput: ({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+  }) => (
+    <input
+      aria-label="Search runs by input"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  ),
 }));
 
 vi.mock("./WorkflowActions", () => ({
@@ -65,7 +107,7 @@ vi.mock("./hooks/useWorkflowQuery", () => ({
 }));
 
 vi.mock("./hooks/useWorkflowRunsQuery", () => ({
-  useWorkflowRunsQuery: () => mockWorkflowRunsQuery(),
+  useWorkflowRunsQuery: (props: unknown) => mockWorkflowRunsQuery(props),
 }));
 
 vi.mock("./hooks/useWorkflowTagsBatchQuery", () => ({
@@ -288,5 +330,113 @@ describe("WorkflowPage analytics button", () => {
         "Automatic retry with fallback credential",
       ),
     ).toBeNull();
+  });
+});
+
+describe("Past Runs list state in the URL", () => {
+  function locationSearch(container: HTMLElement): string {
+    return (
+      container
+        .querySelector('[data-testid="location-search"]')
+        ?.getAttribute("data-search") ?? ""
+    );
+  }
+
+  it("restores the search term and status filter from the URL", () => {
+    const { container } = renderWorkflowPage({
+      initialEntries: ["/workflows/wpid_abc123?search=invoice&status=failed"],
+      workflowRuns: [makeWorkflowRun({ workflow_run_id: "wr_match" })],
+    });
+
+    expect(
+      (screen.getByLabelText("Search runs by input") as HTMLInputElement).value,
+    ).toBe("invoice");
+    expect(
+      container
+        .querySelector('[data-testid="status-filter"]')
+        ?.getAttribute("data-values"),
+    ).toBe("failed");
+    expect(mockWorkflowRunsQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        search: "invoice",
+        statusFilters: [Status.Failed],
+      }),
+    );
+  });
+
+  it("writes the search term to the URL and drops it once cleared", () => {
+    const { container } = renderWorkflowPage({
+      initialEntries: ["/workflows/wpid_abc123?page=2"],
+      // A non-empty page keeps the empty-page rollback effect from rewriting
+      // ?page= on its own, so the reset below is the search handler's doing.
+      workflowRuns: [makeWorkflowRun({ workflow_run_id: "wr_1" })],
+    });
+    const input = screen.getByLabelText("Search runs by input");
+
+    fireEvent.change(input, { target: { value: "invoice" } });
+
+    expect(locationSearch(container)).toContain("search=invoice");
+    expect(locationSearch(container)).toContain("page=1");
+    expect(
+      (screen.getByLabelText("Search runs by input") as HTMLInputElement).value,
+    ).toBe("invoice");
+
+    fireEvent.change(input, { target: { value: "" } });
+
+    expect(locationSearch(container)).not.toContain("search=");
+  });
+
+  it("restores the query after opening a run and going back", async () => {
+    mockFeatureFlagEnabled.mockReturnValue(true);
+    mockWorkflowRunsQuery.mockReturnValue({
+      data: [makeWorkflowRun({ workflow_run_id: "wr_1" })],
+      isLoading: false,
+    });
+    const router = createMemoryRouter(
+      [
+        { path: "/workflows/:workflowPermanentId", element: <WorkflowPage /> },
+        { path: "*", element: <div>run detail</div> },
+      ],
+      { initialEntries: ["/workflows/wpid_abc123"] },
+    );
+
+    render(
+      <CloudContext.Provider value={true}>
+        <PageSlotsProvider value={{}}>
+          <RouterProvider router={router} />
+        </PageSlotsProvider>
+      </CloudContext.Provider>,
+    );
+
+    fireEvent.change(screen.getByLabelText("Search runs by input"), {
+      target: { value: "invoice" },
+    });
+    fireEvent.click(screen.getByText("wr_1"));
+    await waitFor(() => expect(screen.getByText("run detail")).toBeTruthy());
+
+    await act(async () => {
+      await router.navigate(-1);
+    });
+
+    expect(
+      (screen.getByLabelText("Search runs by input") as HTMLInputElement).value,
+    ).toBe("invoice");
+    expect(mockWorkflowRunsQuery).toHaveBeenLastCalledWith(
+      expect.objectContaining({ search: "invoice" }),
+    );
+  });
+
+  it("writes the status filter to the URL and drops it once cleared", () => {
+    const { container } = renderWorkflowPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Filter failed" }));
+
+    expect(locationSearch(container)).toContain("status=failed");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear status filter" }),
+    );
+
+    expect(locationSearch(container)).not.toContain("status=");
   });
 });

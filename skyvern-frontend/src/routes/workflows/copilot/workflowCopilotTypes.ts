@@ -223,6 +223,7 @@ export interface WorkflowCopilotToolCallUpdate {
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotToolResultUpdate {
@@ -234,6 +235,7 @@ export interface WorkflowCopilotToolResultUpdate {
   iteration: number;
   tool_call_id: string;
   detail?: string | null;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
