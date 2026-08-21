@@ -12,7 +12,7 @@ from asyncio.exceptions import CancelledError
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Tuple, cast
+from typing import Any, Iterable, Literal, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -139,6 +139,8 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
+from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, parse_totp_config
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -161,7 +163,12 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import describe_webhook_contract_failure, poll_otp_value, resolve_otp_value
+from skyvern.services.otp_service import (
+    describe_webhook_contract_failure,
+    extract_totp_from_navigation_inputs,
+    poll_otp_value,
+    resolve_otp_value,
+)
 from skyvern.services.webhook_delivery import (
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     deliver_webhook_with_retries,
@@ -421,6 +428,81 @@ def _classify_reasoning_kind(reasoning: str | None) -> str:
     """
     text = (reasoning or "").lower()
     return "literal" if any(s in text for s in _LITERAL_REASONING_SIGNALS) else "semantic"
+
+
+def _has_multi_field_totp_shape(observations: Iterable[tuple[str, Any]]) -> bool:
+    """True when ``observations`` BEGIN with 4+ consecutive single-digit INPUT_TEXT actions.
+
+    ``observations`` are normalized ``(action_type, text)`` pairs. The run must start at action-list
+    index 0: the multi-field execution path (``_handle_multi_field_totp_sequence``) generates and
+    caches the TOTP only for the digit whose absolute ``action_index == 0`` and expects that cache to
+    already exist for every later digit. A leading non-TOTP action pushes the first digit to index 1,
+    so the handler never seeds the cache and every digit fails with a cache miss. Requiring the
+    single-digit run to begin at index 0 keeps this shared shape check aligned with that runtime
+    invariant. Actions after the run (e.g. a model-requested submit click) are irrelevant and may
+    remain. Shared behind both the raw-dict first-plan predicate and the parsed-Action detector.
+    """
+    single_digit_run = 0
+    for action_type, text in observations:
+        if action_type == ActionType.INPUT_TEXT.value and isinstance(text, str) and len(text) == 1 and text.isdigit():
+            single_digit_run += 1
+            if single_digit_run >= 4:
+                return True
+        else:
+            return False
+    return False
+
+
+def _first_plan_carries_consumable_totp(actions: list[Any], multi_field_secret_ready: bool) -> bool:
+    """Whether the first-pass plan already carries a shape the existing runtime materializes into a
+    credential TOTP at DOM-write time: a multi-field single-digit sequence backed by a runtime secret
+    stash. A literal digit string, a bare placeholder, a provider marker, or a
+    ``get_verification_code`` action is not runtime-consumable on this v1 two-pass seam, so it keeps
+    the polling re-plan.
+
+    The multi-field arm is only consumable when the runtime already holds the code the multi-field
+    execution path types per digit — the existing ``totp_codes[f"{task_id}_secret"]`` stash. Without
+    it the runtime cannot materialize the digits, so ``multi_field_secret_ready`` gates that arm.
+    """
+    if not multi_field_secret_ready:
+        return False
+    observations = (
+        (str(action.get("action_type") or "").lower(), action.get("text")) if isinstance(action, dict) else ("", None)
+        for action in actions
+    )
+    return _has_multi_field_totp_shape(observations)
+
+
+def _first_plan_carries_single_field_credential_totp(
+    actions: list[Any], workflow_run_context: WorkflowRunContext | None, active_credential_parameter_key: str | None
+) -> bool:
+    """Recognize the single-field credential placeholder consumed by the input handler at runtime."""
+    if not workflow_run_context or not actions:
+        return False
+    if any(not isinstance(action, dict) for action in actions):
+        return False
+    if str(actions[0].get("action_type") or "").upper() != ActionType.INPUT_TEXT.value.upper():
+        return False
+    if any(
+        str(action.get("action_type") or "").upper() == ActionType.INPUT_TEXT.value.upper() for action in actions[1:]
+    ):
+        return False
+    text = actions[0].get("text")
+    if not isinstance(text, str) or text not in workflow_run_context.secrets:
+        return False
+    key = workflow_run_context.find_credential_parameter_key_for_secret(text)
+    if not key or workflow_run_context.values.get(key, {}).get("totp") != text:
+        return False
+    if active_credential_parameter_key is not None and active_credential_parameter_key != key:
+        return False
+    resolved = workflow_run_context.get_original_secret_value_or_none(text)
+    if resolved not in {BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP}:
+        return False
+    secret_key = workflow_run_context.totp_secret_value_key(text)
+    if secret_key not in workflow_run_context.secrets:
+        return False
+    secret = workflow_run_context.get_original_secret_value_or_none(secret_key)
+    return bool(secret and parse_totp_config(secret))
 
 
 def record_validation_span_attrs(span: Any, task: Task, actions: list[Action]) -> None:
@@ -1106,6 +1188,7 @@ class ForgeAgent:
             run_task_v3_agent_loop,
             taskv3_runaway_backstops,
         )
+        from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -1121,11 +1204,22 @@ class ForgeAgent:
                 # loss is contained by the loop's per-tool-call error handling.
                 return await browser_state.must_get_working_page()
 
+            async def _fingerprint_page() -> Any:
+                # get (not must_get): recovery at finish time could navigate and induce duplicate
+                # actions, so a lost page yields None and the verdict is accepted as-is.
+                return await browser_state.get_working_page()
+
         else:
             initial_page = await browser_state.must_get_working_page()
 
             async def _page_provider() -> Any:
                 return initial_page
+
+            async def _fingerprint_page() -> Any:
+                # The fingerprint MUST sample the page the tools act on. Bare tasks pin one page for
+                # the run, and browser_state.get_working_page() would both return the newest tab
+                # (wrong page after any popup) and repoint the working page as a side effect.
+                return None if initial_page.is_closed() else initial_page
 
         llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
         parameters = coerce_v3_parameters(task.navigation_payload)
@@ -1365,25 +1459,23 @@ class ForgeAgent:
             if len(login_credential_keys) == 1:
                 credential_parameter_key = login_credential_keys[0]
 
-        _page_fingerprint = None
-        if task_block is not None:
-            # One cheap DOM sample per call: a content hash plus length and element count, so a swap
-            # that preserves the page's shape still changes the fingerprint. Peeks with the
-            # NON-recovering accessor — recovery at finish time could navigate and induce duplicate
-            # actions; a lost page returns None (nothing to verify; accept the verdict as-is).
-            # Errors propagate: the finish gate treats them as unknown, never as settled. Timing and
-            # its deadline/cancellation bounds live with the gate, not here.
-            # Fenced to block tasks so the live bare-task arm's finish path is unchanged.
-            async def _page_fingerprint() -> str | None:
-                peek = await browser_state.get_working_page()
-                if peek is None:
-                    return None
-                probe_js = (
-                    "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
-                    " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
-                    " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
-                )
-                return await peek.evaluate(probe_js)
+        # One cheap DOM sample per call: a content hash plus length and element count, so a swap
+        # that preserves the page's shape still changes the fingerprint. A lost page returns None
+        # (nothing to verify; accept the verdict as-is). Errors propagate: the finish gate treats
+        # them as unknown, never as settled. Timing and its deadline/cancellation bounds live with
+        # the gate, not here. Built for both populations — the failure-evidence gate needs a sampler
+        # to run at all — over the same page accessor each population's tools use, so the evidence
+        # is sampled from the page the model actually acted on.
+        async def _page_fingerprint() -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+            probe_js = (
+                "() => { if (!document.body) return '0'; const s = document.body.innerHTML;"
+                " let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;"
+                " return h + ':' + s.length + ':' + document.querySelectorAll('*').length; }"
+            )
+            return await peek.evaluate(probe_js)
 
         resolve_typed_text = None
         if task_block is not None:
@@ -1416,6 +1508,10 @@ class ForgeAgent:
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                # The 2026-08-18 scoping decision kept the completed-side settle probe off the
+                # bare-task arm. Fenced by its own deferral budget so it does not also disable
+                # the failure-evidence gate that shares the sampler (SKY-14598).
+                max_settle_deferrals=DEFAULT_MAX_SETTLE_DEFERRALS if task_block is not None else 0,
                 llm_caller=llm_caller,
                 goal=goal,
                 parameters=parameters,
@@ -3352,6 +3448,14 @@ class ForgeAgent:
         engine: RunEngine = RunEngine.openai_cua,
     ) -> tuple[list[Action], OpenAIResponse | None]:
         cua_model = app.OPENAI_CUA_MODEL
+        # The CUA tool must declare the browser's real viewport so returned coordinates land in the
+        # page's own space. The live viewport can be smaller than the settings default, so read it
+        # from the scraped page rather than assuming BROWSER_WIDTH/HEIGHT.
+        cua_window_dimension = (
+            cast(Resolution, scraped_page.window_dimension)
+            if scraped_page.window_dimension
+            else Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
+        )
         if not previous_response:
             # this is the first step
             first_response: OpenAIResponse = await app.OPENAI_CLIENT.responses.create(
@@ -3359,8 +3463,8 @@ class ForgeAgent:
                 tools=[
                     {
                         "type": "computer_use_preview",
-                        "display_width": settings.BROWSER_WIDTH,
-                        "display_height": settings.BROWSER_HEIGHT,
+                        "display_width": cua_window_dimension["width"],
+                        "display_height": cua_window_dimension["height"],
                         "environment": "browser",
                     }
                 ],
@@ -3449,8 +3553,8 @@ class ForgeAgent:
                 tools=[
                     {
                         "type": "computer_use_preview",
-                        "display_width": settings.BROWSER_WIDTH,
-                        "display_height": settings.BROWSER_HEIGHT,
+                        "display_width": cua_window_dimension["width"],
+                        "display_height": cua_window_dimension["height"],
                         "environment": "browser",
                     }
                 ],
@@ -3490,8 +3594,8 @@ class ForgeAgent:
                 tools=[
                     {
                         "type": "computer_use_preview",
-                        "display_width": settings.BROWSER_WIDTH,
-                        "display_height": settings.BROWSER_HEIGHT,
+                        "display_width": cua_window_dimension["width"],
+                        "display_height": cua_window_dimension["height"],
                         "environment": "browser",
                     }
                 ],
@@ -3554,6 +3658,9 @@ class ForgeAgent:
         if uses_new_computer_tool:
             type = "computer_20251124"
             betas = ["computer-use-2025-11-24"]
+        # These are placeholder dimensions: LLMCaller.call rewrites display_*_px to the screenshot
+        # resize target derived from the live window_dimension (passed below) before the request, so
+        # a dynamic viewport is already reflected there. Do not special-case it here.
         tools = [
             {
                 "type": type,
@@ -5579,39 +5686,17 @@ class ForgeAgent:
         Returns:
             bool: True if this is a multi-field TOTP sequence
         """
-        # Must have at least 4 actions (minimum for TOTP)
-        if len(actions) < 4:
-            return False
-
-        # Check if we have multiple consecutive single-digit INPUT_TEXT actions
-        consecutive_single_digits = 0
-        max_consecutive = 0
-
-        for action in actions:
-            if (
-                action.action_type == ActionType.INPUT_TEXT
-                and hasattr(action, "text")
-                and action.text
-                and len(action.text) == 1
-                and action.text.isdigit()
-            ):
-                consecutive_single_digits += 1
-                max_consecutive = max(max_consecutive, consecutive_single_digits)
-            else:
-                # If we hit a non-single-digit action, reset consecutive counter
-                consecutive_single_digits = 0
-
-        # Consider it a multi-field TOTP if we have 4+ consecutive single-digit inputs
-        # This is more reliable than just counting total single digits
-        # We use 4+ as the threshold to avoid false positives with single TOTP fields
-        is_multi_field_totp = max_consecutive >= 4
+        observations = (
+            (
+                action.action_type.value if isinstance(action.action_type, ActionType) else "",
+                getattr(action, "text", None),
+            )
+            for action in actions
+        )
+        is_multi_field_totp = _has_multi_field_totp_shape(observations)
 
         if is_multi_field_totp:
-            LOG.debug(
-                "Detected multi-field TOTP sequence",
-                max_consecutive=max_consecutive,
-                total_actions=len(actions),
-            )
+            LOG.debug("Detected multi-field TOTP sequence", total_actions=len(actions))
 
         return is_multi_field_totp
 
@@ -5838,7 +5923,7 @@ class ForgeAgent:
                         artifact_type=ArtifactType.SCREENSHOT_FINAL,
                         data=screenshot,
                     )
-                except TargetClosedError:
+                except (TargetClosedError, ScreenshotTargetClosed):
                     LOG.warning(
                         "Failed to take screenshot before sending task response, page is closed",
                     )
@@ -7604,6 +7689,45 @@ class ForgeAgent:
             and not place_to_enter_verification_code
             and not should_enter_verification_code
         ):
+            return json_response, []
+
+        # The first plan may already carry a runtime-consumable multi-field TOTP shape backed by the
+        # runtime secret stash. In that case the existing per-digit execution path resolves it, so the
+        # polling verification re-plan is redundant and would discard the first plan. Magic-link
+        # verification and payload OTP both outrank it and are resolved on their own paths, so the skip
+        # never runs ahead of them.
+        runtime_context = skyvern_context.current()
+        workflow_run_id = getattr(task, "workflow_run_id", None)
+        workflow_run_context = None
+        if workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+        multi_field_secret_ready = bool(runtime_context and runtime_context.totp_codes.get(f"{task.task_id}_secret"))
+        first_plan_actions = json_response.get("actions")
+        if (
+            should_resolve_verification_code
+            and not should_verify_by_magic_link
+            and isinstance(first_plan_actions, list)
+            and _first_plan_carries_consumable_totp(first_plan_actions, multi_field_secret_ready)
+            and extract_totp_from_navigation_inputs(task.navigation_payload) is None
+        ):
+            LOG.info(
+                "Keeping first-pass credential TOTP plan; skipping verification re-plan",
+                task_id=task.task_id,
+            )
+            return json_response, []
+
+        if (
+            should_resolve_verification_code
+            and not should_verify_by_magic_link
+            and isinstance(first_plan_actions, list)
+            and _first_plan_carries_single_field_credential_totp(
+                first_plan_actions,
+                workflow_run_context,
+                getattr(runtime_context, "active_credential_parameter_key", None),
+            )
+            and extract_totp_from_navigation_inputs(task.navigation_payload) is None
+        ):
+            LOG.info("Keeping first-pass single-field credential TOTP plan", task_id=task.task_id)
             return json_response, []
 
         if should_resolve_verification_code:

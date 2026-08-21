@@ -172,6 +172,67 @@ ACTION_LOOP_TERMINATE_AFTER = 6
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
 
+# Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
+# solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
+# complete asynchronously — the sampled false-negative verdicts fired 2-7s after the model's last
+# look while the page went on to show the submission confirmation. Trigger tools are the ones whose
+# page effects can land after their tool result; the window is in loop turns so intervening
+# perception does NOT disarm it (the state can flip after the last observe while a protocol is in
+# flight). The true verdict-to-flip latency is unmeasured in the sampled replays: the quiescence
+# wait exits on the first stable fingerprint pair (so honest gated failures pay ~one sample), the
+# cap only bounds a still-mutating page, and the effective evidence window is dominated by the
+# deferral round-trip itself (one LLM turn + the observe).
+# Completed-side settle deferrals. 0 disables that gate while leaving the failure-evidence gate
+# (which shares the fingerprint sampler) intact.
+DEFAULT_MAX_SETTLE_DEFERRALS = 2
+FAILURE_EVIDENCE_WINDOW_TURNS = 5
+FAILURE_EVIDENCE_SETTLE_MAX_SECONDS = 8.0
+# A deferral needs room for its corrected cycle; without it the gate would convert an honest
+# failure verdict into budget_exhausted (a budget cap landing mid-deferral). The worst-case cycle
+# is wait + observe + re-finish — the deferral message invites an optional brief wait — so both
+# the turn and tool-call reservations are 3, the latter read from a per-call refreshed counter.
+# The deadline headroom must additionally fund the settle cap plus the cycle's LLM round trips.
+FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS = 60.0
+FAILURE_EVIDENCE_MIN_TOOL_CALLS = 3
+FAILURE_EVIDENCE_MIN_TURNS = 3
+
+
+def _arms_failure_evidence(tool_name: str, args: dict[str, Any], ok: bool) -> bool:
+    """solve_captcha arms on ANY dispatch — its "not solved" error is exactly the verdict the async
+    protocol can contradict. Other actions arm only when they reached the page AND in their
+    submit-shaped form: any click, an Enter press, or a type that pressed Enter."""
+    if tool_name == "solve_captcha":
+        return True
+    if not ok:
+        return False
+    if tool_name == "click":
+        # Deliberately broad: the loop has no submit-classification for click targets, and
+        # narrowing by label/selector text is the marker-parsing this design avoids.
+        return True
+    if tool_name == "press_key":
+        return str(args.get("key", "")).strip().lower() in ("enter", "return", "numpadenter")
+    if tool_name == "type":
+        return bool(args.get("press_enter"))
+    return False
+
+
+@dataclass
+class ActivityRecency:
+    """Written by the tool loop each turn/action, read by the finish tool's failure-evidence gate."""
+
+    turn: int = 0
+    turns_remaining: int | None = None
+    tool_calls_remaining: int | None = None
+    tokens_remaining: int | None = None
+    last_turn_tokens: int = 0
+    last_trigger_turn: int | None = None
+    # True while any perception tool's identical-snapshot streak is one short of the stall
+    # terminator: a deferral-forced observe must never be the snapshot that trips it.
+    perception_stall_imminent: bool = False
+
+    def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
+        return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
+
 
 def _unblocker_options(available_tools: set[str]) -> list[str]:
     options = []
@@ -226,10 +287,13 @@ def _append_skipped_tool_results(
 
 def make_finish_tool(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
-    max_settle_deferrals: int = 2,
+    max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     deadline_at: float | None = None,
     settle_wait_seconds: float = 0.7,
+    activity: ActivityRecency | None = None,
+    max_failure_deferrals: int = 1,
+    failure_settle_max_seconds: float = FAILURE_EVIDENCE_SETTLE_MAX_SECONDS,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -237,8 +301,40 @@ def make_finish_tool(
     the settled state instead of a mid-render shell — delayed loads otherwise produce stochastic
     false completions. A sampling error is unknown, not settled: it defers. The wait between samples
     is capped at `deadline_at` (time.monotonic clock) and abandoned once `should_cancel` reports
-    True, so probing cannot outlive the loop's own bounds."""
+    True, so probing cannot outlive the loop's own bounds.
+
+    The symmetric failure side: when `activity` reports recent submit-class/captcha activity, a
+    finish(failed) is held for ONE evidence turn (`max_failure_deferrals`, per run like the
+    completed-side cap, not per verdict attempt) — a quiescence wait
+    bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
+    because async submissions and captcha protocols otherwise produce false-negative verdicts.
+    terminated is never gated on either side."""
     deferrals = 0
+    failure_deferrals = 0
+
+    async def _quiesced() -> bool:
+        """Bounded wait for the page to stop mutating before the failure verdict's evidence turn.
+        Returns False when there is no page to observe (a deferral would burn a turn for nothing)."""
+        assert page_fingerprint is not None  # gated by the caller's None check
+        prev = await page_fingerprint()
+        if prev is None:
+            return False
+        cap_at = time.monotonic() + failure_settle_max_seconds
+        while True:
+            wait = min(settle_wait_seconds, cap_at - time.monotonic())
+            if deadline_at is not None:
+                wait = min(wait, deadline_at - time.monotonic())
+            if wait <= 0:
+                return True
+            await asyncio.sleep(wait)
+            if should_cancel is not None and await should_cancel():
+                return True  # defer: the loop's cancellation check ends the run before another turn
+            current = await page_fingerprint()
+            if current is None:
+                return False
+            if current == prev:
+                return True
+            prev = current
 
     async def _settled() -> bool:
         assert page_fingerprint is not None  # gated by the caller's None check
@@ -255,7 +351,7 @@ def make_finish_tool(
         return first == await page_fingerprint()
 
     async def handler(args: dict[str, Any]) -> ToolResult:
-        nonlocal deferrals
+        nonlocal deferrals, failure_deferrals
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -275,6 +371,53 @@ def make_finish_tool(
                     "called finish. Wait for it to settle, re-observe, confirm the goal's effect is "
                     "present in the loaded content (not a loading indicator or empty container), "
                     "then finish again."
+                )
+        if (
+            status == "failed"
+            and activity is not None
+            and page_fingerprint is not None
+            and failure_deferrals < max_failure_deferrals
+            and activity.armed()
+            # The corrected cycle needs budget for its worst case (wait + observe + re-finish);
+            # without headroom on every budget axis a deferral would convert an honest failure
+            # into budget_exhausted (or, for a stall-streak one short of the terminator, into a
+            # generic stall termination that replaces the model's accurate reason).
+            and (activity.turns_remaining is None or activity.turns_remaining >= FAILURE_EVIDENCE_MIN_TURNS)
+            and (
+                activity.tool_calls_remaining is None
+                or activity.tool_calls_remaining >= FAILURE_EVIDENCE_MIN_TOOL_CALLS
+            )
+            # The token margin is deliberately approximate: sized off the triggering turn, while
+            # the deferral turns carry a slightly larger transcript.
+            and (
+                activity.tokens_remaining is None
+                or activity.tokens_remaining >= FAILURE_EVIDENCE_MIN_TURNS * max(activity.last_turn_tokens, 1)
+            )
+            and not activity.perception_stall_imminent
+            and (
+                deadline_at is None or deadline_at - time.monotonic() >= FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS
+            )
+        ):
+            should_defer = True
+            try:
+                # False only when there is no page to observe; cancellation mid-wait still defers
+                # (the loop's own cancel check ends the run first).
+                should_defer = await _quiesced()
+            except Exception:
+                pass  # unknown page state still defers: the model's re-observe is the evidence step
+            if should_defer:
+                failure_deferrals += 1
+                LOG.info("taskv3 finish failure deferred for evidence", turn=activity.turn)
+                return ToolResult.error(
+                    "failure verdict held for one evidence check: it follows recent page actions or "
+                    "a captcha attempt whose effects can land after your last look — submissions and "
+                    "captcha protocols often complete asynchronously, so the page may no longer show "
+                    "the state this verdict was based on. Re-observe the page once (waiting briefly "
+                    "first if it may still be processing): only a positive confirmation of the goal "
+                    "(e.g. a submission confirmation banner) justifies finishing with "
+                    "status=completed; if it still shows the blocked or failed state, or shows no "
+                    "positive confirmation at all, finish with status=failed again and the verdict "
+                    "will stand."
                 )
         return ToolResult.ok(
             content="Task attempt ended. No further actions are permitted.",
@@ -367,6 +510,7 @@ async def run_agent_tool_loop(
     stall_terminate_after: int | None = PERCEPTION_STALL_TERMINATE_AFTER,
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
     action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
+    activity: ActivityRecency | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     openai_tools = [tool.to_openai_tool() for tool in tools]
@@ -448,6 +592,10 @@ async def run_agent_tool_loop(
             outcome = LoopOutcome("budget_exhausted", f"max_tool_calls ({max_tool_calls}) reached")
             break
         turns += 1
+        if activity is not None:
+            activity.turn = turns
+            activity.turns_remaining = max_turns - turns
+            activity.tool_calls_remaining = max_tool_calls - total_tool_calls
 
         # Elide superseded perception results before re-sending the transcript, so a perception-heavy
         # run can't balloon the context to the token backstop (the pre-compaction runaway mode).
@@ -504,6 +652,9 @@ async def run_agent_tool_loop(
         if not turn_tokens:
             turn_tokens = (_get(usage, "prompt_tokens") or 0) + (_get(usage, "completion_tokens") or 0)
         total_tokens += int(turn_tokens or 0)
+        if activity is not None:
+            activity.last_turn_tokens = int(turn_tokens or 0)
+            activity.tokens_remaining = None if max_tokens is None else max_tokens - total_tokens
 
         text = _extract_text(response)
         tool_calls = _extract_tool_calls(response)
@@ -547,6 +698,10 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(messages, tool_calls[idx:], "action-step budget reached")
                 break
             total_tool_calls += 1
+            if activity is not None:
+                # Refreshed per call, not per turn: a batched action+finish turn must not defer on
+                # a stale turn-start snapshot (the conversion the headroom guard exists to prevent).
+                activity.tool_calls_remaining = max_tool_calls - total_tool_calls
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -606,6 +761,10 @@ async def run_agent_tool_loop(
                 prev = stall_counts.get(tool_name)
                 identical_count = prev[1] + 1 if prev is not None and prev[0] == result.content else 1
                 stall_counts[tool_name] = (result.content, identical_count)
+                if activity is not None and stall_terminate_after is not None:
+                    activity.perception_stall_imminent = any(
+                        count >= stall_terminate_after - 1 for _, count in stall_counts.values()
+                    )
                 if stall_terminate_after is not None and identical_count >= stall_terminate_after:
                     LOG.info(
                         "taskv3 loop perception stalled", tool=tool_name, identical_count=identical_count, turn=turns
@@ -660,6 +819,8 @@ async def run_agent_tool_loop(
                 round_actions.append((tool_name, args, result.status == "ok"))
                 if spec.billable and result.status == "ok":
                     billable_actions.append(tool_name)
+                if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
+                    activity.last_trigger_turn = turns
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}

@@ -21,7 +21,7 @@ from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Request, Response, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Request, Response
 from pydantic import BaseModel, field_validator
 
 from skyvern.config import settings
@@ -78,6 +78,7 @@ from skyvern.exceptions import (
     PhoneNumberInputBrowserInteractionFailed,
     PhoneNumberInputBrowserValidityMismatch,
     PhoneNumberInputMismatch,
+    ScreenshotTargetClosed,
     SecretInputMismatch,
     SkyvernException,
     SkyvernHTTPException,
@@ -135,6 +136,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
@@ -164,6 +166,7 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
@@ -260,19 +263,19 @@ _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, tt
 
 
 def _is_selected_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    """A driver-native timeout under THIS run's selected engine; the stock Playwright ``TimeoutError``
-    identity when no engine is pinned (unchanged default)."""
+    """A driver-native timeout under THIS run's selected engine; any installed Playwright-family
+    driver's timeout identity when no engine is pinned."""
     if engine_selection is not None:
         return engine_selection.is_engine_timeout_error(exc)
-    return isinstance(exc, TimeoutError)
+    return is_driver_timeout_error(exc)
 
 
 def _is_selected_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    """A driver-native error under THIS run's selected engine; the stock Playwright ``Error`` identity
-    when no engine is pinned (unchanged default)."""
+    """A driver-native error under THIS run's selected engine; any installed Playwright-family
+    driver's error identity when no engine is pinned."""
     if engine_selection is not None:
         return engine_selection.is_engine_error(exc)
-    return isinstance(exc, PlaywrightError)
+    return is_driver_error(exc)
 
 
 class _CollapseGateResult(NamedTuple):
@@ -4564,6 +4567,13 @@ class ActionHandler:
             else:
                 LOG.exception("Unhandled exception in action handler", action=action)
                 actions_result.append(ActionFailure(e))
+        except ScreenshotTargetClosed as e:
+            LOG.warning(
+                "Browser target closed while handling action",
+                action=action,
+                exception_message=str(e),
+            )
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
@@ -6092,25 +6102,23 @@ def _emit_tel_input_outcome(
         return
 
     try:
-        final_result = results[-1] if results else None
-        if isinstance(final_result, ActionSuccess):
-            terminal_result = ActionStatus.completed.value
-        elif isinstance(final_result, ActionAbort):
-            terminal_result = ActionStatus.skipped.value
-        else:
-            terminal_result = ActionStatus.failed.value
-        if exception_type is None and final_result is not None:
-            exception_type = final_result.exception_type
-        LOG.info(
-            "tel_input_outcome",
-            sampling=False,
-            **outcome.model_dump(mode="json"),
-            terminal_result=terminal_result,
-            exception_type=exception_type,
-        )
-    except Exception as exc:
-        with contextlib.suppress(Exception):
-            LOG.warning("Failed to emit tel input outcome", error_type=type(exc).__name__)
+        with contained_effect("emit tel input outcome"):
+            final_result = results[-1] if results else None
+            if isinstance(final_result, ActionSuccess):
+                terminal_result = ActionStatus.completed.value
+            elif isinstance(final_result, ActionAbort):
+                terminal_result = ActionStatus.skipped.value
+            else:
+                terminal_result = ActionStatus.failed.value
+            if exception_type is None and final_result is not None:
+                exception_type = final_result.exception_type
+            LOG.info(
+                "tel_input_outcome",
+                sampling=False,
+                **outcome.model_dump(mode="json"),
+                terminal_result=terminal_result,
+                exception_type=exception_type,
+            )
     finally:
         action.tel_input_outcome = None
 
@@ -8040,6 +8048,14 @@ async def handle_complete_action(
         verification_result = await app.agent.complete_verify(
             page, scraped_page, task, step, verification_trigger="complete_action_forced"
         )
+    except ScreenshotTargetClosed as e:
+        _span.set_attribute("verification_path", "needs_llm_error")
+        LOG.warning(
+            "Browser target closed while verifying the complete action",
+            workflow_run_id=task.workflow_run_id,
+            exception_message=str(e),
+        )
+        return [ActionFailure(exception=e)]
     except Exception as e:
         _span.set_attribute("verification_path", "needs_llm_error")
         LOG.exception(

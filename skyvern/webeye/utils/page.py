@@ -16,7 +16,6 @@ import structlog
 from opentelemetry import trace as otel_trace
 from PIL import Image
 from playwright._impl._errors import Error as PlaywrightError
-from playwright._impl._errors import TimeoutError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
@@ -25,6 +24,7 @@ from skyvern.forge.sdk.browser_action_preflight import policy_observation_enable
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
+from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_health import BrowserOperation
@@ -242,15 +242,16 @@ _NAVIGATION_SETTLE_TIMEOUT_MS = 3000
 
 
 def _is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    """Whether ``exc`` belongs to THIS run's selected browser-engine error family. Falls back to the
-    stock-Playwright identity when no engine is pinned, so an unmigrated caller keeps exact stock
-    behavior; a foreign engine's error (or an unrelated exception) is rejected and left to propagate."""
-    return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
+    """Whether ``exc`` belongs to THIS run's selected browser-engine error family. Falls back to every
+    installed Playwright-family driver's identity when no engine is pinned, because an unpinned caller
+    can hold a page from either driver package the image installs; a foreign engine's error (or an
+    unrelated exception) is rejected and left to propagate."""
+    return engine_selection.is_engine_error(exc) if engine_selection is not None else is_driver_error(exc)
 
 
 def is_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
     return (
-        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else is_driver_timeout_error(exc)
     )
 
 
@@ -1547,6 +1548,11 @@ class SkyvernFrame:
                     _close_screenshot_stitch_resources(images, merged_img, buffer)
                     if len(images) > 1:
                         gc.collect()
+        except ScreenshotTargetClosed:
+            # The fallback below captures the same page, so a closed target can only fail there too.
+            x = None
+            y = None
+            raise
         except Exception:
             LOG.warning(
                 "Failed to take full page screenshot, fallback to use playwright full page screenshot",

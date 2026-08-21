@@ -570,7 +570,7 @@ async def _take_workflow_run_block_screenshot(
     """
     browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
     if not browser_state:
-        LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+        LOG.info("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
         screenshot = await browser_state.take_fullpage_screenshot()
         if screenshot:
@@ -3274,7 +3274,7 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
                 if isinstance(current_value, dict):
                     block_reference_data.update(current_value)
                 else:
-                    LOG.warning(
+                    LOG.debug(
                         f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
                     )
 

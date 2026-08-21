@@ -25,7 +25,14 @@ REDACTED = "****"
 
 # Request headers dropped wholesale from request logs.  proxy-authorization and
 # set-cookie carry credentials too and are classified as such by other modules.
-SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+SENSITIVE_HEADERS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-posthog-attribution",
+}
 
 # Exact field names that are always redacted.  Use a set for O(1) lookup
 # instead of regex substring matching to avoid false positives like

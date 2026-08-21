@@ -327,6 +327,10 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
     tool_input: dict = Field(default_factory=dict, description="Sanitized tool input (no secrets)")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
@@ -356,6 +360,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
             "passed or failed; None for non-run tools."
         ),
+    )
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
     )
 
 

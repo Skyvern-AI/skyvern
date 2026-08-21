@@ -351,24 +351,58 @@ _OBSERVE_JS = (
   // Monotonic across observe() calls (persisted on window), and never reassigned on an element that
   // already has one, so a data-tv3 marker always denotes the same element. Resetting the counter per
   // call let a selector remembered from an earlier observe silently resolve to a different node.
-  if (typeof window.__tv3_next !== 'number') window.__tv3_next = 0;
+  if (!Number.isInteger(window.__tv3_next) || window.__tv3_next < 0 || window.__tv3_next > 1e9) window.__tv3_next = 0;
   let i = 0;
+  let dropped = 0;
   let lastGroup = '';
   for (const el of els) {
+   // A form exposes its named controls as its own properties, so <input name="tagName"> makes
+   // el.tagName that input. Every read below can therefore be a clobbered non-function, and the
+   // loop is inside page.evaluate: one throw costs the whole element list, not one element.
+   try {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
     let selector = null;
-    const uniq = (s) => { try { return document.querySelectorAll(s).length === 1; } catch (e) { return false; } };
-    if (el.id) { const s = '#' + CSS.escape(el.id); if (uniq(s)) selector = s; }
-    if (!selector && el.getAttribute('data-testid')) { const s = '[data-testid="' + el.getAttribute('data-testid') + '"]'; if (uniq(s)) selector = s; }
-    if (!selector && el.name) { const s = el.tagName.toLowerCase() + '[name="' + el.name + '"]'; if (uniq(s)) selector = s; }
+    // Unique is not enough -- it must be THIS element. A page can pre-seed a marker or exploit
+    // U+0000 folding to U+FFFD so a selector matches exactly one node that is a different one.
+    const resolves = (s) => { try { return document.querySelectorAll(s).length === 1 && document.querySelector(s) === el; } catch (e) { return false; } };
+    // Values here are page-controlled: an unescaped `"` closes the selector and turns it into a
+    // selector list aimed at an element of the page's choosing, which still resolves uniquely.
+    // String() because form named getters make el.id/el.name return an ELEMENT, not a string.
+    const attr = (name, value) => '[' + name + '="' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+    // The model copies these selectors back verbatim, and an escape sequence does not survive that:
+    // `#\31 abc` addresses a different codepoint the moment its terminating space is dropped. The
+    // escape being a no-op is exactly the condition for the id needing no escaping. The trim check
+    // is separate: Playwright trims the selector string, so `#email<NBSP>` -- which CSS.escape leaves
+    // alone, being above U+007F -- reaches the page as `#email` and silently selects a different
+    // element. Only the tail can be trimmed away; a leading one sits behind the `#` and survives.
+    if (el.id) {
+      const raw = String(el.id);
+      const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
+      const s = esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw);
+      if (resolves(s)) selector = s;
+    }
+    if (!selector && el.getAttribute('data-testid')) { const s = attr('data-testid', el.getAttribute('data-testid')); if (resolves(s)) selector = s; }
+    if (!selector && el.name) { const s = el.tagName.toLowerCase() + attr('name', el.name); if (resolves(s)) selector = s; }
     if (!selector) {
       let m = el.getAttribute('data-tv3');
       // Reuse a marker only if it still uniquely resolves; otherwise mint a fresh monotonic one.
       // Keeps a marker stable across observe() calls without trusting a foreign, duplicated, or
       // syntactically-broken data-tv3 value that a remembered selector could resolve to the wrong node.
-      if (!m || !uniq('[data-tv3="' + m + '"]')) { m = 't' + (window.__tv3_next++); el.setAttribute('data-tv3', m); }
-      selector = '[data-tv3="' + m + '"]';
+      if (!m || !resolves(attr('data-tv3', m))) {
+        // Skip values the page already carries, or a pre-seeded data-tv3 collides with a freshly
+        // minted one and two elements share a selector. Bounded, and the suffix varies per attempt:
+        // a frozen or saturated counter makes ++ a no-op, and an unbounded search would wedge the
+        // renderer for the rest of the run. An element we cannot name uniquely is left unlisted.
+        m = null;
+        for (let n = 0; n < 64 && m === null; n++) {
+          const candidate = 't' + (window.__tv3_next++) + (n ? '-' + n : '');
+          if (!document.querySelector(attr('data-tv3', candidate))) m = candidate;
+        }
+        if (m === null) { dropped++; continue; }
+        el.setAttribute('data-tv3', m);
+      }
+      selector = attr('data-tv3', m);
     }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
     if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
@@ -397,6 +431,7 @@ _OBSERVE_JS = (
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     out.push(rec);
     if (++i > 250) break;
+   } catch (e) { dropped++; continue; }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
   // summaries) live in non-interactive nodes the element list can never carry. Sources are
@@ -458,7 +493,7 @@ _OBSERVE_JS = (
       iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, dropped: dropped, elements: out });
 }
 """
 )
@@ -557,6 +592,11 @@ def build_browser_tools(
                 + "; ".join(parts)
                 + overflow
             )
+        dropped = data.get("dropped") or 0
+        if dropped:
+            # Without this an element list emptied by unreadable elements is indistinguishable from
+            # a page that genuinely has no controls.
+            lines.append(f"note: {dropped} element(s) could not be described and are not listed below")
         for e in elements:
             extra = ""
             if e.get("value"):

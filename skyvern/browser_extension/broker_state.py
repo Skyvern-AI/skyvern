@@ -666,6 +666,14 @@ def read_readiness(fd: int, *, timeout: float = STARTUP_TIMEOUT_SECONDS) -> dict
         raise BrowserExtensionBrokerError("INVALID_READINESS", "Broker readiness response is invalid") from exc
     if not isinstance(value, dict) or value.get("status") not in {"READY", "ERROR"}:
         raise BrowserExtensionBrokerError("INVALID_READINESS", "Broker readiness response is invalid")
+    if value["status"] == "READY":
+        port = value.get("port")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise BrowserExtensionBrokerError("INVALID_READINESS", "Broker readiness response is invalid")
+    else:
+        code = value.get("code")
+        if not isinstance(code, str) or not code:
+            raise BrowserExtensionBrokerError("INVALID_READINESS", "Broker readiness response is invalid")
     return value
 
 

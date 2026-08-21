@@ -127,7 +127,7 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
             if isinstance(current_value, dict):
                 block_reference_data.update(current_value)
             else:
-                LOG.warning(
+                LOG.debug(
                     f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
                 )
 
@@ -277,9 +277,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
             task_id = context.task_id if context else None
             task = await app.DATABASE.tasks.get_task(task_id, organization_id) if task_id and organization_id else None
             if organization_id and task and step:
-                actions = parse_actions(
-                    task, step.step_id, step.order, self.scraped_page, json_response.get("actions", [])
-                )
+                actions = parse_actions(task, step.step_id, step.order, self.scraped_page, actions_json)
+                if not actions:
+                    raise SkyvernActionFailed(
+                        f"AI returned no usable click action for intention: {intention}. "
+                        "The proposed action could not be parsed."
+                    )
                 action = cast(ClickAction, actions[0])
 
                 # Run the registered click setup (e.g. the selected-state guard) the
@@ -544,6 +547,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
         else:
             if is_unresolved_totp_value(transformed_value):
                 raise NoTOTPSecretFound()
+            if not selector:
+                raise SkyvernActionFailed(
+                    "Input text failed: no selector was provided and no intention was given to locate the element"
+                )
             locator = self.page.locator(selector)
             await handler_utils.input_sequentially(locator, transformed_value, timeout=timeout)
         return value

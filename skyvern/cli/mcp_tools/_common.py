@@ -5,7 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 from skyvern.cli.core.artifacts import get_artifact_dir, save_artifact
-from skyvern.cli.core.result import Artifact, BrowserContext, ErrorCode, Timer, make_error, make_result
+from skyvern.cli.core.result import (
+    Artifact,
+    BrowserContext,
+    ErrorCode,
+    Timer,
+    make_error,
+    make_result,
+    restore_pending_attach,
+)
 from skyvern.client.errors import NotFoundError
 
 DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
@@ -105,6 +113,7 @@ __all__ = [
     "raw_http_delete",
     "raw_http_get",
     "raw_http_post",
+    "restore_pending_attach",
     "raw_http_put",
     "save_artifact",
 ]

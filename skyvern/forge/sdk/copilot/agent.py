@@ -151,6 +151,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     BrowserProbeOutcome,
     _browser_context_attachability,
 )
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import OBSTRUCTION_SUMMARY_MAX_CHARS
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values
 from skyvern.forge.sdk.copilot.streaming_adapter import (
@@ -680,8 +681,8 @@ def _clean_authoring_repair_prompt_atom(value: str, *, max_chars: int = 160) -> 
     return cleaned[:max_chars]
 
 
-def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 20) -> str:
-    cleaned = [_clean_authoring_repair_prompt_atom(item) for item in items[:max_items]]
+def _render_authoring_repair_prompt_list(items: list[str], *, max_items: int = 20, max_chars: int = 160) -> str:
+    cleaned = [_clean_authoring_repair_prompt_atom(item, max_chars=max_chars) for item in items[:max_items]]
     return ", ".join(item for item in cleaned if item) or "(none)"
 
 
@@ -848,6 +849,11 @@ def _code_authoring_repair_context_prompt(ctx: CopilotContext | None) -> str:
             lines.append(
                 f"page_challenges: {_render_authoring_repair_prompt_list(repair_context.page_challenge_summaries)}"
             )
+        if repair_context.page_obstruction_summaries:
+            rendered_obstructions = _render_authoring_repair_prompt_list(
+                repair_context.page_obstruction_summaries, max_chars=OBSTRUCTION_SUMMARY_MAX_CHARS
+            )
+            lines.append(f"page_obstructions: {rendered_obstructions}")
     if repair_context.reason_code == "metadata_reject":
         if repair_context.runtime_failure_reason:
             lines.append(
@@ -1719,6 +1725,7 @@ def _build_narrative_payload(
             else:
                 block_type = str(block_type_value or "task")
             raw_status = ctx.block_state_map.get(label)
+            run_identity = ctx.block_run_identity_map.get(label)
             block_entry: NarrativeBlock = {
                 "label": label,
                 "blockType": block_type,
@@ -1726,11 +1733,13 @@ def _build_narrative_payload(
                     raw_status,
                     drafted_fallback=ctx.has_staged_proposal,
                 ),
-                "lastSeenIteration": 0,
+                "lastSeenIteration": run_identity.iteration if run_identity is not None else 0,
                 "activity": list(block_activity.get(label, [])),
                 "startedAt": ctx.block_started_at_map.get(label),
                 "endedAt": ctx.block_ended_at_map.get(label),
             }
+            if run_identity is not None:
+                block_entry["workflowRunBlockId"] = run_identity.workflow_run_block_id
             if recorded_outcome is not None and label in outcome_labels:
                 block_entry["outcome"] = recorded_outcome.verdict
                 block_entry["outcomeRole"] = recorded_outcome.role

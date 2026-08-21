@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
     post_run_inspection_cleanly_matches,
+    repair_page_evidence_is_admissible,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -584,7 +585,7 @@ def _preserves_existing_post_run_page_evidence(
     *,
     run_id: str,
 ) -> bool:
-    if stamped.get("observed_after_workflow_run") is True and has_bounded_page_schema(stamped):
+    if stamped.get("observed_after_workflow_run") is True and repair_page_evidence_is_admissible(stamped):
         return False
     return post_run_inspection_cleanly_matches(copilot_ctx.composition_page_evidence, run_id)
 

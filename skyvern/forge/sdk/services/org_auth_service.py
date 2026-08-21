@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.request_logging import set_request_organization
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
@@ -185,11 +186,11 @@ async def get_current_org(
 
 
 def apply_request_org_context(organization: Organization) -> None:
-    """Populate skyvern_context + OTEL span with the resolved organization.
+    """Populate skyvern_context, the api.raw_request record, and the OTEL span with the org.
 
-    Shared by get_current_org and get_current_caller_context so the cached
-    helper paths (which short-circuit the per-helper context-setting on cache
-    hits) still leave a consistent request-scoped context for downstream routes.
+    Every request-scoped auth path funnels through here so a cache hit — which
+    short-circuits the per-helper context-setting — still leaves a consistent
+    request-scoped identity for downstream routes and for request logging.
     """
     try:
         ctx = skyvern_context.current()
@@ -198,6 +199,8 @@ def apply_request_org_context(organization: Organization) -> None:
             ctx.organization_name = organization.organization_name
     except Exception:
         pass
+    # The request-logging middleware sits outside skyvern_context, so it needs its own stamp.
+    set_request_organization(organization.organization_id, organization.organization_name)
     if not settings.OTEL_ENABLED:
         return
     try:
@@ -296,13 +299,20 @@ async def get_current_org_with_api_token(
 
 async def get_current_org_with_authentication(
     authorization: Annotated[str | None, Header()] = None,
+    x_posthog_attribution: Annotated[
+        str | None,
+        Header(alias=POSTHOG_ATTRIBUTION_HEADER, include_in_schema=False),
+    ] = None,
 ) -> Organization:
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    return await authenticate_helper(authorization)
+    return await authenticate_helper(
+        authorization,
+        attribution_header=x_posthog_attribution,
+    )
 
 
 def _extract_bearer_token(authorization: str) -> str | None:
@@ -342,12 +352,7 @@ async def authenticate_helper(
             detail="Invalid credentials",
         )
 
-    # set organization_id in skyvern context and log context
-    context = skyvern_context.current()
-    if context:
-        context.organization_id = organization.organization_id
-        context.organization_name = organization.organization_name
-
+    apply_request_org_context(organization)
     return organization
 
 
@@ -589,12 +594,6 @@ async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
         invalidation_generation = _current_org_cache_invalidation_generation
         validation = await resolve_org_from_api_key(x_api_key, db)
 
-        # set organization_id in skyvern context and log context
-        context = skyvern_context.current()
-        if context:
-            context.organization_id = validation.organization.organization_id
-            context.organization_name = validation.organization.organization_name
-
         if invalidation_generation == _current_org_cache_invalidation_generation:
             _current_org_cache[cache_key] = validation.organization
         return validation.organization
@@ -613,12 +612,11 @@ async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
             db,
             token_types=(OrganizationAuthTokenType.ui_session,),
         )
-        context = skyvern_context.current()
-        if context:
-            context.organization_id = validation.organization.organization_id
-            context.organization_name = validation.organization.organization_name
-        return validation.organization
-    return await _get_current_org_cached(x_api_key, db)
+        organization = validation.organization
+    else:
+        organization = await _get_current_org_cached(x_api_key, db)
+    apply_request_org_context(organization)
+    return organization
 
 
 def invalidate_cached_org(organization_id: str) -> None:

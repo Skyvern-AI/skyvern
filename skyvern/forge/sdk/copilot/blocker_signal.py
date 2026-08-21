@@ -6,12 +6,15 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODES
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 
 BlockerKind = Literal[
     "authority_denied",
@@ -199,6 +202,7 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     block_state_map: dict[str, str]
     block_started_at_map: dict[str, str]
     block_ended_at_map: dict[str, str]
+    block_run_identity_map: dict[str, BlockRunIdentity]
 
 
 def terminal_evidence_from_ctx(ctx: _TerminalEvidenceCtx) -> TerminalEvidence:
@@ -238,6 +242,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.block_state_map = {}
     ctx.block_started_at_map = {}
     ctx.block_ended_at_map = {}
+    ctx.block_run_identity_map = {}
 
 
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"

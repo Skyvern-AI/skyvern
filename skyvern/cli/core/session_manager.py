@@ -23,7 +23,7 @@ from skyvern.webeye.browser_errors import is_context_lost_message, is_target_clo
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
-from .result import BrowserContext, ErrorCode, make_error
+from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
 LOG = structlog.get_logger(__name__)
@@ -547,6 +547,7 @@ def _extension_browser_is_connected(browser: SkyvernBrowser) -> bool:
         return False
 
 
+@count_browser_attach
 async def resolve_browser(
     session_id: str | None = None,
     cdp_url: str | None = None,

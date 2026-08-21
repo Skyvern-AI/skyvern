@@ -359,6 +359,7 @@ def run_server() -> None:
         factory=True,
         # uvloop can double-close a recycled fd after create_connection cancellation (MagicStack/uvloop#740).
         loop="asyncio",
+        timeout_keep_alive=settings.UVICORN_TIMEOUT_KEEP_ALIVE,
         ws="websockets-sansio",
         # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
         ws_ping_interval=20.0,

@@ -43,9 +43,11 @@ ERROR_CODES = frozenset(
         "TAB_NOT_FOUND",
         "TAB_NOT_SCOPED",
         "RESTRICTED_URL",
+        "ATTACH_FAILED",
         "DEBUGGER_DETACHED",
         "CDP_METHOD_NOT_ALLOWED",
         "CDP_ERROR",
+        "COMMAND_TIMEOUT",
         "INTERNAL",
     }
 )

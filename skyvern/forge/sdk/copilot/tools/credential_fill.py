@@ -972,7 +972,7 @@ async def _fill_credential_field_impl_serial(
     if submitted:
         data["submit_url"] = safe_page_origin(observed_url) or ""
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(copilot_ctx, result, page_evidence)
     else:
         form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
         if form_submits:
