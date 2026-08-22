@@ -24,6 +24,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.forge.sdk.routes.streaming.screencast import (
     release_browser_state,
     start_screencast_loop,
@@ -80,8 +81,12 @@ async def task_stream(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
+            if disconnected.done():
+                LOG.info("Client disconnected. Closing connection", task_id=task_id, organization_id=organization_id)
+                return
             # if no activity for 5 minutes, close the connection
             if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
                 LOG.info(
@@ -155,6 +160,8 @@ async def task_stream(
     except Exception:
         LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id, exc_info=True)
         return
+    finally:
+        disconnected.cancel()
     LOG.info("WebSocket connection closed successfully", task_id=task_id, organization_id=organization_id)
     return
 
@@ -203,8 +210,16 @@ async def workflow_run_streaming(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
+            if disconnected.done():
+                LOG.info(
+                    "WofklowRun Streaming: Client disconnected. Closing connection",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                return
             # if no activity for 5 minutes, close the connection
             if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
                 LOG.info(
@@ -302,6 +317,8 @@ async def workflow_run_streaming(
             exc_info=True,
         )
         return
+    finally:
+        disconnected.cancel()
     LOG.info(
         "WofklowRun Streaming: WebSocket connection closed successfully",
         workflow_run_id=workflow_run_id,

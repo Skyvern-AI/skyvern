@@ -3512,6 +3512,13 @@ class ForgeAgent:
         screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
         if last_call_id is None:
             current_context = skyvern_context.ensure_context()
+            reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
+            assistant_message: str | None = None
+            if assistant_messages:
+                assistant_message = "\n".join(
+                    part.text for part in assistant_messages[-1].content if getattr(part, "text", None)
+                )
+            cua_question = assistant_message
             resp_content = None
             if task.task_id in current_context.totp_codes:
                 verification_code = current_context.totp_codes[task.task_id]
@@ -3524,8 +3531,6 @@ class ForgeAgent:
                 resp_content = f"Here is the verification code: {verification_code}"
             else:
                 # try address the conversation with the context we have
-                reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
-                assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
                 skyvern_repsonse_prompt = load_prompt_with_elements(
                     element_tree_builder=scraped_page,
                     prompt_engine=prompt_engine,
@@ -3542,14 +3547,23 @@ class ForgeAgent:
                     system_prompt=task.workflow_system_prompt,
                 )
                 LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
+                cua_question = cua_question or skyvern_response.get("question_or_decision")
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
                 else:
                     resp_content = f"{resp_content}\n\n{CUA_EXECUTE_ACTIONS_DIRECTIVE}"
+            # The Computer tool rejects a user-supplied input_image when the request also threads a
+            # previous response, so this visual turn must be a fresh, self-contained request. Restate
+            # the navigation goal and the question being answered so a context-dependent answer (e.g.
+            # "yes", "the second option") is not detached from what it responds to.
+            continuation_sections = [f"Task: {task.navigation_goal}"]
+            if cua_question:
+                continuation_sections.append(f"Question or decision to address: {cua_question}")
+            continuation_sections.append(resp_content)
+            continuation_content = "\n\n".join(continuation_sections)
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model=cua_model,
-                previous_response_id=previous_response.id,
                 tools=[
                     {
                         "type": "computer_use_preview",
@@ -3562,7 +3576,7 @@ class ForgeAgent:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": resp_content},
+                            {"type": "input_text", "text": continuation_content},
                             {
                                 "type": "input_image",
                                 "image_url": f"data:image/png;base64,{screenshot_base64}",

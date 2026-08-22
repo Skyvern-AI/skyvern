@@ -27,6 +27,7 @@ from skyvern.webeye.cdp_connection import (
     redact_cdp_url,
     resolve_local_pbs_cdp_url,
 )
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
@@ -117,7 +118,10 @@ class CdpChannel:
 
         LOG.info(f"{self.class_name} connecting to CDP", **self.identity)
 
-        pw = self.pw or await async_playwright().start()
+        pw = self.pw
+        if pw is None:
+            pw = await async_playwright().start()
+            close_driver_connection_on_transport_loss(pw)
 
         self.pw = pw
 

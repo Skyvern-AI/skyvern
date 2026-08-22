@@ -36,6 +36,7 @@ from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFac
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
@@ -659,6 +660,7 @@ class RealBrowserState(BrowserState):
             self.pw = await self.engine_selection.start_driver()
         else:
             self.pw = await async_playwright().start()
+            close_driver_connection_on_transport_loss(self.pw)
         try:
             await self.check_and_fix_state(
                 proxy_location=proxy_location,

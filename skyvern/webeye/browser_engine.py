@@ -39,6 +39,7 @@ from skyvern.webeye.browser_errors import (
     BrowserErrorFamiliesConfigError,
     classify_browser_error,
 )
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.tasks import Task
@@ -345,7 +346,9 @@ class BrowserEngineRegistry:
 
 
 async def _start_stock_driver() -> Playwright:
-    return await async_playwright().start()
+    driver = await async_playwright().start()
+    close_driver_connection_on_transport_loss(driver)
+    return driver
 
 
 def _stock_error_types() -> tuple[type[BaseException], type[BaseException]]:
@@ -384,7 +387,9 @@ def _stock_rich_error_types() -> BrowserEngineRichErrorTypes:
 async def _start_rustwright_driver() -> Playwright:
     from rustwright.async_api import async_playwright as rustwright_async_playwright
 
-    return await rustwright_async_playwright().start()
+    driver = await rustwright_async_playwright().start()
+    close_driver_connection_on_transport_loss(driver)
+    return driver
 
 
 def _rustwright_error_types() -> tuple[type[BaseException], type[BaseException]]:
