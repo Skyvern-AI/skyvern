@@ -590,6 +590,9 @@ _OBSERVE_JS = (
   // counted and disclosed. Every root is kept for the uniqueness probe below.
   const allRoots = [];
   const els = [];
+  // Roots whose host chain reaches a <form>. `closest` stops at the root it starts in, so a block
+  // inside a component cannot see the form its host sits in; this is that answer, carried down.
+  const inFormRoots = new Set();
   {
     const seenRoots = new Set();
     // Pushes `root`'s own matches onto `els`, and collects the roots nested directly under it into
@@ -610,7 +613,7 @@ _OBSERVE_JS = (
         if (sr && sr.nodeType === 11) {
           if (seenRoots.has(sr)) continue;
           seenRoots.add(sr);
-          kids.push({ root: sr, host: el });
+          kids.push({ root: sr, host: el, parent: root });
         }
        } catch (e) {
         // This costs the element's entire root, not the element -- its own matches were pushed by
@@ -634,6 +637,10 @@ _OBSERVE_JS = (
     while (stack.length) {
       const frame = stack.pop();
       allRoots.push(frame.root);
+      // Pre-order, so the parent root's answer is already settled when we get here.
+      try {
+        if (inFormRoots.has(frame.parent) || frame.host.closest('form')) inFormRoots.add(frame.root);
+      } catch (e) { /* one host that cannot answer only costs its own root's ranking */ }
       const kids = [];
       // One root that cannot be enumerated costs its own subtree, not the walk. A root that throws
       // for every query is disclosed by the marker gather below; one that throws only for this
@@ -1073,9 +1080,43 @@ _OBSERVE_JS = (
     // Only "error" is matched against id: id-named chrome (#alert-count, #cookie-warning) is the
     // false-positive family this channel is most exposed to, and "error" is the one id that isn't.
     const msgSel = '[class*="error" i],[class*="invalid" i],[class*="alert" i],[class*="warning" i],[id*="error" i]';
-    const msgCands = Array.from(document.querySelectorAll(msgSel));
-    const inForm = msgCands.filter((el) => el.closest('form'));
-    const orderedCands = inForm.concat(msgCands.filter((el) => !el.closest('form')));
+    // A component renders its validation summary in its own shadow root, where a document query
+    // cannot reach it -- the blindness already lifted for controls, on the channel that carries
+    // refusal messages. Walked like the ARIA and heading channels above, so this asks the page no
+    // new question, only the same one of more roots.
+    const formMsgs = [];
+    const otherMsgs = [];
+    for (const root of allRoots) {
+      // nodeType 11 first: Document has no `host`, so `root.host` would hit the HTML named-property
+      // getter and <form name="host"> would supply one.
+      const host = root.nodeType === 11 ? root.host || null : null;
+      // One component that refuses this query costs its own root, not the digest: an uncaught throw
+      // reaches the outer catch and empties every channel. A root that throws for every query is
+      // already disclosed by the marker gather; one that throws only for this selector is not, and
+      // is not defended here.
+      let cands;
+      try { cands = root.querySelectorAll(msgSel); } catch (e) { continue; }
+      for (const el of cands) {
+        // Being inside a form is what separates a validation message from page chrome, and it is
+        // a structural fact rather than a guess about which roots tend to hold content. Ranking
+        // component blocks above light-DOM ones instead would bury a page's own banner under the
+        // cookie-consent and chat widgets that also ship as components.
+        const bucket = (el.closest('form') || inFormRoots.has(root)) ? formMsgs : otherMsgs;
+        // Bounded per bucket at the same 200 the loop below stops at, so a page of components cannot
+        // make the gather itself the expensive part.
+        if (bucket.length < 200) bucket.push({ el: el, host: host });
+      }
+    }
+    const orderedCands = formMsgs.concat(otherMsgs);
+    // A per-field state wrapper (`field--has-error`, `field--no-error`) matches this selector and its
+    // text is just the control's own name, so it spends the channel's budget on what the element list
+    // already carries -- enough of them and the page's real message never fits. Read off the records
+    // already built, so recognising them asks the page nothing.
+    const listedLabels = new Set();
+    for (const r of out) {
+      const lb = (r.label || '').replace(/\s+/g, ' ').trim();
+      if (lb) listedLabels.add(lb);
+    }
     // Stricter than visible(): this channel's selector is broad and site chrome is routinely present
     // but hidden, whereas an ARIA live region styled invisible is not a pattern worth the extra reads.
     const visibleText = (el) => {
@@ -1085,15 +1126,27 @@ _OBSERVE_JS = (
       const cs = getComputedStyle(el);
       return cs.visibility !== 'hidden' && cs.opacity !== '0';
     };
-    for (const el of orderedCands) {
+    for (const cand of orderedCands) {
       if (textFull || textTotal - blockStart >= 600 || ++messageCandidates > 200) break;
       // This selector set is broad, so one poisoned element degrades to "skip it", not to an
       // emptied digest (the outer catch is for the narrow ARIA channel).
       try {
+        const el = cand.el;
         if (!visibleText(el)) continue;
-        const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        // A component's message block is `<div class="alert"><slot></slot></div>`: the words are
+        // slotted from the host's light DOM, so the block's own innerText is empty and the host
+        // carries them. Same fallback the heading channel below uses, and the field count comes
+        // from whichever node supplied the text.
+        let t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        let src = el;
+        if (!t && cand.host) {
+          t = (cand.host.innerText || '').replace(/\s+/g, ' ').trim();
+          src = cand.host;
+        }
         if (!t) continue;
-        if (t.length <= 300 || (t.length <= 900 && el.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
+        // Compared at the width labels are stored at, so a truncated one still matches.
+        if (listedLabels.has(t.slice(0, 140))) continue;
+        if (t.length <= 300 || (t.length <= 900 && src.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
       } catch (e) { continue; }
     }
     // role=heading alongside h1-h3: a component's heading is a custom element, so its tag name
