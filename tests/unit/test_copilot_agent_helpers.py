@@ -226,6 +226,9 @@ workflow_definition:
                     "workflow_run_id": "wr_budget",
                     "overall_status": "canceled",
                     "current_url": "https://example.com/lookup",
+                    # The watchdog reads the page live on the non-dispatched branch and stamps this
+                    # alongside the URL; without it a live read cannot claim a verified page state.
+                    "current_url_live_observed": True,
                     "page_title": "Example Lookup Registry",
                     "executed_block_labels": ["search_registry"],
                     "frontier_start_label": "search_registry",

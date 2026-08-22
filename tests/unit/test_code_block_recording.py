@@ -23,8 +23,13 @@ from playwright.sync_api import sync_playwright
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
-from skyvern.forge.sdk.workflow.models.code_block_recorder import CODE_BLOCK_FILENAME, RecordingPage
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    CODE_BLOCK_FILENAME,
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    RecordingPage,
+)
 from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.webeye.actions.actions import (
@@ -120,6 +125,71 @@ async def test_capture_failure_still_persists_the_action_and_reports_page_state(
     upsert.assert_awaited_once()
     warning = next(log for log in logs if log["event"] == "Code block screenshot capture failed")
     assert warning["page_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_secret_straddling_the_response_bound_is_masked_whole() -> None:
+    # The masker matches secret values by exact substring, so the recorded failure text has to be
+    # masked before it is bounded or the cut leaves an unmatchable fragment on the persisted row.
+    secret = "sk-live-" + "z" * 52
+    prefix = "Locator.click: Timeout exceeded. Call log: "
+    message = prefix.ljust(RECORDED_FAILURE_RESPONSE_MAX_CHARS - 30, "-") + secret + " intercepts pointer events"
+    assert secret not in message[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+    assert secret[:30] in message[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=AsyncMock(return_value=b"png"),
+        is_closed=lambda: False,
+        goto=AsyncMock(side_effect=RuntimeError(message)),
+    )
+    recording = _recording(page)
+    recording._workflow_run_context.secrets = {"api_token": secret}
+    unbound_mask = WorkflowRunContext.mask_secrets_in_data
+    recording._workflow_run_context.mask_secrets_in_data = unbound_mask.__get__(  # type: ignore[method-assign]
+        recording._workflow_run_context
+    )
+    recording.recording_page = RecordingPage(page, on_action=recording._recorded_action_sink)
+    upsert = AsyncMock()
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert),
+        patch(f"{_RECORDING_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", AsyncMock()),
+        pytest.raises(RuntimeError),
+    ):
+        await recording.recording_page.goto("https://example.com/next")
+
+    persisted = upsert.await_args.args[0]
+    assert len(persisted.response) == RECORDED_FAILURE_RESPONSE_MAX_CHARS
+    assert "sk-live" not in persisted.response
+    assert "Locator.click: Timeout exceeded." in persisted.response
+
+
+@pytest.mark.asyncio
+async def test_synthetic_failure_row_is_masked_before_it_is_bounded() -> None:
+    secret = "sk-live-" + "z" * 52
+    action = Action(
+        action_type=ActionType.NULL_ACTION,
+        status=ActionStatus.failed,
+        response="Failed to execute code block. Reason: ".ljust(RECORDED_FAILURE_RESPONSE_MAX_CHARS - 30, "-") + secret,
+    )
+    page = SimpleNamespace(
+        url="https://example.com/", screenshot=AsyncMock(return_value=b"png"), is_closed=lambda: False
+    )
+    recording = _recording(page)
+    recording._workflow_run_context.secrets = {"api_token": secret}
+    unbound_mask = WorkflowRunContext.mask_secrets_in_data
+    recording._workflow_run_context.mask_secrets_in_data = unbound_mask.__get__(  # type: ignore[method-assign]
+        recording._workflow_run_context
+    )
+    upsert = AsyncMock()
+
+    with patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert):
+        await recording._persist_action(action, recording._remember_action_metadata(action))
+
+    persisted = upsert.await_args.args[0]
+    assert len(persisted.response) <= RECORDED_FAILURE_RESPONSE_MAX_CHARS
+    assert "sk-live" not in persisted.response
 
 
 @pytest.mark.asyncio

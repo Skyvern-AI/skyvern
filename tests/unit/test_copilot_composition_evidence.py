@@ -3760,12 +3760,16 @@ async def test_capture_reports_structured_failure_without_calling_get_html() -> 
     )
 
     assert evidence is None
-    assert error == "structured page evidence failed: evaluate returned an error"
+    assert (
+        error
+        == "skyvern_evaluate returned an error while capturing structured page evidence: structured extract failed"
+    )
+    assert "structured page evidence failed: evaluate returned an error" not in error
     assert server.calls.count("skyvern_get_html") == 0
 
 
 @pytest.mark.asyncio
-async def test_capture_does_not_reflect_structured_exception_text_to_copilot() -> None:
+async def test_capture_redacts_raw_secrets_from_reflected_structured_exception_text() -> None:
     server = _RecordingCompositionServer(
         structured_json=None,
         structured_exception=RuntimeError("https://example.com/callback?token=raw-secret"),
@@ -3777,8 +3781,9 @@ async def test_capture_does_not_reflect_structured_exception_text_to_copilot() -
     )
 
     assert evidence is None
-    assert error == "skyvern_evaluate failed while capturing structured page evidence"
+    assert error.startswith("skyvern_evaluate raised while capturing structured page evidence: ")
     assert "raw-secret" not in error
+    assert "[REDACTED_SECRET]" in error
 
 
 @pytest.mark.asyncio
