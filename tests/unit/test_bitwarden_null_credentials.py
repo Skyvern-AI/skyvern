@@ -29,10 +29,10 @@ def _stub_bitwarden_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _noop_login(*args: object, **kwargs: object) -> None:
         return None
 
-    async def _noop_sync() -> None:
+    async def _noop_sync(**_: object) -> None:
         return None
 
-    async def _fake_unlock(_master_password: str) -> str:
+    async def _fake_unlock(_master_password: str, **_: object) -> str:
         return "session-key"
 
     async def _noop_logout() -> None:

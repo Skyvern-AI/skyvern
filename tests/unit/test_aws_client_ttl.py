@@ -1,4 +1,8 @@
+import asyncio
+import contextlib
 import time
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -339,3 +343,58 @@ async def test_get_object_info_retries_on_expired_token():
             mock_refresh.assert_called_once()
             assert mock_head.call_count == 2
             assert result == {"ContentLength": 42}
+
+
+@pytest.mark.asyncio
+async def test_upload_file_from_path_cancelled_mid_multipart_aborts_upload_and_strands_no_uploaders(
+    tmp_path: Path,
+) -> None:
+    from aioboto3.s3 import inject as s3_inject
+
+    big_file = tmp_path / "big.bin"
+    with big_file.open("wb") as f:
+        f.truncate(9 * 1024 * 1024)  # past aioboto3's 8 MiB multipart threshold; sparse, so instant
+
+    parts_started = asyncio.Event()
+    release_parts = asyncio.Event()
+    aborted_upload_ids: list[str] = []
+
+    class FakeS3:
+        async def create_multipart_upload(self, **kwargs: object) -> dict[str, str]:
+            return {"UploadId": "upload-1"}
+
+        async def upload_part(self, **kwargs: object) -> None:
+            parts_started.set()
+            await release_parts.wait()
+            raise RuntimeError("part upload failed")
+
+        async def abort_multipart_upload(self, **kwargs: object) -> None:
+            aborted_upload_ids.append(str(kwargs["UploadId"]))
+
+        async def complete_multipart_upload(self, **kwargs: object) -> None:
+            raise AssertionError("a failed multipart upload must not be completed")
+
+    fake_s3 = FakeS3()
+    fake_s3.upload_file = types.MethodType(s3_inject.upload_file, fake_s3)  # type: ignore[attr-defined]
+
+    @contextlib.asynccontextmanager
+    async def fake_s3_client():  # type: ignore[no-untyped-def]
+        yield fake_s3
+
+    client = aws.AsyncAWSClient()
+    with patch.object(client, "_s3_client", fake_s3_client):
+        caller = asyncio.ensure_future(
+            client.upload_file_from_path("s3://bucket/key.bin", str(big_file), raise_exception=True)
+        )
+        await asyncio.wait_for(parts_started.wait(), timeout=5)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        release_parts.set()
+        async with asyncio.timeout(5):
+            while not aborted_upload_ids or len(asyncio.all_tasks()) > 1:
+                await asyncio.sleep(0.01)
+
+    assert aborted_upload_ids == ["upload-1"]
+    assert not [t for t in asyncio.all_tasks() if "upload_fileobj.<locals>.uploader" in repr(t)]
