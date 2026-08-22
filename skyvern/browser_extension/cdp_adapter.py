@@ -147,7 +147,7 @@ class ExtensionCdpAdapter:
                     pass
                 else:
                     return
-            generation = self._begin_tab_scope(tab_id)
+            generation = self._resume_tab_scope(tab_id)
             if self._auto_attach:
                 self._spawn(
                     self._handle_tab_added(
@@ -167,7 +167,7 @@ class ExtensionCdpAdapter:
             scoped_tabs = params.get("scopedTabs")
             if isinstance(scoped_tabs, list):
                 tabs = [
-                    (tab, self._begin_tab_scope(tab["tabId"]))
+                    (tab, self._resume_tab_scope(tab["tabId"]))
                     for tab in scoped_tabs
                     if isinstance(tab, dict) and type(tab.get("tabId")) is int
                 ]
@@ -474,13 +474,14 @@ class ExtensionCdpAdapter:
         if type(tab_id) is not int:
             await self._send_error(ws, request_id, -32000, "created target is invalid", response_session_id)
             return
-        generation = self._begin_tab_scope(tab_id)
+        generation = self._resume_tab_scope(tab_id)
         attached = await self._ensure_attached(tab, generation=generation)
         if attached is None:
             await self._send_error(ws, request_id, -32000, "target was revoked", response_session_id)
             return
-        target_id, _ = attached
-        await self._emit_attached(tab_id, target_id, generation)
+        target_id, is_new = attached
+        if is_new:
+            await self._emit_attached(tab_id, target_id, generation)
         await self._reply(ws, request_id, {"targetId": target_id}, response_session_id)
 
     async def _close_target(
@@ -829,8 +830,9 @@ class ExtensionCdpAdapter:
         else:
             if not self._scope_is_current(tab_id, generation):
                 return
-            target_id = self._register_tab(tab, opener_id)
-        if self._discover_targets and self._scope_is_current(tab_id, generation):
+            is_new = not self._registry.has_tab(tab_id)
+            self._register_tab(tab, opener_id)
+        if is_new and self._discover_targets and self._scope_is_current(tab_id, generation):
             await self._emit(
                 "Target.targetCreated",
                 {"targetInfo": self._target_info(tab_id)},
@@ -1032,6 +1034,12 @@ class ExtensionCdpAdapter:
         self._scope_generations[tab_id] = generation
         self._scope_tombstones.discard(tab_id)
         return generation
+
+    def _resume_tab_scope(self, tab_id: int) -> int:
+        # A tab's announcement and its Target.createTarget both name the same tab, so whichever
+        # arrives second must reuse the live scope rather than revoke the attach already in flight.
+        generation = self._active_scope_generation(tab_id)
+        return self._begin_tab_scope(tab_id) if generation is None else generation
 
     def _revoke_tab_scope(self, tab_id: int) -> int:
         generation = self._scope_generations.get(tab_id, 0) + 1

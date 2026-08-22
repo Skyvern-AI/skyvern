@@ -107,6 +107,9 @@ class VirtualTargetRegistry:
         self._browser_session_aliases.remove(session_id)
         return True
 
+    def has_tab(self, tab_id: int) -> bool:
+        return tab_id in self._tabs
+
     def target_id_for_tab(self, tab_id: int) -> str:
         return self._tabs[tab_id].target_id
 
