@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from skyvern.exceptions import ScrapingFailed, ScreenshotTargetClosed, SkyvernActionFailed
+from skyvern.exceptions import (
+    MissingBrowserStatePage,
+    ScrapingFailed,
+    ScreenshotTargetClosed,
+    SkyvernActionFailed,
+)
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
 from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
@@ -229,6 +234,29 @@ async def test_handler_returns_422_when_browser_target_closed(
             side_effect=ScreenshotTargetClosed(
                 error_message="Page.screenshot: Target page, context or browser has been closed"
             ),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(HTTPException) as exc_info:
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert exc_info.value.status_code == 422
+    mock_app.DATABASE.tasks.update_task.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_returns_422_when_browser_state_page_is_missing(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """A closed browser context is the same caller-visible condition as a closed target, so it
+    must not fall through to the generic handler and surface as a 500."""
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=MissingBrowserStatePage(task_id="tsk_gone"),
         ),
     ):
         mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from bs4 import BeautifulSoup
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -34,12 +35,20 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     _BARE_MAGNITUDE_RE,
+    _MAX_CARRIED_VALUE_CHARS,
     _MAX_CLICKABLE_CONTROLS,
+    _MAX_MODAL_DISMISS_CONTROLS,
     _MAX_NAVIGATION_TARGETS,
+    _MAX_PARSED_LABEL_CONTEXT_CHARS,
     _MAX_SELECTOR_CHARS,
+    _MAX_VISIBLE_CONTROLS,
     _SELECTOR_CANDIDATE_SOURCES,
     _UNKNOWN_SELECTOR_SOURCE,
+    _carried_selector_candidates,
+    _page_obstructions_from_modal_overlays,
+    _selector_for,
     _structural_path,
+    _structured_modal_dismiss_controls,
     composition_page_evidence_error,
     has_actionable_steer_content,
     has_bounded_page_schema,
@@ -5174,3 +5183,365 @@ def test_html_fallback_capture_carries_no_visibility_flags() -> None:
     form = parsed["forms"][0]
 
     assert [control for control in form["fields"] + form["submit_controls"] if "visible" in control] == []
+
+
+_DISMISS_FIXTURE_HTML = Path(__file__).parent / "data/click_overlay_named_dismiss.html"
+_DISMISS_FIXTURE_STRUCTURED = Path(__file__).parent / "data/click_overlay_named_dismiss.structured.json"
+_DISMISS_FIXTURE_URL = "https://example.test/statements"
+
+
+def _dismiss_control_keys(evidence: dict[str, Any]) -> set[frozenset[str]]:
+    return {frozenset(control) for overlay in evidence["modal_overlays"] for control in overlay["dismiss_controls"]}
+
+
+def _visible_control_keys(evidence: dict[str, Any]) -> set[frozenset[str]]:
+    return {
+        frozenset(control)
+        for obstruction in evidence["page_obstructions"]
+        for control in obstruction["visible_controls"]
+    }
+
+
+def test_obstruction_conversion_keeps_every_field_the_capture_produced() -> None:
+    control = {
+        "tag": "button",
+        "text": "Close",
+        "selector": "#close",
+        "type": "button",
+        "selector_candidates": [{"selector": "#close", "source": "id"}],
+        "identity": {"tag": "button", "role": "button", "label_context": "Close"},
+        "disabled": False,
+        "shadow_host_depth": 2,
+    }
+
+    obstructions = _page_obstructions_from_modal_overlays(
+        [{"selector": "#modal", "text": "Consent", "dismiss_controls": [control]}]
+    )
+
+    assert set(obstructions[0]["visible_controls"][0]) >= set(control)
+
+
+def test_obstruction_conversion_bounds_control_count_without_dropping_fields() -> None:
+    controls = [
+        {"tag": "button", "text": f"Option {index}", "selector": f"#option-{index}", "type": "button"}
+        for index in range(_MAX_VISIBLE_CONTROLS + 3)
+    ]
+
+    obstructions = _page_obstructions_from_modal_overlays([{"selector": "#modal", "dismiss_controls": controls}])
+
+    visible_controls = obstructions[0]["visible_controls"]
+    assert len(visible_controls) == _MAX_VISIBLE_CONTROLS
+    assert all(set(carried) == set(controls[0]) for carried in visible_controls)
+
+
+def test_obstruction_conversion_bounds_oversized_text_by_size_only() -> None:
+    control = {
+        "tag": "button",
+        "text": "Close " * 200,
+        "selector": "#close",
+        "type": "button",
+        "identity": {"tag": "button", "role": "button", "label_context": "Close"},
+    }
+
+    obstructions = _page_obstructions_from_modal_overlays([{"selector": "#modal", "dismiss_controls": [control]}])
+
+    carried = obstructions[0]["visible_controls"][0]
+    assert set(carried) == set(control)
+    assert len(carried["text"]) <= 120
+
+
+def test_structured_dismiss_controls_carry_producer_fields_they_do_not_name() -> None:
+    control = {
+        "tag": "BUTTON",
+        "text": "Accept",
+        "aria_label": "",
+        "title": "",
+        "selector": "#accept",
+        "type": "button",
+        "selector_candidates": [{"selector": "#accept", "source": "id"}],
+        "identity": {"tag": "button", "role": "button", "label_context": "Accept cookies"},
+        "pointer_events_none": True,
+        "occluded_by": "x" * (_MAX_CARRIED_VALUE_CHARS + 60),
+        "bounding_box": {"x": 10, "y": 20},
+    }
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert entry["pointer_events_none"] is True
+    assert len(entry["occluded_by"]) == _MAX_CARRIED_VALUE_CHARS
+    # A shape the carry does not model is bounded, not dropped: the field this test is named for.
+    assert "10" in entry["bounding_box"] and "20" in entry["bounding_box"]
+    assert entry["selector_candidates"] == [{"selector": "#accept", "source": "id"}]
+    assert entry["identity"]["label_context"] == "Accept cookies"
+
+
+def test_structured_dismiss_controls_reject_unbounded_evidence_the_producer_sent() -> None:
+    control = {
+        "tag": "button",
+        "text": "Accept",
+        "selector": "#accept",
+        "selector_candidates": [{"selector": "#" + "a" * (_MAX_SELECTOR_CHARS + 1), "source": "id"}],
+        "identity": {"role": "button", "label_context": "Accept cookies"},
+    }
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert "selector_candidates" not in entry
+    assert "identity" not in entry
+
+
+def test_identity_label_context_is_reported_whole_so_a_cut_prefix_cannot_read_as_a_rename() -> None:
+    label = "x" * 5000
+    control = {
+        "tag": "button",
+        "text": "Accept",
+        "selector": "#accept",
+        "identity": {"tag": "button", "role": "button", "label_context": label},
+    }
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert entry["identity"]["label_context"] == label
+
+
+def test_parsed_dismiss_controls_bound_a_label_context_no_upstream_cap_protects() -> None:
+    # The parsed path has no packet cap to fail closed above it, and _control_label falls through to
+    # the control's whole subtree text, so this caller bounds what _structured_identity reports whole.
+    label = "word " * 2000
+    html = f'<div role="dialog"><button id="accept">{label}</button></div>'
+
+    parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+
+    control = parsed["modal_overlays"][0]["dismiss_controls"][0]
+    assert len(control["identity"]["label_context"]) == _MAX_PARSED_LABEL_CONTEXT_CHARS
+
+
+def test_a_producer_field_emitted_as_null_or_empty_is_absent_rather_than_rendered_as_text() -> None:
+    control = {
+        "tag": "button",
+        "text": "Accept",
+        "selector": "#accept",
+        "occluded_by": None,
+        "covering_selectors": [],
+        "bounding_box": {},
+    }
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert "occluded_by" not in entry
+    assert "covering_selectors" not in entry
+    assert "bounding_box" not in entry
+
+
+def test_a_control_named_only_by_its_wrapping_label_is_not_reported_anonymous() -> None:
+    # A checkbox has no text of its own, so the label wrapping it is the only thing naming it. The
+    # browser producer reports that label; the parsed twin reported nothing until it mirrored the ladder.
+    html = '<div role="dialog"><label><input type="checkbox" id="accept-terms" /><span>I agree.</span></label></div>'
+
+    parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+
+    control = parsed["modal_overlays"][0]["dismiss_controls"][0]
+    assert control["identity"]["label_context"] == "I agree."
+    assert control.get("text", "") != control["identity"]["label_context"]
+
+
+def test_no_selector_candidate_the_producer_sent_is_dropped_for_being_one_too_many() -> None:
+    sent = [{"selector": f"#accept-{index}", "source": "id"} for index in range(40)]
+    sent.append({"selector": "html > body > button", "source": "structural"})
+    control = {"tag": "button", "text": "Accept", "selector": "#accept", "selector_candidates": sent}
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert [candidate["selector"] for candidate in entry["selector_candidates"]] == [
+        candidate["selector"] for candidate in sent
+    ]
+
+
+def test_structured_dismiss_controls_screen_an_injected_key_without_dropping_carried_ones() -> None:
+    injected_key = "onclick=alert(1)"
+    control: dict[str, Any] = {
+        "tag": "button",
+        "text": "Accept",
+        "selector": "#accept",
+        injected_key: "x",
+    }
+    control.update({f"extra_{index}": index for index in range(40)})
+
+    entry = _structured_modal_dismiss_controls([control])[0]
+
+    assert injected_key not in entry
+    assert entry["text"] == "Accept"
+    assert all(entry[f"extra_{index}"] == index for index in range(1, 40))
+
+
+def test_both_dismiss_control_producers_agree_on_the_fields_they_report() -> None:
+    parsed_html = parse_composition_html(
+        _DISMISS_FIXTURE_HTML.read_text(),
+        inspected_url=_DISMISS_FIXTURE_URL,
+        current_url=_DISMISS_FIXTURE_URL,
+    )
+    parsed_structured = parse_composition_structured(
+        json.loads(_DISMISS_FIXTURE_STRUCTURED.read_text()),
+        inspected_url=_DISMISS_FIXTURE_URL,
+        current_url=_DISMISS_FIXTURE_URL,
+    )
+    assert parsed_structured is not None
+
+    assert _dismiss_control_keys(parsed_html) == _dismiss_control_keys(parsed_structured)
+    assert _visible_control_keys(parsed_html) == _visible_control_keys(parsed_structured)
+
+    # Key sets alone pass while the two producers name the same element differently, which is what
+    # happened when the parsed twin fed label_context from the function that feeds `text`.
+    def identities(evidence: dict[str, Any]) -> dict[str, dict[str, str]]:
+        found: dict[str, dict[str, str]] = {}
+        for overlay in evidence["modal_overlays"]:
+            for control in overlay["dismiss_controls"]:
+                found.setdefault(control["selector"], control["identity"])
+        return found
+
+    from_html, from_structured = identities(parsed_html), identities(parsed_structured)
+    shared = set(from_html) & set(from_structured)
+    assert shared
+    for selector in shared:
+        assert from_html[selector] == from_structured[selector], selector
+
+
+def test_obstruction_conversion_hands_over_every_control_and_candidate_untouched() -> None:
+    controls = [
+        {
+            "text": "Accept all",
+            "selector": "#accept",
+            "selector_candidates": [
+                {"selector": "div > button:nth-of-type(1)", "source": "structural"},
+                {"selector": 'button[name="accept"]', "source": "name"},
+                {"selector": 'button[name="accept "]', "source": "name"},
+                {"selector": "#accept", "source": "id"},
+            ],
+        },
+        {
+            "text": "Necessary only",
+            "selector": "#necessary",
+            "selector_candidates": [
+                {"selector": 'button[aria-label="Necessary only"]', "source": "aria_label"},
+                {"selector": "#necessary", "source": "id"},
+            ],
+        },
+        {
+            "text": "Manage preferences",
+            "selector": "#manage",
+            "selector_candidates": [{"selector": "#manage", "source": "id"}],
+        },
+    ]
+
+    obstructions = _page_obstructions_from_modal_overlays([{"selector": "#modal", "dismiss_controls": controls}])
+    visible_controls = obstructions[0]["visible_controls"]
+
+    assert [control["text"] for control in visible_controls] == [control["text"] for control in controls]
+    assert [control["selector_candidates"] for control in visible_controls] == [
+        control["selector_candidates"] for control in controls
+    ]
+
+
+def test_page_obstruction_evidence_carries_candidates_and_identity() -> None:
+    payload = json.loads(_DISMISS_FIXTURE_STRUCTURED.read_text())
+    produced = payload["modal_overlays"][0]["dismiss_controls"][0]
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url=_DISMISS_FIXTURE_URL,
+        current_url=_DISMISS_FIXTURE_URL,
+    )
+    assert parsed is not None
+
+    assert {key for key, value in produced.items() if isinstance(value, (list, dict))} == {
+        "selector_candidates",
+        "identity",
+    }
+    normalized = parsed["modal_overlays"][0]["dismiss_controls"][0]
+    assert normalized["selector_candidates"] == produced["selector_candidates"]
+    assert normalized["identity"]["tag"] == produced["identity"]["tag"]
+
+    control = parsed["page_obstructions"][0]["visible_controls"][0]
+    assert control["selector_candidates"] == produced["selector_candidates"]
+    assert control["identity"]["tag"] == produced["identity"]["tag"]
+
+
+def test_parsed_dismiss_controls_bound_the_number_of_controls_they_report() -> None:
+    buttons = "".join(
+        f'<button id="close-{index}">Close {index}</button>' for index in range(_MAX_MODAL_DISMISS_CONTROLS + 4)
+    )
+    html = f'<div role="dialog">{buttons}</div>'
+
+    parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+
+    controls = parsed["modal_overlays"][0]["dismiss_controls"]
+    assert len(controls) == _MAX_MODAL_DISMISS_CONTROLS
+    assert all(control["selector_candidates"] for control in controls)
+
+
+def test_chosen_selector_ignores_the_aria_label_rung_the_candidates_keep() -> None:
+    soup = BeautifulSoup('<div role="dialog"><button aria-label="Close consent notice">x</button></div>', "html.parser")
+    control = soup.find("button")
+
+    chosen = _selector_for(control)
+    sources = [candidate["source"] for candidate in _carried_selector_candidates(control)]
+
+    assert "aria-label" not in chosen
+    assert chosen == _structural_path(control)
+    assert "aria_label" in sources
+
+
+def test_parsed_dismiss_controls_never_emit_an_unbounded_candidate() -> None:
+    html = f'<div role="dialog"><button id="{"i" * (_MAX_SELECTOR_CHARS + 40)}">Close</button></div>'
+
+    parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+    control = parsed["modal_overlays"][0]["dismiss_controls"][0]
+
+    assert control["selector_candidates"]
+    assert all(len(candidate["selector"]) <= _MAX_SELECTOR_CHARS for candidate in control["selector_candidates"])
+
+
+def test_obstruction_conversion_keeps_a_producer_reported_false() -> None:
+    payload = {
+        "modal_overlays": [
+            {
+                "selector": "#modal",
+                "text": "Consent",
+                "dismiss_controls": [
+                    {
+                        "tag": "button",
+                        "text": "Accept",
+                        "selector": "#accept",
+                        "pointer_events_none": False,
+                        "stacking_index": 0,
+                    }
+                ],
+            }
+        ]
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+    assert parsed is not None
+
+    control = parsed["page_obstructions"][0]["visible_controls"][0]
+    assert control["pointer_events_none"] is False
+    assert control["stacking_index"] == 0
+
+
+def test_parsed_dismiss_controls_offer_selector_sources_in_the_browser_rung_order() -> None:
+    html = (
+        '<div role="dialog"><button id="btn-close" name="close" class="cta" type="button" '
+        'aria-label="Close consent">x</button></div>'
+    )
+
+    parsed = parse_composition_html(html, inspected_url=_DISMISS_FIXTURE_URL, current_url=_DISMISS_FIXTURE_URL)
+    control = parsed["modal_overlays"][0]["dismiss_controls"][0]
+
+    assert [candidate["source"] for candidate in control["selector_candidates"]] == [
+        "id",
+        "name",
+        "aria_label",
+        "class",
+        "class_type",
+        "structural",
+    ]

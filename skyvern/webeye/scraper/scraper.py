@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import DEFAULT_MAX_TOKENS, SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     FailedToTakeScreenshot,
+    MissingBrowserStatePage,
     NoElementFound,
     ScrapingFailed,
     ScrapingFailedBlankPage,
@@ -334,6 +335,14 @@ async def scrape_website(
     except ScrapingFailedBlankPage:
         raise
     except Exception as e:
+        if isinstance(e, MissingBrowserStatePage) and e.diagnostic is not None:
+            # A disconnect was observed and never recovered, so the browser context is gone for
+            # good: check_and_fix_state only rebuilds a None context, and a lost page cannot be
+            # reopened on a disconnected one. Neither a retry here nor a later rung of the caller's
+            # scrape ladder can change that, and calling it ScrapingFailed blames the site for a
+            # browser-lifecycle failure. A missing page with no observed disconnect may still be a
+            # transient reopen failure, so that case keeps its retries.
+            raise
         # NOTE: MAX_SCRAPING_RETRIES is set to 0 in both staging and production
         if num_retry > max_retries:
             if isinstance(e, ScreenshotTargetClosed):
