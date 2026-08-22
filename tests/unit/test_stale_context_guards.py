@@ -6,7 +6,7 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.exceptions import MissingElement, MultipleElementsFound
+from skyvern.exceptions import MissingElement, MissingElementDict, MultipleElementsFound
 from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, resolve_locator
 
 _DETACHED_ERROR = "ElementHandle.content_frame: Element is not attached to the DOM"
@@ -202,3 +202,22 @@ async def test_press_fill_classifies_timeout_when_element_gone(monkeypatch: pyte
     monkeypatch.setattr("skyvern.webeye.utils.dom.EventStrategyFactory.type_text", _raise)
     with pytest.raises(MissingElement):
         await element.press_fill("hello")
+
+
+@pytest.mark.asyncio
+async def test_find_label_for_returns_none_when_for_control_was_not_scraped() -> None:
+    # The label's for= control is live (found once, carries a unique id) but is absent from the scraped dict.
+    control_locator = MagicMock()
+    control_locator.count = AsyncMock(return_value=1)
+    control_locator.get_attribute = AsyncMock(return_value="AACH")
+    frame = MagicMock()
+    frame.locator = MagicMock(return_value=control_locator)
+    label = SkyvernElement(MagicMock(), frame, {"id": "AABQ", "tagName": "label", "attributes": {"for": "ctl"}})
+    dom = MagicMock()
+    dom.get_skyvern_element_by_id = AsyncMock(side_effect=MissingElementDict("AACH"))
+
+    assert await label.find_label_for(dom) is None
+
+    mapped = object()
+    dom.get_skyvern_element_by_id = AsyncMock(return_value=mapped)
+    assert await label.find_label_for(dom) is mapped
