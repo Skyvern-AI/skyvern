@@ -238,6 +238,160 @@ _SELECTOR_EXISTS_JS = (
 }"""
 )
 
+# The single discriminator observe and both act paths share: the element that visibly stands in for a
+# control the page renders at zero size. Nothing rendered means a collapsed section, a closed modal or
+# an inactive step. Kept as one fragment because three page.evaluate payloads cannot be kept in sync by
+# hand, and the whole point is that perception and action agree on what counts as a styled proxy.
+_VISIBLE_PROXY_JS = r"""(el) => {
+  let named = el.labels && el.labels[0];
+  if (!named) {
+    const lbId = el.getAttribute('aria-labelledby');
+    // An IDREF resolves inside the element's OWN tree, so a control in a shadow root must be looked
+    // up there -- document.getElementById cannot see it. Read through the prototype like every other
+    // root check here; an element whose root cannot hold ids simply has no name.
+    let root = null;
+    try { root = Node.prototype.getRootNode.call(el); } catch (e) { root = null; }
+    named = lbId && root && root.getElementById ? root.getElementById(String(lbId).trim().split(/\s+/)[0]) : null;
+  }
+  const r = named ? named.getBoundingClientRect() : null;
+  return r && r.width > 0 && r.height > 0 ? named : null;
+}"""
+
+# The executor's selector engine pierces open shadow roots, and observe now derives selectors from
+# every one of them, so a probe resolving a selector against the document alone silently declines to
+# act on a control it has just listed. Roots are visited in walk order, the order that engine matches
+# in, and gathered once per payload so a probe never walks the page twice.
+_ROOT_QUERY_JS = (
+    r"""(() => {
+  const _roots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  const roots = _roots(document);
+  return {
+    find: (sel) => {
+      for (const root of roots) {
+        let f = null;
+        // A throw is the ROOT's, not the selector's -- it was already parsed by an earlier root.
+        try { f = root.querySelector(sel); } catch (e) { continue; }
+        if (f) return f;
+      }
+      return null;
+    },
+    all: (sel) => {
+      const out = [];
+      for (const root of roots) {
+        try { for (const e of root.querySelectorAll(sel)) out.push(e); } catch (e) { /* this root only */ }
+      }
+      return out;
+    },
+  };
+})()"""
+)
+
+
+# Design-system forms render a <select> at zero size behind a styled listbox proxy. Playwright's
+# actionability wait never resolves against it, so select_option probes visibility first and only
+# forces past actionability when the element exists but is genuinely hidden this way.
+_SELECT_VISIBILITY_JS = (
+    r"""(sel) => {
+  const _visibleProxy = """
+    + _VISIBLE_PROXY_JS
+    + r""";
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  try {
+    const el = _q.find(sel);
+    if (!el) return { exists: false, visible: false };
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    // Forcing a value onto a select nothing stands in for carries a value the user never saw into
+    // whatever the run submits next.
+    return {
+      exists: true,
+      visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden',
+      disabled: !!el.disabled,
+      proxied: !!_visibleProxy(el),
+    };
+  } catch (e) { return { exists: false, visible: false }; }
+}"""
+)
+
+# Read back after a forced select_option so a styled proxy that silently didn't sync from its
+# native control is caught rather than reported as a successful selection.
+_SELECT_READBACK_JS = (
+    r"""(sel) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  try {
+    const el = _q.find(sel);
+    if (!el) return null;
+    const idx = el.selectedIndex;
+    const opt = idx >= 0 ? el.options[idx] : null;
+    // Playwright matches label= against option.label (whitespace-collapsed), not raw text.
+    return { value: el.value, selectedIndex: idx, selectedLabel: opt ? opt.label : null };
+  } catch (e) { return null; }
+}"""
+)
+
+# A skinned checkbox/radio is a zero-size or invisible native input whose visible <label> is the
+# real click target; the label is tagged (stale tags cleared first) so click can act on it.
+_SKINNED_CHECKBOX_PROBE_JS = (
+    r"""(sel) => {
+  const _visibleProxy = """
+    + _VISIBLE_PROXY_JS
+    + r""";
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  try {
+    // Cleared across roots, not just the document: a tag left inside a component would still be
+    // matched by the executor's piercing engine and clicked as though it were this call's proxy.
+    _q.all('[data-tv3-proxy]').forEach((e) => e.removeAttribute('data-tv3-proxy'));
+    const el = _q.find(sel);
+    if (!el) return { exists: false, skinned: false, labelTagged: false };
+    const type = String(el.type || '').toLowerCase();
+    if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, labelTagged: false, file: true };
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    const invisible = r.width === 0 || r.height === 0 || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05;
+    if (el.tagName === 'SELECT') {
+      return { exists: true, skinned: false, labelTagged: false, select: true, invisible, proxied: !!_visibleProxy(el) };
+    }
+    if (el.tagName !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) {
+      return { exists: true, skinned: false, labelTagged: false };
+    }
+    if (!invisible) return { exists: true, skinned: false, labelTagged: false };
+    const radio = type === 'radio';
+    const proxy = _visibleProxy(el);
+    if (!proxy) return { exists: true, skinned: false, labelTagged: false, radio, unproxied: true };
+    const disabled = !!el.disabled;
+    // A label that also wraps another control (a button, link, or a second input) is not a safe
+    // proxy: a real click on it can activate that control instead.
+    const label = el.labels && el.labels[0];
+    const wrapsOther = (l) => Array.from(l.querySelectorAll('button,a[href],input,select,textarea')).some((c) => c !== el);
+    // Only a real <label> activates its control on click; an aria-labelledby target is a name, not a proxy.
+    if (label && label === proxy && !wrapsOther(label)) {
+      label.setAttribute('data-tv3-proxy', '1');
+      return { exists: true, skinned: true, labelTagged: true, radio, disabled };
+    }
+    return { exists: true, skinned: true, labelTagged: false, radio, disabled };
+  } catch (e) { return { exists: false, skinned: false, labelTagged: false }; }
+}"""
+)
+
+# Read twice (before and after the forced click): a proxy that does not sync from its native input
+# must fail loud, not read as a successful toggle.
+_CHECKBOX_CHECKED_JS = (
+    r"""(sel) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  try { const el = _q.find(sel); return el ? !!el.checked : null; } catch (e) { return null; }
+}"""
+)
+
 # Pre-click state for the dropdown-commit path: whether a click-opened menu (rows tagged
 # data-tv3-menu by _FIND_MENU_JS) is currently open, whether the click target IS one of its rows, and
 # that row's state fingerprint — aria checked/selected/pressed, class, child count, text — so an option
@@ -415,6 +569,9 @@ _OBSERVE_JS = (
 () => {
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
+    + r""";
+  const _visibleProxy = """
+    + _VISIBLE_PROXY_JS
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
@@ -708,6 +865,11 @@ _OBSERVE_JS = (
   let unnamedUnsafe = 0;
   let i = 0;
   let dropped = 0;
+  // Two counters, deliberately: hiddenKept bounds the retention work and is spent the moment a
+  // control passes the styled-proxy gate, while hiddenListed is what the digest note claims. They
+  // diverge whenever a retained control is dropped later for having no selector that names it.
+  let hiddenKept = 0;
+  let hiddenListed = 0;
   let truncated = 0;
   let truncatedInComponents = 0;
   let lastGroup = '';
@@ -720,7 +882,22 @@ _OBSERVE_JS = (
    // loop is inside page.evaluate: one throw costs the whole element list, not one element.
    try {
     const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) continue;
+    let hidden = false;
+    if (r.width === 0 || r.height === 0) {
+      // Design systems skin a native SELECT/checkbox/radio/file input at zero size behind a styled
+      // proxy widget. Keep only that narrow shape, and only with a visible label pointing at it —
+      // a genuinely hidden button/link/text-input is still dropped, same as before.
+      const tag = el.tagName;
+      const type = String(el.type || '').toLowerCase();
+      const skinnable = tag === 'SELECT' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio' || type === 'file'));
+      if (skinnable && _visibleProxy(el)) {
+        if (hiddenKept >= 40) { dropped++; continue; }
+        hidden = true;
+        hiddenKept++;
+      } else {
+        continue;
+      }
+    }
     let selector = naturalSelector(el);
     if (!selector) {
       // We do not write inside a shadow root. Setting a marker there is a mutation of the
@@ -745,6 +922,15 @@ _OBSERVE_JS = (
     }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
     if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
+    if (!label) {
+      const lbId = el.getAttribute('aria-labelledby');
+      // Tree-scoped for the same reason as _VISIBLE_PROXY_JS: the shadow walk feeds this loop
+      // elements whose label id lives in their own root, not in the document.
+      let lbRoot = null;
+      try { lbRoot = Node.prototype.getRootNode.call(el); } catch (e) { lbRoot = null; }
+      const lb = lbId && lbRoot && lbRoot.getElementById ? lbRoot.getElementById(String(lbId).trim().split(/\s+/)[0]) : null;
+      if (lb) label = (lb.innerText || '').trim();
+    }
     if (!label) label = (el.innerText || (el.type === 'password' ? '' : el.value) || '').trim();
     const role = el.getAttribute('role');
     // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
@@ -753,6 +939,7 @@ _OBSERVE_JS = (
     // line -- and a MIME type is noise to the model anyway.
     const _typed = el.tagName === 'INPUT' || el.tagName === 'BUTTON' || el.tagName === 'SELECT';
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, 140) };
+    if (hidden) rec.hidden = true;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
     // and the model cannot tell it from decoration. The role travels with its state below, or it is
     // not worth surfacing: an on switch and an off one that read identically invite toggling the
@@ -805,6 +992,7 @@ _OBSERVE_JS = (
     const pressed = el.getAttribute('aria-pressed');
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     if (mintedValue !== null) mintedOn.push({ rec: rec, el: el, m: mintedValue });
+    if (hidden) hiddenListed++;
     out.push(rec);
     if (++i > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
@@ -953,7 +1141,7 @@ _OBSERVE_JS = (
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, rootCount: allRoots.length - 1, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, elements: out });
 }
 """
 )
@@ -1063,6 +1251,11 @@ def build_browser_tools(
         # is a different, invalid URL.
         url_note = f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > 300 else ""
         lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        hidden_kept = data.get("hiddenListed") or 0
+        if hidden_kept:
+            lines.append(
+                f"note: {hidden_kept} native control(s) hidden behind styled proxies are listed with [hidden-native]"
+            )
         for t in data.get("text") or []:
             lines.append(f"text: {t!r}")
         text_dropped = data.get("textDropped") or 0
@@ -1161,6 +1354,13 @@ def build_browser_tools(
                 extra += " *invalid" if e["invalid"] is True else f" *invalid={e['invalid']!r}"
             if e.get("autocomplete"):
                 extra += " [autocomplete→use select_combobox]"
+            if e.get("hidden"):
+                if e.get("type") == "file":
+                    extra += " [hidden-native: styled proxy; file_upload works on it directly]"
+                elif e.get("tag") == "select":
+                    extra += " [hidden-native: styled proxy; select_option acts on it directly]"
+                else:
+                    extra += " [hidden-native: styled proxy; click acts on it directly]"
             if e.get("group"):
                 extra += f" group={e['group']!r}"
             # INVARIANT for this line and every line above it: no page-controlled byte reaches the
@@ -1198,12 +1398,29 @@ def build_browser_tools(
                     html = ""
         else:
             html = await page.content()
-        # The click/type reaction gate stamps data-tv3-pre on every visible element; it is internal
-        # bookkeeping, and left in place it costs a third of the truncation budget below in noise.
-        html = html.replace(' data-tv3-pre="1"', "")
+        # The click/type reaction gate stamps data-tv3-pre on every visible element and the skinned-click
+        # probe stamps data-tv3-proxy on one label; both are internal bookkeeping, and left in place the
+        # first costs a third of the truncation budget below in noise.
+        html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-proxy="1"', "")
         if len(html) > 20000:
             return ToolResult.ok(html[:20000] + "…[truncated at 20000 chars]")
         return ToolResult.ok(html)
+
+    def _unreachable_error(selector: str) -> ToolResult:
+        return ToolResult.error(
+            f"{selector} is not rendered and nothing visible stands in for it — its section is collapsed, "
+            "closed or inactive, so a person could not reach this control either. Act on whatever reveals "
+            "it (the section header, the step, the modal trigger), then re-observe."
+        )
+
+    async def _clear_proxy_tags(page: Any) -> None:
+        try:
+            await page.evaluate(
+                "() => { const _q = " + _ROOT_QUERY_JS + "; "
+                "_q.all('[data-tv3-proxy]').forEach((e) => e.removeAttribute('data-tv3-proxy')); }"
+            )
+        except Exception:
+            pass
 
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str
@@ -1337,21 +1554,97 @@ def build_browser_tools(
                 pass
         url_before = await _url(page)
         try:
-            await page.click(selector, timeout=15000)
-        except Exception as e:
-            gone = False
+            skin_probe = await page.evaluate(_SKINNED_CHECKBOX_PROBE_JS, selector)
+        except Exception:
+            skin_probe = None
+        if isinstance(skin_probe, dict) and skin_probe.get("file"):
+            return ToolResult.error(
+                f"{selector} is a file input — clicking it opens a native picker the run cannot drive; "
+                "use file_upload with this selector instead"
+            )
+        if isinstance(skin_probe, dict) and skin_probe.get("select") and skin_probe.get("invisible"):
+            # Playwright's actionability wait never resolves against it, so a click here is 15s of pure
+            # loss followed by a raise; select_option forces past that on the same selector — but only
+            # for one something visible stands in for, so an unreachable select is sent to reveal first
+            # rather than to a tool that would refuse it a turn later.
+            if not skin_probe.get("proxied"):
+                return _unreachable_error(selector)
+            return ToolResult.error(
+                f"{selector} is a hidden native <select> — a click cannot open it; use select_option "
+                "with this selector instead"
+            )
+        if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
+            return _unreachable_error(selector)
+        skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
+        label_tagged = bool(isinstance(skin_probe, dict) and skin_probe.get("labelTagged"))
+        checked_before: bool | None = None
+        if skinned:
+            if skin_probe.get("disabled"):
+                # Playwright refuses a label bound to a disabled control the same way it refuses the
+                # control, so the click path would spend its full timeout and then blame a re-render.
+                await _clear_proxy_tags(page)
+                return ToolResult.error(f"{selector} is disabled — it cannot be toggled until the page enables it")
             try:
-                gone = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+                checked_before = await page.evaluate(_CHECKBOX_CHECKED_JS, selector)
             except Exception:
-                gone = False
-            if gone:
+                checked_before = None
+            if checked_before is True and skin_probe.get("radio"):
+                # The probe tagged the label on its way here; left behind it shows up in get_html.
+                await _clear_proxy_tags(page)
+                return ToolResult.ok(f"{selector} is already selected — no change needed")
+
+        if skinned and label_tagged:
+            try:
+                await page.click('[data-tv3-proxy="1"]', timeout=15000)
+            except Exception as e:
                 return ToolResult.error(
-                    f"click on {selector} failed: the element no longer exists on the page — it was "
-                    "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
-                    f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})"
+                    f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
+                    "re-rendered; re-observe and act on fresh selectors"
                 )
-            raise
-        base = f"clicked {selector} — now at {await _url(page)}"
+            finally:
+                await _clear_proxy_tags(page)
+            base = f"clicked {selector} via its label — now at {await _url(page)}"
+        elif skinned:
+            await page.evaluate(
+                "(sel) => { const _q = " + _ROOT_QUERY_JS + "; const el = _q.find(sel); if (el) el.click(); }",
+                selector,
+            )
+            base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
+        else:
+            try:
+                await page.click(selector, timeout=15000)
+            except Exception as e:
+                gone = False
+                try:
+                    gone = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+                except Exception:
+                    gone = False
+                if gone:
+                    return ToolResult.error(
+                        f"click on {selector} failed: the element no longer exists on the page — it was "
+                        "likely removed by a re-render (e.g. a menu closed and destroyed its options). "
+                        f"Re-observe and act on fresh selectors. (original error: {type(e).__name__})"
+                    )
+                raise
+            base = f"clicked {selector} — now at {await _url(page)}"
+
+        if skinned:
+            try:
+                checked_after = await page.evaluate(_CHECKBOX_CHECKED_JS, selector)
+            except Exception:
+                checked_after = None
+            if checked_after is None:
+                return ToolResult.ok(
+                    f"{base} — the control left the page after the click, so its state could not be "
+                    "verified; re-observe before relying on it"
+                )
+            if checked_after == checked_before:
+                return ToolResult.error(
+                    f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
+                    "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
+                    "proxy instead"
+                )
+
         if pre is None:
             return ToolResult.ok(base)
         try:
@@ -1550,11 +1843,45 @@ def build_browser_tools(
         if error is not None:
             return error
         selector = args["selector"]
-        if args.get("label") is not None:
-            await page.select_option(selector, label=args["label"], timeout=15000)
+        label = args.get("label")
+        value = args.get("value")
+        try:
+            probe = await page.evaluate(_SELECT_VISIBILITY_JS, selector)
+        except Exception:
+            probe = None
+        # force bypasses actionability for a select a design system hides behind a styled proxy;
+        # Playwright still sets the value and dispatches native input/change on the real element.
+        if isinstance(probe, dict) and probe.get("exists") and probe.get("disabled"):
+            return ToolResult.error(f"{selector} is disabled — it cannot be set until the page enables it")
+        force = bool(isinstance(probe, dict) and probe.get("exists") and not probe.get("visible"))
+        if force and not probe.get("proxied"):
+            return _unreachable_error(selector)
+        if label is not None:
+            await page.select_option(selector, label=label, timeout=15000, force=force)
         else:
-            await page.select_option(selector, value=args.get("value"), timeout=15000)
-        return ToolResult.ok(f"selected on {selector}")
+            await page.select_option(selector, value=value, timeout=15000, force=force)
+        if not force:
+            return ToolResult.ok(f"selected on {selector}")
+        try:
+            readback = await page.evaluate(_SELECT_READBACK_JS, selector)
+        except Exception:
+            readback = None
+        committed = False
+        value_read: Any = None
+        if isinstance(readback, dict):
+            value_read = readback.get("value")
+            committed = readback.get("selectedLabel") == label if label is not None else value_read == value
+        if readback is None:
+            return ToolResult.ok(
+                f"selected on {selector} — the control left the page afterwards, so the selection could not "
+                "be verified; re-observe before relying on it"
+            )
+        if not committed:
+            return ToolResult.error(
+                f"select on {selector} did NOT commit: native select still reads {value_read!r} — the styled "
+                "widget may not sync from its hidden control; re-observe and act on the visible proxy instead"
+            )
+        return ToolResult.ok(f"selected on {selector} (hidden native select, set directly)")
 
     async def press_key(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
