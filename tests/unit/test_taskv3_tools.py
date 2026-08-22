@@ -4673,3 +4673,507 @@ async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() 
         assert "note: 1 native control(s) hidden behind styled proxies" in r.content, r.content
         # the two that share an id are dropped, and said to be dropped, rather than counted as listed
         assert "reused by another instance of the same component" in r.content
+
+
+# --- Reaction probes inside open shadow roots. Perception already pierces; these cover the
+# probes that judge what an action DID -- click precheck, menu open/close, suggestion commit --
+# plus the pre-snapshot carrier they all read, which cannot stamp an attribute inside a root
+# without provoking the re-render it would then misread. ---
+
+_LISTBOX_FIXTURE_HTML = """
+<label id="country-label">Country*</label>
+<div id="proxy" role="listbox" tabindex="0" aria-label="Country">Select a country</div>
+<div id="options" style="display:none">
+  <div id="opt-us" role="option" data-value="us">United States</div>
+  <div id="opt-ca" role="option" data-value="ca">Canada</div>
+</div>
+<select id="native" style="display:none">
+  <option value="">--</option><option value="us">United States</option><option value="ca">Canada</option>
+</select>
+<script>
+document.getElementById('proxy').addEventListener('click', function () {
+  document.getElementById('options').style.display = 'block';
+});
+document.querySelectorAll('#options [role=option]').forEach(function (o) {
+  o.addEventListener('click', function () {
+    document.getElementById('proxy').textContent = o.textContent;
+    document.getElementById('native').value = o.getAttribute('data-value');
+    document.getElementById('native').dispatchEvent(new Event('change', {bubbles: true}));
+    document.getElementById('options').style.display = 'none';
+  });
+});
+</script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_aria_listbox_proxy_can_be_driven_to_a_committed_selection() -> None:
+    # The whole point of enumerating the proxy: the intended interaction is click-to-open then
+    # click-the-option, and the widget writes through to the display:none native select itself.
+    # select_option cannot drive that hidden select, and this is why it does not need to.
+    async with _live_page(_LISTBOX_FIXTURE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        opened = await _tool(tools, "click").handler({"selector": "#proxy"})
+        assert opened.status == "ok"
+        assert "opened a menu of 2 options" in opened.content
+
+        chosen = await _tool(tools, "click").handler({"selector": "#opt-ca"})
+        assert chosen.status == "ok"
+        assert await page.eval_on_selector("#native", "e => e.value") == "ca"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_precheck_recognizes_a_shadow_hosted_menu_option() -> None:
+    # isOption gates the whole commit-verification path; reading False for a real option silently
+    # disables it for exactly the controls shadow piercing unlocks.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<ds-menu id="m"></ds-menu><script>
+        document.getElementById('m').attachShadow({mode:'open'}).innerHTML =
+          '<ul><li id="o1" data-tv3-menu="1" role="option">Alpha</li>'
+          + '<li id="o2" data-tv3-menu="2" role="option">Beta</li></ul>';
+        </script>"""
+    ) as page:
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, '[data-tv3-menu="1"]')
+        assert pre["isOption"] is True
+        assert pre["menuOpen"] is True
+        assert pre["optText"] == "Alpha"
+
+
+def test_fake_page_dispatch_markers_are_unique_to_one_blob() -> None:
+    # The click/typeahead fakes route page.evaluate by matching substrings of the real JS constants,
+    # so a marker that starts appearing in a second blob silently re-routes every probe and the
+    # failures land far from the edit. (This caught `return !!` leaking into the shared helper.)
+    from skyvern.forge.taskv3 import tools as _t  # noqa: PLC0415
+
+    blobs = {n: v for n in dir(_t) if n.endswith("_JS") and isinstance(v := getattr(_t, n), str)}
+    for marker, expected in (
+        ("return !!found", "_SELECTOR_EXISTS_JS"),
+        ("menuOpen", "_CLICK_PRECHECK_JS"),
+        ("stillOpen", "_MENU_AFTER_JS"),
+        ("clickable", "_FIND_MENU_JS"),
+    ):
+        owners = sorted(n for n, b in blobs.items() if marker in b)
+        assert owners == [expected], f"{marker!r} must identify only {expected}, found {owners}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_menu_after_does_not_report_an_open_shadow_menu_as_closed() -> None:
+    # The most damaging fabrication: stillOpen==0 makes _click_reaction return the affirmative
+    # "the menu closed" — a success claim invented from the query's blindness, on a menu still open.
+    from skyvern.forge.taskv3.tools import _MENU_AFTER_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<ds-menu id="m"></ds-menu><script>
+        document.getElementById('m').attachShadow({mode:'open'}).innerHTML =
+          '<ul><li id="o1" data-tv3-menu="1" role="option">Alpha</li>'
+          + '<li id="o2" data-tv3-menu="2" role="option">Beta</li></ul>';
+        </script>"""
+    ) as page:
+        assert await page.is_visible('[data-tv3-menu="1"]') is True
+        after = await page.evaluate(_MENU_AFTER_JS, '[data-tv3-menu="1"]')
+        assert after["stillOpen"] == 2
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_menu_finder_refuses_when_no_snapshot_arms_it() -> None:
+    # The reaction gate is the whole basis for calling these rows "a menu the click just opened".
+    # A navigation destroys window and with it the snapshot, so the probe wakes up on a document it
+    # never saw before typing or clicking, where every row reads as new. That is the state this
+    # asserts directly: no snapshot, rows present, and the only honest answer is silence.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
+
+    html = """<button id="pick" style="position:absolute;top:10px;left:10px;width:120px;height:24px">Pick</button>
+        <div id="menu" style="position:absolute;top:40px;left:10px;width:200px">
+          <div role="option" style="height:20px">Alpha Corp</div>
+          <div role="option" style="height:20px">Beta LLC</div>
+          <div role="option" style="height:20px">Gamma Inc</div>
+        </div>"""
+    async with _live_page(html) as page:
+        # No precheck has run: window carries no snapshot, exactly as after a navigation.
+        assert await page.evaluate("() => window.__tv3_pre === undefined") is True
+        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+        # ...and the same page WITH a snapshot still finds nothing, because nothing reacted — so the
+        # refusal above is about the missing snapshot, not about an unfindable menu.
+        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+        # Prove the fixture is findable at all once the rows genuinely appear in reaction.
+        await page.evaluate("() => { document.getElementById('menu').remove(); }")
+        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.evaluate(
+            "(h) => { const d = document.createElement('div'); d.innerHTML = h;"
+            " document.body.appendChild(d.firstElementChild); }",
+            """<div id="menu2" style="position:absolute;top:40px;left:10px;width:200px">
+                 <div role="option" style="height:20px">Alpha Corp</div>
+                 <div role="option" style="height:20px">Beta LLC</div>
+                 <div role="option" style="height:20px">Gamma Inc</div>
+               </div>""",
+        )
+        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        assert isinstance(found, dict) and found.get("count") == 3, found
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_menu_finder_sees_rows_written_straight_into_a_shadow_root() -> None:
+    # Rows grouped by parentElement vanish at the shadow boundary: a ShadowRoot is not an Element, so
+    # `root.innerHTML = '<div role="option">...'` produced no group and the menu was invisible —
+    # while the same rows wrapped in a <ul> were found. Half a capability is its own trap: the shape
+    # decides whether the model is told the menu exists.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<button id="pick" style="position:absolute;top:10px;left:10px;width:120px;height:24px">Pick</button>
+        <x-menu id="m" style="position:absolute;top:40px;left:10px;display:block;width:200px;height:60px"></x-menu>
+        <script>
+        window.root = document.getElementById('m').attachShadow({mode:'open'});
+        document.getElementById('pick').addEventListener('click', function () {
+          // Direct children of the root — no wrapper element to group by.
+          window.root.innerHTML =
+            '<div role="option" style="height:20px">Alpha</div>'
+            + '<div role="option" style="height:20px">Beta</div>'
+            + '<div role="option" style="height:20px">Gamma</div>';
+        });
+        </script>"""
+    ) as page:
+        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.click("#pick")
+        await page.wait_for_timeout(100)
+        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        assert isinstance(found, dict) and found.get("count") == 3, found
+        assert [o["text"] for o in found["options"]] == ["Alpha", "Beta", "Gamma"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_precheck_flags_a_shadow_host_that_wraps_the_open_menu() -> None:
+    # containsMenu is a safety valve: clicking the container AROUND a menu may land the center point
+    # on an arbitrary row, so the handler must make no open/closed/selected claim. Node.contains()
+    # only walks the light tree, so a host whose OWN shadow root holds the rows read as "not the
+    # container" — the valve disengaged and the handler was free to report "this click CLOSED the
+    # open menu — no option was selected" about a click it could not actually account for. Piercing
+    # perception is what makes those rows reachable, so this became live with it.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<button id="pick" style="position:absolute;top:10px;left:10px;width:120px;height:24px">Pick</button>
+        <x-menu id="m" style="position:absolute;top:40px;left:10px;display:block;width:200px;height:60px"></x-menu>
+        <script>
+        window.root = document.getElementById('m').attachShadow({mode:'open'});
+        document.getElementById('pick').addEventListener('click', function () {
+          window.root.innerHTML =
+            '<div role="option" style="height:20px">Alpha</div>'
+            + '<div role="option" style="height:20px">Beta</div>'
+            + '<div role="option" style="height:20px">Gamma</div>';
+        });
+        </script>"""
+    ) as page:
+        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.click("#pick")
+        await page.wait_for_timeout(100)
+        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        assert isinstance(found, dict) and found.get("count") == 3, found
+
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, "#m")
+        assert pre["menuOpen"] is True, pre
+        # The host encloses every tagged row through its own shadow root, so this click cannot be
+        # attributed to any one option.
+        assert pre["containsMenu"] is True, pre
+        assert pre["isOption"] is False, pre
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pierced_query_does_not_count_a_named_getter_decoy_as_a_second_root() -> None:
+    # A form exposes its named controls as its own properties, so <fieldset name="shadowRoot"> makes
+    # form.shadowRoot that fieldset. Walking it adds a non-root to the list every probe then queries,
+    # and because the fieldset is ALREADY in the document, everything inside it gets counted twice —
+    # so a uniqueness check reads a single element as ambiguous and the probe declines a real answer.
+    # Existence probes cannot see this (an extra root only adds matches); accumulation can.
+    from skyvern.forge.taskv3.tools import _PIERCED_QUERY_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<form id="hostile">
+          <fieldset name="shadowRoot"><input id="decoy" name="decoyChild"></fieldset>
+        </form>"""
+    ) as page:
+        counts = await page.evaluate(
+            "() => {" + _PIERCED_QUERY_JS + " return {roots: _rootList.length, hits: pQSA('#decoy').length}; }"
+        )
+        assert counts == {"roots": 1, "hits": 1}, counts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pre_snapshot_does_not_provoke_the_re_render_it_then_misreads() -> None:
+    # Marking the pre-snapshot with attributes mutates the page, and a component watching its own
+    # shadow root re-renders in response — destroying every mark just made, so the finders see an
+    # unmarked subtree and report a static list as something that appeared in reaction.
+    from skyvern.forge.taskv3.tools import _FIND_MENU_JS, _FIND_SUGGESTION_JS, _PRESNAPSHOT_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<input id="city" style="position:absolute;top:20px;left:20px;width:200px;height:24px">
+        <x-list id="lst" style="position:absolute;top:50px;left:20px;display:block;width:220px;height:70px"></x-list>
+        <script>
+        var root = document.getElementById('lst').attachShadow({mode: 'open'});
+        window.renders = 0;
+        function render() {
+          window.renders++;
+          // role=option so these rows are menu-ELIGIBLE: a plain <li> is filtered out before the
+          // reaction gate is consulted, which would make the _FIND_MENU_JS assertion below pass
+          // whatever the gate does.
+          root.innerHTML = '<ul style="margin:0"><li role="option" style="height:20px">Paris Texas</li>'
+            + '<li role="option" style="height:20px">Paris France</li>'
+            + '<li role="option" style="height:20px">Parish Road</li></ul>';
+        }
+        render();
+        // Disconnected across its own write, or re-rendering would observe itself and spin.
+        var obs = new MutationObserver(function () {
+          obs.disconnect();
+          render();
+          obs.observe(root, {subtree: true, attributes: true, childList: true});
+        });
+        obs.observe(root, {subtree: true, attributes: true, childList: true});
+        </script>"""
+    ) as page:
+        await page.evaluate(_PRESNAPSHOT_JS)
+        await page.wait_for_timeout(150)
+        # Nothing on this page reacts to anything, so both finders must come back empty.
+        assert await page.evaluate(_FIND_SUGGESTION_JS, {"field": "#city", "value": "Paris France"}) is None
+        # A STRING, not a dict: _FIND_MENU_JS takes the clicked selector. A dict stringifies to
+        # "[object Object]", pQS throws on it, and the probe returns null at the trigger step —
+        # passing for a reason that has nothing to do with the reaction gate under test.
+        assert await page.evaluate(_FIND_MENU_JS, "#city") is None
+        assert await page.evaluate("() => window.renders") == 1, "the snapshot must not mutate the page"
+
+        # The fixture really is reactive: stamping an attribute the old way does re-render it, so the
+        # assertion above is about our snapshot and not about an inert page.
+        await page.evaluate(
+            "() => { document.getElementById('lst').shadowRoot.querySelector('li').setAttribute('x', '1'); }"
+        )
+        await page.wait_for_timeout(150)
+        assert await page.evaluate("() => window.renders") > 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pre_snapshot_survives_a_container_the_page_rebuilds_by_cloning() -> None:
+    # The light-DOM half of the snapshot is an ATTRIBUTE, not node identity, because an attribute
+    # survives cloneNode/innerHTML and node identity does not. A page that re-creates a list by
+    # cloning it would otherwise read as "all of this appeared in reaction to your click", and the
+    # model would be told to pick one of its own search results as a dropdown option.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<button id="sort" style="position:absolute;top:10px;left:10px;width:120px;height:24px">Sort</button>
+        <div id="results" style="position:absolute;top:40px;left:10px;width:220px">
+          <a href="/a" role="option" style="display:block;height:20px">Result Alpha</a>
+          <a href="/b" role="option" style="display:block;height:20px">Result Beta</a>
+          <a href="/c" role="option" style="display:block;height:20px">Result Gamma</a>
+        </div>"""
+    ) as page:
+        await page.evaluate(_CLICK_PRECHECK_JS, "#sort")
+        # The page rebuilds the container: every node is new, but every node carries the mark.
+        await page.evaluate(
+            "() => { const r = document.getElementById('results'); r.parentNode.replaceChild(r.cloneNode(true), r); }"
+        )
+        assert await page.evaluate(_FIND_MENU_JS, "#sort") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_reaction_gate_rejects_a_page_supplied_snapshot_impostor() -> None:
+    # preReady() exists to tell "no snapshot" apart from "everything is new". A page that pre-defines
+    # __tv3_pre as a non-writable accessor keeps its own object through preReset, and an impostor
+    # whose has() always returns false makes every element read as a reaction — turning the guard
+    # into the exact confident-wrong answer it was added to prevent. instanceof, not truthiness.
+    from skyvern.forge.taskv3.tools import _CLICK_PRECHECK_JS, _FIND_MENU_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<button id="pick" style="position:absolute;top:10px;left:10px;width:120px;height:24px">Pick</button>
+        <x-menu id="m" style="position:absolute;top:40px;left:10px;display:block;width:200px;height:60px"></x-menu>
+        <script>
+        // The rows live in a shadow root ON PURPOSE: in the light DOM the attribute half of the
+        // snapshot carries identity and would mask the impostor. Inside a root the WeakSet is the
+        // only carrier, so this is exactly where an impostor decides the answer.
+        document.getElementById('m').attachShadow({mode:'open'}).innerHTML =
+          '<div role="option" style="height:20px">Alpha Corp</div>'
+          + '<div role="option" style="height:20px">Beta LLC</div>'
+          + '<div role="option" style="height:20px">Gamma Inc</div>';
+        Object.defineProperty(window, '__tv3_pre', {
+          configurable: false,
+          get: function () { return { add: function () {}, has: function () { return false; } }; },
+          set: function () {},
+        });
+        </script>"""
+    ) as page:
+        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        # The impostor answers "not in the snapshot" for every row. Without the instanceof check the
+        # probe believes it, and reports three static links as a menu the click just opened.
+        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_suggestion_finder_refuses_when_the_field_cannot_be_resolved() -> None:
+    # Without a field there is no geometry gate, and the scan is then page-wide: it will tag, and
+    # _commit_typeahead will click, a row nowhere near the control that was typed into. "Cannot
+    # judge" and "nothing reacted" are both safe outcomes; a confident wrong click is not.
+    from skyvern.forge.taskv3.tools import _FIND_SUGGESTION_JS, _PRESNAPSHOT_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<input id="city" style="position:absolute;top:20px;left:20px;width:200px;height:24px">
+        <div id="far" style="position:absolute;top:1500px;left:600px;display:none">Paris France</div>"""
+    ) as page:
+        await page.evaluate(_PRESNAPSHOT_JS)
+        await page.evaluate("() => { document.getElementById('far').style.display = 'block'; }")
+        assert await page.evaluate(_FIND_SUGGESTION_JS, {"field": "#missing", "value": "Paris France"}) is None
+        # and a selector the CSS engine cannot parse stays loud rather than degrading to a page scan
+        with pytest.raises(Exception):
+            await page.evaluate(_FIND_SUGGESTION_JS, {"field": "text=City", "value": "Paris France"})
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_verify_commit_reads_a_shadow_hosted_field() -> None:
+    # Reading '' for a field that did commit turns a successful type into a reported failure.
+    from skyvern.forge.taskv3.tools import _VERIFY_COMMIT_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<ds-field id="f"></ds-field><script>
+        document.getElementById('f').attachShadow({mode:'open'}).innerHTML =
+          '<input id="inner" value="United States" />';
+        </script>"""
+    ) as page:
+        assert await page.evaluate(_VERIFY_COMMIT_JS, {"field": "#inner", "typed": "United"}) == "United States"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibling() -> None:
+    # Unique is not enough, it must be THIS element, and that has to hold on the pierced path too: a
+    # NULL id folds to U+FFFD when escaped, so a selector built from it denotes a sibling carrying
+    # the real U+FFFD id. observe declines to name the first control and says why, rather than
+    # handing out a selector that resolves to the second -- and the sibling it does name still
+    # resolves to itself.
+    async with _live_page(
+        """<x-host id="h"></x-host><script>
+        var r = document.getElementById('h').attachShadow({mode: 'open'});
+        var real = document.createElement('button');
+        real.setAttribute('id', '\\u0000');
+        real.textContent = 'Real Control';
+        real.setAttribute('style', 'display:block;width:120px;height:20px');
+        var decoy = document.createElement('button');
+        decoy.setAttribute('id', '\\uFFFD');
+        decoy.textContent = 'Decoy';
+        decoy.setAttribute('style', 'display:block;width:120px;height:20px');
+        r.appendChild(real); r.appendChild(decoy);
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert "Real Control" not in r.content, r.content
+        assert "identifier we cannot render safely" in r.content, r.content
+        line = next(ln for ln in r.content.splitlines() if "Decoy" in ln)
+        selector = line[1 : line.index("] ")]
+        assert await page.locator(selector).first.inner_text() == "Decoy"
+
+
+# The seam between the two shipped halves: a styled listbox proxy AND the hidden native it writes
+# through to, both inside one open shadow root, with the option rows rendered in that same root. The
+# hidden-native listing reaches the <select>; the pierced reaction probes reach the rows. Nothing
+# below asserts that they compile — each step asserts what the page did.
+_PROXY_MENU_IN_SHADOW_HTML = """
+<!doctype html><html><body>
+  <ds-country id="country-host"></ds-country>
+  <script>
+    var c = document.getElementById('country-host').attachShadow({mode: 'open'});
+    c.innerHTML =
+      '<label for="sr-country">Shipping Country</label>' +
+      '<select id="sr-country" style="display:none">' +
+      '<option value="">Pick</option><option value="us">United States</option>' +
+      '<option value="ca">Canada</option></select>' +
+      '<div role="listbox" id="sr-proxy" style="width:200px;height:30px">Pick</div>' +
+      '<div id="sr-opts" style="display:none;position:absolute;top:40px;left:0;width:200px">' +
+      '<div role="option" data-v="us" style="height:20px">United States</div>' +
+      '<div role="option" data-v="ca" style="height:20px">Canada</div></div>';
+    c.getElementById('sr-proxy').addEventListener('click', function () {
+      c.getElementById('sr-opts').style.display = 'block';
+    });
+    c.querySelectorAll('#sr-opts [role=option]').forEach(function (o) {
+      o.addEventListener('click', function () {
+        var s = c.getElementById('sr-country');
+        s.value = o.getAttribute('data-v');
+        s.dispatchEvent(new Event('change', {bubbles: true}));
+        c.getElementById('sr-proxy').textContent = o.textContent;
+        c.getElementById('sr-opts').style.display = 'none';
+      });
+    });
+    c.getElementById('sr-country').addEventListener('change', function (e) {
+      window.__srChanged = e.target.value;
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pierced_probes_and_hidden_native_listing_agree_on_the_shadow_hosted_widget() -> None:
+    async with _content_page(_PROXY_MENU_IN_SHADOW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        # The hidden-native half still reaches the <select> through the root.
+        assert any("[hidden-native" in ln and "sr-country" in ln for ln in r.content.splitlines()), r.content
+
+        # The pierced reaction probes see the rows the component rendered into its own root.
+        opened = await _tool(tools, "click").handler({"selector": "#sr-proxy"})
+        assert opened.status == "ok", opened.content
+        assert "opened a menu of 2 options" in opened.content, opened.content
+
+        assert "Canada" in opened.content, opened.content
+
+        chosen = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="2"]'})
+        assert chosen.status == "ok", chosen.content
+        # The element actually driven is the hidden native the other half listed — the two halves
+        # agree about what this widget is, rather than each acting on a different element.
+        assert await page.evaluate("window.__srChanged") == "ca"
+        assert (
+            await page.evaluate(
+                "() => document.getElementById('country-host').shadowRoot.getElementById('sr-country').value"
+            )
+            == "ca"
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_menu_opened_by_a_hash_href_trigger_is_still_reported() -> None:
+    # `<a href="#">` is the ordinary markup for a dropdown trigger, and clicking one moves the URL to
+    # `...#` without leaving the document. Treating any URL change as a navigation deleted these
+    # menus outright: the rows are visible, the finder returns all of them, and the tool reported
+    # nothing — so the model never learns there is a list to pick from. A real cross-document
+    # navigation needs no such guard, because it destroys the pre-snapshot that arms the finder.
+    async with _live_page(
+        """<a id="go" href="#" style="display:block;width:120px;height:24px">Menu</a>
+        <div id="menu" style="display:none;position:absolute;top:40px;left:0;width:200px">
+          <div role="option" style="height:20px">Alpha Corp</div>
+          <div role="option" style="height:20px">Beta LLC</div>
+          <div role="option" style="height:20px">Gamma Inc</div>
+        </div>
+        <script>
+        document.getElementById('go').addEventListener('click', function () {
+          document.getElementById('menu').style.display = 'block';
+        });
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#go"})
+        assert r.status == "ok", r.content
+        assert "opened a menu of 3 options" in r.content, r.content
+        assert "Alpha Corp" in r.content, r.content

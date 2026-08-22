@@ -8,6 +8,7 @@ import pytest
 from fastapi import HTTPException
 
 from skyvern.exceptions import (
+    ConcurrencyLimitExceeded,
     MissingBrowserStatePage,
     ScrapingFailed,
     ScreenshotTargetClosed,
@@ -556,3 +557,33 @@ async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
     assert rejection is not None
     assert rejection.status_code == 400
     page_ai.ai_upload_file.assert_not_awaited()
+
+
+class _RejectingSlot:
+    def __init__(self, organization_id: str) -> None:
+        self._organization_id = organization_id
+
+    async def __aenter__(self) -> None:
+        raise ConcurrencyLimitExceeded(organization_id=self._organization_id, operation="SDK action", limit=4)
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_action_over_the_concurrency_cap_is_rejected_before_any_run_is_created(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """A rejected action must cost a request, not a workflow run, a task or a step."""
+    mock_request.workflow_run_id = None
+    mock_app.RATE_LIMITER.limit_sdk_action_concurrency = MagicMock(side_effect=_RejectingSlot)
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock()
+
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
+        with pytest.raises(ConcurrencyLimitExceeded) as rejected:
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert rejected.value.status_code == 429
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_awaited()
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+    mock_app.DATABASE.tasks.create_step.assert_not_awaited()
