@@ -23827,6 +23827,27 @@
               "agent",
               "code"
             ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -24146,6 +24167,27 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
             ]
           }
         },
@@ -29726,6 +29768,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -29989,6 +30052,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
