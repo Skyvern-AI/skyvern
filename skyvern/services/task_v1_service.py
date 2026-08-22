@@ -21,6 +21,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
+from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
@@ -116,6 +117,7 @@ async def run_task(
     request: Request | None = None,
     background_tasks: BackgroundTasks | None = None,
     ab_routing_eligible: bool = True,
+    file_ids: list[str] | None = None,
 ) -> tuple[Task, RunEngine]:
     await _validate_task_v1_model_for_org(organization, task.model)
     if task.url:
@@ -157,6 +159,12 @@ async def run_task(
             organization_id=organization.organization_id,
             task_id=created_task.task_id,
         )
+    # Bound before dispatch so the run cannot reach teardown with nothing attached to delete.
+    await uploaded_file_service.attach_files_to_run(
+        file_ids=file_ids or [],
+        organization_id=organization.organization_id,
+        run_id=created_task.task_id,
+    )
     await AsyncExecutorFactory.get_executor().execute_task(
         request=request,
         background_tasks=background_tasks,

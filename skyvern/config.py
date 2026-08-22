@@ -316,6 +316,11 @@ class Settings(BaseSettings):
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
     # still means "no expiry of its own", governed by the org's data-retention policy.
     MAX_UPLOADED_FILE_RETENTION_DAYS: int = Field(default=365, gt=0)
+    # Backstop expiry given to a file attached to a run, so a run that never reaches its
+    # terminal handler (cancelled worker, lost node) still cannot strand the bytes. Must stay
+    # comfortably above WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES plus queue time, since deleting
+    # a file mid-run would fail the run that is using it.
+    RUN_ATTACHED_FILE_BACKSTOP_HOURS: int = Field(default=24, gt=0)
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"

@@ -160,7 +160,7 @@ from skyvern.forge.validation_evidence_router import (
 )
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services import run_service, service_utils
+from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
@@ -6137,6 +6137,11 @@ class ForgeAgent:
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
+
+        # Before the webhook, so a caller acting on the run's completion already sees the
+        # attached files gone. Tasks belonging to a workflow run returned above; their
+        # attachments hang off the workflow run and are deleted by its own cleanup.
+        await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
 
         if need_call_webhook:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:

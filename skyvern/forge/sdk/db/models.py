@@ -2061,6 +2061,11 @@ class UploadedFileModel(Base):
             postgresql_where=text("deleted_at IS NULL AND expires_at IS NOT NULL"),
         ),
         Index("ix_uploaded_files_organization_id", "organization_id"),
+        Index(
+            "ix_uploaded_files_run_id_live",
+            "run_id",
+            postgresql_where=text("deleted_at IS NULL AND run_id IS NOT NULL"),
+        ),
         CheckConstraint("size_bytes >= 0", name="ck_uploaded_files_size_bytes_non_negative"),
     )
 
@@ -2074,6 +2079,10 @@ class UploadedFileModel(Base):
     # NULL means the file has no caller-specified lifetime and is governed only by the
     # organization's existing data-retention policy.
     expires_at = Column(DateTime, nullable=True)
+    # The run this file is attached to, deleted when that run reaches a terminal state. No
+    # foreign key: a run id is a task id, a workflow run id, or a task v2 id depending on the
+    # engine, so there is no single table to point at.
+    run_id = Column(String, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

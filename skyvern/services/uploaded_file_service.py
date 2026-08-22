@@ -24,6 +24,17 @@ class InvalidRetentionPeriod(ValueError):
     pass
 
 
+class FileNotAttachable(ValueError):
+    """One or more file ids cannot be attached to the run."""
+
+    def __init__(self, file_ids: list[str]) -> None:
+        self.file_ids = file_ids
+        super().__init__(
+            "These file ids are not available to attach — each must name a file uploaded by this "
+            f"organization that is not deleted and not already attached to another run: {', '.join(file_ids)}"
+        )
+
+
 def generate_upload_id() -> str:
     """Mint a file id before the bytes are written, so it can be embedded in storage_uri.
 
@@ -99,6 +110,129 @@ async def delete_uploaded_file(*, file_id: str, organization_id: str) -> bool:
         file_id=uploaded_file.file_id,
     )
     return True
+
+
+async def assert_files_attachable(*, file_ids: list[str], organization_id: str) -> None:
+    """Reject unknown, deleted, or already-attached file ids before a run is created.
+
+    Attaching happens after the run exists, which is too late to answer 4xx. Checking first
+    means a bad file id costs the caller nothing instead of leaving a started run holding an
+    attachment it never got.
+    """
+    requested = list(dict.fromkeys(file_ids))
+    if not requested:
+        return
+    live = await app.DATABASE.uploaded_files.get_uploaded_files_by_ids(
+        file_ids=requested, organization_id=organization_id
+    )
+    attachable = {uploaded_file.file_id for uploaded_file in live if uploaded_file.run_id is None}
+    unattachable = [file_id for file_id in requested if file_id not in attachable]
+    if unattachable:
+        raise FileNotAttachable(unattachable)
+
+
+async def attach_files_to_run(*, file_ids: list[str], organization_id: str, run_id: str) -> list[UploadedFile]:
+    """Bind uploaded files to a run so the run's terminal handler deletes them.
+
+    Every attachment also gets a backstop expiry: the terminal handler is the fast path, and
+    the existing expiry sweep is what guarantees the bytes go away even if a run never reaches
+    it. Without the backstop, a lost worker would strand exactly the sensitive data this
+    feature exists to bound.
+    """
+    if not file_ids:
+        return []
+
+    backstop = datetime.now(timezone.utc) + timedelta(hours=settings.RUN_ATTACHED_FILE_BACKSTOP_HOURS)
+    attached = await app.DATABASE.uploaded_files.attach_uploaded_files_to_run(
+        file_ids=list(dict.fromkeys(file_ids)),
+        organization_id=organization_id,
+        run_id=run_id,
+        expires_at=backstop,
+    )
+    attached_ids = {uploaded_file.file_id for uploaded_file in attached}
+    missed = [file_id for file_id in dict.fromkeys(file_ids) if file_id not in attached_ids]
+    if missed:
+        # Lost a race with a concurrent delete or another run's attach between the pre-check
+        # and here. The run is already created, so this is logged rather than raised: the run
+        # proceeds and simply has no attachment to delete for those ids.
+        LOG.warning(
+            "Some files could not be attached to the run",
+            organization_id=organization_id,
+            run_id=run_id,
+            file_ids=missed,
+        )
+    if attached:
+        LOG.info(
+            "Attached uploaded files to run",
+            organization_id=organization_id,
+            run_id=run_id,
+            file_ids=sorted(attached_ids),
+            backstop_expires_at=backstop,
+        )
+    return attached
+
+
+async def delete_files_attached_to_run(*, run_id: str) -> int:
+    """Delete every file attached to a run. Safe to call for runs that have no attachments.
+
+    Never raises. This runs inside run teardown, where an exception would cost the run its
+    webhook and artifact persistence — a far worse outcome than a late delete. Anything that
+    fails here is picked up by the expiry sweep via the backstop expiry set at attach time.
+    """
+    try:
+        attached = await app.DATABASE.uploaded_files.get_uploaded_files_for_run(run_id=run_id)
+    except Exception:
+        LOG.exception("Failed to look up files attached to run", run_id=run_id)
+        return 0
+    if not attached:
+        return 0
+
+    deleted = 0
+    for uploaded_file in attached:
+        try:
+            await _delete_stored_object(uploaded_file)
+        except Exception:
+            LOG.exception(
+                "Failed to delete file attached to run",
+                organization_id=uploaded_file.organization_id,
+                run_id=run_id,
+                file_id=uploaded_file.file_id,
+            )
+            continue
+        try:
+            await app.DATABASE.uploaded_files.claim_uploaded_file_for_deletion(
+                file_id=uploaded_file.file_id, organization_id=uploaded_file.organization_id
+            )
+        except Exception:
+            LOG.exception(
+                "Deleted the bytes of a run attachment but failed to retire its row",
+                organization_id=uploaded_file.organization_id,
+                run_id=run_id,
+                file_id=uploaded_file.file_id,
+            )
+            continue
+        deleted += 1
+
+    LOG.info(
+        "Deleted files attached to run",
+        run_id=run_id,
+        attached=len(attached),
+        deleted=deleted,
+    )
+    return deleted
+
+
+async def resolve_file_reference(*, file_id: str, organization_id: str) -> str | None:
+    """Return the storage URI behind a file id, or None when the org has no such live file.
+
+    This is what lets a caller hand the agent a file id instead of a presigned URL: the URI is
+    read from the row rather than taken from input, and the storage layer re-checks it against
+    the organization's prefix before any bytes are read.
+    """
+    uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
+        file_id=file_id, organization_id=organization_id
+    )
+    return uploaded_file.storage_uri if uploaded_file else None
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

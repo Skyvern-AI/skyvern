@@ -228,7 +228,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
-from skyvern.services import script_service, workflow_script_service
+from skyvern.services import script_service, uploaded_file_service, workflow_script_service
 from skyvern.services.script_review_cap import (
     check_and_increment_cap_v3,
     increment_script_review_counter_v2,
@@ -11248,6 +11248,10 @@ class WorkflowService:
                     exc_info=True,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+            # Before the webhook, so a caller acting on the run's completion already sees the
+            # attached files gone.
+            await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run.workflow_run_id)
 
             if need_call_webhook:
                 await self.execute_workflow_webhook(workflow_run, api_key)
