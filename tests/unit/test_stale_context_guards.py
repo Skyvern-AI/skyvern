@@ -11,12 +11,14 @@ from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, 
 
 _DETACHED_ERROR = "ElementHandle.content_frame: Element is not attached to the DOM"
 _FRAME_DETACHED_ERROR = "Locator.count: Frame was detached"
+_FRAME_HAS_BEEN_DETACHED_ERROR = "Frame.frame_element: Frame has been detached."
 _TYPE_TIMEOUT_ERROR = "Locator.type: Timeout 10000ms exceeded."
 
 
 def test_predicate_matches_detached_errors() -> None:
     assert is_element_detached_error(PlaywrightError(_DETACHED_ERROR)) is True
     assert is_element_detached_error(PlaywrightError(_FRAME_DETACHED_ERROR)) is True
+    assert is_element_detached_error(PlaywrightError(_FRAME_HAS_BEEN_DETACHED_ERROR)) is True
     assert is_element_detached_error(PlaywrightTimeoutError(_TYPE_TIMEOUT_ERROR)) is False
 
 
