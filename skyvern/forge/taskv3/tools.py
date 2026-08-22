@@ -205,7 +205,7 @@ _FIND_SUGGESTION_JS = (
   const want = toks(args.value || '');
   pQSA('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
   if (!want.size || !preReady()) return null;
-  const field = pQS(args.field);
+  const field = pQS(args.field) || (args.el && args.el.isConnected ? args.el : null);
   // No field means no geometry gate, and without it the scan below is page-wide and will happily
   // tag -- and then click -- a row far from the control the caller typed into. Refuse instead:
   // "cannot judge" and "nothing reacted" are both safe, and a confident wrong click is not.
@@ -267,17 +267,20 @@ _VERIFY_COMMIT_JS = (
     + r"""
   const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3));
   const overlaps = (a, b) => { const B = toks(b); for (const w of toks(a)) if (B.has(w)) return true; return false; };
-  const el = pQS(args.field);
+  const el = pQS(args.field) || (args.el && args.el.isConnected ? args.el : null);
+  // null (not '') when there is nothing to read: the caller must tell "read it, no commit" from
+  // "could not read it", and a later second probe would answer about a different instant.
+  if (!el) return null;
   const typed = String(args.typed || '').trim();
   const chosen = String(args.chosen || '').trim() || typed;
-  const cur = el ? (el.value || '').trim() : '';
+  const cur = (el.value || '').trim();
   const tagged = pQS('[data-tv3-sugg]');
   const listClosed = !tagged || tagged.getBoundingClientRect().height === 0;
   // A short normalized value ("New York" -> "NY", "United States" -> "US") has no >=3-char token to
   // overlap, so accept it on causality alone (it changed / the list closed). Longer values must still
   // relate to the chosen suggestion so an unrelated change can't read as a successful commit.
   if (cur && (cur !== typed || listClosed) && (toks(cur).size === 0 || overlaps(cur, chosen) || overlaps(cur, typed))) return cur;
-  const cont = el ? el.closest('div,li,fieldset') : null;
+  const cont = el.closest('div,li,fieldset');
   if (cont) {
     for (const h of cont.querySelectorAll('input[type=hidden]')) {
       const v = (h.value || '').trim();
@@ -299,17 +302,17 @@ _VERIFY_COMMIT_JS = (
 # Both readings happen in ONE evaluation: as two round trips, an ordinary re-render landing between
 # them lets each describe a different moment.
 _PROBE_REACH_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
   const _roots = """
     + _SHADOW_ROOTS_JS
     + r""";
   try {
-    if (document.querySelector(sel)) return '';
+    if (document.querySelector(arg.sel)) return '';
   } catch (e) { return 'unprobeable'; }
   try {
-    for (const root of _roots(document)) { if (root.querySelector(sel)) return 'component'; }
+    for (const root of _roots(document)) { if (root.querySelector(arg.sel)) return 'component'; }
   } catch (e) { return ''; }
-  return '';
+  return (arg.el && arg.el.isConnected ? arg.el : null) ? 'component' : '';
 }"""
 )
 
@@ -318,13 +321,15 @@ _PROBE_REACH_JS = (
 # Pierces open shadow roots because the caller compares against what `page.click` would resolve, and
 # a document-only probe reports "gone" for every element a web component renders.
 _SELECTOR_EXISTS_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
   const _roots = """
     + _SHADOW_ROOTS_JS
     + r""";
   try {
     let found = null;
-    for (const root of _roots(document)) { found = root.querySelector(sel); if (found) break; }
+    for (const root of _roots(document)) { found = root.querySelector(arg.sel); if (found) break; }
+    // The executor can resolve a selector no single root can match; that is existence too.
+    if (!found) found = (arg.el && arg.el.isConnected ? arg.el : null);
     return !!found;
   } catch (e) { return true; }
 }"""
@@ -385,7 +390,11 @@ _ROOT_QUERY_JS = (
 # actionability wait never resolves against it, so select_option probes visibility first and only
 # forces past actionability when the element exists but is genuinely hidden this way.
 _SELECT_VISIBILITY_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
+  const sel = arg.sel;
+  // A node the page replaced between the executor's lookup and this evaluate is not evidence about
+  // the live page: reading a detached one reports a stale value as a current verdict.
+  const _executorEl = arg.el && arg.el.isConnected ? arg.el : null;
   const _visibleProxy = """
     + _VISIBLE_PROXY_JS
     + r""";
@@ -393,7 +402,7 @@ _SELECT_VISIBILITY_JS = (
     + _ROOT_QUERY_JS
     + r""";
   try {
-    const el = _q.find(sel);
+    const el = _q.find(sel) || _executorEl;
     if (!el) return { exists: false, visible: false };
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
@@ -412,12 +421,16 @@ _SELECT_VISIBILITY_JS = (
 # Read back after a forced select_option so a styled proxy that silently didn't sync from its
 # native control is caught rather than reported as a successful selection.
 _SELECT_READBACK_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
+  const sel = arg.sel;
+  // A node the page replaced between the executor's lookup and this evaluate is not evidence about
+  // the live page: reading a detached one reports a stale value as a current verdict.
+  const _executorEl = arg.el && arg.el.isConnected ? arg.el : null;
   const _q = """
     + _ROOT_QUERY_JS
     + r""";
   try {
-    const el = _q.find(sel);
+    const el = _q.find(sel) || _executorEl;
     if (!el) return null;
     const idx = el.selectedIndex;
     const opt = idx >= 0 ? el.options[idx] : null;
@@ -430,7 +443,11 @@ _SELECT_READBACK_JS = (
 # A skinned checkbox/radio is a zero-size or invisible native input whose visible <label> is the
 # real click target; the label is tagged (stale tags cleared first) so click can act on it.
 _SKINNED_CHECKBOX_PROBE_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
+  const sel = arg.sel;
+  // A node the page replaced between the executor's lookup and this evaluate is not evidence about
+  // the live page: reading a detached one reports a stale value as a current verdict.
+  const _executorEl = arg.el && arg.el.isConnected ? arg.el : null;
   const _visibleProxy = """
     + _VISIBLE_PROXY_JS
     + r""";
@@ -441,7 +458,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
     // Cleared across roots, not just the document: a tag left inside a component would still be
     // matched by the executor's piercing engine and clicked as though it were this call's proxy.
     _q.all('[data-tv3-proxy]').forEach((e) => e.removeAttribute('data-tv3-proxy'));
-    const el = _q.find(sel);
+    const el = _q.find(sel) || _executorEl;
     if (!el) return { exists: false, skinned: false, labelTagged: false };
     const type = String(el.type || '').toLowerCase();
     if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, labelTagged: false, file: true };
@@ -476,11 +493,15 @@ _SKINNED_CHECKBOX_PROBE_JS = (
 # Read twice (before and after the forced click): a proxy that does not sync from its native input
 # must fail loud, not read as a successful toggle.
 _CHECKBOX_CHECKED_JS = (
-    r"""(sel) => {
+    r"""(arg) => {
+  const sel = arg.sel;
+  // A node the page replaced between the executor's lookup and this evaluate is not evidence about
+  // the live page: reading a detached one reports a stale value as a current verdict.
+  const _executorEl = arg.el && arg.el.isConnected ? arg.el : null;
   const _q = """
     + _ROOT_QUERY_JS
     + r""";
-  try { const el = _q.find(sel); return el ? !!el.checked : null; } catch (e) { return null; }
+  try { const el = _q.find(sel) || _executorEl; return el ? !!el.checked : null; } catch (e) { return null; }
 }"""
 )
 
@@ -490,7 +511,8 @@ _CHECKBOX_CHECKED_JS = (
 # click on a multi-select menu (which commits WITHOUT closing) can be verified by its state change.
 # Also takes the visible-DOM pre-snapshot (data-tv3-pre) so a menu the click opens reads as a reaction.
 _CLICK_PRECHECK_JS = (
-    r"""(clicked) => {"""
+    r"""(arg) => {
+  const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + r"""
   const vis = (el) => {
@@ -518,7 +540,7 @@ _CLICK_PRECHECK_JS = (
   const openRows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
   let target = null;
-  try { target = pQS(clicked); } catch (e) { target = null; }
+  try { target = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { target = (arg.el && arg.el.isConnected ? arg.el : null); }
   let isOption = false;
   let containsMenu = false;
   let optText = '';
@@ -547,7 +569,8 @@ _CLICK_PRECHECK_JS = (
 # destroyed or hidden — reads 0), plus the clicked row's current state fingerprint for the multi-select
 # commit check. Field names are distinct from _CLICK_PRECHECK_JS's on purpose (tests dispatch on them).
 _MENU_AFTER_JS = (
-    r"""(clicked) => {"""
+    r"""(arg) => {
+  const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + r"""
   const vis = (el) => {
@@ -574,7 +597,7 @@ _MENU_AFTER_JS = (
   const rows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) { stillOpen++; rows.push(el); }
   let target = null;
-  try { target = pQS(clicked); } catch (e) { target = null; }
+  try { target = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { target = (arg.el && arg.el.isConnected ? arg.el : null); }
   let optState = '';
   if (target) {
     for (const el of rows) {
@@ -595,12 +618,13 @@ _MENU_AFTER_JS = (
 # stay valid until the menu re-renders, so the model can pick an option without a re-observe re-minting
 # ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
 _FIND_MENU_JS = (
-    r"""(clicked) => {"""
+    r"""(arg) => {
+  const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + r"""
   const vis = (r) => r.width > 0 && r.height > 0;
   let trigger = null;
-  try { trigger = pQS(clicked); } catch (e) { return null; }
+  try { trigger = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { return null; }
   if (!trigger) return null;
   // The reaction gate below is the whole basis for calling these rows a menu the click just opened.
   // A navigation destroys window, so an absent snapshot here means the page under us is not the page
@@ -980,6 +1004,68 @@ _OBSERVE_JS = (
     takenMarkers.add(m);
     return attr('data-tv3', m);
   };
+  // Every scope the executor searches under a host: the host's own light subtree, the root it owns,
+  // and any root nested beneath either. A descendant combinator is shadow-transparent to the
+  // executor, so content SLOTTED into the component matches `#host #ctrl` too -- counting the root
+  // alone undercounts, and an undercount is what hands out a selector that denotes two elements.
+  const hostScopes = (host) => {
+    const scopes = [host];
+    const stack = [host];
+    const own = host.shadowRoot;
+    if (own && own.nodeType === 11) { scopes.push(own); stack.push(own); }
+    while (stack.length) {
+      const scope = stack.pop();
+      let kids;
+      try { kids = scope.querySelectorAll('*'); } catch (e) { return null; }
+      for (const k of kids) {
+        let sr = null;
+        try { sr = k.shadowRoot; } catch (e) { return null; }
+        if (sr && sr.nodeType === 11 && scopes.indexOf(sr) === -1) { scopes.push(sr); stack.push(sr); }
+      }
+    }
+    return scopes;
+  };
+  // resolvesTo, scoped to one host. Same shape and same `found === target` guarantee: whatever the
+  // string turns out to select under this host, it is accepted only if the one element it selects
+  // is THIS one.
+  const scopedResolvesTo = (host, s, target) => {
+    const scopes = hostScopes(host);
+    if (!scopes) return false;
+    let found = null;
+    let n = 0;
+    for (const scope of scopes) {
+      let hits;
+      try { hits = scope.querySelectorAll(s); } catch (e) { return false; }
+      n += hits.length;
+      if (n > 1) return false;
+      if (hits.length === 1) found = hits[0];
+    }
+    return n === 1 && found === target;
+  };
+  // Shadow encapsulation scopes ids to their own root, so a design system reuses one internal id in
+  // every instance and no unscoped selector can single one out. The host itself is outside the root
+  // it owns, so it can be named the ordinary way, and anchoring on it scopes the reused id without
+  // writing anything into the component.
+  const hostAnchored = (el, host) => {
+    if (!host || !el.id) return null;
+    const raw = String(el.id);
+    if (_FORGEABLE.test(raw)) return null;
+    const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
+    const ctrl = esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw);
+    if (!scopedResolvesTo(host, ctrl, el)) return null;
+    // naturalSelector reports its cause through shared state; the control's own cause is already
+    // settled by the time we get here and must survive naming the host.
+    const why = naturalWhy;
+    const inconclusive = checkInconclusive;
+    const hostSel = naturalSelector(host);
+    naturalWhy = why;
+    checkInconclusive = inconclusive;
+    // A host we could not name is left alone rather than marked. Minting here would hand out a
+    // handle on the one page where uniqueness could not be checked -- an unreadable root makes the
+    // host's own count inconclusive, and mintOn keeps a marker it could not verify.
+    if (!hostSel) return null;
+    return hostSel + ' ' + ctrl;
+  };
   // Controls inside a component that we could not name, split by CAUSE: these need different
   // fixes, and one merged tally would send the follow-up after the wrong one.
   //   anonymous    -- no id/name/data-testid at all
@@ -987,9 +1073,8 @@ _OBSERVE_JS = (
   //                   cross-root count is >1 and no unscoped selector can single this one out
   //   unverifiable -- has one, but a root threw, so the count could not be taken
   //   unsafe       -- has one carrying a character that could forge a payload line
-  // A host-anchored selector (`#host #ctrl`) is the fix for the first two. It is not built here,
-  // but it IS verifiable in page: a unique host selector plus `#ctrl` occurring exactly once across
-  // the host's own root and every root nested under it. See SKY-14710.
+  // A duplicated ID is recovered by anchoring on the host (`#host #ctrl`), which is the shape a
+  // design system produces; a name or testid reused across instances is not, and neither is the rest.
   // Records named by a marker we wrote, re-checked after the walk: a later element can mutate an
   // earlier one, and an element's own attributeChangedCallback can move our marker onto a peer.
   const mintedOn = [];
@@ -1044,15 +1129,19 @@ _OBSERVE_JS = (
       // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
       // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
       if (host) {
-        if (naturalWhy === 'duplicated') unnamedDuplicated++;
-        else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
-        else if (naturalWhy === 'unsafe') unnamedUnsafe++;
-        else unnamedAnonymous++;
-        continue;
+        if (naturalWhy === 'duplicated') selector = hostAnchored(el, host);
+        if (!selector) {
+          if (naturalWhy === 'duplicated') unnamedDuplicated++;
+          else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
+          else if (naturalWhy === 'unsafe') unnamedUnsafe++;
+          else unnamedAnonymous++;
+          continue;
+        }
+      } else {
+        selector = mintOn(el);
+        if (!selector) { dropped++; continue; }
+        mintedValue = el.getAttribute('data-tv3');
       }
-      selector = mintOn(el);
-      if (!selector) { dropped++; continue; }
-      mintedValue = el.getAttribute('data-tv3');
     }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
     if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
@@ -1593,6 +1682,20 @@ def build_browser_tools(
             "it (the section header, the step, the modal trigger), then re-observe."
         )
 
+    async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
+        # Probes resolve per root, which cannot match a host-anchored selector whose two halves
+        # straddle a shadow boundary. The executor's own engine can, so it supplies the element the
+        # action will actually land on -- consulted only where the per-root lookup finds nothing.
+        # Only a composed selector needs it, and hostAnchored composes with a space, so anything
+        # without one keeps its single round trip. A quoted space costs a spare lookup, never a miss.
+        if " " not in selector:
+            return {"sel": selector, "el": None}
+        try:
+            element = await page.query_selector(selector)
+        except Exception:
+            element = None
+        return {"sel": selector, "el": element}
+
     async def _clear_proxy_tags(page: Any) -> None:
         try:
             await page.evaluate(
@@ -1623,7 +1726,7 @@ def build_browser_tools(
                 # a live price) keeps moving. Only a state that holds across two reads is evidence.
                 await asyncio.sleep(0.15)
                 try:
-                    again_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+                    again_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
                 except Exception:
                     return True
                 again = again_raw if isinstance(again_raw, dict) else {}
@@ -1633,7 +1736,7 @@ def build_browser_tools(
             if url_before and url_now and url_now != url_before:
                 return f"Selected option {opt!r} — the page navigated.", None
             try:
-                after_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+                after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 # the page tearing down right after an option click is a navigation — commit evidence
                 return f"Selected option {opt!r} — the page navigated.", None
@@ -1647,7 +1750,7 @@ def build_browser_tools(
             # bounded settle, only on this would-be-error path.
             await asyncio.sleep(0.6)
             try:
-                settled_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+                settled_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return f"Selected option {opt!r} — the page navigated.", None
             settled = settled_raw if isinstance(settled_raw, dict) else {}
@@ -1658,7 +1761,7 @@ def build_browser_tools(
             # No-commit evidence is already established: a crash of this last informational probe must
             # not fall through to the caller's fail-open bare ok.
             try:
-                submenu = await page.evaluate(_FIND_MENU_JS, selector)
+                submenu = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
             except Exception:
                 submenu = None
             if isinstance(submenu, dict) and submenu.get("count"):
@@ -1674,10 +1777,10 @@ def build_browser_tools(
                 # arbitrary row, so any open/closed/selected claim could be false. Say nothing.
                 return None, None
             try:
-                after_raw = await page.evaluate(_MENU_AFTER_JS, selector)
+                after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            found = await page.evaluate(_FIND_MENU_JS, selector)
+            found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
             if isinstance(found, dict) and found.get("count"):
                 return _menu_open_note(found, selector), None
             if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
@@ -1686,7 +1789,7 @@ def build_browser_tools(
                     'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
                 ), None
             return None, None
-        found = await page.evaluate(_FIND_MENU_JS, selector)
+        found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
             return _menu_open_note(found, selector), None
         return None, None
@@ -1699,7 +1802,7 @@ def build_browser_tools(
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
             missing = False
             try:
-                missing = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+                missing = not await page.evaluate(_SELECTOR_EXISTS_JS, await _probe_arg(page, selector))
             except Exception:
                 missing = False
             if missing:
@@ -1716,7 +1819,7 @@ def build_browser_tools(
                     )
         pre: dict[str, Any] | None = None
         try:
-            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, selector)
+            pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
             if isinstance(pre_raw, dict):
                 pre = pre_raw
         except Exception:
@@ -1727,14 +1830,17 @@ def build_browser_tools(
             # "its state changed" commit evidence on a no-op click.
             try:
                 await page.hover(selector, timeout=2000)
-                hovered = await page.evaluate(_MENU_AFTER_JS, selector)
+                hovered = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
                 if isinstance(hovered, dict) and hovered.get("optState"):
                     pre["optState"] = hovered["optState"]
             except Exception:
                 pass
         url_before = await _url(page)
+        # One resolution for the whole pre-click phase: these run back to back with no mutation
+        # between them, so re-asking the executor per probe would only buy round trips.
+        pre_click_arg = await _probe_arg(page, selector)
         try:
-            skin_probe = await page.evaluate(_SKINNED_CHECKBOX_PROBE_JS, selector)
+            skin_probe = await page.evaluate(_SKINNED_CHECKBOX_PROBE_JS, pre_click_arg)
         except Exception:
             skin_probe = None
         if isinstance(skin_probe, dict) and skin_probe.get("file"):
@@ -1765,7 +1871,7 @@ def build_browser_tools(
                 await _clear_proxy_tags(page)
                 return ToolResult.error(f"{selector} is disabled — it cannot be toggled until the page enables it")
             try:
-                checked_before = await page.evaluate(_CHECKBOX_CHECKED_JS, selector)
+                checked_before = await page.evaluate(_CHECKBOX_CHECKED_JS, pre_click_arg)
             except Exception:
                 checked_before = None
             if checked_before is True and skin_probe.get("radio"):
@@ -1785,10 +1891,22 @@ def build_browser_tools(
                 await _clear_proxy_tags(page)
             base = f"clicked {selector} via its label — now at {await _url(page)}"
         elif skinned:
-            await page.evaluate(
-                "(sel) => { const _q = " + _ROOT_QUERY_JS + "; const el = _q.find(sel); if (el) el.click(); }",
-                selector,
+            # Resolved again here rather than reused: this evaluate is the action, not a probe, and a
+            # selector naming a control through its host resolves ONLY through the handle -- a node the
+            # page replaced while the probes ran would be clicked off-document, silently.
+            fired = await page.evaluate(
+                "(arg) => { const _q = "
+                + _ROOT_QUERY_JS
+                + "; const el = _q.find(arg.sel) || arg.el;"
+                + " if (!el || !el.isConnected) return false; el.click(); return true; }",
+                await _probe_arg(page, selector),
             )
+            if not fired:
+                await _clear_proxy_tags(page)
+                return ToolResult.error(
+                    f"{selector} left the page before the click could land — it was replaced by a "
+                    "re-render; re-observe and act on fresh selectors"
+                )
             base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
             try:
@@ -1796,7 +1914,7 @@ def build_browser_tools(
             except Exception as e:
                 gone = False
                 try:
-                    gone = not await page.evaluate(_SELECTOR_EXISTS_JS, selector)
+                    gone = not await page.evaluate(_SELECTOR_EXISTS_JS, await _probe_arg(page, selector))
                 except Exception:
                     gone = False
                 if gone:
@@ -1810,7 +1928,7 @@ def build_browser_tools(
 
         if skinned:
             try:
-                checked_after = await page.evaluate(_CHECKBOX_CHECKED_JS, selector)
+                checked_after = await page.evaluate(_CHECKBOX_CHECKED_JS, await _probe_arg(page, selector))
             except Exception:
                 checked_after = None
             if checked_after is None:
@@ -1844,7 +1962,9 @@ def build_browser_tools(
         await page.hover(selector, timeout=15000)
         return ToolResult.ok(f"hovered {selector}")
 
-    async def _commit_typeahead(page: Any, selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+    async def _commit_typeahead(
+        page: Any, selector: str, value: str, rounds: int
+    ) -> tuple[str | None, str | None, bool]:
         # Poll for the suggestion list rendered IN REACTION to the value already typed into `selector`,
         # click the best match, and verify the field committed. Site-agnostic (see _FIND_SUGGESTION_JS).
         # Returns (committed_value, suggestion_text): suggestion_text is None when no suggestion ever
@@ -1854,7 +1974,10 @@ def build_browser_tools(
         for _ in range(rounds):
             await asyncio.sleep(0.4)
             try:
-                found = await page.evaluate(_FIND_SUGGESTION_JS, {"value": value, "field": selector})
+                found = await page.evaluate(
+                    _FIND_SUGGESTION_JS,
+                    {"value": value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
+                )
             except Exception as e:
                 LOG.debug("taskv3 typeahead suggestion-find failed", selector=selector, error=str(e))
                 found = None
@@ -1862,7 +1985,7 @@ def build_browser_tools(
                 best_txt = str(found["text"])
                 break
         if not best_txt:
-            return None, None
+            return None, None, False
         # Click the tagged best row. If the list re-rendered and dropped the tag, re-find (re-tag the
         # current best) and click once more — never blind-press ArrowDown/Enter, which would commit
         # whichever row the widget happens to highlight rather than the one we actually scored.
@@ -1872,7 +1995,10 @@ def build_browser_tools(
             clicked = True
         except Exception:
             try:
-                refound = await page.evaluate(_FIND_SUGGESTION_JS, {"value": value, "field": selector})
+                refound = await page.evaluate(
+                    _FIND_SUGGESTION_JS,
+                    {"value": value, "field": selector, "el": (await _probe_arg(page, selector))["el"]},
+                )
                 if isinstance(refound, dict) and refound.get("text"):
                     best_txt = str(refound["text"])
                     await page.click('[data-tv3-sugg="1"]', timeout=3000)
@@ -1882,18 +2008,30 @@ def build_browser_tools(
         if not clicked:
             # a suggestion surfaced but we couldn't click it — report un-committed, don't guess
             LOG.debug("taskv3 typeahead could not click suggestion", selector=selector, suggestion=best_txt)
-            return None, best_txt
+            return None, best_txt, False
         await asyncio.sleep(0.3)
+        readable = False
         try:
-            committed = (
-                (await page.evaluate(_VERIFY_COMMIT_JS, {"field": selector, "typed": value, "chosen": best_txt})) or ""
-            ).strip()
+            read = await page.evaluate(
+                _VERIFY_COMMIT_JS,
+                {
+                    "field": selector,
+                    "typed": value,
+                    "chosen": best_txt,
+                    "el": (await _probe_arg(page, selector))["el"],
+                },
+            )
+            # null means the field could not be read at all; '' means it was read and holds nothing.
+            readable = read is not None
+            committed = str(read or "").strip()
         except Exception as e:
             LOG.debug("taskv3 typeahead commit-verify failed", selector=selector, error=str(e))
             committed = ""
-        return (committed or None), best_txt
+        return (committed or None), best_txt, readable
 
-    async def _type_and_commit(page: Any, selector: str, value: str, rounds: int) -> tuple[str | None, str | None]:
+    async def _type_and_commit(
+        page: Any, selector: str, value: str, rounds: int
+    ) -> tuple[str | None, str | None, bool]:
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM just before typing so the finder treats only NEW/reacting nodes as suggestions —
         # static page text that merely shares a word with the value can't be mistaken for one.
@@ -1910,7 +2048,7 @@ def build_browser_tools(
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe.
-            return None, None
+            return None, None, False
         return await _commit_typeahead(page, selector, value, rounds)
 
     # Input kinds that are never typeaheads — skip the suggestion probe (and its latency) for these.
@@ -1940,7 +2078,7 @@ def build_browser_tools(
         # and a selector our probe cannot parse. Empty on failure -- claiming a reason we did not
         # establish would be its own false statement.
         try:
-            reach = str(await page.evaluate(_PROBE_REACH_JS, selector) or "")
+            reach = str(await page.evaluate(_PROBE_REACH_JS, await _probe_arg(page, selector)) or "")
         except Exception:
             return None
         if reach == "component":
@@ -1976,18 +2114,17 @@ def build_browser_tools(
         if text and clear and not press_enter and await _field_type(page, selector) not in _NON_TYPEAHEAD_TYPES:
             # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
             # not just on a single `input` from fill — still surfaces them, then commit the best match.
-            committed, opt_txt = await _type_and_commit(page, selector, text, rounds=3)
+            committed, opt_txt, readable = await _type_and_commit(page, selector, text, rounds=3)
             if opt_txt and committed:
                 return ToolResult.ok(
                     f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
                 )
             if opt_txt and not committed:
-                # The verifier pierces open shadow roots, so inside a component it does read the
-                # field -- but a widget that portals its list elsewhere in the page, or renders it in
-                # a closed root, is still beyond it, and "did not commit" would then be its own
-                # unearned claim on a field that is often filled. Halting a batch on that is as wrong
-                # as proceeding on a real failure, so say which one we actually established.
-                why = await _unverifiable_because(page, selector)
+                # The verifier pierces open roots and also reads the element the executor resolved,
+                # so inside a component the failure is established rather than guessed. A list portaled
+                # elsewhere, or a field in a closed root, is still beyond both -- and that is exactly
+                # what the read reports by returning nothing, so the softening follows the read.
+                why = None if readable else await _unverifiable_because(page, selector)
                 if why:
                     return ToolResult.ok(
                         f"clicked suggestion {opt_txt!r} for {selector}; {why}, so the commit could not "
@@ -2028,7 +2165,7 @@ def build_browser_tools(
         label = args.get("label")
         value = args.get("value")
         try:
-            probe = await page.evaluate(_SELECT_VISIBILITY_JS, selector)
+            probe = await page.evaluate(_SELECT_VISIBILITY_JS, await _probe_arg(page, selector))
         except Exception:
             probe = None
         # force bypasses actionability for a select a design system hides behind a styled proxy;
@@ -2045,7 +2182,7 @@ def build_browser_tools(
         if not force:
             return ToolResult.ok(f"selected on {selector}")
         try:
-            readback = await page.evaluate(_SELECT_READBACK_JS, selector)
+            readback = await page.evaluate(_SELECT_READBACK_JS, await _probe_arg(page, selector))
         except Exception:
             readback = None
         committed = False
@@ -2153,7 +2290,7 @@ def build_browser_tools(
             return error
         selector = args["selector"]
         value = _resolve_text(args["value"])
-        committed, opt_txt = await _type_and_commit(page, selector, value, rounds=8)
+        committed, opt_txt, readable = await _type_and_commit(page, selector, value, rounds=8)
         if opt_txt is None:
             # The suggestion finder pierces open shadow roots, so inside a component it now sees a
             # list rendered in that root -- but a portalled or closed-root list stays invisible, so a
@@ -2173,7 +2310,7 @@ def build_browser_tools(
                 "— do not assume success or move on as if it were"
             )
         if not committed:
-            why = await _unverifiable_because(page, selector)
+            why = None if readable else await _unverifiable_because(page, selector)
             if why:
                 return ToolResult.ok(
                     f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
