@@ -106,6 +106,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     repair_page_evidence_is_admissible,
     same_run_typed_challenge_kind,
 )
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import (
     stash_turn_halt_from_blocker_signal,
@@ -426,14 +427,18 @@ async def _attach_action_traces(
             }
             output = action.output
             code_line = output.get("code_line") if isinstance(output, dict) else None
-            if (
-                action.action_type == ActionType.NULL_ACTION
-                and action.status == ActionStatus.failed
-                and type(code_line) is int
-                and action.description
-            ):
-                entry["description"] = action.description[:150]
-                entry["code_line"] = code_line
+            if action.status == ActionStatus.failed:
+                # code_line is the code-block recorder's stamp. Gating on it keeps this to the
+                # recorder's own rows: personalize_action writes the typed-in field value to
+                # response, which is user data and must not reach the packet.
+                if type(code_line) is int:
+                    entry["code_line"] = code_line
+                    if action.action_type == ActionType.NULL_ACTION and action.description:
+                        entry["description"] = action.description[:150]
+                    if action.response:
+                        # Persistence masks registered secrets and parameters; a token the block
+                        # obtained at runtime is in neither registry, so screen it here too.
+                        entry["response"] = redact_raw_secrets_for_prompt(action.response)[:300]
             action_trace.append(entry)
         block_result["action_trace"] = action_trace
 
@@ -517,6 +522,8 @@ async def _attach_failed_block_screenshots(
             block_result["screenshot_b64"] = b64
         if block.final_url:
             block_result["final_url"] = block.final_url
+        if b64 is None and not block.final_url:
+            block_result["at_failure_evidence"] = "No at-failure screenshot or final URL was persisted for this block."
         if b64 is not None or block.final_url:
             LOG.info(
                 "Attached at-failure evidence to failed block",
@@ -584,6 +591,35 @@ def _block_end_urls_by_label(run_block_rows: list[WorkflowRunBlock]) -> dict[str
     return end_urls
 
 
+NO_PERSISTED_END_URL = "No worker-persisted final URL exists for this run; the page it ended on is unknown."
+
+# block.py masks the at-failure URL before persisting it, so a login/MFA failure can leave a
+# final_url that parses but is not the page: it cannot be resumed and must not be reported as one.
+_SECRET_MASK = "*****"
+DISPATCHED_END_URL_MAX_CHARS = 2000
+
+
+def _dispatched_end_url(run_block_rows: list[WorkflowRunBlock]) -> str | None:
+    """Page the run ended on, read from the terminal worker-persisted row because the session is worker-owned.
+
+    Only the terminal row counts: an earlier block's URL is a different page, and reporting it would
+    answer "where did the run end" with a page the run left.
+    """
+    if not run_block_rows:
+        return None
+    final_url = _valid_runtime_anchor_url(run_block_rows[-1].final_url)
+    if final_url is None or _SECRET_MASK in final_url:
+        return None
+    # The mask only covers the secret and parameter registries; a token the block picked up at
+    # runtime is in neither, and a URL is as good a carrier for one as an error message is.
+    screened = redact_raw_secrets_for_prompt(final_url)
+    # Refuse rather than truncate: a cut URL still parses, so it would be reported as the page the
+    # run ended on while being unresumable -- the same thing the mask check above returns None for.
+    if len(screened) > DISPATCHED_END_URL_MAX_CHARS:
+        return None
+    return screened
+
+
 def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[str]:
     """Render the six newest action entries chronologically for the compact packet."""
     if not action_trace:
@@ -596,13 +632,16 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
         status = entry.get("status") or ""
         element = entry.get("element")
         description = entry.get("description")
+        response = entry.get("response")
         code_line = entry.get("code_line")
         bits = [str(action)]
         if element:
             bits.append(str(element))
         if status:
             bits.append(str(status))
-        if isinstance(description, str) and description:
+        if isinstance(response, str) and response:
+            bits.append(f"response={response}")
+        elif isinstance(description, str) and description:
             bits.append(f"description={description}")
         if type(code_line) is int:
             bits.append(f"code_line={code_line}")
@@ -2411,6 +2450,7 @@ async def _run_blocks_and_collect_debug(
                         "overall_status": run.status if run is not None else None,
                         "failure_reason": user_facing_summary,
                         "current_url": current_url,
+                        "current_url_live_observed": bool(current_url) and not dispatch_to_worker,
                         "page_title": page_title,
                         # Omitting this reads downstream as "run session unknown", which grants a
                         # scout-sourced page post-run identity on exactly the fresh-session path.
@@ -2547,17 +2587,19 @@ async def _run_blocks_and_collect_debug(
             entry.pop("action_trace", None)
 
         # Dispatched runs: the worker owns the run session; do not touch it over CDP from the API.
-        # The frontier's per-block anchors come from the run rows the worker persisted instead;
-        # current_url stays unset here, so what the model and the judges are told is unchanged.
+        # The frontier's anchors and the page the run ended on both come from the rows the worker
+        # persisted instead. A dispatched run has no page title to report.
         block_end_urls = _block_end_urls_by_label(run_block_rows)
+        dispatched_end_url = _dispatched_end_url(run_block_rows) if dispatch_to_worker else None
         current_url, page_title = (
-            ("", "") if dispatch_to_worker else await _fallback_page_info(ctx, session_id_override=run_session_id)
+            (dispatched_end_url or "", "")
+            if dispatch_to_worker
+            else await _fallback_page_info(ctx, session_id_override=run_session_id)
         )
 
         screenshot_b64: str | None = None
         # Dispatched runs: the worker owns the persistent browser session, so the API side must not
-        # grab the live page over CDP. A worker-persisted screenshot artifact can be surfaced from
-        # the DB instead (follow-up); for now the dispatched failure packet omits the inline capture.
+        # grab the live page over CDP. Their at-failure frames come from worker-persisted artifacts.
         if not dispatch_to_worker and not run_ok and run_session_id:
             try:
                 browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
@@ -2629,6 +2671,10 @@ async def _run_blocks_and_collect_debug(
             "page_title": page_title,
             "action_trace_summary": action_trace_summary,
         }
+        if not dispatch_to_worker and current_url:
+            result_data["current_url_live_observed"] = True
+        if dispatch_to_worker and dispatched_end_url is None:
+            result_data["current_url_evidence"] = NO_PERSISTED_END_URL
         post_run_page_evidence = _same_run_page_evidence_for_result(ctx, workflow_run.workflow_run_id)
         if post_run_page_evidence is not None:
             result_data["post_run_page_evidence"] = post_run_page_evidence
@@ -2784,10 +2830,16 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         organization_id=ctx.organization_id,
         workflow_permanent_id=ctx.workflow_permanent_id,
     )
-    current_url, page_title = ("", "") if dispatch_to_worker else await _fallback_page_info(ctx)
+    dispatched_end_url = _dispatched_end_url(list(reversed(blocks))) if dispatch_to_worker else None
+    current_url, page_title = (dispatched_end_url or "", "") if dispatch_to_worker else await _fallback_page_info(ctx)
     if current_url:
         result_data["current_url"] = current_url
-        result_data["page_title"] = page_title
+        if not dispatch_to_worker:
+            result_data["current_url_live_observed"] = True
+        if page_title:
+            result_data["page_title"] = page_title
+    if dispatch_to_worker and dispatched_end_url is None:
+        result_data["current_url_evidence"] = NO_PERSISTED_END_URL
     if getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
@@ -3028,7 +3080,12 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
     current_url = _valid_runtime_anchor_url(data.get("current_url"))
     if current_url is not None:
         evidence.current_url = current_url
-        evidence.live_page_state_verified = True
+        # Only a live read of the page verifies its state. A writer that omits the marker — a
+        # dispatched run reading worker-persisted rows, or a new caller — must not claim otherwise,
+        # so the absent case is the unverified one. The flag is only ever set True and survives an
+        # earlier live read, so it has to move with the URL it describes: leaving it set beside a
+        # worker-persisted URL would report a verification of a page this one is not.
+        evidence.live_page_state_verified = data.get("current_url_live_observed") is True
         if data.get("observed_after_workflow_run") is True:
             evidence.current_url_observed_after_workflow_run = True
             evidence.current_url_may_encode_runtime_state = bool(urlparse(current_url).query)

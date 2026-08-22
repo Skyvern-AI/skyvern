@@ -13,6 +13,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
     RecordingPage,
     recorded_action_from_payload,
@@ -237,6 +238,9 @@ class CodeBlockActionRecording:
             # A matching bool/number becomes a string placeholder, which typed Action fields reject.
             # Null it recursively so subclass defaults cannot silently restore user-controlled values.
             masked = _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else {}
+            response = masked.get("response")
+            if isinstance(response, str):
+                masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
             # IDs, timestamps, and implicit model defaults come from a snapshot taken before user
             # code can mutate the action. Explicit page/action fields remain masked.
             masked.update(metadata)

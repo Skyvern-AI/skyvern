@@ -124,6 +124,11 @@ async def _retrieve_action_plan(task: Task, step: Step, scraped_page: ScrapedPag
         updated_action.action_order = idx
         # Reset the action response to None so we don't use the previous answers
         updated_action.response = None
+        # The code-block recorder's line stamp belongs to the run that produced it. Carrying it into
+        # a reused action would point the model at unrelated code, and readers treat the stamp as
+        # proof the row came from the recorder. model_copy is shallow, so rebuild rather than mutate.
+        if isinstance(updated_action.output, dict) and "code_line" in updated_action.output:
+            updated_action.output = {k: v for k, v in updated_action.output.items() if k != "code_line"}
 
         # Update the element id with the element id from the current scraped page, matched by element hash
         if cached_action.skyvern_element_hash:

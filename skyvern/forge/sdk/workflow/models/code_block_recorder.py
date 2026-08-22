@@ -25,6 +25,8 @@ CODE_BLOCK_FILENAME = "<code_block>"
 CODE_LINE_OFFSET = 2
 MAX_RECORDED_ACTION_VALIDATION_ERROR_FIELDS = 20
 PENDING_CALL_DELAY_SECONDS = 20.0
+RECORDED_FAILURE_RESPONSE_MAX_CHARS = 500
+RECORDED_FAILURE_CAPTURE_MAX_CHARS = 8000
 
 _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "goto": ActionType.GOTO_URL,
@@ -415,7 +417,18 @@ class _Recorder:
             result = await call()
         except BaseException as exc:
             action.status = ActionStatus.failed
-            action.response = "Browser operation failed."
+            # Generous rather than tight: the persistence path masks secrets by exact match, so a
+            # tight bound here could split one into an unmatched fragment. It cannot be unbounded --
+            # redact_codeblock_parameter_values counts disclosure characters across the whole payload
+            # and returns a replacement string past its budget, which would drop the row entirely.
+            # A user-defined __str__ can raise or return a non-str. Unguarded, that replaces the
+            # browser's failure with its own and skips both last_exception and the re-raise below,
+            # so the run would lose the fault this line exists to report.
+            try:
+                captured = str(exc)[:RECORDED_FAILURE_CAPTURE_MAX_CHARS]
+            except BaseException:
+                captured = ""
+            action.response = captured or type(exc).__name__
             self.last_exception = exc
             raise
         finally:
