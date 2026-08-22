@@ -62,11 +62,13 @@ def is_incompatible_text_input_error(exc: BaseException) -> bool:
 
 
 def is_element_detached_error(exc: BaseException) -> bool:
-    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node) and
-    # "Frame was detached" (ops routed through a frame that navigated or was removed)
-    # both mean the resolved target no longer exists in the live page.
+    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node), "Frame was
+    # detached" (ops routed through a frame that navigated or was removed) and "Frame has been
+    # detached" (frame_element() on such a frame) all mean the target no longer exists in the live page.
     message = str(exc).lower()
-    return "not attached to the dom" in message or "frame was detached" in message
+    return (
+        "not attached to the dom" in message or "frame was detached" in message or "frame has been detached" in message
+    )
 
 
 def is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
