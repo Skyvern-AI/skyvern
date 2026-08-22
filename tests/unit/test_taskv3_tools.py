@@ -11,6 +11,7 @@ import contextlib
 import html
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -117,7 +118,12 @@ class _FakePage:
         self.calls.append(("type", {"selector": selector, "text": text}))
 
     async def select_option(
-        self, selector: str, value: Any = None, label: Any = None, timeout: int | None = None
+        self,
+        selector: str,
+        value: Any = None,
+        label: Any = None,
+        timeout: int | None = None,
+        force: bool = False,
     ) -> None:
         self.calls.append(("select_option", {"selector": selector, "value": value, "label": label}))
 
@@ -2511,6 +2517,64 @@ async def test_dom_get_html_strips_reaction_bookkeeping_attrs() -> None:
         assert "data-tv3-pre" not in html.content
 
 
+# --- Hidden native controls skinned by a styled proxy (SKY-14662): design-system forms hide the
+# real <select>/checkbox behind a custom widget. observe must still list them so the model can act
+# on the real control directly, instead of guessing at the invisible proxy internals. ---
+
+_HIDDEN_NATIVE_HTML = """
+<!doctype html><html><body>
+  <label for="country">Country</label>
+  <select id="country" style="display:none">
+    <option value="">Pick</option>
+    <option value="us">United States</option>
+    <option value="ca">Canada</option>
+  </select>
+  <div role="listbox" id="country-proxy" style="width:200px;height:30px">Pick</div>
+  <select id="ghost" style="display:none"><option>x</option></select>
+  <label for="agree" style="display:inline-block;width:200px;height:24px">I agree</label>
+  <input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+  <input id="nolabel" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+  <input id="visible-text" type="text" style="width:0;height:0;border:0;padding:0">
+  <script>
+    document.getElementById('country').addEventListener('change', e => {
+      window.__changed = e.target.value;
+      document.getElementById('country-proxy').textContent = e.target.selectedOptions[0].text;
+    });
+    document.getElementById('agree').addEventListener('change', e => {
+      window.__agreeChanged = e.target.checked;
+    });
+  </script>
+</body></html>
+"""
+
+# Same shapes, but the page's own change listener reverts the value/checked state synchronously —
+# the styled proxy never actually adopted the change, so the forced action must fail loud rather
+# than report success on a widget that silently didn't sync.
+_HIDDEN_SELECT_REVERTS_HTML = """
+<!doctype html><html><body>
+  <label for="country">Country</label>
+  <select id="country" style="display:none">
+    <option value="">Pick</option>
+    <option value="us">United States</option>
+    <option value="ca">Canada</option>
+  </select>
+  <script>
+    document.getElementById('country').addEventListener('change', e => { e.target.value = ''; });
+  </script>
+</body></html>
+"""
+
+_HIDDEN_CHECKBOX_REVERTS_HTML = """
+<!doctype html><html><body>
+  <label for="agree" style="display:inline-block;width:200px;height:24px">I agree</label>
+  <input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+  <script>
+    document.getElementById('agree').addEventListener('change', e => { e.target.checked = false; });
+  </script>
+</body></html>
+"""
+
+
 _SHADOW_FIXTURE_HTML = """
 <h1 id="posting-title">Software Engineer</h1>
 <p id="blurb">This role sits on the platform team, and the posting body runs long enough that the
@@ -2587,6 +2651,20 @@ async def _shadow_page() -> AsyncIterator[Any]:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_observe_lists_hidden_native_select_with_visible_label() -> None:
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        assert "#country" in r.content
+        assert "United States" in r.content
+        assert "hidden-native" in r.content
+        assert "#ghost" not in r.content
+        assert "#visible-text" not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_enumerates_controls_inside_open_shadow_roots() -> None:
     # The production signature this fixes: observe collapsed to the light-DOM chrome and reported it
     # byte-identically forever, while the screenshot showed a painted, labelled application form.
@@ -2605,6 +2683,18 @@ async def test_observe_enumerates_controls_inside_open_shadow_roots() -> None:
         ) in r.content
         # and it still reports the light-DOM chrome it always could see
         assert "Apply With Partner" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        assert "#agree" in r.content
+        assert "hidden-native" in r.content
+        assert "#nolabel" not in r.content
 
 
 @_skip_no_browser
@@ -2642,6 +2732,20 @@ async def test_observe_reports_a_reused_component_id_as_reused_not_as_anonymous(
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_option_on_hidden_native_select_sets_value_and_fires_change() -> None:
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok"
+        assert elapsed < 10
+        assert await page.evaluate("window.__changed") == "us"
+        assert await page.eval_on_selector("#country-proxy", "el => el.textContent") == "United States"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_component_that_mirrors_its_id_inward_is_named_by_its_tag() -> None:
     # The dominant real shape, from a production capture: the host carries id="first-name-input" and
     # repeats it on the native input inside its own root, so the bare id matches twice with ONE
@@ -2665,6 +2769,16 @@ async def test_a_component_that_mirrors_its_id_inward_is_named_by_its_tag() -> N
         # Only the inner input carries a listener, so this receipt cannot be produced by a click
         # that landed on the host instead.
         assert await page.evaluate("() => window.hits") == ["inner:INPUT"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_on_hidden_native_select_fails_loud_when_change_does_not_commit() -> None:
+    async with _content_page(_HIDDEN_SELECT_REVERTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
+        assert r.status == "error"
+        assert "did NOT commit" in r.content
 
 
 @_skip_no_browser
@@ -2693,6 +2807,21 @@ async def test_typing_into_a_component_control_does_not_claim_a_check_we_could_n
         assert await page.evaluate("() => document.getElementById('wrap').shadowRoot.querySelector('input').value") == (
             "Main Street"
         )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_skinned_checkbox_routes_via_label() -> None:
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#agree"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok"
+        assert elapsed < 10
+        assert await page.eval_on_selector("#agree", "el => el.checked") is True
+        assert await page.evaluate("window.__agreeChanged") is True
+        assert await page.eval_on_selector_all("[data-tv3-proxy]", "els => els.length") == 0
 
 
 @_skip_no_browser
@@ -2752,6 +2881,20 @@ async def test_a_root_cannot_disguise_itself_as_our_own_malformed_selector() -> 
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_refuses_a_skinned_checkbox_with_no_proxy_at_all() -> None:
+    # observe refuses to list this one (no visibly-rendered proxy), so click must not act on it either.
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#nolabel"})
+        elapsed = time.monotonic() - start
+        assert r.status == "error"
+        assert elapsed < 10
+        assert await page.eval_on_selector("#nolabel", "el => el.checked") is False
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_pre_seeded_marker_holding_a_line_separator_cannot_forge_a_line() -> None:
     # A data-tv3 already on the element is page-controlled text like any other attribute, and it is
     # rendered bare inside the selector. Screened before reuse, or a planted one splits the payload
@@ -2772,6 +2915,42 @@ async def test_a_pre_seeded_marker_holding_a_line_separator_cannot_forge_a_line(
         assert len(r.content.splitlines()) == header + 1, r.content
         assert chr(0x2028) not in r.content, r.content
         assert "FORGED" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_skinned_checkbox_fails_loud_when_toggle_does_not_commit() -> None:
+    async with _content_page(_HIDDEN_CHECKBOX_REVERTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#agree"})
+        assert r.status == "error"
+        assert "did NOT commit" in r.content
+
+
+_HIDDEN_NATIVE_EDGES_HTML = """
+<!doctype html><html><body>
+  <label for="state">State</label>
+  <select id="state" style="display:none">
+    <option value="">Pick</option>
+    <option value="ny">
+      New York
+    </option>
+  </select>
+  <label for="locked">Locked</label>
+  <select id="locked" style="display:none" disabled><option value="">Pick</option><option value="a">A</option></select>
+  <label for="cv" style="display:inline-block;width:120px;height:24px">Resume</label>
+  <input id="cv" type="file" style="position:absolute;width:0;height:0;opacity:0">
+  <div id="many"></div>
+  <script>
+    const many = document.getElementById('many');
+    for (let n = 0; n < 45; n++) {
+      many.insertAdjacentHTML('beforeend',
+        `<label for="h${n}" style="display:inline-block;width:60px;height:20px">H${n}</label>` +
+        `<select id="h${n}" style="display:none"><option value="">Pick</option><option value="x">X</option></select>`);
+    }
+  </script>
+</body></html>
+"""
 
 
 @_skip_no_browser
@@ -2817,6 +2996,18 @@ async def test_a_playwright_syntax_selector_is_not_called_a_component_control() 
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_forced_select_readback_accepts_whitespace_padded_option_label() -> None:
+    # Playwright matches label= against the whitespace-collapsed option.label; the commit read-back
+    # must not reject a selection that Playwright itself accepted.
+    async with _content_page(_HIDDEN_NATIVE_EDGES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": "#state", "label": "New York"})
+        assert r.status == "ok"
+        assert await page.eval_on_selector("#state", "el => el.value") == "ny"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_widget_that_unmounts_its_own_input_is_not_called_a_component() -> None:
     # "The main document cannot see it" is not "it is inside a component": a combobox that tears down
     # its search input answers the same way with no shadow DOM anywhere. Calling that a component
@@ -2835,6 +3026,16 @@ async def test_a_widget_that_unmounts_its_own_input_is_not_called_a_component() 
         assert await page.evaluate("() => !document.getElementById('city')"), "fixture did not unmount"
         assert "inside a component" not in r.content, r.content
         assert r.status == "error" and "NOT filled" in r.content, r
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_forced_select_refuses_disabled_select() -> None:
+    async with _content_page(_HIDDEN_NATIVE_EDGES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_option").handler({"selector": "#locked", "label": "A"})
+        assert r.status == "error" and "disabled" in r.content
+        assert await page.eval_on_selector("#locked", "el => el.value") == ""
 
 
 @_skip_no_browser
@@ -2859,6 +3060,31 @@ async def test_an_unreadable_root_is_disclosed_on_the_very_first_observe() -> No
         again = await _tool(tools, "observe").handler({})
         assert "part of this page could not be queried" in first.content, first.content
         assert first.content == again.content, f"static page churned:\n{first.content}\n---\n{again.content}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_bounds_hidden_natives_and_points_file_inputs_at_file_upload() -> None:
+    async with _content_page(_HIDDEN_NATIVE_EDGES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        listed = [line for line in r.content.splitlines() if line.startswith("[") and "hidden-native" in line]
+        assert len(listed) == 40
+        assert "note: 40 native control(s)" in r.content
+        assert "could not be described" in r.content  # the overflow is disclosed, not silently dropped
+        cv_line = next(line for line in listed if "[#cv]" in line)
+        assert "file_upload" in cv_line and "click" not in cv_line
+
+
+_LABEL_WRAPS_BUTTON_HTML = """
+<!doctype html><html><body>
+  <label style="display:inline-block;width:240px;height:40px">
+    <input id="opt" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+    <button id="danger" type="button" style="width:240px;height:40px" onclick="window.__fired = true">Submit</button>
+  </label>
+</body></html>
+"""
 
 
 @_skip_no_browser
@@ -3302,6 +3528,17 @@ async def test_stale_id_probe_does_not_report_shadow_hosted_selector_as_gone() -
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_skinned_click_never_routes_through_a_label_that_wraps_another_control() -> None:
+    async with _content_page(_LABEL_WRAPS_BUTTON_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#opt"})
+        assert r.status == "ok"
+        assert await page.eval_on_selector("#opt", "el => el.checked") is True
+        assert await page.evaluate("window.__fired") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_does_not_manufacture_blind_spots_from_decorative_components() -> None:
     # A closed shadow root cannot be detected from script, and its nearest proxy -- a visible custom
     # element with no light-DOM content -- is also every decorative divider, spacer and icon on an
@@ -3527,6 +3764,25 @@ async def test_observe_survives_named_getter_clobbering_while_piercing() -> None
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_on_file_input_redirects_to_file_upload_without_waiting() -> None:
+    async with _content_page(_HIDDEN_NATIVE_EDGES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#cv"})
+        assert time.monotonic() - start < 10
+        assert r.status == "error" and "file_upload" in r.content
+
+
+_ARIA_LABELLEDBY_HTML = """
+<!doctype html><html><body>
+  <span id="consent-text" style="display:inline-block;width:200px;height:24px">I consent</span>
+  <input id="consent" type="checkbox" aria-labelledby="consent-text" style="position:absolute;width:0;height:0;opacity:0">
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_element_choice_survives_a_page_that_overrides_matches() -> None:
     # Element.prototype.matches is page-overridable, so selecting elements through it lets an
     # anti-bot page decide what counts as interactive. A CSS-string query is not routed through it.
@@ -3566,6 +3822,42 @@ async def test_observe_discloses_elements_dropped_by_the_budget() -> None:
         # just that it starved something. Without it, "N more elements" reads as more of the same.
         note = next(ln for ln in r.content.splitlines() if "element budget" in ln)
         assert "inside components" in note, note
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_aria_labelledby_names_and_routes_a_skinned_checkbox() -> None:
+    async with _content_page(_ARIA_LABELLEDBY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        line = next(ln for ln in r.content.splitlines() if "[#consent]" in ln)
+        assert "I consent" in line and "hidden-native" in line
+        r = await _tool(tools, "click").handler({"selector": "#consent"})
+        assert r.status == "ok" and "toggled directly" in r.content  # a span is a name, not a click proxy
+        assert await page.eval_on_selector("#consent", "el => el.checked") is True
+
+
+# A section the page has collapsed hides the control AND the proxy the user would have clicked, so
+# there is nothing on screen standing in for it — the discriminator observe already applies. The
+# selector survives the collapse, so the model can still hold it from an earlier observation.
+_COLLAPSED_PANEL_HTML = """
+<!doctype html><html><body>
+  <div id="panel">
+    <label for="terms" style="display:inline-block;width:200px;height:24px">Accept terms</label>
+    <input id="terms" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">
+    <label for="tier" style="display:inline-block;width:200px;height:24px">Tier</label>
+    <select id="tier" style="position:absolute;width:0;height:0;opacity:0">
+      <option value="">Pick</option>
+      <option value="pro">Pro</option>
+    </select>
+  </div>
+  <script>
+    document.getElementById('terms').addEventListener('change', e => { window.__termsChanged = e.target.checked; });
+    document.getElementById('tier').addEventListener('change', e => { window.__tierChanged = e.target.value; });
+    window.__collapse = () => { document.getElementById('panel').style.display = 'none'; };
+  </script>
+</body></html>
+"""
 
 
 @_skip_no_browser
@@ -3611,6 +3903,24 @@ async def test_budget_note_counts_only_what_it_actually_cost_and_offers_no_false
         # 260 visible, 251 listed, 40 hidden: the overflow is the 9 visible ones, not 49. Anchored at
         # the start of the count, because "49 more element(s)" CONTAINS "9 more element(s)".
         assert note.startswith("note: 9 more element(s)"), note
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_refuses_a_skinned_checkbox_once_its_proxy_stops_rendering() -> None:
+    async with _content_page(_COLLAPSED_PANEL_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r_open = await _tool(tools, "observe").handler({})
+        assert "#terms" in r_open.content  # listed while the panel is open
+        await page.evaluate("window.__collapse()")
+        r_closed = await _tool(tools, "observe").handler({})
+        assert "#terms" not in r_closed.content  # observe refuses it once collapsed
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#terms"})
+        assert time.monotonic() - start < 10
+        assert r.status == "error"
+        assert await page.eval_on_selector("#terms", "el => el.checked") is False
+        assert await page.evaluate("window.__termsChanged") is None
 
 
 @_skip_no_browser
@@ -3783,6 +4093,20 @@ async def test_observe_logs_omission_only_when_something_was_actually_omitted() 
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_select_option_refuses_a_hidden_select_once_its_proxy_stops_rendering() -> None:
+    async with _content_page(_COLLAPSED_PANEL_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate("window.__collapse()")
+        start = time.monotonic()
+        r = await _tool(tools, "select_option").handler({"selector": "#tier", "label": "Pro"})
+        assert time.monotonic() - start < 10
+        assert r.status == "error"
+        assert await page.eval_on_selector("#tier", "el => el.value") == ""
+        assert await page.evaluate("window.__tierChanged") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_page_cannot_forge_an_element_line_into_the_observe_payload() -> None:
     # The digest is the model's whole picture of the page, so a page that can write a line into it
     # can invent a control ("[#pay-now] button 'Confirm payment'") or restate a real one with a
@@ -3832,6 +4156,28 @@ async def test_switch_state_is_reported_only_when_the_page_states_it() -> None:
         assert "checked=" not in listed["#unset"], listed["#unset"]
         assert "checked=" not in listed["#mixed"], listed["#mixed"]
         assert "checked=True" in listed["#on"], listed["#on"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_hidden_select_digest_names_select_option_alone_and_click_refuses_it() -> None:
+    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        line = next(ln for ln in r.content.splitlines() if "[#country]" in ln)
+        assert "select_option" in line and "click" not in line
+        start = time.monotonic()
+        rc = await _tool(tools, "click").handler({"selector": "#country"})
+        assert time.monotonic() - start < 10
+        assert rc.status == "error" and "select_option" in rc.content
+
+
+_DISABLED_SKINNED_HTML = """
+<!doctype html><html><body>
+  <label for="agree" style="display:inline-block;width:200px;height:24px">I agree</label>
+  <input id="agree" type="checkbox" disabled style="position:absolute;width:0;height:0;opacity:0">
+</body></html>
+"""
 
 
 @_skip_no_browser
@@ -3934,6 +4280,26 @@ async def test_a_planted_marker_cannot_steer_a_click_to_a_decoy() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_refuses_a_disabled_skinned_checkbox_without_waiting() -> None:
+    async with _content_page(_DISABLED_SKINNED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#agree"})
+        assert time.monotonic() - start < 10
+        assert r.status == "error" and "disabled" in r.content
+        assert await page.eval_on_selector("#agree", "el => el.checked") is False
+
+
+_SKINNED_RADIO_HTML = """
+<!doctype html><html><body>
+  <label for="pick" style="display:inline-block;width:200px;height:24px">Standard shipping</label>
+  <input id="pick" type="radio" name="ship" checked style="position:absolute;width:0;height:0;opacity:0">
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_digest_carries_a_live_region_rendered_inside_a_component() -> None:
     # Validation banners and submission results are exactly what the model needs after an action, and
     # a design system renders them inside the component that owns the field. A document-only digest
@@ -3981,6 +4347,18 @@ async def test_shadow_control_with_an_id_is_observable_and_clickable_end_to_end(
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_no_change_click_leaves_no_proxy_tag_on_the_page() -> None:
+    async with _content_page(_SKINNED_RADIO_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#pick"})
+        assert r.status == "ok" and "already selected" in r.content
+        assert await page.eval_on_selector_all("[data-tv3-proxy]", "els => els.length") == 0
+        html = await _tool(tools, "get_html").handler({})
+        assert "data-tv3-proxy" not in html.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_one_unreadable_root_does_not_cost_every_selector_on_the_page() -> None:
     # `resolvesTo` verifies a candidate selector across every root. With one try/catch around the
     # whole loop, a single root whose querySelectorAll throws made EVERY natural selector fail
@@ -4014,6 +4392,21 @@ async def test_one_unreadable_root_does_not_cost_every_selector_on_the_page() ->
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_click_on_an_unreachable_hidden_select_says_reveal_it_not_use_select_option() -> None:
+    # select_option would refuse this one too, so pointing the model at it costs a turn to learn nothing.
+    async with _content_page(_COLLAPSED_PANEL_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.evaluate("window.__collapse()")
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": "#tier"})
+        assert time.monotonic() - start < 10
+        assert r.status == "error"
+        assert "select_option" not in r.content
+        assert "reveal" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_truncated_header_url_says_so() -> None:
     # Every other cap in this payload names itself. A URL cut mid-query-string looks complete and is
     # a different, invalid URL — the model has no way to tell unless we say so.
@@ -4031,3 +4424,110 @@ async def test_a_truncated_header_url_says_so() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert "url truncated" not in r.content.splitlines()[0]
+
+
+# The seam between the styled-proxy retention above and the open-shadow-root walk: neither mechanism
+# was ever exercised against the other. A zero-size native inside a component reaches the retention
+# block only because the walk enumerates it, and it keeps its name only if the label lookup is scoped
+# to the component's own tree. Both labelling routes are covered because they resolve differently:
+# .labels is tree-scoped by the platform, aria-labelledby is an IDREF we resolve ourselves.
+_HIDDEN_NATIVE_IN_SHADOW_HTML = """
+<!doctype html><html><body>
+  <ds-country id="country-host"></ds-country>
+  <ds-terms id="terms-host"></ds-terms>
+  <script>
+    var c = document.getElementById('country-host').attachShadow({mode: 'open'});
+    c.innerHTML =
+      '<label for="sr-country">Shipping Country</label>' +
+      '<select id="sr-country" style="display:none">' +
+      '<option value="">Pick</option><option value="us">United States</option>' +
+      '<option value="ca">Canada</option></select>' +
+      '<div role="listbox" id="sr-country-proxy" style="width:200px;height:30px">Pick</div>';
+    c.getElementById('sr-country').addEventListener('change', function (e) {
+      window.__srChanged = e.target.value;
+      c.getElementById('sr-country-proxy').textContent = e.target.selectedOptions[0].text;
+    });
+    var t = document.getElementById('terms-host').attachShadow({mode: 'open'});
+    t.innerHTML =
+      '<span id="sr-terms-label" style="display:inline-block;width:200px;height:24px">Accept Terms</span>' +
+      '<input id="sr-terms" type="checkbox" aria-labelledby="sr-terms-label" ' +
+      'style="position:absolute;width:0;height:0;opacity:0">';
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_hidden_natives_inside_open_shadow_roots_by_either_label_route() -> None:
+    async with _content_page(_HIDDEN_NATIVE_IN_SHADOW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
+        assert len(tagged) == 2, r.content
+        # <label for> inside the same root: the platform scopes .labels for us.
+        assert any("sr-country" in ln and "Shipping Country" in ln for ln in tagged), tagged
+        # aria-labelledby is an IDREF we resolve ourselves. Resolved against the document it finds
+        # nothing, so the control reads as unlabelled and is dropped at zero size -- listed nowhere
+        # and counted as no omission.
+        assert any("sr-terms" in ln and "Accept Terms" in ln for ln in tagged), tagged
+        assert "note: 2 native control(s) hidden behind styled proxies" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_option_drives_a_hidden_native_select_inside_an_open_shadow_root() -> None:
+    async with _content_page(_HIDDEN_NATIVE_IN_SHADOW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "select_option").handler({"selector": "#sr-country", "label": "Canada"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok"
+        assert elapsed < 10
+        assert await page.evaluate("window.__srChanged") == "ca"
+        assert (
+            await page.evaluate(
+                "() => document.getElementById('country-host').shadowRoot"
+                ".getElementById('sr-country-proxy').textContent"
+            )
+            == "Canada"
+        )
+
+
+# Two dropzones of the same component reuse one id, so neither is nameable and both are dropped
+# AFTER the styled-proxy gate already counted them. The note must count what it listed, not what it
+# retained, or it reports controls the model cannot find any line for.
+_SHARED_ID_DROPZONES_HTML = """
+<!doctype html><html><body>
+  <ds-drop id="dz-single"></ds-drop>
+  <ds-drop id="dz-a"></ds-drop>
+  <ds-drop id="dz-b"></ds-drop>
+  <script>
+    function mk(hostId, inputId, labelText) {
+      var r = document.getElementById(hostId).attachShadow({mode: 'open'});
+      r.innerHTML =
+        '<label for="' + inputId + '" style="display:inline-block;width:240px;height:40px">' +
+        labelText + '</label>' +
+        '<input type="file" id="' + inputId + '" style="position:absolute;width:0;height:0;opacity:0">';
+    }
+    mk('dz-single', 'resume-unique', 'Upload resume (only one)');
+    mk('dz-a', 'resume', 'Upload resume');
+    mk('dz-b', 'resume', 'Upload cover letter');
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() -> None:
+    async with _content_page(_SHARED_ID_DROPZONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
+        assert len(tagged) == 1 and "resume-unique" in tagged[0], r.content
+        assert "note: 1 native control(s) hidden behind styled proxies" in r.content, r.content
+        # the two that share an id are dropped, and said to be dropped, rather than counted as listed
+        assert "reused by another instance of the same component" in r.content
