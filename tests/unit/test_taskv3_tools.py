@@ -2649,7 +2649,7 @@ async def test_a_component_that_mirrors_its_id_inward_is_named_by_its_tag() -> N
     # them. The click is asserted by a receipt the inner element's own listener writes, because a
     # selector that merely returns ok can still have landed on the host.
     async with _live_page(
-        """<spl-input id="first-name-input"></spl-input>
+        """<ds-input id="first-name-input"></ds-input>
         <script>
         window.hits = [];
         var r = document.getElementById('first-name-input').attachShadow({mode: 'open'});
@@ -3198,7 +3198,7 @@ async def test_a_tag_qualified_id_only_narrows_what_the_bare_id_already_matched(
     # property over every tag-qualified selector observe emitted — each resolves to exactly one, and
     # each only appeared where the bare form was genuinely ambiguous.
     async with _live_page(
-        """<spl-input id="mirrored"></spl-input>
+        """<ds-input id="mirrored"></ds-input>
         <input id="unique-one" style="width:80px;height:20px">
         <script>
         var r = document.getElementById('mirrored').attachShadow({mode: 'open'});
@@ -3308,10 +3308,10 @@ async def test_observe_does_not_manufacture_blind_spots_from_decorative_componen
     # ordinary page. Reporting those as content we cannot see is noise that invites off-list guessing.
     async with _live_page(
         """<style>my-spacer{display:block;height:20px;width:100px}
-        sl-divider{display:block;height:2px;width:200px}
-        ion-icon{display:inline-block;width:24px;height:24px}
+        deco-divider{display:block;height:2px;width:200px}
+        deco-icon{display:inline-block;width:24px;height:24px}
         my-sealed{display:block;height:30px;width:200px}</style>
-        <my-spacer></my-spacer><sl-divider></sl-divider><ion-icon></ion-icon>
+        <my-spacer></my-spacer><deco-divider></deco-divider><deco-icon></deco-icon>
         <my-sealed id="sealed"></my-sealed>
         <button id="go">Go</button>
         <script>
@@ -3331,7 +3331,7 @@ async def test_observe_does_not_manufacture_blind_spots_from_decorative_componen
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert "#go" in r.content
-        assert "sl-divider" not in r.content
+        assert "deco-divider" not in r.content
         assert "my-sealed" not in r.content, "a closed root must not be reported: we cannot tell it from decoration"
         assert "sealed-field" not in r.content, "and we genuinely cannot see inside it"
 
