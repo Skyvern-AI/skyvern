@@ -9,12 +9,14 @@ import pytest
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge.sdk.copilot import tools
+from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     summarize_tool_result,
 )
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
@@ -24,6 +26,13 @@ from skyvern.forge.sdk.copilot.tools import (
     _referenced_output_labels,
 )
 from skyvern.forge.sdk.copilot.tools import frontier as frontier_module
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _credit_composition_verified_labels,
+    _record_run_blocks_result,
+    run_workflow_end_to_end,
+    terminal_ready_for_latch,
+)
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 
 
@@ -187,7 +196,7 @@ def test_plan_frontier_append_after_success_runs_only_appended() -> None:
     ctx.verified_prefix_labels = ["a", "b"]
     ctx.verified_block_outputs = {"a": "nav_ok", "b": {"title": "hi"}}
 
-    labels, _seed, frontier = _plan_frontier(ctx, ["a", "b", "c"], old, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["a", "b", "c"], old, new)
     assert labels == ["c"]
     assert frontier == "c"
 
@@ -210,7 +219,7 @@ def test_plan_frontier_append_walks_back_when_workflow_prefix_is_not_verified() 
     ctx.verified_prefix_labels = ["open"]
     ctx.verified_block_outputs = {"open": "opened"}
 
-    labels, seed, frontier = _plan_frontier(ctx, ["submit_search"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["submit_search"], old, new)
 
     assert labels == ["open", "set_search", "submit_search"]
     assert seed == {}
@@ -229,7 +238,7 @@ def test_plan_frontier_unchanged_workflow_continues_from_first_unverified_label(
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open", "set_search"]
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open", "set_search", "submit_search", "extract"],
         definition,
@@ -253,7 +262,7 @@ def test_plan_frontier_verified_only_request_advances_to_next_unverified_workflo
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["open", "set_search"]
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open", "set_search"],
         definition,
@@ -281,7 +290,7 @@ def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -
         "search": {"current_url": "https://example.com/search/results"},
     }
 
-    labels, seed, frontier = _plan_frontier(ctx, ["expand"], definition, definition)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["expand"], definition, definition)
 
     assert labels == ["expand"]
     assert seed == {
@@ -586,7 +595,7 @@ def test_plan_frontier_edit_walks_back_to_upstream_navigation_anchor() -> None:
     ctx.verified_prefix_labels = ["nav", "click"]
     ctx.verified_block_outputs = {"nav": "ok"}
 
-    labels, _seed, frontier = _plan_frontier(ctx, ["nav", "click"], old, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["nav", "click"], old, new)
     assert labels == ["nav", "click"]
     assert frontier == "nav"
 
@@ -601,7 +610,7 @@ def test_plan_frontier_edit_read_only_block_still_walks_back_to_anchor() -> None
     ctx.verified_prefix_labels = ["nav", "extract"]
     ctx.verified_block_outputs = {"nav": "ok", "extract": "old_out"}
 
-    labels, _seed, frontier = _plan_frontier(ctx, ["nav", "extract"], old, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["nav", "extract"], old, new)
     assert labels == ["nav", "extract"]
     assert frontier == "nav"
 
@@ -636,7 +645,7 @@ def test_plan_frontier_edit_resumes_at_edited_block_when_live_page_matches_recor
     }
     ctx.verified_prefix_terminal_label = "inspect_summary"
 
-    labels, _seed, frontier = _plan_frontier(
+    labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -669,7 +678,7 @@ def test_plan_frontier_edit_walks_back_when_a_loop_hides_a_credential_fill() -> 
     ctx.verified_prefix_block_end_urls = {"open_site": "https://app.example.com/signin"}
     ctx.verified_prefix_terminal_label = "retry_login"
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_site", "retry_login"],
         old,
@@ -691,7 +700,7 @@ def test_plan_frontier_resume_names_the_browser_that_must_run_it() -> None:
     ctx.verified_prefix_terminal_label = "inspect_summary"
     ctx.verified_prefix_block_end_session_id = "pbs_login_run"
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -722,7 +731,7 @@ def test_plan_frontier_append_names_the_browser_that_ran_the_prefix() -> None:
     ctx.verified_prefix_block_end_session_id = "pbs_login_run"
     ctx.verified_prefix_terminal_label = "login_to_site"
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_site", "login_to_site", "read_total"],
         old,
@@ -755,7 +764,7 @@ def test_plan_frontier_does_not_name_a_browser_when_the_seeder_vetoes_the_fronti
     ctx.verified_prefix_block_end_session_id = "pbs_login_run"
     ctx.verified_prefix_terminal_label = "read_total"
 
-    labels, _seed, frontier = _plan_frontier(
+    labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         labels_in_order,
         _definition("result = 1"),
@@ -777,7 +786,7 @@ def test_plan_frontier_edit_walks_back_when_live_page_left_the_recorded_anchor()
     ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
     ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/dashboard"}
 
-    labels, _seed, frontier = _plan_frontier(
+    labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -794,7 +803,7 @@ def test_plan_frontier_edit_walks_back_when_no_anchor_was_recorded() -> None:
     ctx.verified_prefix_labels = list(_LOGIN_THEN_INSPECT_LABELS)
     ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -826,7 +835,7 @@ def test_plan_frontier_edit_walks_back_when_only_the_spa_route_fragment_matches(
     ctx.verified_block_outputs = {"open_site": "ok", "login_to_site": "ok"}
     ctx.verified_prefix_block_end_urls = {"login_to_site": "https://app.example.com/#/dashboard"}
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         _LOGIN_THEN_INSPECT_LABELS,
         old,
@@ -856,7 +865,7 @@ def test_plan_frontier_edit_walks_back_when_the_browser_ran_past_the_edited_bloc
     ctx.verified_prefix_block_end_urls = dict.fromkeys(labels_in_order, "https://app.example.com/")
     ctx.verified_prefix_terminal_label = "checkout"
 
-    labels, _seed, frontier = _plan_frontier(
+    labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         labels_in_order,
         _definition("await page.click('#add')"),
@@ -887,7 +896,7 @@ def test_plan_frontier_edit_walks_back_when_the_frontier_would_refill_credential
     ctx.verified_block_outputs = {"open_site": "ok"}
     ctx.verified_prefix_block_end_urls = {"open_site": "https://app.example.com/signin"}
 
-    _labels, _seed, frontier = _plan_frontier(
+    _labels, _seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_site", "login_code"],
         old,
@@ -976,7 +985,7 @@ def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() ->
     new = _FakeDefinition([_FakeBlock("click", "action", {"selector": "#b"}), _FakeBlock("download", "download_to_s3")])
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["click", "download"]
-    labels, seed, frontier = _plan_frontier(ctx, ["click", "download"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["click", "download"], old, new)
     assert labels == ["click", "download"]
     assert frontier == "click"
     assert seed == {}
@@ -987,7 +996,7 @@ def test_plan_frontier_without_verified_prefix_falls_back_to_full() -> None:
     new = _FakeDefinition([_FakeBlock("a", "navigation"), _FakeBlock("b", "extraction", {"prompt": "changed"})])
     ctx = _make_ctx()
     # No verified_prefix_labels — previous run must have failed.
-    labels, _seed, frontier = _plan_frontier(ctx, ["a", "b"], old, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["a", "b"], old, new)
     assert labels == ["a", "b"]
     assert frontier == "a"
 
@@ -995,7 +1004,7 @@ def test_plan_frontier_without_verified_prefix_falls_back_to_full() -> None:
 def test_plan_frontier_cold_start_no_old_definition_uses_first_requested() -> None:
     new = _FakeDefinition([_FakeBlock("a", "navigation")])
     ctx = _make_ctx()
-    labels, _seed, frontier = _plan_frontier(ctx, ["a"], None, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["a"], None, new)
     assert labels == ["a"]
     assert frontier == "a"
 
@@ -1010,7 +1019,7 @@ def test_plan_frontier_ambiguous_diff_falls_back_on_exception(monkeypatch: pytes
     new = _FakeDefinition([_FakeBlock("a", "navigation")])
     ctx = _make_ctx()
     ctx.verified_prefix_labels = ["a"]
-    labels, seed, frontier = _plan_frontier(ctx, ["a"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["a"], old, new)
     assert labels == ["a"]
     assert frontier == "a"
     assert seed == {}
@@ -1079,7 +1088,7 @@ def test_plan_frontier_append_with_block_form_jinja_ref_falls_back_to_full_run()
         "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
     }
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_page", "extract_article_info", "summarize_article"],
         old,
@@ -1121,7 +1130,7 @@ def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
         "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
     }
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_page", "extract_article_info", "summarize_article"],
         old,
@@ -1253,7 +1262,7 @@ def test_plan_frontier_unknown_jinja_root_falls_back_to_full_requested_list() ->
     ctx.verified_prefix_labels = ["open_page"]
     ctx.verified_block_outputs = {"open_page": "nav_ok"}
 
-    labels, seed, frontier = _plan_frontier(ctx, ["open_page", "summarize_article"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["open_page", "summarize_article"], old, new)
 
     assert labels == ["open_page", "summarize_article"]
     assert seed == {}
@@ -1293,7 +1302,7 @@ def test_plan_frontier_falls_back_when_unknown_root_coexists_with_seedable_ref()
         "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
     }
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_page", "extract_article_info", "summarize_article"],
         old,
@@ -1476,7 +1485,7 @@ def test_plan_frontier_append_only_with_workflow_param_does_not_fall_back() -> N
     ctx.verified_prefix_labels = ["open_page"]
     ctx.verified_block_outputs = {"open_page": "nav_ok"}
 
-    labels, seed, frontier = _plan_frontier(ctx, ["open_page", "search"], old, new)
+    labels, seed, frontier, _provenance = _plan_frontier(ctx, ["open_page", "search"], old, new)
 
     assert labels == ["search"]
     assert seed == {"open_page": "nav_ok"}
@@ -1678,7 +1687,7 @@ def test_plan_frontier_uses_recorded_failed_block_position_for_same_request_orde
         workflow_definition=definition,
     )
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open", "search", "extract"],
         definition,
@@ -1708,7 +1717,7 @@ def test_plan_frontier_maps_recorded_failed_block_by_structure_across_label_chur
         workflow_definition=old,
     )
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_new", "search_new", "extract_new"],
         old,
@@ -1738,7 +1747,7 @@ def test_plan_frontier_fails_closed_when_recorded_failed_order_differs() -> None
         workflow_definition=old,
     )
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_new", "extract_new", "search_new"],
         old,
@@ -1768,7 +1777,7 @@ def test_plan_frontier_fails_closed_when_recorded_failed_shapes_are_ambiguous() 
         workflow_definition=old,
     )
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["second_new", "first_new", "extract_new"],
         old,
@@ -1800,7 +1809,7 @@ def test_plan_frontier_does_not_index_suffix_failed_run_into_full_request() -> N
         workflow_definition=old,
     )
 
-    labels, seed, frontier = _plan_frontier(
+    labels, seed, frontier, _provenance = _plan_frontier(
         ctx,
         ["open_new", "search_new", "extract_new"],
         old,
@@ -1949,7 +1958,7 @@ def test_edit_invalidates_verified_goal_block_on_split_path() -> None:
 
     # Split path: run_blocks passes old==new; the pruned prefix makes the edited
     # block the frontier again instead of reusing it as verified.
-    labels, _seed, frontier = _plan_frontier(ctx, ["open", "search", "extract"], new, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open", "search", "extract"], new, new)
     assert frontier == "extract"
     assert "extract" in labels
 
@@ -2226,8 +2235,8 @@ def test_fused_and_split_leave_identical_verified_state() -> None:
 
     # Neither the split seam (new, new) nor the fused seam (prior, new) reuses the
     # edited block as verified.
-    split_labels, _s, _sf = _plan_frontier(split_ctx, ["open", "search", "extract"], new, new)
-    fused_labels, _f, _ff = _plan_frontier(fused_ctx, ["open", "search", "extract"], prior, new)
+    split_labels, _s, _sf, _sp = _plan_frontier(split_ctx, ["open", "search", "extract"], new, new)
+    fused_labels, _f, _ff, _fp = _plan_frontier(fused_ctx, ["open", "search", "extract"], prior, new)
     assert "extract" in split_labels
     assert "extract" in fused_labels
 
@@ -2329,7 +2338,7 @@ def test_appended_block_output_parameter_keeps_upstream_verified_prefix() -> Non
     assert ctx.workflow_verification_evidence.full_workflow_verified is False
     assert ctx.last_full_workflow_test_ok is False
 
-    labels, _seed, frontier = _plan_frontier(ctx, ["sign_in", "read_summary"], prior, new)
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["sign_in", "read_summary"], prior, new)
     assert labels == ["read_summary"]
     assert frontier == "read_summary"
 
@@ -2518,5 +2527,387 @@ def test_reorder_resets_verified_trust() -> None:
     assert ctx.last_full_workflow_test_ok is False
 
 
+def test_unanchored_append_is_never_credited_as_composition_verified() -> None:
+    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
+    appended = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("add_to_cart", "navigation", {"prompt": "add the item to the cart"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
+    ctx.composition_verified_labels = ["open"]
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "add_to_cart"], prior, appended)
+
+    assert frontier == "add_to_cart"
+    assert provenance == "unanchored"
+
+    _credit_composition_verified_labels(ctx, labels, provenance)
+
+    assert "add_to_cart" not in ctx.composition_verified_labels
+
+
+def test_a_lone_mid_workflow_block_that_opens_a_page_is_not_a_replay() -> None:
+    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
+    appended = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("open_cart", "goto_url", {"url": "https://example.com/cart"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
+    ctx.composition_verified_labels = ["open"]
+    ctx.last_workflow = _FakeWorkflow(appended)
+    ctx.last_workflow_yaml = "workflow: yaml"
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "open_cart"], prior, appended)
+
+    assert frontier == "open_cart"
+    assert provenance == "unanchored"
+
+    _credit_composition_verified_labels(ctx, labels, provenance)
+
+    assert ctx.composition_verified_labels == ["open"]
+
+
+def test_a_workflow_with_no_resolvable_labels_is_not_vacuously_tested() -> None:
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=[],
+            has_executed_blocks=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=None,
+        )
+        is False
+    )
+    assert (
+        terminal_ready_for_latch(
+            current_workflow_labels=["open"],
+            has_executed_blocks=True,
+            unverified=[],
+            composition_unverified=[],
+            artifact_reason=None,
+            structured_blocker=None,
+            empty_data_blocks=None,
+        )
+        is True
+    )
+
+
+def test_a_run_starting_before_the_credited_boundary_still_earns_credit() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("pick_size", "navigation", {"prompt": "pick a size"}),
+        ("add_to_cart", "navigation", {"prompt": "add the item"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.composition_verified_labels = ["open"]
+
+    _credit_composition_verified_labels(ctx, ["open", "pick_size", "add_to_cart"], "initial")
+
+    assert ctx.composition_verified_labels == ["open", "pick_size", "add_to_cart"]
+
+
+def test_a_walk_back_replay_credits_through_its_own_end() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("pick_size", "navigation", {"prompt": "pick a size"}),
+        ("add_to_cart", "navigation", {"prompt": "add the item"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.composition_verified_labels = ["open", "pick_size"]
+
+    _credit_composition_verified_labels(ctx, ["pick_size", "add_to_cart"], "replayed")
+
+    assert ctx.composition_verified_labels == ["open", "pick_size", "add_to_cart"]
+
+
+def test_a_non_contiguous_run_credits_no_composition_labels() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("pick_size", "navigation", {"prompt": "pick a size"}),
+        ("add_to_cart", "navigation", {"prompt": "add the item"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+
+    _credit_composition_verified_labels(ctx, ["open", "add_to_cart"], "initial")
+
+    assert ctx.composition_verified_labels == []
+
+
+def test_a_passing_unanchored_run_still_leaves_the_workflow_composition_unverified() -> None:
+    prior = _wf_def(("open", "goto_url", {"url": "https://example.com"}))
+    appended = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("add_to_cart", "navigation", {"prompt": "add the item to the cart"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
+    ctx.composition_verified_labels = ["open"]
+    ctx.last_workflow = _FakeWorkflow(appended)
+    ctx.last_workflow_yaml = "workflow: yaml"
+
+    labels, _seed, _frontier, provenance = _plan_frontier(ctx, ["open", "add_to_cart"], prior, appended)
+    _credit_composition_verified_labels(ctx, labels, provenance)
+    ctx.verified_prefix_labels = ["open", "add_to_cart"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_append",
+                "requested_block_labels": ["add_to_cart"],
+                "executed_block_labels": ["add_to_cart"],
+                "blocks": [{"label": "add_to_cart", "status": "completed", "extracted_data": {"in_cart": True}}],
+            },
+        },
+    )
+
+    assert ctx.last_unverified_block_labels == []
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.verified_terminal_proposal_ready is False
+
+
+def test_editing_a_composed_block_truncates_composition_credit_at_that_block() -> None:
+    prior = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "grab the total"}),
+    )
+    edited = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "grab the grand total"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open", "extract"], current_url="https://example.com/cart", full=True)
+    ctx.composition_verified_labels = ["open", "extract"]
+    ctx.verified_prefix_block_end_urls = {
+        "open": "https://example.com/cart",
+        "extract": "https://example.com/cart",
+    }
+    ctx.verified_prefix_block_end_session_id = "pbs_debug"
+    ctx.verified_prefix_terminal_label = "extract"
+
+    _invalidate_verified_state_on_edit(ctx, prior, edited)
+
+    assert ctx.composition_verified_labels == ["open"]
+
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_block_end_urls = {"open": "https://example.com/cart"}
+    ctx.verified_prefix_terminal_label = "open"
+    labels, _seed, frontier, provenance = _plan_frontier(
+        ctx, ["open", "extract"], prior, edited, "https://example.com/cart"
+    )
+
+    assert labels == ["extract"]
+    assert frontier == "extract"
+    assert provenance == "resumed"
+
+    ctx.last_workflow = _FakeWorkflow(edited)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    _credit_composition_verified_labels(ctx, labels, provenance)
+    ctx.verified_prefix_labels = ["open", "extract"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_edit",
+                "requested_block_labels": ["extract"],
+                "executed_block_labels": ["extract"],
+                "blocks": [{"label": "extract", "status": "completed", "extracted_data": {"total": "12"}}],
+            },
+        },
+    )
+
+    assert ctx.composition_verified_labels == ["open", "extract"]
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.verified_terminal_proposal_ready is True
+
+
+def test_a_first_block_that_establishes_no_state_is_not_an_anchored_start() -> None:
+    definition = _wf_def(
+        ("add_to_cart", "task", {"prompt": "add the jacket to the cart"}),
+        ("read_total", "extraction", {"prompt": "grab the total"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+
+    labels, _seed, _frontier, provenance = _plan_frontier(ctx, ["add_to_cart", "read_total"], None, definition)
+
+    assert provenance == "unanchored"
+    _credit_composition_verified_labels(ctx, labels, provenance)
+    assert ctx.composition_verified_labels == []
+
+
+def test_full_workflow_run_from_the_first_block_earns_composition_credit() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "grab the total"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+
+    labels, _seed, frontier, provenance = _plan_frontier(ctx, ["open", "extract"], None, definition)
+
+    assert frontier == "open"
+    assert provenance == "initial"
+
+    _credit_composition_verified_labels(ctx, labels, provenance)
+    ctx.verified_prefix_labels = ["open", "extract"]
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_full",
+                "requested_block_labels": ["open", "extract"],
+                "executed_block_labels": ["open", "extract"],
+                "blocks": [
+                    {"label": "open", "status": "completed"},
+                    {"label": "extract", "status": "completed", "extracted_data": {"total": "12"}},
+                ],
+            },
+        },
+    )
+
+    assert ctx.composition_verified_labels == ["open", "extract"]
+    assert ctx.last_full_workflow_test_ok is True
+
+
+def test_frontier_planning_adds_no_rerun_floor_or_goal_classifier() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "grab the total"}),
+    )
+    ctx = _make_ctx()
+    _seed_verified(ctx, ["open"], current_url="https://example.com/list", full=False)
+
+    labels, _seed, frontier, _provenance = _plan_frontier(ctx, ["open", "extract"], definition, definition)
+
+    assert labels == ["extract"]
+    assert frontier == "extract"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_runs_every_label_from_a_run_owned_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("add_to_cart", "task", {"prompt": "add the jacket"}),
+    )
+    captured: dict[str, Any] = {}
+
+    async def _fake_process(**kwargs: Any) -> _FakeWorkflow:
+        return _FakeWorkflow(definition)
+
+    async def _fake_run(
+        params: dict[str, Any],
+        ctx: CopilotContext,
+        *,
+        labels_to_execute: list[str] | None = None,
+        block_outputs_to_seed: dict[str, Any] | None = None,
+        frontier_start_label: str | None = None,
+        force_fresh_session: bool = False,
+        definition_unpersisted: bool = False,
+        outside_turn_deadline: bool = False,
+    ) -> dict[str, Any]:
+        captured["requested"] = list(params["block_labels"])
+        captured["definition_unpersisted"] = definition_unpersisted
+        captured["executed"] = list(labels_to_execute or [])
+        captured["frontier_start_label"] = frontier_start_label
+        captured["force_fresh_session"] = force_fresh_session
+        captured["outside_turn_deadline"] = outside_turn_deadline
+        captured["provenance"] = ctx.frontier_start_provenance or "unanchored"
+        return {"ok": True, "data": {}}
+
+    async def _fake_verify(copilot_ctx: Any, result: dict[str, Any], handler_start: float) -> None:
+        return None
+
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _fake_process)
+    monkeypatch.setattr(run_execution_module, "_run_blocks_and_collect_debug", _fake_run)
+    monkeypatch.setattr(run_execution_module, "_verify_and_record_run_blocks_result", _fake_verify)
+
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "add_to_cart"]
+    ctx.composition_verified_labels = []
+
+    await run_workflow_end_to_end(ctx, "workflow: yaml")
+
+    assert captured["requested"] == ["open", "add_to_cart"]
+    assert captured["executed"] == ["open", "add_to_cart"]
+    assert captured["frontier_start_label"] == "open"
+    assert captured["force_fresh_session"] is True
+    assert captured["definition_unpersisted"] is True
+    assert captured["outside_turn_deadline"] is True
+    assert captured["provenance"] == "initial"
+
+
+def test_test_end_to_end_provenance_earns_composition_credit_and_flips_the_latch() -> None:
+    definition = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("add_to_cart", "task", {"prompt": "add the jacket"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.last_workflow_yaml = "workflow: yaml"
+    labels = ["open", "add_to_cart"]
+
+    _credit_composition_verified_labels(ctx, labels, "initial")
+    ctx.verified_prefix_labels = list(labels)
+
+    _record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_e2e",
+                "requested_block_labels": labels,
+                "executed_block_labels": labels,
+                "blocks": [
+                    {"label": "open", "status": "completed"},
+                    {"label": "add_to_cart", "status": "completed", "extracted_data": {"in_cart": True}},
+                ],
+            },
+        },
+    )
+
+    assert ctx.composition_verified_labels == labels
+    assert ctx.verified_terminal_proposal_ready is True
+    assert ctx.last_full_workflow_test_ok is True
+    # The proposal the turn surfaces is what moves the review gate onto this turn, so a clean
+    # end-to-end run is what repaints the pill.
+    assert _verified_workflow_or_none(ctx) == (ctx.last_workflow, ctx.last_workflow_yaml)
+
+
+@pytest.mark.asyncio
+async def test_test_end_to_end_will_not_touch_the_browser_after_a_raw_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _unreachable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("the browser must not be reached on a raw-secret turn")
+
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _unreachable)
+    monkeypatch.setattr(run_execution_module, "_run_blocks_and_collect_debug", _unreachable)
+
+    ctx = _make_ctx()
+    ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
+
+    result = await run_workflow_end_to_end(ctx, "workflow: yaml")
+
+    assert result["ok"] is False

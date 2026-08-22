@@ -454,6 +454,7 @@ def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow(
     )
     ctx.last_workflow_yaml = "workflow: yaml"
     ctx.verified_prefix_labels = ["open", "extract"]
+    ctx.composition_verified_labels = ["open", "extract"]
     ctx.last_unverified_block_labels = ["stale_extract"]
 
     result = {
