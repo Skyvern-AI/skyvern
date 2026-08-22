@@ -1,3 +1,4 @@
+from contextlib import AbstractAsyncContextManager, nullcontext
 from typing import Protocol
 
 
@@ -21,6 +22,26 @@ class RateLimiter(Protocol):
         """
         ...
 
+    def limit_sdk_action_concurrency(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+        """
+        Hold one in-flight SDK action slot for the organization for the duration of the block.
+
+        Unlike the request-rate limit above, this bounds how many SDK actions one organization may
+        have running at once. SDK actions execute synchronously in the API process, so a single
+        organization's concurrency is what an API worker's event loop actually has to absorb.
+
+        Entering raises when the organization is already at its cap, so a caller over the cap is
+        rejected rather than queued. The slot is released when the block exits, which is what lets a
+        backing-off organization resume with no operator action.
+
+        Args:
+            organization_id: The organization ID to bound
+
+        Raises:
+            Exception: If the organization is at its concurrency cap (implementation-specific)
+        """
+        ...
+
 
 class NoopRateLimiter(RateLimiter):
     """
@@ -31,3 +52,7 @@ class NoopRateLimiter(RateLimiter):
 
     async def rate_limit_submit_run(self, organization_id: str) -> None:
         """No-op implementation that never rate limits."""
+
+    def limit_sdk_action_concurrency(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+        """No-op implementation that never bounds concurrency."""
+        return nullcontext()

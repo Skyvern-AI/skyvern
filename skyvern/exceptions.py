@@ -227,6 +227,19 @@ class RateLimitExceeded(SkyvernHTTPException):
         super().__init__(message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
 
 
+class ConcurrencyLimitExceeded(SkyvernHTTPException):
+    def __init__(self, organization_id: str, operation: str, limit: int):
+        self.organization_id = organization_id
+        self.operation = operation
+        self.limit = limit
+        message = (
+            f"Concurrency limit exceeded for organization {organization_id}. "
+            f"At most {limit} {operation} requests may be in flight at once. "
+            "Retry once an in-flight request finishes."
+        )
+        super().__init__(message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")

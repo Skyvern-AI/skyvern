@@ -91,17 +91,98 @@ _SHADOW_ROOTS_JS = r"""(from_root) => {
 }"""
 
 
+# Document-plus-shadow equivalents of the DOM query APIs. Every reaction/commit probe below judges
+# what a Playwright action just did, and Playwright's selector engine pierces open shadow roots — so
+# a document-only probe reports "not an option" / "menu closed" / "did not commit" about elements
+# that are visible and were acted on successfully, which is a fabricated answer rather than a gap.
+_PIERCED_QUERY_JS = (
+    r"""
+  const _shadowRoots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  // Walked once per invocation: a probe calls these helpers several times, and the roots cannot
+  // change between those calls.
+  const _rootList = _shadowRoots(document);
+  // A throw here propagates, exactly as document.querySelector did: an unparseable selector is not
+  // the same fact as "no such element", and callers that gate on the result disarm themselves if the
+  // two are conflated.
+  const pQS = (sel) => {
+    for (const root of _rootList) {
+      const el = root.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  };
+  const pQSA = (sel) => {
+    const acc = [];
+    for (const root of _rootList) {
+      for (const el of root.querySelectorAll(sel)) acc.push(el);
+    }
+    return acc;
+  };
+  // Node.contains walks the light tree only, so a host does not contain its own shadow content.
+  // Every caller below compares elements drawn from the pierced scope, where a cross-tree pair is
+  // ordinary. Same hop parentOf() uses: a ShadowRoot has no parentNode, so step to its host.
+  const pContains = (a, b) => {
+    if (!a || !b) return false;
+    for (let n = b; n; n = n.parentNode || n.host || null) if (n === a) return true;
+    return false;
+  };
+  // The pre-snapshot carries element identity across a click or a keystroke, so the carrier has to
+  // survive whatever the page did in between -- and the two halves of the page need different ones.
+  // In the light DOM an attribute is the only carrier that survives cloneNode/innerHTML, so a
+  // container the page re-creates by cloning still reads as "existed before" rather than "appeared
+  // in reaction". Inside a shadow root we write nothing at all: stamping there makes a component
+  // watching its own root re-render, destroying the marks just made and leaving the finders reading
+  // a static list as a reaction. The WeakSet is the best carrier that costs no mutation, at one
+  // disclosed price -- a component that re-creates its own content by cloning reads as all-new.
+  // Absent (a navigation cleared window) means "no snapshot", never "everything is new".
+  const preMark = (el, inShadow) => {
+    if (inShadow) window.__tv3_pre.add(el);
+    else el.setAttribute('data-tv3-pre', '1');
+  };
+  // instanceof, not truthiness: a page that pre-defines __tv3_pre as an accessor keeps its own
+  // object through preReset, and a `has: () => false` impostor would make every element read as a
+  // reaction -- defeating the one distinction this guard exists to draw.
+  const preReady = () => window.__tv3_pre instanceof WeakSet;
+  const preHas = (el) => {
+    try { if (el.hasAttribute('data-tv3-pre')) return true; } catch (e) { /* clobbered getter */ }
+    return preReady() && window.__tv3_pre.has(el);
+  };
+  const preReset = () => {
+    pQSA('[data-tv3-pre]').forEach((e) => e.removeAttribute('data-tv3-pre'));
+    window.__tv3_pre = new WeakSet();
+  };
+  // 'body *' has no meaning inside a shadow root, whose own descendants are the equivalent scope.
+  const pScopeEach = (fn) => {
+    for (const root of _rootList) {
+      const inShadow = root !== document;
+      for (const el of root.querySelectorAll(inShadow ? '*' : 'body *')) fn(el, inShadow);
+    }
+  };
+  const pScopeAll = () => {
+    const acc = [];
+    pScopeEach((el) => acc.push(el));
+    return acc;
+  };
+"""
+)
+
 # Snapshot of everything visible BEFORE typing. The finder ignores anything marked here, so only DOM
 # that appeared (or became visible) IN REACTION to typing can be treated as a suggestion — static page
 # text that merely happens to share a word with the value (a nearby card, nav item, prior answer) is
 # never eligible. This is what makes "detect by the page's reaction" rigorous rather than a claim.
-_PRESNAPSHOT_JS = r"""() => {
-  document.querySelectorAll('[data-tv3-pre]').forEach((e) => e.removeAttribute('data-tv3-pre'));
-  for (const el of document.querySelectorAll('body *')) {
+_PRESNAPSHOT_JS = (
+    r"""() => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
+  preReset();
+  pScopeEach((el, inShadow) => {
     const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) el.setAttribute('data-tv3-pre', '1');
-  }
+    if (r.width > 0 && r.height > 0) preMark(el, inShadow);
+  });
 }"""
+)
 
 # Behavioral, site-agnostic suggestion finder. After the caller types a value (with a pre-snapshot taken
 # first), this looks for the suggestion list the typeahead rendered IN REACTION: a small, visible,
@@ -114,19 +195,25 @@ _PRESNAPSHOT_JS = r"""() => {
 # rows, so it ties/outranks any single row; clicking it would land on the wrong row), so it's dropped.
 # Tags the winner with data-tv3-sugg and returns {text, score}, or null if nothing reacted.
 _FIND_SUGGESTION_JS = (
-    r"""(args) => {
+    r"""(args) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
   const STOP = """
     + _STOPWORDS_JS
     + r""";
   const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3 && !STOP.has(w)));
   const want = toks(args.value || '');
-  document.querySelectorAll('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
-  if (!want.size) return null;
-  const field = document.querySelector(args.field);
-  const fr = field ? field.getBoundingClientRect() : null;
+  pQSA('[data-tv3-sugg]').forEach((e) => e.removeAttribute('data-tv3-sugg'));
+  if (!want.size || !preReady()) return null;
+  const field = pQS(args.field);
+  // No field means no geometry gate, and without it the scan below is page-wide and will happily
+  // tag -- and then click -- a row far from the control the caller typed into. Refuse instead:
+  // "cannot judge" and "nothing reacted" are both safe, and a confident wrong click is not.
+  if (!field) return null;
+  const fr = field.getBoundingClientRect();
   const cands = [];
-  for (const el of document.querySelectorAll('body *')) {
-    if (el.hasAttribute('data-tv3-pre')) continue;                    // existed/was visible before typing → not a reaction
+  for (const el of pScopeAll()) {
+    if (preHas(el)) continue;                                         // existed/was visible before typing → not a reaction
     const tag = el.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
     const role = el.getAttribute('role');
@@ -150,7 +237,7 @@ _FIND_SUGGESTION_JS = (
   if (!cands.length) return null;
   // Drop any candidate that CONTAINS another candidate (a dropdown container over its own rows), then
   // take the highest score, breaking ties toward the smallest (innermost) row.
-  const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && c.el.contains(o.el)));
+  const leaves = cands.filter((c) => !cands.some((o) => o.el !== c.el && pContains(c.el, o.el)));
   const pool = leaves.length ? leaves : cands;
   pool.sort((a, b) => b.score - a.score || a.h - b.h);
   const best = pool[0];
@@ -174,14 +261,17 @@ _FIND_SUGGESTION_JS = (
 # with the chosen suggestion, or the typed value) and (b) shows the click took effect — it changed from
 # the raw typed text OR the suggestion list closed. Failing that, a hidden input in the nearest
 # div/li/fieldset (never the whole <form>) whose value overlaps. Otherwise "" — nothing committed.
-_VERIFY_COMMIT_JS = r"""(args) => {
+_VERIFY_COMMIT_JS = (
+    r"""(args) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
   const toks = (s) => new Set(String(s).toLowerCase().replace(/[\/,]/g, ' ').split(/\s+/).filter((w) => w.length >= 3));
   const overlaps = (a, b) => { const B = toks(b); for (const w of toks(a)) if (B.has(w)) return true; return false; };
-  const el = document.querySelector(args.field);
+  const el = pQS(args.field);
   const typed = String(args.typed || '').trim();
   const chosen = String(args.chosen || '').trim() || typed;
   const cur = el ? (el.value || '').trim() : '';
-  const tagged = document.querySelector('[data-tv3-sugg]');
+  const tagged = pQS('[data-tv3-sugg]');
   const listClosed = !tagged || tagged.getBoundingClientRect().height === 0;
   // A short normalized value ("New York" -> "NY", "United States" -> "US") has no >=3-char token to
   // overlap, so accept it on causality alone (it changed / the list closed). Longer values must still
@@ -196,16 +286,18 @@ _VERIFY_COMMIT_JS = r"""(args) => {
   }
   return '';
 }"""
+)
 
-# Whether the MAIN-DOCUMENT query the reaction probes use can see this element. They are all
-# document-only, so a control inside a component is invisible to them even though Playwright types
-# into it perfectly well -- the action works and only our verification of it is blind. False here
-# means "do not claim this was checked", never "do not act".
-# Why our reaction probes cannot see this selector, if they cannot: `component` (only a piercing
-# query resolves it), `unprobeable` (the main-document query cannot even parse it -- Playwright
-# syntax like `css=`, `>> nth=`, `:visible`, `text=`), or `` (probeable, so any failure to find it is
-# a fact about the page rather than about us). Both readings happen in ONE evaluation: as two round
-# trips, an ordinary re-render landing between them lets each describe a different moment.
+# Why a reaction probe's answer about this selector may not carry a claim. `unprobeable` -- in-page
+# CSS cannot even parse it (Playwright syntax like `css=`, `>> nth=`, `:visible`, `text=`).
+# `component` -- it lives inside a component. The probes DO pierce open shadow roots, so this no
+# longer means they are blind to the element itself; it means the widget's own list may still render
+# where a pierced query does not reach -- a portal mounted elsewhere in the page, or a closed root,
+# which is undetectable from script. So a missing suggestion list there is still not proof the field
+# is unfilled, and the softened reading is kept deliberately rather than for lack of reach.
+# `` -- neither applies, so any failure to find the element is a fact about the page, not about us.
+# Both readings happen in ONE evaluation: as two round trips, an ordinary re-render landing between
+# them lets each describe a different moment.
 _PROBE_REACH_JS = (
     r"""(sel) => {
   const _roots = """
@@ -397,7 +489,10 @@ _CHECKBOX_CHECKED_JS = (
 # that row's state fingerprint — aria checked/selected/pressed, class, child count, text — so an option
 # click on a multi-select menu (which commits WITHOUT closing) can be verified by its state change.
 # Also takes the visible-DOM pre-snapshot (data-tv3-pre) so a menu the click opens reads as a reaction.
-_CLICK_PRECHECK_JS = r"""(clicked) => {
+_CLICK_PRECHECK_JS = (
+    r"""(clicked) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
   const vis = (el) => {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return false;
@@ -421,9 +516,9 @@ _CLICK_PRECHECK_JS = r"""(clicked) => {
     ].join('|');
   };
   const openRows = [];
-  for (const el of document.querySelectorAll('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
+  for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
   let target = null;
-  try { target = document.querySelector(clicked); } catch (e) { target = null; }
+  try { target = pQS(clicked); } catch (e) { target = null; }
   let isOption = false;
   let containsMenu = false;
   let optText = '';
@@ -433,24 +528,28 @@ _CLICK_PRECHECK_JS = r"""(clicked) => {
       // The target being the row or inside it is an option pick. The target merely CONTAINING rows
       // (the card around the menu) is not — and since a center-point click on the card can land on
       // an arbitrary row, that case is flagged so the handler makes no claims about it at all.
-      if (el === target || el.contains(target)) {
+      if (el === target || pContains(el, target)) {
         isOption = true;
         optText = (el.innerText || '').trim().slice(0, 80);
         optState = state(el);
         break;
       }
-      if (target.contains(el)) containsMenu = true;
+      if (pContains(target, el)) containsMenu = true;
     }
   }
-  document.querySelectorAll('[data-tv3-pre]').forEach((e) => e.removeAttribute('data-tv3-pre'));
-  for (const el of document.querySelectorAll('body *')) if (vis(el)) el.setAttribute('data-tv3-pre', '1');
+  preReset();
+  pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
   return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState };
 }"""
+)
 
 # Post-click menu state: how many previously-tagged menu rows are still visible (a closed menu — nodes
 # destroyed or hidden — reads 0), plus the clicked row's current state fingerprint for the multi-select
 # commit check. Field names are distinct from _CLICK_PRECHECK_JS's on purpose (tests dispatch on them).
-_MENU_AFTER_JS = r"""(clicked) => {
+_MENU_AFTER_JS = (
+    r"""(clicked) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
   const vis = (el) => {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return false;
@@ -473,17 +572,18 @@ _MENU_AFTER_JS = r"""(clicked) => {
   };
   let stillOpen = 0;
   const rows = [];
-  for (const el of document.querySelectorAll('[data-tv3-menu]')) if (vis(el)) { stillOpen++; rows.push(el); }
+  for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) { stillOpen++; rows.push(el); }
   let target = null;
-  try { target = document.querySelector(clicked); } catch (e) { target = null; }
+  try { target = pQS(clicked); } catch (e) { target = null; }
   let optState = '';
   if (target) {
     for (const el of rows) {
-      if (el === target || el.contains(target)) { optState = state(el); break; }
+      if (el === target || pContains(el, target)) { optState = state(el); break; }
     }
   }
   return { stillOpen, optState };
 }"""
+)
 
 # Behavioral, site-agnostic menu finder: after a click (with the pre-snapshot taken first),
 # look for the option list the page rendered IN REACTION — a NEW container (not data-tv3-pre: a
@@ -494,15 +594,23 @@ _MENU_AFTER_JS = r"""(clicked) => {
 # navigational rows are listed too. Tags rows data-tv3-menu="1..N" (top-to-bottom) — in-DOM tags that
 # stay valid until the menu re-renders, so the model can pick an option without a re-observe re-minting
 # ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
-_FIND_MENU_JS = r"""(clicked) => {
+_FIND_MENU_JS = (
+    r"""(clicked) => {"""
+    + _PIERCED_QUERY_JS
+    + r"""
   const vis = (r) => r.width > 0 && r.height > 0;
   let trigger = null;
-  try { trigger = document.querySelector(clicked); } catch (e) { return null; }
+  try { trigger = pQS(clicked); } catch (e) { return null; }
   if (!trigger) return null;
+  // The reaction gate below is the whole basis for calling these rows a menu the click just opened.
+  // A navigation destroys window, so an absent snapshot here means the page under us is not the page
+  // we clicked on, and every row would read as new. Refuse: "cannot judge" beats naming three
+  // ordinary links on a fresh document as a menu and telling the model to pick one.
+  if (!preReady()) return null;
   const tr = trigger.getBoundingClientRect();
   const rows = [];
-  for (const el of document.querySelectorAll('body *')) {
-    if (el.hasAttribute('data-tv3-pre')) continue;
+  for (const el of pScopeAll()) {
+    if (preHas(el)) continue;
     const tag = el.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LABEL' || tag === 'FORM') continue;
     if (el.children.length > 8) continue;
@@ -521,14 +629,32 @@ _FIND_MENU_JS = r"""(clicked) => {
     rows.push({ el, r, txt });
   }
   if (rows.length < 2) return null;
-  const leaves = rows.filter((c) => !rows.some((o) => o.el !== c.el && c.el.contains(o.el)));
+  const leaves = rows.filter((c) => !rows.some((o) => o.el !== c.el && pContains(c.el, o.el)));
   if (leaves.length < 2) return null;
   // Group by parent AND grandparent so both flat menus (card > button*N) and nested ones
   // (ul > li > button) find their shared container.
   const groups = new Map();
+  // parentElement is null at a shadow boundary (a ShadowRoot is not an Element), so a menu whose
+  // rows are written straight into the root -- root.innerHTML = '<div role="option">...' -- would
+  // group under nothing and never be found. The host stands in for the boundary.
+  // A host reached this way stands in for the boundary, and a host necessarily pre-exists the menu
+  // its component just rendered -- so the container-is-new check below must not be applied to it.
+  // The rows' own newness still carries the reaction evidence.
+  const boundaryStandIns = new Set();
+  const parentOf = (el) => {
+    if (!el) return null;
+    const p = el.parentNode;
+    if (!p) return null;
+    if (p.nodeType === 11) {
+      if (!p.host) return null;
+      boundaryStandIns.add(p.host);
+      return p.host;
+    }
+    return p.nodeType === 1 ? p : null;
+  };
   for (const c of leaves) {
-    const p1 = c.el.parentElement;
-    for (const p of [p1, p1 ? p1.parentElement : null]) {
+    const p1 = parentOf(c.el);
+    for (const p of [p1, parentOf(p1)]) {
       if (!p || p === document.body || p === document.documentElement) continue;
       if (!groups.has(p)) groups.set(p, new Set());
       groups.get(p).add(c);
@@ -538,7 +664,7 @@ _FIND_MENU_JS = r"""(clicked) => {
   for (const [p, set] of groups) {
     const g = Array.from(set);
     if (g.length < 2) continue;
-    if (p.hasAttribute('data-tv3-pre')) continue;
+    if (!boundaryStandIns.has(p) && preHas(p)) continue;
     // A dialog is a page mode, not a menu — mislabeling it invites a wrong "pick an option" move.
     try { if (p.closest('dialog,[role~="dialog"],[aria-modal="true"]')) continue; } catch (e) {}
     const pr = p.getBoundingClientRect();
@@ -550,7 +676,7 @@ _FIND_MENU_JS = r"""(clicked) => {
     if (!best || g.length > best.g.length || (g.length === best.g.length && pr.height < best.h)) best = { p, g, h: pr.height };
   }
   if (!best) return null;
-  document.querySelectorAll('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
+  pQSA('[data-tv3-menu]').forEach((e) => e.removeAttribute('data-tv3-menu'));
   best.g.sort((a, b) => a.r.top - b.r.top || a.r.left - b.r.left);
   const options = [];
   let n = 0;
@@ -561,6 +687,7 @@ _FIND_MENU_JS = r"""(clicked) => {
   }
   return { count: n, options };
 }"""
+)
 
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
@@ -1808,9 +1935,9 @@ def build_browser_tools(
 
     async def _unverifiable_because(page: Any, selector: str) -> str | None:
         # Returns the clause explaining why a check could not be run, or None when it could. "The
-        # document cannot see it" is not one fact but three: a widget that unmounts its own input, a
-        # control inside a component, and a selector our probe cannot parse all answer alike, and
-        # only the middle one is a component. Empty on failure -- claiming a reason we did not
+        # probe cannot carry this claim" is not one fact but three: a widget that unmounts its own
+        # input, a control inside a component whose list may render beyond a pierced query's reach,
+        # and a selector our probe cannot parse. Empty on failure -- claiming a reason we did not
         # establish would be its own false statement.
         try:
             reach = str(await page.evaluate(_PROBE_REACH_JS, selector) or "")
@@ -1855,10 +1982,11 @@ def build_browser_tools(
                     f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
                 )
             if opt_txt and not committed:
-                # The verifier reads the field with document.querySelector, so on a control inside a
-                # component it reads nothing and "did not commit" is its own unearned claim -- the
-                # field is often filled. Halting a batch on that is as wrong as proceeding on a real
-                # failure, so say which one we actually established.
+                # The verifier pierces open shadow roots, so inside a component it does read the
+                # field -- but a widget that portals its list elsewhere in the page, or renders it in
+                # a closed root, is still beyond it, and "did not commit" would then be its own
+                # unearned claim on a field that is often filled. Halting a batch on that is as wrong
+                # as proceeding on a real failure, so say which one we actually established.
                 why = await _unverifiable_because(page, selector)
                 if why:
                     return ToolResult.ok(
@@ -1872,10 +2000,11 @@ def build_browser_tools(
                     f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is NOT "
                     "filled; re-observe and retry, do not proceed"
                 )
-            # No suggestion list surfaced. On a control inside a component that is not evidence of
-            # absence: the finder is document-only and could not have seen one. Saying "typed into X"
-            # here reads as a verified fill, and on a typeahead that silently rejects raw text it
-            # turns an honest failure into a confident wrong answer on a form we then submit.
+            # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
+            # inside one -- but not one the widget portals elsewhere in the page or renders in a
+            # closed root, so inside a component this is still not evidence of absence. Saying
+            # "typed into X" there reads as a verified fill, and on a typeahead that silently rejects
+            # raw text it turns an honest failure into a confident wrong answer on a form we submit.
             why = await _unverifiable_because(page, selector)
             if why:
                 return ToolResult.ok(
@@ -2026,10 +2155,12 @@ def build_browser_tools(
         value = _resolve_text(args["value"])
         committed, opt_txt = await _type_and_commit(page, selector, value, rounds=8)
         if opt_txt is None:
-            # The suggestion finder is document-only, so inside a component it sees no list -- which is
-            # not evidence there was none, and "the field is NOT filled" is measurably false there (the
-            # value is typed in). Erroring would also strand the country/phone comboboxes on the very
-            # forms this targets. observe DOES pierce, so re-observing is a check the model can run.
+            # The suggestion finder pierces open shadow roots, so inside a component it now sees a
+            # list rendered in that root -- but a portalled or closed-root list stays invisible, so a
+            # missing list there is still not evidence there was none, and "the field is NOT filled"
+            # would be measurably false (the value is typed in). Erroring would also strand the
+            # country/phone comboboxes on the very forms this targets. observe pierces too, so
+            # re-observing is a check the model can run.
             why = await _unverifiable_because(page, selector)
             if why:
                 return ToolResult.ok(
