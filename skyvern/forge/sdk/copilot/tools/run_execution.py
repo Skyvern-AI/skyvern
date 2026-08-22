@@ -66,6 +66,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     _blocks_by_label,
     block_shape_hashes_by_label,
 )
+from skyvern.forge.sdk.copilot.frontier_provenance_dump import frontier_dump_root, trust_snapshot, write_packet
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
@@ -91,6 +92,7 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    FrontierStartProvenance,
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
@@ -135,11 +137,14 @@ from ._shared import (
     _FAILED_BLOCK_STATUSES,
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     _completed_run_block_labels,
+    _composition_unverified_current_workflow_labels,
+    _current_workflow_block_labels,
     _failed_run_block_labels,
     _fallback_page_info,
     _is_meaningful_extracted_data,
     _unverified_current_workflow_labels,
     _valid_runtime_anchor_url,
+    _workflow_definition_block_labels,
     _workflow_verification_evidence,
 )
 from .banned_blocks import _copilot_block_authoring_policy
@@ -174,6 +179,7 @@ from .frontier import (
     _workflow_with_runtime_frontier_starter_url_seed,
 )
 from .guardrails import (
+    _authority_tool_error,
     _parameter_binding_invariant_error,
     _placeholder_for_parameter_type,
 )
@@ -1654,6 +1660,112 @@ def _resolve_run_data_and_unbound_keys(
     return data, unbound
 
 
+def terminal_ready_for_latch(
+    *,
+    current_workflow_labels: list[str],
+    has_executed_blocks: bool,
+    unverified: list[str],
+    composition_unverified: list[str],
+    artifact_reason: object | None,
+    structured_blocker: object | None,
+    empty_data_blocks: object,
+) -> bool:
+    """The single definition of "tested". Offline replay calls this, so the rule cannot drift from its grader."""
+    return (
+        # "Every label is credited" says nothing when there are no labels, so an unresolvable
+        # workflow must not satisfy it by emptiness.
+        bool(current_workflow_labels)
+        and has_executed_blocks
+        and not unverified
+        and not composition_unverified
+        and artifact_reason is None
+        and structured_blocker is None
+        and not empty_data_blocks
+    )
+
+
+def _credit_composition_verified_labels(
+    ctx: AgentContext,
+    labels_to_execute: list[str],
+    start_provenance: FrontierStartProvenance,
+) -> None:
+    """Passing is not anchoring: credit only a run that started from a provable composition state
+    and executed exactly the workflow labels following the credit already earned."""
+    if start_provenance == "unanchored":
+        return
+    workflow_labels = _current_workflow_block_labels(ctx)
+    if not workflow_labels:
+        return
+    credited = list(ctx.composition_verified_labels or [])
+    # Credit is an ordered contiguous prefix, so a workflow that no longer opens with it has to
+    # re-earn the whole chain rather than keep set membership that says nothing about order.
+    if credited != workflow_labels[: len(credited)]:
+        ctx.composition_verified_labels = []
+        return
+    if not labels_to_execute:
+        return
+    # Starting before the credited boundary is more evidence, not less: a walk-back replay or a
+    # full re-run proves the chain from further back, so credit it rather than demanding the plan
+    # begin exactly where the previous credit stopped.
+    try:
+        start_index = workflow_labels.index(labels_to_execute[0])
+    except ValueError:
+        return
+    if start_index > len(credited):
+        return
+    end = start_index + len(labels_to_execute)
+    if labels_to_execute != workflow_labels[start_index:end]:
+        return
+    ctx.composition_verified_labels = workflow_labels[: max(end, len(credited))]
+
+
+async def run_workflow_end_to_end(ctx: CopilotContext, workflow_yaml: str) -> dict[str, Any]:
+    """Run every block of a candidate workflow in one browser minted for this run. Frontier
+    selection is bypassed and the provenance stamped so a clean result earns composition credit
+    for the whole chain rather than for one label."""
+    authority_error = _authority_tool_error(ctx, "run_blocks_and_collect_debug")
+    if authority_error:
+        return {"ok": False, "error": authority_error}
+
+    workflow = await _process_workflow_yaml(
+        workflow_id=ctx.workflow_id,
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+        workflow_yaml=workflow_yaml,
+        settings_fallback_yaml=ctx.persisted_workflow_yaml,
+    )
+    # Checked before anything is staged: a blockless candidate would otherwise replace the good
+    # in-memory workflow on its way to returning an error.
+    labels = _workflow_definition_block_labels(workflow.workflow_definition)
+    if not labels:
+        return {"ok": False, "error": "This workflow has no blocks to run."}
+
+    ctx.staged_workflow = workflow
+    ctx.staged_workflow_yaml = workflow_yaml
+    ctx.workflow_yaml = workflow_yaml
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = workflow_yaml
+
+    # This run starts the chain over in its own browser, so its result supersedes credit earned
+    # by earlier partial runs rather than appending to it. A resume id left by an earlier plan
+    # would outrank force_fresh_session and run this in a carried browser, which is the one way
+    # "initial" could be stamped on a start it cannot prove.
+    ctx.frontier_resume_session_id = None
+    ctx.composition_verified_labels = []
+    ctx.frontier_start_provenance = "initial"
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": labels, "parameters": {}},
+        ctx,
+        labels_to_execute=labels,
+        frontier_start_label=labels[0],
+        force_fresh_session=True,
+        definition_unpersisted=True,
+        outside_turn_deadline=True,
+    )
+    await _verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+    return result
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -1661,11 +1773,16 @@ async def _run_blocks_and_collect_debug(
     labels_to_execute: list[str] | None = None,
     block_outputs_to_seed: dict[str, Any] | None = None,
     frontier_start_label: str | None = None,
+    force_fresh_session: bool = False,
+    definition_unpersisted: bool = False,
+    outside_turn_deadline: bool = False,
 ) -> dict[str, Any]:
     # Read the planner's session choice before any exit path, so a run that bails cannot leave it
     # set for a later run whose frontier was never proven against that browser.
     resume_session_id = ctx.frontier_resume_session_id
     ctx.frontier_resume_session_id = None
+    start_provenance: FrontierStartProvenance = ctx.frontier_start_provenance or "unanchored"
+    ctx.frontier_start_provenance = None
 
     block_labels = params["block_labels"]
     if not block_labels:
@@ -1707,6 +1824,9 @@ async def _run_blocks_and_collect_debug(
         if prior_draft_workflow is not None:
             workflow = prior_draft_workflow
             resolved_from_prior_draft = True
+    # An in-memory definition the canonical rows never saw: nothing for the parameter-binding
+    # invariant to compare against, and the run needs a persisted snapshot of its own to bind.
+    executes_unpersisted_definition = resolved_from_prior_draft or definition_unpersisted
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
@@ -1819,10 +1939,11 @@ async def _run_blocks_and_collect_debug(
 
     # Short-circuit before a wasted workflow execution when the definition
     # JSON has drifted from the persisted parameter rows that runtime reads.
-    # Skipped for the prior-draft fallback: its in-memory params differ from the rolled-back canonical rows by design.
+    # Skipped when the definition was never persisted: its in-memory params differ from the
+    # canonical rows by design, and the run binds against its own snapshot version instead.
     invariant_error = (
         None
-        if resolved_from_prior_draft
+        if executes_unpersisted_definition
         else _parameter_binding_invariant_error(workflow, persisted_workflow_params, persisted_output_params)
     )
     if invariant_error is not None:
@@ -1852,8 +1973,8 @@ async def _run_blocks_and_collect_debug(
 
     # A resume proven against another browser has to run in that browser; minting or falling back
     # to the chat's would drop the very state the resume was authorised against.
-    use_fresh_session = resume_session_id is None and _should_use_fresh_session_for_login_first_replay(
-        ctx, labels_that_may_execute, workflow
+    use_fresh_session = resume_session_id is None and (
+        force_fresh_session or _should_use_fresh_session_for_login_first_replay(ctx, labels_that_may_execute, workflow)
     )
     # Reported as run evidence, so it stays literal: a browser minted for this run. A carried
     # browser is not one, and reporting it as such would misattribute a challenge that stalled.
@@ -1930,17 +2051,17 @@ async def _run_blocks_and_collect_debug(
             }
         )
 
-    # Snapshot version persisted for a worker-dispatched run or an inline run sourced from an
-    # unsaved prior draft. The run is created against its exact workflow_id so prepare_workflow
+    # Snapshot version persisted for a worker-dispatched run or an inline run of a definition that
+    # was never persisted. The run is created against its exact workflow_id so prepare_workflow
     # reads parameter rows from the same definition execute_workflow receives. Without the inline
-    # prior-draft snapshot, newly drafted parameters exist only in memory and are omitted from the
+    # snapshot, newly drafted parameters exist only in memory and are omitted from the
     # WorkflowRunParameter rows, causing block execution to fail before it reaches the browser.
     # The snapshot is soft-deleted once the run resolves so it never lingers as the latest version.
     dispatch_draft_workflow_id: str | None = None
     # The persisted dispatch version (its own regenerated parameter ids) used for post-run output
     # mapping on the dispatch path; runtime_workflow / ctx.staged_workflow is left unmutated.
     dispatch_workflow: Workflow | None = None
-    if dispatch_to_worker or resolved_from_prior_draft:
+    if dispatch_to_worker or executes_unpersisted_definition:
         # Persist the wrapped runtime workflow as a real new version (with its own parameter /
         # output-parameter rows) through the normal create machinery. The run is then created
         # against this version so the worker resolves it by run.workflow_id and registers block
@@ -1956,7 +2077,7 @@ async def _run_blocks_and_collect_debug(
                 "Failed to persist copilot run snapshot; blocking execution",
                 workflow_permanent_id=ctx.workflow_permanent_id,
                 dispatch_to_worker=dispatch_to_worker,
-                resolved_from_prior_draft=resolved_from_prior_draft,
+                executes_unpersisted_definition=executes_unpersisted_definition,
                 exc_info=True,
             )
             if dispatch_to_worker:
@@ -2153,9 +2274,10 @@ async def _run_blocks_and_collect_debug(
         # Active block runs use the tighter per-tool budget so a single in-flight
         # call cannot consume the whole copilot session. Quiet-block runs keep the
         # long safety ceiling because HumanInteractionBlock can legitimately pause
-        # indefinitely.
+        # indefinitely, and so does a run the user triggered outside the turn: it
+        # replays every block, which the per-tool budget is far too small to cover.
         budget_exit_reason: WatchdogExitReason
-        if stagnation_enabled:
+        if stagnation_enabled and not outside_turn_deadline:
             budget_seconds = _active_block_run_budget_seconds(ctx)
             budget_exit_reason = "per_tool_budget"
         else:
@@ -2557,6 +2679,7 @@ async def _run_blocks_and_collect_debug(
                     existing_prefix.append(label)
                     existing_set.add(label)
             ctx.verified_prefix_labels = existing_prefix
+            _credit_composition_verified_labels(ctx, labels_to_execute, start_provenance)
             # Rebuilt from this run's rows alone: the position was forgotten at dispatch, and the
             # browser these pages describe is the one this run used.
             ctx.verified_prefix_block_end_urls = dict(block_end_urls)
@@ -3177,6 +3300,7 @@ def _record_run_blocks_result(
             output_report=output_report,
         )
         unverified = _unverified_current_workflow_labels(copilot_ctx)
+        composition_unverified = _composition_unverified_current_workflow_labels(copilot_ctx)
         result_blocks = data.get("blocks") if isinstance(data, dict) else None
         executed_labels = data.get("executed_block_labels") if isinstance(data, dict) else None
         has_executed_blocks = bool(
@@ -3188,14 +3312,31 @@ def _record_run_blocks_result(
         copilot_ctx.last_failed_workflow_yaml = None
         copilot_ctx.last_test_failure_reason = None
         copilot_ctx.last_test_suspicious_success = False
-        terminal_ready = (
-            has_executed_blocks
-            and not unverified
-            and artifact_reason is None
-            and structured_blocker is None
-            and not empty_data_blocks
+        terminal_ready = terminal_ready_for_latch(
+            current_workflow_labels=_current_workflow_block_labels(copilot_ctx),
+            has_executed_blocks=has_executed_blocks,
+            unverified=unverified,
+            composition_unverified=composition_unverified,
+            artifact_reason=artifact_reason,
+            structured_blocker=structured_blocker,
+            empty_data_blocks=empty_data_blocks,
         )
         copilot_ctx.verified_terminal_proposal_ready = terminal_ready
+        if frontier_dump_root() is not None:
+            write_packet(
+                "latch",
+                {
+                    "trust": trust_snapshot(copilot_ctx),
+                    "current_workflow_labels": _current_workflow_block_labels(copilot_ctx),
+                    "unverified": unverified,
+                    "composition_unverified": composition_unverified,
+                    "has_executed_blocks": has_executed_blocks,
+                    "artifact_reason": artifact_reason,
+                    "structured_blocker": structured_blocker,
+                    "empty_data_blocks": empty_data_blocks,
+                    "terminal_ready": terminal_ready,
+                },
+            )
         copilot_ctx.last_full_workflow_test_ok = terminal_ready
         if copilot_ctx.last_full_workflow_test_ok:
             copilot_ctx.last_unverified_block_labels = []

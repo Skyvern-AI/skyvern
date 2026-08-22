@@ -281,6 +281,40 @@ async def resolve_inherited_workflow_task_page(browser_state: BrowserState, work
     raise InvalidWorkflowTaskURLState(workflow_run_id)
 
 
+def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
+    """Probe liveness and fail the step if the browser is already known to be gone.
+
+    The probe is a local flag read that latches the disconnect diagnostic, so a state nothing upstream
+    probed (caller-supplied, or a cached Skyvern-hosted one the manager never reconnects) is still
+    caught here. ``check_and_fix_state`` clears the diagnostic whenever it rebuilds, so a latched one
+    means every page access this step makes is guaranteed to raise; reconnecting instead (what
+    ``block.py`` does at a block boundary) would hand a mid-flow task a blank browser with none of its
+    cookies or page state.
+    """
+    browser_state.is_connected()
+    diagnostic = get_browser_state_diagnostic(browser_state)
+    if diagnostic is None:
+        return
+    detected_at = datetime.now(UTC)
+    LOG.warning(
+        "Browser is already gone; failing the step instead of starting it against a dead browser",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        step_order=step.order,
+        step_retry=step.retry_index,
+        disconnect_reason=diagnostic.reason,
+        disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat(),
+        disconnect_observation_source=diagnostic.observation_source,
+    )
+    raise MissingBrowserStatePage(
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        diagnostic=diagnostic,
+        detected_at=detected_at,
+        failure_reason="browser_disconnected_before_step",
+    )
+
+
 def should_auto_download_pdf(pdf_src: str) -> bool:
     context = skyvern_context.current()
     if not context:
@@ -3512,6 +3546,13 @@ class ForgeAgent:
         screenshot_base64 = base64.b64encode(scraped_page.screenshots[0]).decode("utf-8")
         if last_call_id is None:
             current_context = skyvern_context.ensure_context()
+            reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
+            assistant_message: str | None = None
+            if assistant_messages:
+                assistant_message = "\n".join(
+                    part.text for part in assistant_messages[-1].content if getattr(part, "text", None)
+                )
+            cua_question = assistant_message
             resp_content = None
             if task.task_id in current_context.totp_codes:
                 verification_code = current_context.totp_codes[task.task_id]
@@ -3524,8 +3565,6 @@ class ForgeAgent:
                 resp_content = f"Here is the verification code: {verification_code}"
             else:
                 # try address the conversation with the context we have
-                reasoning = reasonings[0].summary[0].text if reasonings and reasonings[0].summary else None
-                assistant_message = assistant_messages[0].content[0].text if assistant_messages else None
                 skyvern_repsonse_prompt = load_prompt_with_elements(
                     element_tree_builder=scraped_page,
                     prompt_engine=prompt_engine,
@@ -3542,14 +3581,23 @@ class ForgeAgent:
                     system_prompt=task.workflow_system_prompt,
                 )
                 LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
+                cua_question = cua_question or skyvern_response.get("question_or_decision")
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
                     resp_content = "I don't know. Can you help me make the best decision to achieve the goal?"
                 else:
                     resp_content = f"{resp_content}\n\n{CUA_EXECUTE_ACTIONS_DIRECTIVE}"
+            # The Computer tool rejects a user-supplied input_image when the request also threads a
+            # previous response, so this visual turn must be a fresh, self-contained request. Restate
+            # the navigation goal and the question being answered so a context-dependent answer (e.g.
+            # "yes", "the second option") is not detached from what it responds to.
+            continuation_sections = [f"Task: {task.navigation_goal}"]
+            if cua_question:
+                continuation_sections.append(f"Question or decision to address: {cua_question}")
+            continuation_sections.append(resp_content)
+            continuation_content = "\n\n".join(continuation_sections)
             current_response = await app.OPENAI_CLIENT.responses.create(
                 model=cua_model,
-                previous_response_id=previous_response.id,
                 tools=[
                     {
                         "type": "computer_use_preview",
@@ -3562,7 +3610,7 @@ class ForgeAgent:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": resp_content},
+                            {"type": "input_text", "text": continuation_content},
                             {
                                 "type": "input_image",
                                 "image_url": f"data:image/png;base64,{screenshot_base64}",
@@ -4605,6 +4653,8 @@ class ForgeAgent:
                 task=task,
                 browser_session_id=browser_session_id,
             )
+        # Every way a step can acquire a browser converges here, including a caller-supplied one.
+        fail_step_if_browser_already_gone(task=task, step=step, browser_state=browser_state)
         # Initialize video artifact for the task here, afterwards it'll only get updated.
         # The recording file is still open here, so skip the ffmpeg remux — matches the
         # per-step sync path; the finalized upload happens in cleanup_and_persist_task.
@@ -6551,10 +6601,10 @@ class ForgeAgent:
             if getattr(task, key) != value
         }
 
-        start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
-        duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
         # Track task duration when task is completed, failed, or terminated
         if status in [TaskStatus.completed, TaskStatus.failed, TaskStatus.terminated]:
+            start_time = task.started_at.replace(tzinfo=UTC) if task.started_at else task.created_at.replace(tzinfo=UTC)
+            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
             queued_seconds = (start_time - task.created_at.replace(tzinfo=UTC)).total_seconds()
             LOG.info(
                 "Task duration metrics",
@@ -6568,19 +6618,33 @@ class ForgeAgent:
             )
         await save_task_logs(task.task_id)
         LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
-        updated_task = await app.DATABASE.tasks.update_task(
+        updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
             task.task_id,
             organization_id=task.organization_id,
             **updates,
         )
-        # Minutes emit after the terminal write lands and only on the non-final ->
-        # final transition (task holds the pre-write status), so neither a retried
-        # failed write nor a repeated terminal update double-counts the run;
-        # is_final() includes canceled and timed_out, matching the workflow-run gate.
-        if task.workflow_run_id is None and status.is_final() and not task.status.is_final():
-            await app.AGENT_FUNCTION.record_run_duration(
-                run_type="task_v1", status=str(status), duration_seconds=duration_seconds
-            )
+        # Minutes emit only when THIS write atomically flipped finished_at from NULL
+        # -- the shared claim every task_v1 finalizer rides -- so a concurrent
+        # finalizer (the stuck-task sweep's CAS, the temporal timeout activity, a
+        # retried write) cannot double-count the run. Both the duration and the
+        # exclusion come from the post-claim row, never the entry read: a worker can
+        # stamp started_at between the two, and the stale read would bill that
+        # compute as never_started.
+        if updated_task.workflow_run_id is None and finish_claimed:
+            if updated_task.started_at and updated_task.finished_at:
+                await app.AGENT_FUNCTION.record_run_duration(
+                    run_type="task_v1",
+                    status=str(status),
+                    duration_seconds=(updated_task.finished_at - updated_task.started_at).total_seconds(),
+                )
+            else:
+                # Never started: no compute, but export the exclusion.
+                await app.AGENT_FUNCTION.record_run_duration(
+                    run_type="task_v1",
+                    status=str(status),
+                    duration_seconds=0.0,
+                    excluded_reason="never_started",
+                )
         return updated_task
 
     async def _handle_completed_step_with_parallel_verification(

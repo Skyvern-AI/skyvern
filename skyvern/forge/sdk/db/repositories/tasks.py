@@ -591,6 +591,64 @@ class TasksRepository(BaseRepository):
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
+        updated_task, _ = await self._update_task_with_finish_claim(
+            task_id,
+            status=status,
+            extracted_information=extracted_information,
+            webhook_failure_reason=webhook_failure_reason,
+            failure_reason=failure_reason,
+            errors=errors,
+            max_steps_per_run=max_steps_per_run,
+            organization_id=organization_id,
+            failure_category=failure_category,
+        )
+        return updated_task
+
+    @traced(name="skyvern.db.update_task_and_claim_finish")
+    @db_operation("update_task_and_claim_finish")
+    async def update_task_and_claim_finish(
+        self,
+        task_id: str,
+        status: TaskStatus | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        max_steps_per_run: int | None = None,
+        organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> tuple[Task, bool]:
+        """``update_task``, plus whether THIS write flipped ``finished_at`` from NULL.
+
+        The flip happens under a row lock and every finalizer stamps ``finished_at``
+        atomically with its terminal status (here and in the bulk CAS paths), so at
+        most one concurrent finalizer sees True. Callers use it as the exactly-once
+        gate for per-task side effects such as the run-minutes emission.
+        """
+        return await self._update_task_with_finish_claim(
+            task_id,
+            status=status,
+            extracted_information=extracted_information,
+            webhook_failure_reason=webhook_failure_reason,
+            failure_reason=failure_reason,
+            errors=errors,
+            max_steps_per_run=max_steps_per_run,
+            organization_id=organization_id,
+            failure_category=failure_category,
+        )
+
+    async def _update_task_with_finish_claim(
+        self,
+        task_id: str,
+        status: TaskStatus | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        max_steps_per_run: int | None = None,
+        organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> tuple[Task, bool]:
         if (
             status is None
             and extracted_information is None
@@ -603,10 +661,17 @@ class TasksRepository(BaseRepository):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
             )
+        finish_claimed = False
         async with self.Session() as session:
             if task := (
                 await session.scalars(
-                    select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                    select(TaskModel)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                    # The row lock makes the finished_at NULL->set flip below an atomic
+                    # claim: concurrent finalizers serialize here, and only the first
+                    # sees finished_at still NULL.
+                    .with_for_update()
                 )
             ).first():
                 if status is not None:
@@ -617,6 +682,7 @@ class TasksRepository(BaseRepository):
                         task.started_at = naive_utc_now()
                     if status.is_final() and task.finished_at is None:
                         task.finished_at = naive_utc_now()
+                        finish_claimed = True
                 if extracted_information is not None:
                     task.extracted_information = extracted_information
                 if failure_reason is not None:
@@ -649,9 +715,45 @@ class TasksRepository(BaseRepository):
                     self._background_tasks.add(bg)
                     bg.add_done_callback(self._background_tasks.discard)
 
-                return updated_task
+                return updated_task, finish_claimed
             else:
                 raise NotFoundError("Task not found")
+
+    @traced(name="skyvern.db.reset_task_for_rerun")
+    @db_operation("reset_task_for_rerun")
+    async def reset_task_for_rerun(self, task_id: str, organization_id: str) -> Task:
+        """Return a task to ``created`` with its lifecycle timestamps cleared.
+
+        ``update_task`` only ever stamps timestamps forward, so it cannot undo a finished
+        run. Clearing ``finished_at`` here is what re-arms the exactly-once finish claim in
+        ``_update_task_with_finish_claim``: leaving it set spends the rerun's claim before it
+        begins, and the rerun's real compute never emits.
+        """
+        async with self.Session() as session:
+            if task := (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                    .with_for_update()
+                )
+            ).first():
+                task.status = TaskStatus.created
+                task.queued_at = None
+                task.started_at = None
+                task.finished_at = None
+                await session.commit()
+                await session.refresh(task)
+                reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)
+            else:
+                raise NotFoundError("Task not found")
+
+        await self.sync_task_run_status(
+            organization_id=organization_id,
+            run_id=task_id,
+            status=TaskStatus.created.value,
+        )
+        return reset_task
 
     @db_operation("update_task_2fa_state")
     async def update_task_2fa_state(
@@ -711,9 +813,11 @@ class TasksRepository(BaseRepository):
             return []
 
         async with self.Session() as session:
-            update_values = {}
+            update_values: dict[str, Any] = {}
             if status:
                 update_values["status"] = status.value
+                if status.is_final():
+                    update_values["finished_at"] = func.coalesce(TaskModel.finished_at, naive_utc_now())
             if failure_reason:
                 update_values["failure_reason"] = failure_reason
 

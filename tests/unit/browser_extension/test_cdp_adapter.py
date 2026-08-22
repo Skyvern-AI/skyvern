@@ -557,6 +557,58 @@ async def test_frame_discovery_broker_failure_discards_attachment_and_restores_a
 
 
 @pytest.mark.asyncio
+async def test_create_target_reuses_the_scope_the_echoed_tab_added_event_opened(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    # The extension announces a created tab before it answers tabs.create, so the announcement's
+    # attach is always the one already in flight when Target.createTarget resumes.
+    adapter, relay, _registry = adapter_server
+    adapter._auto_attach = True
+    relay.block_attach_tab_id = 100
+    original_request = relay.request
+
+    async def request_announcing_the_tab_before_returning_it(op: str, args: dict, timeout: float = 30.0) -> dict:
+        result = await original_request(op, args, timeout)
+        if op == "tabs.create":
+            await adapter.handle_extension_event(
+                "scope.tabAdded", {"tabId": result["tabId"], "url": args["url"], "title": ""}
+            )
+        return result
+
+    relay.request = request_announcing_the_tab_before_returning_it
+    async with ClientSession() as session:
+        async with session.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "method": "Target.createTarget", "params": {"url": "https://new.example"}})
+            await asyncio.wait_for(relay.attach_started.wait(), timeout=2)
+            relay.release_attach.set()
+
+            response = await receive_response(ws, 1)
+            assert "error" not in response, response
+            assert response["result"]["targetId"]
+            assert ("debugger.detach", {"tabId": 100}) not in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_create_target_survives_a_tab_added_event_that_lands_mid_attach(
+    adapter_server: tuple[ExtensionCdpAdapter, StubRelay, VirtualTargetRegistry],
+) -> None:
+    adapter, relay, _registry = adapter_server
+    relay.block_attach_tab_id = 100
+    async with ClientSession() as session:
+        async with session.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "method": "Target.createTarget", "params": {"url": "https://new.example"}})
+            await asyncio.wait_for(relay.attach_started.wait(), timeout=2)
+            await adapter.handle_extension_event(
+                "scope.tabAdded", {"tabId": 100, "url": "https://new.example", "title": ""}
+            )
+            relay.release_attach.set()
+
+            response = await receive_response(ws, 1)
+            assert "error" not in response, response
+            assert response["result"]["targetId"]
+
+
+@pytest.mark.asyncio
 async def test_scope_revoked_during_frame_discovery_discards_the_attachment() -> None:
     relay = StubRelay([{"tabId": 33, "url": "https://racy.example", "title": "Racy"}])
     frame_key = (None, "Page.getFrameTree")

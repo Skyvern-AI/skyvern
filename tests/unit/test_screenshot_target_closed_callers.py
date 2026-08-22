@@ -45,6 +45,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.actions.actions import ActionType, ClickAction, CompleteAction
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.test_agent_step_characterization import make_agent_step_rig
 
@@ -520,6 +521,95 @@ class TestCompleteActionVerificationTargetClosed:
 
         assert len(results) == 1 and results[0].success is False
         assert any("Failed to verify the complete action" in str(call.args[0]) for call in log.exception.call_args_list)
+
+
+class _CachedBrowserState:
+    """Mirrors ``RealBrowserState`` at the two points the step boundary depends on: the liveness read
+    is what latches the disconnect diagnostic, and the diagnostic is what every consumer reads to
+    decide the browser is provably gone."""
+
+    def __init__(self, *, connected: bool, browser_artifacts: Any = None) -> None:
+        self._connected = connected
+        self._diagnostic: BrowserStateDiagnostic | None = None
+        self.browser_context = None
+        self.browser_artifacts = browser_artifacts
+
+    def is_connected(self) -> bool:
+        if not self._connected and self._diagnostic is None:
+            self._diagnostic = BrowserStateDiagnostic(
+                reason="browser_context_closed",
+                disconnect_observed_at=datetime.now(UTC),
+                event="browser_context_disconnected",
+                observation_source="liveness_probe",
+            )
+        return self._connected
+
+    def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
+        return self._diagnostic
+
+
+class TestStepBoundaryBrowserLoss:
+    """A step that starts against a browser already known to be gone spends its whole scrape ladder
+    re-discovering that. ``check_and_fix_state`` clears the diagnostic whenever it rebuilds, and
+    nothing in the scrape path rebuilds, so a diagnostic still latched at acquisition means every
+    page access this step makes is guaranteed to raise. Reconnecting instead — what ``block.py`` does
+    at a block boundary — would hand a mid-flow task a blank browser with none of its state.
+    """
+
+    def _rig(self, monkeypatch: pytest.MonkeyPatch, browser_state: _CachedBrowserState) -> tuple[ForgeAgent, dict]:
+        now = datetime.now(UTC)
+        organization = make_organization(now)
+        task = make_task(now, organization, task_id="tsk_boundary")
+        step = make_step(now, task, step_id="step-boundary", status=StepStatus.running, order=4, output=None)
+
+        manager = RealBrowserManager()
+        manager.pages[task.task_id] = browser_state  # type: ignore[assignment]
+        monkeypatch.setattr(agent_mod.app, "BROWSER_MANAGER", manager)
+        skyvern_context.set(SkyvernContext(task_id=task.task_id, organization_id=task.organization_id))
+
+        return ForgeAgent(), {"task": task, "step": step}
+
+    @pytest.mark.asyncio
+    async def test_cached_dead_browser_fails_the_step_before_it_starts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A task with no persistent session is handed its cached, dead browser state untouched: the
+        manager only probes (and reconnects) persistent-session states, because only a session can
+        be re-acquired as the SAME browser. The gate's own probe is what makes the death visible."""
+        browser_state = _CachedBrowserState(connected=False, browser_artifacts=MagicMock())
+        agent, kwargs = self._rig(monkeypatch, browser_state)
+        video_artifacts = AsyncMock(side_effect=AssertionError("the step must not start on a dead browser"))
+        monkeypatch.setattr(agent_mod.app.BROWSER_MANAGER, "get_video_artifacts", video_artifacts)
+        create = AsyncMock(side_effect=AssertionError("a mid-flow task must not be given a fresh blank browser"))
+        monkeypatch.setattr(agent_mod.app.BROWSER_MANAGER, "_create_browser_state", create)
+
+        with pytest.raises(MissingBrowserStatePage) as exc_info:
+            await agent.initialize_execution_state(**kwargs)
+
+        assert exc_info.value.diagnostic is browser_state.get_browser_state_diagnostic()
+        video_artifacts.assert_not_called()
+        create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pre_resolved_browser_state_does_not_bypass_the_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A caller-supplied state skips the manager entirely, so nothing upstream has probed it and
+        no diagnostic is latched yet. The gate must probe liveness itself, not just read."""
+        browser_state = _CachedBrowserState(connected=False, browser_artifacts=MagicMock())
+        assert browser_state.get_browser_state_diagnostic() is None
+        agent, kwargs = self._rig(monkeypatch, _CachedBrowserState(connected=True))
+
+        with pytest.raises(MissingBrowserStatePage) as exc_info:
+            await agent.initialize_execution_state(**kwargs, pre_resolved_browser_state=browser_state)  # type: ignore[arg-type]
+
+        assert exc_info.value.diagnostic is browser_state.get_browser_state_diagnostic()
+
+    @pytest.mark.asyncio
+    async def test_a_live_browser_still_starts_the_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: no observed disconnect means the browser is not provably gone, and the step runs."""
+        browser_state = _CachedBrowserState(connected=True)
+        agent, kwargs = self._rig(monkeypatch, browser_state)
+
+        _, acquired, _ = await agent.initialize_execution_state(**kwargs)
+
+        assert acquired is browser_state
 
 
 class TestTaskV2IterationTargetClosed:

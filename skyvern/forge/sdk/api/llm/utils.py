@@ -175,15 +175,17 @@ def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool)
     dicts = [item for item in response if isinstance(item, dict)]
     lists = [item for item in response if isinstance(item, list)]
 
-    # Reasoning object + nested action array. This shape is unambiguous (a nested
-    # action array beside a non-action dict), so it never collides with
-    # single-object prompts and is recovered regardless of caller.
-    if len(dicts) == 1 and len(lists) == 1:
-        preamble = dicts[0]
-        nested = lists[0]
-        is_action_list = bool(nested) and all(isinstance(item, dict) and "action_type" in item for item in nested)
-        if is_action_list and "actions" not in preamble and "action_type" not in preamble:
-            return {**preamble, "actions": nested}
+    # Reasoning object + nested action array. This shape is unambiguous (exactly one
+    # nested action array beside dicts that carry no decision of their own), so it
+    # never collides with single-object prompts and is recovered regardless of
+    # caller. An unescaped quote inside the reasoning text ends that string early
+    # and strands the remainder as extra fragments, so surplus non-action fragments
+    # are tolerated as long as only one action array survives.
+    action_lists = [
+        item for item in lists if item and all(isinstance(entry, dict) and "action_type" in entry for entry in item)
+    ]
+    if dicts and len(action_lists) == 1 and all("actions" not in d and "action_type" not in d for d in dicts):
+        return {**dicts[0], "actions": action_lists[0]}
 
     # Bare list of action dicts. Collides with single-object callers whose object
     # carries action_type, so only wrap when the caller consumes an actions array.

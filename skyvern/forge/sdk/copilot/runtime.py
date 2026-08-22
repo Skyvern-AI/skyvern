@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
 
@@ -64,8 +64,20 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
+# Where a planned frontier run starts its browser from; only a non-``unanchored`` start proves the
+# run began in a composition state the workflow itself established.
+FrontierStartProvenance = Literal["initial", "replayed", "resumed", "unanchored"]
+
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
-_BROWSER_PROBE_WAIT_SECONDS = 5.0
+# Sized to cover the manager's COMMON recovery so this deadline stops cancelling it midway and
+# reporting a session unverified that was about to be handed back: a 2s cached-handle probe, a
+# stale teardown the manager documents as additive (5s close + 5s driver stop), then a CDP
+# re-attach — roughly 12s of the 15s. It does NOT dominate the worst case, and is not meant to: a
+# cached wrapper that fails ``is_connected()`` routes to an unbounded close budgeted at
+# ``BROWSER_INTERCEPTOR_DISABLE_TIMEOUT + 3 * BROWSER_CLOSE_TIMEOUT`` (~9.5 min), which needs
+# bounding in cloud/ rather than a larger number here. ``ensure_browser_session`` applies this
+# twice in sequence — probe, then attach-verify — so the worst-case turn stall is double.
+_BROWSER_PROBE_WAIT_SECONDS = 15.0
 # Browser contexts can lag the persistent-session row under load; this keeps
 # Copilot from handing a not-yet-attachable session to the next MCP tool.
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
@@ -341,6 +353,12 @@ class AgentContext:
     # Set by the planner when it proved a resume against the browser above; the next run is
     # threaded into that browser instead of the chat's. Consumed and cleared by that run.
     frontier_resume_session_id: str | None = None
+    # Where the planned run starts from, stamped once per plan and consumed by that run. Only a
+    # non-``unanchored`` start can credit its labels as composition-verified.
+    frontier_start_provenance: FrontierStartProvenance | None = None
+    # Labels whose last successful run started from a provable composition state. Distinct from
+    # verified_prefix_labels, which drives frontier advancement and must stay per-label.
+    composition_verified_labels: list[str] = field(default_factory=list)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)

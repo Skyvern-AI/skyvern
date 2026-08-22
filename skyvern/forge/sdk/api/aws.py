@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import time
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from mimetypes import add_type, guess_type
 from typing import IO, TYPE_CHECKING, Any
@@ -163,6 +165,30 @@ class AsyncAWSClient:
                     continue
                 raise
 
+    async def _detach_on_cancel(self, op_name: str, operation: Callable[[], Awaitable[Any]], **log_kwargs: Any) -> Any:
+        """Run a multipart transfer so the caller's cancellation cannot strand aioboto3's worker tasks.
+
+        aioboto3's upload_fileobj (still true in 15.5.0) cancels its uploader tasks and aborts the multipart
+        upload only on its own exit path; a CancelledError delivered at its internal asyncio.wait skips both.
+        """
+        # The detached transfer has no deadline of its own: botocore's per-request timeouts bound a stall,
+        # and a process shutdown cancels it exactly as before.
+        task = asyncio.ensure_future(operation())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(lambda done: self._log_detached_transfer(op_name, done, **log_kwargs))
+            raise
+
+    @staticmethod
+    def _log_detached_transfer(op_name: str, task: asyncio.Task[Any], **log_kwargs: Any) -> None:
+        if task.cancelled():
+            LOG.warning(f"S3 {op_name} cancelled after its caller stopped waiting", **log_kwargs)
+        elif (exc := task.exception()) is not None:
+            LOG.warning(f"S3 {op_name} failed after its caller stopped waiting", error=str(exc), **log_kwargs)
+        else:
+            LOG.info(f"S3 {op_name} completed after its caller stopped waiting", **log_kwargs)
+
     def _ecs_client(self) -> ECSClient:
         return self._get_session(AWSClientType.ECS).client(
             AWSClientType.ECS, region_name=self.region_name, endpoint_url=self._endpoint_url
@@ -294,7 +320,11 @@ class AsyncAWSClient:
             return None
 
         try:
-            return await self._s3_with_retry("stream upload", _op, before_retry=_rewind_stream, uri=uri)
+            return await self._detach_on_cancel(
+                "stream upload",
+                lambda: self._s3_with_retry("stream upload", _op, before_retry=_rewind_stream, uri=uri),
+                uri=uri,
+            )
         except Exception:
             LOG.exception("S3 upload stream failed.", uri=uri)
             return None
@@ -332,7 +362,7 @@ class AsyncAWSClient:
                 )
 
         try:
-            await self._s3_with_retry("upload", _op, uri=uri)
+            await self._detach_on_cancel("upload", lambda: self._s3_with_retry("upload", _op, uri=uri), uri=uri)
         except Exception as e:
             LOG.exception("S3 upload failed.", uri=uri)
             if raise_exception:

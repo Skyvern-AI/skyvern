@@ -577,7 +577,9 @@ async def download_file(
         LOG.warning("Failed to download file, blocked host", exc_info=True)
         raise
     except Exception:
-        LOG.exception("Failed to download file")
+        # Dominated by the requested host erroring, which the run record already carries; a genuine
+        # defect in this path therefore surfaces at warning, not error.
+        LOG.warning("Failed to download file", exc_info=True)
         raise
 
 

@@ -96,9 +96,22 @@ def test_dict_with_own_actions_key_is_not_overridden_by_nested_list():
     assert _coerce_response_to_dict([own, stray]) == own
 
 
-def test_two_reasoning_dicts_plus_action_list_keeps_first_dict():
+def test_stray_fragments_between_preamble_and_action_list_still_reattach():
+    # An unescaped quote inside `thoughts` ends that string early, so the rest of
+    # the reasoning text is stranded as extra top-level fragments sitting between
+    # the preamble and the action array.
+    preamble = {"page_info": "p1", "thoughts": "OCR output is `{'document_category': 'BILLING INVOICE'"}
+    dict_fragment = {"document_category": "BILLING INVOICE", "customer_number": "0206556463"}
+    list_fragment = ["0206556463"]
+    actions = [{"action_type": "COMPLETE", "reasoning": "done", "confidence_float": 1.0}]
+    expected = {**preamble, "actions": actions}
+    assert _coerce_response_to_dict([preamble, dict_fragment, actions], "decisive-criterion-validate") == expected
+    assert _coerce_response_to_dict([preamble, list_fragment, actions], "decisive-criterion-validate") == expected
+
+
+def test_later_dict_carrying_action_type_keeps_first_dict():
     first = {"page_info": "p1"}
-    second = {"thoughts": "t2"}
+    second = {"action_type": "TERMINATE", "reasoning": "competing decision"}
     actions = [{"action_type": "COMPLETE", "reasoning": "done"}]
     assert _coerce_response_to_dict([first, second, actions]) == first
 

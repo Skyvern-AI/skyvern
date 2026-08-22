@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, cast
+from typing import Any, Awaitable, Callable, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
@@ -75,6 +75,11 @@ LOG = structlog.get_logger()
 
 
 BrowserCleanupFunc = Callable[[], Awaitable[None]] | None
+# Playwright defaults a ".har" path to content="embed", which holds every response body in the driver's
+# JS heap for the life of the context and serializes them all in one JSON.stringify at close, so long runs
+# blow the ~3 GB V8 heap there and the driver dies with every task on it. "omit" keeps the HAR bounded by
+# request count instead.
+HAR_CONTENT_POLICY: Literal["omit"] = "omit"
 # Header to signal fresh browser context creation (stripped before sending to websites)
 # When set to "true", creates a new incognito-like context instead of reusing existing ones
 FRESH_CONTEXT_HEADER = "X-Skyvern-Fresh-Context"
@@ -697,6 +702,7 @@ class BrowserContextFactory:
                 "--enable-automation",
             ],
             "record_har_path": har_dir,
+            "record_har_content": HAR_CONTENT_POLICY,
             "record_video_dir": video_dir,
             "viewport": {
                 "width": settings.BROWSER_WIDTH,
