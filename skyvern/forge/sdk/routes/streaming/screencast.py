@@ -10,11 +10,12 @@ import time
 from collections.abc import Awaitable, Callable
 
 import structlog
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 from opentelemetry import metrics
 from playwright.async_api import CDPSession
 
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
@@ -445,6 +446,7 @@ async def start_screencast_loop(
                     max_poll_interval_seconds=ACTIVE_PAGE_MAX_POLL_INTERVAL,
                 )
 
+    client_disconnected = False
     try:
         page = await _resolve_working_page(browser_state, entity_id, entity_type, workflow_run_id, organization_id)
         if page is None:
@@ -455,11 +457,13 @@ async def start_screencast_loop(
         forward_task = asyncio.create_task(_frame_forwarding_loop())
         poll_task = asyncio.create_task(_completion_polling_loop())
         page_monitor_task = asyncio.create_task(_active_page_monitor_loop())
+        disconnect_task = watch_for_client_disconnect(websocket)
 
         done, pending = await asyncio.wait(
-            [forward_task, poll_task, page_monitor_task],
+            [forward_task, poll_task, page_monitor_task, disconnect_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
+        client_disconnected = disconnect_task in done
         for task in pending:
             task.cancel()
             try:
@@ -482,3 +486,6 @@ async def start_screencast_loop(
     finally:
         await _stop_current_screencast()
         LOG.info("CDP screencast cleaned up", entity_id=entity_id, entity_type=entity_type)
+    # Raised after cleanup so the caller's disconnect branch runs instead of its final-status write.
+    if client_disconnected:
+        raise WebSocketDisconnect()

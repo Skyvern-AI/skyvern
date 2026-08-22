@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
+from fastapi import WebSocketDisconnect
 
 from tests.unit_tests._stub_streaming import import_with_stubs
 
@@ -246,6 +247,16 @@ class _FakePage:
         self.viewport_size = {"width": 800, "height": 600}
 
 
+def _connected_websocket(send_json: object) -> SimpleNamespace:
+    """A real WebSocket is readable, and the screencast loop reads it to notice a client disconnect."""
+
+    async def _receive() -> dict:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    return SimpleNamespace(send_json=send_json, receive=_receive)
+
+
 async def _wait_for(predicate: Callable[[], bool]) -> bool:
     for _ in range(500):
         if predicate():
@@ -271,7 +282,7 @@ async def test_forwarded_frame_is_acked_and_records_forward_latency(monkeypatch:
         if len(sent) == 2:
             raise RuntimeError("client gone")
 
-    websocket = SimpleNamespace(send_json=_send_json)
+    websocket = _connected_websocket(_send_json)
 
     async def _never_finalized() -> bool:
         return False
@@ -298,6 +309,28 @@ async def test_forwarded_frame_is_acked_and_records_forward_latency(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_client_disconnect_is_raised_so_the_caller_does_not_write_a_final_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _FakeCdpSession()
+    monkeypatch.setattr(screencast, "_resolve_working_page", AsyncMock(return_value=_FakePage(session)))
+    websocket = SimpleNamespace(
+        send_json=AsyncMock(),
+        receive=AsyncMock(return_value={"type": "websocket.disconnect", "code": 1006}),
+    )
+
+    async def _never_finalized() -> bool:
+        return False
+
+    with pytest.raises(WebSocketDisconnect):
+        await asyncio.wait_for(
+            screencast.start_screencast_loop(websocket, object(), "pbs_1", "browser_session", _never_finalized),
+            timeout=5,
+        )
+    assert session.detached
+
+
+@pytest.mark.asyncio
 async def test_evicted_frame_records_queue_dwell(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeCdpSession()
     page = _FakePage(session)
@@ -318,7 +351,7 @@ async def test_evicted_frame_records_queue_dwell(monkeypatch: pytest.MonkeyPatch
         elif payload["screenshot"] == "frame-3":
             raise RuntimeError("client gone")
 
-    websocket = SimpleNamespace(send_json=_send_json)
+    websocket = _connected_websocket(_send_json)
 
     async def _never_finalized() -> bool:
         return False
@@ -390,7 +423,7 @@ async def test_a_page_that_cannot_be_attached_does_not_kill_the_running_stream(
         if payload["screenshot"] == "frame-from-next-page":
             raise RuntimeError("client gone")
 
-    websocket = SimpleNamespace(send_json=_send_json)
+    websocket = _connected_websocket(_send_json)
 
     async def _never_finalized() -> bool:
         return False
@@ -449,7 +482,7 @@ async def test_a_frame_that_lands_mid_swap_is_still_acked(monkeypatch: pytest.Mo
 
     await asyncio.wait_for(
         screencast.start_screencast_loop(
-            SimpleNamespace(send_json=_send_json), object(), "pbs_1", "browser_session", _never_finalized
+            _connected_websocket(_send_json), object(), "pbs_1", "browser_session", _never_finalized
         ),
         timeout=5,
     )
@@ -520,7 +553,7 @@ async def _drive_page_monitor(
 
     task = asyncio.create_task(
         screencast.start_screencast_loop(
-            SimpleNamespace(send_json=AsyncMock()),
+            _connected_websocket(AsyncMock()),
             object(),
             entity_id,
             entity_type,

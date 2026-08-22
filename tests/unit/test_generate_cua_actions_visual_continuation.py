@@ -24,6 +24,7 @@ from tests.unit.helpers import make_organization, make_step, make_task
 
 SCREENSHOT_BYTES = b"\x89PNG\r\n\x1a\nfake-screenshot-bytes"
 HELPER_ANSWER = "I'll scroll down to see the rest of the page."
+HELPER_QUESTION = "Which download icon should I click to export the report?"
 
 
 def _fake_usage() -> SimpleNamespace:
@@ -55,15 +56,22 @@ def _flatten_input_message(create_input: list[dict[str, Any]]) -> tuple[list[str
 
 
 async def _invoke_no_call_continuation(
-    monkeypatch: pytest.MonkeyPatch, helper_answer: str | None = HELPER_ANSWER
-) -> AsyncMock:
+    monkeypatch: pytest.MonkeyPatch,
+    helper_answer: str | None = HELPER_ANSWER,
+    totp_code: str | None = None,
+    assistant_texts: list[str] | None = None,
+) -> tuple[AsyncMock, Any]:
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
     task = make_task(now, organization)
     step = make_step(now, task, step_id="cua-step", status=StepStatus.created, order=0, output=None)
 
-    previous_response = SimpleNamespace(id="resp_prev", output=[])
+    output = [
+        SimpleNamespace(type="message", role="assistant", content=[SimpleNamespace(type="text", text=text)])
+        for text in (assistant_texts or [])
+    ]
+    previous_response = SimpleNamespace(id="resp_prev", output=output)
     scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES], window_dimension=None)
 
     create_mock = AsyncMock(return_value=SimpleNamespace(id="resp_new", output=[], usage=_fake_usage()))
@@ -81,35 +89,79 @@ async def _invoke_no_call_continuation(
     )
 
     monkeypatch.setattr(agent_module, "load_prompt_with_elements", MagicMock(return_value="prompt"))
-    monkeypatch.setattr(
-        agent_module.skyvern_context,
-        "ensure_context",
-        lambda: SimpleNamespace(totp_codes={}),
-    )
+    context = SimpleNamespace(totp_codes={task.task_id: totp_code} if totp_code else {})
+    monkeypatch.setattr(agent_module.skyvern_context, "ensure_context", lambda: context)
     monkeypatch.setattr(
         agent_module,
         "get_org_aware_primary_llm_api_handler",
-        lambda default=None: AsyncMock(return_value={"answer": helper_answer}),
+        lambda default=None: AsyncMock(return_value={"answer": helper_answer, "question_or_decision": HELPER_QUESTION}),
     )
     monkeypatch.setattr(agent_module, "parse_cua_actions", AsyncMock(return_value=[]))
 
     await agent._generate_cua_actions(
         task=task, step=step, scraped_page=scraped_page, previous_response=previous_response
     )
-    return create_mock
+    return create_mock, task
 
 
 @pytest.mark.asyncio
 async def test_no_computer_call_continuation_includes_answer_and_screenshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    create_mock = await _invoke_no_call_continuation(monkeypatch)
+    create_mock, _ = await _invoke_no_call_continuation(monkeypatch)
 
     create_mock.assert_awaited_once()
     create_input = create_mock.await_args.kwargs["input"]
     texts, image_urls = _flatten_input_message(create_input)
 
     assert any(HELPER_ANSWER in text for text in texts)
+
+    expected_data_url = f"data:image/png;base64,{base64.b64encode(SCREENSHOT_BYTES).decode('utf-8')}"
+    assert expected_data_url in image_urls
+
+
+@pytest.mark.asyncio
+async def test_no_computer_call_continuation_omits_previous_response_id_and_includes_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The no-call visual turn is a fresh request: it must not thread `previous_response_id`
+    (the Computer tool rejects a user-supplied input_image alongside a previous response), and it
+    must carry the original navigation goal so action generation keeps its context."""
+    create_mock, task = await _invoke_no_call_continuation(monkeypatch)
+
+    kwargs = create_mock.await_args.kwargs
+    assert "previous_response_id" not in kwargs
+
+    texts, _ = _flatten_input_message(kwargs["input"])
+    assert any(task.navigation_goal in text for text in texts)
+    assert any(HELPER_ANSWER in text for text in texts)
+    # The answered question must travel with the answer so a context-dependent reply stays anchored.
+    assert any(HELPER_QUESTION in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_fresh_continuation_anchors_on_latest_assistant_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-message no-call response must anchor on the model's latest question, not the first,
+    so the helper's answer is attached to what CUA actually asked last."""
+    create_mock, _ = await _invoke_no_call_continuation(
+        monkeypatch, assistant_texts=["An earlier aside.", "The final question to answer?"]
+    )
+
+    texts, _ = _flatten_input_message(create_mock.await_args.kwargs["input"])
+    assert any("The final question to answer?" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_totp_continuation_is_self_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    create_mock, task = await _invoke_no_call_continuation(monkeypatch, totp_code="123456")
+
+    kwargs = create_mock.await_args.kwargs
+    assert "previous_response_id" not in kwargs
+
+    texts, image_urls = _flatten_input_message(kwargs["input"])
+    assert any(task.navigation_goal in text for text in texts)
+    assert any("123456" in text for text in texts)
+    assert all(agent_module.CUA_EXECUTE_ACTIONS_DIRECTIVE not in text for text in texts)
 
     expected_data_url = f"data:image/png;base64,{base64.b64encode(SCREENSHOT_BYTES).decode('utf-8')}"
     assert expected_data_url in image_urls
@@ -175,7 +227,7 @@ async def test_cua_tool_falls_back_to_settings_without_a_live_viewport(monkeypat
 
 @pytest.mark.asyncio
 async def test_truthy_answer_appends_execute_directive(monkeypatch: pytest.MonkeyPatch) -> None:
-    create_mock = await _invoke_no_call_continuation(monkeypatch)
+    create_mock, _ = await _invoke_no_call_continuation(monkeypatch)
 
     create_input = create_mock.await_args.kwargs["input"]
     texts, _ = _flatten_input_message(create_input)
@@ -186,7 +238,7 @@ async def test_truthy_answer_appends_execute_directive(monkeypatch: pytest.Monke
 
 @pytest.mark.asyncio
 async def test_no_answer_default_question_omits_directive(monkeypatch: pytest.MonkeyPatch) -> None:
-    create_mock = await _invoke_no_call_continuation(monkeypatch, helper_answer="")
+    create_mock, _ = await _invoke_no_call_continuation(monkeypatch, helper_answer="")
 
     create_input = create_mock.await_args.kwargs["input"]
     texts, _ = _flatten_input_message(create_input)
@@ -231,9 +283,10 @@ async def test_computer_call_output_continuation_shape_unchanged(monkeypatch: py
         task=task, step=step, scraped_page=scraped_page, previous_response=previous_response
     )
 
-    create_input = create_mock.await_args.kwargs["input"]
+    kwargs = create_mock.await_args.kwargs
+    assert kwargs["previous_response_id"] == "resp_prev"
     expected_data_url = f"data:image/png;base64,{base64.b64encode(SCREENSHOT_BYTES).decode('utf-8')}"
-    assert create_input == [
+    assert kwargs["input"] == [
         {
             "call_id": "call_123",
             "type": "computer_call_output",
