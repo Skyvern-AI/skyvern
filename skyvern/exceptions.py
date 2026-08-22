@@ -1599,11 +1599,8 @@ class MissingRoutedVncAddressError(SkyvernException):
 
 class BrowserSessionClosed(SkyvernHTTPException):
     def __init__(self, browser_session_id: str, *, reason: str | None = None) -> None:
-        message = f"Browser session {browser_session_id} is closed."
-        if reason:
-            message = f"Browser session {browser_session_id} {reason}. Create a new browser session and retry."
         super().__init__(
-            message,
+            f"Browser session {browser_session_id} {reason or 'is closed'}. Create a new browser session and retry.",
             status_code=HTTPStatus.GONE,
         )
 

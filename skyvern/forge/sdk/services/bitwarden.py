@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import time
 from enum import IntEnum, StrEnum
 from typing import Any, Tuple
 
@@ -39,6 +40,13 @@ from skyvern.utils.strings import is_uuid
 
 LOG = structlog.get_logger()
 BITWARDEN_SERVER_BASE_URL = f"{settings.BITWARDEN_SERVER}:{settings.BITWARDEN_SERVER_PORT or 8002}"
+_RETRY_BACKOFF_BASE_SECONDS = 5.0
+_RETRY_BACKOFF_CAP_SECONDS = 60.0
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    # Full jitter: a batch of runs that failed together retries spread out instead of re-aligned.
+    return random.uniform(0, min(_RETRY_BACKOFF_CAP_SECONDS, _RETRY_BACKOFF_BASE_SECONDS * (2**attempt)))
 
 
 class BitwardenItemType(IntEnum):
@@ -370,6 +378,7 @@ class BitwardenService:
             env.update(additional_env)  # Update with any additional environment variables
 
         shell_subprocess = None
+        started = time.monotonic()
         try:
             async with asyncio.timeout(timeout):
                 shell_subprocess = await asyncio.create_subprocess_exec(
@@ -388,8 +397,18 @@ class BitwardenService:
             LOG.error(
                 "Bitwarden command timed out",
                 timeout_seconds=timeout,
+                elapsed_seconds=round(time.monotonic() - started, 2),
                 command=command[0:2],
                 exc_info=True,
+            )
+            raise
+        except asyncio.CancelledError:
+            # An enclosing deadline fired before this command's own budget; name the step so the
+            # attempt-level timeout is attributable to it.
+            LOG.warning(
+                "Bitwarden command cancelled by an enclosing deadline",
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                command=command[0:2],
             )
             raise
         finally:
@@ -533,11 +552,11 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
         await BitwardenService._apply_jitter()
-        for i in range(max_retries):
-            # FIXME: just simply double the timeout for the second try. maybe a better backoff policy when needed
-            timeout = (i + 1) * timeout
+        for attempt in range(max_retries):
             try:
-                async with asyncio.timeout(timeout):
+                # Every CLI command gets `timeout`; the attempt as a whole gets twice that, so one slow step
+                # cannot consume the others' budget and a dead vault still fails in bounded time.
+                async with asyncio.timeout(2 * timeout):
                     async with BitwardenService._cli_session_lock:
                         return await BitwardenService._get_secret_value_from_url(
                             client_id=client_id,
@@ -554,12 +573,15 @@ class BitwardenService:
             except BitwardenAccessDeniedError as e:
                 raise e
             except Exception as e:
-                LOG.info("Failed to get secret value from Bitwarden", tried_times=i + 1, exc_info=True)
+                LOG.info("Failed to get secret value from Bitwarden", tried_times=attempt + 1, exc_info=True)
                 fail_reasons.append(f"{type(e).__name__}: {str(e)}")
-        else:
-            raise BitwardenListItemsError(
-                f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}"
-            )
+                if attempt + 1 < max_retries:
+                    delay = _retry_backoff_seconds(attempt)
+                    LOG.info(
+                        "Backing off before retrying Bitwarden", delay_seconds=round(delay, 2), attempt=attempt + 1
+                    )
+                    await asyncio.sleep(delay)
+        raise BitwardenListItemsError(f"Bitwarden CLI failed after all retry attempts. Fail reasons: {fail_reasons}")
 
     @staticmethod
     def normalize_totp_config(totp_value: str) -> str:
@@ -602,13 +624,15 @@ class BitwardenService:
         Get the secret value from the Bitwarden CLI.
         """
         try:
-            await BitwardenService.login(client_id, client_secret, email=email, master_password=master_password)
-            await BitwardenService.sync()
-            session_key = await BitwardenService.unlock(master_password)
+            await BitwardenService.login(
+                client_id, client_secret, email=email, master_password=master_password, timeout=timeout
+            )
+            await BitwardenService.sync(timeout=timeout)
+            session_key = await BitwardenService.unlock(master_password, timeout=timeout)
 
             if item_id:  # if item_id provided, get single item by item id
                 command = ["bw", "get", "item", item_id, "--session", session_key]
-                item_result = await BitwardenService.run_command(command)
+                item_result = await BitwardenService.run_command(command, timeout=timeout)
                 if item_result.stderr:
                     raise BitwardenGetItemError(
                         f"Failed to get the bitwarden item {item_id}. Error: {item_result.stderr}"
@@ -762,6 +786,7 @@ class BitwardenService:
 
             remaining_retries -= 1
             LOG.info("Retrying to get sensitive information from Bitwarden", remaining_retries=remaining_retries)
+            await asyncio.sleep(_retry_backoff_seconds(len(fail_reasons)))
             return await BitwardenService.get_sensitive_information_from_identity(
                 client_id=client_id,
                 client_secret=client_secret,
@@ -864,6 +889,7 @@ class BitwardenService:
         client_secret: str | None,
         email: str | None = None,
         master_password: str | None = None,
+        timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
     ) -> None:
         """
         Log in to the Bitwarden CLI.
@@ -883,7 +909,7 @@ class BitwardenService:
             login_command = ["bw", "login", bw_email, "--passwordenv", "BW_PASSWORD"]
         else:
             login_command = ["bw", "login", "--apikey"]
-        login_result = await BitwardenService.run_command(login_command, env)
+        login_result = await BitwardenService.run_command(login_command, env, timeout=timeout)
 
         # Validate the login result
         if login_result.stdout and "You are logged in!" not in login_result.stdout:
@@ -895,7 +921,7 @@ class BitwardenService:
         LOG.info("Bitwarden login successful")
 
     @staticmethod
-    async def unlock(master_password: str) -> str:
+    async def unlock(master_password: str, timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> str:
         """
         Unlock the Bitwarden CLI.
         """
@@ -903,7 +929,7 @@ class BitwardenService:
             "BW_PASSWORD": master_password,
         }
         unlock_command = ["bw", "unlock", "--passwordenv", "BW_PASSWORD"]
-        unlock_result = await BitwardenService.run_command(unlock_command, env)
+        unlock_result = await BitwardenService.run_command(unlock_command, env, timeout=timeout)
 
         # Validate the unlock result
         if unlock_result.stdout and "Your vault is now unlocked!" not in unlock_result.stdout:
@@ -923,24 +949,24 @@ class BitwardenService:
         return session_key
 
     @staticmethod
-    async def sync() -> None:
+    async def sync(timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> None:
         """
         Sync the Bitwarden CLI.
         """
         sync_command = ["bw", "sync"]
         LOG.info("Bitwarden CLI sync started")
-        sync_result = await BitwardenService.run_command(sync_command)
+        sync_result = await BitwardenService.run_command(sync_command, timeout=timeout)
         LOG.info("Bitwarden CLI sync completed")
         if sync_result.stderr:
             raise BitwardenSyncError(sync_result.stderr)
 
     @staticmethod
-    async def logout() -> None:
+    async def logout(timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS) -> None:
         """
         Log out of the Bitwarden CLI.
         """
         logout_command = ["bw", "logout"]
-        logout_result = await BitwardenService.run_command(logout_command)
+        logout_result = await BitwardenService.run_command(logout_command, timeout=timeout)
         if logout_result.stderr and "You are not logged in." not in logout_result.stderr:
             raise BitwardenLogoutError(logout_result.stderr)
 
@@ -1066,6 +1092,7 @@ class BitwardenService:
 
             remaining_retries -= 1
             LOG.info("Retrying to get credit card data from Bitwarden", remaining_retries=remaining_retries)
+            await asyncio.sleep(_retry_backoff_seconds(len(fail_reasons)))
             return await BitwardenService.get_credit_card_data(
                 client_id=client_id,
                 client_secret=client_secret,

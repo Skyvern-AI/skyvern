@@ -197,6 +197,12 @@ def test_browser_session_timeout_exceptions_distinguish_startup_from_expiry() ->
     )
 
 
+def test_browser_session_closed_states_the_remedy_without_an_explicit_reason() -> None:
+    assert str(BrowserSessionClosed("pbs_test")) == (
+        "Browser session pbs_test is closed. Create a new browser session and retry."
+    )
+
+
 def test_raise_server_extra_required_translates_when_server_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "skyvern.exceptions.find_spec",
