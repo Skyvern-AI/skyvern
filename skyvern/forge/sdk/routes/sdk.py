@@ -69,6 +69,16 @@ async def run_sdk_action(
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> RunSdkActionResponse:
     """Execute a single SDK action with the specified parameters."""
+    # The whole action runs on this process's event loop, so the cap is taken before any database
+    # write or page work: an organization over its cap costs a rejected request, not a started one.
+    async with app.RATE_LIMITER.limit_sdk_action_concurrency(organization.organization_id):
+        return await _run_sdk_action(action_request, organization)
+
+
+async def _run_sdk_action(
+    action_request: RunSdkActionRequest,
+    organization: Organization,
+) -> RunSdkActionResponse:
     LOG.info(
         "Running SDK action",
         organization_id=organization.organization_id,
