@@ -9478,6 +9478,10 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            # Run minutes measure compute. A run finalized without ever reaching
+            # `running` held no pod, and the created_at fallback above would bill its
+            # whole queue age instead -- so it records as an exclusion (a zero-minute
+            # sample tagged excluded=never_started) rather than silently vanishing.
             if emit_run_minutes and workflow_run.parent_workflow_run_id is None:
                 await app.AGENT_FUNCTION.record_run_duration(
                     run_type="workflow_run",
@@ -9485,6 +9489,7 @@ class WorkflowService:
                     duration_seconds=duration_seconds,
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
+                    excluded_reason=None if workflow_run.started_at else "never_started",
                 )
             await self._apply_completion_run_tags_best_effort(workflow_run)
             self._schedule_workflow_run_terminal_hooks(
@@ -9987,6 +9992,9 @@ class WorkflowService:
             trigger_type=updated.trigger_type,
             workflow_schedule_id=updated.workflow_schedule_id,
         )
+        # Same compute gate as ``_after_workflow_run_status_write``: cancelling a run
+        # that never started bills queue age, not compute, so it records as a tagged
+        # zero-minute exclusion instead.
         if updated.parent_workflow_run_id is None:
             await app.AGENT_FUNCTION.record_run_duration(
                 run_type="workflow_run",
@@ -9994,6 +10002,7 @@ class WorkflowService:
                 duration_seconds=duration_seconds,
                 workflow_run_id=workflow_run_id,
                 organization_id=updated.organization_id,
+                excluded_reason=None if updated.started_at else "never_started",
             )
         await self._apply_completion_run_tags_best_effort(updated)
 
