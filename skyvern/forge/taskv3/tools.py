@@ -413,13 +413,22 @@ _OBSERVE_JS = (
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
     else if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio') rec.checked = el.getAttribute('aria-checked') === 'true';
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
+    const isChoice = el.type === 'checkbox' || el.type === 'radio' || el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio';
+    // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
+    // not mutate the page. Checkbox/radio .value is the static attribute ("on"), so they are excluded.
+    const ai = el.getAttribute('aria-invalid');
+    if (ai && ai !== 'false') rec.invalid = true;
+    // willValidate excludes readonly/disabled fields the agent cannot fix; password is excluded so
+    // validationMessage (which can echo the typed value) never leaks it.
+    else if (!isChoice && el.type !== 'password' && el.value && el.willValidate && !(el.form && el.form.noValidate) && el.validity && !el.validity.valid) {
+      rec.invalid = (el.validationMessage || '').slice(0, 140) || true;
+    }
     // Flag typeahead/autocomplete inputs so the model treats them as combobox fills instead of typing
     // raw text that never registers as a valid selection (type() also auto-commits them). See _IS_AUTOCOMPLETE_JS.
     if (_isAutocomplete(el)) rec.autocomplete = true;
     // Attach the surrounding question/group text for controls whose meaning lives in nearby
     // non-interactive text (radio/checkbox groups, weakly-labeled fields) so the agent can answer
     // without fetching raw HTML. Deduped against the previous element to keep grouped options compact.
-    const isChoice = el.type === 'checkbox' || el.type === 'radio' || el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio';
     if (isChoice || label.length < 3) {
       const g = el.closest('fieldset,[role=group],li,dd,.form-group,[class*="question"],[class*="field"]');
       if (g) {
@@ -434,13 +443,19 @@ _OBSERVE_JS = (
    } catch (e) { dropped++; continue; }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
-  // summaries) live in non-interactive nodes the element list can never carry. Sources are
-  // structural only — ARIA status channels first, then headings — never a body-text dump, so the
-  // digest stays bounded and can't regrow the context that transcript compaction bounds.
+  // summaries) live in non-interactive nodes the element list can never carry. Three sources in
+  // priority order — ARIA status channels (uncapped within the 900 total), class/id-named message
+  // blocks (600, or 300 past what ARIA spent, whichever is larger, still inside the 900), then
+  // headings (whatever the 900 leaves) — never a body-text
+  // dump, so the digest stays bounded and can't regrow the context that transcript compaction
+  // bounds. All three carry page-controlled text at the same trust level as element labels.
   const texts = [];
   let textTotal = 0;
   let textFull = false;
-  const pushText = (t) => {
+  let textDropped = 0;
+  // `limit` is a cumulative reservation: a channel stops at its limit so the channels after it keep
+  // a floor of the 900 total instead of being starved by whichever channel ran first.
+  const pushText = (t, limit = 900) => {
     t = (t || '').replace(/\s+/g, ' ').trim().slice(0, 300);
     if (!t) return;
     // Containment dedupe, richer message wins: an alert's text re-surfaces inside its heading's
@@ -449,7 +464,7 @@ _OBSERVE_JS = (
     if (texts.some((s) => s.includes(t))) return;
     const kept = texts.filter((s) => !t.includes(s));
     const keptTotal = kept.reduce((total, s) => total + s.length, 0);
-    if (keptTotal + t.length > 900) { textFull = true; return; }
+    if (keptTotal + t.length > limit) { textFull = textFull || limit >= 900; textDropped++; return; }
     texts.length = 0; texts.push(...kept, t); textTotal = keptTotal + t.length;
   };
   const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -461,6 +476,42 @@ _OBSERVE_JS = (
       if (textFull) break;
       if (visible(el)) pushText(el.innerText);
     }
+    // Rejection messages most sites render as a plain styled block with no ARIA; class/id naming is
+    // the only signal. A block with several form fields is a container (skipped unless short); one
+    // with at most one field up to the digest total is a message; longer is prose.
+    let messageCandidates = 0;
+    // A prior channel (ARIA) can already occupy the shared total before this loop starts; spend is
+    // measured relative to that starting point so this channel still gets its own floor.
+    const blockStart = textTotal;
+    const blockLimit = Math.min(900, Math.max(600, blockStart + 300));
+    // Real validation errors live inside the form; cookie banners and alert dropdowns sit above it
+    // in DOM order and must not spend the budget before the form's own error is seen.
+    // Only "error" is matched against id: id-named chrome (#alert-count, #cookie-warning) is the
+    // false-positive family this channel is most exposed to, and "error" is the one id that isn't.
+    const msgSel = '[class*="error" i],[class*="invalid" i],[class*="alert" i],[class*="warning" i],[id*="error" i]';
+    const msgCands = Array.from(document.querySelectorAll(msgSel));
+    const inForm = msgCands.filter((el) => el.closest('form'));
+    const orderedCands = inForm.concat(msgCands.filter((el) => !el.closest('form')));
+    // Stricter than visible(): this channel's selector is broad and site chrome is routinely present
+    // but hidden, whereas an ARIA live region styled invisible is not a pattern worth the extra reads.
+    const visibleText = (el) => {
+      if (!visible(el) || el.closest('[aria-hidden="true"]')) return false;
+      const r = el.getBoundingClientRect();
+      if (r.right <= 0 || r.bottom <= 0) return false;
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.opacity !== '0';
+    };
+    for (const el of orderedCands) {
+      if (textFull || textTotal - blockStart >= 600 || ++messageCandidates > 200) break;
+      // This selector set is broad, so one poisoned element degrades to "skip it", not to an
+      // emptied digest (the outer catch is for the narrow ARIA channel).
+      try {
+        if (!visibleText(el)) continue;
+        const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (t.length <= 300 || (t.length <= 900 && el.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
+      } catch (e) { continue; }
+    }
     for (const h of document.querySelectorAll('h1,h2,h3')) {
       if (textFull) break;
       if (!visible(h)) continue;
@@ -469,7 +520,7 @@ _OBSERVE_JS = (
       const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
       pushText(pt && pt.length <= 300 ? pt : h.innerText);
     }
-  } catch (e) { texts.length = 0; }
+  } catch (e) { texts.length = 0; textDropped = 0; }
   // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
   // perception can never list its contents — record host + signature so the model can see the gate
   // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
@@ -493,7 +544,7 @@ _OBSERVE_JS = (
       iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, iframes: iframeInfo, dropped: dropped, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, elements: out });
 }
 """
 )
@@ -577,6 +628,10 @@ def build_browser_tools(
         lines = [f"url={data.get('url')} title={data.get('title')!r} ({len(elements)} interactive elements)"]
         for t in data.get("text") or []:
             lines.append(f"text: {t!r}")
+        text_dropped = data.get("textDropped") or 0
+        if text_dropped:
+            # A capped digest must say it was capped: silently showing the first N reads as "that is all".
+            lines.append(f"note: {text_dropped} more page message(s) did not fit the text digest")
         iframe_info = data.get("iframes") or {}
         iframe_entries = iframe_info.get("entries") or []
         if iframe_entries:
@@ -609,6 +664,8 @@ def build_browser_tools(
                 extra += f" pressed={e['pressed']}"
             if e.get("required"):
                 extra += " *required"
+            if e.get("invalid"):
+                extra += " *invalid" if e["invalid"] is True else f" *invalid={e['invalid']!r}"
             if e.get("autocomplete"):
                 extra += " [autocomplete→use select_combobox]"
             if e.get("group"):
