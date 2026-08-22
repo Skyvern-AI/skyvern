@@ -281,6 +281,40 @@ async def resolve_inherited_workflow_task_page(browser_state: BrowserState, work
     raise InvalidWorkflowTaskURLState(workflow_run_id)
 
 
+def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
+    """Probe liveness and fail the step if the browser is already known to be gone.
+
+    The probe is a local flag read that latches the disconnect diagnostic, so a state nothing upstream
+    probed (caller-supplied, or a cached Skyvern-hosted one the manager never reconnects) is still
+    caught here. ``check_and_fix_state`` clears the diagnostic whenever it rebuilds, so a latched one
+    means every page access this step makes is guaranteed to raise; reconnecting instead (what
+    ``block.py`` does at a block boundary) would hand a mid-flow task a blank browser with none of its
+    cookies or page state.
+    """
+    browser_state.is_connected()
+    diagnostic = get_browser_state_diagnostic(browser_state)
+    if diagnostic is None:
+        return
+    detected_at = datetime.now(UTC)
+    LOG.warning(
+        "Browser is already gone; failing the step instead of starting it against a dead browser",
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        step_order=step.order,
+        step_retry=step.retry_index,
+        disconnect_reason=diagnostic.reason,
+        disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat(),
+        disconnect_observation_source=diagnostic.observation_source,
+    )
+    raise MissingBrowserStatePage(
+        task_id=task.task_id,
+        workflow_run_id=task.workflow_run_id,
+        diagnostic=diagnostic,
+        detected_at=detected_at,
+        failure_reason="browser_disconnected_before_step",
+    )
+
+
 def should_auto_download_pdf(pdf_src: str) -> bool:
     context = skyvern_context.current()
     if not context:
@@ -4619,6 +4653,8 @@ class ForgeAgent:
                 task=task,
                 browser_session_id=browser_session_id,
             )
+        # Every way a step can acquire a browser converges here, including a caller-supplied one.
+        fail_step_if_browser_already_gone(task=task, step=step, browser_state=browser_state)
         # Initialize video artifact for the task here, afterwards it'll only get updated.
         # The recording file is still open here, so skip the ffmpeg remux — matches the
         # per-step sync path; the finalized upload happens in cleanup_and_persist_task.
