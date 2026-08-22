@@ -5,7 +5,13 @@ from fastapi import Depends, HTTPException, status
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScrapingFailed, ScreenshotTargetClosed, SkyvernActionFailed, SkyvernHTTPException
+from skyvern.exceptions import (
+    MissingBrowserStatePage,
+    ScrapingFailed,
+    ScreenshotTargetClosed,
+    SkyvernActionFailed,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
@@ -304,6 +310,23 @@ async def run_sdk_action(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser page, context or browser was closed before the action could complete.",
+            )
+        except MissingBrowserStatePage as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the browser had no page left to act on",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The browser had no page left to act on before the action could complete.",
             )
         except SkyvernHTTPException as e:
             await app.DATABASE.tasks.update_task(
