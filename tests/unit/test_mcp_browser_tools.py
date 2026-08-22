@@ -1695,6 +1695,42 @@ async def test_do_select_option_accepts_idempotent_exact_committed_value(
 
 
 @pytest.mark.asyncio
+async def test_do_select_option_still_scans_and_probes_once_when_opening_ate_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stalled event loop between the open click and the first scan (a loaded CI shard) must not
+    # turn the budget into "no option looked at": the deadline bounds waiting, not the first tick.
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#oregon", "role": "option", "name": "OR"}]),
+    )
+    committed = {
+        "text": "Oregon",
+        "value": "OR",
+        "dataValues": [],
+        "expanded": "false",
+        "optionVisible": False,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        committed,
+        committed,
+    ]
+
+    async def stalled_click(**_: object) -> None:
+        await asyncio.sleep(0.02)
+
+    control.click = AsyncMock(side_effect=stalled_click)
+
+    assert await do_select_option(page, "#state", "or", timeout=1) == "OR"
+
+
+@pytest.mark.asyncio
 async def test_do_select_option_rejects_toggle_deselect_of_requested_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
