@@ -401,6 +401,12 @@ def _unverified_current_workflow_labels(ctx: object) -> list[str]:
     return [label for label in labels if label not in verified]
 
 
+def _composition_unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_workflow_block_labels(ctx)
+    verified = set(getattr(ctx, "composition_verified_labels", []) or [])
+    return [label for label in labels if label not in verified]
+
+
 def _iter_yaml_blocks(blocks: Any) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
     if not isinstance(blocks, list):

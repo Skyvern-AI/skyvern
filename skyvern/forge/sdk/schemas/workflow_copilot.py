@@ -165,6 +165,14 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
+    product_action: Literal["test_end_to_end"] | None = Field(
+        None,
+        description=(
+            "Structured product action for this turn, dispatched by the server instead of the agent. "
+            "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
+            "for that run."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
