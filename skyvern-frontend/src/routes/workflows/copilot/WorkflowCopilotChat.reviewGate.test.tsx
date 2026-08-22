@@ -486,7 +486,7 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
     );
     expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
     expect(screen.getByText("Proposed changes")).toBeTruthy();
-    expect(screen.getByText("Tested")).toBeTruthy();
+    expect(screen.queryByText("Tested")).toBeNull();
   });
 
   it("clears the proposal and shows a discarded receipt on a late Reject", async () => {

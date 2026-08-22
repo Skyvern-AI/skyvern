@@ -3,6 +3,7 @@ import { MagicWandIcon } from "@radix-ui/react-icons";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 import { humanizeBlockLabel } from "../blockLabel";
+import { everyTestBlockExecuted, hasFailedTestBlock } from "../copilotPhases";
 import { TurnNarrativeState } from "../narrativeState";
 import { getDiffCardTitle } from "./diffCardTitle";
 
@@ -21,6 +22,9 @@ export function getReviewGateVerdict(
   turn: TurnNarrativeState | undefined,
   proposedWorkflow: WorkflowApiResponse | null,
 ): ReviewGateVerdict {
+  if (turn && hasFailedTestBlock(turn)) {
+    return "untested";
+  }
   if (
     turn?.proposalDisposition === "review_tested" ||
     turn?.proposalDisposition === "auto_applicable"
@@ -30,11 +34,8 @@ export function getReviewGateVerdict(
   if (turn?.proposalDisposition) {
     return "untested";
   }
-  if (!proposedWorkflow) {
-    return null;
-  }
-  const legacy = proposedWorkflow as LegacyProposedWorkflow;
-  return legacy._copilot_unvalidated ? "untested" : "tested";
+  const legacy = proposedWorkflow as LegacyProposedWorkflow | null;
+  return legacy?._copilot_unvalidated ? "untested" : null;
 }
 
 const VERDICT_PILL_CLASSES: Record<"tested" | "untested", string> = {
@@ -42,6 +43,14 @@ const VERDICT_PILL_CLASSES: Record<"tested" | "untested", string> = {
     "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
   untested: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
 };
+
+const END_TO_END_REAL_ACTIONS =
+  "Testing end-to-end performs real actions on the site, so it can submit forms, " +
+  "place orders, or send messages for real.";
+
+const END_TO_END_EXPLAINER =
+  "Each step was tested on its own — the steps have not been run together yet. " +
+  END_TO_END_REAL_ACTIONS;
 
 const VERDICT_PILL_LABELS: Record<"tested" | "untested", string> = {
   tested: "Tested",
@@ -58,6 +67,7 @@ interface ReviewGateCardProps {
   onAlwaysAccept: () => void;
   onReject: () => void;
   onReview: () => void;
+  onTestEndToEnd?: () => void;
   gateId?: string;
   // Transient highlight when the pending-proposal chip scrolls to this gate.
   flash?: boolean;
@@ -102,6 +112,7 @@ export function ReviewGateCard({
   onAlwaysAccept,
   onReject,
   onReview,
+  onTestEndToEnd,
   gateId,
   flash = false,
 }: ReviewGateCardProps) {
@@ -223,6 +234,25 @@ export function ReviewGateCard({
           >
             Reject
           </button>
+          {onTestEndToEnd ? (
+            <button
+              type="button"
+              onClick={onTestEndToEnd}
+              className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-slate-elevation4 dark:text-slate-200"
+            >
+              Test end-to-end
+            </button>
+          ) : null}
+          {onTestEndToEnd ? (
+            <p className="basis-full text-[11px] leading-snug text-muted-foreground">
+              {verdict === "untested" &&
+              turn &&
+              everyTestBlockExecuted(turn) &&
+              !hasFailedTestBlock(turn)
+                ? END_TO_END_EXPLAINER
+                : END_TO_END_REAL_ACTIONS}
+            </p>
+          ) : null}
         </div>
       ) : null}
       {settled ? (
