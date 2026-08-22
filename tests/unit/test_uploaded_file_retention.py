@@ -20,10 +20,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
+from skyvern.forge.sdk.api import files as files_api
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.files import UploadedFile
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.schemas.runs import RunEngine
 from skyvern.services import uploaded_file_service
 
 VICTIM_ORG_ID = "o_victim"
@@ -41,7 +43,13 @@ class FakeUploadedFilesRepository:
         self.rows: dict[str, UploadedFile] = {}
         self._next_id = 0
 
-    def seed(self, organization_id: str, expires_at: datetime | None = None, filename: str = "secret.pdf") -> str:
+    def seed(
+        self,
+        organization_id: str,
+        expires_at: datetime | None = None,
+        filename: str = "secret.pdf",
+        run_id: str | None = None,
+    ) -> str:
         self._next_id += 1
         file_id = f"file_{self._next_id}"
         now = datetime.now(timezone.utc)
@@ -51,6 +59,7 @@ class FakeUploadedFilesRepository:
             storage_uri=_uri(organization_id, filename),
             filename=filename,
             expires_at=expires_at,
+            run_id=run_id,
             created_at=now,
             modified_at=now,
         )
@@ -103,6 +112,37 @@ class FakeUploadedFilesRepository:
             for row in self.rows.values()
             if row.deleted_at is None and row.expires_at is not None and row.expires_at <= before
         ][:limit]
+
+    async def get_uploaded_files_by_ids(self, file_ids: list[str], organization_id: str) -> list[UploadedFile]:
+        return [
+            row
+            for file_id in file_ids
+            if (row := self.rows.get(file_id)) is not None
+            and row.organization_id == organization_id
+            and row.deleted_at is None
+        ]
+
+    async def get_uploaded_files_for_run(self, run_id: str) -> list[UploadedFile]:
+        return [row for row in self.rows.values() if row.run_id == run_id and row.deleted_at is None]
+
+    async def attach_uploaded_files_to_run(
+        self,
+        file_ids: list[str],
+        organization_id: str,
+        run_id: str,
+        expires_at: datetime,
+    ) -> list[UploadedFile]:
+        attached = []
+        for file_id in file_ids:
+            row = self.rows.get(file_id)
+            if row is None or row.organization_id != organization_id or row.deleted_at is not None:
+                continue
+            if row.run_id is not None and row.run_id != run_id:
+                continue
+            row.run_id = run_id
+            row.expires_at = min(row.expires_at, expires_at) if row.expires_at else expires_at
+            attached.append(row)
+        return attached
 
 
 class FakeStorage:
@@ -349,6 +389,145 @@ class TestExpirySweep:
 
         assert result == {"examined": 1, "deleted": 0, "failed": 1}
         assert repo.live_ids() == {file_id}
+
+
+class TestRunAttachment:
+    """Attaching a file to a run (SKY-14439): the run's end is what deletes it."""
+
+    @pytest.mark.asyncio
+    async def test_a_runs_attached_files_are_deleted_when_the_run_ends(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+    ) -> None:
+        attached = repo.seed(VICTIM_ORG_ID, filename="cv.pdf")
+        other_run = repo.seed(VICTIM_ORG_ID, filename="other.pdf", run_id="wr_other")
+        unattached = repo.seed(VICTIM_ORG_ID, filename="kept.pdf")
+        await uploaded_file_service.attach_files_to_run(
+            file_ids=[attached], organization_id=VICTIM_ORG_ID, run_id="wr_1"
+        )
+
+        deleted = await uploaded_file_service.delete_files_attached_to_run(run_id="wr_1")
+
+        assert deleted == 1
+        assert storage.deleted == [_uri(VICTIM_ORG_ID, "cv.pdf")]
+        assert repo.live_ids() == {other_run, unattached}
+
+    @pytest.mark.asyncio
+    async def test_an_attached_file_gets_a_backstop_expiry(
+        self, service_app: object, repo: FakeUploadedFilesRepository
+    ) -> None:
+        """A run that never reaches its terminal handler must not strand the bytes forever."""
+        file_id = repo.seed(VICTIM_ORG_ID, expires_at=None)
+
+        await uploaded_file_service.attach_files_to_run(
+            file_ids=[file_id], organization_id=VICTIM_ORG_ID, run_id="wr_1"
+        )
+
+        expires_at = repo.rows[file_id].expires_at
+        assert expires_at is not None
+        assert expires_at <= datetime.now(timezone.utc) + timedelta(hours=settings.RUN_ATTACHED_FILE_BACKSTOP_HOURS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("attach_to_other_run", [True, False])
+    async def test_a_file_another_run_is_using_cannot_be_attached(
+        self, service_app: object, repo: FakeUploadedFilesRepository, attach_to_other_run: bool
+    ) -> None:
+        """Re-attaching would move the deletion trigger onto a run the first one is still using."""
+        file_id = repo.seed(VICTIM_ORG_ID, run_id="wr_first" if attach_to_other_run else None)
+
+        if attach_to_other_run:
+            with pytest.raises(uploaded_file_service.FileNotAttachable):
+                await uploaded_file_service.assert_files_attachable(file_ids=[file_id], organization_id=VICTIM_ORG_ID)
+        else:
+            await uploaded_file_service.assert_files_attachable(file_ids=[file_id], organization_id=VICTIM_ORG_ID)
+
+    @pytest.mark.asyncio
+    async def test_another_orgs_file_is_not_attachable(
+        self, service_app: object, repo: FakeUploadedFilesRepository
+    ) -> None:
+        victim_file = repo.seed(VICTIM_ORG_ID)
+
+        with pytest.raises(uploaded_file_service.FileNotAttachable):
+            await uploaded_file_service.assert_files_attachable(file_ids=[victim_file], organization_id=ATTACKER_ORG_ID)
+
+    @pytest.mark.asyncio
+    async def test_a_task_v1_file_is_bound_before_the_run_is_dispatched(
+        self, service_app: object, repo: FakeUploadedFilesRepository, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Binding after dispatch would let a fast run reach teardown with nothing to delete."""
+        from skyvern.forge.sdk.schemas.tasks import TaskRequest
+        from skyvern.services import task_v1_service
+
+        file_id = repo.seed(VICTIM_ORG_ID)
+        bound_at_dispatch: list[str | None] = []
+
+        async def execute_task(**kwargs: object) -> None:
+            bound_at_dispatch.append(repo.rows[file_id].run_id)
+
+        monkeypatch.setattr(task_v1_service, "_validate_task_v1_model_for_org", AsyncMock())
+        monkeypatch.setattr(task_v1_service, "validate_fetch_url", lambda url: url)
+        monkeypatch.setattr(
+            task_v1_service.app.agent, "create_task", AsyncMock(return_value=SimpleNamespace(task_id="tsk_1"))
+        )
+        monkeypatch.setattr(
+            task_v1_service.app.AGENT_FUNCTION, "resolve_run_engine", AsyncMock(return_value=RunEngine.skyvern_v1)
+        )
+        monkeypatch.setattr(task_v1_service.app.DATABASE.tasks, "create_task_run", AsyncMock())
+        monkeypatch.setattr(
+            task_v1_service.AsyncExecutorFactory, "get_executor", lambda: SimpleNamespace(execute_task=execute_task)
+        )
+
+        await task_v1_service.run_task(
+            TaskRequest(url="https://task.example.test"), _make_org(VICTIM_ORG_ID), file_ids=[file_id]
+        )
+
+        assert bound_at_dispatch == ["tsk_1"]
+
+    @pytest.mark.asyncio
+    async def test_teardown_deletion_does_not_raise_when_storage_fails(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+    ) -> None:
+        """An exception here would cost the run its webhook; the sweep retries via the backstop."""
+        file_id = repo.seed(VICTIM_ORG_ID, run_id="wr_1")
+        storage.fail_with = RuntimeError("s3 is down")
+
+        assert await uploaded_file_service.delete_files_attached_to_run(run_id="wr_1") == 0
+        assert repo.live_ids() == {file_id}
+
+
+class TestFileIdAsFileReference:
+    """A file id can stand in for a URL, so the run never needs a presigned URL."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("file_384430212391591428", True),
+            ("file:///etc/passwd", False),
+            ("https://example.com/cv.pdf", False),
+            ("file_", False),
+        ],
+    )
+    def test_only_a_file_id_is_treated_as_one(self, value: str, expected: bool) -> None:
+        assert files_api.is_uploaded_file_id(value) is expected
+
+    @pytest.mark.asyncio
+    async def test_a_file_id_resolves_to_its_own_orgs_uri_and_no_one_elses(
+        self, service_app: object, repo: FakeUploadedFilesRepository
+    ) -> None:
+        file_id = repo.seed(VICTIM_ORG_ID, filename="cv.pdf")
+
+        assert await files_api.resolve_uploaded_file_id(file_id, VICTIM_ORG_ID) == _uri(VICTIM_ORG_ID, "cv.pdf")
+        with pytest.raises(FileNotFoundError):
+            await files_api.resolve_uploaded_file_id(file_id, ATTACKER_ORG_ID)
+
+    @pytest.mark.asyncio
+    async def test_a_file_id_without_an_organization_is_refused(
+        self, service_app: object, repo: FakeUploadedFilesRepository
+    ) -> None:
+        """Unauthenticated call sites must fail closed rather than resolve someone's file."""
+        file_id = repo.seed(VICTIM_ORG_ID)
+
+        with pytest.raises(PermissionError):
+            await files_api.resolve_uploaded_file_id(file_id, None)
 
 
 class TestStorageGuard:
