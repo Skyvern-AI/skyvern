@@ -90,6 +90,13 @@ class _SessionFactory:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sessionmaker, name)
 
+    def current(self) -> AsyncSession | None:
+        entry = self._session_ctx.get()
+        current_task = asyncio.current_task()
+        if entry is None or current_task is None or entry.task is not current_task:
+            return None
+        return entry.session
+
     @asynccontextmanager
     async def bind_connection(self, connection: AsyncConnection) -> AsyncIterator[AsyncSession]:
         session = self._sessionmaker(bind=connection, join_transaction_mode="rollback_only")

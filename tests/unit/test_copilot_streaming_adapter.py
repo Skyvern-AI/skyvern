@@ -190,6 +190,71 @@ def _new_ctx() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
+async def test_tool_activity_entries_share_the_clock_read_of_their_sse_update() -> None:
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("c1", "update_workflow"),
+        _tool_output_event("c1"),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = _new_ctx()
+
+    await stream_to_sse(result, stream, ctx)
+
+    live_by_id = {
+        f"tc-{p.tool_call_id}" if p.type == WorkflowCopilotStreamMessageType.TOOL_CALL else f"tr-{p.tool_call_id}": p
+        for p in sent
+        if p.type in (WorkflowCopilotStreamMessageType.TOOL_CALL, WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    }
+    entries = ctx.narrator_state.design_activity
+    assert {e["id"] for e in entries} == {"tc-c1", "tr-c1"}
+    for entry in entries:
+        assert entry["timestamp"] == live_by_id[entry["id"]].timestamp.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_goal_satisfied_flush_entry_shares_the_clock_read_of_its_sse_update() -> None:
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+
+    narrator_state = NarratorState()
+    ctx = SimpleNamespace(
+        narrator_state=narrator_state,
+        in_flight_stream_tool_call=InFlightStreamToolCall(
+            call_id="c9", tool_name="update_workflow", iteration=2, display_label=None
+        ),
+        goal_satisfied_tool_name="update_workflow",
+        goal_satisfied_tool_output={"ok": True, "data": {"block_count": 1}},
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+    )
+
+    await flush_goal_satisfied_tool_result(stream, ctx)  # type: ignore[arg-type]
+
+    entry = narrator_state.design_activity[0]
+    live = next(p for p in sent if p.type == WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    assert entry["id"] == "tr-c9"
+    assert entry["timestamp"] == live.timestamp.isoformat()
+
+
+@pytest.mark.asyncio
 async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
     """SKY-8986 regression: a dropped SSE client must NOT cancel the agent run.
 
@@ -931,6 +996,7 @@ class TestCodeRepairProgressStreaming:
         narration_entries = [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"]
         assert len(narration_entries) == 1
         assert narration_entries[0]["text"] == _PROGRESS_TEXT
+        assert narration_entries[0]["timestamp"] == narrations[0].timestamp.isoformat()
         assert all(e["kind"] != "tool_result" for e in ctx.narrator_state.design_activity)
         # De-duplicated rejects still advance the narrator iteration (read by the run-outcome frame).
         assert ctx.narrator_state.current_iteration == 2

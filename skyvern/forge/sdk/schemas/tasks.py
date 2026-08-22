@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import status
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
@@ -147,6 +147,12 @@ class TaskBase(BaseModel):
 
 
 class TaskRequest(TaskBase):
+    task_type: Literal[TaskType.general, TaskType.validation, TaskType.action] | None = Field(
+        default=TaskType.general,
+        description="The type of the task",
+        examples=[TaskType.general, TaskType.validation, TaskType.action],
+    )
+
     url: str = Field(
         ...,
         description="Starting URL for the task.",

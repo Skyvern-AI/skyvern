@@ -213,6 +213,7 @@ from skyvern.services import (
     workflow_service,
 )
 from skyvern.services.pdf_import_service import pdf_import_service
+from skyvern.utils.organization_slug import is_org_slug_unique_violation
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
@@ -5458,6 +5459,12 @@ async def update_organization(
     org_update: OrganizationUpdate,
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Organization:
+    if "slug" in org_update.model_fields_set and org_update.slug is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Organization slug cannot be cleared.",
+        )
+
     if org_update.webhook_callback_url and org_update.webhook_callback_url != current_org.webhook_callback_url:
         org_update.webhook_callback_url = validate_webhook_url(org_update.webhook_callback_url)
 
@@ -5520,20 +5527,30 @@ async def update_organization(
                 detail=f"{field_name} must reference a valid custom LLM for this organization",
             )
 
-    updated = await app.DATABASE.organizations.update_organization(
-        current_org.organization_id,
-        max_steps_per_run=org_update.max_steps_per_run,
-        max_steps_per_workflow_run=org_update.max_steps_per_workflow_run,
-        clear_max_steps_per_workflow_run=org_update.clear_max_steps_per_workflow_run,
-        max_retries_per_step=org_update.max_retries_per_step,
-        webhook_callback_url=org_update.webhook_callback_url,
-        artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
-        clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
-        default_llm_key=org_update.default_llm_key,
-        clear_default_llm_key=org_update.clear_default_llm_key,
-        default_secondary_llm_key=org_update.default_secondary_llm_key,
-        clear_default_secondary_llm_key=org_update.clear_default_secondary_llm_key,
-    )
+    try:
+        updated = await app.DATABASE.organizations.update_organization(
+            current_org.organization_id,
+            slug=org_update.slug,
+            update_slug="slug" in org_update.model_fields_set,
+            max_steps_per_run=org_update.max_steps_per_run,
+            max_steps_per_workflow_run=org_update.max_steps_per_workflow_run,
+            clear_max_steps_per_workflow_run=org_update.clear_max_steps_per_workflow_run,
+            max_retries_per_step=org_update.max_retries_per_step,
+            webhook_callback_url=org_update.webhook_callback_url,
+            artifact_url_expiry_seconds=org_update.artifact_url_expiry_seconds,
+            clear_artifact_url_expiry_seconds=org_update.clear_artifact_url_expiry_seconds,
+            default_llm_key=org_update.default_llm_key,
+            clear_default_llm_key=org_update.clear_default_llm_key,
+            default_secondary_llm_key=org_update.default_secondary_llm_key,
+            clear_default_secondary_llm_key=org_update.clear_default_secondary_llm_key,
+        )
+    except IntegrityError as exc:
+        if "slug" not in org_update.model_fields_set or not is_org_slug_unique_violation(exc):
+            raise
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Organization slug is already in use.",
+        ) from exc
 
     org_auth_service.invalidate_cached_org(current_org.organization_id)
     return updated

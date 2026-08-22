@@ -192,9 +192,13 @@ class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
         )
 
 
-class InvalidWaitBlockTime(SkyvernException):
-    def __init__(self, max_sec: int) -> None:
-        super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")
+class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, wait_sec: int, max_sec: int) -> None:
+        super().__init__(
+            f"Invalid wait time {wait_sec} for wait block '{block_label}'. "
+            f"It must be a whole number of seconds between 1 and {max_sec}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
 
 
 class FailedToFormatJinjaStyleParameter(SkyvernException):

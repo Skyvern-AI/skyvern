@@ -450,6 +450,7 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
     return Organization(
         organization_id=org_model.organization_id,
         organization_name=org_model.organization_name,
+        slug=org_model.slug,
         webhook_callback_url=org_model.webhook_callback_url,
         max_steps_per_run=org_model.max_steps_per_run,
         max_steps_per_workflow_run=org_model.max_steps_per_workflow_run,

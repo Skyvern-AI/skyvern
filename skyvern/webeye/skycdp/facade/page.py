@@ -592,14 +592,11 @@ class Page:
         return self._network.take_document_response()
 
     async def reload(self, *, timeout: float | None = None, wait_until: str = "load") -> None:
-        # Page.reload keeps the URL, so wait_for_load_state cannot be trusted here: its readyState poll
-        # reads the pre-reload document -- still the frame's registered execution context and already
-        # "complete" -- and returns before the new document exists (the load-count-1->1 parity gap).
-        # The new document's execution context is only registered as the reload commits, so wait for
-        # the load event that fires *after* this reload's own main-frame commit; that load, unlike the
-        # poll, cannot be satisfied until the re-created document is in place.
+        # Page.reload keeps the URL, so readyState polling can observe the pre-reload document. Wait for
+        # this reload's own main-frame commit and its following load event instead.
         seconds = seconds_from_ms(timeout, DEFAULT_NAVIGATION_TIMEOUT_MS)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
         committed: asyncio.Future[None] = loop.create_future()
         loaded: asyncio.Future[None] = loop.create_future()
 
@@ -614,9 +611,12 @@ class Page:
         self.on("framenavigated", on_navigated)
         self._session.on("Page.loadEventFired", on_loaded)
         try:
-            await self._session.send("Page.reload", {})
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(loaded, seconds)
+            await self._session.send("Page.reload", {}, timeout=seconds)
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                await asyncio.wait_for(loaded, timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise CdpTimeoutError("reload did not commit and load a new main-frame document") from exc
         finally:
             self.remove_listener("framenavigated", on_navigated)
             self._session.off("Page.loadEventFired", on_loaded)

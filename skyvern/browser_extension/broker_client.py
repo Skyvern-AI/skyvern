@@ -158,7 +158,7 @@ class BrokerClient:
         if self.connected:
             return True
         result = await self._control_request(
-            "extension.wait_connected", {"timeout": min(max(timeout, 0.0), 35.0)}, timeout + 1
+            "extension.wait_connected", {"timeout": min(max(timeout, 0.0), 45.0)}, timeout + 1
         )
         connected = result.get("connected") is True
         if connected:
@@ -654,6 +654,11 @@ def _ensure_broker_process(port: int, paths: BrokerPaths) -> subprocess.Popen[by
 
         try:
             readiness = read_readiness(read_fd, timeout=STARTUP_TIMEOUT_SECONDS)
+            if readiness["status"] == "READY" and readiness["port"] != port:
+                raise BrowserExtensionBrokerError(
+                    "INVALID_READINESS",
+                    "Broker readiness response is invalid",
+                )
         except BrowserExtensionBrokerError as exc:
             _terminate_spawned_process(process)
             log_thread.join(timeout=1.0)

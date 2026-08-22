@@ -24,6 +24,7 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -41,8 +42,18 @@ from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, Out
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.taskv3.engine import MIN_ACTION_STEPS
 from skyvern.forge.taskv3.loop import LoopOutcome
-from skyvern.webeye.actions.actions import ActionStatus, ActionType
-from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from skyvern.webeye.actions.actions import (
+    ActionStatus,
+    ActionType,
+    ClickAction,
+    HoverAction,
+    InputTextAction,
+    KeypressAction,
+    SelectOptionAction,
+    SolveCaptchaAction,
+    UploadFileAction,
+)
+from tests.unit.helpers import make_action_row, make_browser_state, make_organization, make_step, make_task
 
 
 async def _run_execute_task_v3(
@@ -622,13 +633,13 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
 async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.MonkeyPatch) -> None:
     # wpid-scoped PostHog conditions need workflow_permanent_id in properties; non-workflow
     # tasks send the "not_workflow" sentinel (same convention as the workflow-block-engine flag).
-    reader = AsyncMock(return_value="OPENAI_GPT5_6_LUNA_HIGH")
+    reader = AsyncMock(return_value="FLAG_KEY")
     monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
 
     resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
-    assert resolved == "OPENAI_GPT5_6_LUNA_HIGH"
+    assert resolved == "FLAG_KEY"
     assert reader.call_args.kwargs["properties"] == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_123",
@@ -1971,18 +1982,60 @@ async def test_execute_task_v3_failed_run_carries_failure_category(
 async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Both populations get a fingerprint sampler: the failure-evidence gate needs one to run at all
+    # (SKY-14598). Only the completed-side settle deferral stays fenced to block tasks, and it is
+    # fenced by its own deferral budget rather than by starving the shared sampler.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     block = _make_block(NavigationBlock, navigation_goal="Open the panel")
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, task_block=block, data_extraction_goal=None, extracted_information_schema=None
     )
-    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
-    assert fingerprint is not None
+    assert loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert loop_mock.await_args.kwargs["max_settle_deferrals"] > 0
 
     _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
-    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is None
+    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert bare_loop_mock.await_args.kwargs["max_settle_deferrals"] == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_fingerprint_samples_the_pinned_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare task pins one page for the run, so its fingerprint must sample THAT page. Going through
+    # browser_state.get_working_page() would return the newest tab after any popup — sampling a page
+    # the model never acted on — and would repoint the working page as a side effect, which is a
+    # behaviour change to the live bare-task arm rather than the scoped one this gate intends.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.evaluate = AsyncMock(return_value="pinned-hash:100:10")
+    popup = MagicMock()
+    popup.is_closed = MagicMock(return_value=False)
+    popup.evaluate = AsyncMock(return_value="popup-hash:1:1")
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned],
+        get_working_page_side_effect=[popup, popup, popup],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    before = loop_mock.browser_state.get_working_page.await_count
+    assert await fingerprint() == "pinned-hash:100:10"
+    # The sampler probed the pinned page and never the popup, and did not consult (or repoint) the
+    # browser's working page to do it. Counting the delta rather than asserting never-awaited: the
+    # post-loop completion-veto gate legitimately calls get_working_page once, before this point.
+    popup.evaluate.assert_not_awaited()
+    assert loop_mock.browser_state.get_working_page.await_count == before
+
+    # A closed pinned page yields None rather than silently falling back to another tab.
+    pinned.is_closed = MagicMock(return_value=True)
+    assert await fingerprint() is None
 
 
 @pytest.mark.asyncio
@@ -2019,3 +2072,88 @@ async def test_execute_task_v3_page_fingerprint_peeks_without_recovery(
     loop_mock.browser_state.get_working_page = lost_page_peek
     assert await fingerprint() is None
     lost_page_peek.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_persists_typed_actions_that_hydrate_as_their_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A row carrying only a description fails typed-subclass validation on every read and falls back
+    # to base Action with a warning; the persisted action must carry the tool call's typed fields so
+    # hydrate_action returns the subclass its action_type names (SKY-14494).
+    from skyvern.forge import agent as agent_mod
+
+    rounds = [
+        [
+            ("click", {"selector": "#go"}, True),
+            ("hover", {"selector": "#menu"}, True),
+            ("type", {"selector": "#q", "text": "hello"}, True),
+            ("select_option", {"selector": "#plan", "label": "Pro"}, True),
+            ("select_combobox", {"selector": "#city", "value": "Lisbon"}, True),
+            ("press_key", {"key": "Enter"}, True),
+            ("file_upload", {"selector": "#cv", "file": "https://files.example/cv.pdf"}, True),
+            ("solve_captcha", {}, True),
+        ]
+    ]
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=rounds,
+        workflow_run_id="wr_v3test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    persisted = [c.kwargs["action"] for c in agent_mod.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [a.description for a in persisted[:2]] == ["task_v3 click #go", "task_v3 hover #menu"]
+    click, hover, typed, selected, combobox, keypress, upload, captcha = (
+        hydrate_action(make_action_row(action_type=a.action_type, element_id=a.element_id, action_json=a.model_dump()))
+        for a in persisted
+    )
+    assert isinstance(click, ClickAction) and click.element_id == "#go"
+    assert isinstance(hover, HoverAction) and hover.element_id == "#menu"
+    assert isinstance(typed, InputTextAction) and (typed.element_id, typed.text) == ("#q", "hello")
+    assert isinstance(selected, SelectOptionAction) and (selected.element_id, selected.option.label) == ("#plan", "Pro")
+    assert isinstance(combobox, SelectOptionAction) and (combobox.element_id, combobox.option.value) == (
+        "#city",
+        "Lisbon",
+    )
+    assert isinstance(keypress, KeypressAction) and keypress.keys == ["Enter"]
+    assert isinstance(upload, UploadFileAction) and (upload.element_id, upload.file_url) == (
+        "#cv",
+        "https://files.example/cv.pdf",
+    )
+    assert isinstance(captcha, SolveCaptchaAction)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed_code", ["482913", 482913, ["482913"]])
+async def test_execute_task_v3_redacts_registered_secrets_from_persisted_action_fields(
+    monkeypatch: pytest.MonkeyPatch, typed_code: str | int | list[str]
+) -> None:
+    # A verification code the model typed is a registered secret; persisting the typed field must
+    # scrub it under the same redaction gate the v3 path applies to extracted output - also when the
+    # model emits the code as a JSON number, since nothing coerces tool args to the declared schema.
+    from skyvern.forge import agent as agent_mod
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run", lambda *_a, **_k: {"482913"}
+    )
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["type"])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        action_rounds=[[("type", {"selector": "#otp", "text": typed_code}, True)]],
+        workflow_run_id="wr_v3test",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    persisted = agent_mod.app.DATABASE.workflow_params.create_action.await_args.kwargs["action"]
+    assert isinstance(persisted, InputTextAction)
+    assert persisted.element_id == "#otp"
+    assert "482913" not in persisted.model_dump_json()

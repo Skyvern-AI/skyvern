@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -73,8 +73,33 @@ _PAYLOAD_KEYS_THAT_WOULD_LEAK = {"args", "merged_args", "arguments", "mcp_args",
 _BROWSER_BOOT_SECONDS = 2.0
 _MCP_CALL_SECONDS = 3.0
 _AFTER_CALL_SECONDS = 5.0
+_AFTER_CALL_MS = 5000
 _WALL_MS = 5000
 _SESSION_ONLY_MS = 2000
+_MCP_CALL_MS = 3000
+_CONTEXT_ENTER_SECONDS = 4.0
+_CONTEXT_EXIT_SECONDS = 1.0
+_CONTEXT_ENTER_MS = 4000
+_CONTEXT_EXIT_MS = 1000
+_GAP_WALL_MS = 10000
+_AN_HOUR_SECONDS = 3600.0
+_AN_HOUR_MS = 3_600_000
+_PHASE_KEYS = (
+    "phase_session_prepare_ms",
+    "phase_context_enter_ms",
+    "phase_dispatch_ms",
+    "phase_context_exit_ms",
+    "phase_residual_ms",
+)
+
+
+def _assert_every_millisecond_is_attributed(record: dict[str, Any]) -> None:
+    """The residual is the remainder, so its bound is what proves the segments were charged correctly.
+
+    Summing the segments and the residual is an identity that holds for any values whatsoever.
+    """
+    assert sum(record[key] for key in _PHASE_KEYS) == record["wall_clock_ms"]
+    assert 0 <= record["phase_residual_ms"] < len(mcp_adapter._MCP_CALL_SEGMENTS)
 
 
 class _SharedLocalCache(LocalCache):
@@ -111,6 +136,28 @@ def _stub_browser_session(monkeypatch: pytest.MonkeyPatch, _fake_clock: list[flo
     yield
 
 
+def _install_timed_context(monkeypatch: pytest.MonkeyPatch, clock: list[float]) -> None:
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        clock[0] += _CONTEXT_ENTER_SECONDS
+        try:
+            yield
+        finally:
+            clock[0] += _CONTEXT_EXIT_SECONDS
+
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+
+
+def _browser_server(on_call: Callable[[], None]) -> SkyvernOverlayMCPServer:
+    return _make_server(
+        make_copilot_ctx(browser_session_id="pbs_1"),
+        {"ok": True},
+        SchemaOverlay(requires_browser=True),
+        alias_map=get_skyvern_mcp_alias_map(),
+        on_call=on_call,
+    )
+
+
 def _timing_records(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in captured if record.get("event") == _TIMING_EVENT]
 
@@ -135,12 +182,13 @@ def _server_whose_call_takes_time(
     clock: list[float],
     alias_map: dict[str, str] | None = None,
     is_error: bool = False,
+    browser_session_id: str | None = "pbs_1",
 ) -> SkyvernOverlayMCPServer:
     def _advance() -> None:
         clock[0] += _MCP_CALL_SECONDS
 
     return _make_server(
-        make_copilot_ctx(browser_session_id="pbs_1"),
+        make_copilot_ctx(browser_session_id=browser_session_id),
         payload,
         overlay,
         alias_map=alias_map,
@@ -199,10 +247,26 @@ class TestMCPToolTiming:
         records = _timing_records(captured)
         assert len(records) == 1
         assert records[0]["server_timing_ms"] is None
+        assert records[0]["server_attach_ms"] is None
         assert records[0]["tool_name"] == "skyvern_evaluate"
         assert records[0]["mcp_tool_name"] == "skyvern_evaluate"
         assert records[0]["call_path"] == "internal"
         assert records[0]["wall_clock_ms"] == _WALL_MS
+
+    @pytest.mark.asyncio
+    async def test_the_browser_attach_is_named_and_folded_back_into_the_server_span_once(
+        self, _fake_clock: list[float]
+    ) -> None:
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"attach": 300, "total": 515}}
+        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
+
+        with capture_logs() as captured:
+            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+
+        record = _timing_records(captured)[0]
+        assert record["server_attach_ms"] == 300
+        assert record["server_timing_ms"] == 815
+        assert record["phase_dispatch_untimed_ms"] == _MCP_CALL_MS - 815
 
     @pytest.mark.asyncio
     async def test_model_facing_call_logs_both_names_and_excludes_the_post_hook(self, _fake_clock: list[float]) -> None:
@@ -242,6 +306,7 @@ class TestMCPToolTiming:
         assert len(records) == 1
         assert records[0]["call_status"] == "timeout"
         assert records[0]["server_timing_ms"] is None
+        assert records[0]["timing_server_overrun"] is None
         assert records[0]["wall_clock_ms"] == _WALL_MS
 
     @pytest.mark.asyncio
@@ -291,6 +356,10 @@ class TestMCPToolTiming:
         assert records[0]["call_path"] == call_path
         assert records[0]["wall_clock_ms"] == _SESSION_ONLY_MS
         assert records[0]["server_timing_ms"] is None
+        assert records[0]["timing_phase"] == "session_prepare"
+        assert records[0]["phase_session_prepare_ms"] == _SESSION_ONLY_MS
+        assert records[0]["phase_dispatch_ms"] == 0
+        assert records[0]["phase_residual_ms"] >= 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
@@ -302,7 +371,9 @@ class TestMCPToolTiming:
             return {"ok": False, "error": "no browser session"}
 
         monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _session_error)
-        server = _server_whose_call_takes_time({"ok": True}, SchemaOverlay(requires_browser=True), _fake_clock)
+        server = _server_whose_call_takes_time(
+            {"ok": True}, SchemaOverlay(requires_browser=True), _fake_clock, browser_session_id=None
+        )
 
         with capture_logs() as captured:
             result = await _call(server, call_path)
@@ -369,6 +440,258 @@ class TestMCPToolTiming:
         assert records[0]["call_status"] == "not_connected"
         assert records[0]["call_path"] == "internal"
         assert records[0]["server_timing_ms"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_path", ["model", "internal"])
+    async def test_a_call_whose_wall_clock_dwarfs_the_server_total_names_where_the_time_went(
+        self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        _install_timed_context(monkeypatch, _fake_clock)
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(
+            payload, SchemaOverlay(requires_browser=True), _fake_clock, alias_map=get_skyvern_mcp_alias_map()
+        )
+
+        with capture_logs() as captured:
+            await _call(server, call_path)
+
+        record = _timing_records(captured)[0]
+        assert record["wall_clock_ms"] == _GAP_WALL_MS
+        assert record["server_timing_ms"] == 815
+        assert record["phase_session_prepare_ms"] == _SESSION_ONLY_MS
+        assert record["phase_context_enter_ms"] == _CONTEXT_ENTER_MS
+        assert record["phase_dispatch_ms"] == _MCP_CALL_MS
+        assert record["phase_context_exit_ms"] == _CONTEXT_EXIT_MS
+        assert record["phase_residual_ms"] == 0
+        assert record["timing_phase"] is None
+        _assert_every_millisecond_is_attributed(record)
+        assert record["phase_dispatch_untimed_ms"] == _MCP_CALL_MS - 815
+        assert record["timing_server_overrun"] is False
+        outside_the_server = sum(record[key] for key in _PHASE_KEYS if key != "phase_dispatch_ms")
+        assert outside_the_server + record["phase_dispatch_untimed_ms"] == _GAP_WALL_MS - 815
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_path", ["model", "internal"])
+    async def test_a_tool_that_answered_with_an_error_names_no_segment_as_the_one_it_died_in(
+        self, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        _install_timed_context(monkeypatch, _fake_clock)
+        payload = {"ok": False, "error": "the page said no", "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(
+            payload, SchemaOverlay(requires_browser=True), _fake_clock, alias_map=get_skyvern_mcp_alias_map()
+        )
+
+        with capture_logs() as captured:
+            await _call(server, call_path)
+
+        record = _timing_records(captured)[0]
+        assert record["call_status"] == "error"
+        assert record["timing_phase"] is None
+        assert record["post_call_evidence_drain_ms"] is None
+        _assert_every_millisecond_is_attributed(record)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("requires_browser", [False, True], ids=["no_browser", "browser"])
+    async def test_a_call_far_longer_than_any_plausible_ceiling_runs_to_completion(
+        self, requires_browser: bool, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        overlay = SchemaOverlay(requires_browser=requires_browser)
+        assert overlay.timeout is None
+        if requires_browser:
+            _install_timed_context(monkeypatch, _fake_clock)
+
+        dispatches = []
+
+        def _advance_an_hour() -> None:
+            dispatches.append(_fake_clock[0])
+            _fake_clock[0] += _AN_HOUR_SECONDS
+
+        server = _make_server(
+            make_copilot_ctx(browser_session_id="pbs_1"),
+            {"ok": True, "data": {"x": 1}},
+            overlay,
+            on_call=_advance_an_hour,
+        )
+
+        with capture_logs() as captured:
+            result = await server.call_tool("evaluate", {"expression": "scan()"})
+
+        assert isinstance(result, CallToolResult)
+        assert result.isError is not True
+        assert len(dispatches) == 1
+        assert json.loads(result.content[0].text)["data"] == {"x": 1}
+        record = _timing_records(captured)[0]
+        assert record["call_status"] == "ok"
+        assert record["phase_dispatch_ms"] == _AN_HOUR_MS
+        around_the_dispatch = _SESSION_ONLY_MS + _CONTEXT_ENTER_MS + _CONTEXT_EXIT_MS if requires_browser else 0
+        assert record["wall_clock_ms"] == _AN_HOUR_MS + around_the_dispatch
+        assert record["phase_residual_ms"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_path", ["model", "internal"])
+    @pytest.mark.parametrize("cancel_at", ["context_enter", "dispatch", "context_exit"])
+    async def test_a_cancelled_call_names_the_segment_that_was_in_flight(
+        self, cancel_at: str, call_path: str, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        @asynccontextmanager
+        async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+            _fake_clock[0] += _CONTEXT_ENTER_SECONDS
+            if cancel_at == "context_enter":
+                raise asyncio.CancelledError
+            try:
+                yield
+            finally:
+                _fake_clock[0] += _CONTEXT_EXIT_SECONDS
+                if cancel_at == "context_exit":
+                    raise asyncio.CancelledError
+
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+
+        def _advance() -> None:
+            _fake_clock[0] += _MCP_CALL_SECONDS
+            if cancel_at == "dispatch":
+                raise asyncio.CancelledError
+
+        server = _browser_server(_advance)
+
+        with capture_logs() as captured:
+            with pytest.raises(asyncio.CancelledError):
+                await _call(server, call_path)
+
+        record = _timing_records(captured)[0]
+        assert record["call_status"] == "cancelled"
+        assert record["call_path"] == call_path
+        assert record["timing_phase"] == cancel_at
+        assert record["server_timing_ms"] is None
+        assert record["phase_residual_ms"] >= 0
+        _assert_every_millisecond_is_attributed(record)
+        if cancel_at == "context_enter":
+            assert record["phase_dispatch_ms"] == 0
+            assert record["phase_context_exit_ms"] == 0
+        else:
+            assert record["phase_dispatch_ms"] == _MCP_CALL_MS
+            assert record["phase_context_exit_ms"] == _CONTEXT_EXIT_MS
+
+    @pytest.mark.asyncio
+    async def test_a_server_total_larger_than_the_dispatch_segment_is_not_subtracted(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        _install_timed_context(monkeypatch, _fake_clock)
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": _MCP_CALL_MS + 1}}
+        server = _server_whose_call_takes_time(
+            payload, SchemaOverlay(requires_browser=True), _fake_clock, alias_map=get_skyvern_mcp_alias_map()
+        )
+
+        with capture_logs() as captured:
+            await server.call_tool("evaluate", {"expression": "scan()"})
+
+        record = _timing_records(captured)[0]
+        assert record["phase_dispatch_untimed_ms"] is None
+        assert record["timing_server_overrun"] is True
+        _assert_every_millisecond_is_attributed(record)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failure", "call_status"),
+        [
+            (asyncio.CancelledError(), "cancelled"),
+            (CopilotBrowserSessionUnavailable("pbs_1"), "session_error"),
+            (RuntimeError("drain exploded"), "error"),
+        ],
+        ids=["cancelled", "session_error", "error"],
+    )
+    async def test_an_evidence_drain_that_fails_still_reports_the_budget_it_spent(
+        self,
+        failure: BaseException,
+        call_status: str,
+        monkeypatch: pytest.MonkeyPatch,
+        _fake_clock: list[float],
+    ) -> None:
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
+        server._evidence_candidate_origin = "https://public.test"
+        server._context_provider().browser_session_replacements = {"pbs_1": "pbs_replacement"}
+
+        async def _failing_drain() -> None:
+            _fake_clock[0] += _AFTER_CALL_SECONDS
+            raise failure
+
+        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _failing_drain)
+
+        with capture_logs() as captured:
+            if isinstance(failure, asyncio.CancelledError):
+                with pytest.raises(asyncio.CancelledError):
+                    await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+            else:
+                await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+
+        record = _timing_records(captured)[0]
+        assert record["call_status"] == call_status
+        assert record["wall_clock_ms"] == _WALL_MS
+        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
+        assert record["phase_residual_ms"] == 0
+        assert record["timing_phase"] == "evidence_drain"
+        _assert_every_millisecond_is_attributed(record)
+
+    @pytest.mark.asyncio
+    async def test_an_evidence_drain_that_succeeds_reports_what_the_caller_waited_for_it(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
+        server._evidence_candidate_origin = "https://public.test"
+
+        async def _slow_drain() -> None:
+            _fake_clock[0] += _AFTER_CALL_SECONDS
+
+        monkeypatch.setattr(server, "_drain_evidence_candidate_response_tasks", _slow_drain)
+
+        with capture_logs() as captured:
+            await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+
+        record = _timing_records(captured)[0]
+        assert record["call_status"] == "ok"
+        assert record["post_call_evidence_drain_ms"] == _AFTER_CALL_MS
+        assert record["wall_clock_ms"] == _WALL_MS
+        _assert_every_millisecond_is_attributed(record)
+
+    @pytest.mark.asyncio
+    async def test_a_timing_sink_that_fails_costs_the_record_and_not_the_tool_result(
+        self, monkeypatch: pytest.MonkeyPatch, _fake_clock: list[float]
+    ) -> None:
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
+        real_info = mcp_adapter.LOG.info
+
+        def _sink_down(event: str, **fields: Any) -> Any:
+            if event == "MCP tool timing":
+                raise RuntimeError("structlog sink unavailable")
+            return real_info(event, **fields)
+
+        monkeypatch.setattr(mcp_adapter.LOG, "info", _sink_down)
+
+        result = await server.call_internal_tool("skyvern_evaluate", {"expression": "scan()"})
+
+        assert result.get("data") == {"x": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_tool_that_needs_no_browser_spends_its_whole_wall_clock_dispatching(
+        self, _fake_clock: list[float]
+    ) -> None:
+        payload = {"ok": True, "data": {"x": 1}, "timing_ms": {"total": 815}}
+        server = _server_whose_call_takes_time(payload, SchemaOverlay(), _fake_clock)
+
+        with capture_logs() as captured:
+            await server.call_tool("evaluate", {"expression": "scan()"})
+
+        record = _timing_records(captured)[0]
+        assert record["wall_clock_ms"] == _MCP_CALL_MS
+        assert record["phase_dispatch_ms"] == _MCP_CALL_MS
+        assert record["phase_session_prepare_ms"] == 0
+        assert record["phase_context_enter_ms"] == 0
+        assert record["phase_context_exit_ms"] == 0
+        assert record["phase_residual_ms"] == 0
+        assert record["timing_phase"] is None
 
 
 class TestBrowserSessionContinuity:
@@ -647,22 +970,28 @@ class TestBrowserSessionContinuity:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("call_path", ["model", "internal"])
-    async def test_pre_dispatch_probe_uncertainty_does_not_claim_session_loss(
+    async def test_pre_dispatch_probe_uncertainty_dispatches_instead_of_claiming_loss(
         self, call_path: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_lost")
 
-        async def _undetermined(_ctx: AgentContext, **_kwargs: Any) -> dict[str, Any]:
+        async def _undetermined(_ctx: AgentContext, *, require_verified_session: bool = False) -> Any:
             await asyncio.sleep(0)
-            return {"ok": False, "error": "Could not verify the browser session; please retry"}
+            # Only a caller that demands verification is handed a verdict; everyone else is
+            # allowed through to attach and find out.
+            return {"ok": False, "error": "unverified"} if require_verified_session else None
+
+        @asynccontextmanager
+        async def _attached(_ctx: AgentContext) -> AsyncIterator[None]:
+            yield
 
         monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _undetermined)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _attached)
         server = _make_server(ctx, {"ok": True}, SchemaOverlay(requires_browser=True))
 
         with capture_logs() as logs:
-            result = await _call(server, call_path)
+            await _call(server, call_path)
 
-        assert "Could not verify the browser session" in _surfaced_error(result, call_path)
         assert ctx.blocker_signal is None
         assert ctx.browser_session_id == "pbs_lost"
         assert ctx.browser_session_replacements == {}
@@ -670,7 +999,7 @@ class TestBrowserSessionContinuity:
         assert continuity == []
         timing = _timing_records(logs)
         assert len(timing) == 1
-        assert timing[0]["call_status"] == "session_error"
+        assert timing[0]["call_status"] == "ok"
 
     @pytest.mark.asyncio
     async def test_reestablish_budget_expiry_terminalizes_session_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:

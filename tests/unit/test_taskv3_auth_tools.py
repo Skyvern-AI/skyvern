@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +14,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.taskv3 import auth_tools
 from skyvern.services import otp_service
 from skyvern.services.otp_service import OTPValue
@@ -183,6 +185,18 @@ def test_get_secret_values_for_run_standalone_task_uses_global_artifact_redactio
         skyvern_context.reset()
 
 
+def _credential_parameter(key: str) -> CredentialParameter:
+    now = datetime.now(timezone.utc)
+    return CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="w_test",
+        credential_id=f"cred_{key}",
+        created_at=now,
+        modified_at=now,
+    )
+
+
 def _workflow_run_context_with_totp_credentials() -> WorkflowRunContext:
     workflow_run_context = WorkflowRunContext(
         workflow_title="t",
@@ -195,6 +209,8 @@ def _workflow_run_context_with_totp_credentials() -> WorkflowRunContext:
     workflow_run_context.values["cred_2"] = {"totp": "totp_id_2"}
     workflow_run_context.secrets["totp_id_1_value"] = "SEED_ONE"
     workflow_run_context.secrets["totp_id_2_value"] = "SEED_TWO"
+    workflow_run_context.parameters["cred_1"] = _credential_parameter("cred_1")
+    workflow_run_context.parameters["cred_2"] = _credential_parameter("cred_2")
     return workflow_run_context
 
 

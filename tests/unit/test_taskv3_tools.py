@@ -6,7 +6,9 @@ operations (no task-ecosystem) with the right args, without a live browser.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import html
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -936,6 +938,205 @@ async def test_observe_reports_aria_pressed_state() -> None:
         assert by_sel["#toggle-no"].get("pressed") is True
 
 
+# (id, the selector observe must mint for it). Expected selectors are written out rather than
+# recomputed, so the test pins a format instead of mirroring the implementation's own escaping.
+# "-" is minted today as `#\\-`, which document.querySelectorAll accepts (so the in-page uniqueness
+# guard admits it) but Playwright's parser rejects, breaking every consume site.
+_ID_MATRIX_ESCAPED = [
+    ("1abc", '[id="1abc"]'),
+    ("9f2b1e7a-1c3d-4e5f-8a9b-0c1d2e3f4a5b", '[id="9f2b1e7a-1c3d-4e5f-8a9b-0c1d2e3f4a5b"]'),
+    ("42", '[id="42"]'),
+    ("-1abc", '[id="-1abc"]'),
+    ("-", '[id="-"]'),
+    ("a.b", '[id="a.b"]'),
+    ("a:b", '[id="a:b"]'),
+    ("form:panel:input", '[id="form:panel:input"]'),
+    ("a b", '[id="a b"]'),
+    ("a[0]", '[id="a[0]"]'),
+    ('a"b', '[id="a\\"b"]'),
+    ("a\\b", '[id="a\\\\b"]'),
+    # Playwright trims the selector string, and CSS.escape leaves everything above U+007F alone, so
+    # `#email<NBSP>` arrives as `#email` -- which selects the plain `email` element further down.
+    ("email\u00a0", '[id="email\u00a0"]'),
+    ("\u00a0", '[id="\u00a0"]'),
+    ("trailing ", '[id="trailing "]'),  # escaped by CSS.escape already; pins that branch, not the trim
+]
+# Ids that keep `#id`. Non-ASCII is not by itself a reason to change form -- accented and CJK ids
+# select fine -- so only whitespace at the ends disqualifies an id, and an interior one is harmless.
+_ID_MATRIX_PLAIN = [
+    ("email", "#email"),
+    ("first-name", "#first-name"),
+    ("_field1", "#_field1"),
+    ("--custom", "#--custom"),
+    ("caf\u00e9", "#caf\u00e9"),
+    ("\u767b\u5f55", "#\u767b\u5f55"),
+    ("a\u00a0b", "#a\u00a0b"),
+    ("\u00a0email", "#\u00a0email"),  # behind the `#`, so nothing trims it and the form still works
+]
+_ID_MATRIX = _ID_MATRIX_ESCAPED + _ID_MATRIX_PLAIN
+
+
+def _id_matrix_html() -> str:
+    rows = "".join(
+        f'<input type="text" id="{html.escape(v, quote=True)}" data-probe="{i}">' for i, (v, _) in enumerate(_ID_MATRIX)
+    )
+    return f"<!doctype html><html><body>{rows}</body></html>"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_mints_selectors_that_resolve_for_every_id_shape() -> None:
+    # Minted selectors are copied by the model into its own tool calls, so a selector that only
+    # looks well-formed is worthless: each one has to select its own element through the same query
+    # paths the tools use. A `#id` selector carrying an escape (`#\31 abc`) does not survive that
+    # trip -- drop the space terminating the hex escape and it addresses a different codepoint.
+    async with _content_page(_id_matrix_html()) as page:
+        by_probe = {e["i"]: e["selector"] for e in (await _observe_data(page))["elements"]}
+        assert len(by_probe) == len(_ID_MATRIX)
+        for i, (elem_id, _) in enumerate(_ID_MATRIX):
+            selector = by_probe[i]
+            if selector.startswith("#"):
+                assert "\\" not in selector, (elem_id, selector)
+            handle = await page.query_selector(selector)
+            assert handle is not None, (elem_id, selector)
+            assert await handle.get_attribute("data-probe") == str(i), (elem_id, selector)
+            # click/fill/press go through Playwright's own selector engine, not querySelector.
+            assert await page.locator(selector).count() == 1, (elem_id, selector)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_keeps_plain_id_selectors_unchanged() -> None:
+    # Negative control: ids that need no escaping keep the `#id` form byte for byte. Changing the
+    # selector format for ids that already work would be a far wider blast radius than the bug.
+    async with _content_page(_id_matrix_html()) as page:
+        by_probe = {e["i"]: e["selector"] for e in (await _observe_data(page))["elements"]}
+        for i, (elem_id, expected) in enumerate(_ID_MATRIX):
+            assert by_probe[i] == expected, (elem_id, by_probe[i])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_falls_back_to_a_marker_for_ids_holding_a_raw_line_break() -> None:
+    # A raw line break cannot appear in a CSS string, so these ids get no id selector and take the
+    # marker path. That is the intended trade, not an accident: the `#a\a b` form they used to get
+    # carries the same escape terminator this whole change exists to keep out of the transcript.
+    html_doc = (
+        '<!doctype html><html><body><input type="text" data-probe="0"><input type="text" data-probe="1"></body></html>'
+    )
+    async with _content_page(html_doc) as page:
+        await page.evaluate(
+            "() => document.querySelectorAll('input').forEach((el, i) => { el.id = 'a' + (i ? '\\r' : '\\n') + 'b'; })"
+        )
+        for element in (await _observe_data(page))["elements"]:
+            assert element["selector"].startswith("[data-tv3="), element
+            assert await page.locator(element["selector"]).count() == 1, element
+
+
+# A form exposes its named controls as its own properties, so <input name="X"> inside a form makes
+# form.X that input rather than whatever it normally is. Every one of these is read while building
+# an element record, and the read happens inside page.evaluate.
+_CLOBBERABLE = ["id", "name", "tagName", "getAttribute", "getBoundingClientRect", "innerText", "closest"]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize("clobbered", _CLOBBERABLE)
+@pytest.mark.asyncio
+async def test_observe_survives_a_form_that_clobbers_a_property_it_reads(clobbered: str) -> None:
+    # One such element used to throw out of page.evaluate and take the whole element list with it,
+    # so the agent lost perception entirely -- and on static markup it never got it back.
+    html_doc = (
+        "<!doctype html><html><body>"
+        f'<form role="button" id="real"><input name="{clobbered}" data-probe="0"><span>x</span></form>'
+        '<input id="other" data-probe="1">'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        elements = (await _observe_data(page))["elements"]
+        assert any(e["selector"] == "#other" for e in elements), elements
+        for element in elements:
+            assert await page.locator(element["selector"]).count() == 1, element
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_markers_are_not_collided_by_a_marker_the_page_already_carries() -> None:
+    # Uniqueness alone let a page pre-seed the marker the counter was about to mint, giving two
+    # elements the same selector. Playwright's page-level click takes the first match, so the agent
+    # would act on the wrong control with nothing to indicate it.
+    html_doc = (
+        "<!doctype html><html><body>"
+        '<div role="button" data-tv3="t0" data-probe="0">A</div>'
+        '<div role="button" data-probe="1">B</div>'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        elements = (await _observe_data(page))["elements"]
+        selectors = [e["selector"] for e in elements]
+        assert len(set(selectors)) == len(selectors), selectors
+        for element in elements:
+            handle = await page.query_selector(element["selector"])
+            assert await handle.get_attribute("data-probe") == str(element["i"]), element
+
+
+# Each stops `window.__tv3_next++` from making progress while still looking like a plain integer.
+_FROZEN_COUNTERS = [
+    "window.__tv3_next = 1e21",
+    "window.__tv3_next = 9007199254740992",
+    "Object.defineProperty(window, '__tv3_next', {value: 0, writable: false})",
+]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize("tamper", _FROZEN_COUNTERS)
+@pytest.mark.asyncio
+async def test_observe_still_mints_distinct_markers_when_the_counter_cannot_advance(tamper: str) -> None:
+    # Searching for a free marker used to loop until it found one, so a counter that cannot advance
+    # spun the renderer's main thread forever -- not just failing this observe but killing the page
+    # for the rest of the run, since nothing else on it can run again either.
+    async with _content_page(
+        '<!doctype html><html><body><div role="button">A</div><div role="button">B</div></body></html>'
+    ) as page:
+        await page.evaluate(f"() => {{ {tamper}; }}")
+        selectors = [e["selector"] for e in (await asyncio.wait_for(_observe_data(page), timeout=10))["elements"]]
+        assert len(selectors) == 2, selectors
+        assert len(set(selectors)) == 2, selectors
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_still_sees_elements_when_the_page_removes_css_escape() -> None:
+    # CSS.escape is page-removable and sits on the path of every element carrying an id, so losing
+    # it emptied the whole element list -- and an empty list reads as "this page has no controls"
+    # rather than as a failure. It costs the `#id` shorthand now, not the elements.
+    async with _content_page('<!doctype html><html><body><input id="9start"><input id="a b"></body></html>') as page:
+        await page.evaluate("() => { window.CSS = null; }")
+        data = await _observe_data(page)
+        assert [e["selector"] for e in data["elements"]] == ['[id="9start"]', '[id="a b"]']
+        assert not data.get("dropped")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_selectors_cannot_be_aimed_at_another_element_by_page_markup() -> None:
+    # An unescaped quote in a page-controlled attribute closes the selector and continues it as a
+    # selector list, which still matches exactly one element -- so the uniqueness guard passes and
+    # the agent is handed a selector for the element the page chose.
+    breakout = 'x"] , [id="victim'
+    html_doc = (
+        "<!doctype html><html><body>"
+        f'<input data-testid="{html.escape(breakout, quote=True)}" data-probe="0">'
+        f'<textarea name="{html.escape(breakout, quote=True)}" data-probe="1"></textarea>'
+        '<input id="victim" data-probe="2">'
+        "</body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        for element in (await _observe_data(page))["elements"]:
+            handle = await page.query_selector(element["selector"])
+            assert handle is not None, element
+            assert await handle.get_attribute("data-probe") == str(element["i"]), element
+
+
 @pytest.mark.asyncio
 async def test_observe_renders_text_digest_and_pressed_state() -> None:
     class _DigestPage(_FakePage):
@@ -1445,3 +1646,679 @@ async def test_download_signal_survives_compaction_end_to_end_through_loop(tmp_p
     elided = [m for m in observe_msgs if m["content"].startswith("[superseded ")]
     assert len(elided) >= 1  # compaction actually ran on an earlier observe
     assert any("Downloaded: report.pdf" in m["content"] for m in observe_msgs)  # notice survives on a live message
+
+
+# --- Commit-verified click-open dropdown selection. The staging specimen: a click-open
+# filter popover that toggles open/closed on trigger clicks and REMOUNTS its option nodes each open,
+# so ids from a prior observe go stale and every toggle click returns an uninformative ok. The click
+# tool must (1) report a menu it opened WITH stable in-DOM option tags, (2) verify an option click
+# committed (menu closed / navigation / option state change) and error loudly when it did not, and
+# (3) turn vanished-element timeouts into honest "re-observe" errors. Plain clicks stay byte-identical. ---
+
+
+class _ClickFakePage:
+    """Fake page for the click reaction-probe control flow. `evaluate` dispatches on distinctive
+    substrings of the real JS constants (mirroring _TypeaheadFakePage): 'return !!' => the
+    selector-exists probe, 'menuOpen' => the pre-click check, 'stillOpen' => the menu-state read
+    (consumed in call order from `after_states`, last one repeating — the handler reads it after
+    hover, after click, and after the settle), 'clickable' => the new-menu finder."""
+
+    def __init__(
+        self,
+        *,
+        exists: bool = True,
+        menu_open: bool = False,
+        is_option: bool = False,
+        opt_text: str = "",
+        opt_state: str = "",
+        after_states: list[dict[str, Any]] | None = None,
+        found_menu: dict[str, Any] | None = None,
+        probe_raises: bool = False,
+        find_raises: bool = False,
+        click_raises: Exception | None = None,
+    ) -> None:
+        self.url = "https://example.test/results"
+        self.calls: list[tuple[str, Any]] = []
+        self._exists = exists
+        self._menu_open = menu_open
+        self._is_option = is_option
+        self._opt_text = opt_text
+        self._opt_state = opt_state
+        self._after_states = after_states or [{"stillOpen": 0, "optState": ""}]
+        self._after_i = 0
+        self._found_menu = found_menu
+        self._probe_raises = probe_raises
+        self._find_raises = find_raises
+        self._click_raises = click_raises
+
+    async def evaluate(self, js: str, arg: Any = None) -> Any:
+        if "return !!" in js:
+            return self._exists
+        if self._probe_raises:
+            raise RuntimeError("probe boom")
+        if "menuOpen" in js:
+            return {
+                "menuOpen": self._menu_open,
+                "isOption": self._is_option,
+                "optText": self._opt_text,
+                "optState": self._opt_state,
+            }
+        if "stillOpen" in js:
+            state = self._after_states[min(self._after_i, len(self._after_states) - 1)]
+            self._after_i += 1
+            return state
+        if "clickable" in js:
+            if self._find_raises:
+                raise RuntimeError("finder boom")
+            return self._found_menu
+        return None
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        self.calls.append(("click", selector))
+        if self._click_raises is not None:
+            raise self._click_raises
+
+    async def hover(self, selector: str, timeout: int | None = None) -> None:
+        self.calls.append(("hover", selector))
+
+    async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
+        self.calls.append(("wait_for_selector", (selector, timeout)))
+        if not self._exists:
+            raise TimeoutError(f"waiting for {selector}")
+
+
+@pytest.mark.asyncio
+async def test_click_plain_result_format_unchanged() -> None:
+    # Constraint: a click that is not a dropdown interaction gains nothing — the result is
+    # byte-identical to the pre-feature format (no notes, no errors, no latency-adding retries).
+    page = _ClickFakePage()
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#save"})
+    assert r.status == "ok"
+    assert r.content == "clicked #save — now at https://example.test/results"
+
+
+@pytest.mark.asyncio
+async def test_click_probe_failure_falls_back_to_bare_ok() -> None:
+    # Any reaction-probe failure must degrade to today's behavior, never fail the click.
+    page = _ClickFakePage(probe_raises=True)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#save"})
+    assert r.status == "ok"
+    assert r.content == "clicked #save — now at https://example.test/results"
+    assert ("click", "#save") in page.calls
+
+
+@pytest.mark.asyncio
+async def test_click_reports_opened_menu_with_stable_tags() -> None:
+    page = _ClickFakePage(
+        found_menu={
+            "count": 7,
+            "options": [
+                {"n": 1, "text": "Relevance"},
+                {"n": 2, "text": "Most recent"},
+                {"n": 3, "text": "Most popular"},
+                {"n": 4, "text": "Highest rated"},
+                {"n": 5, "text": "Nearest"},
+                {"n": 6, "text": "Price low to high"},
+                {"n": 7, "text": "Price high to low"},
+            ],
+        }
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t82"]'})
+    assert r.status == "ok"
+    assert "opened a menu of 7 options" in r.content
+    assert '[data-tv3-menu="1"]' in r.content and "Relevance" in r.content
+    assert "Most popular" in r.content
+    # the model is told the options are volatile: re-clicking the trigger destroys them
+    assert "closes the menu" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_menu_listing_is_bounded_with_overflow_note() -> None:
+    # Click results are billable and NOT compactable — they live in the transcript forever, so a
+    # 40-option menu must not inflate a permanent transcript entry.
+    options = [{"n": i, "text": f"Option number {i}"} for i in range(1, 16)]
+    page = _ClickFakePage(found_menu={"count": 40, "options": options})
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#filters"})
+    assert r.status == "ok"
+    assert "opened a menu of 40 options" in r.content
+    assert "Option number 15" in r.content
+    assert "Option number 16" not in r.content
+    assert "+25 more" in r.content and "re-observe" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_commit_verified_by_menu_close() -> None:
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}, {"stillOpen": 0, "optState": ""}],
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "ok"
+    assert "Selected option 'Most popular'" in r.content
+    assert "menu closed" in r.content
+    # commit judged against the POST-hover baseline: the handler hovered before clicking
+    assert ("hover", '[data-tv3-menu="3"]') in page.calls
+
+
+@pytest.mark.asyncio
+async def test_click_option_no_commit_errors_loud(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The click-open-family contract: an option click whose selection did not commit (menu still open
+    # even after the settle, option state unchanged, no navigation, no submenu) must error loudly —
+    # never a bare ok that fuels a 21-click loop.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}],
+        found_menu=None,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "error"
+    assert "did not commit" in r.content
+    assert "Most popular" in r.content
+    assert "Do not repeat" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_commit_after_async_close_settles_not_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A healthy commit that closes the menu via a fade or an async server ack must not read as
+    # "did not commit" off the instantaneous probe — the settle re-probe accepts the late close.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[
+            {"stillOpen": 7, "optState": "s0"},  # post-hover baseline
+            {"stillOpen": 7, "optState": "s0"},  # instant read: close animation still running
+            {"stillOpen": 0, "optState": ""},  # settled: closed
+        ],
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "ok"
+    assert "Selected option 'Most popular'" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_hover_highlight_is_not_commit_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Playwright's click hovers first, and menus restyle rows on hover. The pre-click fingerprint
+    # ('s0') differs from the hovered one ('hl') — commit must be judged against the POST-hover
+    # baseline, so an otherwise no-op click still errors instead of claiming "its state changed".
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Banana",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "hl"}],
+        found_menu=None,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="1"]'})
+    assert r.status == "error"
+    assert "did not commit" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_no_commit_error_survives_submenu_probe_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Once no-commit evidence is established, a crash of the final informational submenu probe must
+    # not fall through to the fail-open bare ok — that would be a silent ok on the exact case the
+    # feature exists to make loud.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}],
+        find_raises=True,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "error"
+    assert "did not commit" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_multiselect_option_state_change_is_commit() -> None:
+    # Filter menus are disproportionately multi-select: a successful pick leaves the menu OPEN and
+    # marks the option (checkmark/aria-checked/class flip). That state change IS commit evidence —
+    # erroring here would fire exactly where the feature is aimed.
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="In stock",
+        opt_state="aria-checked=false",
+        after_states=[
+            {"stillOpen": 7, "optState": "aria-checked=false"},  # post-hover baseline
+            {"stillOpen": 7, "optState": "aria-checked=true"},  # post-click: marked
+        ],
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="2"]'})
+    assert r.status == "ok"
+    assert "Selected option 'In stock'" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_opening_submenu_is_not_a_false_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An option click that spawns a child menu (cascading filter, date-picker) commits nothing yet
+    # but is NOT a failure — report the submenu's options instead of a false "did not commit".
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="More filters",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}],
+        found_menu={
+            "count": 3,
+            "options": [{"n": 1, "text": "Colour"}, {"n": 2, "text": "Size"}, {"n": 3, "text": "Brand"}],
+        },
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="5"]'})
+    assert r.status == "ok"
+    assert "opened a menu of 3 options" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_trigger_reclick_reports_menu_closed_no_selection() -> None:
+    # The staging loop's core move: re-clicking the trigger toggles the menu closed. That must be
+    # named — 17 byte-identical bare oks are what kept the model looping.
+    page = _ClickFakePage(
+        menu_open=True, is_option=False, after_states=[{"stillOpen": 0, "optState": ""}], found_menu=None
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t82"]'})
+    assert r.status == "ok"
+    assert "CLOSED the open menu" in r.content
+    assert "no option was selected" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_stale_marker_fast_fails_without_15s_wait() -> None:
+    # A [data-tv3=...] marker is minted only by our own enrichment: if it matches nothing now, it can
+    # never appear without a re-observe — waiting Playwright's full 15s (4x in the staging trace) is
+    # pure loss. Fail fast and loud, and never dispatch the doomed click.
+    page = _ClickFakePage(exists=False)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t157"]'})
+    assert r.status == "error"
+    assert "no longer exists" in r.content
+    assert "e-observe" in r.content
+    assert not any(c[0] == "click" for c in page.calls)
+    # the short attach grace was attempted (re-attach tolerance), not a bare instant fail
+    waited = [c for c in page.calls if c[0] == "wait_for_selector"]
+    assert waited and waited[0][1][1] is not None and waited[0][1][1] <= 2000
+
+
+@pytest.mark.asyncio
+async def test_click_timeout_on_vanished_element_reports_removal() -> None:
+    # Non-marker selector: the click itself timed out AND the element is gone — say so, instead of
+    # surfacing a generic Playwright timeout the model cannot act on.
+    page = _ClickFakePage(exists=False, click_raises=TimeoutError("Page.click: Timeout 15000ms exceeded"))
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": "#opt-old"})
+    assert r.status == "error"
+    assert "no longer exists" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_timeout_on_live_element_reraises_original() -> None:
+    # The element exists but was not actionable (covered/detached mid-render): that is a genuine
+    # timeout — keep today's behavior (the loop converts the raised error), no reinterpretation.
+    class _Boom(Exception):
+        pass
+
+    page = _ClickFakePage(exists=True, click_raises=_Boom("not actionable"))
+    tools = build_browser_tools(_fixed_page_provider(page))
+    with pytest.raises(_Boom):
+        await _tool(tools, "click").handler({"selector": "#covered"})
+
+
+# --- DOM-level tests: the REAL precheck/finder/after JS against live Chromium, on a faithful mimic
+# of the staging widget (conditional-render popover, option nodes REMOUNTED on every toggle). ---
+
+_MENU_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div style="height:40px">Results header</div>
+  <button id="sort-trigger" style="position:absolute;top:50px;left:600px;height:30px">Sort: Relevance</button>
+  <div id="results" style="position:absolute;top:120px;left:40px;width:500px">
+    <a href="#r1" style="display:block;height:40px">First result row</a>
+    <a href="#r2" style="display:block;height:40px">Second result row</a>
+  </div>
+  <div id="pager" style="position:absolute;top:220px;left:40px"><button id="next-page">Next</button></div>
+  <script>
+    window.__commits = 0;
+    const OPTS = ['Relevance','Most recent','Most popular','Highest rated','Nearest','Price low to high','Price high to low'];
+    document.getElementById('sort-trigger').addEventListener('click', () => {
+      const ex = document.getElementById('sort-menu');
+      if (ex) { ex.remove(); return; }
+      const card = document.createElement('div');
+      card.id = 'sort-menu';
+      card.setAttribute('style', 'position:absolute;top:82px;left:600px;width:180px;background:#fff;border:1px solid #ccc');
+      for (const t of OPTS) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = t;
+        b.setAttribute('style', 'display:block;width:100%;height:28px;text-align:left');
+        if (window.__checkboxSelect) {
+          const cb = document.createElement('input');
+          cb.type = 'checkbox'; cb.setAttribute('style', 'pointer-events:none');
+          b.prepend(cb);
+        }
+        b.addEventListener('mouseenter', () => { b.className = 'hl'; });
+        b.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (window.__noCommit) return;
+          if (window.__checkboxSelect) {
+            const cb = b.querySelector('input');
+            cb.checked = !cb.checked;
+            window.__commits++;
+            return;
+          }
+          if (window.__multiSelect) {
+            b.setAttribute('aria-checked', b.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+            window.__commits++;
+            return;
+          }
+          document.getElementById('sort-trigger').textContent = 'Sort: ' + t;
+          window.__commits++;
+          if (window.__asyncClose) { setTimeout(() => card.remove(), 300); } else { card.remove(); }
+        });
+        card.appendChild(b);
+      }
+      document.body.appendChild(card);
+    });
+    document.getElementById('next-page').addEventListener('click', () => {
+      const res = document.getElementById('results');
+      res.innerHTML = '';
+      for (const t of ['Third result row', 'Fourth result row']) {
+        const a = document.createElement('a');
+        a.href = '#more'; a.textContent = t;
+        a.setAttribute('style', 'display:block;height:40px;cursor:pointer');
+        res.appendChild(a);
+      }
+    });
+  </script>
+</body></html>
+"""
+
+
+@contextlib.asynccontextmanager
+async def _menu_page() -> AsyncIterator[Any]:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+            await page.set_content(_MENU_FIXTURE_HTML)
+            yield page
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_click_trigger_reports_menu_and_option_click_commits_in_two_actions() -> None:
+    # The staging shape, green contract: commit achieved within 2 clicks — never 21.
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert r1.status == "ok"
+        assert "opened a menu of 7 options" in r1.content
+        assert '[data-tv3-menu="3"]' in r1.content and "Most popular" in r1.content
+        r2 = await click.handler({"selector": '[data-tv3-menu="3"]'})
+        assert r2.status == "ok"
+        assert "Selected option 'Most popular'" in r2.content
+        label = await page.eval_on_selector("#sort-trigger", "e => e.textContent")
+        assert label == "Sort: Most popular"
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_trigger_reclick_names_the_toggle_close() -> None:
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert "opened a menu of 7 options" in r1.content
+        r2 = await click.handler({"selector": "#sort-trigger"})
+        assert r2.status == "ok"
+        assert "CLOSED the open menu" in r2.content
+        assert await page.evaluate("() => window.__commits") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_option_click_that_never_commits_errors_loud() -> None:
+    # The no-commit variant of the widget (click lands, nothing changes): loud error, not a bare ok.
+    async with _menu_page() as page:
+        await page.evaluate("() => { window.__noCommit = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert "opened a menu of 7 options" in r1.content
+        r2 = await click.handler({"selector": '[data-tv3-menu="3"]'})
+        assert r2.status == "error"
+        assert "did not commit" in r2.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_multiselect_option_commits_by_state_change() -> None:
+    async with _menu_page() as page:
+        await page.evaluate("() => { window.__multiSelect = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#sort-trigger"})
+        r2 = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert r2.status == "ok"
+        assert "Selected option 'Most recent'" in r2.content
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_multiselect_option_commits_by_child_checkbox_property() -> None:
+    # A multi-select whose commit is ONLY a child checkbox's .checked DOM property (no aria, class,
+    # or text change) must read as committed — not return a false "did not commit" error.
+    async with _menu_page() as page:
+        await page.evaluate("() => { window.__checkboxSelect = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert "opened a menu of 7 options" in r1.content
+        r2 = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert r2.status == "ok"
+        assert "Selected option" in r2.content and "Most recent" in r2.content
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_self_mutating_row_text_is_not_commit_evidence() -> None:
+    # A row whose text updates on its own (countdown, live price) changes the state fingerprint
+    # without any commit; a no-op click on it must error loud, not read as "its state changed".
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert "opened a menu of 7 options" in r1.content
+        await page.evaluate(
+            "() => { window.__noCommit = 1; const row = document.querySelector('[data-tv3-menu=\"1\"]');"
+            " let n = 0; setInterval(() => { row.textContent = 'Trending ' + n++; }, 80); }"
+        )
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r2.status == "error"
+        assert "did not commit" in r2.content
+        assert await page.evaluate("() => window.__commits") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_stale_menu_marker_click_fails_fast_and_loud() -> None:
+    # Menu-row tags die when the popover remounts — a click on a stale [data-tv3-menu] id (the
+    # staging trace's 4x-timeout move) must fail fast like a stale [data-tv3] marker, not eat 15s.
+    import time  # noqa: PLC0415
+
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        r1 = await click.handler({"selector": "#sort-trigger"})
+        assert "opened a menu of 7 options" in r1.content
+        r2 = await click.handler({"selector": "#sort-trigger"})
+        assert "CLOSED the open menu" in r2.content
+        start = time.monotonic()
+        r3 = await click.handler({"selector": '[data-tv3-menu="3"]'})
+        elapsed = time.monotonic() - start
+        assert r3.status == "error"
+        assert "no longer exists" in r3.content
+        assert elapsed < 5.0  # not Playwright's 15s actionability wait
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_stale_marker_click_fails_fast_and_loud() -> None:
+    import time  # noqa: PLC0415
+
+    async with _menu_page() as page:
+        await page.evaluate(
+            "() => { const b = document.createElement('button'); b.setAttribute('data-tv3', 't9');"
+            " b.textContent = 'ephemeral'; document.body.appendChild(b); b.remove(); }"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "click").handler({"selector": '[data-tv3="t9"]'})
+        elapsed = time.monotonic() - start
+        assert r.status == "error"
+        assert "no longer exists" in r.content
+        assert elapsed < 5.0  # not Playwright's 15s actionability wait
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selector",
+    ["#plain-btn", "#nav-link", "#the-checkbox", "#submit-btn", "#next-page"],
+    ids=["plain-button", "nav-link", "checkbox", "submit", "pagination"],
+)
+async def test_dom_fp_matrix_plain_interactions_pass_through_untouched(selector: str) -> None:
+    # The FP matrix from the brief: none of these are dropdown interactions; each must produce the
+    # exact bare pre-feature result — no menu notes, no errors. Pagination is the sharp case: it
+    # swaps rows inside a PRE-EXISTING visible container, which must not read as a menu opening.
+    extra = """
+      <button id="plain-btn" style="position:absolute;top:300px;left:40px">Save draft</button>
+      <a id="nav-link" href="#section-2" style="position:absolute;top:340px;left:40px;display:block">Jump to section</a>
+      <input id="the-checkbox" type="checkbox" style="position:absolute;top:380px;left:40px">
+      <form action="#done" style="position:absolute;top:420px;left:40px"><button id="submit-btn" type="submit">Submit</button></form>
+    """
+    async with _menu_page() as page:
+        await page.evaluate(
+            "(html) => { const d = document.createElement('div'); d.innerHTML = html; document.body.appendChild(d); }",
+            extra,
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": selector})
+        assert r.status == "ok"
+        assert r.content == f"clicked {selector} — now at {page.url}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_async_close_commit_is_not_a_false_error() -> None:
+    # A menu that closes 300ms after the option click (server-ack pattern) is a healthy commit; the
+    # settle re-probe must accept it instead of erroring off the instantaneous read.
+    async with _menu_page() as page:
+        await page.evaluate("() => { window.__asyncClose = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#sort-trigger"})
+        r2 = await click.handler({"selector": '[data-tv3-menu="3"]'})
+        assert r2.status == "ok"
+        assert "Selected option 'Most popular'" in r2.content
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_clicking_menu_container_is_not_an_option_pick() -> None:
+    # Clicking the card AROUND the menu is not picking an option — fabricating "Selected option"
+    # for it would tell the model a selection happened when none did.
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#sort-trigger"})
+        r2 = await click.handler({"selector": "#sort-menu"})
+        # The center-point click lands on an arbitrary row (a real Playwright behavior), so any
+        # selected/closed claim could be false — the contract is NO claims at all.
+        assert r2.status == "ok"
+        assert r2.content == f"clicked #sort-menu — now at {page.url}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_confirm_dialog_is_not_reported_as_menu() -> None:
+    # A confirm dialog is a page mode, not a menu: its title/body are not clickable "options", and
+    # its horizontal button pair must not be either. The bare pre-feature ok is the contract.
+    async with _menu_page() as page:
+        await page.evaluate(
+            """() => {
+              const d = document.createElement('div');
+              d.innerHTML = '<button id="del-btn" style="position:absolute;top:300px;left:40px">Delete</button>';
+              document.body.appendChild(d);
+              document.getElementById('del-btn').addEventListener('click', () => {
+                const m = document.createElement('div');
+                m.id = 'confirm-modal';
+                m.setAttribute('role', 'dialog');
+                m.setAttribute('style', 'position:absolute;top:280px;left:60px;width:280px;background:#fff;border:1px solid #333;padding:8px');
+                m.innerHTML = '<h2 style="height:24px;margin:0">Delete this item?</h2>'
+                  + '<p style="height:20px;margin:4px 0">This cannot be undone.</p>'
+                  + '<div><button style="width:100px">Cancel</button><button style="width:100px">Confirm</button></div>';
+                document.body.appendChild(m);
+              });
+            }"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#del-btn"})
+        assert r.status == "ok"
+        assert r.content == f"clicked #del-btn — now at {page.url}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_get_html_strips_reaction_bookkeeping_attrs() -> None:
+    # The reaction gate stamps data-tv3-pre on every visible element per click; leaking it into
+    # get_html would burn ~a third of the 20k truncation budget on noise.
+    async with _menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "click").handler({"selector": "#sort-trigger"})
+        html = await _tool(tools, "get_html").handler({})
+        assert "data-tv3-pre" not in html.content

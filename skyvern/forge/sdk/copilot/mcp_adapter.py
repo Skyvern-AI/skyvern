@@ -55,6 +55,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_state import BrowserState
 
 if TYPE_CHECKING:
@@ -115,6 +116,9 @@ class SchemaOverlay:
     """Schema overlay for MCP tools — hides params, renames args, injects forced values."""
 
     description: str | None = None
+    # Appended to the tool's own description instead of replacing it, for a fact the copilot
+    # owns (a policy-dependent restriction) on a tool whose documentation it does not own.
+    description_suffix: str | None = None
     hide_params: frozenset[str] = frozenset()
     required_overrides: list[str] | None = None
     arg_transforms: dict[str, str] = field(default_factory=dict)
@@ -321,32 +325,106 @@ def _scrub_tool_exception(ctx: AgentContext, tool_name: str, exception: BaseExce
     return _scrub_tool_result(ctx, {"ok": False, "error": error})
 
 
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
+_MCPCallPhase = Literal["session_prepare", "context_enter", "dispatch", "evidence_drain", "context_exit"]
+# The segments charged to the wall clock. ``evidence_drain`` names where a call died but is never
+# charged here, so the residual stays the remainder of what the record actually reports.
+_MCP_CALL_SEGMENTS: tuple[_MCPCallPhase, ...] = ("session_prepare", "context_enter", "dispatch", "context_exit")
+
+
+class _PhaseClock:
+    """Segments one MCP call's wall clock. Per-segment flooring keeps the residual non-negative."""
+
+    def __init__(self) -> None:
+        self._started = time.monotonic()
+        self._mark = self._started
+        self._bucket: _MCPCallPhase | None = None
+        self._wall: int | None = None
+        self.current: _MCPCallPhase | None = None
+        self.elapsed: dict[_MCPCallPhase, int] = {}
+        self.drain_ms: int | None = None
+
+    def _charge(self, now: float) -> None:
+        if self._bucket is not None:
+            self.elapsed[self._bucket] = self.elapsed.get(self._bucket, 0) + int((now - self._mark) * 1000)
+        self._mark = now
+
+    def enter(self, phase: _MCPCallPhase) -> None:
+        self._charge(time.monotonic())
+        self._bucket = phase
+        self.current = phase
+
+    def unwind(self) -> None:
+        """Charge the teardown to ``context_exit`` while ``current`` keeps naming the segment that failed."""
+        self._charge(time.monotonic())
+        self._bucket = "context_exit"
+
+    def close(self) -> int:
+        if self._wall is None:
+            now = time.monotonic()
+            self._charge(now)
+            self._bucket = None
+            self._wall = int((now - self._started) * 1000)
+        return self._wall
+
+    def record_drain(self, started: float, *, failed: bool) -> None:
+        """Settling the page runs after the wall is frozen: the caller waits for it, but it is not part of the call."""
+        self.drain_ms = int((time.monotonic() - started) * 1000)
+        if failed:
+            self.current = "evidence_drain"
+
+    def settle(self) -> None:
+        """The call answered, so no segment holds a failure and ``timing_phase`` would misname a returned error."""
+        self.current = None
+
+
+def _server_mark(raw_mcp: dict[str, Any], name: str) -> int | None:
+    timing = raw_mcp.get("timing_ms")
+    value = timing.get(name) if isinstance(timing, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _log_mcp_timing(
     ctx: CopilotContext,
     tool_name: str,
     mcp_tool_name: str,
-    wall_clock_ms: int,
+    phases: _PhaseClock,
     raw_mcp: dict[str, Any],
     call_path: Literal["model", "internal"],
     call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
 ) -> None:
-    timing = raw_mcp.get("timing_ms")
-    total = timing.get("total") if isinstance(timing, dict) else None
-    reported = total if isinstance(total, int) and not isinstance(total, bool) else None
-    LOG.info(
-        "MCP tool timing",
-        tool_name=tool_name,
-        mcp_tool_name=mcp_tool_name,
-        wall_clock_ms=wall_clock_ms,
-        server_timing_ms=reported,
-        call_path=call_path,
-        call_status=call_status,
-        **_copilot_log_fields(ctx),
-    )
+    with contained_effect("emit MCP tool timing", tool_name=tool_name, call_status=call_status):
+        reported = _server_mark(raw_mcp, "total")
+        attach_ms = _server_mark(raw_mcp, "attach")
+        # The tool's total excludes the browser attach it did before opening its timer, so the span the
+        # server actually held the call is the two together.
+        server_span_ms = None if reported is None else reported + (attach_ms or 0)
+        wall_clock_ms = phases.close()
+        spent = {phase: phases.elapsed.get(phase, 0) for phase in _MCP_CALL_SEGMENTS}
+        dispatch_ms = spent["dispatch"]
+        # The server measures on its own clock, so a span outside the dispatch segment cannot be
+        # subtracted from it without inventing a component.
+        server_fits = server_span_ms is not None and 0 <= server_span_ms <= dispatch_ms
+        untimed_ms = dispatch_ms - server_span_ms if server_fits and server_span_ms is not None else None
+        LOG.info(
+            "MCP tool timing",
+            tool_name=tool_name,
+            mcp_tool_name=mcp_tool_name,
+            wall_clock_ms=wall_clock_ms,
+            server_timing_ms=server_span_ms,
+            server_attach_ms=attach_ms,
+            call_path=call_path,
+            call_status=call_status,
+            phase_session_prepare_ms=spent["session_prepare"],
+            phase_context_enter_ms=spent["context_enter"],
+            phase_dispatch_ms=dispatch_ms,
+            phase_context_exit_ms=spent["context_exit"],
+            post_call_evidence_drain_ms=phases.drain_ms,
+            phase_residual_ms=wall_clock_ms - sum(spent.values()),
+            timing_phase=phases.current if call_status != "ok" else None,
+            phase_dispatch_untimed_ms=untimed_ms,
+            timing_server_overrun=None if server_span_ms is None else not server_fits,
+            **_copilot_log_fields(ctx),
+        )
 
 
 def _browser_session_loss_result(
@@ -478,35 +556,36 @@ def _emit_continuity_event(
     replacement_session_id: str | None,
     disposition: Literal["detected", "reestablished", "failed"],
 ) -> None:
-    workflow_run_id = (
-        ctx.sdk_action_workflow_run_ids_by_browser_session.get((ctx.organization_id, lost_session_id))
-        or ctx.last_run_blocks_workflow_run_id
-    )
-    fields: dict[str, Any] = {
-        "error_code": _SESSION_EXPIRED_ERROR_CODE,
-        "session_id": lost_session_id,
-        "replacement_session_id": replacement_session_id,
-        "workflow_run_id": workflow_run_id,
-        "tool_name": tool_name,
-        "call_path": call_path,
-        "continuity_source": "direct_mcp",
-        "continuity_disposition": disposition,
-        **_copilot_log_fields(cast("CopilotContext", ctx)),
-    }
-    if disposition != "detected":
-        fields["reestablish_budget_seconds"] = _SESSION_REESTABLISH_TIMEOUT_SECONDS
-    log = LOG.info if disposition == "reestablished" else LOG.warning
-    try:
-        log("copilot_browser_session_continuity_loss", **fields)
-    except Exception:
+    # The payload is built inside the guard too: this emit sits ahead of the recovery
+    # call, so a failure anywhere in it -- not just in the sink -- would leave
+    # ensure_browser_session uncalled and the disposition unrecorded.
+    with contained_effect("emit copilot session continuity event", session_id=lost_session_id):
+        workflow_run_id = (
+            ctx.sdk_action_workflow_run_ids_by_browser_session.get((ctx.organization_id, lost_session_id))
+            or ctx.last_run_blocks_workflow_run_id
+        )
+        fields: dict[str, Any] = {
+            "error_code": _SESSION_EXPIRED_ERROR_CODE,
+            "session_id": lost_session_id,
+            "replacement_session_id": replacement_session_id,
+            "workflow_run_id": workflow_run_id,
+            "tool_name": tool_name,
+            "call_path": call_path,
+            "continuity_source": "direct_mcp",
+            "continuity_disposition": disposition,
+            **_copilot_log_fields(cast("CopilotContext", ctx)),
+        }
+        if disposition != "detected":
+            fields["reestablish_budget_seconds"] = _SESSION_REESTABLISH_TIMEOUT_SECONDS
+        log = LOG.info if disposition == "reestablished" else LOG.warning
         try:
+            log("copilot_browser_session_continuity_loss", **fields)
+        except Exception:
             _FALLBACK_LOGGER.warning(
                 "copilot_browser_session_continuity_loss session_id=%s disposition=%s",
                 lost_session_id,
                 disposition,
             )
-        except Exception:
-            pass
 
 
 def _apply_continuity_outcome(
@@ -554,7 +633,7 @@ async def _prepare_browser_session_for_dispatch(
 
         prior_session_id = ctx.browser_session_id
         if not prior_session_id:
-            return await ensure_browser_session(ctx, require_verified_session=True), None
+            return await ensure_browser_session(ctx), None
 
         async with _browser_session_continuity_lock(ctx.organization_id, prior_session_id):
             recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
@@ -562,10 +641,9 @@ async def _prepare_browser_session_for_dispatch(
                 _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
                 return None, _browser_session_loss_result({}, disposition=recorded.disposition)
 
-            error = await ensure_browser_session(ctx, require_verified_session=True)
-            if error is not None and ctx.browser_session_id == prior_session_id:
-                # A bounded probe that could not determine liveness is not evidence of loss.
-                return error, None
+            # No preflight verdict here: the attach below is the oracle, and an indeterminate probe
+            # is not evidence of loss.
+            error = await ensure_browser_session(ctx)
             if (
                 getattr(ctx, "turn_origin", TurnOrigin.interactive) == TurnOrigin.runtime_self_heal
                 or ctx.browser_session_id == prior_session_id
@@ -895,6 +973,8 @@ class SkyvernOverlayMCPServer(MCPServer):
             schema = _apply_schema_overlay(tool.inputSchema, overlay)
             schema = _requested_output_path_choices(schema, requested_output_path_choices)
             description = overlay.description or tool.description or ""
+            if overlay.description_suffix:
+                description = f"{description} {overlay.description_suffix}".strip()
 
             result.append(
                 MCPTool(
@@ -956,11 +1036,12 @@ class SkyvernOverlayMCPServer(MCPServer):
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
-        started = time.monotonic()
+        phases = _PhaseClock()
         mcp_name = self._alias_map.get(tool_name, tool_name)
         mcp_args = _transform_args(arguments, overlay)
 
         if overlay.requires_browser:
+            phases.enter("session_prepare")
             try:
                 err, continuity_result = await _prepare_browser_session_for_dispatch(
                     copilot_ctx,
@@ -969,18 +1050,18 @@ class SkyvernOverlayMCPServer(MCPServer):
                     observed_generation=observed_continuity_generation,
                 )
             except asyncio.CancelledError:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "cancelled")
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
                 raise
             except Exception:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
                 raise
             if err:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
                 err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err)
             if continuity_result is not None:
-                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
+                _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
                 continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
                 return _copilot_to_call_tool_result(continuity_result)
@@ -992,19 +1073,27 @@ class SkyvernOverlayMCPServer(MCPServer):
             # one. The ceiling bounds every await under the call — a page evaluate, but also a stale
             # session handle whose CDP request never answers, which held a turn for 307s (SKY-13226).
             if overlay.requires_browser:
+                phases.enter("context_enter")
                 async with mcp_browser_context(copilot_ctx):
-                    raw_result = await asyncio.wait_for(
-                        self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
-                        timeout=overlay.timeout,
-                    )
+                    phases.enter("dispatch")
+                    try:
+                        raw_result = await asyncio.wait_for(
+                            self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
+                            timeout=overlay.timeout,
+                        )
+                    except BaseException:
+                        phases.unwind()
+                        raise
+                    phases.enter("context_exit")
             else:
+                phases.enter("dispatch")
                 raw_result = await asyncio.wait_for(
                     self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
                     timeout=overlay.timeout,
                 )
         except TimeoutError:
             LOG.warning("MCP tool call timed out", tool=tool_name, ceiling_seconds=overlay.timeout)
-            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "timeout")
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "timeout")
             # The call is cancelled where it stands, so a tool that changes the page may already have
             # changed it. Reporting a plain failure invites a retry that acts on the page twice.
             err = {
@@ -1018,7 +1107,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
         except CopilotBrowserSessionUnavailable as exc:
-            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "session_error")
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
             disposition = await _handle_browser_session_loss(
                 copilot_ctx,
                 tool_name=tool_name,
@@ -1032,15 +1121,14 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
         except asyncio.CancelledError:
-            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "cancelled")
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
             raise
         except Exception as exc:
             LOG.warning("MCP tool call failed", tool=tool_name)
-            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, _elapsed_ms(started), {}, "model", "error")
+            _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "error")
             err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
-        wall_clock_ms = _elapsed_ms(started)
 
         # Copy fastmcp's structured_content so mutations below stay local to
         # this call — the client may reuse or cache the response object.
@@ -1053,7 +1141,8 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
         failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
-        _log_mcp_timing(copilot_ctx, tool_name, mcp_name, wall_clock_ms, raw_mcp, "model", "error" if failed else "ok")
+        phases.settle()
+        _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, raw_mcp, "model", "error" if failed else "ok")
         # Scrub before the post hook so evidence the hooks record from raw_mcp
         # (flow evidence, scout observations) is scrubbed too.
         raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
@@ -1122,13 +1211,14 @@ class SkyvernOverlayMCPServer(MCPServer):
         extracted error string rather than silently defaulting to
         ``ok=True``.
         """
-        started = time.monotonic()
+        phases = _PhaseClock()
         copilot_name = self._reverse_alias.get(mcp_tool_name, mcp_tool_name)
         ctx = self._context_provider()
         observed_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0)
         if not self._client:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "not_connected")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "not_connected")
             return _scrub_tool_result(ctx, {"ok": False, "error": "MCP client not connected"})
+        phases.enter("session_prepare")
         try:
             err, continuity_result = await _prepare_browser_session_for_dispatch(
                 ctx,
@@ -1137,31 +1227,45 @@ class SkyvernOverlayMCPServer(MCPServer):
                 observed_generation=observed_continuity_generation,
             )
         except asyncio.CancelledError:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "cancelled")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
             raise
         except Exception:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             raise
         if err:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             return _scrub_tool_result(ctx, err)
         if continuity_result is not None:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             return _scrub_tool_result(ctx, continuity_result)
         merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
         call_browser_session_id = ctx.browser_session_id
         try:
+            phases.enter("context_enter")
             async with mcp_browser_context(ctx):
-                raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
-            wall_clock_ms = _elapsed_ms(started)
+                phases.enter("dispatch")
+                try:
+                    raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+                except BaseException:
+                    phases.unwind()
+                    raise
+                phases.enter("context_exit")
+            # The evidence drain runs outside the dispatch span this record covers.
+            phases.close()
             if self._evidence_candidate_origin is not None:
-                await asyncio.sleep(0)
-                await self._drain_evidence_candidate_response_tasks()
+                drain_started = time.monotonic()
+                try:
+                    await asyncio.sleep(0)
+                    await self._drain_evidence_candidate_response_tasks()
+                except BaseException:
+                    phases.record_drain(drain_started, failed=True)
+                    raise
+                phases.record_drain(drain_started, failed=False)
         except asyncio.CancelledError:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "cancelled")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
             raise
         except CopilotBrowserSessionUnavailable as exc:
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "session_error")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             disposition = await _handle_browser_session_loss(
                 ctx,
                 tool_name=copilot_name,
@@ -1171,7 +1275,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             return _scrub_tool_result(ctx, _browser_session_loss_result({}, disposition=disposition))
         except Exception as exc:
             LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
-            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, _elapsed_ms(started), {}, "internal", "error")
+            _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "error")
             return _scrub_tool_exception(ctx, mcp_tool_name, exc)
         raw_mcp = dict(raw.structured_content or {})
         if raw.is_error:
@@ -1182,9 +1286,8 @@ class SkyvernOverlayMCPServer(MCPServer):
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
         failed = raw.is_error or raw_mcp.get("ok", True) is not True
-        _log_mcp_timing(
-            ctx, copilot_name, mcp_tool_name, wall_clock_ms, raw_mcp, "internal", "error" if failed else "ok"
-        )
+        phases.settle()
+        _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", "error" if failed else "ok")
         scrubbed = _scrub_tool_result(ctx, raw_mcp)
         result = mcp_to_copilot(scrubbed) if scrubbed else {}
         if (

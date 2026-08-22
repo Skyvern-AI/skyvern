@@ -82,6 +82,26 @@ def test_legacy_task_request_validates_browser_address_at_parse_time() -> None:
     assert request.browser_address == "wss://browser.example.test/devtools/browser/id"
 
 
+def test_public_task_request_rejects_internal_synthetic_task_type() -> None:
+    import pydantic
+
+    from skyvern.forge.sdk.db.enums import TaskType
+    from skyvern.forge.sdk.schemas.tasks import TaskRequest
+
+    with pytest.raises(pydantic.ValidationError, match="task_type"):
+        TaskRequest(url="https://task.example.test", task_type=TaskType.synthetic_sdk_action)
+
+    task_type_schema = TaskRequest.model_json_schema()["properties"]["task_type"]
+    schema_values = set(task_type_schema.get("enum", []))
+    schema_values.update(value for branch in task_type_schema.get("anyOf", []) for value in branch.get("enum", []))
+    assert schema_values == {
+        TaskType.general.value,
+        TaskType.validation.value,
+        TaskType.action.value,
+    }
+    assert TaskType.synthetic_sdk_action.value not in schema_values
+
+
 def test_legacy_workflow_request_validates_browser_address_at_parse_time() -> None:
     import pydantic
 

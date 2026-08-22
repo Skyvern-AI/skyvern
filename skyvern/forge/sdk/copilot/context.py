@@ -8,7 +8,7 @@ import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
 
 import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
@@ -68,10 +68,14 @@ class NarrativeActivityEntry(TypedDict):
     displayLabel: NotRequired[str]
     success: NotRequired[bool]
     id: str
+    # Server clock read for the event this entry describes, shared with the SSE
+    # update so a rehydrated row renders the same elapsed the live row did.
+    timestamp: NotRequired[str]
 
 
 class NarrativeBlock(TypedDict):
     label: str
+    workflowRunBlockId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -81,6 +85,11 @@ class NarrativeBlock(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+
+
+class BlockRunIdentity(NamedTuple):
+    workflow_run_block_id: str
+    iteration: int
 
 
 class NarrativeConnectedAccountChoice(TypedDict):
@@ -223,6 +232,7 @@ class CodeAuthoringRepairContext(BaseModel):
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
+    page_obstruction_summaries: list[str] = Field(default_factory=list)
     required_block_structure: str = ""
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
@@ -859,6 +869,9 @@ class CopilotContext(AgentContext):
     block_state_map: dict[str, str] = field(default_factory=dict)
     block_started_at_map: dict[str, str] = field(default_factory=dict)
     block_ended_at_map: dict[str, str] = field(default_factory=dict)
+    # Keyed by label, so a label that ran more than once in a turn keeps only its
+    # last run's identity.
+    block_run_identity_map: dict[str, BlockRunIdentity] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
 

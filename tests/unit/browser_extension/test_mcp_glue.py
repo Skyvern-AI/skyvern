@@ -16,7 +16,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli import run_commands
 from skyvern.cli.commands import browser as browser_commands
@@ -203,6 +203,44 @@ async def test_broker_session_opens_one_step_pairing_inline(
     assert "extension-token" not in result["error"]["message"]
     runtime.begin_pairing.assert_awaited_once_with()
     assert runtime.wait_for_extension.await_args_list == [call(8.0), call(remaining_wait)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("broker_error", "hint_fragment", "excluded_fragment"),
+    [
+        (
+            BrowserExtensionBrokerError("INVALID_READINESS", "Broker readiness response is invalid"),
+            "startup.log",
+            "SKYVERN_BROWSER_EXTENSION_PORT",
+        ),
+        (
+            BrowserExtensionBrokerError("PORT_IN_USE", "Browser-extension port is already in use"),
+            "SKYVERN_BROWSER_EXTENSION_PORT",
+            "startup.log",
+        ),
+    ],
+)
+async def test_broker_startup_failures_have_distinct_actionable_hints(
+    monkeypatch: pytest.MonkeyPatch,
+    broker_error: BrowserExtensionBrokerError,
+    hint_fragment: str,
+    excluded_fragment: str,
+) -> None:
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER", raising=False)
+    monkeypatch.setattr(
+        mcp_session.BrowserExtensionRuntime,
+        "get_or_start",
+        AsyncMock(side_effect=broker_error),
+    )
+
+    result = await mcp_session.skyvern_browser_session_create()
+
+    assert result["ok"] is False
+    assert broker_error.code in result["error"]["message"]
+    assert hint_fragment in result["error"]["hint"]
+    assert excluded_fragment not in result["error"]["hint"]
 
 
 @pytest.mark.asyncio

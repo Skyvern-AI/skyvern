@@ -334,6 +334,7 @@ def _repair_context_root_cause_identity(
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
+        payload["page_obstruction_summaries"] = _safe_identity_list(repair_context.page_obstruction_summaries)
     elif reason_code == "runtime_missing_output_dependency":
         payload["missing_output_key"] = _safe_text(repair_context.missing_output_key, 120)
         payload["available_output_keys"] = _safe_identity_list(repair_context.available_output_keys)

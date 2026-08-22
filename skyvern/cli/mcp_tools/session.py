@@ -5,6 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
@@ -57,6 +58,28 @@ def _broker_extension_not_connected_guidance(*, pairing_opened: bool) -> str:
         "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
         "To open the one-click pairing page, run `skyvern browser extension-pair`."
     )
+
+
+def _broker_extension_not_connected_hint() -> str:
+    return (
+        "Verify that Chrome is running and the Skyvern Agent extension is enabled. "
+        "The extension checks for the broker every 30 seconds."
+    )
+
+
+def _browser_extension_start_hint(error: Exception) -> str:
+    if isinstance(error, BrowserExtensionBrokerError):
+        if error.code in {"INVALID_READINESS", "STARTUP_TIMEOUT"}:
+            return (
+                "Inspect ~/.skyvern/run/browser-extension/<port>/startup.log, stop any stale Skyvern MCP "
+                "process, and retry."
+            )
+        if error.code == "PORT_IN_USE":
+            return (
+                "Stop the process using the configured localhost port, or set SKYVERN_BROWSER_EXTENSION_PORT "
+                "to a free port and use the same port in the Skyvern Agent popup."
+            )
+    return "Failed to start or connect to the Skyvern browser extension"
 
 
 def _session_api_key_hash() -> str | None:
@@ -189,7 +212,7 @@ async def skyvern_browser_session_create(
                             error=make_error(
                                 ErrorCode.BROWSER_NOT_FOUND,
                                 guidance,
-                                "",
+                                _broker_extension_not_connected_hint() if broker_mode else "",
                             ),
                         )
             except Exception as e:
@@ -200,7 +223,7 @@ async def skyvern_browser_session_create(
                     error=make_error(
                         ErrorCode.SDK_ERROR,
                         str(e),
-                        "Failed to start or connect to the Skyvern browser extension",
+                        _browser_extension_start_hint(e),
                     ),
                 )
 
@@ -220,7 +243,7 @@ async def skyvern_browser_session_create(
                     error=make_error(
                         ErrorCode.BROWSER_NOT_FOUND,
                         guidance,
-                        "",
+                        _broker_extension_not_connected_hint() if broker_mode else "",
                     ),
                 )
         return make_result(

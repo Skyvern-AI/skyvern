@@ -464,6 +464,8 @@ def try_generate_totp_for_credential(
     credential_key: str,
     workflow_run_id: str,
 ) -> OTPValue | None:
+    if not workflow_run_context.is_registered_credential_parameter_key(credential_key):
+        return None
     value = workflow_run_context.values.get(credential_key)
     if not isinstance(value, dict):
         return None
@@ -521,13 +523,17 @@ def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
     current_context = skyvern_context.current()
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
     if active_credential_key:
+        if not workflow_run_context.is_registered_credential_parameter_key(active_credential_key):
+            return False
         value = workflow_run_context.values.get(active_credential_key)
         return isinstance(value, dict) and isinstance(value.get("totp"), str)
 
     candidate_keys = [
         key
         for key, value in workflow_run_context.values.items()
-        if isinstance(value, dict) and isinstance(value.get("totp"), str)
+        if isinstance(value, dict)
+        and isinstance(value.get("totp"), str)
+        and workflow_run_context.is_registered_credential_parameter_key(key)
     ]
     return len(candidate_keys) == 1
 
@@ -555,7 +561,9 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     candidate_keys = [
         key
         for key, value in workflow_run_context.values.items()
-        if isinstance(value, dict) and isinstance(value.get("totp"), str)
+        if isinstance(value, dict)
+        and isinstance(value.get("totp"), str)
+        and workflow_run_context.is_registered_credential_parameter_key(key)
     ]
     if len(candidate_keys) != 1:
         if len(candidate_keys) > 1:

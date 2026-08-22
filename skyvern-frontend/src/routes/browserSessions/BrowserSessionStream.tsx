@@ -14,12 +14,22 @@ import {
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
 import {
-  STREAM_MAX_RECONNECT_ATTEMPTS,
-  STREAM_RECONNECT_DELAY_MS,
+  BROWSER_SESSION_STREAM_SUBJECT,
   diagnosticForStatus,
-  isTerminalStreamStatus,
-  shouldReconnectStream,
 } from "./BrowserSessionStream.utils";
+import {
+  STREAM_ABNORMAL_CLOSE_CODE,
+  STREAM_STALE_FRAME_AFTER_ATTEMPTS,
+  STREAM_VNC_FALLBACK_CLOSE_CODE,
+  STREAM_VNC_FALLBACK_CLOSE_REASON,
+  diagnosticForReconnectExhausted,
+  diagnosticForStreamEnded,
+  isStreamStatusOnlyMessage,
+  isTerminalStreamStatus,
+  reconnectHint,
+  shouldReconnectStream,
+  streamReconnectDelayMs,
+} from "@/routes/streaming/streamLifecycle";
 import { useSettingsStore } from "@/store/SettingsStore";
 
 type StreamMessage = {
@@ -38,16 +48,11 @@ const STARTING_DIAGNOSTIC: StreamDiagnostic = {
   pending: true,
 };
 
-function diagnosticForReconnectExhausted(): StreamDiagnostic {
-  return {
-    title: "Stream connection dropped",
-    detail: "The browser stream disconnected and could not reconnect.",
-    hint: "Refresh the editor or create a new browser session.",
-  };
-}
-
 function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
-  if (event.code === 4001 || event.reason === "use-vnc-streaming") {
+  if (
+    event.code === STREAM_VNC_FALLBACK_CLOSE_CODE ||
+    event.reason === STREAM_VNC_FALLBACK_CLOSE_REASON
+  ) {
     return {
       title: "Backend wants to use VNC streaming",
       detail:
@@ -55,10 +60,10 @@ function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
       hint: "Check BROWSER_STREAMING_MODE on the backend and the runtime config response.",
     };
   }
-  if (event.code === 1006) {
+  if (event.code === STREAM_ABNORMAL_CLOSE_CODE) {
     return {
       title: "The connection slipped away",
-      detail: "The browser stream WebSocket closed before sending a frame.",
+      detail: "The browser stream WebSocket dropped without closing cleanly.",
       hint: "Check that the API server is running and reachable from the UI.",
     };
   }
@@ -121,8 +126,12 @@ function BrowserSessionStream({
   const rafRef = useRef<number | null>(null);
   const lastCommittedTokenRef = useRef<number>(0);
   const reconnectAttemptsRef = useRef(0);
-  const terminalStatusSeenRef = useRef(false);
+  const streamFinishedRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Why the stream stopped, when the server told us before closing. Survives into
+  // the close handler so a reconnect notice augments that reason instead of
+  // replacing it with a generic "closed with code 1000".
+  const streamEndedDiagnosticRef = useRef<StreamDiagnostic | null>(null);
 
   // The CDP input socket must be wired whenever the stream can be controlled,
   // whether by default interaction or via the take-control button.
@@ -172,7 +181,8 @@ function BrowserSessionStream({
     setDiagnostic(STARTING_DIAGNOSTIC);
     hasFrameRef.current = false;
     reconnectAttemptsRef.current = 0;
-    terminalStatusSeenRef.current = false;
+    streamFinishedRef.current = false;
+    streamEndedDiagnosticRef.current = null;
 
     const clearReconnectTimer = () => {
       if (reconnectTimerRef.current) {
@@ -252,6 +262,7 @@ function BrowserSessionStream({
           if (message.screenshot) {
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
+            streamEndedDiagnosticRef.current = null;
             const token = markMessage();
             pendingFrameRef.current = {
               token,
@@ -276,19 +287,44 @@ function BrowserSessionStream({
             onActivityRef.current?.();
           }
           const isTerminal = isTerminalStreamStatus(message.status);
+          // A bare status frame is the server signing off. After frames have flowed
+          // that ends the live view even when the status itself is non-terminal --
+          // the session outlives the screencast, and rendering its last frame as
+          // current is what left viewers staring at a dead browser (SKY-14617).
+          const streamEnded =
+            isTerminal ||
+            (hasFrameRef.current && isStreamStatusOnlyMessage(message));
           if (message.status && (isTerminal || !message.screenshot)) {
-            setDiagnostic(diagnosticForStatus(message.status));
+            const endedDiagnostic =
+              streamEnded && !isTerminal
+                ? diagnosticForStreamEnded({
+                    status: message.status,
+                    subject: BROWSER_SESSION_STREAM_SUBJECT,
+                  })
+                : diagnosticForStatus(message.status);
+            streamEndedDiagnosticRef.current = streamEnded
+              ? endedDiagnostic
+              : null;
+            setDiagnostic(endedDiagnostic);
           }
-          if (isTerminal) {
-            terminalStatusSeenRef.current = true;
+          if (streamEnded) {
             // Drop the last frame: keeping it leaves a dead, still-interactive
-            // screenshot covering the terminal status panel.
+            // screenshot covering the status panel.
             clearPendingFrame();
+            hasFrameRef.current = false;
             setStreamImgSrc("");
+            // Only a terminal status forecloses reconnecting; a live session whose
+            // screencast ended is exactly the case worth redialling.
+            if (isTerminal) {
+              streamFinishedRef.current = true;
+            }
             socket.close();
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          // The backend only sends non-JSON text to reject credentials, and
+          // retrying that would just burn the reconnect budget in silence.
+          streamFinishedRef.current = true;
           setDiagnostic({
             title: "The stream said something funny",
             detail: "The browser sent a message the UI couldn't parse.",
@@ -313,44 +349,57 @@ function BrowserSessionStream({
         clearPendingFrame();
         socketRef.current = null;
 
-        if (
-          !cancelled &&
-          !hasFrameRef.current &&
-          !terminalStatusSeenRef.current
-        ) {
-          setDiagnostic(diagnosticForClose(event));
+        // Prefer the reason the server gave over "the socket closed": after a clean
+        // close those are the same event, and only the former says anything useful.
+        const closeDiagnostic =
+          streamEndedDiagnosticRef.current ?? diagnosticForClose(event);
+        if (!cancelled && !hasFrameRef.current && !streamFinishedRef.current) {
+          setDiagnostic(closeDiagnostic);
         }
         const canReconnect =
           !cancelled &&
           shouldReconnectStream({
             closeCode: event.code,
             closeReason: event.reason,
-            terminalStatusSeen: terminalStatusSeenRef.current,
+            streamFinished: streamFinishedRef.current,
             reconnectAttempts: reconnectAttemptsRef.current,
           });
 
         if (canReconnect) {
+          const delayMs = streamReconnectDelayMs(reconnectAttemptsRef.current);
           reconnectAttemptsRef.current += 1;
+          if (
+            hasFrameRef.current &&
+            reconnectAttemptsRef.current > STREAM_STALE_FRAME_AFTER_ATTEMPTS
+          ) {
+            hasFrameRef.current = false;
+            setStreamImgSrc("");
+          }
           if (!hasFrameRef.current) {
             setDiagnostic({
-              ...diagnosticForClose(event),
-              hint: `Reconnecting in ${STREAM_RECONNECT_DELAY_MS / 1000}s (${reconnectAttemptsRef.current}/${STREAM_MAX_RECONNECT_ATTEMPTS}).`,
+              ...closeDiagnostic,
+              hint: reconnectHint(reconnectAttemptsRef.current),
             });
           }
           clearReconnectTimer();
           reconnectTimerRef.current = setTimeout(() => {
             reconnectTimerRef.current = null;
             void connect();
-          }, STREAM_RECONNECT_DELAY_MS);
+          }, delayMs);
         } else if (
           !cancelled &&
-          !terminalStatusSeenRef.current &&
-          hasFrameRef.current &&
-          reconnectAttemptsRef.current >= STREAM_MAX_RECONNECT_ATTEMPTS
+          !streamFinishedRef.current &&
+          // A transport switch is the caller's cue to re-mount on VNC, not a drop.
+          event.code !== STREAM_VNC_FALLBACK_CLOSE_CODE &&
+          event.reason !== STREAM_VNC_FALLBACK_CLOSE_REASON
         ) {
+          // Out of retries with nothing live behind the last frame: say so instead
+          // of leaving that frame up as if it were current.
           hasFrameRef.current = false;
           setStreamImgSrc("");
-          setDiagnostic(diagnosticForReconnectExhausted());
+          setDiagnostic(
+            diagnosticForReconnectExhausted(BROWSER_SESSION_STREAM_SUBJECT),
+          );
         }
       });
     }

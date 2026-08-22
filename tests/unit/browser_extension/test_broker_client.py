@@ -712,6 +712,30 @@ def test_first_spawn_leaves_extension_credentials_for_daemon_child(
     )
 
 
+def test_spawn_rejects_ready_response_for_a_different_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    paths = ensure_run_directory(19778, base_dir=tmp_path / "run")
+    process = MagicMock()
+    monkeypatch.setattr(broker_client_module, "_broker_is_reachable", lambda _paths: False)
+    monkeypatch.setattr(broker_client_module.subprocess, "Popen", MagicMock(return_value=process))
+    monkeypatch.setattr(
+        broker_client_module,
+        "read_readiness",
+        MagicMock(return_value={"status": "READY", "port": 19779}),
+    )
+    terminate = MagicMock()
+    monkeypatch.setattr(broker_client_module, "_terminate_spawned_process", terminate)
+
+    with pytest.raises(BrowserExtensionBrokerError, match="readiness response is invalid") as error_info:
+        broker_client_module._ensure_broker_process(19778, paths)
+
+    assert error_info.value.code == "INVALID_READINESS"
+    terminate.assert_called_once_with(process)
+
+
 def test_client_only_surfaces_daemon_auto_enable_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

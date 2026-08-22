@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +14,12 @@ from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificati
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.workflow.context_manager import _CREDENTIAL_PARAMETER_TYPES
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.services import otp_service
 from skyvern.services.otp_service import (
     OTPValue,
@@ -177,6 +183,49 @@ class TestResolveOtpValuePlaceholderFallthrough:
         assert result is credential_value
         credential.assert_called_once_with("wr_test")
         poll.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_input_dict_falls_through_to_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An ordinary run input dict with a placeholder `totp` is not a credential.
+
+        With the real credential lookup running against a realistic registration shape,
+        the ordinary dict must fall through to polling (awaited once) rather than being
+        resolved as a credential-backed TOTP and short-circuiting resolution.
+        """
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "111111")
+        fake_context = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        fake_app = SimpleNamespace(
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake_context,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
+            DATABASE=SimpleNamespace(
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            ),
+        )
+        monkeypatch.setattr(otp_service, "app", fake_app)
+
+        task = SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            totp_verification_url="https://example.com/webhook",
+            totp_identifier=None,
+            navigation_payload={},
+        )
+        polled = OTPValue(value="424242", type=OTPType.TOTP)
+        poll = AsyncMock(return_value=polled)
+        monkeypatch.setattr(otp_service, "poll_otp_value", poll)
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = await resolve_otp_value(task)
+
+        assert result is polled
+        poll.assert_awaited_once()
 
 
 def _mock_org_token() -> MagicMock:
@@ -1553,12 +1602,54 @@ class TestPollOtpValueRetry:
         assert raw not in str(polling.values())
 
 
-class _FakeWorkflowRunContext:
-    """Minimal stub mirroring WorkflowRunContext shape for try_generate_totp_from_credential."""
+def _credential_parameter(key: str) -> CredentialParameter:
+    now = datetime.now(timezone.utc)
+    return CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="wf_test",
+        credential_id=f"cred_{key}",
+        created_at=now,
+        modified_at=now,
+    )
 
-    def __init__(self, values: dict[str, dict[str, str]], secrets: dict[str, str]) -> None:
+
+def _ordinary_workflow_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_type=WorkflowParameterType.JSON,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_id="wf_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+class _FakeWorkflowRunContext:
+    """Stub mirroring WorkflowRunContext shape (values/secrets/parameters) for TOTP lookup.
+
+    ``parameters`` maps each key to a real Parameter model so
+    ``is_registered_credential_parameter_key`` exercises the same
+    ``_CREDENTIAL_PARAMETER_TYPES`` isinstance check as production. When omitted,
+    every values key is registered as a real credential parameter (the shape the
+    original credential-selection tests assume).
+    """
+
+    def __init__(
+        self,
+        values: dict[str, dict[str, str]],
+        secrets: dict[str, str],
+        parameters: dict[str, object] | None = None,
+    ) -> None:
         self.values = values
         self.secrets = secrets
+        if parameters is None:
+            parameters = {key: _credential_parameter(key) for key in values}
+        self.parameters = parameters
+
+    def is_registered_credential_parameter_key(self, key: str) -> bool:
+        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
@@ -1676,6 +1767,58 @@ class TestTryGenerateTotpFromCredential:
 
         assert result is not None
         assert result.value == "131313"
+
+    def test_ordinary_input_dict_with_placeholder_totp_is_not_a_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ordinary run input dict with a placeholder-shaped `totp` is not a credential.
+
+        Before the registration boundary it was the sole fallback candidate and its
+        `totp` value was resolved and generated, letting an ordinary input masquerade as
+        a credential-backed TOTP instead of falling through to polling.
+        """
+        fake = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "111111")
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is None
+
+    def test_active_key_not_registered_credential_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale/arbitrary active key pointing at an ordinary dict cannot bypass the boundary."""
+        fake = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+
+        with skyvern_context.scoped(_scoped_context(active="user_input")):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is None
+
+    def test_registered_credential_parameter_generates_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A registered credential parameter with a TOTP secret still generates normally."""
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u", "totp": "tot_b"}},
+            secrets={"tot_b_value": _VALID_TOTP_SEED},
+            parameters={"credentials": _credential_parameter("credentials")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "246810")
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is not None
+        assert result.value == "246810"
 
     def test_workflow_run_id_none_returns_none(self) -> None:
         assert try_generate_totp_from_credential(None) is None

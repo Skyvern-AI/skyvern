@@ -86,3 +86,30 @@ def test_explicit_code_block_mode_ignores_legacy_setting_with_warning(
     assert "CODE_BLOCK_MODE=disabled" in caplog.text
     assert "deprecated" in caplog.text
     assert "ignored" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("256", 256),
+        # The gt=0 bound would otherwise make "turn shedding off" unreachable from an env file,
+        # and a boot-time ValidationError takes the API down rather than uncapping it.
+        ("", None),
+        ("0", None),
+        ("none", None),
+        ("null", None),
+    ],
+)
+def test_api_limit_concurrency_env_values(
+    monkeypatch: pytest.MonkeyPatch, raw_value: str, expected: int | None
+) -> None:
+    monkeypatch.setenv("API_LIMIT_CONCURRENCY", raw_value)
+
+    assert Settings(_env_file=None).API_LIMIT_CONCURRENCY == expected
+
+
+def test_api_limit_concurrency_rejects_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_LIMIT_CONCURRENCY", "-1")
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)

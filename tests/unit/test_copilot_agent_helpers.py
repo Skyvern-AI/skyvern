@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -5423,3 +5424,59 @@ class TestRecordedBuildTestOutcomeSourceBinding:
         assert "code matches" in prompt
         assert "POST-RUN PAGE-PATH CONTRACT UNBOUND" not in prompt
         assert "inspect_page_for_composition" not in prompt
+
+
+def _resolved_description(overlay: object) -> str:
+    """Mirror mcp_adapter resolution: the suffix appends to the description, never replaces it."""
+    base = getattr(overlay, "description", None) or ""
+    suffix = getattr(overlay, "description_suffix", None) or ""
+    return f"{base} {suffix}".strip()
+
+
+class TestToolFactOwnership:
+    """A fact deleted from the static prompt must still reach the model through the tool
+    description the usage guide is generated from, or the deletion removed the only copy."""
+
+    @staticmethod
+    def _tool_usage_guide() -> str:
+        from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays(BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        tool_info = [(tool.name, tool.description or "") for tool in NATIVE_TOOLS]
+        tool_info.extend((name, _resolved_description(overlay)) for name, overlay in overlays.items())
+        return agent_module._build_tool_usage_guide(tool_info)
+
+    @staticmethod
+    def _prompt_text() -> str:
+        return (
+            Path(agent_module.__file__).resolve().parents[2] / "prompts" / "skyvern" / "workflow-copilot-agent.j2"
+        ).read_text()
+
+    @pytest.mark.parametrize(
+        ("tool", "fact"),
+        [
+            ("click", "instant and"),
+            ("scroll", "below the fold"),
+            ("select_option", "For free-text inputs"),
+            ("press_key", "Escape"),
+            ("console_messages", "read-only"),
+            ("inspect_page_for_composition", "navigates the live browser there"),
+            ("get_block_schema", "task_v2"),
+            ("evaluate", "record a scouted interaction"),
+            ("inspect_page_for_composition", "bounded read of known or current page state"),
+            ("update_and_run_blocks", "higher latency than a bounded page read"),
+        ],
+    )
+    def test_migrated_fact_reaches_the_model_through_its_owning_tool(self, tool: str, fact: str) -> None:
+        guide = self._tool_usage_guide()
+
+        assert f"**{tool}**" in guide
+        assert fact in guide
+
+    def test_prompt_carries_no_tool_call_ration_or_duplicated_tool_docs(self) -> None:
+        prompt = self._prompt_text()
+
+        assert "more than twice in a row" not in prompt
+        for duplicated in ("- CSS SELECTORS:", "- SCROLL:", "- SELECT_OPTION:", "- PRESS_KEY:", "- CONSOLE_MESSAGES:"):
+            assert duplicated not in prompt
+        assert "Use evaluate for reading/inspection" not in prompt

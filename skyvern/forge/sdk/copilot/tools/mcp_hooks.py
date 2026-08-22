@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_cont
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     download_scout_act_required_for_policy,
+    normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
@@ -43,6 +44,8 @@ from ._shared import (
 )
 from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
+    _COPILOT_BANNED_BLOCK_TYPES,
+    _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     _code_only_browser_schema_guidance,
     _code_only_browser_unavailable_summary,
     _copilot_banned_block_alternatives,
@@ -63,15 +66,15 @@ from .scouting import (
     _attach_scout_observation_step,
     _attach_scout_page_summary,
     _capture_post_interaction_screenshot,
-    _capture_scout_ambiguity,
-    _capture_scout_role_name,
-    _capture_scout_selector_candidates,
+    _capture_scout_pre_action,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
+    _clear_pending_scout_selector_facts,
     _consume_scout_source_url,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
+    _page_evidence_names_obstruction,
     _prenav_ambiguity_for_selector,
     _prenav_role_name_for_selector,
     _record_scout_trajectory_fact,
@@ -409,24 +412,17 @@ async def _click_pre_hook(
 ) -> dict[str, Any] | None:
     # Cleared up front so an early return below (deterministic result or no selector)
     # cannot leave a prior click's stash for this click's post-hook to consume.
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
     ctx.pending_scout_click_selector = None
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_download_snapshot = None
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
+    await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
     if not selector:
         return None
     ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    await _capture_scout_role_name(ctx, selector)
-    await _capture_scout_selector_candidates(ctx, selector)
-    await _capture_scout_ambiguity(ctx, selector)
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
         await _arm_scout_download_listener(ctx)
@@ -439,10 +435,7 @@ async def _type_text_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
+    _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
     text = params.get("text")
     selector = str(params.get("selector") or "")
@@ -461,9 +454,7 @@ async def _type_text_pre_hook(
         }
     if isinstance(text, str) and text:
         ctx.pending_scout_input_value = text
-    await _capture_scout_role_name(ctx, selector)
-    await _capture_scout_selector_candidates(ctx, selector)
-    await _capture_scout_ambiguity(ctx, selector)
+    await _capture_scout_pre_action(ctx, selector)
     return None
 
 
@@ -471,16 +462,8 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_reanchor = None
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
     await _capture_scout_source_url(ctx)
-    await _capture_scout_role_name(ctx, params.get("selector", ""))
-    await _capture_scout_selector_candidates(ctx, params.get("selector", ""))
-    await _capture_scout_ambiguity(ctx, params.get("selector", ""))
+    await _capture_scout_pre_action(ctx, params.get("selector", ""))
     return None
 
 
@@ -489,16 +472,7 @@ async def _press_key_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_reanchor = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
-    if params.get("selector"):
-        await _capture_scout_role_name(ctx, params.get("selector"))
-        await _capture_scout_selector_candidates(ctx, params.get("selector"))
-        await _capture_scout_ambiguity(ctx, params.get("selector"))
+    await _capture_scout_pre_action(ctx, params.get("selector"))
     return None
 
 
@@ -644,6 +618,7 @@ async def _click_post_hook(
 ) -> dict[str, Any]:
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
+    page_evidence: dict[str, Any] | None = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
@@ -723,7 +698,7 @@ async def _click_post_hook(
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
         elif ctx.last_scout_act_observe_outcome == "unchanged":
             result["data"]["page_observation"] = {
                 "status": "unchanged",
@@ -731,9 +706,9 @@ async def _click_post_hook(
                     "The page observation did not change after the click; no post-click page evidence was attached."
                 ),
             }
-    # Fresh page evidence already described the change, so the round-trip buys little. Accepted
-    # cost: a blocker only a frame can show goes unseen until the next action fails and captures.
-    if ctx.last_scout_act_observe_outcome != "attached":
+    # The round-trip is skipped only when the evidence positively names the obstruction a frame
+    # would have shown; evidence that merely parsed is not a substitute for looking at the page.
+    if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
         await _capture_post_interaction_screenshot(ctx)
     return result
 
@@ -1017,7 +992,7 @@ async def _type_text_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
@@ -1349,7 +1324,7 @@ async def _select_option_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
@@ -1432,7 +1407,7 @@ async def _press_key_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
@@ -1454,17 +1429,19 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
 
 
 _EVALUATE_BASE_DESCRIPTION = (
-    "Execute JavaScript in the browser and return the result. "
-    "Use this to inspect DOM state, read values, or run arbitrary JS."
+    "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
+    "values. JavaScript run here can also change the page, but only click, type_text, select_option "
+    "and press_key record a scouted interaction, so a change made through this tool leaves nothing to "
+    "author from -- act with those tools and read with this one."
 )
 # Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
 # target only once its page is reached. The model reaches that page with navigate/click and
-# observes it here — evaluate cannot click — so the model can author the terminal download step.
+# observes it here -- evaluate records no interaction -- so the model can author the download step.
 _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     _EVALUATE_BASE_DESCRIPTION
     + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
-    "once the page holding them is reached. Use this tool to OBSERVE that page — it cannot click; "
-    "reach the page with the navigate/click tools first. For a download, observe the page that "
+    "once the page holding them is reached. Use this tool to OBSERVE that page; reach it with the "
+    "navigate/click tools first. For a download, observe the page that "
     "exposes the download control and capture a stable selector, then author the terminal download "
     "step from the code-block schema contract."
 )
@@ -1478,11 +1455,25 @@ def _evaluate_overlay_description(
     return _EVALUATE_BASE_DESCRIPTION
 
 
+def _block_schema_banned_types_note(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> str:
+    """Name the rejected types from the same constant the schema pre-hook rejects on. The set is
+    policy-dependent, which a static prompt line cannot track."""
+    banned = (
+        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
+        if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        else _COPILOT_BANNED_BLOCK_TYPES
+    )
+    return f"Unavailable under the active policy and rejected on request: {', '.join(sorted(banned))}."
+
+
 def _build_skyvern_mcp_overlays(
     block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
 ) -> dict[str, SchemaOverlay]:
     return {
         "get_block_schema": SchemaOverlay(
+            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),

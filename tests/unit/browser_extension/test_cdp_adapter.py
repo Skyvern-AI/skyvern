@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 from aiohttp import ClientSession, ClientWebSocketResponse
 
 from skyvern.browser_extension.cdp_adapter import ExtensionCdpAdapter
-from skyvern.browser_extension.errors import ExtensionRequestError
+from skyvern.browser_extension.errors import (
+    BrowserExtensionBrokerError,
+    BrowserExtensionNotConnectedError,
+    ExtensionRequestError,
+)
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
 
 
@@ -18,7 +23,7 @@ class StubRelay:
         self.scoped_tabs = scoped_tabs or []
         self.calls: list[tuple[str, dict]] = []
         self.next_tab_id = 100
-        self.fail_next: ExtensionRequestError | None = None
+        self.fail_next: BrowserExtensionBrokerError | ExtensionRequestError | None = None
         self.fail_attach_tab_ids: set[int] = set()
         self.block_attach_tab_id: int | None = None
         self.attach_started = asyncio.Event()
@@ -28,7 +33,13 @@ class StubRelay:
         self.release_detach = asyncio.Event()
         self.main_frame_ids: dict[int, str] = {}
         self.block_send_keys: set[tuple[str | None, str]] = set()
-        self.fail_send_keys: dict[tuple[str | None, str], ExtensionRequestError] = {}
+        self.fail_send_keys: dict[
+            tuple[str | None, str],
+            BrowserExtensionBrokerError
+            | BrowserExtensionNotConnectedError
+            | ExtensionRequestError
+            | asyncio.CancelledError,
+        ] = {}
         self.send_started: dict[tuple[str | None, str], asyncio.Event] = {}
         self.release_send: dict[tuple[str | None, str], asyncio.Event] = {}
         self.released_tabs: list[int] = []
@@ -42,7 +53,7 @@ class StubRelay:
         if op == "debugger.attach":
             tab_id = args["tabId"]
             if tab_id in self.fail_attach_tab_ids:
-                raise ExtensionRequestError("CDP_ERROR", "attach failed")
+                raise ExtensionRequestError("ATTACH_FAILED", "attach failed")
             if tab_id == self.block_attach_tab_id:
                 self.attach_started.set()
                 await self.release_attach.wait()
@@ -258,6 +269,60 @@ async def test_auto_attach_existing_and_later_scoped_tabs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_coded_attach_failed_already_attached_error_propagates_without_unsharing_tab() -> None:
+    tab = {"tabId": 11, "url": "https://shared.example", "title": "Shared"}
+    relay = StubRelay([tab])
+    relay.fail_next = ExtensionRequestError("ATTACH_FAILED", "Another debugger is already attached")
+    adapter = ExtensionCdpAdapter(VirtualTargetRegistry(), relay)
+    adapter._send = AsyncMock()
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}),
+    )
+
+    adapter._send.assert_awaited_once_with(
+        None,
+        {"id": 1, "error": {"code": -32000, "message": "ATTACH_FAILED: Another debugger is already attached"}},
+    )
+    assert relay.scoped_tabs == [tab]
+    assert not any(op == "debugger.detach" for op, _ in relay.calls)
+    assert not any(op == "debugger.send" for op, _ in relay.calls)
+
+
+@pytest.mark.asyncio
+async def test_adopted_group_tab_uses_same_attach_flow_as_session_created_tab() -> None:
+    relay = StubRelay()
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._auto_attach = True
+    emit_attached = AsyncMock()
+    adapter._emit_attached = emit_attached
+    try:
+        await adapter.handle_extension_event(
+            "tabs.created",
+            {"tabId": 50, "url": "https://created.example", "title": "Created"},
+        )
+        await asyncio.gather(*list(adapter._background_tasks))
+        await adapter.handle_extension_event(
+            "scope.tabAdded",
+            {"tabId": 51, "url": "https://adopted.example", "title": "Adopted"},
+        )
+        await asyncio.gather(*list(adapter._background_tasks))
+    finally:
+        await adapter.stop()
+
+    assert [call for call in relay.calls if call[0] == "debugger.attach"] == [
+        ("debugger.attach", {"tabId": 50}),
+        ("debugger.attach", {"tabId": 51}),
+    ]
+    assert [call.args[:2] for call in emit_attached.await_args_list] == [
+        (50, "tab-50"),
+        (51, "tab-51"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_root_target_discovery_waits_for_auto_attach_while_session_commands_continue() -> None:
     scoped_tabs = [
         {"tabId": 41, "url": "https://one.example", "title": "One"},
@@ -273,7 +338,6 @@ async def test_root_target_discovery_waits_for_auto_attach_while_session_command
     try:
         async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
             await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
-            assert await receive_response(ws, 1) == {"id": 1, "result": {}}
             await asyncio.wait_for(relay.attach_started.wait(), 1)
 
             attached_session_id = registry.root_session_id(41)
@@ -296,6 +360,7 @@ async def test_root_target_discovery_waits_for_auto_attach_while_session_command
             }
 
             relay.release_attach.set()
+            assert await receive_response(ws, 1) == {"id": 1, "result": {}}
             targets = await receive_response(ws, 2)
     finally:
         relay.release_attach.set()
@@ -305,7 +370,257 @@ async def test_root_target_discovery_waits_for_auto_attach_while_session_command
 
 
 @pytest.mark.asyncio
-async def test_auto_attach_post_reply_failure_skips_failed_tab_without_second_response() -> None:
+async def test_auto_attach_failure_reaches_client_instead_of_acknowledging_success() -> None:
+    relay = StubRelay([{"tabId": 30, "url": "https://bad.example", "title": "Bad"}])
+    relay.fail_attach_tab_ids.add(30)
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}),
+    )
+
+    adapter._send.assert_awaited_once_with(
+        None,
+        {"id": 1, "error": {"code": -32000, "message": "ATTACH_FAILED: attach failed"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_auto_attach_failure_restores_enabled_state_for_later_scoped_tabs() -> None:
+    relay = StubRelay([{"tabId": 30, "url": "https://good.example", "title": "Good"}])
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    await adapter.start()
+    try:
+        async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
+            await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+            assert await receive_response(ws, 1) == {"id": 1, "result": {}}
+            await receive_event(ws, "Target.attachedToTarget")
+
+            relay.scoped_tabs.append({"tabId": 31, "url": "https://bad.example", "title": "Bad"})
+            relay.fail_attach_tab_ids.add(31)
+            await ws.send_json({"id": 2, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
+            assert await receive_response(ws, 2) == {
+                "id": 2,
+                "error": {"code": -32000, "message": "ATTACH_FAILED: attach failed"},
+            }
+            assert adapter._auto_attach is True
+
+            relay.fail_attach_tab_ids.remove(31)
+            await adapter.handle_extension_event(
+                "scope.tabAdded", {"tabId": 32, "url": "https://later.example", "title": "Later"}
+            )
+            later = await receive_event(ws, "Target.attachedToTarget")
+    finally:
+        await adapter.stop()
+
+    assert later["params"]["targetInfo"]["targetId"] == "tab-32"
+
+
+@pytest.mark.asyncio
+async def test_empty_scope_auto_attach_broker_failure_reaches_client() -> None:
+    relay = StubRelay()
+    relay.fail_next = BrowserExtensionBrokerError("BROKER_UNAVAILABLE", "broker unavailable")
+    adapter = ExtensionCdpAdapter(VirtualTargetRegistry(), relay)
+    adapter._send = AsyncMock()
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}),
+    )
+
+    adapter._send.assert_awaited_once_with(
+        None,
+        {"id": 1, "error": {"code": -32000, "message": "BROKER_UNAVAILABLE: broker unavailable"}},
+    )
+    assert adapter._auto_attach is False
+
+
+@pytest.mark.asyncio
+async def test_auto_attach_replies_before_a_concurrent_scope_event() -> None:
+    relay = StubRelay()
+    relay.block_attach_tab_id = 100
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    original_request = relay.request
+    order: list[str] = []
+
+    async def request_with_scope_event(op: str, args: dict, timeout: float = 30.0) -> dict:
+        result = await original_request(op, args, timeout)
+        if op == "tabs.create":
+            await adapter.handle_extension_event(
+                "scope.tabAdded",
+                {"tabId": result["tabId"], "url": args["url"], "title": ""},
+            )
+            asyncio.get_running_loop().call_soon(relay.release_attach.set)
+        return result
+
+    relay.request = request_with_scope_event
+    adapter._reply = AsyncMock(side_effect=lambda *_args: order.append("reply"))
+    adapter._emit_attached = AsyncMock(side_effect=lambda *_args: order.append("attached"))
+
+    await adapter._handle_root_command(None, 1, "Target.setAutoAttach", {"autoAttach": True})  # type: ignore[arg-type]
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    assert order == ["reply", "attached"]
+    assert [call for call in relay.calls if call[0] == "debugger.attach"] == [
+        ("debugger.attach", {"tabId": 100}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_frame_discovery_timeout_does_not_register_a_phantom_attached_page() -> None:
+    relay = StubRelay([{"tabId": 32, "url": "https://frame.example", "title": "Frame"}])
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = ExtensionRequestError(
+        "COMMAND_TIMEOUT", "frame discovery timed out"
+    )
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    generation = adapter._begin_tab_scope(32)
+
+    with pytest.raises(ExtensionRequestError, match="frame discovery timed out"):
+        await adapter._ensure_attached(relay.scoped_tabs[0], generation=generation)
+
+    assert 32 not in adapter._attached_tabs
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(32)
+    assert ("debugger.detach", {"tabId": 32}) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_frame_discovery_not_connected_discards_attachment_and_restores_auto_attach() -> None:
+    relay = StubRelay([{"tabId": 32, "url": "https://frame.example", "title": "Frame"}])
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = BrowserExtensionNotConnectedError()
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+
+    with pytest.raises(BrowserExtensionNotConnectedError):
+        await adapter._set_auto_attach(None, 1, {"autoAttach": True}, None)  # type: ignore[arg-type]
+
+    assert adapter._auto_attach is False
+    assert 32 not in adapter._attached_tabs
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(32)
+    assert ("debugger.detach", {"tabId": 32}) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_frame_discovery_cancellation_discards_attachment_and_restores_auto_attach() -> None:
+    relay = StubRelay([{"tabId": 32, "url": "https://frame.example", "title": "Frame"}])
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = asyncio.CancelledError()
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._set_auto_attach(None, 1, {"autoAttach": True}, None)  # type: ignore[arg-type]
+
+    assert adapter._auto_attach is False
+    assert 32 not in adapter._attached_tabs
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(32)
+    assert ("debugger.detach", {"tabId": 32}) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_frame_discovery_broker_failure_discards_attachment_and_restores_auto_attach() -> None:
+    relay = StubRelay([{"tabId": 32, "url": "https://frame.example", "title": "Frame"}])
+    relay.fail_send_keys[(None, "Page.getFrameTree")] = BrowserExtensionBrokerError(
+        "EXTENSION_RESET_IN_PROGRESS", "extension reset in progress"
+    )
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    adapter._send = AsyncMock()
+
+    await adapter._handle_client_text(
+        None,  # type: ignore[arg-type]
+        json.dumps({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}),
+    )
+
+    adapter._send.assert_awaited_once_with(
+        None,
+        {
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "EXTENSION_RESET_IN_PROGRESS: extension reset in progress",
+            },
+        },
+    )
+    assert adapter._auto_attach is False
+    assert 32 not in adapter._attached_tabs
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(32)
+    assert ("debugger.detach", {"tabId": 32}) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_scope_revoked_during_frame_discovery_discards_the_attachment() -> None:
+    relay = StubRelay([{"tabId": 33, "url": "https://racy.example", "title": "Racy"}])
+    frame_key = (None, "Page.getFrameTree")
+    relay.block_send_keys.add(frame_key)
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    generation = adapter._begin_tab_scope(33)
+
+    attaching = asyncio.create_task(adapter._ensure_attached(relay.scoped_tabs[0], generation=generation))
+    await relay.send_started.setdefault(frame_key, asyncio.Event()).wait()
+    adapter._revoke_tab_scope(33)
+    relay.release_send.setdefault(frame_key, asyncio.Event()).set()
+
+    assert await attaching is None
+    assert 33 not in adapter._attached_tabs
+    assert ("debugger.detach", {"tabId": 33}) in relay.calls
+
+
+@pytest.mark.asyncio
+async def test_auto_attach_scope_revocation_cancellation_rolls_back_prior_tabs() -> None:
+    relay = StubRelay(
+        [
+            {"tabId": 33, "url": "https://first.example", "title": "First"},
+            {"tabId": 34, "url": "https://revoked.example", "title": "Revoked"},
+        ]
+    )
+    relay.block_detach_tab_id = 34
+    registry = VirtualTargetRegistry()
+    adapter = ExtensionCdpAdapter(registry, relay)
+    original_request = relay.request
+    revoked_detach_finished = asyncio.Event()
+
+    async def request_with_scope_revocation(op: str, args: dict, timeout: float = 30.0) -> dict:
+        result = await original_request(op, args, timeout)
+        if op == "debugger.send" and args["tabId"] == 34 and args["method"] == "Page.getFrameTree":
+            adapter._revoke_tab_scope(34)
+        if op == "debugger.detach" and args["tabId"] == 34:
+            revoked_detach_finished.set()
+        return result
+
+    relay.request = request_with_scope_revocation
+    attaching = asyncio.create_task(
+        adapter._set_auto_attach(None, 1, {"autoAttach": True}, None)  # type: ignore[arg-type]
+    )
+    await relay.detach_started.wait()
+
+    attaching.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attaching
+
+    relay.release_detach.set()
+    await asyncio.wait_for(revoked_detach_finished.wait(), timeout=1)
+
+    assert adapter._auto_attach is False
+    assert adapter._attached_tabs == set()
+    assert ("debugger.detach", {"tabId": 33}) in relay.calls
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(33)
+    with pytest.raises(KeyError):
+        registry.target_id_for_tab(34)
+
+
+@pytest.mark.asyncio
+async def test_auto_attach_transactional_failure_restores_state_without_second_response() -> None:
     relay = StubRelay(
         [
             {"tabId": 30, "url": "https://bad.example", "title": "Bad"},
@@ -320,18 +635,14 @@ async def test_auto_attach_post_reply_failure_skips_failed_tab_without_second_re
         async with ClientSession() as client, client.ws_connect(adapter.cdp_ws_url) as ws:
             await ws.send_json({"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}})
 
-            assert await receive_response(ws, 1) == {"id": 1, "result": {}}
-            attached = await receive_event(ws, "Target.attachedToTarget")
-            assert attached["params"]["targetInfo"]["targetId"] == "tab-31"
+            assert await receive_response(ws, 1) == {
+                "id": 1,
+                "error": {"code": -32000, "message": "ATTACH_FAILED: attach failed"},
+            }
             with pytest.raises(TimeoutError):
                 await ws.receive_json(timeout=0.05)
-            await ws.send_json({"id": 2, "method": "Browser.close", "params": {}})
-            assert await receive_response(ws, 2) == {"id": 2, "result": {}}
-            await ws.receive(timeout=1)
     finally:
         await adapter.stop()
-
-    assert set(relay.released_tabs) == {30, 31}
 
 
 @pytest.mark.asyncio

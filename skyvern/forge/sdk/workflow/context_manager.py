@@ -1550,7 +1550,7 @@ class WorkflowRunContext:
         self, parameter: OutputParameter, value: dict[str, Any] | list | str | None
     ) -> None:
         if parameter.key in self.values:
-            LOG.warning(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
+            LOG.debug(f"Output parameter {parameter.output_parameter_id} already has a registered value, overwriting")
 
         self.values[parameter.key] = value
         self.register_block_reference_variable_from_output_parameter(parameter, value)
@@ -1580,7 +1580,7 @@ class WorkflowRunContext:
                 merged = {**current_value, **block_reference_value}
                 block_reference_value = merged
             else:
-                LOG.warning(f"Parameter {block_label} already has a value in workflow run context, overwriting")
+                LOG.debug(f"Parameter {block_label} already has a value in workflow run context, overwriting")
 
         self.values[block_label] = block_reference_value
         self.workflow_run_outputs[block_label] = block_reference_value
@@ -1710,6 +1710,15 @@ class WorkflowRunContext:
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
+
+    def is_registered_credential_parameter_key(self, key: str) -> bool:
+        """Whether ``key`` was registered as one of the credential parameter types.
+
+        Ordinary workflow/run inputs can share the dict-with-``totp`` shape but are not
+        credentials; only a registered credential parameter owns a credential-backed TOTP
+        secret. Callers use this to keep arbitrary run inputs out of credential-only paths.
+        """
+        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
 
     def find_credential_parameter_key_for_secret(self, secret_id: str) -> str | None:
         for parameter_key, value in self.values.items():

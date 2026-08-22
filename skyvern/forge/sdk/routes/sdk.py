@@ -5,12 +5,18 @@ from fastapi import Depends, HTTPException, status
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
+from skyvern.exceptions import (
+    MissingBrowserStatePage,
+    ScrapingFailed,
+    ScreenshotTargetClosed,
+    SkyvernActionFailed,
+    SkyvernHTTPException,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.sdk_actions import (
@@ -95,6 +101,7 @@ async def run_sdk_action(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Workflow {workflow_run.workflow_id} not found",
             )
+        task_type = TaskType.general
     else:
         workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
             organization,
@@ -112,9 +119,7 @@ async def run_sdk_action(
             version=None,
             trigger_type=WorkflowRunTriggerType.api,
         )
-        workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(
-            workflow_run_id=workflow_run.workflow_run_id,
-        )
+        task_type = TaskType.synthetic_sdk_action
 
     task = await app.DATABASE.tasks.create_task(
         organization_id=organization_id,
@@ -126,7 +131,13 @@ async def run_sdk_action(
         workflow_run_id=workflow_run.workflow_run_id,
         browser_session_id=browser_session_id,
         browser_address=browser_address,
+        task_type=task_type,
     )
+
+    if created_workflow_run:
+        workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
 
     step = await app.DATABASE.tasks.create_step(
         task.task_id,
@@ -283,6 +294,54 @@ async def run_sdk_action(
                 error=e.reason,
             )
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=e.reason)
+        except ScreenshotTargetClosed as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the browser target was closed",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The browser page, context or browser was closed before the action could complete.",
+            )
+        except MissingBrowserStatePage as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the browser had no page left to act on",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The browser had no page left to act on before the action could complete.",
+            )
+        except SkyvernHTTPException as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed with a typed HTTP error",
+                action_type=action.type,
+                status_code=e.status_code,
+                error=str(e),
+            )
+            raise
         except Exception as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,

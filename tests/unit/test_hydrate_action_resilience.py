@@ -5,7 +5,6 @@ endpoint via ValidationError propagation.
 """
 
 import inspect
-from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -22,6 +21,7 @@ from skyvern.webeye.actions.actions import (
     MoveAction,
     UploadFileAction,
 )
+from tests.unit.helpers import make_action_row as _action_row
 
 
 def _task() -> SimpleNamespace:
@@ -47,37 +47,6 @@ def _session_yielding(rows: list) -> Any:
             return _Result()
 
     return staticmethod(lambda *_args: _Session())
-
-
-def _action_row(**overrides: Any) -> SimpleNamespace:
-    """Build a minimal duck-typed stand-in for ActionModel."""
-    base: dict[str, Any] = {
-        "action_id": "act_test",
-        "action_type": ActionType.MOVE,
-        "status": ActionStatus.completed,
-        "source_action_id": None,
-        "organization_id": "o_test",
-        "workflow_run_id": "wr_test",
-        "task_id": "tsk_test",
-        "step_id": "stp_test",
-        "step_order": 0,
-        "action_order": 0,
-        "confidence_float": None,
-        "reasoning": None,
-        "intention": None,
-        "response": None,
-        "element_id": None,
-        "skyvern_element_hash": None,
-        "skyvern_element_data": None,
-        "screenshot_artifact_id": None,
-        "started_at": None,
-        "finished_at": None,
-        "created_at": datetime(2026, 5, 6, 0, 0, 0),
-        "modified_at": datetime(2026, 5, 6, 0, 0, 0),
-        "action_json": None,
-    }
-    base.update(overrides)
-    return SimpleNamespace(**base)
 
 
 def test_hydrate_action_happy_path_returns_subclass() -> None:

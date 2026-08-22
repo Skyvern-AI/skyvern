@@ -131,6 +131,15 @@ def test_uvicorn_run_configuration(module_path: str) -> None:
         assert isinstance(loop_kwarg.value, ast.Constant) and loop_kwarg.value.value == "asyncio", (
             f"{module_path} must select loop='asyncio' until MagicStack/uvloop#740 is released"
         )
+        keep_alive_kwarg = next((kw for kw in node.keywords if kw.arg == "timeout_keep_alive"), None)
+        assert keep_alive_kwarg is not None, (
+            f"{module_path} must pass timeout_keep_alive= to uvicorn.run(); uvicorn's 5s default "
+            "sits below any load balancer idle timeout, which is AWS's documented 502 condition."
+        )
+        assert (
+            isinstance(keep_alive_kwarg.value, ast.Attribute)
+            and keep_alive_kwarg.value.attr == "UVICORN_TIMEOUT_KEEP_ALIVE"
+        ), f"{module_path} must source timeout_keep_alive from settings.UVICORN_TIMEOUT_KEEP_ALIVE"
         for kw in node.keywords:
             assert kw.arg != "log_level", (
                 f"{module_path} must not pass log_level= to uvicorn.run(); it triggers "

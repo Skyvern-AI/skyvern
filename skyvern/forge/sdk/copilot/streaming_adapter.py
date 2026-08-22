@@ -348,8 +348,11 @@ async def stream_to_sse(
                 ctx.in_flight_stream_tool_call = InFlightStreamToolCall(
                     call_id=call_id, tool_name=tool_name, iteration=iteration, display_label=display_label
                 )
+                tool_call_ts = datetime.now(timezone.utc)
                 narrator_state.record_activity(
-                    build_tool_call_activity(tool_name, iteration, call_id, display_label=display_label)
+                    build_tool_call_activity(
+                        tool_name, iteration, call_id, timestamp=tool_call_ts, display_label=display_label
+                    )
                 )
 
                 if not client_gone:
@@ -361,6 +364,7 @@ async def stream_to_sse(
                             tool_input=_sanitize_input(tool_input),
                             iteration=iteration,
                             tool_call_id=call_id,
+                            timestamp=tool_call_ts,
                         )
                     )
 
@@ -401,9 +405,16 @@ async def stream_to_sse(
                         parsed, tool_name=tool_name, blocker_signal=blocker_signals, success=success
                     )
                     result_label = call_id_to_label.get(call_id) or tool_activity_display_label(tool_name)
+                    tool_result_ts = datetime.now(timezone.utc)
                     narrator_state.record_activity(
                         build_tool_result_activity(
-                            tool_name, summary, success, iteration, call_id, display_label=result_label
+                            tool_name,
+                            summary,
+                            success,
+                            iteration,
+                            call_id,
+                            timestamp=tool_result_ts,
+                            display_label=result_label,
                         )
                     )
 
@@ -419,6 +430,7 @@ async def stream_to_sse(
                                 tool_call_id=call_id,
                                 detail=detail,
                                 workflow_run_id=_tool_result_workflow_run_id(tool_name, parsed),
+                                timestamp=tool_result_ts,
                             )
                         )
 
@@ -543,11 +555,18 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
     summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
     success = user_facing_success(parsed, blocker_signal=blocker_signals)
     display_label = pending.display_label or tool_activity_display_label(pending.tool_name)
+    flush_ts = datetime.now(timezone.utc)
     narrator_state = ctx.narrator_state
     if narrator_state is not None:
         narrator_state.record_activity(
             build_tool_result_activity(
-                pending.tool_name, summary, success, pending.iteration, pending.call_id, display_label=display_label
+                pending.tool_name,
+                summary,
+                success,
+                pending.iteration,
+                pending.call_id,
+                timestamp=flush_ts,
+                display_label=display_label,
             )
         )
     if await stream.is_disconnected():
@@ -565,6 +584,7 @@ async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: Copil
                 parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals, success=success
             ),
             workflow_run_id=_tool_result_workflow_run_id(pending.tool_name, parsed),
+            timestamp=flush_ts,
         )
     )
 

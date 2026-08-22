@@ -6,29 +6,52 @@ helper classifies it and logs info, but each caller frame decided severity indep
 suppressing one frame just moved the ERROR-with-traceback — and the auto-filed Error Tracking
 issue — up to the next one. ``agent_step`` now passes it through as an expected terminal failure
 alongside ``ScrapingFailed`` / ``MissingBrowserStatePage``, and ``execute_step`` fails the task
-cleanly at warning. These tests pin every frame, with controls so unrelated failures still ERROR.
+cleanly at warning. Task teardown, the action handler, complete-action verification and the SDK
+route (``test_run_sdk_action_failures.py``) were the frames left over from that first pass. These
+tests pin every frame, with controls so unrelated failures still ERROR.
+
+``MissingBrowserStatePage`` is the same class of condition -- the browser context is gone, so no
+page exists to scrape -- and it needs the same pass-through. ``scrape_website`` laundered it into
+``ScrapingFailed``, which the step's scrape ladder treats as retryable, so a closed context spent
+every rung of ``SCRAPE_TYPE_ORDER`` re-discovering that the browser was still gone before failing.
 """
 
 from __future__ import annotations
 
 import inspect
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from playwright._impl._errors import TargetClosedError
 
 import skyvern.forge.agent as agent_mod
 import skyvern.services.task_v2_service as task_v2_mod
+import skyvern.webeye.actions.handler as handler_mod
 import skyvern.webeye.scraper.scraper as scraper_mod
-from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed
+from skyvern.exceptions import (
+    BrowserStateDiagnostic,
+    FailedToTakeScreenshot,
+    MissingBrowserStatePage,
+    ScrapingFailed,
+    ScreenshotTargetClosed,
+)
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
+from skyvern.webeye.actions.actions import ActionType, ClickAction, CompleteAction
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.test_agent_step_characterization import make_agent_step_rig
+
+
+@asynccontextmanager
+async def _noop_async_context(*args: Any, **kwargs: Any) -> AsyncIterator[None]:
+    yield
 
 
 def _agent_rig(
@@ -193,6 +216,140 @@ class TestScrapeRetryLoopTargetClosed:
         assert any("All scrape attempts failed" in str(call.args[0]) for call in log.error.call_args_list)
 
 
+def _browser_gone() -> MissingBrowserStatePage:
+    """A missing page whose browser state already observed an unrecovered disconnect."""
+    now = datetime.now(UTC)
+    return MissingBrowserStatePage(
+        task_id="tsk_gone",
+        diagnostic=BrowserStateDiagnostic(
+            reason="browser_context_close_event",
+            disconnect_observed_at=now,
+            event="browser_context_close",
+            observation_source="browser_event",
+        ),
+        detected_at=now,
+    )
+
+
+class TestMissingBrowserStatePagePassThrough:
+    """A closed browser context is terminal: ``check_and_fix_state`` only rebuilds when
+    ``browser_context`` is ``None`` (a closed context is not), and ``_reopen_lost_working_page``
+    bails on a disconnected context. Every further scrape attempt is guaranteed to fail the same
+    way, so the scraper must surface the condition instead of relabelling it a scrape failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scrape_website_reraises_missing_page_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = _browser_gone()
+        monkeypatch.setattr(scraper_mod, "scrape_web_unsafe", AsyncMock(side_effect=error))
+        monkeypatch.setattr(scraper_mod, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
+
+        with pytest.raises(MissingBrowserStatePage) as exc_info:
+            await scraper_mod.scrape_website(
+                browser_state=MagicMock(),
+                url="https://example.test/apply",
+                cleanup_element_tree=AsyncMock(),
+                max_retries=0,
+            )
+
+        assert exc_info.value is error
+
+    @pytest.mark.asyncio
+    async def test_scrape_website_retries_are_not_spent_on_a_gone_browser(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``max_retries`` is 0 in production, but a caller passing a budget must not spend it either."""
+        scrape = AsyncMock(side_effect=_browser_gone())
+        monkeypatch.setattr(scraper_mod, "scrape_web_unsafe", scrape)
+        monkeypatch.setattr(scraper_mod, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
+
+        with pytest.raises(MissingBrowserStatePage):
+            await scraper_mod.scrape_website(
+                browser_state=MagicMock(),
+                url="https://example.test/apply",
+                cleanup_element_tree=AsyncMock(),
+                max_retries=3,
+            )
+
+        assert scrape.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_page_without_an_observed_disconnect_keeps_its_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: no disconnect was observed, so the page may yet reopen -- the browser is not
+        provably gone and the caller's ladder still deserves its attempts."""
+        scrape = AsyncMock(side_effect=MissingBrowserStatePage(task_id="tsk_maybe"))
+        monkeypatch.setattr(scraper_mod, "scrape_web_unsafe", scrape)
+        monkeypatch.setattr(scraper_mod, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
+
+        with pytest.raises(ScrapingFailed):
+            await scraper_mod.scrape_website(
+                browser_state=MagicMock(),
+                url="https://example.test/apply",
+                cleanup_element_tree=AsyncMock(),
+                max_retries=0,
+            )
+
+    def _ladder_rig(self, monkeypatch: pytest.MonkeyPatch, scrape_error: Exception) -> tuple[ForgeAgent, list, dict]:
+        now = datetime.now(UTC)
+        organization = make_organization(now)
+        task = make_task(now, organization)
+        step = make_step(now, task, step_id="step-gone", status=StepStatus.running, order=0, output=None)
+        browser_state, _, _ = make_browser_state()
+
+        monkeypatch.setattr(scraper_mod, "scrape_web_unsafe", AsyncMock(side_effect=scrape_error))
+        monkeypatch.setattr(scraper_mod, "build_scraping_failed_reason", AsyncMock(return_value="reason"))
+        monkeypatch.setattr(
+            agent_mod.app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False)
+        )
+        skyvern_context.set(SkyvernContext(task_id=task.task_id, organization_id=task.organization_id))
+
+        # Drive the real scraper so the ladder sees the exception type scrape_website actually raises.
+        attempts: list[object] = []
+
+        async def scrape_with_type(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(kwargs.get("scrape_type"))
+            return await scraper_mod.scrape_website(
+                browser_state=browser_state,
+                url=task.url,
+                cleanup_element_tree=AsyncMock(),
+                max_retries=0,
+            )
+
+        agent = ForgeAgent()
+        monkeypatch.setattr(agent, "_scrape_with_type", scrape_with_type)
+
+        return (
+            agent,
+            attempts,
+            {"task": task, "step": step, "browser_state": browser_state, "engine": RunEngine.skyvern_v1},
+        )
+
+    @pytest.mark.asyncio
+    async def test_ladder_stops_at_the_first_rung_when_the_browser_is_gone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, attempts, kwargs = self._ladder_rig(monkeypatch, _browser_gone())
+
+        with pytest.raises(MissingBrowserStatePage):
+            await agent.build_and_record_step_prompt(**kwargs)
+
+        assert len(attempts) == 1, f"a closed browser context still cost {len(attempts)} scrape attempts"
+
+    @pytest.mark.asyncio
+    async def test_ladder_still_spends_every_rung_on_a_real_scrape_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: a site-caused failure is still worth retrying with the next strategy."""
+        agent, attempts, kwargs = self._ladder_rig(monkeypatch, RuntimeError("boom"))
+
+        with pytest.raises(ScrapingFailed):
+            await agent.build_and_record_step_prompt(**kwargs)
+
+        assert len(attempts) == len(agent_mod.SCRAPE_TYPE_ORDER)
+
+
 class TestAgentStepPassThrough:
     """``agent_step`` must treat a closed target as an expected terminal failure, the way it already
     treats ``ScrapingFailed`` / ``MissingBrowserStatePage`` — otherwise its generic handler re-files
@@ -225,6 +382,144 @@ class TestAgentStepPassThrough:
         await rig.run()
 
         log.exception.assert_called()
+
+
+class TestCleanUpTaskTargetClosed:
+    """The final screenshot is best-effort teardown, taken while the browser is being torn down.
+    The narrow handler only named Playwright's ``TargetClosedError``, but the screenshot helper
+    stopped letting that through -- it classifies and re-raises ``ScreenshotTargetClosed``.
+    """
+
+    def _rig(self, monkeypatch: pytest.MonkeyPatch, screenshot_error: Exception) -> tuple[MagicMock, dict]:
+        now = datetime.now(UTC)
+        organization = make_organization(now)
+        task = make_task(now, organization, workflow_run_id="wr-cleanup")
+        step = make_step(now, task, step_id="step-cleanup", status=StepStatus.completed, order=0, output=None)
+
+        browser_state, _, page = make_browser_state()
+        browser_state.get_working_page = AsyncMock(return_value=page)
+        browser_state.take_fullpage_screenshot = AsyncMock(side_effect=screenshot_error)
+
+        app_mock = MagicMock()
+        app_mock.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        app_mock.BROWSER_MANAGER.get_for_task = MagicMock(return_value=browser_state)
+        app_mock.ARTIFACT_MANAGER.create_artifact = AsyncMock()
+        monkeypatch.setattr(agent_mod, "app", app_mock)
+        monkeypatch.setattr(agent_mod.analytics, "capture", MagicMock())
+        monkeypatch.setattr(agent_mod, "settle_browser_downloads_for_context", _noop_async_context)
+
+        log = MagicMock()
+        monkeypatch.setattr(agent_mod, "LOG", log)
+        skyvern_context.set(SkyvernContext(task_id=task.task_id, organization_id=task.organization_id))
+
+        return log, {"task": task, "last_step": step}
+
+    @pytest.mark.asyncio
+    async def test_closed_target_is_logged_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, ScreenshotTargetClosed(error_message="Page is closed"))
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        log.exception.assert_not_called()
+        assert any("page is closed" in str(call.args[0]).lower() for call in log.warning.call_args_list), (
+            f"closed target was not warned about: {log.warning.call_args_list}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_screenshot_failures_still_log_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, kwargs = self._rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
+
+        await ForgeAgent().clean_up_task(**kwargs)
+
+        assert any(
+            "Failed to take screenshot before sending task response" in str(call.args[0])
+            for call in log.exception.call_args_list
+        )
+
+
+class TestHandleActionTargetClosed:
+    async def _run(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[MagicMock, list]:
+        now = datetime.now(UTC)
+        task = make_task(now, make_organization(now))
+        step = make_step(now, task, step_id="step-action", status=StepStatus.running, order=0, output=None)
+
+        async def failing_handler(*args: object, **kwargs: object) -> None:
+            raise error
+
+        app_mock = MagicMock()
+        app_mock.AGENT_FUNCTION.wait_for_challenge_solver = AsyncMock()
+        log = MagicMock()
+        monkeypatch.setattr(handler_mod, "app", app_mock)
+        monkeypatch.setattr(handler_mod, "LOG", log)
+
+        with (
+            patch.dict(handler_mod.ActionHandler._handled_action_types, {ActionType.CLICK: failing_handler}),
+            patch.dict(handler_mod.ActionHandler._setup_action_types, {}, clear=True),
+            patch.dict(handler_mod.ActionHandler._teardown_action_types, {}, clear=True),
+        ):
+            results = await handler_mod.ActionHandler._handle_action(
+                scraped_page=MagicMock(id_to_element_dict={"el": {"id": "el"}}),
+                task=task,
+                step=step,
+                page=MagicMock(),
+                action=ClickAction(element_id="el"),
+            )
+        return log, results
+
+    @pytest.mark.asyncio
+    async def test_closed_target_fails_the_action_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, results = await self._run(monkeypatch, ScreenshotTargetClosed(error_message="Page is closed"))
+
+        assert len(results) == 1 and results[0].success is False
+        assert results[0].exception_type == "ScreenshotTargetClosed"
+        log.exception.assert_not_called()
+        log.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_other_failures_still_log_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, results = await self._run(monkeypatch, RuntimeError("boom"))
+
+        assert len(results) == 1 and results[0].success is False
+        assert any(
+            "Unhandled exception in action handler" in str(call.args[0]) for call in log.exception.call_args_list
+        )
+
+
+class TestCompleteActionVerificationTargetClosed:
+    async def _run(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> tuple[MagicMock, list]:
+        now = datetime.now(UTC)
+        task = make_task(now, make_organization(now))
+        step = make_step(now, task, step_id="step-complete", status=StepStatus.running, order=0, output=None)
+
+        app_mock = MagicMock()
+        app_mock.agent.complete_verify = AsyncMock(side_effect=error)
+        log = MagicMock()
+        monkeypatch.setattr(handler_mod, "app", app_mock)
+        monkeypatch.setattr(handler_mod, "LOG", log)
+
+        results = await handler_mod.handle_complete_action(
+            CompleteAction(),
+            MagicMock(),
+            MagicMock(),
+            task,
+            step,
+        )
+        return log, results
+
+    @pytest.mark.asyncio
+    async def test_closed_target_fails_verification_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, results = await self._run(monkeypatch, ScreenshotTargetClosed(error_message="Page is closed"))
+
+        assert len(results) == 1 and results[0].success is False
+        log.exception.assert_not_called()
+        log.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_other_failures_still_log_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        log, results = await self._run(monkeypatch, RuntimeError("boom"))
+
+        assert len(results) == 1 and results[0].success is False
+        assert any("Failed to verify the complete action" in str(call.args[0]) for call in log.exception.call_args_list)
 
 
 class TestTaskV2IterationTargetClosed:

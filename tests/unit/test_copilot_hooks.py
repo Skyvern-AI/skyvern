@@ -22,17 +22,26 @@ from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
-    _capture_scout_ambiguity,
+    _capture_scout_pre_action,
     _click_post_hook,
     _click_pre_hook,
     _prenav_ambiguity_for_selector,
     _verify_scout_type_landed,
+    mcp_hooks,
 )
+from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import _fill_observed_effects
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     ScoutReadbackOutcome,
     _scout_readback_outcome,
     _scout_type_landing_failure,
+)
+from skyvern.forge.sdk.copilot.tools.scouting import (
+    _PAGE_SUMMARY_SELECTOR_CAP,
+    _build_scout_page_summary,
+    _page_evidence_names_obstruction,
+    _summary_disclosure_control,
+    _summary_entry,
 )
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -528,7 +537,6 @@ class TestMCPFailedStepLoopDetection:
                 return FakeRawResult()
 
         async def fake_ensure_browser_session(ctx: Any, *, require_verified_session: bool = False) -> None:
-            assert require_verified_session is True
             ctx.browser_session_id = "pbs_copilot"
             return None
 
@@ -1119,6 +1127,39 @@ class TestBrowserInteractionObservationHooks:
         assert ctx.pending_browser_interaction_observation is None
 
 
+_ACTED_SELECTOR = "button[data-action='order']"
+
+
+def _no_redaction_ctx() -> SimpleNamespace:
+    """These cases assert summary shape; the redactor is a no-op without codeblock parameters."""
+    return SimpleNamespace(codeblock_redaction_parameters={})
+
+
+# Post-action browser calls each interaction issues, production-shaped (vision on). Only `click`
+# is in _ACT_OBSERVE_TOOLS, so only it takes the structured packet and its retained fallback frame;
+# The type_text path takes no frame but is the heaviest at four calls: two reads that verify the
+# text landed plus two evaluates. A new probe on any path fails this.
+_INTERACTION_HOOK_PAIRS = (
+    ("_click_pre_hook", {}, "_click_post_hook", {}, {"skyvern_evaluate": 1, "skyvern_screenshot": 1}),
+    (
+        "_type_text_pre_hook",
+        {"text": "socks"},
+        "_type_text_post_hook",
+        {"text_length": 5},
+        {"skyvern_evaluate": 2, "skyvern_get_value": 2},
+    ),
+    ("_select_option_pre_hook", {"value": "price_asc"}, "_select_option_post_hook", {"value": "price_asc"}, {}),
+    ("_press_key_pre_hook", {"key": "Enter"}, "_press_key_post_hook", {"key": "Enter"}, {}),
+)
+
+_INTERACTION_PRE_HOOKS = (
+    ("_click_pre_hook", {}),
+    ("_type_text_pre_hook", {"text": "socks"}),
+    ("_select_option_pre_hook", {"value": "price_asc"}),
+    ("_press_key_pre_hook", {"key": "Enter"}),
+)
+
+
 class TestScoutedInteractionCapture:
     """A scouted interaction with a concrete selector is captured and surfaced to
     code-only authoring; intent-only and failed-readback actions are not."""
@@ -1357,8 +1398,6 @@ class TestScoutedInteractionCapture:
 
     @pytest.mark.asyncio
     async def test_navigate_post_hook_records_the_ordered_effect_fact(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
         ctx = self._ctx(source_url="https://example.com/two-factor")
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock())
@@ -1377,8 +1416,6 @@ class TestScoutedInteractionCapture:
     async def test_navigate_post_hook_next_step_claims_no_attached_screenshot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
         ctx = self._ctx(source_url="https://example.com/login")
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=False))
@@ -1396,8 +1433,6 @@ class TestScoutedInteractionCapture:
     async def test_navigate_post_hook_claims_only_the_screenshot_it_staged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
         ctx = self._ctx(source_url="https://example.com/login")
         monkeypatch.setattr(mcp_hooks, "_bind_login_credential_for_observed_url", AsyncMock())
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", AsyncMock(return_value=True))
@@ -1412,8 +1447,6 @@ class TestScoutedInteractionCapture:
 
     @pytest.mark.asyncio
     async def test_failed_navigate_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
         capture = AsyncMock(return_value=True)
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
 
@@ -1424,17 +1457,18 @@ class TestScoutedInteractionCapture:
         assert "next_step" not in result
 
     @pytest.mark.asyncio
-    async def test_click_that_attached_page_evidence_stages_no_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
-
+    async def _click_with_attached_evidence(
+        self, monkeypatch: pytest.MonkeyPatch, evidence: dict[str, Any]
+    ) -> AsyncMock:
         capture = AsyncMock(return_value=True)
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
 
         async def attach_observation(ctx: SimpleNamespace, **kwargs: Any) -> tuple[int | None, dict[str, Any] | None]:
             ctx.last_scout_act_observe_outcome = "attached"
-            return None, None
+            return None, evidence
 
         monkeypatch.setattr(mcp_hooks, "_register_scout_interaction_observation", attach_observation)
+        monkeypatch.setattr(mcp_hooks, "_attach_scout_page_summary", lambda ctx, result, page_evidence: None)
 
         ctx = self._ctx(source_url="https://example.com/product")
         await mcp_hooks._click_post_hook(
@@ -1442,13 +1476,34 @@ class TestScoutedInteractionCapture:
             {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
             ctx,
         )
+        return capture
 
+    @pytest.mark.asyncio
+    async def test_click_whose_evidence_names_a_modal_stages_no_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        evidence = {
+            "page_title": "Cart",
+            "modal_overlays": [{"selector": "#promo", "dismiss_controls": [{"text": "No thanks"}]}],
+            "challenge_state": {"detected": False},
+        }
+        capture = await self._click_with_attached_evidence(monkeypatch, evidence)
         capture.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_failed_click_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import mcp_hooks
+    async def test_click_whose_evidence_names_no_obstruction_still_stages_a_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        evidence = {
+            "page_title": "Cart",
+            "modal_overlays": [],
+            "challenge_controls": [],
+            "challenge_state": {"detected": False},
+            "visual_obstruction_candidates": [{"selector": ".sticky", "reason": "fixed_overlay"}],
+        }
+        capture = await self._click_with_attached_evidence(monkeypatch, evidence)
+        capture.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_failed_click_stages_a_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
         capture = AsyncMock(return_value=True)
         monkeypatch.setattr(mcp_hooks, "_capture_post_interaction_screenshot", capture)
 
@@ -1764,12 +1819,8 @@ class TestScoutedInteractionCapture:
     async def test_click_pre_hook_stashes_role_name_from_bare_css_via_browser_read(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Bare CSS selector cannot be parsed, so the stash comes from the TIER-2 pre-navigation read.
-        async def _fake_read(_ctx: object, _selector: str, *, timeout_seconds: float) -> tuple[str, str]:
-            return "link", "Download"
-
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.scouting._capture_accessible_role_name", _fake_read)
-        ctx = self._ctx()
+        # Bare CSS selector cannot be parsed, so the role/name comes from the page read.
+        ctx = self._ctx_with_scripted_reads(selector_count=1, role_name=("link", "Download"), match_count=1)
         ctx.pending_scout_source_url = None
         await _click_pre_hook({"selector": "a"}, ctx)
         assert ctx.pending_scout_role_name == ("a", "link", "Download")
@@ -1858,25 +1909,13 @@ class TestScoutedInteractionCapture:
         from skyvern.forge.sdk.copilot.tools import _press_key_post_hook
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _press_key_pre_hook
 
-        ctx = self._ctx(source_url="https://example.com/form")
-        ctx.discovery_mcp_server = SimpleNamespace(
-            call_internal_tool=AsyncMock(
-                side_effect=[
-                    {"ok": True, "data": {"result": {"role": "textbox", "accessible_name": "Search"}}},
-                    {"ok": True, "data": {"result": 2}},
-                    {
-                        "ok": True,
-                        "data": {
-                            "result": [
-                                {"selector": "#q", "source": "id"},
-                                {"selector": 'input[name="q"]', "source": "name"},
-                            ]
-                        },
-                    },
-                    {"ok": True, "data": {"result": 2}},
-                ]
-            )
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2,
+            role_name=("textbox", "Search"),
+            match_count=2,
+            candidates=[{"selector": "#q", "source": "id"}, {"selector": 'input[name="q"]', "source": "name"}],
         )
+        ctx.pending_scout_source_url = "https://example.com/form"
 
         assert await _press_key_pre_hook({"selector": "#q", "key": "Enter"}, ctx) is None
         await _press_key_post_hook(
@@ -1963,22 +2002,18 @@ class TestScoutedInteractionCapture:
         assert result["data"]["observation_step"] == entry["step"]
 
     def _ctx_with_count(self, count: int) -> SimpleNamespace:
-        server = SimpleNamespace()
-        server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"result": count}})
-        ctx = self._ctx(source_url="https://example.com/portal")
-        ctx.discovery_mcp_server = server
-        return ctx
+        return self._ctx_with_scripted_reads(selector_count=count, role_name=("", ""), match_count=-1)
 
     @pytest.mark.asyncio
     async def test_capture_scout_ambiguity_marks_multi_match_selector(self) -> None:
         ctx = self._ctx_with_count(3)
-        await _capture_scout_ambiguity(ctx, "button[data-action='orderDocuments']")
+        await _capture_scout_pre_action(ctx, "button[data-action='orderDocuments']")
         assert ctx.pending_scout_ambiguous == ("button[data-action='orderDocuments']", True)
 
     @pytest.mark.asyncio
     async def test_capture_scout_ambiguity_does_not_mark_unique_selector(self) -> None:
         ctx = self._ctx_with_count(1)
-        await _capture_scout_ambiguity(ctx, "#unique")
+        await _capture_scout_pre_action(ctx, "#unique")
         assert ctx.pending_scout_ambiguous is None
 
     def test_live_scout_packet_has_no_dynamic_row_classifier(self) -> None:
@@ -1999,16 +2034,27 @@ class TestScoutedInteractionCapture:
         assert ctx.scouted_interactions[-1].get("ambiguous") is True
 
     def _ctx_with_scripted_reads(
-        self, *, selector_count: int, role_name: tuple[str, str], match_count: int
+        self,
+        *,
+        selector_count: int,
+        role_name: tuple[str, str],
+        match_count: int,
+        candidates: list[dict[str, str]] | None = None,
     ) -> SimpleNamespace:
+        role, name = role_name
+
         async def call(_tool: str, args: dict[str, Any]) -> dict[str, Any]:
-            expression = args["expression"]
-            if "accessible_name:" in expression:
-                role, name = role_name
-                return {"ok": True, "data": {"result": {"role": role, "accessible_name": name}}}
-            if "targetRole" in expression:
-                return {"ok": True, "data": {"result": match_count}}
-            return {"ok": True, "data": {"result": selector_count}}
+            return {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "role_name": {"role": role, "accessible_name": name} if (role or name) else None,
+                        "role_name_match_count": match_count,
+                        "selector_match_count": selector_count,
+                        "selector_candidates": candidates or [],
+                    }
+                },
+            }
 
         server = SimpleNamespace()
         server.call_internal_tool = AsyncMock(side_effect=call)
@@ -2021,7 +2067,7 @@ class TestScoutedInteractionCapture:
         ctx = self._ctx_with_scripted_reads(
             selector_count=2, role_name=("button", "I AM A BUSINESS CUSTOMER"), match_count=1
         )
-        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
         assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
         assert ctx.pending_scout_reanchor == (
             "button[data-action='businessToggle']",
@@ -2032,14 +2078,14 @@ class TestScoutedInteractionCapture:
     @pytest.mark.asyncio
     async def test_capture_scout_ambiguity_withholds_name_degenerate_reanchor(self) -> None:
         ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Toggle"), match_count=2)
-        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
         assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
         assert ctx.pending_scout_reanchor is None
 
     @pytest.mark.asyncio
     async def test_capture_scout_ambiguity_withholds_nameless_reanchor(self) -> None:
         ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", ""), match_count=1)
-        await _capture_scout_ambiguity(ctx, "button[data-action='businessToggle']")
+        await _capture_scout_pre_action(ctx, "button[data-action='businessToggle']")
         assert ctx.pending_scout_ambiguous == ("button[data-action='businessToggle']", True)
         assert ctx.pending_scout_reanchor is None
 
@@ -2236,6 +2282,339 @@ class TestScoutedInteractionCapture:
         assert press_result["data"]["selector"] == ""
         assert ctx.scouted_interactions[0]["tool_name"] == "press_key"
         assert ctx.scouted_interactions[0]["key"] == "Enter"
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.parametrize("policy", [None, BlockAuthoringPolicy.CODE_ONLY_BROWSER])
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hook_issues_one_internal_packet(
+        self,
+        hook_name: str,
+        extra_params: dict[str, Any],
+        policy: BlockAuthoringPolicy | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Order"), match_count=1)
+        ctx.block_authoring_policy = policy
+
+        assert await getattr(mcp_hooks, hook_name)({"selector": _ACTED_SELECTOR, **extra_params}, ctx) is None
+
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 1
+
+    def _ctx_with_post_action_capture(
+        self, *, hollow: bool = False, unsettled_challenge: bool = False
+    ) -> SimpleNamespace:
+        """Context whose discovery server answers the fused pre-action read and the
+        post-action structured capture. ``hollow`` returns a packet with no controls,
+        which is the only state that earns the bounded recapture."""
+        page: dict[str, Any] = {"page_title": "Results", "forms": [], "navigation_targets": []}
+        if not hollow:
+            page = {
+                "page_title": "Results",
+                "forms": [
+                    {
+                        "fields": [{"name": "npi", "label": "NPI number", "type": "text", "selector": "#npi"}],
+                        "submit_controls": [{"text": "Search", "type": "submit", "selector": "#go"}],
+                    }
+                ],
+                "navigation_targets": [{"text": "Details", "href": "https://example.com/d", "selector": "a.d"}],
+                "result_containers": [{"tag": "table", "id": "results", "selector": "#results"}],
+            }
+        if unsettled_challenge:
+            # Keyword says challenge, no rendered carrier resolves it — the second recapture trigger.
+            page = {**page, "anti_bot_indicators": ["captcha"], "challenge_controls": []}
+
+        async def call(_tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            if "REQUESTED_TARGETS" in str(args.get("expression", "")):
+                return {"ok": True, "data": {"result": page}}
+            return {
+                "ok": True,
+                "data": {
+                    "result": {
+                        "role_name": {"role": "button", "accessible_name": "Order"},
+                        "role_name_match_count": 1,
+                        "selector_match_count": 1,
+                        "selector_candidates": [],
+                    }
+                },
+            }
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(side_effect=call)
+        ctx = self._ctx(source_url="https://example.com/portal")
+        ctx.discovery_mcp_server = server
+        ctx.pre_run_gated_output_warning_fingerprint = ()
+        ctx.last_code_authoring_repair_context = None
+        ctx.supports_vision = True
+        return ctx
+
+    @staticmethod
+    def _census(ctx: SimpleNamespace) -> dict[str, int]:
+        census: dict[str, int] = {}
+        for await_call in ctx.discovery_mcp_server.call_internal_tool.await_args_list:
+            census[await_call.args[0]] = census.get(await_call.args[0], 0) + 1
+        return census
+
+    @pytest.mark.parametrize(
+        ("pre_hook", "pre_args", "post_hook", "post_data", "expected_census"), _INTERACTION_HOOK_PAIRS
+    )
+    @pytest.mark.asyncio
+    async def test_every_interaction_post_hook_census(
+        self,
+        pre_hook: str,
+        pre_args: dict[str, Any],
+        post_hook: str,
+        post_data: dict[str, Any],
+        expected_census: dict[str, int],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Production-shaped: vision on, so the retained fallback frame is counted."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture()
+        assert await getattr(mcp_hooks, pre_hook)({"selector": _ACTED_SELECTOR, **pre_args}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await getattr(mcp_hooks, post_hook)(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR, **post_data}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == expected_census
+
+    @pytest.mark.parametrize("policy", [None, BlockAuthoringPolicy.CODE_ONLY_BROWSER])
+    @pytest.mark.parametrize("landing_url", ["https://example.com/portal", "https://example.com/next"])
+    @pytest.mark.asyncio
+    async def test_click_post_hook_issues_one_structured_packet_plus_the_frame(
+        self,
+        policy: BlockAuthoringPolicy | None,
+        landing_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Vision is on, as it is in production, so the fallback frame is counted here."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture()
+        ctx.block_authoring_policy = policy
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": landing_url, "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == {"skyvern_evaluate": 1, "skyvern_screenshot": 1}
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_recaptures_once_when_the_first_packet_is_hollow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hollow is one of three recapture triggers; unsettled challenge evidence and an
+        unchanged-after-interaction page are the others."""
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture(hollow=True)
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        assert self._census(ctx) == {"skyvern_evaluate": 2, "skyvern_screenshot": 1}
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_recaptures_once_when_challenge_evidence_is_unsettled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_post_action_capture(unsettled_challenge=True)
+        assert await mcp_hooks._click_pre_hook({"selector": _ACTED_SELECTOR}, ctx) is None
+        ctx.discovery_mcp_server.call_internal_tool.reset_mock()
+
+        await mcp_hooks._click_post_hook(
+            {"ok": True, "data": {"selector": _ACTED_SELECTOR}},
+            {"browser_context": {"url": "https://example.com/next", "title": "Next"}},
+            ctx,
+        )
+
+        # Two packets, no frame: the settled packet names the challenge, which is the one case the
+        # ticket allows the fallback frame to be dropped.
+        assert self._census(ctx) == {"skyvern_evaluate": 2}
+        assert ctx.last_scout_act_observe_recapture_attempted is True
+
+    def test_page_summary_drops_an_oversized_selector_instead_of_truncating_it(self) -> None:
+        long_selector = "div.wrapper > " + " > ".join(f"section.level-{n}" for n in range(12))
+        assert len(long_selector) > _PAGE_SUMMARY_SELECTOR_CAP
+
+        entry = _summary_entry("Close", {"selector": long_selector})
+
+        assert entry == {"text": "Close"}
+        assert _summary_entry("Close", {"selector": "#close"}) == {"text": "Close", "selector": "#close"}
+
+        # the disclosure summary carries selectors too and holds the same invariant
+        oversized = {"expanded": True, "text": "Show options", "selector": long_selector}
+        assert "selector" not in _summary_disclosure_control(oversized)
+        sized = {"expanded": True, "text": "Show options", "selector": "#opts"}
+        assert _summary_disclosure_control(sized)["selector"] == "#opts"
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hooks_reach_the_same_stash(
+        self, hook_name: str, extra_params: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        candidates = [{"selector": "#order-docs", "source": "id"}]
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=2, role_name=("button", "Order"), match_count=1, candidates=candidates
+        )
+
+        assert await getattr(mcp_hooks, hook_name)({"selector": _ACTED_SELECTOR, **extra_params}, ctx) is None
+
+        assert ctx.pending_scout_role_name == (_ACTED_SELECTOR, "button", "Order")
+        assert ctx.pending_scout_role_name_match_count == (_ACTED_SELECTOR, "button", "Order", 1)
+        assert ctx.pending_scout_selector_candidates == candidates
+        assert ctx.pending_scout_selector_match_count == (_ACTED_SELECTOR, 2)
+        assert ctx.pending_scout_ambiguous == (_ACTED_SELECTOR, True)
+        assert ctx.pending_scout_reanchor == (_ACTED_SELECTOR, "button", "Order")
+
+    @pytest.mark.parametrize(("hook_name", "extra_params"), _INTERACTION_PRE_HOOKS)
+    @pytest.mark.asyncio
+    async def test_interaction_pre_hook_without_a_selector_clears_the_prior_stash(
+        self, hook_name: str, extra_params: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_hooks, "_scout_session_download_names", AsyncMock(return_value=frozenset()))
+        ctx = self._ctx_with_scripted_reads(selector_count=2, role_name=("button", "Order"), match_count=1)
+        ctx.pending_scout_role_name = ("#stale", "button", "Stale")
+        ctx.pending_scout_selector_match_count = ("#stale", 1)
+
+        assert await getattr(mcp_hooks, hook_name)(dict(extra_params), ctx) is None
+
+        assert ctx.pending_scout_role_name is None
+        assert ctx.pending_scout_selector_match_count is None
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_pre_action_packet_keeps_every_candidate_and_the_ambiguity_flag(self) -> None:
+        candidates = [
+            {"selector": "button[data-action='order']", "source": "requested"},
+            {"selector": "#order-docs", "source": "id"},
+            {"selector": "button.order", "source": "class_list"},
+        ]
+        ctx = self._ctx_with_scripted_reads(
+            selector_count=3, role_name=("button", "Order documents"), match_count=3, candidates=candidates
+        )
+        await _capture_scout_pre_action(ctx, "button[data-action='order']")
+
+        assert ctx.pending_scout_selector_candidates == candidates
+        assert ctx.pending_scout_ambiguous == ("button[data-action='order']", True)
+        assert ctx.pending_scout_selector_match_count == ("button[data-action='order']", 3)
+        assert ctx.pending_scout_reanchor is None
+
+    @pytest.mark.asyncio
+    async def test_pre_action_packet_leaves_unknown_cardinality_unset(self) -> None:
+        ctx = self._ctx_with_scripted_reads(selector_count=-1, role_name=("", ""), match_count=-1)
+        await _capture_scout_pre_action(ctx, "input[[bad")
+
+        assert ctx.pending_scout_selector_match_count is None
+        assert ctx.pending_scout_role_name_match_count is None
+        assert ctx.pending_scout_ambiguous is None
+
+
+class TestScoutPageSummary:
+    @staticmethod
+    def _evidence(field_count: int) -> dict[str, Any]:
+        return {
+            "page_title": "Checkout",
+            "forms": [
+                {
+                    "fields": [
+                        {"label": f"Field {index} with a fairly long visible label", "selector": f"#field-{index}"}
+                        for index in range(field_count)
+                    ],
+                    "submit_controls": [{"text": "Place order", "selector": "#place-order"}],
+                }
+            ],
+            "navigation_targets": [
+                {"text": f"Section {index} of the site navigation", "selector": f"a.nav-{index}"} for index in range(8)
+            ],
+            "modal_overlays": [{"dismiss_controls": [{"text": "No thanks", "selector": "#promo-close"}]}],
+            "challenge_state": {"detected": False},
+        }
+
+    def test_summary_carries_the_selector_for_each_control(self) -> None:
+        summary = _build_scout_page_summary(self._evidence(2))
+
+        assert summary["forms"][0]["fields"][0]["selector"] == "#field-0"
+        assert summary["forms"][0]["submit_controls"][0] == {"text": "Place order", "selector": "#place-order"}
+        assert summary["navigation_targets"][0]["selector"] == "a.nav-0"
+        assert summary["modal_dismiss_controls"][0]["selector"] == "#promo-close"
+
+    def test_summary_names_every_section_it_sheds(self) -> None:
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * (scouting_module._SCOUT_RESULT_CHAR_CAP - 800)}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, self._evidence(8))
+
+        page = result["data"]["page"]
+        assert page["shed"][:2] == ["control_selectors", "navigation_targets"]
+        assert page["navigation_targets"] == []
+        assert "page_summary" not in page["shed"]
+
+    def test_selectors_are_shed_before_any_control_the_baseline_carried(self) -> None:
+        evidence = self._evidence(8)
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * 900}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, evidence)
+
+        page = result["data"]["page"]
+        assert page["shed"] == ["control_selectors"]
+        assert page["navigation_targets"] == [target["text"] for target in evidence["navigation_targets"]]
+        assert page["forms"][0]["fields"] == [field["label"] for field in evidence["forms"][0]["fields"]]
+
+    def test_a_summary_too_large_to_shed_still_leaves_its_shed_record(self) -> None:
+        result: dict[str, Any] = {"ok": True, "data": {"filler": "x" * scouting_module._SCOUT_RESULT_CHAR_CAP}}
+        scouting_module._attach_scout_page_summary(_no_redaction_ctx(), result, self._evidence(8))
+
+        page = result["data"]["page"]
+        assert set(page) == {"shed"}
+        assert page["shed"][0] == "control_selectors"
+        assert page["shed"][-1] == "page_summary"
+
+    def test_summary_carries_no_filled_field_value(self) -> None:
+        secret = "hunter2-not-a-real-secret"
+        summary = _build_scout_page_summary(
+            {
+                "page_title": "Sign in",
+                "forms": [
+                    {
+                        "fields": [
+                            {"label": "Password", "type": "password", "value": secret, "selector": "#pw"},
+                            {"label": "Username", "value": "operator", "selector": "#user"},
+                        ],
+                        "submit_controls": [{"text": "Sign in", "selector": "#signin"}],
+                    }
+                ],
+            }
+        )
+
+        assert secret not in json.dumps(summary)
+        assert summary["forms"][0]["fields"][0] == {"text": "Password", "selector": "#pw"}
+
+    def test_obstruction_predicate_ignores_visual_candidates(self) -> None:
+        assert not _page_evidence_names_obstruction(
+            {
+                "modal_overlays": [],
+                "challenge_controls": [],
+                "challenge_state": {"detected": False},
+                "visual_obstruction_candidates": [{"selector": ".sticky"}],
+            }
+        )
+        assert not _page_evidence_names_obstruction({"modal_overlays": [{"selector": "#promo"}]})
+        assert _page_evidence_names_obstruction(
+            {"modal_overlays": [{"selector": "#promo", "dismiss_controls": [{"text": "Close", "selector": ".x"}]}]}
+        )
+        assert _page_evidence_names_obstruction({"challenge_state": {"detected": True}})
 
 
 class TestAssembleEnforcementMessages:

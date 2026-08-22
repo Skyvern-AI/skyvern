@@ -5,6 +5,7 @@ import re
 import time
 import typing
 from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import partial
 
 import structlog
@@ -45,6 +46,9 @@ _SENSITIVE_ENDPOINTS = {
 _SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;
+# there is nothing to act on, so they stay out of the warn tier.
+_ROUTINE_CLIENT_ERROR_STATUSES = frozenset({404, 405})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
@@ -56,6 +60,43 @@ _raw_request_exception_logger: ContextVar[typing.Callable[[int], None] | None] =
 _raw_request_stream_success_logger: ContextVar[typing.Callable[[int, str], None] | None] = ContextVar(
     "raw_request_stream_success_logger", default=None
 )
+
+
+@dataclass
+class _RequestIdentity:
+    organization_id: str | None = None
+    organization_name: str | None = None
+
+
+_request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
+
+
+def set_request_organization(organization_id: str | None, organization_name: str | None = None) -> None:
+    """Attribute the in-flight ``api.raw_request`` record to the authenticated organization.
+
+    Auth resolves in a child task of this middleware, and a ContextVar rebound there never
+    reaches the middleware that emits the record. Mutating the holder bound before
+    ``call_next`` does, because the child inherits the same object.
+    """
+    identity = _request_identity.get()
+    if identity is None:
+        return
+    if organization_id:
+        identity.organization_id = organization_id
+    if organization_name:
+        identity.organization_name = organization_name
+
+
+def _organization_log_fields() -> dict[str, str]:
+    identity = _request_identity.get()
+    if identity is None:
+        return {}
+    fields: dict[str, str] = {}
+    if identity.organization_id:
+        fields["organization_id"] = identity.organization_id
+    if identity.organization_name:
+        fields["organization_name"] = identity.organization_name
+    return fields
 
 
 def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
@@ -175,6 +216,7 @@ def _log_unhandled_request(
             headers=headers,
             exc_info=True,
             duration_seconds=time.monotonic() - start_time,
+            **_organization_log_fields(),
         )
     except Exception:
         pass
@@ -193,7 +235,7 @@ def _log_request(
 ) -> None:
     if status_code >= 500:
         log_method = LOG.error
-    elif status_code >= 400:
+    elif status_code >= 400 and status_code not in _ROUTINE_CLIENT_ERROR_STATUSES:
         log_method = LOG.warning
     else:
         log_method = LOG.info
@@ -211,6 +253,7 @@ def _log_request(
             # backwards-compat: keep error_body for existing Datadog queries
             error_body=response_body if status_code >= 400 else None,
             duration_seconds=time.monotonic() - start_time,
+            **_organization_log_fields(),
         )
     except Exception:
         pass
@@ -229,6 +272,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
         return await call_next(request)
 
     start_time = time.monotonic()
+    _request_identity.set(_RequestIdentity())
     try:
         body_bytes = await request.body()
     except ClientDisconnect:

@@ -1,6 +1,7 @@
 import logging
 import random
 import sys
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
@@ -883,6 +884,112 @@ def _categorize_exception(exc_type: type, exc_name: str) -> str:
     return "ERROR"
 
 
+_INTERPRETER_TRACEBACK_HOOK_MARKER = "_skyvern_interpreter_traceback_hook"
+_UNRAISABLE_OBJECT_REPR_CHARS = 512
+_INTERPRETER_HOOK_REENTRY = threading.local()
+
+
+def _log_interpreter_traceback(
+    msg: str,
+    exc_info: tuple[type[BaseException] | None, BaseException | None, TracebackType | None],
+    **fields: Any,
+) -> bool:
+    """Emit one structured record for a traceback the interpreter would print to stderr.
+
+    Returns False when the caller must fall back to the hook it replaced.
+    """
+    exc_type, exc_value, exc_traceback = exc_info
+    if exc_type is None or exc_value is None:
+        return False
+    # These hooks fire from arbitrary garbage-collection points, so emitting can itself trigger a
+    # collection whose finalizer raises another unraisable. Without this guard that recurses until
+    # the stack is exhausted.
+    if getattr(_INTERPRETER_HOOK_REENTRY, "active", False):
+        return False
+    _INTERPRETER_HOOK_REENTRY.active = True
+    try:
+        logging.getLogger("skyvern.interpreter").error(
+            msg,
+            exc_info=(exc_type, exc_value, exc_traceback),
+            extra={key: value for key, value in fields.items() if value is not None},
+        )
+    except Exception:
+        return False
+    finally:
+        _INTERPRETER_HOOK_REENTRY.active = False
+    return True
+
+
+def _unraisable_object_repr(obj: Any) -> str | None:
+    # CPython folds the object's repr into err_msg instead of setting `object` in some finalizer
+    # paths, so None here is normal and the field is dropped rather than rendered as "None".
+    if obj is None:
+        return None
+    try:
+        return str(_truncate_log_value(repr(obj), _UNRAISABLE_OBJECT_REPR_CHARS))
+    except BaseException:
+        return "<unrepresentable>"
+
+
+def _install_interpreter_traceback_hooks() -> None:
+    """Route the tracebacks the interpreter writes straight to stderr through the logging stack.
+
+    ``sys.excepthook``, ``threading.excepthook`` and ``sys.unraisablehook`` bypass ``logging``
+    entirely and print a multi-line traceback to stderr. A line-oriented collector bills each
+    frame as its own event, so one exception lands as ~30 unstitched events carrying none of the
+    ``error_type``/``exception_hash`` fields ``add_error_processor`` derives — which is what
+    ``exception_hash`` grouping and any error-rate threshold on the service are read against.
+    """
+    previous_excepthook = sys.excepthook
+    if not getattr(previous_excepthook, _INTERPRETER_TRACEBACK_HOOK_MARKER, False):
+
+        def excepthook(
+            exc_type: type[BaseException],
+            exc_value: BaseException,
+            exc_traceback: TracebackType | None,
+        ) -> None:
+            if issubclass(exc_type, (KeyboardInterrupt, SystemExit)) or not _log_interpreter_traceback(
+                "Uncaught exception", (exc_type, exc_value, exc_traceback)
+            ):
+                previous_excepthook(exc_type, exc_value, exc_traceback)
+
+        setattr(excepthook, _INTERPRETER_TRACEBACK_HOOK_MARKER, True)
+        sys.excepthook = excepthook
+
+    previous_threading_excepthook = threading.excepthook
+    if not getattr(previous_threading_excepthook, _INTERPRETER_TRACEBACK_HOOK_MARKER, False):
+        # Typed Any like codeblock_runner's unraisable hook: neither hook argument has a type
+        # CPython exposes at runtime, and these annotations are evaluated at import time.
+        def threading_excepthook(args: Any) -> None:
+            # threading's default hook drops SystemExit silently; keep that.
+            if args.exc_type is SystemExit or not _log_interpreter_traceback(
+                "Uncaught exception in thread",
+                (args.exc_type, args.exc_value, args.exc_traceback),
+                thread_name=args.thread.name if args.thread is not None else None,
+            ):
+                previous_threading_excepthook(args)
+
+        setattr(threading_excepthook, _INTERPRETER_TRACEBACK_HOOK_MARKER, True)
+        threading.excepthook = threading_excepthook
+
+    previous_unraisable_hook = sys.unraisablehook
+    if not getattr(previous_unraisable_hook, _INTERPRETER_TRACEBACK_HOOK_MARKER, False):
+
+        def unraisablehook(unraisable: Any) -> None:
+            # The default renders the object into the message; keeping it in its own field leaves
+            # `msg` low-cardinality enough to group on.
+            if not _log_interpreter_traceback(
+                "Exception ignored in interpreter callback",
+                (unraisable.exc_type, unraisable.exc_value, unraisable.exc_traceback),
+                unraisable_err_msg=unraisable.err_msg,
+                unraisable_object=_unraisable_object_repr(unraisable.object),
+            ):
+                previous_unraisable_hook(unraisable)
+
+        setattr(unraisablehook, _INTERPRETER_TRACEBACK_HOOK_MARKER, True)
+        sys.unraisablehook = unraisablehook
+
+
 def setup_logger() -> None:
     """
     Setup the logger with the specified format
@@ -1032,3 +1139,6 @@ def setup_logger() -> None:
     asyncio_logger = logging.getLogger("asyncio")
     asyncio_logger.filters = [f for f in asyncio_logger.filters if not isinstance(f, _DriverPipeNoiseFilter)]
     asyncio_logger.addFilter(_DriverPipeNoiseFilter())
+
+    # Last, so the handler these hooks log through is already installed.
+    _install_interpreter_traceback_hooks()

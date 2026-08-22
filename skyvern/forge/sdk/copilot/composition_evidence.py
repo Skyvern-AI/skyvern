@@ -63,6 +63,11 @@ _MAX_SELECT_OPTIONS = 30
 _MAX_CHALLENGE_CONTROLS = 8
 _MAX_MODAL_OVERLAYS = 5
 _MAX_MODAL_DISMISS_CONTROLS = 6
+_MAX_CARRIED_VALUE_CHARS = 240
+# The browser caps every field it emits in-page at this width, which is what makes
+# _structured_identity's whole report safe there. Nothing caps the parsed caller, so it matches.
+_MAX_PARSED_LABEL_CONTEXT_CHARS = 2048
+_MAX_LABEL_CONTEXT_HOPS = 4
 _MAX_PAGE_OBSTRUCTIONS = 5
 _MAX_VISIBLE_CONTROLS = 6
 _MAX_CLICKABLE_CONTROLS = 12
@@ -1523,6 +1528,139 @@ def _control_label(node: Any) -> str:
     return ""
 
 
+_NAMING_TAGS = ("label", "h1", "h2", "h3", "h4")
+_CONTROL_TAGS = ("input", "select", "textarea", "button")
+_CONTROL_ROLES = frozenset({"textbox", "combobox"})
+_NAMED_BY_OWN_TEXT_ROLES = frozenset({"button", "link", "menuitem", "tab", "option", "checkbox", "radio"})
+_INPUT_TYPE_ROLES = {
+    "button": "button",
+    "submit": "button",
+    "reset": "button",
+    "checkbox": "checkbox",
+    "radio": "radio",
+    "text": "textbox",
+    "search": "textbox",
+    "email": "textbox",
+    "tel": "textbox",
+    "url": "textbox",
+    "password": "textbox",
+    "": "textbox",
+}
+
+
+def _implicit_role(node: Any) -> str:
+    """Mirror of ``implicitRole``. The browser reports an element's implicit role in ``identity``, so a
+    twin that reads only the explicit attribute names the same element differently."""
+    tag = getattr(node, "name", None) or ""
+    if tag == "a":
+        return "link" if node.has_attr("href") else ""
+    if tag == "button":
+        return "button"
+    if tag == "select":
+        return "combobox"
+    if tag == "textarea":
+        return "textbox"
+    if tag == "input":
+        return _INPUT_TYPE_ROLES.get(_attr_value(node, "type").lower(), "")
+    return "heading" if re.fullmatch(r"h[1-6]", tag) else ""
+
+
+def _value_like(text: str) -> bool:
+    """Mirror of ``valueLike``: a datum rather than a name."""
+    return any(character.isdigit() for character in text) and not re.search(r"[A-Za-z]{3}", text)
+
+
+def _naming_text_of(node: Any) -> str:
+    return _attr_value(node, "aria-label") or _node_text(node)
+
+
+def _is_naming_node(node: Any) -> bool:
+    return getattr(node, "name", None) in _NAMING_TAGS or bool(_attr_value(node, "aria-label"))
+
+
+def _is_or_holds_control(node: Any) -> bool:
+    if getattr(node, "name", None) in _CONTROL_TAGS or _attr_value(node, "role") in _CONTROL_ROLES:
+        return True
+    return node.find(_CONTROL_TAGS) is not None
+
+
+def _named_by_own_text(node: Any) -> bool:
+    """``NAMED_BY_OWN_TEXT_ROLES`` over the tags this path reports. The browser resolves an implicit
+    role for any element; only a control whose own text reads as a datum needs the distinction."""
+    return (_attr_value(node, "role") or _implicit_role(node)) in _NAMED_BY_OWN_TEXT_ROLES
+
+
+def _label_context_for(node: Any) -> str:
+    """Mirror of ``labelContextFor``. The parsed twin previously fed ``identity.label_context`` from
+    ``_control_label`` — the mirror of ``controlLabel``, which feeds ``text`` — so the two producers
+    named the same element differently and the field carried nothing ``text`` did not."""
+    own = _attr_value(node, "aria-label")
+    if own:
+        return own
+    node_id = _attr_value(node, "id")
+    if node_id:
+        root = node
+        while getattr(root, "parent", None) is not None:
+            root = root.parent
+        for candidate in root.find_all("label"):
+            if _attr_value(candidate, "for") == node_id:
+                return _naming_text_of(candidate)
+    wrapping = node.find_parent("label")
+    if wrapping is not None:
+        own_text = _node_text(node)
+        wrapping_text = _node_text(wrapping)
+        # A control with no text of its own subtracts nothing, which is the whole point for a
+        # checkbox: the label wrapping it is the only thing naming it.
+        text = "".join(wrapping_text.split(own_text)).strip() if own_text else wrapping_text.strip()
+        if text:
+            return text
+    if _reads_as_one_leaf(node):
+        own_text = _node_text(node)
+        if own_text and (_named_by_own_text(node) or not _value_like(own_text)):
+            return own_text
+    inner = next((child for child in node.find_all(True) if _is_naming_node(child)), None)
+    if inner is not None:
+        return _naming_text_of(inner)
+    children = node.find_all(True, recursive=False)
+    if children and not children[0].find(True) and len(children) > 1:
+        leading = _node_text(children[0])
+        if leading and not _value_like(leading):
+            return leading
+    return _label_context_from_ancestors(node)
+
+
+def _label_context_from_ancestors(node: Any) -> str:
+    """A label sitting beside a field names the field it precedes, so document order decides which one
+    is ours and a control standing between the two means the label belongs to that one instead."""
+    current = node.parent
+    for _ in range(_MAX_LABEL_CONTEXT_HOPS):
+        if current is None or getattr(current, "name", None) is None:
+            break
+        children = current.find_all(True, recursive=False)
+        mine = next((index for index, child in enumerate(children) if child is node or node in child.descendants), -1)
+        if mine >= 0:
+            naming = [
+                index
+                for index, child in enumerate(children)
+                if index != mine and node not in child.descendants and _is_naming_node(child)
+            ]
+            adjacent = [
+                index
+                for index in naming
+                if not any(
+                    _is_or_holds_control(children[between]) for between in range(min(index, mine) + 1, max(index, mine))
+                )
+            ]
+            if adjacent:
+                preceding = [index for index in adjacent if index < mine]
+                # Nothing precedes us and several could apply: no honest pick, so say nothing.
+                if not preceding and len(adjacent) > 1:
+                    return ""
+                return _naming_text_of(children[preceding[-1] if preceding else adjacent[0]])
+        current = current.parent
+    return ""
+
+
 _MAX_SELECTOR_CHARS = 160
 # The rung that produced a candidate, so the model can tell a name-anchored offer from a positional
 # one. An untyped candidate is not passed on: nothing downstream can rank or grade it.
@@ -1550,42 +1688,73 @@ def _bounded_selector(selector: str) -> str:
     return selector if len(selector) <= _MAX_SELECTOR_CHARS else ""
 
 
-def _selector_for(node: Any) -> str:
-    """Mirror of ``selectorFor`` in composition_browser_expressions. The selector is a contract: the
-    model clicks it and authors it into generated blocks, so every candidate is verified to match
-    this exact node and nothing else before it is handed out."""
+def _selector_candidates_for(node: Any, *, include_aria_label: bool = False) -> list[dict[str, str]]:
+    """Mirror of ``selectorCandidatesFor``'s attribute rungs, in the same order. The positional path
+    and the aria-label rung are offered only to callers that ask: the first costs an ancestor walk,
+    and the second would change which selector ``_selector_for`` settles on."""
     tag_name = getattr(node, "name", None) or "*"
-    candidates: list[str] = []
+    candidates: list[dict[str, str]] = []
     node_id = _attr_value(node, "id")
     if node_id:
         candidates.append(
-            f"#{node_id}" if _simple_css_identifier(node_id) else f'{tag_name}[id="{_css_attr(node_id)}"]'
+            {
+                "selector": f"#{node_id}"
+                if _simple_css_identifier(node_id)
+                else f'{tag_name}[id="{_css_attr(node_id)}"]',
+                "source": "id",
+            }
         )
     node_name = _attr_value(node, "name")
     node_value = _attr_value(node, "value")
     if node_name and node_value:
-        candidates.append(f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]')
+        candidates.append(
+            {
+                "selector": f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]',
+                "source": "name_value",
+            }
+        )
     classes = _classes_for(node)
     class_selector = _class_selector(classes)
     if class_selector and node_value:
-        candidates.append(f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]')
+        candidates.append(
+            {"selector": f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]', "source": "class_value"}
+        )
     if node_name:
-        candidates.append(f'{tag_name}[name="{_css_attr(node_name)}"]')
+        candidates.append({"selector": f'{tag_name}[name="{_css_attr(node_name)}"]', "source": "name"})
+    aria_label = _attr_value(node, "aria-label") if include_aria_label else ""
+    if aria_label:
+        candidates.append({"selector": f'{tag_name}[aria-label="{_css_attr(aria_label)}"]', "source": "aria_label"})
     href = _attr_value(node, "href")
     if tag_name == "a" and href:
-        candidates.append(f'a[href="{_css_attr(href)}"]')
+        candidates.append({"selector": f'a[href="{_css_attr(href)}"]', "source": "href"})
     if class_selector:
-        candidates.append(f"{tag_name}{class_selector}")
+        candidates.append({"selector": f"{tag_name}{class_selector}", "source": "class"})
     node_type = _attr_value(node, "type")
     if class_selector and node_type:
-        candidates.append(f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]')
+        candidates.append(
+            {"selector": f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]', "source": "class_type"}
+        )
+    return candidates
+
+
+def _carried_selector_candidates(node: Any) -> list[dict[str, str]]:
+    candidates = _selector_candidates_for(node, include_aria_label=True)
+    candidates.append({"selector": _structural_path(node), "source": "structural"})
+    return _structured_selector_candidates(candidates)
+
+
+def _selector_for(node: Any) -> str:
+    """Mirror of ``selectorFor`` in composition_browser_expressions. The selector is a contract: the
+    model clicks it and authors it into generated blocks, so every candidate is verified to match
+    this exact node and nothing else before it is handed out."""
+    candidates = [entry["selector"] for entry in _selector_candidates_for(node)]
     for candidate in candidates:
         if _resolves_uniquely(node, candidate):
             return candidate
     path = _structural_path(node)
     if _resolves_uniquely(node, path):
         return path
-    return candidates[0] if candidates else str(tag_name)
+    return candidates[0] if candidates else str(getattr(node, "name", None) or "*")
 
 
 def _clickable_controls_channel(controls: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -2456,17 +2625,28 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
         aria_label = _schema_text(_attr_value(control, "aria-label"), 120)
         title = _schema_text(_attr_value(control, "title"), 120)
         seen_selectors.add(selector)
+        entry = {
+            "tag": str(getattr(control, "name", "") or "").lower()[:40],
+            "text": text,
+            "aria_label": aria_label,
+            "title": title,
+            "selector": selector,
+            "type": _attr_value(control, "type")[:40],
+        }
         controls.append(
-            {
-                "tag": str(getattr(control, "name", "") or "").lower()[:40],
-                "text": text,
-                "aria_label": aria_label,
-                "title": title,
-                "selector": selector,
-                "type": _attr_value(control, "type")[:40],
-            }
+            _attach_node_evidence(
+                {key: value for key, value in entry.items() if value != ""},
+                {
+                    "selector_candidates": _carried_selector_candidates(control),
+                    "identity": {
+                        "tag": entry["tag"],
+                        "role": _attr_value(control, "role") or _implicit_role(control),
+                        "label_context": _schema_text(_label_context_for(control), _MAX_PARSED_LABEL_CONTEXT_CHARS),
+                    },
+                },
+            )
         )
-    return [{key: value for key, value in entry.items() if value} for entry in controls]
+    return controls
 
 
 def _modal_overlay_entry(node: Any) -> dict[str, Any]:
@@ -2523,10 +2703,16 @@ def _page_obstructions_from_modal_overlays(modal_overlays: list[dict[str, Any]])
                 continue
             text = _bounded_string(control.get("text") or control.get("aria_label") or control.get("title"), 120)
             selector = _bounded_string(control.get("selector"), 160)
-            if text or selector:
-                visible_controls.append(
-                    {key: value for key, value in {"text": text, "selector": selector}.items() if value}
-                )
+            if not (text or selector):
+                continue
+            # The capture is the only place these facts exist; a control that reaches the model with
+            # one selector and no fallbacks cannot be clicked again once that selector goes stale.
+            carried = dict(control)
+            if text:
+                carried["text"] = text
+            if selector:
+                carried["selector"] = selector
+            visible_controls.append(carried)
         entry = {
             "kind": "modal_overlay",
             "source": DOM_EVIDENCE_SOURCE,
@@ -3190,6 +3376,22 @@ def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
     return controls
 
 
+def _is_carried_control_key(key: Any) -> bool:
+    return isinstance(key, str) and 0 < len(key) <= 40 and key.replace("_", "").isalnum()
+
+
+def _carry_value(value: Any) -> str | bool | int | float:
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _bounded_string(value, _MAX_CARRIED_VALUE_CHARS)
+    # null and an empty collection are the producer's ordinary "not applicable", so they leave as the
+    # empty string the caller already drops; every other unmodelled shape arrives bounded, not dropped.
+    if value is None or (isinstance(value, (list, dict, tuple, set)) and not value):
+        return ""
+    return _bounded_string(str(value), _MAX_CARRIED_VALUE_CHARS)
+
+
 def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     if not isinstance(value, list):
@@ -3197,15 +3399,23 @@ def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
     for control in value[:_MAX_MODAL_DISMISS_CONTROLS]:
         if not isinstance(control, dict):
             continue
-        entry = {
-            "tag": (_structured_str(control.get("tag")) or "").lower()[:40],
-            "text": _schema_text(_structured_str(control.get("text")), 120),
-            "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
-            "title": _schema_text(_structured_str(control.get("title")), 120),
-            "selector": _bounded_selector(_structured_str(control.get("selector"))),
-            "type": _structured_str(control.get("type"))[:40],
-        }
-        controls.append(_attach_node_evidence({k: v for k, v in entry.items() if v}, control))
+        # selector_candidates and identity are excluded from the carry so _attach_node_evidence stays
+        # their only writer; a raw copy would smuggle in the shapes that normalization rejects.
+        carried_keys = [
+            key for key in control if key not in ("selector_candidates", "identity") and _is_carried_control_key(key)
+        ]
+        entry: dict[str, Any] = {key: _carry_value(control[key]) for key in carried_keys}
+        entry.update(
+            {
+                "tag": (_structured_str(control.get("tag")) or "").lower()[:40],
+                "text": _schema_text(_structured_str(control.get("text")), 120),
+                "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
+                "title": _schema_text(_structured_str(control.get("title")), 120),
+                "selector": _bounded_selector(_structured_str(control.get("selector"))),
+                "type": _structured_str(control.get("type"))[:40],
+            }
+        )
+        controls.append(_attach_node_evidence({k: v for k, v in entry.items() if v != ""}, control))
     return controls
 
 

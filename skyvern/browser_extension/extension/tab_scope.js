@@ -14,6 +14,7 @@ const SKYVERN_GROUP_TITLE = "Skyvern Controlled";
 const SKYVERN_GROUP_COLOR = "purple";
 const TAB_GROUP_ID_NONE = -1;
 const ANY_GROUP_ID = Symbol("anyGroupId");
+const TAB_OPERATION_TIMEOUT_MS = 28_000;
 
 function tabUrl(tab) {
   return tab.pendingUrl || tab.url || "";
@@ -26,15 +27,19 @@ function isTabRestricted(tab) {
 }
 
 export class TabScope {
-  constructor({ sendEvent }) {
+  constructor({ sendEvent, operationTimeoutMs = TAB_OPERATION_TIMEOUT_MS }) {
     this.sendEvent = sendEvent;
     this.scopedTabIds = new Set();
+    this.quarantinedTabIds = new Set();
     this.scopedGroupIds = new Map();
     this.createdTabIds = new Set();
     this.expectedGroupTransitions = new Map();
     this.tabOperations = new Map();
     this.debuggerRouter = null;
     this.activeOperationCount = 0;
+    this.operationGeneration = 0;
+    this.operationLeases = new Set();
+    this.operationTimeoutMs = operationTimeoutMs;
     this.operationsIdle = Promise.resolve();
     this.resolveOperationsIdle = null;
     this.resetting = false;
@@ -116,6 +121,15 @@ export class TabScope {
     this.resetFinished = new Promise((resolve) => {
       this.resolveResetFinished = resolve;
     });
+    this.operationGeneration += 1;
+    for (const lease of this.operationLeases) {
+      lease.cancel(
+        new ProtocolError(
+          ERROR_CODES.COMMAND_TIMEOUT,
+          "The extension operation was cancelled by reset.",
+        ),
+      );
+    }
     await this.operationsIdle;
   }
 
@@ -164,6 +178,10 @@ export class TabScope {
     return this.scopedTabIds.has(tabId);
   }
 
+  isQuarantined(tabId) {
+    return this.quarantinedTabIds.has(tabId);
+  }
+
   async assertScoped(tabId) {
     await this.ready;
     if (!this.scopedTabIds.has(tabId)) {
@@ -174,20 +192,22 @@ export class TabScope {
     }
   }
 
-  async assertControllableLocked(tabId) {
+  async assertControllableLocked(tabId, lease = null) {
     await this.assertScoped(tabId);
+    lease?.assertCurrent();
     let tab;
     try {
       tab = await this.getTab(tabId);
     } catch (error) {
-      if (this.scopedTabIds.has(tabId)) {
-        await this.removeFromScopeLocked(tabId, "closed", true);
+      if (lease?.isCurrent() !== false && this.scopedTabIds.has(tabId)) {
+        await this.removeFromScopeLocked(tabId, "closed", true, lease);
       }
       throw error;
     }
+    lease?.assertCurrent();
     await this.assertScoped(tabId);
     if (isTabRestricted(tab)) {
-      await this.removeFromScopeLocked(tabId, "unshared", true);
+      await this.removeFromScopeLocked(tabId, "unshared", true, lease);
       throw new ProtocolError(
         ERROR_CODES.RESTRICTED_URL,
         "Chrome does not allow controlling this URL.",
@@ -199,8 +219,15 @@ export class TabScope {
   async shareTab(tabId) {
     await this.ready;
     const validTabId = requireTabId(tabId);
-    return this.runTabOperation(validTabId, async () => {
+    return this.runTabOperation(validTabId, async (lease) => {
+      if (this.quarantinedTabIds.has(validTabId)) {
+        throw new ProtocolError(
+          ERROR_CODES.COMMAND_TIMEOUT,
+          "The requested tab is still being reconciled after reset.",
+        );
+      }
       const tab = await this.getTab(validTabId);
+      lease.assertCurrent();
       if (isTabRestricted(tab)) {
         throw new ProtocolError(
           ERROR_CODES.RESTRICTED_URL,
@@ -210,7 +237,8 @@ export class TabScope {
       if (this.scopedTabIds.has(validTabId)) {
         return {};
       }
-      const scopedTab = await this.addToScopeLocked(tab);
+      const scopedTab = await this.addToScopeLocked(tab, lease);
+      lease.assertCurrent();
       this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
         ...this.publicTab(scopedTab, false),
         origin: "shared",
@@ -222,9 +250,10 @@ export class TabScope {
   async unshareTab(tabId) {
     await this.ready;
     const validTabId = requireTabId(tabId);
-    return this.runTabOperation(validTabId, async () => {
+    return this.runTabOperation(validTabId, async (lease) => {
       await this.assertScoped(validTabId);
-      await this.removeFromScopeLocked(validTabId, "unshared", true);
+      lease.assertCurrent();
+      await this.removeFromScopeLocked(validTabId, "unshared", true, lease);
       return {};
     });
   }
@@ -241,26 +270,33 @@ export class TabScope {
         "Chrome does not allow creating this URL.",
       );
     }
-    let tab;
-    try {
-      tab = await chrome.tabs.create({ url });
-    } catch {
-      throw new ProtocolError(
-        ERROR_CODES.INTERNAL,
-        "Chrome could not create the tab.",
-      );
-    }
-    if (!Number.isInteger(tab.id)) {
-      throw new ProtocolError(
-        ERROR_CODES.TAB_NOT_FOUND,
-        "Chrome did not return a tab identifier.",
-      );
-    }
-    return this.runTabOperation(tab.id, async () => {
-      this.createdTabIds.add(tab.id);
-      await this.persistScope();
+    return this.runTabOperation(Symbol("tabs.create"), async (lease) => {
+      let tab;
       try {
-        const scopedTab = await this.addToScopeLocked(tab);
+        tab = await chrome.tabs.create({ url });
+      } catch {
+        throw new ProtocolError(
+          ERROR_CODES.INTERNAL,
+          "Chrome could not create the tab.",
+        );
+      }
+      if (!lease.isCurrent()) {
+        if (Number.isInteger(tab.id)) {
+          void chrome.tabs.remove(tab.id).catch(() => undefined);
+        }
+        lease.assertCurrent();
+      }
+      if (!Number.isInteger(tab.id)) {
+        throw new ProtocolError(
+          ERROR_CODES.TAB_NOT_FOUND,
+          "Chrome did not return a tab identifier.",
+        );
+      }
+      this.createdTabIds.add(tab.id);
+      await this.persistScope(lease);
+      try {
+        const scopedTab = await this.addToScopeLocked(tab, lease);
+        lease.assertCurrent();
         this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
           ...this.publicTab(scopedTab, false),
           origin: "created",
@@ -280,18 +316,37 @@ export class TabScope {
   async remove(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.runTabOperation(tabId, async () => {
+    return this.runTabOperation(tabId, async (lease) => {
       const created = this.createdTabIds.has(tabId);
       if (this.scopedTabIds.has(tabId)) {
-        await this.assertControllableLocked(tabId);
+        await this.assertControllableLocked(tabId, lease);
       } else if (!created) {
         throw new ProtocolError(
           ERROR_CODES.TAB_NOT_SCOPED,
           "The requested tab is not shared.",
         );
       }
+      if (this.quarantinedTabIds.has(tabId)) {
+        throw new ProtocolError(
+          ERROR_CODES.COMMAND_TIMEOUT,
+          "The requested tab is still being reconciled after reset.",
+        );
+      }
+      this.quarantinedTabIds.add(tabId);
+      lease.assertCurrent();
+      let removePromise;
       try {
-        await chrome.tabs.remove(tabId);
+        removePromise = chrome.tabs.remove(tabId);
+      } catch (error) {
+        this.quarantinedTabIds.delete(tabId);
+        throw error;
+      }
+      const trackedRemove = Promise.resolve(removePromise).finally(() => {
+        this.quarantinedTabIds.delete(tabId);
+      });
+      void trackedRemove.catch(() => undefined);
+      try {
+        await trackedRemove;
       } catch {
         if (!this.scopedTabIds.has(tabId)) {
           if (created) {
@@ -314,11 +369,12 @@ export class TabScope {
           "The requested tab was not found.",
         );
       }
+      lease.assertCurrent();
       this.createdTabIds.delete(tabId);
       if (this.scopedTabIds.has(tabId)) {
-        await this.removeFromScopeLocked(tabId, "closed", false);
+        await this.removeFromScopeLocked(tabId, "closed", false, lease);
       } else {
-        await this.persistScope();
+        await this.persistScope(lease);
       }
       return {};
     });
@@ -327,8 +383,8 @@ export class TabScope {
   async activate(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.runTabOperation(tabId, async () => {
-      const tab = await this.assertControllableLocked(tabId);
+    return this.runTabOperation(tabId, async (lease) => {
+      const tab = await this.assertControllableLocked(tabId, lease);
       try {
         await chrome.tabs.update(tabId, { active: true });
         if (Number.isInteger(tab.windowId)) {
@@ -340,7 +396,8 @@ export class TabScope {
           "The requested tab was not found.",
         );
       }
-      await this.assertControllableLocked(tabId);
+      lease.assertCurrent();
+      await this.assertControllableLocked(tabId, lease);
       return {};
     });
   }
@@ -356,10 +413,11 @@ export class TabScope {
     return this.collectScopedTabs(false);
   }
 
-  async handleDebuggerDetachLocked(tabId) {
+  async handleDebuggerDetachLocked(tabId, lease = null) {
     await this.ready;
+    lease?.assertCurrent();
     if (this.scopedTabIds.has(tabId)) {
-      await this.removeFromScopeLocked(tabId, "detached", false);
+      await this.removeFromScopeLocked(tabId, "detached", false, lease);
     }
   }
 
@@ -368,14 +426,16 @@ export class TabScope {
     if (!Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
       return;
     }
-    await this.runTabOperation(tab.id, async () => {
+    await this.runTabOperation(tab.id, async (lease) => {
       if (!this.scopedTabIds.has(tab.openerTabId) || isTabRestricted(tab)) {
         return;
       }
+      lease.assertCurrent();
       this.createdTabIds.add(tab.id);
-      await this.persistScope();
+      await this.persistScope(lease);
       try {
-        const scopedTab = await this.addToScopeLocked(tab);
+        const scopedTab = await this.addToScopeLocked(tab, lease);
+        lease.assertCurrent();
         this.sendEvent(EVENTS.TABS_CREATED, {
           tabId: scopedTab.id,
           openerTabId: tab.openerTabId,
@@ -394,27 +454,29 @@ export class TabScope {
 
   async handleTabRemoved(tabId) {
     await this.ready;
-    await this.runTabOperation(tabId, async () => {
+    await this.runTabOperation(tabId, async (lease) => {
+      lease.assertCurrent();
       this.expectedGroupTransitions.delete(tabId);
       const ownershipChanged = this.createdTabIds.delete(tabId);
       if (this.scopedTabIds.has(tabId)) {
-        await this.removeFromScopeLocked(tabId, "closed", false);
+        await this.removeFromScopeLocked(tabId, "closed", false, lease);
       } else if (ownershipChanged) {
-        await this.persistScope();
+        await this.persistScope(lease);
       }
     });
   }
 
   async handleTabUpdated(tabId, changeInfo, expectedGroupTransition = null) {
     await this.ready;
-    await this.runTabOperation(tabId, async () => {
+    await this.runTabOperation(tabId, async (lease) => {
       try {
+        lease.assertCurrent();
         if (
           this.scopedTabIds.has(tabId) &&
           Object.hasOwn(changeInfo, "url") &&
           isRestrictedUrl(changeInfo.url)
         ) {
-          await this.removeFromScopeLocked(tabId, "unshared", true);
+          await this.removeFromScopeLocked(tabId, "unshared", true, lease);
           return;
         }
         if (
@@ -430,11 +492,13 @@ export class TabScope {
         } catch {
           return;
         }
+        lease.assertCurrent();
         if (tab.groupId !== changeInfo.groupId) {
           return;
         }
 
         const controlledGroup = await this.getControlledGroup(tab.groupId);
+        lease.assertCurrent();
         if (this.scopedTabIds.has(tabId)) {
           const expectedGroupId = this.scopedGroupIds.get(tabId);
           if (tab.groupId === expectedGroupId) {
@@ -442,12 +506,13 @@ export class TabScope {
           }
           if (controlledGroup !== null) {
             this.scopedGroupIds.set(tabId, tab.groupId);
-            await this.persistScope();
+            await this.persistScope(lease);
+            lease.assertCurrent();
             await this.updateControlledGroup(tab.groupId);
             return;
           }
           if (expectedGroupId !== undefined) {
-            await this.removeFromScopeLocked(tabId, "unshared", true);
+            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
           }
           return;
         }
@@ -456,15 +521,26 @@ export class TabScope {
           return;
         }
         if (isTabRestricted(tab)) {
+          lease.assertCurrent();
           await this.ungroupTabLocked(tabId, tab.groupId);
           return;
         }
 
+        if (this.quarantinedTabIds.has(tabId)) {
+          throw new ProtocolError(
+            ERROR_CODES.COMMAND_TIMEOUT,
+            "The requested tab is still being reconciled after reset.",
+          );
+        }
+        lease.assertCurrent();
         await this.updateControlledGroup(tab.groupId);
+        lease.assertCurrent();
         const scopedTab = await this.addGroupedTabToScopeLocked(
           tab,
           tab.groupId,
+          lease,
         );
+        lease.assertCurrent();
         this.sendEvent(EVENTS.SCOPE_TAB_ADDED, {
           ...this.publicTab(scopedTab, false),
           origin: "shared",
@@ -496,33 +572,51 @@ export class TabScope {
     return !tabExists;
   }
 
-  async addToScopeLocked(tab) {
+  async addToScopeLocked(tab, lease = null) {
     if (!Number.isInteger(tab.id)) {
       throw new ProtocolError(
         ERROR_CODES.TAB_NOT_FOUND,
         "The requested tab was not found.",
       );
     }
+    lease?.assertCurrent();
+    if (this.quarantinedTabIds.has(tab.id)) {
+      throw new ProtocolError(
+        ERROR_CODES.COMMAND_TIMEOUT,
+        "The requested tab is still being reconciled after reset.",
+      );
+    }
     this.scopedTabIds.add(tab.id);
-    await this.persistScope();
-    await this.groupTabLocked(tab);
-    return this.assertControllableLocked(tab.id);
+    await this.persistScope(lease);
+    lease?.assertCurrent();
+    await this.groupTabLocked(tab, lease);
+    lease?.assertCurrent();
+    return this.assertControllableLocked(tab.id, lease);
   }
 
-  async addGroupedTabToScopeLocked(tab, groupId) {
+  async addGroupedTabToScopeLocked(tab, groupId, lease = null) {
     if (!Number.isInteger(tab.id)) {
       throw new ProtocolError(
         ERROR_CODES.TAB_NOT_FOUND,
         "The requested tab was not found.",
+      );
+    }
+    lease?.assertCurrent();
+    if (this.quarantinedTabIds.has(tab.id)) {
+      throw new ProtocolError(
+        ERROR_CODES.COMMAND_TIMEOUT,
+        "The requested tab is still being reconciled after reset.",
       );
     }
     this.scopedTabIds.add(tab.id);
     this.scopedGroupIds.set(tab.id, groupId);
-    await this.persistScope();
-    return this.assertControllableLocked(tab.id);
+    await this.persistScope(lease);
+    lease?.assertCurrent();
+    return this.assertControllableLocked(tab.id, lease);
   }
 
-  async removeFromScopeLocked(tabId, reason, detach) {
+  async removeFromScopeLocked(tabId, reason, detach, lease = null) {
+    lease?.assertCurrent();
     if (!this.scopedTabIds.delete(tabId)) {
       return;
     }
@@ -533,17 +627,21 @@ export class TabScope {
       if (detach && this.debuggerRouter !== null) {
         await this.debuggerRouter.detachIfAttachedLocked(tabId);
       }
+      lease?.assertCurrent();
     } finally {
       try {
-        await this.persistScope();
+        await this.persistScope(lease);
+        lease?.assertCurrent();
       } finally {
+        lease?.assertCurrent();
         await this.ungroupTabLocked(tabId, scopedGroupId);
+        lease?.assertCurrent();
         this.sendEvent(EVENTS.SCOPE_TAB_REMOVED, { tabId, reason });
       }
     }
   }
 
-  async groupTabLocked(tab) {
+  async groupTabLocked(tab, lease = null) {
     const tabId = tab.id;
     if (!Number.isInteger(tabId) || !Number.isInteger(tab.windowId)) {
       return;
@@ -551,6 +649,7 @@ export class TabScope {
     let groupId;
     try {
       const groups = await chrome.tabGroups.query({ windowId: tab.windowId });
+      lease?.assertCurrent();
       const existingGroup = groups.find(
         (group) => group.title === SKYVERN_GROUP_TITLE,
       );
@@ -565,18 +664,24 @@ export class TabScope {
             })
           : await chrome.tabs.group({ tabIds: [tabId] });
         grouped = true;
+        lease?.assertCurrent();
       } finally {
         if (!grouped) {
           this.clearExpectedGroupTransition(tabId, transition);
         }
       }
-    } catch {
+    } catch (error) {
+      lease?.assertCurrent();
       this.scopedGroupIds.delete(tabId);
-      await this.persistScope();
+      await this.persistScope(lease);
+      if (error instanceof ProtocolError) {
+        throw error;
+      }
       return;
     }
+    lease?.assertCurrent();
     this.scopedGroupIds.set(tabId, groupId);
-    await this.persistScope();
+    await this.persistScope(lease);
     await this.updateControlledGroup(groupId);
   }
 
@@ -655,25 +760,32 @@ export class TabScope {
   }
 
   async collectScopedTabs(includeActive) {
+    const generation = this.operationGeneration;
     const tabs = [];
     for (const tabId of [...this.scopedTabIds]) {
-      const tab = await this.runTabOperation(tabId, async () => {
-        if (!this.scopedTabIds.has(tabId)) {
-          return null;
-        }
-        let scopedTab;
-        try {
-          scopedTab = await chrome.tabs.get(tabId);
-        } catch {
-          await this.removeFromScopeLocked(tabId, "closed", false);
-          return null;
-        }
-        if (isTabRestricted(scopedTab)) {
-          await this.removeFromScopeLocked(tabId, "unshared", true);
-          return null;
-        }
-        return this.publicTab(scopedTab, includeActive);
-      });
+      const tab = await this.runTabOperation(
+        tabId,
+        async (lease) => {
+          if (!this.scopedTabIds.has(tabId)) {
+            return null;
+          }
+          let scopedTab;
+          try {
+            scopedTab = await chrome.tabs.get(tabId);
+          } catch {
+            lease.assertCurrent();
+            await this.removeFromScopeLocked(tabId, "closed", false, lease);
+            return null;
+          }
+          lease.assertCurrent();
+          if (isTabRestricted(scopedTab)) {
+            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            return null;
+          }
+          return this.publicTab(scopedTab, includeActive);
+        },
+        generation,
+      );
       if (tab !== null) {
         tabs.push(tab);
       }
@@ -717,48 +829,86 @@ export class TabScope {
     if (ownershipChanged) {
       await this.persistScope();
     }
+    const generation = this.operationGeneration;
     for (const tabId of [...this.scopedTabIds]) {
-      await this.runTabOperation(tabId, async () => {
-        let tab;
-        try {
-          tab = await chrome.tabs.get(tabId);
-        } catch {
-          await this.removeFromScopeLocked(tabId, "closed", false);
-          return;
-        }
-        if (isTabRestricted(tab)) {
-          await this.removeFromScopeLocked(tabId, "unshared", true);
-          return;
-        }
-        const expectedGroupId = this.scopedGroupIds.get(tabId);
-        if (expectedGroupId !== undefined && tab.groupId !== expectedGroupId) {
-          const controlledGroup = await this.getControlledGroup(tab.groupId);
-          if (controlledGroup === null) {
-            await this.removeFromScopeLocked(tabId, "unshared", true);
-          } else {
-            this.scopedGroupIds.set(tabId, tab.groupId);
-            await this.persistScope();
-            await this.updateControlledGroup(tab.groupId);
+      await this.runTabOperation(
+        tabId,
+        async (lease) => {
+          let tab;
+          try {
+            tab = await chrome.tabs.get(tabId);
+          } catch {
+            lease.assertCurrent();
+            await this.removeFromScopeLocked(tabId, "closed", false, lease);
+            return;
           }
-        } else if (expectedGroupId === undefined) {
-          await this.groupTabLocked(tab);
-        }
-      });
+          lease.assertCurrent();
+          if (isTabRestricted(tab)) {
+            await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            return;
+          }
+          const expectedGroupId = this.scopedGroupIds.get(tabId);
+          if (
+            expectedGroupId !== undefined &&
+            tab.groupId !== expectedGroupId
+          ) {
+            const controlledGroup = await this.getControlledGroup(tab.groupId);
+            lease.assertCurrent();
+            if (controlledGroup === null) {
+              await this.removeFromScopeLocked(tabId, "unshared", true, lease);
+            } else {
+              this.scopedGroupIds.set(tabId, tab.groupId);
+              await this.persistScope(lease);
+              lease.assertCurrent();
+              await this.updateControlledGroup(tab.groupId);
+            }
+          } else if (expectedGroupId === undefined) {
+            await this.groupTabLocked(tab, lease);
+          }
+        },
+        generation,
+      );
     }
   }
 
-  async runTabOperation(tabId, operation) {
+  async runTabOperation(
+    tabId,
+    operation,
+    expectedGeneration = this.operationGeneration,
+  ) {
     while (this.resetting) {
       await this.resetFinished;
     }
+    if (expectedGeneration !== this.operationGeneration) {
+      throw new ProtocolError(
+        ERROR_CODES.COMMAND_TIMEOUT,
+        "The extension operation was cancelled by reset.",
+      );
+    }
+    const deadlineMs = Date.now() + this.operationTimeoutMs;
+    const lease = this.createOperationLease(deadlineMs);
+    const timeoutId = setTimeout(
+      () => {
+        lease.cancel(
+          new ProtocolError(
+            ERROR_CODES.COMMAND_TIMEOUT,
+            "The extension tab operation timed out.",
+          ),
+        );
+      },
+      Math.max(0, deadlineMs - Date.now()),
+    );
     if (this.activeOperationCount === 0) {
       this.operationsIdle = new Promise((resolve) => {
         this.resolveOperationsIdle = resolve;
       });
     }
     this.activeOperationCount += 1;
+    this.operationLeases.add(lease);
     const previous = this.tabOperations.get(tabId) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(operation);
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.runOperationWithLease(lease, operation));
     this.tabOperations.set(tabId, current);
     try {
       return await current;
@@ -766,6 +916,8 @@ export class TabScope {
       if (this.tabOperations.get(tabId) === current) {
         this.tabOperations.delete(tabId);
       }
+      this.operationLeases.delete(lease);
+      clearTimeout(timeoutId);
       this.activeOperationCount -= 1;
       if (this.activeOperationCount === 0) {
         this.resolveOperationsIdle?.();
@@ -774,12 +926,63 @@ export class TabScope {
     }
   }
 
-  async persistScope() {
-    const groupIds = Object.fromEntries(this.scopedGroupIds);
-    await chrome.storage.session.set({
-      [SCOPED_TAB_IDS_KEY]: [...this.scopedTabIds],
-      [SCOPED_GROUP_IDS_KEY]: groupIds,
-      [CREATED_TAB_IDS_KEY]: [...this.createdTabIds],
+  createOperationLease(deadlineMs) {
+    const generation = this.operationGeneration;
+    let rejectInvalidated;
+    let cancelled = false;
+    let cancellationError = null;
+    const invalidated = new Promise((_, reject) => {
+      rejectInvalidated = reject;
     });
+    void invalidated.catch(() => undefined);
+    return {
+      invalidated,
+      isCurrent: () => !cancelled && generation === this.operationGeneration,
+      remainingMs: () => Math.max(0, deadlineMs - Date.now()),
+      assertCurrent: () => {
+        if (cancelled || generation !== this.operationGeneration) {
+          throw (
+            cancellationError ??
+            new ProtocolError(
+              ERROR_CODES.COMMAND_TIMEOUT,
+              "The extension operation is no longer current.",
+            )
+          );
+        }
+      },
+      cancel: (error) => {
+        if (cancelled) {
+          return;
+        }
+        cancelled = true;
+        cancellationError = error;
+        rejectInvalidated(error);
+      },
+    };
+  }
+
+  async runOperationWithLease(lease, operation) {
+    lease.assertCurrent();
+    return Promise.race([
+      Promise.resolve().then(() => operation(lease)),
+      lease.invalidated,
+    ]);
+  }
+
+  async persistScope(lease = null) {
+    const values = {
+      [SCOPED_TAB_IDS_KEY]: [...this.scopedTabIds],
+      [SCOPED_GROUP_IDS_KEY]: Object.fromEntries(this.scopedGroupIds),
+      [CREATED_TAB_IDS_KEY]: [...this.createdTabIds],
+    };
+    await chrome.storage.session.set(values);
+    if (lease !== null && !lease.isCurrent()) {
+      await chrome.storage.session.set({
+        [SCOPED_TAB_IDS_KEY]: [...this.scopedTabIds],
+        [SCOPED_GROUP_IDS_KEY]: Object.fromEntries(this.scopedGroupIds),
+        [CREATED_TAB_IDS_KEY]: [...this.createdTabIds],
+      });
+      lease.assertCurrent();
+    }
   }
 }
