@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from skyvern.forge.sdk.db.models import OrganizationModel
+from skyvern.forge.sdk.db.models import OrganizationModel, TaskModel
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
+from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
@@ -462,3 +463,114 @@ async def test_create_task_leaves_started_at_unset_for_other_statuses(monkeypatc
     task = await _create_task_with_status(monkeypatch, TaskStatus.created.value)
 
     assert task.started_at is None
+
+
+@pytest.mark.asyncio
+async def test_task_finish_claim_is_exactly_once_across_racing_finalizers(sqlite_engine: AsyncEngine):
+    """Two finalizers landing on one task must produce exactly one finish claim.
+
+    The arbitration is the finished_at NULL->set flip: bulk_update_tasks' status
+    CAS performs it atomically with its claim, and update_task_and_claim_finish
+    reports whether ITS write performed it. The first interleaving encodes the
+    reproduced race where a concurrent-agent-style writer pre-read a non-final
+    status, the cron sweep claimed the task, and the agent's write still landed:
+    the write lands, but the claim -- and any per-task side effect gated on it --
+    stays with the sweep.
+    """
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = TasksRepository(session_factory=factory, debug_enabled=False)
+    started = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async def _seed(task_id: str) -> None:
+        async with factory() as session:
+            session.add(
+                TaskModel(
+                    task_id=task_id,
+                    organization_id="o_race",
+                    status=TaskStatus.running.value,
+                    url="https://example.test/",
+                    started_at=started,
+                    errors=[],
+                )
+            )
+            await session.commit()
+
+    # Sweep first: its CAS claim IS the flip, so the racing agent-style write
+    # gets claim=False even though its (stale) pre-read saw a non-final status.
+    await _seed("tsk_sweep_first")
+    swept = await repo.bulk_update_tasks(
+        ["tsk_sweep_first"], status=TaskStatus.timed_out, only_if_status_in=[TaskStatus.running]
+    )
+    _, agent_claimed = await repo.update_task_and_claim_finish(
+        "tsk_sweep_first", status=TaskStatus.completed, organization_id="o_race"
+    )
+    assert swept == ["tsk_sweep_first"]
+    assert agent_claimed is False
+
+    # Agent first: the sweep's CAS finds no non-final row and claims nothing.
+    await _seed("tsk_agent_first")
+    _, agent_claimed = await repo.update_task_and_claim_finish(
+        "tsk_agent_first", status=TaskStatus.completed, organization_id="o_race"
+    )
+    swept = await repo.bulk_update_tasks(
+        ["tsk_agent_first"], status=TaskStatus.timed_out, only_if_status_in=[TaskStatus.running]
+    )
+    assert agent_claimed is True
+    assert swept == []
+
+    # Same writer twice (an overlapping activity retry): one flip, one claim.
+    await _seed("tsk_retry")
+    _, first = await repo.update_task_and_claim_finish(
+        "tsk_retry", status=TaskStatus.timed_out, organization_id="o_race"
+    )
+    _, second = await repo.update_task_and_claim_finish(
+        "tsk_retry", status=TaskStatus.timed_out, organization_id="o_race"
+    )
+    assert (first, second) == (True, False)
+
+    for background_sync in list(repo._background_tasks):
+        await background_sync
+
+
+@pytest.mark.asyncio
+async def test_resetting_a_task_for_rerun_re_arms_its_finish_claim(sqlite_engine: AsyncEngine):
+    """A rerun of a finished task must be able to claim its own finish.
+
+    The claim is the finished_at NULL->set flip, so a reset that leaves finished_at
+    set hands the rerun a spent claim: its real compute never emits, and a later
+    sweep that does claim the row emits the PREVIOUS run's duration.
+    """
+    factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+    repo = TasksRepository(session_factory=factory, debug_enabled=False)
+
+    async with factory() as session:
+        session.add(
+            TaskModel(
+                task_id="tsk_rerun",
+                organization_id="o_rerun",
+                status=TaskStatus.running.value,
+                url="https://example.test/",
+                queued_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                errors=[],
+            )
+        )
+        await session.commit()
+
+    _, first_claim = await repo.update_task_and_claim_finish(
+        "tsk_rerun", status=TaskStatus.completed, organization_id="o_rerun"
+    )
+    assert first_claim is True
+
+    reset_task = await repo.reset_task_for_rerun(task_id="tsk_rerun", organization_id="o_rerun")
+
+    assert reset_task.status == TaskStatus.created
+    assert (reset_task.queued_at, reset_task.started_at, reset_task.finished_at) == (None, None, None)
+
+    _, rerun_claim = await repo.update_task_and_claim_finish(
+        "tsk_rerun", status=TaskStatus.completed, organization_id="o_rerun"
+    )
+    assert rerun_claim is True
+
+    for background_sync in list(repo._background_tasks):
+        await background_sync

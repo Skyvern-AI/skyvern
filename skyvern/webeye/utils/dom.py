@@ -901,7 +901,11 @@ class SkyvernElement:
         if unique_id is None:
             return None
 
-        return await dom.get_skyvern_element_by_id(unique_id)
+        try:
+            return await dom.get_skyvern_element_by_id(unique_id)
+        except MissingElementDict:
+            # The for= control is live but was not scraped; an unmapped control is None, not a failed click.
+            return None
 
     @staticmethod
     async def _label_click_forwards_to_descendant(label_locator: Locator, *, fail_closed: bool = False) -> bool:

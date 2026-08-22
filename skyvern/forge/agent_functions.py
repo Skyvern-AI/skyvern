@@ -886,11 +886,14 @@ class AgentFunction:
         duration_seconds: float,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        excluded_reason: str | None = None,
     ) -> None:
         """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
 
         workflow_run_id/organization_id let the override refine run_type (e.g. a
         workflow run that backs a task_v2) without the caller paying for the lookup.
+        excluded_reason marks a run whose duration must not count as compute (e.g.
+        it never started); the override records it as an exclusion, not as minutes.
         """
         return None
 
