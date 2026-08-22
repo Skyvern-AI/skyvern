@@ -3220,6 +3220,519 @@ async def test_observe_reports_a_reused_component_id_as_reused_not_as_anonymous(
         assert "have no id, name or data-testid of their own" not in r.content, r.content
 
 
+# No <label> anywhere, deliberately: an earlier version of this fix keyed on "does the field have a
+# visible label", which passes this fixture for a reason that has nothing to do with the occluder.
+_COVERED_FIELD_HTML = """
+<div data-role="illustrated-input" style="position:relative;width:200px;height:30px">
+  <input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+  <div id="skin-a" style="position:absolute;left:0;top:0;width:200px;height:30px"></div>
+  <div id="skin-b" style="position:absolute;left:0;top:0;width:200px;height:30px"></div>
+</div>
+<script>
+// The decorative treatment repaints, so a DIFFERENT wrapper is topmost on each retry. A fix that
+// remembers "the thing that blocked me" would pass against one static cover and fail against this.
+var i = 0;
+setInterval(function () {
+  i++;
+  document.getElementById('skin-a').style.zIndex = (i % 2) ? '2' : '1';
+  document.getElementById('skin-b').style.zIndex = (i % 2) ? '1' : '2';
+}, 40);
+</script>
+"""
+
+
+# The label is the point: an accessible production form has one, and a discriminator that keys on
+# the FIELD rather than on the OCCLUDER reads it as reachable and types into a field behind a modal.
+_COVERED_BY_UNRELATED_HTML = """
+<label for="city" style="display:block">City</label>
+<div data-role="illustrated-input" style="position:relative;width:200px;height:30px">
+  <input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+</div>
+<div id="modal" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff"></div>
+"""
+
+
+# The production shape: the field's own ANCESTOR paints over it. A negative z-index puts the input
+# behind its wrapper, so elementFromPoint returns the wrapper and Playwright's hit-target check fails.
+_COVERED_BY_ANCESTOR_HTML = """
+<div id="wrap" data-role="illustrated-input" style="position:relative;width:200px;height:30px;background:#eee">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_drives_a_field_a_decorative_wrapper_covers() -> None:
+    # Playwright's actionability check PASSES on this input -- it is visible, enabled and stable --
+    # and the click then fails the separate HIT-TARGET check, retrying for the full 15s before
+    # raising an unhandled TimeoutError out of _type_and_commit's first line. The suggestion ladder
+    # never runs, so the field is never typed into at all.
+    async with _content_page(_COVERED_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+        # force=True skips the hit-target check but still dispatches a real mouse event at
+        # coordinates, so the wrapper can receive it instead. Assert the intended element actually
+        # ended up focused rather than inferring it from the value having landed.
+        assert await page.evaluate("() => document.activeElement && document.activeElement.id") == "city"
+        # The bug spent 15s per attempt; that tax is the whole cost story on this shape.
+        assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_drives_a_field_its_own_ancestor_paints_over() -> None:
+    # The shape seen in production: the interceptor is the field's own wrapper, not a sibling. An
+    # ancestor is the one occluder that cannot be a page-level overlay, so it is always the widget.
+    async with _content_page(_COVERED_BY_ANCESTOR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+        assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_fails_loud_and_fast_when_an_unrelated_overlay_covers_the_field() -> None:
+    # The other half of commit-or-loud: a field genuinely behind a modal must NOT be forced -- that
+    # would type into something the user cannot see. It must say so at once rather than after 15s.
+    async with _content_page(_COVERED_BY_UNRELATED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+        assert elapsed < 10, elapsed
+
+
+# The field hangs directly off <body>, so EVERY overlay on the page is "inside its parent". A purely
+# structural skin test reads a full-viewport modal as this field's own decoration.
+_COVERED_MODAL_SHARES_PARENT_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div id="modal" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff;z-index:9"></div>
+"""
+
+
+# Below the fold: elementFromPoint answers about the viewport and returns null off-screen, which reads
+# as "nothing on top" and silently restores the pre-fix path for most fields on a real form.
+_COVERED_BELOW_THE_FOLD_HTML = """
+<div style="height:3000px"></div>
+<div data-role="illustrated-input" style="position:relative;width:200px;height:30px">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+"""
+
+
+_DISABLED_UNDER_SKIN_HTML = """
+<div data-role="illustrated-input" style="position:relative;width:200px;height:30px;background:#eee">
+  <input id="city" type="text" disabled style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_modal_that_merely_shares_the_fields_parent() -> None:
+    # Structure alone cannot tell a skin from a backdrop when the parent is the page. The occluder
+    # has to be the size of the field too, or every overlay qualifies.
+    async with _content_page(_COVERED_MODAL_SHARES_PARENT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+        assert time.monotonic() - start < 10
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_sees_the_cover_on_a_field_below_the_fold() -> None:
+    # The probe must ask about the layout the click is about to meet, not the one on screen now.
+    async with _content_page(_COVERED_BELOW_THE_FOLD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+        assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_says_a_disabled_field_is_disabled_instead_of_waiting_for_it() -> None:
+    # force= gets the click past a disabled control, but fill() then waits for "enabled" on its own,
+    # so ignoring what the probe already read costs a second full timeout.
+    async with _content_page(_DISABLED_UNDER_SKIN_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "error", r.content
+        assert "disabled" in r.content
+        assert elapsed < 10, elapsed
+
+
+# The skin is a link. Forcing the click follows it, and the selector may well match something on the
+# destination -- so "did the field stop resolving" cannot tell this from a re-render, but the URL can.
+# Needs a routed origin: set_content leaves the page on about:blank, where nothing navigates.
+_SKIN_IS_A_LINK_HTML = """
+<a id="wrap" href="/elsewhere" style="position:relative;display:block;width:200px;height:30px;background:#eee">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</a>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_stops_when_the_forced_click_navigates_away() -> None:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                body = "<h1>elsewhere</h1>" if route.request.url.endswith("/elsewhere") else _SKIN_IS_A_LINK_HTML
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("**/*", _serve)
+            await page.goto("http://skin.test/start")
+            tools = build_browser_tools(_fixed_page_provider(page))
+            start = time.monotonic()
+            r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+            elapsed = time.monotonic() - start
+            assert r.status == "error", r.content
+            assert page.url.endswith("/elsewhere"), page.url
+            # Not a 15s fill() wait against a selector on some other document.
+            assert elapsed < 10, elapsed
+        finally:
+            await browser.close()
+
+
+# scrollIntoView inherits CSS scroll-behavior. Smooth scrolling animates while the rect is read
+# synchronously on the next line, so the element is still off-screen and the probe sees nothing.
+_SMOOTH_SCROLL_BELOW_FOLD_HTML = """
+<style>html { scroll-behavior: smooth; }</style>
+<div style="height:3000px"></div>
+<div data-role="illustrated-input" style="position:relative;width:200px;height:30px">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+"""
+
+
+# The input is a sub-region of the control it belongs to: an icon-padded pill search bar. Measuring
+# the skin against the INPUT's box rejects a legitimate decoration that is doing nothing wrong.
+_PILL_SKIN_HTML = """
+<div style="position:relative;width:320px;height:48px">
+  <input id="city" type="text" style="position:absolute;left:48px;top:0;width:220px;height:48px;border:none;background:transparent">
+  <div id="pill-skin" style="position:absolute;left:0;top:0;width:320px;height:48px;border-radius:24px"></div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_sees_the_cover_even_when_the_page_scrolls_smoothly() -> None:
+    async with _content_page(_SMOOTH_SCROLL_BELOW_FOLD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+        assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_drives_a_field_that_is_a_sub_region_of_its_own_control() -> None:
+    # A skin is sized like the control it decorates, not like the raw input inside it.
+    async with _content_page(_PILL_SKIN_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_continues_when_the_click_only_rewrites_the_url() -> None:
+    # pushState changes the URL without leaving the page. The field never moved, so aborting here
+    # would refuse to type into a field that is still sitting there.
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+
+            async def _serve(route: Any) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="""
+                    <div id="wrap" style="position:relative;width:200px;height:30px;background:#eee">
+                      <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+                    </div>
+                    <script>
+                    document.getElementById('wrap').addEventListener('click', function () {
+                      history.pushState(null, '', '/search?q=');
+                    });
+                    </script>""",
+                )
+
+            await page.route("**/*", _serve)
+            await page.goto("http://skin.test/start")
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+            assert r.status == "ok", r.content
+            assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+            assert "/search" in page.url, "fixture must actually rewrite the URL"
+        finally:
+            await browser.close()
+
+
+# The ordinary modal shape: a fixed backdrop wrapping a statically-positioned panel. Reading the hit
+# element's own position says "relative" and the panel is barely larger than the field.
+_DIALOG_PANEL_OVER_FIELD_HTML = """
+<input id="city" type="text" style="position:absolute;left:40px;top:40px;width:200px;height:30px">
+<div id="backdrop" style="position:fixed;left:0;top:0;width:100%;height:100%">
+  <div id="dialog" style="position:relative;left:40px;top:40px;width:210px;height:36px;background:#fff">Confirm</div>
+</div>
+"""
+
+
+# Sticky pins to the viewport once stuck, so a sticky bar lying over a field is not that field's skin.
+_STICKY_BAR_OVER_FIELD_HTML = """
+<div id="bar" style="position:sticky;top:0;z-index:5;width:300px;height:40px;background:#ddd">promo</div>
+<input id="city" type="text" style="position:relative;top:-40px;width:200px;height:30px">
+"""
+
+
+# A wrapper that swaps its own input on click -- an ordinary SPA remount. The selector then resolves
+# to nothing, and fill() would wait its whole timeout for a node that no longer exists.
+_FIELD_REMOUNTS_ON_CLICK_HTML = """
+<div id="wrap" style="position:relative;width:200px;height:30px;background:#eee">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+<script>
+document.getElementById('wrap').addEventListener('click', function () {
+  var old = document.getElementById('city');
+  if (old) { old.remove(); }
+});
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_dialog_panel_whose_backdrop_is_the_pinned_one() -> None:
+    async with _content_page(_DIALOG_PANEL_OVER_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_sticky_bar_lying_over_the_field() -> None:
+    async with _content_page(_STICKY_BAR_OVER_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_stops_when_the_forced_click_removes_the_field() -> None:
+    async with _content_page(_FIELD_REMOUNTS_ON_CLICK_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        start = time.monotonic()
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        elapsed = time.monotonic() - start
+        assert r.status == "error", r.content
+        # Not a 15s fill() wait for a node that is gone.
+        assert elapsed < 10, elapsed
+
+
+# A container that blocks the form it WRAPS. The old rule exempted every ancestor on the grounds that
+# a dialog is never an ancestor of what it covers, which is not true of a blocking wrapper.
+_BLOCKING_ANCESTOR_HTML = """
+<div id="shade" style="position:absolute;left:0;top:0;width:1024px;height:900px;background:rgba(0,0,0,0.4)">
+  <input id="city" type="text" style="position:relative;z-index:-1;width:200px;height:30px">
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_an_ancestor_that_blocks_the_form_it_wraps() -> None:
+    async with _content_page(_BLOCKING_ANCESTOR_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+# email/password/tel/number/date and textarea skip the typeahead probe entirely and reach fill(),
+# which does no hit-testing -- so nothing fails on its own and the text simply lands in a field
+# nobody could have reached. Login and signup forms behind a consent banner are the everyday shape.
+_COVERED_EMAIL_FIELD_HTML = """
+<label for="em" style="display:block">Email</label>
+<input id="em" type="email" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div id="consent" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">Accept cookies</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_covered_field_whose_type_skips_the_typeahead_probe() -> None:
+    async with _content_page(_COVERED_EMAIL_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#em", "text": "someone@example.com"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#em", "el => el.value") == ""
+
+
+# Design systems routinely put an inner wrapper between the input and the element the skin is
+# positioned against, so "the field's immediate parent" is narrower than "the field's own control".
+_SKIN_ONE_WRAPPER_DEEPER_HTML = """
+<div class="field-outer" style="position:relative;width:200px;height:30px">
+  <div class="input-inner" style="position:absolute;left:0;top:0;width:200px;height:30px">
+    <input id="city" type="text" style="width:200px;height:30px">
+  </div>
+  <div class="skin" style="position:absolute;left:0;top:0;width:200px;height:30px"></div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_drives_a_field_whose_skin_sits_a_wrapper_deeper() -> None:
+    async with _content_page(_SKIN_ONE_WRAPPER_DEEPER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "Iowa City"
+
+
+# No positioning anywhere up the chain, so the occluder has no containing block of its own. Asking
+# "do they share a block" then degenerates into "are they on the same page", which every overlay is.
+_UNRELATED_BADGE_NO_POSITIONING_HTML = """
+<input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+<div id="badge" style="position:absolute;left:0;top:0;width:200px;height:30px;background:pink;z-index:9"></div>
+"""
+
+
+# The ordinary SPA layout: one positioned root wrapping the whole page. It contains the field AND
+# every overlay, so a shared-block test that does not ask whether the block is a CONTROL passes it.
+_POSITIONED_APP_ROOT_HTML = """
+<div id="app" style="position:relative;width:1024px;height:900px">
+  <input id="city" type="text" style="position:absolute;left:0;top:0;width:200px;height:30px">
+  <div id="popover" style="position:absolute;left:0;top:0;width:200px;height:30px;background:pink;z-index:9"></div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_an_unrelated_overlay_on_a_page_with_no_positioning() -> None:
+    async with _content_page(_UNRELATED_BADGE_NO_POSITIONING_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_an_overlay_sharing_only_a_page_wide_app_root() -> None:
+    async with _content_page(_POSITIONED_APP_ROOT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+# An inline-edit row dimmed while an async save is in flight. The row is small and positioned and
+# holds this field -- but it also holds another one, which makes it a layout region, not a control.
+_ROW_SAVING_OVERLAY_HTML = """
+<div id="row" style="position:relative;width:400px;height:40px">
+  <input id="qty" type="text" style="position:absolute;left:0;top:0;width:180px;height:40px">
+  <input id="price" type="text" style="position:absolute;left:200px;top:0;width:180px;height:40px">
+  <div id="saving" style="position:absolute;left:0;top:0;width:400px;height:40px;background:rgba(255,255,255,0.7)">Saving...</div>
+</div>
+"""
+
+
+# A help tooltip inside the same card as the field. The card holds no other control, so structure
+# alone accepts it -- but the element says what it is.
+_TOOLTIP_IN_THE_FIELDS_CARD_HTML = """
+<div id="card" style="position:relative;width:220px;height:40px">
+  <input id="city" type="text" style="position:absolute;left:0;top:0;width:220px;height:40px">
+  <div id="tip" role="tooltip" style="position:absolute;left:0;top:0;width:220px;height:40px;background:#ffd">Saved</div>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_a_row_overlay_in_a_container_holding_other_fields() -> None:
+    async with _content_page(_ROW_SAVING_OVERLAY_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#qty", "text": "42"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#qty", "el => el.value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_refuses_an_occluder_that_says_it_is_an_overlay() -> None:
+    async with _content_page(_TOOLTIP_IN_THE_FIELDS_CARD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+
+
+# A host-anchored selector's two halves straddle a shadow boundary, so no single root matches it and
+# a per-root lookup finds nothing. If the reachability probe reads that as "no field here" the guard
+# is silently off for exactly the controls host-anchoring made addressable.
+_HOST_ANCHORED_COVERED_HTML = """
+<ds-input id="host" style="display:block;position:relative;width:200px;height:30px"></ds-input>
+<div id="modal" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff"></div>
+<script>
+var r = document.getElementById('host').attachShadow({mode: 'open'});
+r.innerHTML = '<input id="ctrl" type="text" style="width:200px;height:30px">';
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_still_checks_reachability_for_a_host_anchored_selector() -> None:
+    async with _content_page(_HOST_ANCHORED_COVERED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        # The selector the engine mints for a control inside a repeated component.
+        r = await _tool(tools, "type").handler({"selector": "#host #ctrl", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#host #ctrl", "el => el.value") == ""
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_select_option_on_hidden_native_select_sets_value_and_fires_change() -> None:
