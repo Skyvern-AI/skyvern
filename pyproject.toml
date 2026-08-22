@@ -200,7 +200,7 @@ cloud = [
     "opentelemetry-instrumentation-grpc>=0.60b1,<1",
     "opentelemetry-instrumentation-requests>=0.60b1,<1",
     "opentelemetry-instrumentation-urllib3>=0.60b1,<1",
-    "guarddog>=3.0.2,<4",
+    "guarddog>=3.0.2,<3.1",
 ]
 dev = [
     "grpcio-tools==1.80.0",

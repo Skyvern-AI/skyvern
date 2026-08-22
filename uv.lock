@@ -7149,7 +7149,7 @@ provides-extras = ["local", "server"]
 cloud = [
     { name = "anchorbrowser", specifier = ">=0.11,<0.12" },
     { name = "browser-use-sdk", specifier = ">=3.8,<4" },
-    { name = "guarddog", specifier = ">=3.0.2,<4" },
+    { name = "guarddog", specifier = ">=3.0.2,<3.1" },
     { name = "kr8s", specifier = ">=0.20.14,<1" },
     { name = "openai-agents", specifier = ">=0.14.8,<0.15" },
     { name = "opentelemetry-distro", specifier = ">=0.60b1,<1" },
