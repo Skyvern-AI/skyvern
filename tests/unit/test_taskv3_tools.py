@@ -925,6 +925,171 @@ async def test_observe_digest_total_cap_holds_under_adversarial_status_content()
         texts = data.get("text") or []
         assert texts  # something survived
         assert sum(len(t) for t in texts) <= 900
+        assert data.get("textDropped", 0) > 0  # a capped digest discloses that it was capped
+
+
+_VALIDATION_PAGE_HTML = """
+<!doctype html><html><head><title>Apply</title></head><body>
+  <h1>Talent Partner</h1>
+  <div class="error-boundary">{prose}</div>
+  <form>
+    <p class="error-message">Required profile link is empty.</p>
+    <p class="error-message" style="display:none">File exceeds the maximum upload size.</p>
+    <span class="field-error" id="phone-error">Enter a valid phone number</span>
+    <ul id="summary-errors">{summary}</ul>
+    <div class="error-summary-region">Please fix the following before continuing: your region must be set here. <select><option>US</option></select> {filler}</div>
+    <div class="alert alert-danger alert-dismissible">We could not process your application. Please correct the highlighted fields. <button type="button" class="close">x</button></div>
+    {headings}
+    <input id="site" type="url" value="N/A">
+    <input id="name" type="text" value="Jane" aria-invalid="true">
+    <input id="empty" type="text" required>
+    <input id="agree" type="checkbox" required>
+    <button id="submit" type="button">Submit</button>
+  </form>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_validation_text_without_aria() -> None:
+    # Many sites render the submit refusal as a plain styled block with no ARIA role; the digest must
+    # still carry it, or the only anomaly the model can see after a refused submit is unrelated
+    # (e.g. a captcha widget that is always present) and the verdict names the wrong cause.
+    prose = "word " * 400  # a prose-length block whose class happens to contain "error" is not a message
+    summary = "".join(f"<li>Error {i}: field {i} must be corrected before you can submit</li>" for i in range(3))
+    headings = "".join(f"<h2>Section {i}: {'heading text ' * 6}</h2>" for i in range(12))  # ~1000 chars of headings
+    async with _content_page(
+        _VALIDATION_PAGE_HTML.format(prose=prose, summary=summary, headings=headings, filler="filler " * 30)
+    ) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        joined = " | ".join(texts)
+        assert "Required profile link is empty." in joined
+        assert "Enter a valid phone number" in joined
+        assert "Error 0: field 0 must be corrected" in joined  # long field-free summary truncates, not drops
+        assert "We could not process your application" in joined  # a dismiss button does not make it a container
+        assert "your region must be set here" in joined  # one embedded fix control does not make it a container
+        assert any(t.startswith("Section 0:") for t in texts)  # headings keep a floor of the budget
+        assert "File exceeds" not in joined  # hidden
+        assert "word word word" not in joined  # large container excluded
+        assert sum(len(t) for t in texts) <= 900
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_message_channel_not_starved_by_aria_total() -> None:
+    # Three ARIA status blocks alone can cross the message-block loop's shared-total break before it
+    # ever runs; the loop needs its own spend, not a check against the total the ARIA pass already ate.
+    def status_block(i: int) -> str:
+        return f'<div role="status">Status update number {i} ' + ("padding " * 29) + f"end{i}</div>"
+
+    filler = "context " * 40  # pushes the form's innerText past 300 chars so the headings channel
+    # can only take the heading alone, leaving the message-block channel as the sole source.
+    html = (
+        "<!doctype html><html><body>"
+        + "".join(status_block(i) for i in range(3))
+        + '<form><p class="error-message">Your application was rejected: the profile link is required.</p>'
+        + f"<h2>Section 0</h2><p>{filler}</p></form>"
+        + "</body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        joined = " | ".join(texts)
+        assert "Your application was rejected: the profile link is required." in joined
+        assert sum(len(t) for t in texts) <= 900
+
+
+def _pad_to(text: str, target: int) -> str:
+    s = text
+    while len(s) < target:
+        s += " word"
+    return s[:target]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_prioritizes_form_error_over_site_chrome() -> None:
+    # Site chrome (cookie banners, alert dropdowns) sits above the form in DOM order and can spend
+    # the whole message-block budget before the loop ever reaches the real validation error.
+    alerts = _pad_to("Recent alerts dropdown notice content", 190)
+    cookie = _pad_to("This site uses cookies for analytics and marketing purposes accept", 250)
+    info = _pad_to("General info alert banner", 100)
+    html = f"""<!doctype html><html><body>
+      <div class="alerts-dropdown">{alerts}</div>
+      <div class="cookie-warning">{cookie}</div>
+      <div class="alert alert-info">{info}</div>
+      <form>
+        <p class="error-message">We could not process your application. Please correct the highlighted fields.</p>
+        <p class="error-message" style="opacity:0">Opacity hidden placeholder</p>
+        <p class="error-message" style="position:absolute;left:-9999px">Offscreen placeholder</p>
+        <p class="error-message" aria-hidden="true">Aria hidden placeholder</p>
+      </form>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        joined = " | ".join(texts)
+        assert "We could not process your application" in joined
+        assert "Opacity hidden placeholder" not in joined
+        assert "Offscreen placeholder" not in joined
+        assert "Aria hidden placeholder" not in joined
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_flags_invalid_fields_with_validation_message() -> None:
+    async with _content_page(_VALIDATION_PAGE_HTML.format(prose="short", summary="", headings="", filler="")) as page:
+        data = await _observe_data(page)
+        by_sel = {e["selector"]: e for e in data["elements"]}
+        # Native constraint: "N/A" is not a URL. The browser's wording is not spec'd, so only its
+        # presence is asserted.
+        assert isinstance(by_sel["#site"]["invalid"], str) and by_sel["#site"]["invalid"]
+        assert by_sel["#name"]["invalid"] is True  # aria-invalid without a native message
+        assert "invalid" not in by_sel["#empty"]  # empty required is *required, not invalid
+        assert "invalid" not in by_sel["#agree"]  # unchecked required checkbox: .value is "on", not a state
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_flags_non_boolean_aria_invalid_values() -> None:
+    # aria-invalid also takes token values ("grammar", "spelling") per the ARIA spec; only the
+    # literal "false" means valid.
+    html = """<!doctype html><html><body>
+      <input id="grammar" aria-invalid="grammar">
+      <input id="spelling" aria-invalid="spelling">
+      <input id="ok" aria-invalid="false">
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        by_sel = {e["selector"]: e for e in data["elements"]}
+        assert by_sel["#grammar"]["invalid"] is True
+        assert by_sel["#spelling"]["invalid"] is True
+        assert "invalid" not in by_sel["#ok"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_native_invalid_excludes_unwritable_and_password_fields() -> None:
+    # readonly/disabled/novalidate fields can never be corrected or submitted as typed, so a native
+    # "invalid" verdict on them is noise; a password's validationMessage would leak its value.
+    html = """<!doctype html><html><body>
+      <input id="ro" type="email" value="not-an-email" readonly>
+      <input id="dis" type="email" value="not-an-email" disabled>
+      <form novalidate><input id="nv" type="email" value="not-an-email"></form>
+      <input id="pw" type="password" minlength="12">
+      <form><input id="plain" type="email" value="not-an-email"></form>
+    </body></html>"""
+    async with _content_page(html) as page:
+        await page.fill("#pw", "abcdefg")
+        data = await _observe_data(page)
+        by_sel = {e["selector"]: e for e in data["elements"]}
+        assert "invalid" not in by_sel["#ro"]
+        assert "invalid" not in by_sel["#dis"]
+        assert "invalid" not in by_sel["#nv"]
+        assert "invalid" not in by_sel["#pw"]
+        assert isinstance(by_sel["#plain"]["invalid"], str) and by_sel["#plain"]["invalid"]
 
 
 @_skip_no_browser
@@ -1146,8 +1311,17 @@ async def test_observe_renders_text_digest_and_pressed_state() -> None:
                     "url": self.url,
                     "title": "Apply",
                     "text": ["Success Your submission was received."],
+                    "textDropped": 3,
                     "elements": [
-                        {"i": 0, "tag": "button", "type": None, "selector": "#no", "label": "No", "pressed": True}
+                        {"i": 0, "tag": "button", "type": None, "selector": "#no", "label": "No", "pressed": True},
+                        {
+                            "i": 1,
+                            "tag": "input",
+                            "type": "url",
+                            "selector": "#site",
+                            "label": "Site",
+                            "invalid": "Enter a URL.",
+                        },
                     ],
                 }
             )
@@ -1156,6 +1330,8 @@ async def test_observe_renders_text_digest_and_pressed_state() -> None:
     r = await _tool(tools, "observe").handler({})
     assert r.status == "ok"
     assert "text: 'Success Your submission was received.'" in r.content
+    assert "note: 3 more page message(s) did not fit the text digest" in r.content
+    assert "*invalid='Enter a URL.'" in r.content
     assert "pressed=True" in r.content
 
 
