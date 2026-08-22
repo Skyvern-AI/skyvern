@@ -2842,23 +2842,20 @@ async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_reports_a_reused_component_id_as_reused_not_as_anonymous() -> None:
-    # The singleton fixture above only proves observe can name a component control with its own id;
-    # the dominant real case is a form built from the SAME component twice (First name, Last name),
-    # and a design system hard-codes the same internal id in every instance because shadow
-    # encapsulation scopes ids to their own root. Both instances resolve to a cross-root count of 2,
-    # so both are dropped — but the note must say "reused", not "no id of their own", because saying
-    # the latter about a control that DOES have an id misdescribes the page.
+    # A design system hard-codes the same internal id in every instance, because shadow encapsulation
+    # scopes ids to their own root, so both instances resolve to a cross-root count of 2. Anchoring on
+    # the host recovers that whenever the host can be named; these hosts deliberately cannot be, which
+    # is what leaves the controls unnamed and keeps this the case the note has to describe correctly.
+    # The note must say "reused", not "no id of their own", because saying the latter about a control
+    # that DOES have an id misdescribes the page.
     async with _live_page(
-        """<ds-form-field id="ff1"></ds-form-field>
-        <ds-form-field id="ff2"></ds-form-field>
+        """<ds-form-field></ds-form-field>
+        <ds-form-field></ds-form-field>
         <script>
-        function openRoot(id, html) {
-          var r = document.getElementById(id).attachShadow({mode: 'open'});
-          r.innerHTML = html;
-          return r;
+        for (const h of document.querySelectorAll('ds-form-field')) {
+          h.attachShadow({mode: 'open'}).innerHTML =
+            '<input id="first-name" name="firstName" style="width:80px;height:20px">';
         }
-        openRoot('ff1', '<input id="first-name" name="firstName" style="width:80px;height:20px">');
-        openRoot('ff2', '<input id="first-name" name="firstName" style="width:80px;height:20px">');
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -3648,8 +3645,8 @@ async def test_stale_id_probe_does_not_report_shadow_hosted_selector_as_gone() -
     from skyvern.forge.taskv3.tools import _SELECTOR_EXISTS_JS  # noqa: PLC0415
 
     async with _shadow_page() as page:
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#first-name") is True
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#no-such-element") is False
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#first-name", "el": None}) is True
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#no-such-element", "el": None}) is False
 
     # And at any nesting depth. The walk feeding this probe used to stop at ten roots, so a control
     # below that answered "gone" and the click path failed loud on an element that was really there.
@@ -3665,7 +3662,7 @@ async def test_stale_id_probe_does_not_report_shadow_hosted_selector_as_gone() -
         </script>"""
     ) as page:
         assert await page.locator("#deep-ctrl").count() == 1, "fixture is not armed"
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#deep-ctrl") is True
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#deep-ctrl", "el": None}) is True
 
 
 @_skip_no_browser
@@ -4085,11 +4082,11 @@ async def test_selector_exists_probe_is_not_fooled_by_a_named_getter_shadow_root
         </script>"""
     ) as page:
         # The genuine shadow-hosted control is found through the real root...
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#really-real") is True
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#really-real", "el": None}) is True
         # ...the decoy's child is found through the document, as an ordinary element...
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#inside-the-decoy") is True
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#inside-the-decoy", "el": None}) is True
         # ...and nothing the page can name into existence is reported as present.
-        assert await page.evaluate(_SELECTOR_EXISTS_JS, "#no-such-element") is False
+        assert await page.evaluate(_SELECTOR_EXISTS_JS, {"sel": "#no-such-element", "el": None}) is False
 
 
 @_skip_no_browser
@@ -4645,6 +4642,8 @@ _SHARED_ID_DROPZONES_HTML = """
   <ds-drop id="dz-single"></ds-drop>
   <ds-drop id="dz-a"></ds-drop>
   <ds-drop id="dz-b"></ds-drop>
+  <ds-drop class="anon"></ds-drop>
+  <ds-drop class="anon"></ds-drop>
   <script>
     function mk(hostId, inputId, labelText) {
       var r = document.getElementById(hostId).attachShadow({mode: 'open'});
@@ -4656,6 +4655,13 @@ _SHARED_ID_DROPZONES_HTML = """
     mk('dz-single', 'resume-unique', 'Upload resume (only one)');
     mk('dz-a', 'resume', 'Upload resume');
     mk('dz-b', 'resume', 'Upload cover letter');
+    // A pair whose hosts cannot be named either, so they stay retained-but-unlisted and the note
+    // keeps having something to count that the listing does not.
+    for (const h of document.querySelectorAll('ds-drop.anon')) {
+      h.attachShadow({mode: 'open'}).innerHTML =
+        '<label for="portfolio" style="display:inline-block;width:240px;height:40px">Upload portfolio</label>' +
+        '<input type="file" id="portfolio" style="position:absolute;width:0;height:0;opacity:0">';
+    }
   </script>
 </body></html>
 """
@@ -4669,10 +4675,37 @@ async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() 
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
         tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
-        assert len(tagged) == 1 and "resume-unique" in tagged[0], r.content
-        assert "note: 1 native control(s) hidden behind styled proxies" in r.content, r.content
-        # the two that share an id are dropped, and said to be dropped, rather than counted as listed
+        assert len(tagged) == 3, r.content
+        assert "note: 3 native control(s) hidden behind styled proxies" in r.content, r.content
+        # The two whose hosts have no name of their own stay unlisted, and are said to be dropped
+        # rather than counted as listed: the note claims what it printed, not what it walked.
         assert "reused by another instance of the same component" in r.content
+        assert "portfolio" not in r.content, r.content
+
+
+def _printed_selectors(content: str) -> list[str]:
+    return re.findall(r"^\[(.*?)\] ", content, re.M)
+
+
+# Two instances of one component, each holding a control under the same id. Shadow encapsulation
+# scopes ids to their own root, so a design system reuses one id per instance and every flat form
+# is cross-root ambiguous. Each inner control reports which instance it belongs to, and the twin
+# carries the same listener, so a receipt naming one instance is proof the other was not touched.
+_REPEATED_COMPONENT_HTML = """
+<ds-field id="fld-a"></ds-field>
+<ds-field id="fld-b"></ds-field>
+<script>
+window.hits = [];
+window.build = function (hostId, token) {
+  var host = document.getElementById(hostId);
+  var r = host.shadowRoot || host.attachShadow({mode: 'open'});
+  r.innerHTML = '<button id="apply" style="width:90px;height:24px">Apply</button>';
+  r.querySelector('button').addEventListener('click', function () { window.hits.push(token); });
+};
+window.build('fld-a', 'a-v1');
+window.build('fld-b', 'b-v1');
+</script>
+"""
 
 
 # --- Reaction probes inside open shadow roots. Perception already pierces; these cover the
@@ -4736,7 +4769,7 @@ async def test_click_precheck_recognizes_a_shadow_hosted_menu_option() -> None:
           + '<li id="o2" data-tv3-menu="2" role="option">Beta</li></ul>';
         </script>"""
     ) as page:
-        pre = await page.evaluate(_CLICK_PRECHECK_JS, '[data-tv3-menu="1"]')
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, {"sel": '[data-tv3-menu="1"]', "el": None})
         assert pre["isOption"] is True
         assert pre["menuOpen"] is True
         assert pre["optText"] == "Alpha"
@@ -4774,7 +4807,7 @@ async def test_menu_after_does_not_report_an_open_shadow_menu_as_closed() -> Non
         </script>"""
     ) as page:
         assert await page.is_visible('[data-tv3-menu="1"]') is True
-        after = await page.evaluate(_MENU_AFTER_JS, '[data-tv3-menu="1"]')
+        after = await page.evaluate(_MENU_AFTER_JS, {"sel": '[data-tv3-menu="1"]', "el": None})
         assert after["stillOpen"] == 2
 
 
@@ -4796,14 +4829,14 @@ async def test_menu_finder_refuses_when_no_snapshot_arms_it() -> None:
     async with _live_page(html) as page:
         # No precheck has run: window carries no snapshot, exactly as after a navigation.
         assert await page.evaluate("() => window.__tv3_pre === undefined") is True
-        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+        assert await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None}) is None
         # ...and the same page WITH a snapshot still finds nothing, because nothing reacted — so the
         # refusal above is about the missing snapshot, not about an unfindable menu.
-        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
-        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#pick", "el": None})
+        assert await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None}) is None
         # Prove the fixture is findable at all once the rows genuinely appear in reaction.
         await page.evaluate("() => { document.getElementById('menu').remove(); }")
-        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#pick", "el": None})
         await page.evaluate(
             "(h) => { const d = document.createElement('div'); d.innerHTML = h;"
             " document.body.appendChild(d.firstElementChild); }",
@@ -4813,7 +4846,7 @@ async def test_menu_finder_refuses_when_no_snapshot_arms_it() -> None:
                  <div role="option" style="height:20px">Gamma Inc</div>
                </div>""",
         )
-        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        found = await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None})
         assert isinstance(found, dict) and found.get("count") == 3, found
 
 
@@ -4840,10 +4873,10 @@ async def test_menu_finder_sees_rows_written_straight_into_a_shadow_root() -> No
         });
         </script>"""
     ) as page:
-        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#pick", "el": None})
         await page.click("#pick")
         await page.wait_for_timeout(100)
-        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        found = await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None})
         assert isinstance(found, dict) and found.get("count") == 3, found
         assert [o["text"] for o in found["options"]] == ["Alpha", "Beta", "Gamma"]
 
@@ -4872,13 +4905,13 @@ async def test_click_precheck_flags_a_shadow_host_that_wraps_the_open_menu() -> 
         });
         </script>"""
     ) as page:
-        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#pick", "el": None})
         await page.click("#pick")
         await page.wait_for_timeout(100)
-        found = await page.evaluate(_FIND_MENU_JS, "#pick")
+        found = await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None})
         assert isinstance(found, dict) and found.get("count") == 3, found
 
-        pre = await page.evaluate(_CLICK_PRECHECK_JS, "#m")
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#m", "el": None})
         assert pre["menuOpen"] is True, pre
         # The host encloses every tagged row through its own shadow root, so this click cannot be
         # attributed to any one option.
@@ -4947,7 +4980,7 @@ async def test_pre_snapshot_does_not_provoke_the_re_render_it_then_misreads() ->
         # A STRING, not a dict: _FIND_MENU_JS takes the clicked selector. A dict stringifies to
         # "[object Object]", pQS throws on it, and the probe returns null at the trigger step —
         # passing for a reason that has nothing to do with the reaction gate under test.
-        assert await page.evaluate(_FIND_MENU_JS, "#city") is None
+        assert await page.evaluate(_FIND_MENU_JS, {"sel": "#city", "el": None}) is None
         assert await page.evaluate("() => window.renders") == 1, "the snapshot must not mutate the page"
 
         # The fixture really is reactive: stamping an attribute the old way does re-render it, so the
@@ -4976,12 +5009,12 @@ async def test_pre_snapshot_survives_a_container_the_page_rebuilds_by_cloning() 
           <a href="/c" role="option" style="display:block;height:20px">Result Gamma</a>
         </div>"""
     ) as page:
-        await page.evaluate(_CLICK_PRECHECK_JS, "#sort")
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#sort", "el": None})
         # The page rebuilds the container: every node is new, but every node carries the mark.
         await page.evaluate(
             "() => { const r = document.getElementById('results'); r.parentNode.replaceChild(r.cloneNode(true), r); }"
         )
-        assert await page.evaluate(_FIND_MENU_JS, "#sort") is None
+        assert await page.evaluate(_FIND_MENU_JS, {"sel": "#sort", "el": None}) is None
 
 
 @_skip_no_browser
@@ -5011,10 +5044,10 @@ async def test_reaction_gate_rejects_a_page_supplied_snapshot_impostor() -> None
         });
         </script>"""
     ) as page:
-        await page.evaluate(_CLICK_PRECHECK_JS, "#pick")
+        await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#pick", "el": None})
         # The impostor answers "not in the snapshot" for every row. Without the instanceof check the
         # probe believes it, and reports three static links as a menu the click just opened.
-        assert await page.evaluate(_FIND_MENU_JS, "#pick") is None
+        assert await page.evaluate(_FIND_MENU_JS, {"sel": "#pick", "el": None}) is None
 
 
 @_skip_no_browser
@@ -5119,6 +5152,224 @@ _PROXY_MENU_IN_SHADOW_HTML = """
   </script>
 </body></html>
 """
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_control_in_a_repeated_component_is_addressed_through_its_host() -> None:
+    # The gap this closes: both instances are correctly refused a flat selector (the id names two
+    # elements), which left them with no selector at all and therefore unreachable by every tool.
+    # Anchoring on the host — which lives outside the root it owns, and so can be named the ordinary
+    # way — separates them without writing anything into the component.
+    async with _live_page(_REPEATED_COMPONENT_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        assert await page.locator("#apply").count() == 2, "fixture must reproduce the reused id"
+
+        r = await _tool(tools, "observe").handler({})
+        selectors = _printed_selectors(r.content)
+        assert len(selectors) == 2, r.content
+        for sel in selectors:
+            assert await page.locator(sel).count() == 1, f"{sel} must denote exactly one element"
+
+        # Pick the instance the digest attributes to the SECOND host, and re-render it before acting:
+        # a mechanism that is correct only until the component rebuilds passes a fixture that never
+        # rebuilds, and fails in production.
+        chosen = next(s for s in selectors if "fld-b" in s)
+        await page.evaluate("() => { window.build('fld-b', 'b-v2'); window.hits = []; }")
+
+        await _tool(tools, "click").handler({"selector": chosen})
+        # The twin carries the same listener, so its silence is the discriminating half of this proof,
+        # and the v2 token is what shows the selector re-resolved to the rebuilt node.
+        assert await page.evaluate("() => window.hits") == ["b-v2"], chosen
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_host_anchored_control_is_driven_rather_than_reported_gone() -> None:
+    # observe naming a control that the act path then refuses to resolve is the seam that cost this
+    # module its worst regression: the probes resolve per root, which cannot match a selector whose
+    # two halves straddle a shadow boundary, so a click fell through to the full actionability wait
+    # and then reported an element that is plainly present as removed by a re-render.
+    async with _content_page(_SHARED_ID_DROPZONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        listed = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
+        assert len(listed) == 3, r.content
+        assert "[#dz-b #resume]" in r.content, r.content
+
+        chosen = next(s for s in _printed_selectors(r.content) if "dz-b" in s)
+        started = time.monotonic()
+        cr = await _tool(tools, "click").handler({"selector": chosen})
+        assert cr.status == "error"
+        assert "file_upload" in cr.content, cr.content
+        assert "no longer exists" not in cr.content, cr.content
+        # The redirect is decided by a probe, not by waiting for Playwright to give up on a control
+        # the page renders at zero size.
+        assert time.monotonic() - started < 5, "the refusal must not cost an actionability timeout"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_host_anchored_selector_counts_what_the_host_slots_as_well_as_what_it_owns() -> None:
+    # A descendant combinator is shadow-transparent to the executor, so `#host #ctrl` also matches a
+    # light-DOM child slotted INTO the component. Scoping the uniqueness count to the root alone
+    # would undercount, and undercounting is the direction that mints an ambiguous selector — which
+    # the executor resolves by silently taking the first of several rather than refusing.
+    async with _live_page(
+        """<ds-field id="host-one"><input id="dup" style="width:80px;height:20px"></ds-field>
+        <script>
+        var r = document.getElementById('host-one').attachShadow({mode: 'open'});
+        r.innerHTML = '<slot></slot><input id="dup" style="width:80px;height:20px">';
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        assert await page.locator("#host-one #dup").count() == 2, "fixture must arm the slotted twin"
+        r = await _tool(tools, "observe").handler({})
+        selectors = _printed_selectors(r.content)
+        # Armed on the DIGEST too, not only on the fixture: the property below is quantified over what
+        # was printed, so an empty or collapsed digest would satisfy it without protecting anything.
+        # The light-DOM twin is still named, and the one under the host is refused AND said to be.
+        assert len(selectors) == 1, r.content
+        assert "#host-one #dup" not in r.content, r.content
+        assert "reused by another instance of the same component" in r.content, r.content
+        for sel in selectors:
+            assert await page.locator(sel).count() == 1, f"{sel} denotes more than one element: {r.content}"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_file_upload_reaches_the_dropzone_of_the_instance_it_was_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # The shape this whole mechanism exists for: a run fills every named field correctly and still
+    # fails the application because it cannot attach the file. click only ever redirects here, so
+    # the redirect passing is not evidence the upload lands — this asserts the file itself arrives,
+    # in the instance named and not its twin.
+    import skyvern.forge.sdk.api.files as _files  # noqa: PLC0415
+
+    staged = tmp_path / "cv.pdf"
+    staged.write_bytes(b"%PDF-1.4 cv")
+
+    async def _staged_file(source: str, output_dir: Any = None, organization_id: Any = None) -> str:
+        return str(staged)
+
+    monkeypatch.setattr(_files, "download_file", _staged_file)
+
+    async with _content_page(_SHARED_ID_DROPZONES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        chosen = next(s for s in _printed_selectors(r.content) if "dz-b" in s)
+
+        ur = await _tool(tools, "file_upload").handler({"selector": chosen, "file": "https://example.test/cv.pdf"})
+        assert ur.status == "ok", ur.content
+
+        # Read every instance's own input: the twin holding zero files is the half of this that
+        # rules out a 50/50 landing.
+        landed = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('ds-drop')).map((h) => {
+                 const i = h.shadowRoot && h.shadowRoot.querySelector('input[type=file]');
+                 return [h.id || h.className, i ? i.files.length : -1];
+               })"""
+        )
+        assert ["dz-b", 1] in landed, landed
+        assert [name for name, count in landed if count > 0] == ["dz-b"], landed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_typeahead_in_a_repeated_component_is_not_reported_as_unfilled() -> None:
+    # Naming these controls makes them reachable by every probe that resolves a selector against the
+    # main document, and those cannot see one whose two halves straddle a boundary. The read-back
+    # then found nothing and the tool reported the field NOT filled while it held the value — a
+    # false claim about the page, which is worse than the silence it replaced.
+    async with _live_page(
+        """<div id="portal"></div>
+        <ds-field id="f1"></ds-field>
+        <ds-field id="f2"></ds-field>
+        <script>
+        for (const h of document.querySelectorAll('ds-field')) {
+          var r = h.attachShadow({mode: 'open'});
+          r.innerHTML = '<input id="city" type="text" autocomplete="off" style="width:140px;height:24px">';
+          (function (inp) {
+            inp.addEventListener('input', function () {
+              var p = document.getElementById('portal');
+              p.innerHTML = '';
+              if (!inp.value) return;
+              ['Lisbon', 'Lisbon Airport', 'Lisboa Centro'].forEach(function (t) {
+                var d = document.createElement('div');
+                d.textContent = t;
+                d.setAttribute('role', 'option');
+                d.style.cssText = 'width:200px;height:24px;cursor:pointer';
+                d.addEventListener('click', function () { inp.value = t; p.innerHTML = ''; });
+                p.appendChild(d);
+              });
+            });
+          })(r.querySelector('input'));
+        }
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        chosen = next(s for s in _printed_selectors(r.content) if "f2" in s)
+
+        tr = await _tool(tools, "type").handler({"selector": chosen, "text": "Lisbon"})
+        landed = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('ds-field')).map(
+                 (h) => h.shadowRoot.querySelector('input').value)"""
+        )
+        assert landed == ["", "Lisbon"], landed
+        # The value is in the page, so "NOT filled" would be false; and the twin staying empty is
+        # what rules out the typing having gone to the wrong instance.
+        assert tr.status == "ok", tr.content
+        assert "NOT filled" not in tr.content, tr.content
+        assert "Lisbon" in tr.content, tr.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_component_typeahead_that_rejects_the_value_still_fails_loudly() -> None:
+    # The other half of the same fix, and the one that decides whether it is safe: teaching the
+    # read-back to see into a component means "did not commit" is now established rather than
+    # guessed, so it must halt the batch. Softening it here would let a run submit an empty
+    # required field believing the outcome was merely unverified.
+    async with _live_page(
+        """<div id="portal"></div>
+        <ds-field id="f1"></ds-field>
+        <ds-field id="f2"></ds-field>
+        <script>
+        for (const h of document.querySelectorAll('ds-field')) {
+          var r = h.attachShadow({mode: 'open'});
+          r.innerHTML = '<input id="city" type="text" autocomplete="off" style="width:140px;height:24px">';
+          (function (inp) {
+            inp.addEventListener('input', function () {
+              var p = document.getElementById('portal');
+              p.innerHTML = '';
+              if (!inp.value) return;
+              ['Lisbon', 'Lisbon Airport'].forEach(function (t) {
+                var d = document.createElement('div');
+                d.textContent = t;
+                d.setAttribute('role', 'option');
+                d.style.cssText = 'width:200px;height:24px;cursor:pointer';
+                // The widget refuses the selection instead of accepting it.
+                d.addEventListener('click', function () { inp.value = ''; p.innerHTML = ''; });
+                p.appendChild(d);
+              });
+            });
+          })(r.querySelector('input'));
+        }
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        chosen = next(s for s in _printed_selectors(r.content) if "f2" in s)
+
+        tr = await _tool(tools, "type").handler({"selector": chosen, "text": "Lisbon"})
+        assert (
+            await page.evaluate("() => document.querySelector('#f2').shadowRoot.querySelector('input').value") == ""
+        ), "fixture must actually reject the value"
+        assert tr.status == "error", tr.content
+        assert "NOT filled" in tr.content, tr.content
+        assert "could not be verified" not in tr.content, tr.content
 
 
 @_skip_no_browser
