@@ -386,6 +386,154 @@ _ROOT_QUERY_JS = (
 )
 
 
+# Every other probe here asks whether a control is VISIBLE. This one asks whether it is REACHABLE,
+# which is a different question and the only one that separates these two cases: Playwright reports a
+# covered input as "visible, enabled, stable" and then fails the separate hit-target check, retrying
+# until the timeout.
+_TYPE_TARGET_PROBE_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  // A host-anchored selector's two halves straddle a shadow boundary, so no single root can match it
+  // and a per-root lookup finds nothing -- which would read as "no field here" and skip the check on
+  // exactly the controls that addressing made reachable. The executor resolves it; take its element.
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return { exists: false };
+  const out = { exists: true, disabled: !!el.disabled, readOnly: !!el.readOnly };
+  let r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return out;
+  // elementFromPoint answers about the VIEWPORT, so a field below the fold returns null and would
+  // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
+  // so scrolling here asks about the same layout the click is about to meet.
+  const inView = r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth;
+  if (!inView) {
+    // 'instant' matters: scrollIntoView inherits CSS scroll-behavior, and a page with smooth
+    // scrolling animates over hundreds of ms while the rect below is read synchronously -- the
+    // element is still off-screen, elementFromPoint returns null, and the probe reports nothing.
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { /* keep the rect */ }
+    r = el.getBoundingClientRect();
+  }
+  let top = null;
+  try { top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); } catch (e) { return out; }
+  // elementFromPoint sees the top-level document only, so a control inside a component resolves to
+  // its host. Treat that as reachable: the host IS what a real click lands on, and the browser
+  // retargets the event inward. The walk must hop ShadowRoot -> host, because Node.contains stays in
+  // the light tree and would read every component control as covered by its own host.
+  const related = (a, b) => {
+    for (let n = b; n; n = n.parentNode || n.host || null) if (n === a) return true;
+    return false;
+  };
+  if (!top || top === el || related(el, top)) return out;
+  out.occluded = true;
+  // Whether to force is a question about the OCCLUDER, not about the field. Structure alone is not
+  // enough: when the field sits directly under <body>, or shares a container with a portal target,
+  // EVERY overlay on the page is "inside its parent". So the occluder must also be the size of a
+  // skin. A decoration drawn over one field stays within that field's box give or take its own
+  // border; a dialog, cookie banner or backdrop is dramatically larger, and forcing past one would
+  // type into something the user cannot see.
+  // One property decides this: is the occluder part of the field's own control, or a surface layered
+  // over the region the field sits in? There are three ways to be a layer, and every condition below
+  // is one of them -- so a fourth would have to be a fourth way, not another special case.
+  //   - it sits outside the field's own subtree (structure);
+  //   - it is pinned to the viewport, where a control's decoration scrolls with its field;
+  //   - it is the size of the viewport, where a decoration is the size of a control.
+  // Ancestors are NOT exempt. "A dialog is never an ancestor of what it covers" was wrong: a wrapper
+  // that disables its own contents while busy is exactly that, and so is a full-screen container
+  // that wraps the form it blocks.
+  const tr = top.getBoundingClientRect();
+  const area = (b) => Math.max(1, b.width * b.height);
+  const viewport = Math.max(1, innerWidth * innerHeight);
+  // Pinning is inherited from whichever ancestor establishes it, so reading the hit element alone
+  // misses the ordinary modal shape: a fixed backdrop wrapping a statically-positioned panel. And
+  // sticky pins to the viewport too once it sticks -- a sticky header covering a field is not a
+  // decoration of that field.
+  let pinned = false;
+  for (let n = top; n && n.nodeType === 1; n = n.parentNode || n.host || null) {
+    let pos = '';
+    try { pos = getComputedStyle(n).position; } catch (e) { break; }
+    if (pos === 'fixed' || pos === 'sticky') { pinned = true; break; }
+  }
+  // Measured against the VIEWPORT, not the field: 10x a small input is a small box, but 10x a large
+  // textarea is bigger than the screen, so a field-relative cap stops meaning anything exactly when
+  // the field is big. A decoration covers a control; a dialog or backdrop covers the view.
+  const coversTheView = area(tr) > 0.6 * viewport;
+  // "The field's own control" is its containing block, not its immediate parent: an overlay skin is
+  // positioned against that block, and design systems routinely put an inner wrapper between the
+  // input and it. Walking to the nearest positioned ancestor finds the same element the skin itself
+  // was laid out against, so a skin one wrapper deeper still reads as part of the control.
+  // Walk up from the OCCLUDER to the block it was positioned against, and ask whether the field is
+  // inside that block. Asking from the field's side instead stops at the field's own wrapper, and a
+  // design system that puts an inner wrapper around the input then hides its own skin from us.
+  let block = null;
+  for (let n = top.parentElement; n; n = n.parentElement) {
+    let pos = '';
+    try { pos = getComputedStyle(n).position; } catch (e) { break; }
+    if (pos !== 'static') { block = n; break; }
+  }
+  // With no positioned ancestor the occluder is laid out against the page itself, so fall back to
+  // the field's own parent rather than letting it inherit the document as its unit.
+  const unit = block || el.parentElement;
+  // Small is not the same as THIS field's. A table row, a card or a list item is small and holds
+  // several independent controls, so a sibling's dropdown or a row-level "saving" overlay would
+  // otherwise read as this field's decoration. A control the field shares with no other control is
+  // the field's own; one that holds others is a layout region.
+  let unitOwnsOnlyThisField = false;
+  if (unit && area(unit.getBoundingClientRect()) <= 0.6 * viewport) {
+    try {
+      unitOwnsOnlyThisField = !Array.from(
+        unit.querySelectorAll('input,select,textarea,button,a[href],[contenteditable],[role="button"]')
+      ).some((c) => c !== el && !related(el, c));
+    } catch (e) { unitOwnsOnlyThisField = false; }
+  }
+  // A thing that announces itself as an overlay is one. This is the least ambiguous signal here --
+  // a decoration has no role, while a tooltip, dialog or toast says so in its markup.
+  const LAYER_ROLE = /^(tooltip|dialog|alertdialog|alert|status|menu|listbox|log|marquee)$/i;
+  let declaresItselfALayer = false;
+  for (let n = top; n && n.nodeType === 1 && n !== unit; n = n.parentNode || n.host || null) {
+    const role = n.getAttribute && n.getAttribute('role');
+    if ((role && LAYER_ROLE.test(role.trim())) || n.hasAttribute('aria-modal') || n.tagName === 'DIALOG') {
+      declaresItselfALayer = true;
+      break;
+    }
+  }
+  const inFieldsOwnSubtree =
+    related(top, el) || (unitOwnsOnlyThisField && related(unit, top) && related(unit, el));
+  out.skinned = !pinned && !coversTheView && !declaresItselfALayer && inFieldsOwnSubtree;
+  return out;
+}"""
+)
+
+_ACTIVE_IS_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+  if (!el) return null;
+  // A control inside a component reports its host as document.activeElement, so ask the root that
+  // actually holds the control rather than the document.
+  let root = null;
+  try { root = Node.prototype.getRootNode.call(el); } catch (e) { root = null; }
+  const active = root && root.activeElement ? root.activeElement : document.activeElement;
+  return active === el;
+}"""
+)
+
+
+class _FieldCovered(Exception):
+    """The field exists and is rendered, but something unrelated is on top of it."""
+
+
+class _FieldNotEditable(Exception):
+    """The field cannot accept typed text at all -- it is disabled, or readonly."""
+
+    def __init__(self, selector: str, read_only: bool) -> None:
+        super().__init__(selector)
+        self.selector = selector
+        self.read_only = read_only
+
+
 # Design-system forms render a <select> at zero size behind a styled listbox proxy. Playwright's
 # actionability wait never resolves against it, so select_option probes visibility first and only
 # forces past actionability when the element exists but is genuinely hidden this way.
@@ -1738,6 +1886,21 @@ def build_browser_tools(
             "it (the section header, the step, the modal trigger), then re-observe."
         )
 
+    def _not_editable_error(exc: _FieldNotEditable) -> ToolResult:
+        if exc.read_only:
+            return ToolResult.error(
+                f"{exc.selector} is readonly — typing cannot change it. If it opens a list, click it and "
+                "pick an option instead; otherwise act on whatever sets it."
+            )
+        return ToolResult.error(f"{exc.selector} is disabled — it cannot be typed into until the page enables it")
+
+    def _covered_error(selector: str) -> ToolResult:
+        return ToolResult.error(
+            f"{selector} is rendered but something else is on top of it, so it cannot be typed into — a "
+            "person could not click it either. Dismiss whatever covers it (a dialog, an overlay, a cookie "
+            "banner), then re-observe."
+        )
+
     async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
         # Probes resolve per root, which cannot match a host-anchored selector whose two halves
         # straddle a shadow boundary. The executor's own engine can, so it supplies the element the
@@ -2018,6 +2181,75 @@ def build_browser_tools(
         await page.hover(selector, timeout=15000)
         return ToolResult.ok(f"hovered {selector}")
 
+    async def _reachable_for_typing(page: Any, selector: str) -> tuple[bool, bool]:
+        """(reachable, occluded). Raises when the field cannot accept typed text at all. Shared by both
+        typing paths: fill() does no hit-testing, so without this a covered password or email field is
+        filled silently -- no timeout to notice, and a person could not have reached it."""
+        try:
+            probe = await page.evaluate(_TYPE_TARGET_PROBE_JS, await _probe_arg(page, selector))
+        except Exception:
+            probe = None
+        if isinstance(probe, dict) and probe.get("exists"):
+            # fill() waits for "enabled" and "editable" on its own, so without these the run pays a
+            # second full timeout for a state the probe has already read.
+            if probe.get("disabled") or probe.get("readOnly"):
+                raise _FieldNotEditable(selector, bool(probe.get("readOnly")))
+        occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
+        if occluded and not probe.get("skinned"):
+            return False, occluded
+        return True, occluded
+
+    async def _focus_for_typing(page: Any, selector: str) -> bool:
+        """Put the caret in `selector`. False means the field is genuinely covered and must not be typed
+        into. A click is how a widget learns to open its suggestion list, so it stays the first move."""
+        reachable, occluded = await _reachable_for_typing(page, selector)
+        if not reachable:
+            return False
+        if occluded:
+            # Forcing skips the hit-target check but still dispatches at coordinates, so the wrapper
+            # can take the event; the focus check below is what makes the outcome deterministic.
+            # Failures are NOT swallowed: force already removed the only reason this click was
+            # expected to fail, so what is left (a detached node, a navigation) is real.
+            # A URL is the wrong question: history.pushState changes it without leaving the page,
+            # and a widget that syncs filter state into the URL on click would abort typing on a
+            # field that never moved. A navigation clears window, so a token planted on it answers
+            # "is this still the same document" exactly -- the same technique the pre-snapshot uses.
+            await page.evaluate("() => { window.__tv3_doc = 1; }")
+            await page.click(selector, timeout=15000, force=True)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=1000)
+            except Exception:
+                pass
+            try:
+                same_document = bool(await page.evaluate("() => window.__tv3_doc === 1"))
+            except Exception:
+                same_document = False
+            if not same_document:
+                # The wrapper was a link and the click followed it. The selector may well match
+                # something on the destination, so typing now would put the text somewhere nobody
+                # asked for.
+                return False
+            try:
+                # The click may have remounted or hidden the field -- a wrapper that swaps its input
+                # on click is an ordinary SPA shape. fill() would wait its own full timeout for a
+                # node that is gone or invisible, which is the cost this whole path exists to avoid.
+                await page.wait_for_selector(selector, state="visible", timeout=1200)
+            except Exception:
+                return False
+        else:
+            await page.click(selector, timeout=15000)
+        try:
+            focused = await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector))
+        except Exception:
+            focused = None
+        # None is "could not tell" -- a selector document.querySelector cannot parse, or a probe that
+        # threw. Only an explicit False is evidence the caret went somewhere else.
+        if focused is False:
+            # focus() needs no hit target, so it repairs a skin that swallowed the click without
+            # forwarding it. Typing then goes to the field rather than wherever the caret was.
+            await page.focus(selector, timeout=15000)
+        return True
+
     async def _commit_typeahead(
         page: Any, selector: str, value: str, rounds: int
     ) -> tuple[str | None, str | None, bool]:
@@ -2091,7 +2323,8 @@ def build_browser_tools(
         # Keystroke-type (so a widget's async suggestion fetch fires on real key events). Snapshot the
         # visible DOM just before typing so the finder treats only NEW/reacting nodes as suggestions —
         # static page text that merely shares a word with the value can't be mistaken for one.
-        await page.click(selector, timeout=15000)
+        if not await _focus_for_typing(page, selector):
+            raise _FieldCovered(selector)
         await page.fill(selector, "", timeout=15000)
         presnapshot_ok = True
         try:
@@ -2170,7 +2403,12 @@ def build_browser_tools(
         if text and clear and not press_enter and await _field_type(page, selector) not in _NON_TYPEAHEAD_TYPES:
             # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
             # not just on a single `input` from fill — still surfaces them, then commit the best match.
-            committed, opt_txt, readable = await _type_and_commit(page, selector, text, rounds=3)
+            try:
+                committed, opt_txt, readable = await _type_and_commit(page, selector, text, rounds=3)
+            except _FieldCovered:
+                return _covered_error(selector)
+            except _FieldNotEditable as exc:
+                return _not_editable_error(exc)
             if opt_txt and committed:
                 return ToolResult.ok(
                     f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
@@ -2205,6 +2443,15 @@ def build_browser_tools(
                     "commit was verified; re-observe to confirm the value before relying on it"
                 )
             return ToolResult.ok(f"typed into {selector}")
+        # The types that skip the typeahead probe still must not be typed into through an overlay.
+        # They reach fill()/type(), which do no hit-testing, so nothing here would fail on its own --
+        # the text simply lands in a field the person could not have reached.
+        try:
+            reachable, _ = await _reachable_for_typing(page, selector)
+        except _FieldNotEditable as exc:
+            return _not_editable_error(exc)
+        if not reachable:
+            return _covered_error(selector)
         if clear:
             await page.fill(selector, text, timeout=15000)
         else:
@@ -2346,7 +2593,12 @@ def build_browser_tools(
             return error
         selector = args["selector"]
         value = _resolve_text(args["value"])
-        committed, opt_txt, readable = await _type_and_commit(page, selector, value, rounds=8)
+        try:
+            committed, opt_txt, readable = await _type_and_commit(page, selector, value, rounds=8)
+        except _FieldCovered:
+            return _covered_error(selector)
+        except _FieldNotEditable as exc:
+            return _not_editable_error(exc)
         if opt_txt is None:
             # The suggestion finder pierces open shadow roots, so inside a component it now sees a
             # list rendered in that root -- but a portalled or closed-root list stays invisible, so a
