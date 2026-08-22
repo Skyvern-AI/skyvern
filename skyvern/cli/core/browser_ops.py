@@ -16,7 +16,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Iterator, Literal
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -1738,6 +1738,14 @@ class CustomSelectMatchError(RuntimeError):
         self.observed_options = observed_options
 
 
+def _ticks(deadline: float) -> Iterator[float]:
+    # Always one tick: the open click or fill may have eaten the budget on a stalled event loop,
+    # and a timeout bounds waiting, not whether the first scan/probe happens at all.
+    yield time.monotonic()
+    while (now := time.monotonic()) < deadline:
+        yield now
+
+
 def _normalized_option(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
@@ -1935,7 +1943,7 @@ async def do_select_option(
     # Each tick re-scans fresh: the pre-open/pre-fill scan can only see the collapsed
     # control's display text (not the real options), and matching that display against
     # the requested value clicks a no-op display node instead of a real option.
-    while (now := time.monotonic()) < option_deadline:
+    for now in _ticks(option_deadline):
         options = await _scoped_custom_options(
             page,
             control,
@@ -2033,7 +2041,7 @@ async def do_select_option(
     before_channels = _custom_select_commit_channels(before)
     before_channel_values = {_normalized_option(v) for v in (before.get("channelValues") or [])} - {""}
     before_text = _normalized_option(before.get("text"))
-    while time.monotonic() < deadline:
+    for _ in _ticks(deadline):
         committed = await control.evaluate(_CUSTOM_SELECT_COMMIT_JS, commit_target, timeout=probe_timeout)
         if isinstance(committed, dict):
             committed_stable_values = _stable_values(committed)

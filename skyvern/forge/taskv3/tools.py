@@ -732,6 +732,10 @@ _OBSERVE_JS = (
   // Set wherever we learn that some region of the page cannot be read. Declared here because the
   // walk below is one of those places and it runs before the marker gather.
   let sawUnreadableRoot = false;
+  // Narrower than sawUnreadableRoot, which a page-wide flag several unrelated failures also set:
+  // this counts only roots the walk never discovered, so a channel that iterates allRoots can say
+  // whether allRoots was the whole story.
+  let undiscoveredRoots = 0;
   // A web component renders its real input/button inside an open shadow root, which
   // document.querySelectorAll does not cross. Playwright's selector engine does, so these elements
   // were always actionable and only perception was blind — a page of them reads as a handful of
@@ -770,6 +774,7 @@ _OBSERVE_JS = (
         // This costs the element's entire root, not the element -- its own matches were pushed by
         // the query above. The root never reaches allRoots, so the loss is disclosed here instead.
         sawUnreadableRoot = true;
+        undiscoveredRoots++;
        }
       }
     };
@@ -796,7 +801,8 @@ _OBSERVE_JS = (
       // One root that cannot be enumerated costs its own subtree, not the walk. A root that throws
       // for every query is disclosed by the marker gather below; one that throws only for this
       // query is not, and is not defended here.
-      try { enumerate(frame.root, frame.host, kids); } catch (e) { /* this root only */ }
+      // Its own matches are lost, and so is every root nested under it -- those never reach allRoots.
+      try { enumerate(frame.root, frame.host, kids); } catch (e) { undiscoveredRoots++; }
       descend(kids);
     }
   }
@@ -1391,26 +1397,52 @@ _OBSERVE_JS = (
   // exists. Attributes only, never the frame's document (page.frames-based traversal was considered
   // and rejected: presence is the contract here, not cross-frame reach). Same visibility rule as
   // elements, so hidden tracking pixels stay out. Isolated like the digest above.
-  const iframeInfo = { total: 0, entries: [] };
+  // `failed` and `unread` are this channel's own bookkeeping, not a question put to the page: on the
+  // section that reports gates, "found none" and "could not look" must not render as one sentence.
+  const iframeInfo = { total: 0, entries: [], failed: false, unread: 0 };
   try {
     const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
-    for (const f of document.querySelectorAll('iframe')) {
-      const r = f.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
-      if (f.hasAttribute('srcdoc')) continue;
-      const src = f.getAttribute('src') || '';
-      let u;
-      try { u = new URL(src, location.href); } catch (e) { continue; }
-      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
-      iframeInfo.total++;
-      if (iframeInfo.entries.length >= 8) continue;
-      const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-      iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
+    // A design system packages the widget inside its own shadow root, where a document query cannot
+    // reach it. Walked like the ARIA, message and heading channels above, so this asks the page no
+    // new question, only the same one of more roots.
+    for (const root of allRoots) {
+      // One root that refuses this query costs its own root, not the channel: an uncaught throw
+      // reaches the outer catch and empties every entry, including main-document ones a
+      // document-only scan reported fine. The iteration is inside the try because a root can hand
+      // back a non-iterable instead of throwing, which is the same attack one line later.
+      try {
+        for (const f of root.querySelectorAll('iframe')) {
+          // Walking more roots means reading more frames, so one poisoned frame inside a component
+          // must not cost the roots already scanned.
+          try {
+            const r = f.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            // A frame with srcdoc renders the inline (same-origin) document; its src is a dead fallback.
+            if (f.hasAttribute('srcdoc')) continue;
+            const src = f.getAttribute('src') || '';
+            let u;
+            try { u = new URL(src, location.href); } catch (e) { continue; }
+            if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) continue;
+            const ttl = (f.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+            const isCaptcha = sig.test(src + ' ' + ttl);
+            // Counted once every throwable read has succeeded: incrementing earlier put a frame in
+            // `total` and in `unread` at once, so the two summed past the page's real count.
+            iframeInfo.total++;
+            if (iframeInfo.entries.length < 8) {
+              iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha });
+            } else if (isCaptcha) {
+              // Spending all 8 slots on ad embeds and dropping the one frame this channel exists to
+              // report defeats the channel, so a gate displaces an embed; the cap and total hold.
+              const at = iframeInfo.entries.findIndex((e) => !e.captcha);
+              if (at !== -1) iframeInfo.entries[at] = { host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha };
+            }
+          } catch (e) { iframeInfo.unread++; continue; }
+        }
+      } catch (e) { iframeInfo.unread++; continue; }
     }
-  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, elements: out });
 }
 """
 )
@@ -1533,10 +1565,26 @@ def build_browser_tools(
             lines.append(f"note: {text_dropped} more page message(s) did not fit the text digest")
         iframe_info = data.get("iframes") or {}
         iframe_entries = iframe_info.get("entries") or []
-        # Always emitted, including the zero case. This scan is document-only, so a captcha packaged
-        # inside a component produces no entry — and printing nothing made that indistinguishable
-        # from a page with no gate on it, on the one section whose whole purpose is to report gates.
-        if iframe_entries:
+        iframe_unread = iframe_info.get("unread") or 0
+        # Every branch states the scope it actually covered: a confident absence is read as "no gate
+        # here" on the page most likely to have one.
+        #
+        # Not a frame count: one unreadable region is a single frame or a whole root, and a root holds
+        # any number of frames.
+        if iframe_unread:
+            iframe_hedge = f"{iframe_unread} unreadable region(s) may hold more"
+        elif data.get("undiscoveredRoots"):
+            # A root the walk never found holds frames that are missing from `total` without the scan
+            # knowing they exist. Keyed off that count and not `unreadableRoot`, which is page-wide and
+            # several failures unrelated to the root walk also set.
+            iframe_hedge = "part of this page could not be read, so there may be more"
+        else:
+            iframe_hedge = ""
+        if iframe_info.get("failed"):
+            # Never "none" and never a count: the scan did not run, so the page's frames are unknown
+            # rather than absent.
+            lines.append("iframes: the frame scan failed on this page; frame presence is unknown")
+        elif iframe_entries:
             total = iframe_info.get("total", len(iframe_entries))
             parts = []
             for f in iframe_entries:
@@ -1544,14 +1592,22 @@ def build_browser_tools(
                 title = f" {f['title']!r}" if f.get("title") else ""
                 parts.append(f"{flag}{_digest_token(f.get('host') or '?', 80)}{title}")
             overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
+            # `total` counts what was readable, so without this the sentence is an absolute claim
+            # about a page some of which was never read.
             lines.append(
-                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector; "
-                "component roots not scanned): " + "; ".join(parts) + overflow
+                f"iframes: {total} cross-origin in the page and its open component roots "
+                "(contents NOT listed here and NOT reachable by selector): "
+                + "; ".join(parts)
+                + overflow
+                + (f"; {iframe_hedge}" if iframe_hedge else "")
             )
+        elif iframe_hedge:
+            lines.append(f"iframes: none found; {iframe_hedge}")
         elif data.get("rootCount"):
-            # Only where the unscanned region actually exists. On a page with no components there is
-            # nothing this line could be hiding, and it would cost a line on every observe of every run.
-            lines.append("iframes: none in the main document (component roots not scanned)")
+            # Only where a component root actually exists. On a page with no components the line
+            # says nothing the element list doesn't, and it would cost a line on every observe of
+            # every run.
+            lines.append("iframes: none in the page or its open component roots")
         dropped = data.get("dropped") or 0
         if dropped:
             # Without this an element list emptied by unreadable elements is indistinguishable from

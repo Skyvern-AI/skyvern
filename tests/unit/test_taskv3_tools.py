@@ -1706,6 +1706,357 @@ async def test_observe_omits_iframe_line_when_no_cross_origin_iframes() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_observe_reports_a_captcha_iframe_packaged_inside_a_component() -> None:
+    # A design system ships the challenge widget as a component, so the frame is a child of its
+    # shadow root and a document query never matches it. The channel then reported "none" on the
+    # one page that most needed a gate reported — and the solve arm can already reach the widget
+    # by selector, so the only broken link was telling the model the gate is there. Drives the real
+    # observe handler, not the JS alone: the rendered line is what the model actually reads.
+    html = """<!doctype html><html><body>
+      <form>
+        <input id="email" type="email" placeholder="Email" style="display:block;width:200px;height:24px">
+        <ds-challenge id="gate" style="display:block;width:300px;height:65px"></ds-challenge>
+        <button id="submit" style="display:block;width:80px;height:20px">Submit application</button>
+      </form>
+      <script>
+        document.getElementById('gate').attachShadow({mode: 'open'}).innerHTML =
+          '<iframe src="https://challenges.antibot-vendor.test/turnstile/anchor?k=secret123"' +
+          ' title="Sign-in widget" width="300" height="65"></iframe>';
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        entries = (data.get("iframes") or {}).get("entries") or []
+        assert len(entries) == 1, data.get("iframes")
+        assert entries[0]["host"] == "challenges.antibot-vendor.test"
+        assert entries[0]["captcha"] is True  # from the src alone: the title carries no signature word
+        assert "secret123" not in json.dumps(entries)  # hosts only — the contract is unchanged
+
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok"
+        line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+        # Pinned whole: asserting a substring lets the scope clause silently revert to the old
+        # "component roots not scanned", which is the false claim this change exists to retire.
+        assert line == (
+            "iframes: 1 cross-origin in the page and its open component roots (contents NOT listed "
+            "here and NOT reachable by selector): [captcha] challenges.antibot-vendor.test 'Sign-in widget'"
+        ), line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_counts_a_frame_once_however_deeply_its_component_nests() -> None:
+    # Four frames reachable four different ways. The slotted one is the trap: it renders inside the
+    # component but belongs to the host's light DOM, so document and the root must not both claim it.
+    html = """<!doctype html><html><body>
+      <iframe src="https://light.antibot-vendor.test/a" width="60" height="20"></iframe>
+      <ds-outer id="outer" style="display:block;width:300px;height:80px"></ds-outer>
+      <ds-panel id="panel" style="display:block;width:300px;height:40px">
+        <iframe src="https://slotted.antibot-vendor.test/d" width="60" height="20"></iframe>
+      </ds-panel>
+      <script>
+        const outer = document.getElementById('outer').attachShadow({mode: 'open'});
+        outer.innerHTML =
+          '<iframe src="https://depth1.antibot-vendor.test/b" width="60" height="20"></iframe>' +
+          '<ds-inner id="inner" style="display:block;width:300px;height:40px"></ds-inner>';
+        outer.getElementById('inner').attachShadow({mode: 'open'}).innerHTML =
+          '<iframe src="https://depth2.antibot-vendor.test/c" width="60" height="20"></iframe>';
+        document.getElementById('panel').attachShadow({mode: 'open'}).innerHTML = '<slot></slot>';
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        hosts = sorted(e["host"] for e in info.get("entries") or [])
+        assert hosts == [
+            "depth1.antibot-vendor.test",
+            "depth2.antibot-vendor.test",
+            "light.antibot-vendor.test",
+            "slotted.antibot-vendor.test",
+        ], hosts
+        assert info.get("total") == 4, info  # not 5: the slotted frame is counted by document only
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_iframe_cap_holds_when_the_frames_are_spread_across_components() -> None:
+    # The cap bounds the payload, so it has to bound what the roots add too — otherwise a page of
+    # frame-carrying components regrows exactly the context the cap exists to hold down.
+    hosts = "\n".join(
+        f'<ds-slot{i} id="s{i}" style="display:block;width:60px;height:20px"></ds-slot{i}>' for i in range(12)
+    )
+    html = f"""<!doctype html><html><body>
+      {hosts}
+      <script>
+        for (let i = 0; i < 12; i++) {{
+          document.getElementById('s' + i).attachShadow({{mode: 'open'}}).innerHTML =
+            '<iframe src="https://embed' + i + '.media.test/player" width="60" height="20"></iframe>';
+        }}
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        assert info.get("total") == 12, info  # the count stays honest past the cap
+        assert len(info.get("entries") or []) == 8, info
+
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "+4 more" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_one_component_refusing_the_iframe_query_costs_only_its_own_root() -> None:
+    # Walking more roots adds throw sources to a channel whose outer catch empties EVERY entry, so
+    # without per-root containment one hostile component would erase the main-document captcha that
+    # the old document-only scan reported fine. That regression is what this pins.
+    html = """<!doctype html><html><body>
+      <input id="email" type="email" placeholder="Email" style="display:block;width:200px;height:24px">
+      <iframe src="https://challenges.antibot-vendor.test/turnstile/anchor"
+              title="Security challenge" width="300" height="65"></iframe>
+      <ds-hostile id="bad" style="display:block;width:60px;height:20px"></ds-hostile>
+      <script>
+        const sr = document.getElementById('bad').attachShadow({mode: 'open'});
+        sr.innerHTML = '<iframe src="https://hidden.antibot-vendor.test/x" width="60" height="20"></iframe>';
+        // Refuses this one selector only: a root that throws for every query is already disclosed by
+        // the marker gather, and this is the case that is not.
+        const real = sr.querySelectorAll.bind(sr);
+        Object.defineProperty(sr, 'querySelectorAll', {
+          value: (s) => { if (String(s) === 'iframe') throw new Error('boom'); return real(s); },
+        });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        hosts = [e["host"] for e in info.get("entries") or []]
+        assert hosts == ["challenges.antibot-vendor.test"], info  # the healthy frame survives
+        assert info.get("total") == 1, info
+        assert "#email" in [e["selector"] for e in data["elements"]]  # element perception intact
+        # The refusing root is NOT laundered into the unreadable-root disclosure: that flag drives a
+        # separate caveat and widening it here would misreport every page carrying one such component.
+        assert data.get("unreadableRoot") is False, data.get("unreadableRoot")
+        # The root it could not read is still disclosed, so the count is not passed off as absolute:
+        # this page holds 2 cross-origin frames and the line may not claim 1 is all of them.
+        assert info.get("unread") == 1, info
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "1 unreadable region(s) may hold more" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_root_that_answers_with_a_non_iterable_costs_only_its_own_root() -> None:
+    # Guarding the query call alone is not enough: a root can answer with something that is not a
+    # list rather than throwing, and the iteration that follows is then what throws. Same attack,
+    # one line apart, and it used to take the whole channel down with the main-document captcha.
+    html = """<!doctype html><html><body>
+      <iframe src="https://challenges.antibot-vendor.test/turnstile/anchor"
+              title="Security challenge" width="300" height="65"></iframe>
+      <ds-hostile id="bad" style="display:block;width:60px;height:20px"></ds-hostile>
+      <script>
+        const sr = document.getElementById('bad').attachShadow({mode: 'open'});
+        const real = sr.querySelectorAll.bind(sr);
+        Object.defineProperty(sr, 'querySelectorAll',
+          { value: (s) => String(s) === 'iframe' ? {} : real(s) });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        assert info.get("failed") is False, info  # the channel survives
+        assert [e["host"] for e in info.get("entries") or []] == ["challenges.antibot-vendor.test"], info
+        assert info.get("unread") == 1, info
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_poisoned_frame_in_a_component_cannot_erase_a_main_document_captcha() -> None:
+    # Walking more roots means reading more frames, so a frame whose own accessors throw is now
+    # reachable where it was not before. Without per-frame containment that throw reaches the outer
+    # catch and empties the channel — losing a main-document captcha that even the unwalked scan
+    # reported fine. Making the gate harder to see is the one outcome this change may not produce.
+    html = """<!doctype html><html><body>
+      <iframe src="https://challenges.antibot-vendor.test/turnstile/anchor"
+              title="Security challenge" width="300" height="65"></iframe>
+      <ds-widget id="w" style="display:block;width:60px;height:20px"></ds-widget>
+      <script>
+        const sr = document.getElementById('w').attachShadow({mode: 'open'});
+        sr.innerHTML = '<iframe src="https://x.media.test/a" width="60" height="20"></iframe>';
+        sr.querySelector('iframe').getBoundingClientRect = () => { throw new Error('boom'); };
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        assert [e["host"] for e in info.get("entries") or []] == ["challenges.antibot-vendor.test"], info
+        assert info.get("failed") is False, info
+        assert info.get("unread") == 1, info
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_frame_that_throws_midway_is_counted_once_not_in_both_tallies() -> None:
+    # A frame whose later reads throw must not land in `total` AND in `unread`: a reader adds the
+    # two, and the sum would exceed the frames the page actually has. The honest-total contract is
+    # the whole reason this section is allowed to state a number at all.
+    html = """<!doctype html><html><body>
+      <iframe src="https://a.media.test/x" width="60" height="20"></iframe>
+      <iframe id="bad" src="https://b.media.test/y" width="60" height="20"></iframe>
+      <script>
+        const bad = document.getElementById('bad'), real = bad.getAttribute.bind(bad);
+        Object.defineProperty(bad, 'getAttribute',
+          { value: (n) => { if (n === 'title') throw new Error('x'); return real(n); } });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        info = (await _observe_data(page)).get("iframes") or {}
+        assert info.get("total") == 1, info  # only the frame that was read all the way through
+        assert info.get("unread") == 1, info
+        assert len(info.get("entries") or []) == 1, info
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        # No "(+N more)": one frame counted, one disclosed as unreadable, nothing double-claimed.
+        assert "more)" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_unreadable_frame_never_renders_as_an_absence() -> None:
+    # "Found none" and "could not look" are different facts. Rendering them as one sentence is the
+    # defect this section exists to retire, and it is worst here: a page that defeats the scan is
+    # exactly the kind that carries a gate. Named for the branch it reaches — the frame is unreadable,
+    # which is not the same as the whole scan failing (that branch is covered separately below).
+    html = """<!doctype html><html><body>
+      <input id="email" type="email" placeholder="Email" style="display:block;width:200px;height:24px">
+      <iframe id="bad" src="https://challenges.antibot-vendor.test/anchor" title="Security challenge"
+              width="300" height="65"></iframe>
+      <ds-any id="c" style="display:block;width:10px;height:10px"></ds-any>
+      <script>
+        document.getElementById('c').attachShadow({mode: 'open'});
+        Object.defineProperty(document.getElementById('bad'), 'getBoundingClientRect',
+          { get() { throw new Error('boom'); } });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+        assert line is not None, r.content
+        # A component root exists, so the old code took the "none ... component roots" branch and
+        # denied a gate that is sitting in the main document.
+        assert line == "iframes: none found; 1 unreadable region(s) may hold more", line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_root_the_walk_never_reached_hedges_the_iframe_count() -> None:
+    # A host whose shadowRoot getter throws never enters the walk, so the frames inside it are absent
+    # from the count without the scan ever learning they existed. Without the hedge the line states a
+    # complete-sounding total for a page it did not finish reading — the same unearned confidence in
+    # a new shape, and the count is the one number a model would use to decide there is no gate.
+    html = """<!doctype html><html><body>
+      <iframe src="https://ads.partner-a.test/slot" title="Sponsored" width="60" height="20"></iframe>
+      <ds-sealed id="s" style="display:block;width:60px;height:20px"></ds-sealed>
+      <script>
+        const host = document.getElementById('s');
+        host.attachShadow({mode: 'open'}).innerHTML =
+          '<iframe src="https://challenges.antibot-vendor.test/turnstile/anchor" width="60" height="20"></iframe>';
+        Object.defineProperty(host, 'shadowRoot', { get() { throw new Error('sealed'); } });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        assert data.get("unreadableRoot") is True, data.get("unreadableRoot")
+        assert (data.get("iframes") or {}).get("total") == 1, data.get("iframes")  # the gate is missing
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+        assert line is not None, r.content
+        assert "part of this page could not be read, so there may be more" in line, line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_unrelated_root_failure_does_not_hedge_the_iframe_count() -> None:
+    # `unreadableRoot` is page-wide and several failures with nothing to do with the frame walk also
+    # set it — a marker-gather refusal, a closest('form') throw, a uniqueness probe. Hedging on it
+    # would attach "there may be more" to a count that was in fact complete, which is the same
+    # mismatch between claim and scan as the defect being fixed, only in the cautious direction.
+    html = """<!doctype html><html><body>
+      <iframe src="https://a.media.test/x" width="60" height="20"></iframe>
+      <ds-quirk id="q" style="display:block;width:60px;height:20px"></ds-quirk>
+      <script>
+        const sr = document.getElementById('q').attachShadow({mode: 'open'});
+        sr.innerHTML = '<button style="display:block;width:40px;height:20px">Go</button>';
+        const real = sr.querySelectorAll.bind(sr);
+        Object.defineProperty(sr, 'querySelectorAll',
+          { value: (s) => { if (String(s).indexOf('data-tv3') !== -1) throw new Error('nope'); return real(s); } });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        # The root was reached and scanned for frames; only an unrelated query on it failed.
+        assert data.get("unreadableRoot") is True, data
+        assert not data.get("undiscoveredRoots"), data.get("undiscoveredRoots")
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+        assert line is not None, r.content
+        assert "may hold more" not in line and "could not be read" not in line, line
+
+
+@pytest.mark.asyncio
+async def test_a_failed_iframe_scan_renders_as_unknown_not_as_none() -> None:
+    # The outer catch is a backstop: it fires only if something throws outside both inner guards, so
+    # no page fixture reaches it now that the root walk and the per-frame reads are both contained.
+    # Pinned at the renderer instead of pretending otherwise — the contract that matters is that a
+    # scan which did not run is never rendered as a page without gates.
+    class _FailedScanPage(_FakePage):
+        async def evaluate(self, _js: str) -> str:
+            return json.dumps(
+                {
+                    "url": self.url,
+                    "title": "Apply",
+                    "text": [],
+                    "iframes": {"total": 0, "entries": [], "failed": True, "unread": 0},
+                    "rootCount": 3,
+                    "elements": [],
+                }
+            )
+
+    tools = build_browser_tools(_fixed_page_provider(_FailedScanPage()))
+    r = await _tool(tools, "observe").handler({})
+    line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
+    assert line == "iframes: the frame scan failed on this page; frame presence is unknown", line
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_captcha_is_not_displaced_from_the_entry_cap_by_ad_embeds() -> None:
+    # The cap bounds the payload, but a page whose 8 slots are all ad embeds must not report the one
+    # frame the channel exists to report as an anonymous "+1 more". Walking component roots enlarges
+    # the population competing for those slots, so the cap has to prefer the gate.
+    embeds = "\n".join(
+        f'<iframe src="https://embed{i}.media.test/player" width="60" height="20"></iframe>' for i in range(8)
+    )
+    html = f"""<!doctype html><html><body>
+      {embeds}
+      <ds-challenge id="gate" style="display:block;width:300px;height:65px"></ds-challenge>
+      <script>
+        document.getElementById('gate').attachShadow({{mode: 'open'}}).innerHTML =
+          '<iframe src="https://challenges.antibot-vendor.test/turnstile/anchor"' +
+          ' title="Security challenge" width="300" height="65"></iframe>';
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        info = data.get("iframes") or {}
+        assert info.get("total") == 9, info  # the count stays honest
+        assert len(info.get("entries") or []) == 8, info  # the cap still holds
+        assert [e for e in info["entries"] if e["captcha"]], info  # and the gate is inside it
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "[captcha] challenges.antibot-vendor.test" in r.content, r.content
+        assert "+1 more" in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_digest_superset_replaces_terse_contained_entry() -> None:
     # A terse live-region entry collected first ("Saved") must not suppress a later, richer
     # superset ("Saved — confirmation #A1B2") — the superset replaces it.
@@ -2966,10 +3317,12 @@ async def test_click_on_skinned_checkbox_routes_via_label() -> None:
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_the_iframe_line_is_emitted_even_when_the_scan_found_nothing() -> None:
-    # The scan is document-only, so a captcha packaged inside a component yields no entry. Printing
-    # nothing made that indistinguishable from a page carrying no gate at all, on the one section
-    # whose purpose is to report gates. Emitted only where a root exists to hide one: on a page with
-    # no components the line would be vacuous and would cost every observe of every run.
+    # Printing nothing made "no gate" indistinguishable from "could not look", on the one section
+    # whose purpose is to report gates. Now that the open roots ARE scanned, the line states the
+    # scope it actually covered. "open" is load-bearing: a closed root is not scanned here — not
+    # because nothing could reach it (the frame list can, and the v1 scraper uses that) but because
+    # this channel's contract is a DOM query, and an absence claim wider than the scan is the thing
+    # that reads to a model as "no gate here".
     async with _live_page(
         """<button id="go" style="display:block;width:80px;height:20px">Go</button>
         <div id="wrap" style="display:block;width:80px;height:20px"></div>
@@ -2981,7 +3334,7 @@ async def test_the_iframe_line_is_emitted_even_when_the_scan_found_nothing() -> 
         r = await _tool(tools, "observe").handler({})
         line = next((ln for ln in r.content.splitlines() if ln.startswith("iframes:")), None)
         assert line is not None, r.content
-        assert "component roots not scanned" in line, line
+        assert line == "iframes: none in the page or its open component roots", line
 
     async with _live_page('<button id="go" style="display:block;width:80px;height:20px">Go</button>') as page:
         tools = build_browser_tools(_fixed_page_provider(page))
