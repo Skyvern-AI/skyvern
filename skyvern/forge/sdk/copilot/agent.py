@@ -168,6 +168,7 @@ from skyvern.forge.sdk.copilot.terminal_envelope import (
 from skyvern.forge.sdk.copilot.todo_list import todo_list_prompt
 from skyvern.forge.sdk.copilot.tools.credentials import _server_verified_google_account_choices
 from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
+from skyvern.forge.sdk.copilot.tools.run_execution import run_workflow_end_to_end
 from skyvern.forge.sdk.copilot.tools.scouting import hydrate_prior_carried_trajectory
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
@@ -1878,6 +1879,51 @@ def _build_exit_result(
             ),
         ),
         exit_site="exit_result",
+    )
+
+
+def _end_to_end_run_reply(result: dict[str, Any], block_count: int) -> str:
+    data = result.get("data")
+    detail = (data.get("failure_reason") if isinstance(data, dict) else None) or result.get("error")
+    detail_text = detail.strip() if isinstance(detail, str) and detail.strip() else None
+    # block_count is the planned label list, so a failure that never reached a run must not be
+    # reported as though those steps were tested.
+    run_started = isinstance(data, dict) and bool(data.get("workflow_run_id"))
+    if block_count == 0 or (not result.get("ok") and not run_started):
+        return detail_text or "I could not start an end-to-end test run."
+    steps = "step" if block_count == 1 else "steps"
+    opening = f"Tested all {block_count} {steps} together in a browser session opened just for this run."
+    if result.get("ok"):
+        return f"{opening} Every step completed."
+    if isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return f"{opening} The run is paused and waiting on you — the run details are above."
+    if detail_text:
+        return f"{opening} It did not get through: {detail_text}"
+    return f"{opening} It did not get through — the run details are above."
+
+
+async def _run_end_to_end_test_turn(
+    ctx: CopilotContext,
+    *,
+    workflow_yaml: str,
+    global_llm_context: str | None,
+) -> AgentResult:
+    result = await run_workflow_end_to_end(ctx, workflow_yaml)
+    block_count = len(ctx.last_executed_block_labels or [])
+    LOG.info(
+        "copilot_test_end_to_end_turn_finished",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        turn_id=ctx.turn_id,
+        executed_block_labels=ctx.last_executed_block_labels,
+        run_ok=bool(result.get("ok")),
+        composition_verified_labels=ctx.composition_verified_labels,
+        terminal_ready=ctx.last_full_workflow_test_ok,
+    )
+    return _build_exit_result(
+        ctx,
+        _end_to_end_run_reply(result, block_count),
+        global_llm_context,
+        proposal_disposition="review_tested" if ctx.last_full_workflow_test_ok else "review_untested",
     )
 
 
@@ -4369,6 +4415,13 @@ async def _run_copilot_turn_impl(
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id)
     ctx.browser_session_id = validated_browser_session_id
+
+    if chat_request.product_action == "test_end_to_end":
+        return await _run_end_to_end_test_turn(
+            ctx,
+            workflow_yaml=chat_request.workflow_yaml or "",
+            global_llm_context=global_llm_context,
+        )
 
     model_name, run_config, llm_key, supports_vision = resolve_model_config(
         llm_api_handler,

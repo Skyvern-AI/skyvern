@@ -123,6 +123,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+const TEST_END_TO_END_PROMPT = "Test this workflow end to end.";
 
 // Cadence for re-fetching a live test run's recorded actions. Mirrors the
 // backend block-status poll (5s) closely enough to surface rows soon after
@@ -1891,6 +1892,9 @@ export function WorkflowCopilotChat({
 
   // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
   const blockBuildTargetLabelRef = useRef<string | null>(null);
+  // Set by the review gate's "Test end-to-end" action so the next send posts that product
+  // action instead of an ordinary authoring turn.
+  const endToEndActionRef = useRef(false);
   // True only while a block-build turn is actually in flight (not a turn it queued behind).
   const blockGenInFlightRef = useRef(false);
 
@@ -1905,8 +1909,11 @@ export function WorkflowCopilotChat({
     }
 
     updateQueuedPrompt(null);
-    // Drop the queued block-build target so it doesn't leak into the next message.
+    // Drop the queued block-build target and end-to-end action so neither leaks into the next
+    // message. Deferring paths (queue_working / queue_live_browser) keep the action armed on
+    // purpose; only abandoning the message disarms it.
     blockBuildTargetLabelRef.current = null;
+    endToEndActionRef.current = false;
     setMessages((prev) => prev.filter((message) => message.id !== queued.id));
     // Text already in the composer is the newer intent — the user was part way
     // through replacing the queued message — so it wins over what comes back.
@@ -2029,6 +2036,7 @@ export function WorkflowCopilotChat({
         return;
       }
       if (!workflowPermanentId) {
+        endToEndActionRef.current = false;
         toast({
           title: "Missing agent",
           description: "Agent permanent ID is required to chat.",
@@ -2050,8 +2058,11 @@ export function WorkflowCopilotChat({
         if (!queued) {
           return;
         }
-        // New text: the block-build scope belonged to the message being replaced.
+        // New text: the block-build scope and the end-to-end action belonged to the message being
+        // replaced. Carrying the action over would run the whole workflow for real on text the user
+        // wrote to say something else.
         blockBuildTargetLabelRef.current = null;
+        endToEndActionRef.current = false;
         updateQueuedPrompt({
           ...queued,
           content: candidate,
@@ -2173,6 +2184,7 @@ export function WorkflowCopilotChat({
         let audioArtifactId: string | null = null;
 
         if (!workflowId) {
+          endToEndActionRef.current = false;
           toast({
             title: "Missing agent",
             description: "Agent ID is required to chat.",
@@ -2444,6 +2456,10 @@ export function WorkflowCopilotChat({
           }
         };
 
+        // Read before the awaits below, and unconditionally: this send owns the action, so a
+        // throw on the way out must not leave it armed for whatever the user types next.
+        const endToEndAction = endToEndActionRef.current;
+        endToEndActionRef.current = false;
         const client = await getSseClient(credentialGetter);
         const targetBlockLabel = blockBuildTargetLabelRef.current;
         blockBuildTargetLabelRef.current = null;
@@ -2472,6 +2488,7 @@ export function WorkflowCopilotChat({
             cancel_token: cancelToken,
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
+            product_action: endToEndAction ? "test_end_to_end" : null,
             keep_pending_proposal:
               copilotUxV1Enabled && Boolean(pendingProposalTurnId),
             // Only opt in behind the flag; flag-off omits the field entirely so
@@ -2688,6 +2705,11 @@ export function WorkflowCopilotChat({
   );
   useEffect(() => {
     handleSendRef.current = handleSend;
+  }, [handleSend]);
+
+  const handleTestEndToEnd = useCallback(() => {
+    endToEndActionRef.current = true;
+    void handleSend(TEST_END_TO_END_PROMPT);
   }, [handleSend]);
 
   const handleConnectedAccountChoice = useCallback(
@@ -3143,6 +3165,7 @@ export function WorkflowCopilotChat({
     ? findLastIndexOfTurn(messages, pendingProposalTurnId)
     : -1;
   const gateIndex = gateOwnerIndex >= 0 ? gateOwnerIndex : lastTurnIndex;
+  const gateOwnerNarrative = messages[gateIndex]?.narrative;
   // Mid-turn Accept would be clobbered by the in-flight turn's terminal
   // restore, so gate actions wait for idle.
   const gateActionable =
@@ -3469,6 +3492,7 @@ export function WorkflowCopilotChat({
                           proposedWorkflow &&
                           handleReviewWorkflow(proposedWorkflow)
                         }
+                        onTestEndToEnd={handleTestEndToEnd}
                         gateId={turnId ? `copilot-gate-${turnId}` : undefined}
                         flash={turnId !== null && turnId === gateFlashTurnId}
                       />
@@ -3672,7 +3696,7 @@ export function WorkflowCopilotChat({
                       <ReviewGateCard
                         pending
                         verdict={getReviewGateVerdict(
-                          undefined,
+                          gateOwnerNarrative,
                           proposedWorkflow,
                         )}
                         settled={null}
@@ -3690,6 +3714,7 @@ export function WorkflowCopilotChat({
                           proposedWorkflow &&
                           handleReviewWorkflow(proposedWorkflow)
                         }
+                        onTestEndToEnd={handleTestEndToEnd}
                       />
                     ) : !copilotUxV1Enabled && showProposedPanel ? (
                       <>

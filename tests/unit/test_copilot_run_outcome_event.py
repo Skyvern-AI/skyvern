@@ -155,6 +155,7 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=workflow_blocks))  # type: ignore[assignment]
     ctx.last_workflow_yaml = "blocks: []"
     ctx.verified_prefix_labels = labels
+    ctx.composition_verified_labels = list(labels)
     ctx.last_run_blocks_block_ids = [f"wrb_{label}" for label in labels]
     ctx.last_run_blocks_block_labels = labels
     return ctx

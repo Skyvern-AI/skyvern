@@ -3123,6 +3123,7 @@ def _ctx_with_blocks(*block_types: str) -> CopilotContext:
     blocks = [SimpleNamespace(block_type=bt, label=f"b{i}") for i, bt in enumerate(block_types)]
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks))
     ctx.verified_prefix_labels = [b.label for b in blocks]
+    ctx.composition_verified_labels = [b.label for b in blocks]
     return ctx
 
 
@@ -9902,6 +9903,7 @@ def test_snapshot_includes_verified_context_labels_without_prior_outputs() -> No
         )
     )
     ctx.verified_prefix_labels = list(labels)
+    ctx.composition_verified_labels = list(labels)
     ctx.verified_block_outputs["expand_noor_assi_result"] = {"stale": "prior run output"}
 
     run = {
@@ -10000,6 +10002,7 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         )
     )
     ctx.verified_prefix_labels = list(labels)
+    ctx.composition_verified_labels = list(labels)
     result = {
         "ok": True,
         "data": {

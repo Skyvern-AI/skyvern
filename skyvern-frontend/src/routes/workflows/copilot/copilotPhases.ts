@@ -189,6 +189,19 @@ function spanIso(blocks: BlockState[]): {
   return { start, end };
 }
 
+export function hasFailedTestBlock(turn: TurnNarrativeState): boolean {
+  return latestBlocksByLabel(turn.blocks)
+    .filter((b) => b.state !== "drafted")
+    .some((b) => b.state === "failed");
+}
+
+export function everyTestBlockExecuted(turn: TurnNarrativeState): boolean {
+  // Gates a claim about every step, so one executed block is not enough and an empty list is
+  // not vacuously true: the turn must carry blocks and none of them may still be drafted.
+  const blocks = latestBlocksByLabel(turn.blocks);
+  return blocks.length > 0 && blocks.every((b) => b.state !== "drafted");
+}
+
 export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
   const {
     explore,
@@ -240,7 +253,7 @@ export function derivePhases(turn: TurnNarrativeState): PhaseRowModel[] {
   // A cancelled turn also lands on terminal "error" — that error is the stop
   // itself, so it must not paint the rail red.
   const isError = turn.terminal === "error" && !isCancelled;
-  const anyFailed = latestBlocks.some((b) => b.state === "failed");
+  const anyFailed = hasFailedTestBlock(turn);
   const anyStopped = latestBlocks.some((b) => b.state === "stopped");
   const anyNotDemonstrated = latestBlocks.some(
     (b) => b.outcome === "not_demonstrated" && !isInterimOutcome(b.outcomeRole),

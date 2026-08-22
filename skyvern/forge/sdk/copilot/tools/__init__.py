@@ -766,9 +766,10 @@ async def run_blocks_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     # No definition change on this path, so the frontier never reaches the edit-in-place branch
     # and a live page read would be spent on nothing.
-    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
+    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, prior_definition
     )
+    copilot_ctx.frontier_start_provenance = start_provenance
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(
@@ -1019,13 +1020,14 @@ async def _run_updated_workflow_blocks(
     if copilot_ctx.last_workflow is not None:
         new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
 
-    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
+    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
         copilot_ctx,
         block_labels,
         prior_definition,
         new_definition,
         await _frontier_runtime_page_url(copilot_ctx),
     )
+    copilot_ctx.frontier_start_provenance = start_provenance
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(

@@ -165,6 +165,7 @@ def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
 COPILOT_CODE_MODE_OPT_OUT_EVENT = "copilot_code_mode_opt_out"
 COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON = "copilot_recoverable_failure"
 USER_CANCELLED_TERMINAL_REASON = "user_cancelled"
+TEST_END_TO_END_TURN_MESSAGE = "Test this workflow end to end."
 
 
 def _effective_copilot_composer_mode(
@@ -2069,6 +2070,24 @@ async def _new_copilot_chat_post(
             )
             if blockless_fallback is not None:
                 chat_request.workflow_yaml = blockless_fallback
+
+            if chat_request.product_action == "test_end_to_end":
+                # The button posts a structured action, so the message is the server's own
+                # receipt line rather than client prose the turn would have to interpret.
+                chat_request.message = TEST_END_TO_END_TURN_MESSAGE
+                pending_proposal_yaml = _prior_copilot_workflow_yaml(
+                    proposed_workflow=chat.proposed_workflow,
+                    persisted_workflow_yaml=None,
+                )
+                # The action runs a definition end to end with real side effects, so it may only ever
+                # run the server's own pending proposal. Falling through would execute whatever YAML
+                # the caller sent, unreviewed.
+                if pending_proposal_yaml is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No pending proposal to test end to end.",
+                    )
+                chat_request.workflow_yaml = pending_proposal_yaml
 
             block_infos, debug_html = await _get_new_copilot_block_infos(
                 organization.organization_id, chat_request.workflow_run_id

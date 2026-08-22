@@ -1734,7 +1734,7 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit"))
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit", "initial"))
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
@@ -1824,7 +1824,7 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total"))
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock())
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
@@ -3225,6 +3225,7 @@ class TestCredentialRefusalReachesAgent:
                     workflow_copilot_chat_id="chat-1",
                     workflow_yaml="",
                     browser_session_id=None,
+                    product_action=None,
                 ),
                 chat_history=[],
                 global_llm_context=None,
@@ -4446,6 +4447,7 @@ class TestCopilotConfig:
                 workflow_copilot_chat_id="chat-1",
                 workflow_yaml="",
                 browser_session_id=None,
+                product_action=None,
             ),
             chat_history=[],
             global_llm_context=None,
