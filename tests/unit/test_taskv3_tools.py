@@ -1422,6 +1422,148 @@ async def test_observe_digest_containment_dedupe_keeps_one_banner_copy() -> None
         assert sum("Access revoked" in t for t in texts) == 1
 
 
+_COMPONENT_REJECTION_HTML = """<!doctype html><html><head><title>Application</title></head><body>
+  {chrome}
+  <ds-page></ds-page>
+  <script>
+    customElements.define('ds-alert', class extends HTMLElement {{
+      connectedCallback() {{
+        const r = this.attachShadow({{mode: 'open'}});
+        r.innerHTML = '<div class="ds-alert ds-alert--error">We could not process your application. The email address is already registered.</div>';
+      }}
+    }});
+    customElements.define('ds-field', class extends HTMLElement {{
+      connectedCallback() {{
+        const r = this.attachShadow({{mode: 'open'}});
+        const id = this.getAttribute('fid');
+        r.innerHTML = '<div class="ds-field ds-field--no-error">' +
+          '<label for="' + id + '">' + this.getAttribute('lbl') + '</label>' +
+          '<input id="' + id + '" type="text"></div>';
+      }}
+    }});
+    customElements.define('ds-page', class extends HTMLElement {{
+      connectedCallback() {{
+        const r = this.attachShadow({{mode: 'open'}});
+        let f = '';
+        for (let i = 0; i < 40; i++)
+          f += '<ds-field fid="f' + i + '" lbl="Question number ' + i + ' about your background"></ds-field>';
+        r.innerHTML = '<form><h2>Your details</h2>' + f +
+          '<ds-alert></ds-alert><button id="submit">Submit</button></form>';
+      }}
+    }});
+  </script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_a_rejection_banner_rendered_inside_a_component() -> None:
+    # A design-system app renders its form AND its validation summary in components. The fields get
+    # enumerated but the message channel queried only the document, so a refused submission read as a
+    # quiet page. Both things that compete for this channel's budget are present: light-DOM chrome
+    # that more than fills it, and per-field state wrappers whose class matches the selector while
+    # their text is only the label the element list already carries. The banner has to outrank both.
+    chrome = "".join(
+        f'<div class="site-alert-{i}">Notice {i}: ' + ("filler text about unrelated site chrome " * 6) + "</div>"
+        for i in range(6)
+    )
+    async with _content_page(_COMPONENT_REJECTION_HTML.format(chrome=chrome)) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert "already registered" in texts[0]
+        assert not any("Question number" in t for t in texts)  # labels are the element list's job
+        assert "#submit" in [e["selector"] for e in data["elements"]]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_component_chrome_does_not_outrank_a_light_dom_rejection_banner() -> None:
+    # Cookie-consent, chat and ad widgets ship as components with alert/warning class names too, so
+    # "lives in a component" cannot mean "is probably the page's message" — ranking on that buries a
+    # light-DOM banner the document-only channel used to surface. Being inside a form is the signal.
+    pad = "we use cookies and similar technologies to personalise content and analyse traffic " * 3
+    html = """<!doctype html><html><body>
+      <cookie-consent></cookie-consent><chat-launcher></chat-launcher><ad-slot></ad-slot>
+      <div class="page-error">We could not process your application. The email is already registered.</div>
+      <form><input id="email" type="email"><button id="submit">Submit</button></form>
+      <script>
+        const mk = (tag, cls, txt) => customElements.define(tag, class extends HTMLElement {
+          connectedCallback() {
+            this.attachShadow({mode: 'open'}).innerHTML = '<div class="' + cls + '">' + txt + '</div>';
+          }
+        });
+        mk('cookie-consent', 'cc-alert', 'Cookie notice. PAD');
+        mk('chat-launcher', 'cl-alert-badge', 'Chat with us. PAD');
+        mk('ad-slot', 'ad-warning', 'Sponsored. PAD');
+      </script>
+    </body></html>""".replace("PAD", pad)
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert "already registered" in texts[0]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_reads_a_component_banner_whose_text_is_slotted() -> None:
+    # The common design-system spelling is `<ds-alert>message</ds-alert>` over a root of
+    # `<div class="alert"><slot></slot></div>`. The block matches the selector but renders slotted
+    # light-DOM text, so its own innerText is empty and only the host carries the words.
+    html = """<!doctype html><html><body>
+      <ds-alert><span>Your card was declined by the issuer</span></ds-alert>
+      <input id="email" type="email">
+      <script>
+        customElements.define('ds-alert', class extends HTMLElement {
+          connectedCallback() {
+            this.attachShadow({mode: 'open'}).innerHTML = '<div class="alert"><slot></slot></div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        assert any("card was declined" in t for t in (data.get("text") or []))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_one_component_refusing_the_message_query_costs_its_root_not_the_digest() -> None:
+    # Querying every open root for message blocks puts the whole digest behind any root that throws.
+    # A root that refuses every query already empties the digest via the ARIA channel, so the shape
+    # that isolates this loop is the selective one: it must cost its own root and nothing else.
+    html = """<!doctype html><html><body>
+      <div class="page-error">Light DOM notice</div>
+      <ds-hostile></ds-hostile>
+      <ds-good></ds-good>
+      <input id="email" type="email">
+      <script>
+        customElements.define('ds-hostile', class extends HTMLElement {
+          connectedCallback() {
+            const r = this.attachShadow({mode: 'open'});
+            r.innerHTML = '<div class="alert">unreachable</div>';
+            const real = r.querySelectorAll.bind(r);
+            r.querySelectorAll = (s) => {
+              if (String(s).includes('error')) throw new Error('boom');
+              return real(s);
+            };
+          }
+        });
+        customElements.define('ds-good', class extends HTMLElement {
+          connectedCallback() {
+            const r = this.attachShadow({mode: 'open'});
+            r.innerHTML = '<div class="alert">Your card was declined</div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        texts = data.get("text") or []
+        assert any("card was declined" in t for t in texts)
+        assert any("Light DOM notice" in t for t in texts)
+        assert not any("unreachable" in t for t in texts)
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_survives_hostile_page_with_throwing_text_accessor() -> None:
