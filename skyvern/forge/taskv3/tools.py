@@ -57,6 +57,40 @@ _STOPWORDS_JS = (
     "'inc','llc','ltd','corp'])"
 )
 
+# Every open shadow root on the page, document first, then each root in depth-first order. Web-component libraries put the
+# real input/button inside a shadow root, and `document.querySelector*` does not cross that boundary
+# while Playwright's selector engine does — so any probe that must agree with what an action tool
+# will resolve has to search these roots too, not just `document`.
+_SHADOW_ROOTS_JS = r"""(from_root) => {
+  const roots = [];
+  const seen = new Set();
+  // An explicit stack, not recursion: the traversal is unbounded in depth because Playwright's
+  // selector engine is, and a root we stop short of is a root the callers' probes silently miss.
+  const stack = [from_root];
+  while (stack.length) {
+    const root = stack.pop();
+    roots.push(root);
+    // Per root, not per walk: one root whose querySelectorAll throws would otherwise propagate out
+    // of the whole traversal, and every caller reads that as "there are no shadow roots here".
+    let all;
+    try { all = root.querySelectorAll('*'); } catch (e) { continue; }
+    const kids = [];
+    for (const el of all) {
+      let sr = null;
+      // A form's named getter can make el.shadowRoot a foreign element; nodeType 11 is what makes
+      // this a real shadow root rather than an <input name="shadowRoot">.
+      try { sr = el.shadowRoot; } catch (e) { continue; }
+      if (!sr || sr.nodeType !== 11 || seen.has(sr)) continue;
+      seen.add(sr);
+      kids.push(sr);
+    }
+    // Reversed, so popping walks the children in document order and the list stays pre-order DFS.
+    for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]);
+  }
+  return roots;
+}"""
+
+
 # Snapshot of everything visible BEFORE typing. The finder ignores anything marked here, so only DOM
 # that appeared (or became visible) IN REACTION to typing can be treated as a suggestion — static page
 # text that merely happens to share a word with the value (a nearby card, nav item, prior answer) is
@@ -163,9 +197,46 @@ _VERIFY_COMMIT_JS = r"""(args) => {
   return '';
 }"""
 
+# Whether the MAIN-DOCUMENT query the reaction probes use can see this element. They are all
+# document-only, so a control inside a component is invisible to them even though Playwright types
+# into it perfectly well -- the action works and only our verification of it is blind. False here
+# means "do not claim this was checked", never "do not act".
+# Why our reaction probes cannot see this selector, if they cannot: `component` (only a piercing
+# query resolves it), `unprobeable` (the main-document query cannot even parse it -- Playwright
+# syntax like `css=`, `>> nth=`, `:visible`, `text=`), or `` (probeable, so any failure to find it is
+# a fact about the page rather than about us). Both readings happen in ONE evaluation: as two round
+# trips, an ordinary re-render landing between them lets each describe a different moment.
+_PROBE_REACH_JS = (
+    r"""(sel) => {
+  const _roots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  try {
+    if (document.querySelector(sel)) return '';
+  } catch (e) { return 'unprobeable'; }
+  try {
+    for (const root of _roots(document)) { if (root.querySelector(sel)) return 'component'; }
+  } catch (e) { return ''; }
+  return '';
+}"""
+)
+
 # Whether a selector currently resolves. `true` on a broken selector: existence is only ever used to
 # soften/enrich behavior, so an unparseable selector must take the normal (unenriched) path.
-_SELECTOR_EXISTS_JS = r"""(sel) => { try { return !!document.querySelector(sel); } catch (e) { return true; } }"""
+# Pierces open shadow roots because the caller compares against what `page.click` would resolve, and
+# a document-only probe reports "gone" for every element a web component renders.
+_SELECTOR_EXISTS_JS = (
+    r"""(sel) => {
+  const _roots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  try {
+    let found = null;
+    for (const root of _roots(document)) { found = root.querySelector(sel); if (found) break; }
+    return !!found;
+  } catch (e) { return true; }
+}"""
+)
 
 # Pre-click state for the dropdown-commit path: whether a click-opened menu (rows tagged
 # data-tv3-menu by _FIND_MENU_JS) is currently open, whether the click target IS one of its rows, and
@@ -345,75 +416,370 @@ _OBSERVE_JS = (
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
     + r""";
-  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[contenteditable=true]';
-  const els = document.querySelectorAll(q);
+  // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
+  // cannot be filled, and the ones that can are already matched by [contenteditable=true].
+  const _WIDGET_ROLES = ['button', 'checkbox', 'radio', 'combobox', 'option', 'menuitem',
+                         'menuitemcheckbox', 'menuitemradio', 'listbox', 'switch', 'spinbutton', 'tab'];
+  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
+  // Set wherever we learn that some region of the page cannot be read. Declared here because the
+  // walk below is one of those places and it runs before the marker gather.
+  let sawUnreadableRoot = false;
+  // A web component renders its real input/button inside an open shadow root, which
+  // document.querySelectorAll does not cross. Playwright's selector engine does, so these elements
+  // were always actionable and only perception was blind — a page of them reads as a handful of
+  // chrome controls that never change. Each root's own matches are appended after the light DOM's,
+  // NOT spliced in at the host's position, so the element budget spends itself on the page's own
+  // controls first and the submit button survives a page of components; what that starves is
+  // counted and disclosed. Every root is kept for the uniqueness probe below.
+  const allRoots = [];
+  const els = [];
+  {
+    const seenRoots = new Set();
+    // Pushes `root`'s own matches onto `els`, and collects the roots nested directly under it into
+    // `kids` in document order.
+    const enumerate = (root, host, kids) => {
+      // Selected by the same CSS-string query the base used, not el.matches(q). This is base parity,
+      // not a defense: a page that overrides querySelectorAll itself can still make <html> and <body>
+      // enumerate, measured, exactly as it can on base. What it does avoid is widening the surface
+      // to a SECOND overridable entry point for the same outcome.
+      for (const el of root.querySelectorAll(q)) els.push({ el, host });
+      for (const el of root.querySelectorAll('*')) {
+       // Same clobbering hazard as the element loop below, and this walk runs before it: a form's
+       // named getter can turn any read here into a foreign object, so one element pays for itself.
+       try {
+        // nodeType 11 because <input name="shadowRoot"> makes el.shadowRoot that input, and
+        // walking it would add a non-root to the list every probe then queries.
+        const sr = el.shadowRoot;
+        if (sr && sr.nodeType === 11) {
+          if (seenRoots.has(sr)) continue;
+          seenRoots.add(sr);
+          kids.push({ root: sr, host: el });
+        }
+       } catch (e) {
+        // This costs the element's entire root, not the element -- its own matches were pushed by
+        // the query above. The root never reaches allRoots, so the loss is disclosed here instead.
+        sawUnreadableRoot = true;
+       }
+      }
+    };
+    // An explicit stack rather than recursion. Playwright's selector engine descends to any depth,
+    // so a root we stop short of is a root resolvesTo cannot count -- an identity recurring beyond
+    // the stopping point reads as unique here and as ambiguous to the executor.
+    const stack = [];
+    // Reversed, so popping walks a root's children in document order and both lists stay pre-order.
+    const descend = (kids) => { for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); };
+    allRoots.push(document);
+    const seed = [];
+    // Unguarded, unlike the roots below: a document that cannot be enumerated is an error worth
+    // raising, not a page that happens to carry no controls.
+    enumerate(document, null, seed);
+    descend(seed);
+    while (stack.length) {
+      const frame = stack.pop();
+      allRoots.push(frame.root);
+      const kids = [];
+      // One root that cannot be enumerated costs its own subtree, not the walk. A root that throws
+      // for every query is disclosed by the marker gather below; one that throws only for this
+      // query is not, and is not defended here.
+      try { enumerate(frame.root, frame.host, kids); } catch (e) { /* this root only */ }
+      descend(kids);
+    }
+  }
   const out = [];
   // Monotonic across observe() calls (persisted on window), and never reassigned on an element that
   // already has one, so a data-tv3 marker always denotes the same element. Resetting the counter per
   // call let a selector remembered from an earlier observe silently resolve to a different node.
   if (!Number.isInteger(window.__tv3_next) || window.__tv3_next < 0 || window.__tv3_next > 1e9) window.__tv3_next = 0;
+  // Unique is not enough -- it must be THIS element. A page can pre-seed a marker or exploit
+  // U+0000 folding to U+FFFD so a selector matches exactly one node that is a different one.
+  // Counted across every root, not just `document`: Playwright resolves a selector globally and
+  // pierces, so a document-only check both misses a collision living in another root and rejects
+  // every shadow-hosted element, whose one true match `document.querySelector` cannot see.
+  // Gathered once, not re-queried per attempt: the mint search below is bounded at 64 attempts, and
+  // when each attempt cost O(roots) a page could freeze window.__tv3_next, seed the 64 candidates in
+  // the LAST root so no attempt short-circuits, and multiply the whole search by its own root count.
+  // Measured before this was hoisted: 51 ms -> 36.4 s at 24,000 roots, past the 30 s tool bound.
+  // Two structures, deliberately: `takenMarkers` is every value known to be in use, gathered AND
+  // minted, and exists only so a fresh candidate never collides. `gatheredCounts` records what the
+  // GATHER saw and nothing else -- reuse consults it, so a marker this call minted itself can never
+  // be handed to a second element as though the page had been observed carrying it once.
+  const takenMarkers = new Set();
+  const gatheredCounts = new Map();
+  for (const root of allRoots) {
+    try {
+      for (const e of root.querySelectorAll('[data-tv3]')) {
+        const v = e.getAttribute('data-tv3');
+        takenMarkers.add(v);
+        gatheredCounts.set(v, (gatheredCounts.get(v) || 0) + 1);
+      }
+    }
+    // One unreadable root must not cost the element list -- but it does mean takenMarkers is
+    // incomplete, so every marker minted below is unverified. On a page whose controls are all
+    // anonymous, resolvesTo is never called and this is the ONLY place that learns it.
+    catch (e) { sawUnreadableRoot = true; }
+  }
+  // A root whose querySelectorAll throws makes uniqueness UNVERIFIABLE, not false -- Playwright's
+  // engine pierces via CDP and would still see a collision living in there, so we must not hand out
+  // a selector we could not check. resolvesTo therefore still refuses. What that used to cost was
+  // the whole page: every element fell through to mintOn, whose reuse check runs through here too,
+  // so a fresh marker was minted on every observe -- and a payload that churns each turn silently
+  // disables the loop's perception-stall terminator. mintOn reuses an existing marker instead when
+  // this is set, which keeps the payload byte-stable.
+  // A NEW marker minted while this is set is itself unverified -- takenMarkers skipped the throwing
+  // root, so a decoy planted in there can collide. Accepted deliberately: refusing to mint costs
+  // every selector on the page, and the collision has not been shown to reach a wrong element
+  // (Playwright ordered the light-DOM match first in every shape tried). The payload says so.
+  // Per-check, unlike sawUnreadableRoot: distinguishes "this element's identity is genuinely
+  // ambiguous" from "we could not tell", which are different omissions with different fixes.
+  let checkInconclusive = false;
+  const resolvesTo = (s, target) => {
+    let found = null;
+    let n = 0;
+    for (const root of allRoots) {
+      let hits;
+      try { hits = root.querySelectorAll(s); }
+      // A throw is the ROOT's, not ours: every candidate is valid by construction -- `#` + an escape
+      // gated on CSS.escape being a no-op, a tag from safeTag's whitelist, or a quoted attr whose
+      // value already passed _FORGEABLE. Asking the page to classify the error instead (its own
+      // e.name, or a probe whose receiver it owns) hands it a one-line switch to the quiet path,
+      // where the disclosure vanishes and markers churn every observe.
+      catch (e) { sawUnreadableRoot = true; checkInconclusive = true; return false; }
+      n += hits.length;
+      if (n > 1) return false;
+      if (hits.length === 1) found = hits[0];
+    }
+    return n === 1 && found === target;
+  };
+  // Values here are page-controlled: an unescaped `"` closes the selector and turns it into a
+  // selector list aimed at an element of the page's choosing, which still resolves uniquely.
+  // String() because form named getters make el.id/el.name return an ELEMENT, not a string.
+  const attr = (name, value) => '[' + name + '="' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+  // The model copies these selectors back verbatim, and an escape sequence does not survive that:
+  // `#\31 abc` addresses a different codepoint the moment its terminating space is dropped. The
+  // escape being a no-op is exactly the condition for the id needing no escaping. The trim check
+  // is separate: Playwright trims the selector string, so `#email<NBSP>` -- which CSS.escape leaves
+  // alone, being above U+007F -- reaches the page as `#email` and silently selects a different
+  // element. Only the tail can be trimmed away; a leading one sits behind the `#` and survives.
+  // The selector is rendered bare inside [...] and CANNOT be sanitized -- stripping a character
+  // would break the very matching the selector exists to do. So a value carrying anything that could
+  // end or restructure a digest line is refused here and the element falls through to a minted
+  // marker, the same route U+0000 already takes. U+000A is refused by CSS itself (an unescaped
+  // newline is a bad-string, so the selector will not parse and resolvesTo rejects it) -- but U+2028
+  // is a legal CSS ident AND string character, so it parses, resolves, and forges a clean line.
+  const _FORGEABLE = /[\x00-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069]/;
+  // A tag name is rendered bare into the selector and is page-controlled, so it is whitelisted to
+  // what a type selector may actually be rather than screened for known-bad characters. A tag may
+  // hold `,` `.` `[` `:` and quotes, and `a,b[id="x"]` is a SELECTOR LIST, not a narrowing of
+  // `#x` -- it reaches elements the bare id never matched. It may also not be a string at all: a
+  // form's named getter makes el.tagName an ELEMENT, and String() of one is
+  // "[object HTMLInputElement]", which is a CSS syntax error. Neither survives this.
+  const safeTag = (el) => {
+    const t = String(el.tagName || '').toLowerCase();
+    return /^[a-z][a-z0-9_-]*$/.test(t) ? t : null;
+  };
+  // Why the last naturalSelector call returned null. The three causes need three different fixes,
+  // so a single "no selector" tally would send the follow-up after the wrong one.
+  let naturalWhy = '';
+  const naturalSelector = (el) => {
+    naturalWhy = '';
+    checkInconclusive = false;
+    const rawTestid = String(el.getAttribute('data-testid') || '');
+    // Read before any attempt: a form's named getter can make el.id an ELEMENT, and String() of
+    // one is truthy, so "has an identity to try" and "that identity is usable" are separate facts.
+    const hasIdentity = !!(el.id || el.name || rawTestid);
+    if (_FORGEABLE.test(String(el.id || '')) || _FORGEABLE.test(String(el.name || ''))
+        || _FORGEABLE.test(rawTestid)) { naturalWhy = 'unsafe'; return null; }
+    if (el.id) {
+      const raw = String(el.id);
+      const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
+      const s = esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw);
+      if (resolvesTo(s, el)) return s;
+      // A component that mirrors its own id onto the native control inside its root makes the bare
+      // id match twice with ONE instance on the page, and naming the tag separates them. Measured on
+      // a production capture: the whole named-field set of a real application form resolves this way
+      // and no other.
+      // What makes this safe is NOT that the qualified form is a subset of `#id` -- it is a subset
+      // only while the tag is a simple type selector, and `safeTag` is what keeps it one. The guard
+      // that holds in general is resolvesTo's `found === target`: whatever the string turns out to
+      // select, it is accepted only if the single element it selects is THIS one.
+      const tq = safeTag(el);
+      if (tq) { const s2 = tq + attr('id', raw); if (resolvesTo(s2, el)) return s2; }
+    }
+    const testid = el.getAttribute('data-testid');
+    if (testid) { const s = attr('data-testid', testid); if (resolvesTo(s, el)) return s; }
+    if (el.name) {
+      const tq = safeTag(el);
+      if (tq) { const s = tq + attr('name', el.name); if (resolvesTo(s, el)) return s; }
+    }
+    // An identity that exists but did not resolve uniquely is NOT anonymous. Shadow encapsulation
+    // scopes ids to their root, so a design system reuses one internal id in every instance and the
+    // cross-root count is 2 -- a duplicate, whose fix is host-anchored scoping. Distinct again from
+    // a count we could not take because some root threw.
+    naturalWhy = !hasIdentity ? 'anonymous' : (checkInconclusive ? 'unverifiable' : 'duplicated');
+    return null;
+  };
+  // Minting writes an attribute, which is only safe in the light DOM. Inside a root it makes a
+  // component watching that root re-render, destroying the marker before the model can click it --
+  // and unlike the pre-snapshot the marker cannot move off-DOM, because the marker IS the handle we
+  // hand out. Each fresh observe would mint another and the click would fail again, forever.
+  const mintOn = (el) => {
+    let m = el.getAttribute('data-tv3');
+    // A marker already on the element is page-controlled text like any other attribute: it is
+    // rendered bare inside the selector, so one carrying a line separator forges a whole element
+    // line. Screened before it can be reused, the same as id/name/data-testid.
+    if (m && _FORGEABLE.test(String(m))) m = null;
+    // Reuse a marker only if it still uniquely resolves; otherwise mint a fresh monotonic one.
+    // Keeps a marker stable across observe() calls without trusting a foreign, duplicated, or
+    // syntactically-broken data-tv3 value that a remembered selector could resolve to the wrong node.
+    if (m) {
+      checkInconclusive = false;
+      if (resolvesTo(attr('data-tv3', m), el)) return attr('data-tv3', m);
+      // Reuse only when THIS check could not be taken AND the gather positively saw this marker
+      // exactly once. Gating on the page-global let one unreadable root anywhere hand out a marker
+      // resolvesTo had proven is a duplicate; gating on inconclusiveness alone still did, because a
+      // throwing DOCUMENT root means the duplicate is never counted at all. Both times two payload
+      // lines carried one selector and the click landed on whichever the executor matched first.
+      if (checkInconclusive && gatheredCounts.get(m) === 1) return attr('data-tv3', m);
+    }
+    // Minting below is NOT verified when a root is unreadable: takenMarkers could not include that
+    // root's markers, so a decoy planted in there can collide with a fresh candidate. Dropping
+    // instead was measured and is worse -- it costs every selector on the page, including elements
+    // whose own id is unique, which is the regression the unreadable-root test exists to prevent.
+    // The page-level "uniqueness could not be verified" note discloses it; see SKY-14710.
+    // Skip values the page already carries, or a pre-seeded data-tv3 collides with a freshly
+    // minted one and two elements share a selector. Bounded, and the suffix varies per attempt:
+    // a frozen or saturated counter makes ++ a no-op, and an unbounded search would wedge the
+    // renderer for the rest of the run. An element we cannot name uniquely is left unlisted.
+    m = null;
+    for (let n = 0; n < 64 && m === null; n++) {
+      const candidate = 't' + (window.__tv3_next++) + (n ? '-' + n : '');
+      // Checked against every root's markers, for the same reason resolvesTo counts that way: a
+      // decoy the page planted inside a shadow root is invisible to document.querySelector, and the
+      // executor pierces -- so a document-only check hands out a marker that already denotes something.
+      if (!takenMarkers.has(candidate)) m = candidate;
+    }
+    if (m === null) return null;
+    // The `host` screened at enumeration time is bookkeeping, not a property of the element at the
+    // moment of the write: a page accessor can move an element into a root after we enumerated it,
+    // and an overridden document.querySelectorAll can hand us an in-root element with no host at
+    // all. Re-read the real root here so "we never write inside a component" holds by construction.
+    let rootNow = null;
+    // Two independent signals, each read through the prototype rather than the instance. Every
+    // in-page check is clobberable on its own -- Node.prototype.getRootNode included -- so they are
+    // combined such that DISAGREEMENT refuses the write: a page must corrupt both consistently to
+    // obtain one, and a throw from either is itself a refusal. An element outside the document is
+    // also refused; we have nothing to gain by marking one.
+    try { rootNow = Node.prototype.getRootNode.call(el); } catch (e) { return null; }
+    if (!rootNow || rootNow.nodeType === 11) return null;
+    try { if (!Node.prototype.contains.call(document, el)) return null; } catch (e) { return null; }
+    el.setAttribute('data-tv3', m);
+    // Verify AFTER the write, against the live DOM rather than the gather. The candidate search
+    // reads a snapshot taken before any mint on this page, so it cannot see a value the page added
+    // since, nor one an ordinary attributeChangedCallback mirrors onto a sibling during this very
+    // setAttribute. A PROVEN collision is dropped rather than handed out: a name that denotes two
+    // elements is the wrong-element click this whole mechanism exists to prevent. An INCONCLUSIVE
+    // check keeps the marker, which is the documented trade -- refusing there was measured and
+    // costs every selector on the page. One check per listed element, not per candidate attempt,
+    // which is what made the old per-attempt re-query unaffordable.
+    checkInconclusive = false;
+    if (!resolvesTo(attr('data-tv3', m), el) && !checkInconclusive) {
+      el.removeAttribute('data-tv3');
+      return null;
+    }
+    takenMarkers.add(m);
+    return attr('data-tv3', m);
+  };
+  // Controls inside a component that we could not name, split by CAUSE: these need different
+  // fixes, and one merged tally would send the follow-up after the wrong one.
+  //   anonymous    -- no id/name/data-testid at all
+  //   duplicated   -- has one, but shadow encapsulation lets every instance reuse it, so the
+  //                   cross-root count is >1 and no unscoped selector can single this one out
+  //   unverifiable -- has one, but a root threw, so the count could not be taken
+  //   unsafe       -- has one carrying a character that could forge a payload line
+  // A host-anchored selector (`#host #ctrl`) is the fix for the first two. It is not built here,
+  // but it IS verifiable in page: a unique host selector plus `#ctrl` occurring exactly once across
+  // the host's own root and every root nested under it. See SKY-14710.
+  // Records named by a marker we wrote, re-checked after the walk: a later element can mutate an
+  // earlier one, and an element's own attributeChangedCallback can move our marker onto a peer.
+  const mintedOn = [];
+  let unnamedAnonymous = 0;
+  let unnamedDuplicated = 0;
+  let unnamedUnverifiable = 0;
+  let unnamedUnsafe = 0;
   let i = 0;
   let dropped = 0;
+  let truncated = 0;
+  let truncatedInComponents = 0;
   let lastGroup = '';
-  for (const el of els) {
+  for (let idx = 0; idx < els.length; idx++) {
+   const el = els[idx].el;
+   const host = els[idx].host;
+   let mintedValue = null;
    // A form exposes its named controls as its own properties, so <input name="tagName"> makes
    // el.tagName that input. Every read below can therefore be a clobbered non-function, and the
    // loop is inside page.evaluate: one throw costs the whole element list, not one element.
    try {
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) continue;
-    let selector = null;
-    // Unique is not enough -- it must be THIS element. A page can pre-seed a marker or exploit
-    // U+0000 folding to U+FFFD so a selector matches exactly one node that is a different one.
-    const resolves = (s) => { try { return document.querySelectorAll(s).length === 1 && document.querySelector(s) === el; } catch (e) { return false; } };
-    // Values here are page-controlled: an unescaped `"` closes the selector and turns it into a
-    // selector list aimed at an element of the page's choosing, which still resolves uniquely.
-    // String() because form named getters make el.id/el.name return an ELEMENT, not a string.
-    const attr = (name, value) => '[' + name + '="' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
-    // The model copies these selectors back verbatim, and an escape sequence does not survive that:
-    // `#\31 abc` addresses a different codepoint the moment its terminating space is dropped. The
-    // escape being a no-op is exactly the condition for the id needing no escaping. The trim check
-    // is separate: Playwright trims the selector string, so `#email<NBSP>` -- which CSS.escape leaves
-    // alone, being above U+007F -- reaches the page as `#email` and silently selects a different
-    // element. Only the tail can be trimmed away; a leading one sits behind the `#` and survives.
-    if (el.id) {
-      const raw = String(el.id);
-      const esc = window.CSS && CSS.escape ? CSS.escape(raw) : null;
-      const s = esc === raw && raw === raw.trimEnd() ? '#' + esc : attr('id', raw);
-      if (resolves(s)) selector = s;
-    }
-    if (!selector && el.getAttribute('data-testid')) { const s = attr('data-testid', el.getAttribute('data-testid')); if (resolves(s)) selector = s; }
-    if (!selector && el.name) { const s = el.tagName.toLowerCase() + attr('name', el.name); if (resolves(s)) selector = s; }
+    let selector = naturalSelector(el);
     if (!selector) {
-      let m = el.getAttribute('data-tv3');
-      // Reuse a marker only if it still uniquely resolves; otherwise mint a fresh monotonic one.
-      // Keeps a marker stable across observe() calls without trusting a foreign, duplicated, or
-      // syntactically-broken data-tv3 value that a remembered selector could resolve to the wrong node.
-      if (!m || !resolves(attr('data-tv3', m))) {
-        // Skip values the page already carries, or a pre-seeded data-tv3 collides with a freshly
-        // minted one and two elements share a selector. Bounded, and the suffix varies per attempt:
-        // a frozen or saturated counter makes ++ a no-op, and an unbounded search would wedge the
-        // renderer for the rest of the run. An element we cannot name uniquely is left unlisted.
-        m = null;
-        for (let n = 0; n < 64 && m === null; n++) {
-          const candidate = 't' + (window.__tv3_next++) + (n ? '-' + n : '');
-          if (!document.querySelector(attr('data-tv3', candidate))) m = candidate;
-        }
-        if (m === null) { dropped++; continue; }
-        el.setAttribute('data-tv3', m);
+      // We do not write inside a shadow root. Setting a marker there is a mutation of the
+      // component's own subtree, and every mechanism that wrote one and then tried to manage the
+      // consequences failed: the mark provokes the re-render that destroys it, and because the mark
+      // IS the handle we hand out it cannot move off-DOM. Verifying it needed a wait, every clock
+      // belongs to the page, and a fixed wait was accurate under 50 ms and silently wrong past it.
+      // Worse, a marker that churns every observe makes the payload differ every turn, which
+      // defeats the loop's perception-stall terminator -- so the page burned the whole budget where
+      // the base engine terminated cleanly. Not writing restores that behavior exactly. A control
+      // with an id, name or data-testid of its own is unaffected, which is the ordinary case.
+      if (host) {
+        if (naturalWhy === 'duplicated') unnamedDuplicated++;
+        else if (naturalWhy === 'unverifiable') unnamedUnverifiable++;
+        else if (naturalWhy === 'unsafe') unnamedUnsafe++;
+        else unnamedAnonymous++;
+        continue;
       }
-      selector = attr('data-tv3', m);
+      selector = mintOn(el);
+      if (!selector) { dropped++; continue; }
+      mintedValue = el.getAttribute('data-tv3');
     }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
     if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
     if (!label) label = (el.innerText || (el.type === 'password' ? '' : el.value) || '').trim();
-    const rec = { i, tag: el.tagName.toLowerCase(), type: el.type || null, selector, label: label.slice(0, 140) };
+    const role = el.getAttribute('role');
+    // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
+    // and SELECT it is a reflected enum; on <a>, <link>, <embed>, <object> and <source> it hands
+    // back the raw attribute, so `type` there is a page-controlled string that reached the rendered
+    // line -- and a MIME type is noise to the model anyway.
+    const _typed = el.tagName === 'INPUT' || el.tagName === 'BUTTON' || el.tagName === 'SELECT';
+    const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, 140) };
+    // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
+    // and the model cannot tell it from decoration. The role travels with its state below, or it is
+    // not worth surfacing: an on switch and an off one that read identically invite toggling the
+    // wrong way and calling it success.
+    // Only ever one of the roles we queried for. The page's raw attribute never reaches the
+    // rendered line: it is page-controlled, and a newline in it would print a second, fabricated
+    // element line for a selector that does not exist.
+    if (role && _WIDGET_ROLES.indexOf(String(role)) !== -1) rec.role = String(role);
     if (el.tagName === 'SELECT') rec.options = Array.from(el.options).map((o) => o.value + '|' + o.text).slice(0, 60);
     if (el.type === 'password') { if (el.value) rec.value = '(hidden)'; } else if (el.value) rec.value = String(el.value).slice(0, 100);
+    // ARIA defines switch as a checkbox variant carrying the same aria-checked, so it belongs here.
     if (el.type === 'checkbox' || el.type === 'radio') rec.checked = !!el.checked;
-    else if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio') rec.checked = el.getAttribute('aria-checked') === 'true';
+    else if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+      // Presence-gated like `selected` below: an absent aria-checked, or "mixed", is a state the
+      // page never stated, and reporting checked=False for an ON switch is the exact wrong-way
+      // toggle this enumeration exists to prevent.
+      const ck = el.getAttribute('aria-checked');
+      if (ck === 'true' || ck === 'false') rec.checked = ck === 'true';
+    }
+    const selected = el.getAttribute('aria-selected');
+    if ((role === 'tab' || role === 'option') && (selected === 'true' || selected === 'false')) rec.selected = selected === 'true';
+    if (role === 'spinbutton') {
+      const now = el.getAttribute('aria-valuenow');
+      if (now !== null && !rec.value) rec.value = String(now).slice(0, 100);
+    }
     if (el.getAttribute('aria-required') === 'true' || el.required) rec.required = true;
-    const isChoice = el.type === 'checkbox' || el.type === 'radio' || el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'radio';
+    const isChoice = el.type === 'checkbox' || el.type === 'radio' || role === 'checkbox' || role === 'radio';
     // Read .validity, never checkValidity(): that dispatches an 'invalid' event and perception must
     // not mutate the page. Checkbox/radio .value is the static attribute ("on"), so they are excluded.
     const ai = el.getAttribute('aria-invalid');
@@ -438,9 +804,36 @@ _OBSERVE_JS = (
     }
     const pressed = el.getAttribute('aria-pressed');
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
+    if (mintedValue !== null) mintedOn.push({ rec: rec, el: el, m: mintedValue });
     out.push(rec);
-    if (++i > 250) break;
+    if (++i > 250) {
+      // Count what the budget actually cost, not what is left in the array: a zero-size match would
+      // have been skipped anyway, and counting it overstates the loss on any page carrying a hidden
+      // dialog. Shadow matches are tallied separately because they are appended last and are
+      // therefore the first thing the budget starves.
+      for (let k = idx + 1; k < els.length; k++) {
+        try {
+          const r2 = els[k].el.getBoundingClientRect();
+          if (r2.width === 0 || r2.height === 0) continue;
+          truncated++;
+          if (els[k].host) truncatedInComponents++;
+        } catch (e) { /* unreadable: not a control we could have listed either */ }
+      }
+      break;
+    }
    } catch (e) { dropped++; continue; }
+  }
+  // A marker we wrote can be gone by the end of the walk: a component that mirrors attributes moves
+  // it onto a peer, and the element we named is then addressed by a selector matching nothing. One
+  // attribute read per named element, no re-query -- a natural selector cannot be invalidated this
+  // way, so only minted ones are checked.
+  for (const rem of mintedOn) {
+    let still = null;
+    try { still = rem.el.getAttribute('data-tv3'); } catch (e) { still = null; }
+    if (still !== rem.m) {
+      const at = out.indexOf(rem.rec);
+      if (at !== -1) { out.splice(at, 1); dropped++; }
+    }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
   // summaries) live in non-interactive nodes the element list can never carry. Three sources in
@@ -472,9 +865,12 @@ _OBSERVE_JS = (
   // friends) must degrade to "no digest", never take element perception down with it.
   try {
     // ~= matches ARIA fallback role lists like role="alert status"; = would silently skip them.
-    for (const el of document.querySelectorAll('[role~=alert],[role~=status],[aria-live=polite],[aria-live=assertive],output')) {
+    for (const root of allRoots) {
       if (textFull) break;
-      if (visible(el)) pushText(el.innerText);
+      for (const el of root.querySelectorAll('[role~=alert],[role~=status],[aria-live=polite],[aria-live=assertive],output')) {
+        if (textFull) break;
+        if (visible(el)) pushText(el.innerText);
+      }
     }
     // Rejection messages most sites render as a plain styled block with no ARIA; class/id naming is
     // the only signal. A block with several form fields is a container (skipped unless short); one
@@ -512,13 +908,25 @@ _OBSERVE_JS = (
         if (t.length <= 300 || (t.length <= 900 && el.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
       } catch (e) { continue; }
     }
-    for (const h of document.querySelectorAll('h1,h2,h3')) {
+    // role=heading alongside h1-h3: a component's heading is a custom element, so its tag name
+    // carries no signal and only the ARIA role does.
+    for (const root of allRoots) {
       if (textFull) break;
-      if (!visible(h)) continue;
-      // A short parent is a banner/panel whose body text carries the message; a large parent would
-      // drag in unrelated content, so the heading stands alone.
-      const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
-      pushText(pt && pt.length <= 300 ? pt : h.innerText);
+      // nodeType 11 first: Document has no `host`, so `root.host` would hit the HTML
+      // named-property getter and <form name="host"> would supply one.
+      const host = root.nodeType === 11 ? root.host || null : null;
+      for (const h of root.querySelectorAll('h1,h2,h3,[role=heading]')) {
+        if (textFull) break;
+        if (!visible(h)) continue;
+        // A component heading is `<h2><slot></slot></h2>`: the slotted text belongs to the host's
+        // light DOM, so the heading's own innerText is empty and the host carries the words.
+        let ht = (h.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!ht && host) ht = (host.innerText || '').replace(/\s+/g, ' ').trim();
+        // A short parent is a banner/panel whose body text carries the message; a large parent would
+        // drag in unrelated content, so the heading stands alone.
+        const pt = h.parentElement ? (h.parentElement.innerText || '').replace(/\s+/g, ' ').trim() : '';
+        pushText(pt && pt.length <= 300 ? pt : ht);
+      }
     }
   } catch (e) { texts.length = 0; textDropped = 0; }
   // Cross-origin iframe PRESENCE: an anti-bot/captcha widget lives in one, and main-frame element
@@ -544,7 +952,8 @@ _OBSERVE_JS = (
       iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: sig.test(src + ' ' + ttl) });
     }
   } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; }
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, elements: out });
+
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, rootCount: allRoots.length - 1, elements: out });
 }
 """
 )
@@ -624,8 +1033,36 @@ def build_browser_tools(
         raw = await asyncio.wait_for(page.evaluate(_OBSERVE_JS), timeout=30)
         data = json.loads(raw) if isinstance(raw, str) else raw
         elements = data.get("elements", [])
+        omitted_anonymous = data.get("unnamedAnonymous") or 0
+        omitted_duplicated = data.get("unnamedDuplicated") or 0
+        omitted_unverifiable = data.get("unnamedUnverifiable") or 0
+        omitted_unsafe = data.get("unnamedUnsafe") or 0
+        omitted_in_components = omitted_anonymous + omitted_duplicated + omitted_unverifiable + omitted_unsafe
+        if omitted_in_components:
+            # Sizes the capability this deliberately gives up, split by cause because the causes have
+            # different fixes: `duplicated` is answered by host-anchored selectors with executor-side
+            # verification (the SKY-14710 family), `anonymous` only by that same path, and neither by
+            # another in-root identity mechanism. Merging them would over-report one and under-report
+            # the other, and the follow-up would be chosen off the wrong number.
+            LOG.info(
+                "taskv3 observe omitted component controls it could not name",
+                omitted_in_components=omitted_in_components,
+                omitted_anonymous=omitted_anonymous,
+                omitted_duplicated=omitted_duplicated,
+                omitted_unverifiable=omitted_unverifiable,
+                omitted_unsafe=omitted_unsafe,
+                listed=len(elements),
+            )
         # Compact rendering keeps the persistent-conversation prefix small (cost is ~linear in it).
-        lines = [f"url={data.get('url')} title={data.get('title')!r} ({len(elements)} interactive elements)"]
+        raw_url = str(data.get("url") or "")
+        # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
+        # the note is measured against the sanitized length rather than the raw one.
+        sanitized_url = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", raw_url)
+        shown_url = sanitized_url[:300]
+        # Every other cap in this payload names itself; a URL cut mid-query-string looks complete and
+        # is a different, invalid URL.
+        url_note = f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > 300 else ""
+        lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
         for t in data.get("text") or []:
             lines.append(f"text: {t!r}")
         text_dropped = data.get("textDropped") or 0
@@ -634,24 +1071,78 @@ def build_browser_tools(
             lines.append(f"note: {text_dropped} more page message(s) did not fit the text digest")
         iframe_info = data.get("iframes") or {}
         iframe_entries = iframe_info.get("entries") or []
+        # Always emitted, including the zero case. This scan is document-only, so a captcha packaged
+        # inside a component produces no entry — and printing nothing made that indistinguishable
+        # from a page with no gate on it, on the one section whose whole purpose is to report gates.
         if iframe_entries:
             total = iframe_info.get("total", len(iframe_entries))
             parts = []
             for f in iframe_entries:
                 flag = "[captcha] " if f.get("captcha") else ""
                 title = f" {f['title']!r}" if f.get("title") else ""
-                parts.append(f"{flag}{f.get('host', '?')}{title}")
+                parts.append(f"{flag}{_digest_token(f.get('host') or '?', 80)}{title}")
             overflow = f" (+{total - len(iframe_entries)} more)" if total > len(iframe_entries) else ""
             lines.append(
-                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector): "
-                + "; ".join(parts)
-                + overflow
+                f"iframes: {total} cross-origin (contents NOT listed here and NOT reachable by selector; "
+                "component roots not scanned): " + "; ".join(parts) + overflow
             )
+        elif data.get("rootCount"):
+            # Only where the unscanned region actually exists. On a page with no components there is
+            # nothing this line could be hiding, and it would cost a line on every observe of every run.
+            lines.append("iframes: none in the main document (component roots not scanned)")
         dropped = data.get("dropped") or 0
         if dropped:
             # Without this an element list emptied by unreadable elements is indistinguishable from
             # a page that genuinely has no controls.
             lines.append(f"note: {dropped} element(s) could not be described and are not listed below")
+        if data.get("unreadableRoot"):
+            # The condition itself, not just its consequences: a root that throws makes uniqueness
+            # unverifiable everywhere, so unnamed elements are dropped rather than given a name we
+            # could not check. Left unsaid, that reads as a page with fewer controls than it has.
+            lines.append(
+                "note: part of this page could not be queried, so selector uniqueness could not be "
+                "verified here; elements we could not name are not listed"
+            )
+        if data.get("textTruncated"):
+            # Every other cap in this payload names itself. This one binds far more often now that
+            # component-rendered live regions feed the digest, and it evicts page headings silently.
+            lines.append("note: page-text digest hit its budget; some page text is not shown")
+        truncated = data.get("truncated") or 0
+        if truncated:
+            # A page of components can spend the whole budget before reaching its submit control, and
+            # a list that stops silently reads as the complete set of what the page offers. No remedy
+            # is suggested because none exists: the list comes from querySelectorAll, so it is
+            # viewport-independent and scrolling returns the identical list and the identical count.
+            note = f"note: {truncated} more element(s) matched but exceeded the element budget and are not listed"
+            in_components = data.get("truncatedInComponents") or 0
+            if in_components:
+                # The budget is spent light-DOM-first so the page's own submit control survives a
+                # page of components — which means component internals are what it starves.
+                note += f", {in_components} of them inside components"
+            lines.append(note)
+        if omitted_in_components:
+            # A statement about OUR limitation, not about the page: naming these would mean writing
+            # into the component's own root, which provokes the re-render that destroys the mark. No
+            # remedy is offered because there is none the model can perform — re-observing returns
+            # the same omission. Split by cause: saying "no id of their own" about a control that has
+            # one, and whose id is merely reused by a sibling instance, tells the model something
+            # false about the page to describe a limitation of ours.
+            why = []
+            if omitted_anonymous:
+                why.append(f"{omitted_anonymous} have no id, name or data-testid of their own")
+            if omitted_duplicated:
+                why.append(
+                    f"{omitted_duplicated} have one that is reused by another instance of the same "
+                    "component, so it does not identify a single element"
+                )
+            if omitted_unverifiable:
+                why.append(f"{omitted_unverifiable} could not be verified because a component root was unreadable")
+            if omitted_unsafe:
+                why.append(f"{omitted_unsafe} carry an identifier we cannot render safely")
+            lines.append(
+                f"note: {omitted_in_components} control(s) inside components are not listed because we "
+                f"have no selector that identifies them: {'; '.join(why)}"
+            )
         for e in elements:
             extra = ""
             if e.get("value"):
@@ -660,6 +1151,8 @@ def build_browser_tools(
                 extra += f" options={e['options']}"
             if e.get("checked") is not None:
                 extra += f" checked={e['checked']}"
+            if e.get("selected") is not None:
+                extra += f" selected={e['selected']}"
             if e.get("pressed") is not None:
                 extra += f" pressed={e['pressed']}"
             if e.get("required"):
@@ -670,9 +1163,19 @@ def build_browser_tools(
                 extra += " [autocomplete→use select_combobox]"
             if e.get("group"):
                 extra += f" group={e['group']!r}"
-            lines.append(
-                f"[{e['selector']}] {e['tag']}{('/' + e['type']) if e.get('type') else ''} {e.get('label', '')!r}{extra}"
-            )
+            # INVARIANT for this line and every line above it: no page-controlled byte reaches the
+            # digest un-escaped, and the header's count and the number of element lines come from the
+            # same list. Everything else here is either repr'd or a literal. `type` is the trap --
+            # on <input> the UA normalises it, but HTMLAnchorElement.type reflects the raw attribute,
+            # so <a href type="x&#10;[#pay] button 'Confirm'"> printed a second, fabricated element
+            # line for a selector that does not exist. `role` is whitelisted at the source; `tag` and
+            # `type` are stripped of anything that could end a line or reorder it.
+            kind = _digest_token(e["tag"], 40)
+            if e.get("type"):
+                kind += "/" + _digest_token(e["type"], 40)
+            elif e.get("role"):
+                kind += "/" + _digest_token(e["role"], 40)
+            lines.append(f"[{e['selector']}] {kind} {e.get('label', '')!r}{extra}")
         return ToolResult.ok("\n".join(lines), data={"count": len(elements)})
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
@@ -957,6 +1460,22 @@ def build_browser_tools(
         }
     )
 
+    async def _unverifiable_because(page: Any, selector: str) -> str | None:
+        # Returns the clause explaining why a check could not be run, or None when it could. "The
+        # document cannot see it" is not one fact but three: a widget that unmounts its own input, a
+        # control inside a component, and a selector our probe cannot parse all answer alike, and
+        # only the middle one is a component. Empty on failure -- claiming a reason we did not
+        # establish would be its own false statement.
+        try:
+            reach = str(await page.evaluate(_PROBE_REACH_JS, selector) or "")
+        except Exception:
+            return None
+        if reach == "component":
+            return "it is inside a component"
+        if reach == "unprobeable":
+            return "we cannot resolve that selector ourselves"
+        return None
+
     async def _field_type(page: Any, selector: str) -> str:
         try:
             return (
@@ -990,12 +1509,32 @@ def build_browser_tools(
                     f"typed into {selector}; it is a typeahead — selected {opt_txt!r} (committed value: {committed!r})"
                 )
             if opt_txt and not committed:
+                # The verifier reads the field with document.querySelector, so on a control inside a
+                # component it reads nothing and "did not commit" is its own unearned claim -- the
+                # field is often filled. Halting a batch on that is as wrong as proceeding on a real
+                # failure, so say which one we actually established.
+                why = await _unverifiable_because(page, selector)
+                if why:
+                    return ToolResult.ok(
+                        f"clicked suggestion {opt_txt!r} for {selector}; {why}, so the commit could not "
+                        "be verified — re-observe to confirm the value before relying on it"
+                    )
                 # A suggestion surfaced but the field did not accept it — the field is NOT filled. Return
                 # an error so a batched turn halts here (the loop stops the rest of the batch on error)
                 # instead of proceeding — e.g. to a queued submit — on an uncommitted field.
                 return ToolResult.error(
                     f"clicked suggestion {opt_txt!r} for {selector} but it did not commit — the field is NOT "
                     "filled; re-observe and retry, do not proceed"
+                )
+            # No suggestion list surfaced. On a control inside a component that is not evidence of
+            # absence: the finder is document-only and could not have seen one. Saying "typed into X"
+            # here reads as a verified fill, and on a typeahead that silently rejects raw text it
+            # turns an honest failure into a confident wrong answer on a form we then submit.
+            why = await _unverifiable_because(page, selector)
+            if why:
+                return ToolResult.ok(
+                    f"typed into {selector} — {why}, so the typeahead check could not see it and no "
+                    "commit was verified; re-observe to confirm the value before relying on it"
                 )
             return ToolResult.ok(f"typed into {selector}")
         if clear:
@@ -1107,11 +1646,28 @@ def build_browser_tools(
         value = _resolve_text(args["value"])
         committed, opt_txt = await _type_and_commit(page, selector, value, rounds=8)
         if opt_txt is None:
+            # The suggestion finder is document-only, so inside a component it sees no list -- which is
+            # not evidence there was none, and "the field is NOT filled" is measurably false there (the
+            # value is typed in). Erroring would also strand the country/phone comboboxes on the very
+            # forms this targets. observe DOES pierce, so re-observing is a check the model can run.
+            why = await _unverifiable_because(page, selector)
+            if why:
+                return ToolResult.ok(
+                    f"typed {value!r} into {selector}; {why}, so the suggestion list could not be seen "
+                    "and no selection was verified — re-observe to confirm the value committed before "
+                    "relying on it"
+                )
             return ToolResult.error(
                 f"no autocomplete suggestion matched {value!r} for {selector}; the field is NOT filled "
                 "— do not assume success or move on as if it were"
             )
         if not committed:
+            why = await _unverifiable_because(page, selector)
+            if why:
+                return ToolResult.ok(
+                    f"selected {opt_txt!r} for {selector}; {why}, so the commit could not be verified — "
+                    "re-observe to confirm the value before relying on it"
+                )
             return ToolResult.error(f"selected suggestion {opt_txt!r} but {selector} did not commit a value")
         return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
 
@@ -1241,8 +1797,26 @@ _DOWNLOAD_SIGNAL_MAX_LINES = 5
 # Unicode line/paragraph separators, zero-width, and bidi-control characters from the DISPLAYED name
 # (seen-set tracking keeps the raw filesystem name).
 _DOWNLOAD_NOTICE_SANITIZE_RE = re.compile(
-    "[\\x00-\\x1f\\x7f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]"
+    "[\\x00-\\x1f\\x7f\\u0085\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069]"
 )
+
+
+def _digest_token(value: object, cap: int) -> str:
+    """Strip anything a page could use to forge a digest line: line separators, bidi overrides,
+    zero-width joiners. For payload fields printed bare rather than through `!r`.
+
+    For `role` and `type` this is the second of two layers -- both are gated at their source
+    (`role` against a whitelist, `type` to the tags whose UA normalises it), so removing either
+    layer alone leaves the payload safe, and removing both forges a line.
+
+    For `tag` it is the ONLY layer, and a tag name is page-controlled. LF and CR never reach one,
+    but U+0085/U+2028/U+2029 do: the HTML tokenizer ends a tag name on ASCII whitespace only, so
+    `<a\\u2028b>` parses to a tagName carrying the separator. `createElement` is stricter and
+    rejects the same name on some builds but not others, which is why the parser is the case that
+    matters. None of them forges a whole element line -- a tag name may not hold `[`, a space or a
+    quote -- but they do split a digest line in two.
+    """
+    return _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(value))[:cap]
 
 
 def _download_signal_identity(name: str) -> str:
