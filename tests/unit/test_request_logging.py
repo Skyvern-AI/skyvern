@@ -27,9 +27,11 @@ from skyvern.forge.request_logging import (
     _client_ip_from_headers,
     _is_loggable_content_type,
     _sanitize_body,
+    _sanitize_headers,
     _sanitize_response_body,
     log_raw_request_exception,
     log_raw_request_middleware,
+    set_request_organization,
 )
 
 # ---------------------------------------------------------------------------
@@ -377,6 +379,15 @@ def _make_request(method: str = "GET", path: str = "/api/v1/test") -> MagicMock:
     return request
 
 
+def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
+    assert _sanitize_headers(
+        {
+            "X-PostHog-Attribution": "encoded-attribution",
+            "X-Request-ID": "request-id",
+        }
+    ) == {"X-Request-ID": "request-id"}
+
+
 class TestSanitizeResponseBody:
     def test_sensitive_endpoint_fully_redacted(self) -> None:
         request = _make_request("POST", "/api/v1/credentials")
@@ -592,6 +603,14 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     async def protected() -> dict:
         raise HTTPException(status_code=403, detail="Invalid credentials")
 
+    @app.get("/payment-required")
+    async def payment_required() -> dict:
+        raise HTTPException(status_code=402, detail="Payment Required")
+
+    @app.post("/post-only")
+    async def post_only() -> dict:
+        return {"ok": True}
+
     @app.get("/v1/credentials/totp")
     async def get_totp() -> dict:
         return {"code": "123456", "content": "Your code is 123456"}
@@ -687,6 +706,69 @@ class TestMiddlewareLogVolume:
         assert log_mock.error.call_args.args[0] == "api.raw_request"
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
 
+    def test_authenticated_request_is_attributed_to_its_organization(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Per-org error-rate monitors need customer identity on every api.raw_request row.
+
+        Auth resolves inside api_app's own BaseHTTPMiddleware layers, whose child tasks do not
+        propagate rebound ContextVars back up to the logging middleware that emits the row.
+        """
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        app = api_app.create_api_app()
+
+        @app.post("/_test_request_logging_authed")
+        async def authed() -> dict:
+            set_request_organization("o_385835488455492960", "Acme Corp")
+            return {"ok": True}
+
+        response = TestClient(app).post("/_test_request_logging_authed")
+
+        assert response.status_code == 200
+        logged = log_mock.info.call_args.kwargs
+        assert logged["organization_id"] == "o_385835488455492960"
+        assert logged["organization_name"] == "Acme Corp"
+
+    def test_unhandled_exception_is_attributed_to_its_organization(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        app = api_app.create_api_app()
+
+        @app.post("/_test_request_logging_authed_boom")
+        async def boom() -> None:
+            set_request_organization("o_385835488455492960", "Acme Corp")
+            raise ValueError("kaboom")
+
+        response = TestClient(app, raise_server_exceptions=False).post("/_test_request_logging_authed_boom")
+
+        assert response.status_code == 500
+        assert log_mock.error.call_args.kwargs["organization_id"] == "o_385835488455492960"
+
+    def test_organization_does_not_leak_into_a_later_unauthenticated_request(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        app = api_app.create_api_app()
+
+        @app.post("/_test_request_logging_authed")
+        async def authed() -> dict:
+            set_request_organization("o_385835488455492960", "Acme Corp")
+            return {"ok": True}
+
+        @app.post("/_test_request_logging_anonymous")
+        async def anonymous() -> dict:
+            return {"ok": True}
+
+        client = TestClient(app)
+        client.post("/_test_request_logging_authed")
+        response = client.post("/_test_request_logging_anonymous")
+
+        assert response.status_code == 200
+        logged = log_mock.info.call_args.kwargs
+        assert "organization_id" not in logged
+        assert "organization_name" not in logged
+
     def test_action_log_request_and_response_bodies_are_fully_redacted(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
         secret = "sk-test-action-log-secret"
@@ -744,13 +826,6 @@ class TestMiddlewareLogVolume:
 
         assert response.status_code == 200
         log_mock.info.assert_called_once()
-
-    def test_failed_get_is_logged_as_warning(self, log_mock: MagicMock) -> None:
-        client = TestClient(_make_app())
-        response = client.get("/missing")
-        assert response.status_code == 404
-        log_mock.warning.assert_called_once()
-        assert log_mock.warning.call_args.args[0] == "api.raw_request"
 
     def test_403_get_keeps_datadog_monitor_contract(self, log_mock: MagicMock) -> None:
         """The 403-spike monitors query api.raw_request status:warn @status_code:403."""
@@ -887,3 +962,31 @@ class TestClientDisconnectDuringBodyRead:
 
         assert response is sentinel
         request.body.assert_not_awaited()
+
+
+class TestRawRequestLogLevel:
+    """Only 4xx rows that call for action share the warn tier; 404/405 are routine and log at info."""
+
+    @pytest.mark.parametrize(("path", "status_code"), [("/missing", 404), ("/post-only", 405)])
+    def test_not_found_and_method_not_allowed_log_at_info(
+        self, log_mock: MagicMock, path: str, status_code: int
+    ) -> None:
+        response = TestClient(_make_app()).get(path)
+
+        assert response.status_code == status_code
+        log_mock.info.assert_called_once()
+        assert log_mock.info.call_args.args[0] == "api.raw_request"
+        assert log_mock.info.call_args.kwargs["status_code"] == status_code
+        log_mock.warning.assert_not_called()
+
+    @pytest.mark.parametrize(("path", "status_code"), [("/payment-required", 402), ("/protected", 403)])
+    def test_actionable_client_errors_still_log_at_warning(
+        self, log_mock: MagicMock, path: str, status_code: int
+    ) -> None:
+        response = TestClient(_make_app()).get(path)
+
+        assert response.status_code == status_code
+        log_mock.warning.assert_called_once()
+        assert log_mock.warning.call_args.args[0] == "api.raw_request"
+        assert log_mock.warning.call_args.kwargs["status_code"] == status_code
+        log_mock.info.assert_not_called()

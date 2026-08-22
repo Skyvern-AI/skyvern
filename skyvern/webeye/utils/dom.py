@@ -10,15 +10,11 @@ from urllib.parse import urljoin, urlparse
 import structlog
 from playwright.async_api import (
     ElementHandle,
-)
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import (
     FloatRect,
     Frame,
     FrameLocator,
     Locator,
     Page,
-    TimeoutError,
 )
 
 from skyvern.config import settings
@@ -41,6 +37,7 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
     read_locator_tag_name,
@@ -74,17 +71,17 @@ def is_element_detached_error(exc: BaseException) -> bool:
 
 def is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
     """Whether ``exc`` is a driver-family error from THIS run's engine. Routes through the per-run
-    selection when one is pinned so a non-Playwright engine's natives are recognised; falls back to the
-    stock Playwright identity when no engine is pinned (callers built outside the per-run engine seam),
-    preserving exact stock behavior. A foreign engine's native error is rejected either way."""
-    return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
+    selection when one is pinned so a non-Playwright engine's natives are recognised; falls back to
+    every installed Playwright-family driver's identity when no engine is pinned (callers built outside
+    the per-run engine seam). A foreign engine's native error is rejected either way."""
+    return engine_selection.is_engine_error(exc) if engine_selection is not None else is_driver_error(exc)
 
 
 def is_engine_timeout_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
-    """Whether ``exc`` is THIS run's engine timeout. Same selection-vs-stock routing as
-    ``is_engine_error``; the stock fallback keeps the historical ``TimeoutError`` identity."""
+    """Whether ``exc`` is THIS run's engine timeout. Same selection-vs-driver routing as
+    ``is_engine_error``."""
     return (
-        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else is_driver_timeout_error(exc)
     )
 
 
@@ -1392,11 +1389,29 @@ class SkyvernElement:
                     element_x = rect["x"] if rect["x"] > 0 else None
                     element_y = rect["y"] if rect["y"] > 0 else None
 
+                # Center the element on the live viewport, not the settings default: the viewport
+                # can be smaller (a dynamic override), and centering on 1920x1080 would scroll the
+                # element off the actual surface. get_frame() is a Page | Frame — a Frame exposes its
+                # owning Page via .page while a Page owns viewport_size directly, so resolve to
+                # whichever carries the viewport. Only a concrete dict with positive integer
+                # width/height is used; otherwise fall back to settings.
+                frame_or_page = self.get_frame()
+                viewport_owner = frame_or_page.page if hasattr(frame_or_page, "page") else frame_or_page
+                frame_viewport = getattr(viewport_owner, "viewport_size", None)
+                viewport_width = settings.BROWSER_WIDTH
+                viewport_height = settings.BROWSER_HEIGHT
+                if isinstance(frame_viewport, dict):
+                    fv_width = frame_viewport.get("width")
+                    fv_height = frame_viewport.get("height")
+                    if isinstance(fv_width, int) and isinstance(fv_height, int) and fv_width > 0 and fv_height > 0:
+                        viewport_width = fv_width
+                        viewport_height = fv_height
+
                 if element_y is not None:
-                    target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+                    target_y = max(int(element_y - (viewport_height / 2)), 0)
 
                 if element_x is not None:
-                    target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+                    target_x = max(int(element_x - (viewport_width / 2)), 0)
 
                 skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
                 if target_x is not None and target_y is not None:

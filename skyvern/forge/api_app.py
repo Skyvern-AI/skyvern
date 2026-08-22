@@ -15,7 +15,6 @@ from pydantic import ValidationError
 from skyvern.exceptions import require_server_extra_modules
 
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
-
 from fastapi import FastAPI, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -23,6 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -228,6 +229,18 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
+def _upgrade_sqlite_organization_slug(connection: Connection) -> None:
+    """Add the organization slug column and index to an existing local SQLite database."""
+    inspector = inspect(connection)
+    if "organizations" not in inspector.get_table_names():
+        return
+    if "slug" not in {column["name"] for column in inspector.get_columns("organizations")}:
+        connection.execute(text("ALTER TABLE organizations ADD COLUMN slug VARCHAR"))
+    connection.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL")
+    )
+
+
 async def _bootstrap_sqlite() -> None:
     """Auto-bootstrap SQLite on first server start.
 
@@ -240,6 +253,7 @@ async def _bootstrap_sqlite() -> None:
     db = forge_app.DATABASE
     async with db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_upgrade_sqlite_organization_slug)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.

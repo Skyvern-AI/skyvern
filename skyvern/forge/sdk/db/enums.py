@@ -16,6 +16,7 @@ class TaskType(StrEnum):
     general = "general"
     validation = "validation"
     action = "action"
+    synthetic_sdk_action = "synthetic_sdk_action"
 
 
 class BrowserSeedSource(StrEnum):

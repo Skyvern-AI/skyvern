@@ -633,13 +633,13 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
 async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.MonkeyPatch) -> None:
     # wpid-scoped PostHog conditions need workflow_permanent_id in properties; non-workflow
     # tasks send the "not_workflow" sentinel (same convention as the workflow-block-engine flag).
-    reader = AsyncMock(return_value="OPENAI_GPT5_6_LUNA_HIGH")
+    reader = AsyncMock(return_value="FLAG_KEY")
     monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
 
     resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
-    assert resolved == "OPENAI_GPT5_6_LUNA_HIGH"
+    assert resolved == "FLAG_KEY"
     assert reader.call_args.kwargs["properties"] == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_123",
@@ -1982,18 +1982,60 @@ async def test_execute_task_v3_failed_run_carries_failure_category(
 async def test_execute_task_v3_settle_completion_fenced_to_block_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Both populations get a fingerprint sampler: the failure-evidence gate needs one to run at all
+    # (SKY-14598). Only the completed-side settle deferral stays fenced to block tasks, and it is
+    # fenced by its own deferral budget rather than by starving the shared sampler.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     block = _make_block(NavigationBlock, navigation_goal="Open the panel")
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, task_block=block, data_extraction_goal=None, extracted_information_schema=None
     )
-    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
-    assert fingerprint is not None
+    assert loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert loop_mock.await_args.kwargs["max_settle_deferrals"] > 0
 
     _step, _task, bare_loop_mock, _post = await _run_execute_task_v3(
         monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
     )
-    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is None
+    assert bare_loop_mock.await_args.kwargs["page_fingerprint"] is not None
+    assert bare_loop_mock.await_args.kwargs["max_settle_deferrals"] == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_bare_task_fingerprint_samples_the_pinned_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare task pins one page for the run, so its fingerprint must sample THAT page. Going through
+    # browser_state.get_working_page() would return the newest tab after any popup — sampling a page
+    # the model never acted on — and would repoint the working page as a side effect, which is a
+    # behaviour change to the live bare-task arm rather than the scoped one this gate intends.
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    pinned = MagicMock()
+    pinned.is_closed = MagicMock(return_value=False)
+    pinned.evaluate = AsyncMock(return_value="pinned-hash:100:10")
+    popup = MagicMock()
+    popup.is_closed = MagicMock(return_value=False)
+    popup.evaluate = AsyncMock(return_value="popup-hash:1:1")
+
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        must_get_working_page_side_effect=[pinned],
+        get_working_page_side_effect=[popup, popup, popup],
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    fingerprint = loop_mock.await_args.kwargs["page_fingerprint"]
+    before = loop_mock.browser_state.get_working_page.await_count
+    assert await fingerprint() == "pinned-hash:100:10"
+    # The sampler probed the pinned page and never the popup, and did not consult (or repoint) the
+    # browser's working page to do it. Counting the delta rather than asserting never-awaited: the
+    # post-loop completion-veto gate legitimately calls get_working_page once, before this point.
+    popup.evaluate.assert_not_awaited()
+    assert loop_mock.browser_state.get_working_page.await_count == before
+
+    # A closed pinned page yields None rather than silently falling back to another tab.
+    pinned.is_closed = MagicMock(return_value=True)
+    assert await fingerprint() is None
 
 
 @pytest.mark.asyncio

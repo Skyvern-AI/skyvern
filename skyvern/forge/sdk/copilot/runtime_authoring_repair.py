@@ -27,6 +27,11 @@ _MISSING_OUTPUT_DEPENDENCY_REASON_CODE = "runtime_missing_output_dependency"
 _RUNTIME_SUMMARY_MAX_CHARS = 120
 _RUNTIME_SUMMARY_MAX_ITEMS = 5
 _INSPECT_PAGE_SOURCE_TOOL = "inspect_page_for_composition"
+_OBSTRUCTION_KEYS = ("kind", "selector", "text", "visual_location")
+_OBSTRUCTION_CONTROL_KEYS = ("text", "selector")
+_OBSTRUCTION_FIELD_MAX_CHARS = 160
+OBSTRUCTION_SUMMARY_MAX_CHARS = 1200
+_NO_DISMISS_CONTROL_SUMMARY = "obstruction present, no dismiss control found in page evidence"
 _KEY_ERROR_RE = re.compile(r"KeyError(?:\s*:|\()\s*['\"]([^'\"]+)['\"]")
 
 
@@ -124,16 +129,21 @@ def _safe_runtime_page_url(value: Any) -> str | None:
     return _bounded_runtime_text(safe_url, 160) or None
 
 
-def _runtime_summary_entry(entry: Any, keys: tuple[str, ...]) -> str:
+def _runtime_summary_entry(
+    entry: Any,
+    keys: tuple[str, ...],
+    field_max_chars: int = 60,
+    summary_max_chars: int = _RUNTIME_SUMMARY_MAX_CHARS,
+) -> str:
     if not isinstance(entry, dict):
         return _bounded_runtime_text(entry)
     parts = [
-        _bounded_runtime_text(entry.get(key), 60)
+        _bounded_runtime_text(entry.get(key), field_max_chars)
         if not isinstance(entry.get(key), bool)
         else ("disabled" if entry.get(key) is True else "enabled")
         for key in keys
     ]
-    return _bounded_runtime_text(" ".join(part for part in parts if part))
+    return _bounded_runtime_text(" ".join(part for part in parts if part), summary_max_chars)
 
 
 def _runtime_summary_list(value: Any, keys: tuple[str, ...]) -> list[str]:
@@ -187,6 +197,73 @@ def _runtime_result_summaries(value: Any) -> list[str]:
     return summaries[:_RUNTIME_SUMMARY_MAX_ITEMS]
 
 
+def _obstruction_entries(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    page_obstructions = evidence.get("page_obstructions")
+    if isinstance(page_obstructions, list):
+        entries = [entry for entry in page_obstructions if isinstance(entry, dict)]
+        if entries:
+            return entries
+    modal_overlays = evidence.get("modal_overlays")
+    if not isinstance(modal_overlays, list):
+        return []
+    return [
+        {"selector": overlay.get("selector"), "visible_controls": overlay.get("dismiss_controls")}
+        for overlay in modal_overlays
+        if isinstance(overlay, dict)
+    ]
+
+
+def _has_page_obstruction(evidence: dict[str, Any]) -> bool:
+    return bool(_obstruction_entries(evidence))
+
+
+def repair_page_evidence_is_admissible(evidence: dict[str, Any]) -> bool:
+    """A packet whose only structured content is an obstruction carries no bounded page schema, yet
+    it is the entire repair signal for a click the overlay intercepted."""
+    return has_bounded_page_schema(evidence) or _has_page_obstruction(evidence)
+
+
+def _joined_obstruction_summary(obstruction: str, control: str) -> str:
+    """The control's selector is the repair-critical tail, so the obstruction prefix absorbs the
+    whole shortfall instead of letting the shared cap clip the selector off the end."""
+    if not obstruction:
+        return control[:OBSTRUCTION_SUMMARY_MAX_CHARS]
+    budget = OBSTRUCTION_SUMMARY_MAX_CHARS - len(control) - 1
+    if budget < 0:
+        return f"{obstruction} {control}"[:OBSTRUCTION_SUMMARY_MAX_CHARS]
+    return f"{obstruction[:budget]} {control}".strip()
+
+
+def _runtime_obstruction_summaries(evidence: Any) -> list[str]:
+    if not isinstance(evidence, dict):
+        return []
+    summaries: list[str] = []
+    for entry in _obstruction_entries(evidence)[:_RUNTIME_SUMMARY_MAX_ITEMS]:
+        obstruction = _runtime_summary_entry(
+            entry, _OBSTRUCTION_KEYS, _OBSTRUCTION_FIELD_MAX_CHARS, OBSTRUCTION_SUMMARY_MAX_CHARS
+        )
+        visible_controls = entry.get("visible_controls")
+        controls = (
+            [control for control in visible_controls if isinstance(control, dict)]
+            if isinstance(visible_controls, list)
+            else []
+        )
+        control_summaries = [
+            summary
+            for summary in (
+                _runtime_summary_entry(
+                    control, _OBSTRUCTION_CONTROL_KEYS, _OBSTRUCTION_FIELD_MAX_CHARS, OBSTRUCTION_SUMMARY_MAX_CHARS
+                )
+                for control in controls
+            )
+            if summary
+        ]
+        summaries.append(
+            _joined_obstruction_summary(obstruction, "; ".join(control_summaries) or _NO_DISMISS_CONTROL_SUMMARY)
+        )
+    return summaries
+
+
 def post_run_inspection_cleanly_matches(evidence: Any, run_id: Any) -> bool:
     return (
         isinstance(evidence, dict)
@@ -195,7 +272,7 @@ def post_run_inspection_cleanly_matches(evidence: Any, run_id: Any) -> bool:
         and isinstance(run_id, str)
         and bool(run_id)
         and evidence.get("workflow_run_id") == run_id
-        and has_bounded_page_schema(evidence)
+        and repair_page_evidence_is_admissible(evidence)
     )
 
 
@@ -375,7 +452,7 @@ def _matching_bounded_post_run_inspection(
     if not isinstance(run_id, str) or run_id != pending.workflow_run_id:
         clear_runtime_authoring_repair_context(copilot_ctx)
         return None
-    if not has_bounded_page_schema(evidence):
+    if not repair_page_evidence_is_admissible(evidence):
         clear_runtime_authoring_repair_context(copilot_ctx)
         return None
     if _post_run_terminal_page_evidence(evidence):
@@ -408,6 +485,7 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
     page_challenge_summaries = _runtime_summary_list(
         evidence.get("challenge_controls"), ("text", "selector", "disabled")
     )
+    page_obstruction_summaries = _runtime_obstruction_summaries(evidence)
     finalized = pending.model_copy(
         update={
             "current_origin": _origin_from_runtime_url(current_url),
@@ -415,12 +493,17 @@ def finalize_runtime_authoring_repair_context_from_page_observation(
             "current_title": _bounded_runtime_text(page_title, 160) or None,
             "page_evidence_source": _bounded_runtime_text(evidence.get("source_tool"), 80) or None,
             "observed_after_workflow_run": bool(
-                page_form_summaries or page_result_summaries or page_action_summaries or page_challenge_summaries
+                page_form_summaries
+                or page_result_summaries
+                or page_action_summaries
+                or page_challenge_summaries
+                or page_obstruction_summaries
             ),
             "page_form_summaries": page_form_summaries,
             "page_result_summaries": page_result_summaries,
             "page_action_summaries": page_action_summaries,
             "page_challenge_summaries": page_challenge_summaries,
+            "page_obstruction_summaries": page_obstruction_summaries,
         }
     )
     copilot_ctx.last_code_authoring_repair_context = finalized
@@ -456,5 +539,6 @@ def inject_runtime_authoring_repair_context(copilot_ctx: Any, result: dict[str, 
         page_form_summary_count=len(repair_context.page_form_summaries),
         page_result_summary_count=len(repair_context.page_result_summaries),
         page_action_summary_count=len(repair_context.page_action_summaries),
+        page_obstruction_summary_count=len(repair_context.page_obstruction_summaries),
     )
     data["authoring_repair_context"] = repair_context.model_dump(mode="json")

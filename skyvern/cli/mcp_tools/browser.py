@@ -86,6 +86,7 @@ from ._common import (
     Timer,
     make_error,
     make_result,
+    restore_pending_attach,
     save_artifact,
 )
 from ._element_state import (
@@ -323,7 +324,9 @@ def _coordinate_target(x: float | None, y: float | None, selector: str | None) -
 
 
 def _add_timing_prefix(timing_ms: dict[str, int], elapsed_ms: int) -> dict[str, int]:
-    return {name: elapsed_ms + duration for name, duration in timing_ms.items()}
+    # Every mark but "attach" is an offset from the timer's start; "attach" is a duration that ran
+    # before it, so shifting it would inflate what the attach itself cost.
+    return {name: duration if name == "attach" else elapsed_ms + duration for name, duration in timing_ms.items()}
 
 
 def _truncate_error_message(message: str) -> str:
@@ -1895,6 +1898,7 @@ async def skyvern_select_option(
                 },
                 timing_ms=custom_timer.timing_ms,
             )
+        restore_pending_attach(custom_timer.timing_ms.get("attach"))
 
     with Timer() as timer:
         try:

@@ -48,7 +48,6 @@ from jinja2.sandbox import SandboxedEnvironment
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from opentelemetry import trace as otel_trace
-from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -254,6 +253,7 @@ from skyvern.utils.url_validators import (
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
@@ -925,7 +925,7 @@ class Block(BaseModel, abc.ABC):
             if isinstance(current_value, dict):
                 block_reference_data.update(current_value)
             else:
-                LOG.warning(
+                LOG.debug(
                     f"Parameter {self.label} has a registered reference value, going to overwrite it by block metadata"
                 )
 
@@ -1178,7 +1178,7 @@ class Block(BaseModel, abc.ABC):
             # create a screenshot
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
             if not browser_state:
-                LOG.warning(
+                LOG.info(
                     "No browser state found when creating workflow_run_block",
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
@@ -5549,7 +5549,7 @@ async def wrapper({default_args}):
             return True
         if engine_selection is not None:
             return engine_selection.is_engine_error(exception) is True
-        return isinstance(exception, PlaywrightError)  # locator/timeout/navigation errors subclass this
+        return is_driver_error(exception)  # locator/timeout/navigation errors subclass the driver's base
 
     async def _finalize_recovery_block(
         self,

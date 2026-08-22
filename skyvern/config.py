@@ -272,6 +272,14 @@ class Settings(BaseSettings):
     SELF_HEAL_MAX_ACTIONS: int = 15
     SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
+    # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
+    # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
+    # /stream sockets all count -- so size it against connections per task, not request concurrency.
+    # Set it empty or 0 to disable shedding.
+    API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
+    # the ALB reuses a connection the server already closed and answers the client with a 502.
+    UVICORN_TIMEOUT_KEEP_ALIVE: int = 125
     ALLOWED_ORIGINS: list[str] = ["*"]
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -921,6 +929,14 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    @field_validator("API_LIMIT_CONCURRENCY", mode="before")
+    @classmethod
+    def _api_limit_concurrency_unlimited_sentinels(cls, value: Any) -> Any:
+        # gt=0 otherwise leaves the unlimited setting unreachable from the environment.
+        if value is None or str(value).strip().lower() in ("", "0", "none", "null"):
+            return None
+        return value
 
     @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
     @classmethod

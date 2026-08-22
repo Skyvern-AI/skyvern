@@ -1,48 +1,7 @@
 import type { StreamDiagnostic } from "@/routes/streaming/StreamDiagnostics";
+import { isTerminalStreamStatus } from "@/routes/streaming/streamLifecycle";
 
-const TERMINAL_STREAM_STATUSES = new Set([
-  "completed",
-  "failed",
-  "timeout",
-  "session_expired",
-  "not_found",
-]);
-
-const STREAM_RECONNECT_DELAY_MS = 1000;
-const STREAM_MAX_RECONNECT_ATTEMPTS = 20;
-const STREAM_ABNORMAL_CLOSE_CODE = 1006;
-const STREAM_VNC_FALLBACK_CLOSE_CODE = 4001;
-const STREAM_VNC_FALLBACK_CLOSE_REASON = "use-vnc-streaming";
-
-function isTerminalStreamStatus(status: string) {
-  return TERMINAL_STREAM_STATUSES.has(status);
-}
-
-function shouldReconnectStream({
-  closeCode,
-  closeReason,
-  terminalStatusSeen,
-  reconnectAttempts,
-}: {
-  closeCode: number;
-  closeReason: string;
-  terminalStatusSeen: boolean;
-  reconnectAttempts: number;
-}) {
-  if (terminalStatusSeen) {
-    return false;
-  }
-  if (
-    closeCode === STREAM_VNC_FALLBACK_CLOSE_CODE ||
-    closeReason === STREAM_VNC_FALLBACK_CLOSE_REASON
-  ) {
-    return false;
-  }
-  if (closeCode !== STREAM_ABNORMAL_CLOSE_CODE) {
-    return false;
-  }
-  return reconnectAttempts < STREAM_MAX_RECONNECT_ATTEMPTS;
-}
+const BROWSER_SESSION_STREAM_SUBJECT = "browser session";
 
 function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
@@ -82,6 +41,15 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
         hint: "Start a new browser session to try again.",
       };
     default:
+      // A terminal status with no copy of its own is still over, so it must not
+      // fall through to the "still working on it" animation.
+      if (isTerminalStreamStatus(status)) {
+        return {
+          title: "This browser session is no longer live",
+          detail: `There's no browser left to stream — status: ${status}.`,
+          hint: "Start a new browser session to keep working.",
+        };
+      }
       return {
         title: "Waiting for browser frames",
         detail: `The stream is connected and the session status is ${status}.`,
@@ -90,10 +58,4 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
   }
 }
 
-export {
-  STREAM_MAX_RECONNECT_ATTEMPTS,
-  STREAM_RECONNECT_DELAY_MS,
-  diagnosticForStatus,
-  isTerminalStreamStatus,
-  shouldReconnectStream,
-};
+export { BROWSER_SESSION_STREAM_SUBJECT, diagnosticForStatus };

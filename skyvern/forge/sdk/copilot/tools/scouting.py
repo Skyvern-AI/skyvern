@@ -34,6 +34,9 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_pre_action_expression as _scout_pre_action_expression,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_candidates_expression as _selector_candidates_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -311,46 +314,6 @@ async def _role_name_match_count(
     return value
 
 
-async def _capture_scout_role_name(ctx: AgentContext, selector: str | None) -> None:
-    """Stash (selector, role, accessible_name) before an in-flight click that may navigate.
-
-    A navigating click leaves only the landing page, so the post-action read returns the wrong
-    element; this captures the source-page anchor so a bare-selector navigating click still carries a
-    role/name into the trajectory."""
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    selector = _selector_text(selector)
-    if not selector:
-        return
-    parsed = _role_name_from_selector(selector)
-    source = "selector"
-    if parsed is not None:
-        role, name = parsed
-    else:
-        source = "page_read"
-        captured = await _capture_accessible_role_name(
-            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
-        )
-        if captured is None:
-            # A read that never answered and one that answered namelessly leave the same empty
-            # trajectory, and only the first is a timeout worth widening.
-            LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
-            return
-        role, name = captured
-    if not role or not name:
-        LOG.info(
-            "copilot_scout_role_name_unavailable",
-            reason="empty_role" if not role else "empty_name",
-            source=source,
-            role_present=bool(role),
-        )
-        return
-    ctx.pending_scout_role_name = (selector, role, name)
-    count = await _role_name_match_count(ctx, role, name)
-    if count is not None:
-        ctx.pending_scout_role_name_match_count = (selector, role, name, count)
-
-
 def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
     """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
     stashed one, so a navigating click's anchor is never applied to a different element."""
@@ -362,50 +325,6 @@ def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selecto
     return role, name
 
 
-async def _capture_scout_ambiguity(ctx: AgentContext, selector: str | None) -> None:
-    """Stash source-page selector ambiguity and, when unique, a role/name re-anchor.
-
-    The ambiguity fact never replaces the observed role/name packet. The re-anchor is an additional
-    fact about uniqueness, not authority to discard a non-unique accessible identity.
-    """
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_reanchor = None
-    ctx.pending_scout_selector_match_count = None
-    selector = _selector_text(selector)
-    if not selector:
-        return
-    count = await _selector_live_match_count(ctx, selector)
-    if count is None:
-        return
-    ctx.pending_scout_selector_match_count = (selector, count)
-    if count <= 1:
-        return
-    ctx.pending_scout_ambiguous = (selector, True)
-    pending_role_name = getattr(ctx, "pending_scout_role_name", None)
-    if isinstance(pending_role_name, tuple) and len(pending_role_name) == 3 and pending_role_name[0] == selector:
-        role, name = pending_role_name[1:]
-    else:
-        captured = await _capture_accessible_role_name(
-            ctx, selector, timeout_seconds=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
-        )
-        if captured is None:
-            return
-        role, name = captured
-    if not role or not name:
-        return
-    pending_role_count = getattr(ctx, "pending_scout_role_name_match_count", None)
-    if (
-        isinstance(pending_role_count, tuple)
-        and len(pending_role_count) == 4
-        and pending_role_count[:3] == (selector, role, name)
-    ):
-        role_count = pending_role_count[3]
-    else:
-        role_count = await _role_name_match_count(ctx, role, name)
-    if role_count == 1:
-        ctx.pending_scout_reanchor = (selector, role, name)
-
-
 def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: str) -> bool:
     """Return the stashed ambiguity verdict only when the recorded selector matches the probed one, so a
     navigating click's verdict is never applied to a different element."""
@@ -415,6 +334,103 @@ def _prenav_ambiguity_for_selector(pending: tuple[str, bool] | None, selector: s
     if stashed_selector != _selector_text(selector):
         return False
     return ambiguous
+
+
+def _clear_pending_scout_selector_facts(ctx: AgentContext) -> None:
+    ctx.pending_scout_role_name = None
+    ctx.pending_scout_role_name_match_count = None
+    ctx.pending_scout_selector_candidates = None
+    ctx.pending_scout_ambiguous = None
+    ctx.pending_scout_reanchor = None
+    ctx.pending_scout_selector_match_count = None
+
+
+def _non_negative_count(value: Any) -> int | None:
+    """A live cardinality, or None for the expression's "could not evaluate" sentinel."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dict[str, Any], *, source: str) -> None:
+    role, name = "", ""
+    role_name = packet.get("role_name")
+    if isinstance(role_name, dict):
+        role = str(role_name.get("role") or "").strip()
+        name = str(role_name.get("accessible_name") or "").strip()
+    if role and name:
+        ctx.pending_scout_role_name = (selector, role, name)
+    else:
+        LOG.info(
+            "copilot_scout_role_name_unavailable",
+            reason="empty_role" if not role else "empty_name",
+            source=source,
+            role_present=bool(role),
+        )
+
+    role_count = _non_negative_count(packet.get("role_name_match_count"))
+    if role and name and role_count is not None:
+        ctx.pending_scout_role_name_match_count = (selector, role, name, role_count)
+
+    candidates: list[ScoutedSelectorCandidate] = []
+    for raw in packet.get("selector_candidates") or []:
+        if not isinstance(raw, dict):
+            continue
+        candidate_selector = _selector_text(raw.get("selector"))
+        candidate_source = _selector_text(raw.get("source"))
+        if not candidate_selector or not candidate_source:
+            continue
+        candidate: ScoutedSelectorCandidate = {"selector": candidate_selector, "source": candidate_source}
+        if candidate not in candidates:
+            candidates.append(candidate)
+    if candidates:
+        ctx.pending_scout_selector_candidates = candidates
+
+    selector_count = _non_negative_count(packet.get("selector_match_count"))
+    if selector_count is None:
+        return
+    ctx.pending_scout_selector_match_count = (selector, selector_count)
+    if selector_count <= 1:
+        return
+    ctx.pending_scout_ambiguous = (selector, True)
+    if role and name and role_count == 1:
+        ctx.pending_scout_reanchor = (selector, role, name)
+
+
+async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> None:
+    """Stash every pre-action source-page fact from one bounded page read.
+
+    The read runs inline before the action dispatches, so a failure leaves the facts it could not
+    reach unset and the action proceeds; the caller's TIER 1 role/name parse is passed in because a
+    role-engine selector is not valid CSS and could not be counted from the page alone."""
+    _clear_pending_scout_selector_facts(ctx)
+    selector = _selector_text(selector)
+    if not selector:
+        return
+    parsed = _role_name_from_selector(selector)
+    source = "selector" if parsed is not None else "page_read"
+    parsed_role, parsed_name = parsed if parsed is not None else ("", "")
+    server = ctx.discovery_mcp_server
+    result = None
+    if server is not None:
+        try:
+            result = await asyncio.wait_for(
+                server.call_internal_tool(
+                    "skyvern_evaluate",
+                    {"expression": _scout_pre_action_expression(selector, parsed_role, parsed_name)},
+                ),
+                timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            result = None
+    packet = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
+    if not isinstance(packet, dict):
+        LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
+        if parsed is None:
+            return
+        # The parse needed no page, so an unreachable page must not cost the identity it already gave.
+        packet = {"role_name": {"role": parsed_role, "accessible_name": parsed_name}}
+    _apply_scout_pre_action_packet(ctx, selector, packet, source=source)
 
 
 async def _resolve_scout_role_name(
@@ -1158,6 +1174,7 @@ _PAGE_SUMMARY_MAX_SUBMITS = 4
 _PAGE_SUMMARY_MAX_NAV_TEXTS = 8
 _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
 _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
+_PAGE_SUMMARY_SELECTOR_CAP = 120
 
 
 def _summary_text(value: Any) -> str:
@@ -1172,14 +1189,25 @@ def _summary_field_name(field: dict[str, Any]) -> str:
     return ""
 
 
+def _summary_selector(control: dict[str, Any]) -> str:
+    """Carry a selector whole or not at all, never shortened: a truncated selector can still parse
+    and match a different element, which is worse for authoring than carrying no selector."""
+    raw = control.get("selector")
+    selector = raw.strip() if isinstance(raw, str) else ""
+    return selector if selector and len(selector) <= _PAGE_SUMMARY_SELECTOR_CAP else ""
+
+
 def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(control.get("expanded"), bool):
         return None
     summary: dict[str, Any] = {"expanded": control["expanded"]}
-    for key in ("text", "selector", "controls"):
+    for key in ("text", "controls"):
         value = _summary_text(control.get(key))
         if value:
             summary[key] = value
+    disclosure_selector = _summary_selector(control)
+    if disclosure_selector:
+        summary["selector"] = disclosure_selector
     if "controls" in summary and isinstance(control.get("controlled_region_visible"), bool):
         summary["controlled_region_visible"] = control["controlled_region_visible"]
     if control.get("disabled") is True:
@@ -1187,6 +1215,19 @@ def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | Non
     if control.get("visible") is False:
         summary["visible"] = False
     return summary
+
+
+def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, str]:
+    """A summary control carrying the selector the evidence observed for it, when there was one.
+
+    The selector is kept whole or dropped, never shortened: a truncated selector can still parse
+    and match a different element, which is worse for authoring than carrying no selector at all.
+    """
+    entry = {"text": text}
+    selector = _summary_selector(control)
+    if selector:
+        entry["selector"] = selector
+    return entry
 
 
 def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1200,12 +1241,16 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             {
                 "field_count": len(fields),
                 "fields": [
-                    name for name in (_summary_field_name(field) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]) if name
+                    _summary_entry(name, field)
+                    for field, name in (
+                        (field, _summary_field_name(field)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
+                    )
+                    if name
                 ],
                 "submit_controls": [
-                    text
-                    for text in (
-                        _summary_text(control.get("text") or control.get("value"))
+                    _summary_entry(text, control)
+                    for control, text in (
+                        (control, _summary_text(control.get("text") or control.get("value")))
                         for control in submits[:_PAGE_SUMMARY_MAX_SUBMITS]
                     )
                     if text
@@ -1213,18 +1258,18 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             }
         )
     nav_targets = [target for target in evidence.get("navigation_targets") or [] if isinstance(target, dict)]
-    dismiss_texts: list[str] = []
+    dismiss_entries: list[dict[str, str]] = []
     for overlay in evidence.get("modal_overlays") or []:
         if not isinstance(overlay, dict):
             continue
         for control in overlay.get("dismiss_controls") or []:
-            if len(dismiss_texts) >= _PAGE_SUMMARY_MAX_DISMISS_TEXTS:
+            if len(dismiss_entries) >= _PAGE_SUMMARY_MAX_DISMISS_TEXTS:
                 break
             if not isinstance(control, dict):
                 continue
             text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"))
             if text:
-                dismiss_texts.append(text)
+                dismiss_entries.append(_summary_entry(text, control))
     challenge_state = evidence.get("challenge_state")
     challenge_detected = bool(evidence.get("challenge_controls")) or (
         isinstance(challenge_state, dict) and challenge_state.get("detected") is True
@@ -1258,67 +1303,142 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         "navigation_target_count": len(nav_targets),
         "navigation_targets_truncated": evidence.get("navigation_targets_truncated") is True,
         "navigation_targets": [
-            text
-            for text in (_summary_text(target.get("text")) for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS])
+            _summary_entry(text, target)
+            for target, text in (
+                (target, _summary_text(target.get("text"))) for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS]
+            )
             if text
         ],
         "result_container_count": len(evidence.get("result_containers") or []),
         "disclosure_controls": disclosure_controls,
         "challenge_detected": challenge_detected,
-        "modal_dismiss_controls": dismiss_texts,
+        "modal_dismiss_controls": dismiss_entries,
     }
 
 
-def _shed_scout_page_summary_section(summary: dict[str, Any]) -> bool:
-    """Drop one summary section, in fixed priority order; False when nothing is left to shed."""
+def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
+    """Collapse every control entry to the bare text it carries, and report whether anything changed."""
+    dropped = False
+    groups: list[Any] = [summary.get("navigation_targets"), summary.get("modal_dismiss_controls")]
+    for form in summary.get("forms") or []:
+        if isinstance(form, dict):
+            groups.extend([form.get("fields"), form.get("submit_controls")])
+    for entries in groups:
+        if not isinstance(entries, list):
+            continue
+        collapsed = [str(entry.get("text") or "") if isinstance(entry, dict) else entry for entry in entries]
+        if collapsed != entries:
+            entries[:] = collapsed
+            dropped = True
+    return dropped
+
+
+def _shed_scout_page_summary_section(summary: dict[str, Any]) -> str | None:
+    """Drop one summary section, in fixed priority order; None when nothing is left to shed. Selectors
+    go first so the enrichment can never cost a control the summary carried without it."""
+    if _drop_scout_page_summary_selectors(summary):
+        return "control_selectors"
     if summary.get("navigation_targets"):
         summary["navigation_targets"] = []
-        return True
+        return "navigation_targets"
     forms = [form for form in summary.get("forms") or [] if isinstance(form, dict)]
     for form in forms[1:]:
         if form.get("fields"):
             form["fields"] = []
-            return True
+            return "later_form_fields"
     if summary.get("modal_dismiss_controls"):
         summary["modal_dismiss_controls"] = []
-        return True
+        return "modal_dismiss_controls"
     for form in forms[1:]:
         if form.get("submit_controls"):
             form["submit_controls"] = []
-            return True
+            return "later_form_submit_controls"
     if forms and forms[0].get("fields"):
         fields = forms[0]["fields"]
         forms[0]["fields"] = fields[: len(fields) // 2] if len(fields) > 2 else []
-        return True
+        return "first_form_fields"
     if forms and forms[0].get("submit_controls"):
         forms[0]["submit_controls"] = []
-        return True
+        return "first_form_submit_controls"
     if len(forms) > 1:
         summary["forms"] = forms[:1]
-        return True
+        return "later_forms"
     if summary.get("disclosure_controls"):
         summary["disclosure_controls"] = []
-        return True
-    return False
+        return "disclosure_controls"
+    return None
 
 
-def _attach_scout_page_summary(result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
+def _redact_summary_node(ctx: AgentContext, node: Any) -> Any:
+    """Redact the summary's string leaves rather than the whole structure.
+
+    The scrubber rewrites dict keys and integers too, which erases the `text` key the shed ladder
+    reads and turns counts into strings. A selector the scrubber rewrote is dropped rather than
+    kept: a partially rewritten selector still parses and can match a different element.
+    """
+    if isinstance(node, dict):
+        redacted_dict: dict[str, Any] = {}
+        for key, value in node.items():
+            redacted_value = _redact_summary_node(ctx, value)
+            if key == "selector" and isinstance(value, str) and redacted_value != value:
+                continue
+            redacted_dict[key] = redacted_value
+        return redacted_dict
+    if isinstance(node, list):
+        return [_redact_summary_node(ctx, item) for item in node]
+    if isinstance(node, str):
+        redacted_leaf = _redact_codeblock_value(ctx, node)
+        return redacted_leaf if isinstance(redacted_leaf, str) else ""
+    return node
+
+
+def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_evidence: dict[str, Any]) -> None:
     """Attach a compact page summary at result["data"]["page"], keeping the whole
     serialized result under the scout result budget by shedding sections —
-    never by slicing the serialized JSON."""
+    never by slicing the serialized JSON.
+
+    The summary carries selectors, which can embed a workflow parameter's value, so it takes the same
+    redaction the interaction identity does. That scrubber knows workflow-parameter values only, and
+    those are populated on self-heal turns -- it is not a general secret filter.
+    """
     data = result.get("data")
     if not isinstance(data, dict):
         return
     try:
-        summary = _build_scout_page_summary(page_evidence)
+        summary = _redact_summary_node(ctx, _build_scout_page_summary(page_evidence))
+        if not isinstance(summary, dict):
+            return
         data["page"] = summary
+        shed: list[str] = []
         while len(json.dumps(result)) > _SCOUT_RESULT_CHAR_CAP:
-            if not _shed_scout_page_summary_section(summary):
-                data.pop("page", None)
+            section = _shed_scout_page_summary_section(summary)
+            if section is None:
+                # A summary that vanished with no trace reads as a page with nothing on it, so the
+                # names of everything dropped stay behind even when the summary itself cannot.
+                data["page"] = {"shed": [*shed, "page_summary"]}
                 return
+            shed.append(section)
+            summary["shed"] = shed
     except Exception:
         data.pop("page", None)
         LOG.warning("copilot_scout_act_observe_summary_failed")
+
+
+def _page_evidence_names_obstruction(page_evidence: dict[str, Any] | None) -> bool:
+    """True only when the evidence positively names a blocker a frame would have shown.
+
+    A computed-style obstruction candidate does not count: it fires on ordinary textless overlays
+    and would suppress the frame on exactly the pages a frame is needed for.
+    """
+    if not isinstance(page_evidence, dict):
+        return False
+    overlays = [overlay for overlay in page_evidence.get("modal_overlays") or [] if isinstance(overlay, dict)]
+    if any(overlay.get("dismiss_controls") for overlay in overlays):
+        return True
+    if page_evidence.get("challenge_controls"):
+        return True
+    challenge_state = page_evidence.get("challenge_state")
+    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
 
 
 def _page_evidence_has_password_control(page_evidence: dict[str, Any]) -> bool:
@@ -1558,7 +1678,7 @@ async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any],
     _record_scout_page_observation(ctx, page_evidence)
     if has_bounded_page_schema(page_evidence):
         _append_flow_evidence(ctx, page_evidence, reached_via="current_page")
-    _attach_scout_page_summary(result, page_evidence)
+    _attach_scout_page_summary(ctx, result, page_evidence)
 
 
 def _mark_post_run_page_observed(

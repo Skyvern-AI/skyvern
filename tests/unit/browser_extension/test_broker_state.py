@@ -317,6 +317,35 @@ def test_readiness_success_error_and_timeout() -> None:
         os.close(write_fd)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\n",
+        b"not-json\n",
+        b'{"status":"READY"}\n',
+        b'{"status":"READY","port":0}\n',
+        b'{"status":"ERROR"}\n',
+        b'{"status":"ERROR","code":""}\n',
+    ],
+)
+def test_readiness_rejects_malformed_probe_payloads(payload: bytes) -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        write_fd = -1
+
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            read_readiness(read_fd, timeout=0.1)
+
+        assert error_info.value.code == "INVALID_READINESS"
+        assert error_info.value.message == "Broker readiness response is invalid"
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
 def test_startup_log_is_bounded_while_child_is_writing(tmp_path: Path) -> None:
     paths = ensure_run_directory(19777, base_dir=tmp_path / "run")
     write_fd, drain_thread = prepare_startup_log(paths)

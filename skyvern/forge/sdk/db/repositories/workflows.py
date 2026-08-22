@@ -456,7 +456,9 @@ class WorkflowsRepository(BaseRepository):
             get_workflow_query = get_workflow_query.filter_by(version=version)
         if ignore_version:
             get_workflow_query = get_workflow_query.filter(WorkflowModel.version != ignore_version)
-        get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc())
+        # Result.first() does not emit LIMIT, so without this the query fetches and discards every
+        # version row for the wpid — cost grows with each edit the workflow has ever received.
+        get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc()).limit(1)
         async with self.Session() as session:
             if workflow := (await session.scalars(get_workflow_query)).first():
                 is_template = (

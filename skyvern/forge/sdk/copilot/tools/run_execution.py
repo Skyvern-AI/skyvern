@@ -101,6 +101,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
+    repair_page_evidence_is_admissible,
     same_run_typed_challenge_kind,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -1463,7 +1464,7 @@ async def _capture_and_store_post_run_page(
     evidence, observed_session_id, _ = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
-    if evidence is not None and has_bounded_page_schema(evidence):
+    if evidence is not None and repair_page_evidence_is_admissible(evidence):
         store_post_run_page_evidence(
             ctx,
             evidence,
@@ -2191,6 +2192,7 @@ async def _run_blocks_and_collect_debug(
                         block_state_map=ctx.block_state_map,
                         block_started_at_map=ctx.block_started_at_map,
                         block_ended_at_map=ctx.block_ended_at_map,
+                        block_run_identity_map=ctx.block_run_identity_map,
                         workflow_run_id=workflow_run.workflow_run_id,
                     )
                     prior_block_ts = tick_result.prior_block_ts

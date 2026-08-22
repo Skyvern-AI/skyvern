@@ -802,8 +802,8 @@ class BrowserExtensionBrokerServer:
                 "quarantines": [],
             }
         if op == "extension.wait_connected":
-            timeout = args.get("timeout", 35.0)
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 <= timeout <= 35:
+            timeout = args.get("timeout", 45.0)
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 <= timeout <= 45:
                 raise BrowserExtensionBrokerError("INVALID_REQUEST", "Connection wait timeout is invalid")
             return {"connected": await self._wait_client_ready(connection, relay, float(timeout))}
         if (

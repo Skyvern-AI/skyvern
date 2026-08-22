@@ -281,6 +281,21 @@ class SkyvernContext:
     # When this reaches the threshold, further captcha solve attempts are short-circuited.
     consecutive_captcha_timeouts: int = 0
 
+    # Circuit breaker: repeated successful captcha solves for one identity (the solve-budget
+    # key below). Bounds a solve-succeeds-repeatedly-but-run-never-advances loop that the
+    # timeout counter cannot see. Independent from consecutive_captcha_timeouts above.
+    consecutive_captcha_solves: int = 0
+    # Solve-budget key (task id + exact page url + concrete solver identity) of the last
+    # reliably-successful solve; a solve with a matching key spends one unit of the budget.
+    # None means no such solve has run yet. Opaque comparison string only; never log it.
+    last_captcha_solve_key: str | None = None
+    # Fast-fail latch (task id + exact page url) set when the solve budget above trips, so a retry
+    # of the captcha action short-circuits at the entry point before invoking a solver instead of
+    # paying another vendor call to re-raise the same failure. Coarser than last_captcha_solve_key
+    # (no solver identity — a pre-entry check can't know it without running the detector); a url
+    # change re-opens it. None means not latched. Opaque comparison string only; never log it.
+    captcha_solve_latch_key: str | None = None
+
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
     recent_dialog_messages: list[DialogEntry] = field(default_factory=list)

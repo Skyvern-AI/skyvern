@@ -881,7 +881,11 @@ def block_yaml_to_block(
 
     elif block_yaml.block_type == BlockType.WAIT:
         if block_yaml.wait_sec <= 0 or block_yaml.wait_sec > settings.WORKFLOW_WAIT_BLOCK_MAX_SEC:
-            raise InvalidWaitBlockTime(settings.WORKFLOW_WAIT_BLOCK_MAX_SEC)
+            raise InvalidWaitBlockTime(
+                block_yaml.label,
+                block_yaml.wait_sec,
+                settings.WORKFLOW_WAIT_BLOCK_MAX_SEC,
+            )
 
         return WaitBlock(
             **base_kwargs,

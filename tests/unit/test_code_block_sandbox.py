@@ -25,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
     OutputParameter,
     ParameterType,
     WorkflowParameter,
@@ -1164,6 +1165,20 @@ _WORKFLOW_RUN_ID = "wr_otp_test"
 _ORG_ID = "o_otp_test"
 
 
+def _register_credential_parameter(wrc, key: str = _CREDENTIAL_KEY) -> None:
+    """Register a real CredentialParameter under ``key``, mirroring production so
+    is_registered_credential_parameter_key gates the credential-only TOTP paths."""
+    now = datetime.now(timezone.utc)
+    wrc.parameters[key] = CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="w",
+        credential_id="vault:item",
+        created_at=now,
+        modified_at=now,
+    )
+
+
 def _build_wrc_with_totp_seed(seed: str = _RFC_TOTP_SEED):
     """Build a real WorkflowRunContext carrying a TOTP-bearing credential.
 
@@ -1189,6 +1204,7 @@ def _build_wrc_with_totp_seed(seed: str = _RFC_TOTP_SEED):
     wrc.secrets[totp_secret_id] = BitwardenConstants.TOTP
     wrc.secrets[wrc.totp_secret_value_key(totp_secret_id)] = seed
     wrc.values[_CREDENTIAL_KEY] = {"context": "placeholder note", "totp": totp_secret_id}
+    _register_credential_parameter(wrc)
     return wrc
 
 
@@ -1208,6 +1224,7 @@ def _build_wrc_with_identifier(identifier: str = "otp@example.com"):
     )
     wrc.values[_CREDENTIAL_KEY] = {"context": "placeholder note"}
     wrc.credential_totp_identifiers[_CREDENTIAL_KEY] = identifier
+    _register_credential_parameter(wrc)
     return wrc
 
 

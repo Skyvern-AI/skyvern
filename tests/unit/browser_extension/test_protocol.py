@@ -99,9 +99,11 @@ def test_protocol_allowlists_match_contract() -> None:
             "TAB_NOT_FOUND",
             "TAB_NOT_SCOPED",
             "RESTRICTED_URL",
+            "ATTACH_FAILED",
             "DEBUGGER_DETACHED",
             "CDP_METHOD_NOT_ALLOWED",
             "CDP_ERROR",
+            "COMMAND_TIMEOUT",
             "INTERNAL",
         }
     )
@@ -270,13 +272,18 @@ const router = new DebuggerRouter({{
   onAttachedChange: () => undefined,
 }});
 router.attachedTabs.add(7);
+router.attachStates.set(7, {{ status: "attached" }});
 const failed = await router.reset();
-if (failed.failedTabCount !== 1 || !router.attachedTabs.has(7)) {{
-  throw new Error("live debugger attachment was certified as detached");
+if (
+  failed.failedTabCount !== 1 ||
+  router.attachedTabs.has(7) ||
+  router.attachStates.get(7)?.status !== "quarantined"
+) {{
+  throw new Error("live debugger attachment was not quarantined after detach failure");
 }}
 targets = [];
 const benign = await router.reset();
-if (benign.failedTabCount !== 0 || router.attachedTabs.has(7)) {{
+if (benign.failedTabCount !== 0 || router.attachedTabs.has(7) || router.attachStates.has(7)) {{
   throw new Error("already-detached or missing target was not accepted");
 }}
 let detachCleanupCount = 0;

@@ -174,6 +174,29 @@ def selector_match_count_expression(css_selector: str) -> str:
     return f"(() => {{  try {{ return document.querySelectorAll({sel}).length; }}  catch (e) {{ return -1; }}}})()"
 
 
+_JS_SELECTOR_CANDIDATES_HELPER = (
+    "const collectCandidates = (el, requested) => {"
+    "  const esc = (v) => window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v);"
+    "  const attr = (n, k) => n && n.getAttribute ? String(n.getAttribute(k) || '') : '';"
+    "  const tag = (el.tagName || '*').toLowerCase();"
+    "  const candidates = [];"
+    "  const add = (selector, source) => {"
+    "    if (!selector || candidates.some((item) => item.selector === selector)) return;"
+    "    let matches = []; try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { return; }"
+    "    if (matches.includes(el)) candidates.push({selector: selector, source: source});"
+    "  };"
+    "  add(requested, 'requested');"
+    "  const id = attr(el, 'id'); if (id) add('#' + esc(id), 'id');"
+    "  const name = attr(el, 'name'); if (name) add(tag + '[name=\"' + name.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'name');"
+    "  const aria = attr(el, 'aria-label'); if (aria) add(tag + '[aria-label=\"' + aria.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'aria_label');"
+    "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
+    "  const classes = Array.from(el.classList || []).filter(Boolean);"
+    "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
+    "  return candidates;"
+    "};"
+)
+
+
 def selector_candidates_expression(css_selector: str) -> str:
     """Return every bounded CSS identity observed for the selected source-page element.
 
@@ -186,23 +209,64 @@ def selector_candidates_expression(css_selector: str) -> str:
         f"  const requested = {sel};"
         "  let el = null; try { el = document.querySelector(requested); } catch (e) { return []; }"
         "  if (!el) return [];"
-        "  const esc = (v) => window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v);"
-        "  const attr = (n, k) => n && n.getAttribute ? String(n.getAttribute(k) || '') : '';"
-        "  const tag = (el.tagName || '*').toLowerCase();"
-        "  const candidates = [];"
-        "  const add = (selector, source) => {"
-        "    if (!selector || candidates.some((item) => item.selector === selector)) return;"
-        "    let matches = []; try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { return; }"
-        "    if (matches.includes(el)) candidates.push({selector: selector, source: source});"
+        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        "  return collectCandidates(el, requested);"
+        "})()"
+    )
+
+
+# Each fact is computed in its own try so a failing sub-read leaves the others populated. Supplying
+# role/name skips the element read, which is what lets a role-engine selector — not valid CSS — count.
+def scout_pre_action_expression(css_selector: str, role: str | None = None, name: str | None = None) -> str:
+    sel = json.dumps(css_selector)
+    parsed_role = json.dumps(role or "")
+    parsed_name = json.dumps(name or "")
+    return (
+        "(() => {"
+        f"  {_JS_TEXT_HELPER}"
+        f"  {_JS_IS_EDITABLE_HELPER}"
+        f"  {_JS_IMPLICIT_ROLE_HELPER}"
+        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
+        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
+        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        f"  const requested = {sel};"
+        f"  const parsedRole = {parsed_role};"
+        f"  const parsedName = {parsed_name};"
+        "  let el = null;"
+        "  try { el = document.querySelector(requested); } catch (e) { el = null; }"
+        "  let roleName = null;"
+        "  if (parsedRole || parsedName) roleName = { role: parsedRole, accessible_name: parsedName };"
+        "  else if (el) {"
+        "    try {"
+        "      const r = text(el.getAttribute('role')) || implicitRole(el);"
+        "      const n = accessibleName(el, r);"
+        "      if (r || n) roleName = { role: r, accessible_name: n };"
+        "    } catch (e) { roleName = null; }"
+        "  }"
+        "  const targetRole = roleName ? roleName.role : '';"
+        "  const targetName = roleName ? roleName.accessible_name : '';"
+        "  let roleNameMatchCount = -1;"
+        "  if (targetRole && targetName) {"
+        "    try {"
+        "      let count = 0;"
+        "      for (const node of document.querySelectorAll('*')) {"
+        "        const r = text(node.getAttribute('role')) || implicitRole(node);"
+        "        if (r !== targetRole) continue;"
+        "        if (accessibleName(node, r) === targetName) count++;"
+        "      }"
+        "      roleNameMatchCount = count;"
+        "    } catch (e) { roleNameMatchCount = -1; }"
+        "  }"
+        "  let selectorMatchCount = -1;"
+        "  try { selectorMatchCount = document.querySelectorAll(requested).length; } catch (e) { selectorMatchCount = -1; }"
+        "  let candidates = [];"
+        "  try { candidates = el ? collectCandidates(el, requested) : []; } catch (e) { candidates = []; }"
+        "  return {"
+        "    role_name: roleName,"
+        "    role_name_match_count: roleNameMatchCount,"
+        "    selector_match_count: selectorMatchCount,"
+        "    selector_candidates: candidates,"
         "  };"
-        "  add(requested, 'requested');"
-        "  const id = attr(el, 'id'); if (id) add('#' + esc(id), 'id');"
-        "  const name = attr(el, 'name'); if (name) add(tag + '[name=\"' + name.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'name');"
-        "  const aria = attr(el, 'aria-label'); if (aria) add(tag + '[aria-label=\"' + aria.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'aria_label');"
-        "  const type = attr(el, 'type'); if (type) add(tag + '[type=\"' + type.replaceAll('\\\\', '\\\\\\\\').replaceAll('\"', '\\\"') + '\"]', 'type');"
-        "  const classes = Array.from(el.classList || []).filter(Boolean);"
-        "  if (classes.length) add(tag + classes.map((value) => '.' + esc(value)).join(''), 'class_list');"
-        "  return candidates;"
         "})()"
     )
 

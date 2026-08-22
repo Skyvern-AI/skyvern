@@ -6,12 +6,13 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSettingsStore } from "@/store/SettingsStore";
-import { BrowserSessionStream } from "./BrowserSessionStream";
 import {
-  diagnosticForStatus,
+  STREAM_MAX_RECONNECT_DELAY_MS,
   isTerminalStreamStatus,
   shouldReconnectStream,
-} from "./BrowserSessionStream.utils";
+} from "@/routes/streaming/streamLifecycle";
+import { BrowserSessionStream } from "./BrowserSessionStream";
+import { diagnosticForStatus } from "./BrowserSessionStream.utils";
 
 const env = vi.hoisted(() => ({
   wssBaseUrl: "ws://127.0.0.1:8000/api/v1",
@@ -560,7 +561,10 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
           },
         );
       });
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
+      // Retries back off, so the longest gap covers every attempt in the budget.
+      await act(async () =>
+        vi.advanceTimersByTimeAsync(STREAM_MAX_RECONNECT_DELAY_MS),
+      );
     }
     expect(FakeStreamSocket.instances).toHaveLength(22);
 
@@ -573,10 +577,47 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
         },
       );
     });
-    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    await act(async () =>
+      vi.advanceTimersByTimeAsync(STREAM_MAX_RECONNECT_DELAY_MS),
+    );
     expect(FakeStreamSocket.instances).toHaveLength(22);
     expect(screen.queryByTestId("stream-frame")).toBeNull();
     expect(screen.getByText("Stream connection dropped")).toBeTruthy();
+  });
+
+  it("retires the stale frame and reconnects when the stream ends non-terminally (SKY-14617)", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeStreamSocket);
+    render(<BrowserSessionStream browserSessionId="pbs_stale" />);
+    await act(async () => Promise.resolve());
+    const socket = FakeStreamSocket.instances[0]!;
+
+    act(() => {
+      socket.emitStreamMessage({
+        status: "running",
+        screenshot: "last-live-frame",
+      });
+    });
+    act(() => {
+      vi.advanceTimersToNextFrame();
+    });
+    expect(screen.getByTestId("stream-frame")).toBeTruthy();
+
+    // What the backend sends once its screencast loop returns for a session that is
+    // still alive: a bare, non-terminal status, then a clean close.
+    act(() => {
+      socket.emitStreamMessage({ status: "running" });
+    });
+    expect(screen.queryByTestId("stream-frame")).toBeNull();
+    expect(
+      screen.getByText("This live view has stopped updating"),
+    ).toBeTruthy();
+
+    act(() => {
+      socket.emit("close", { code: 1000, reason: "" });
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(FakeStreamSocket.instances).toHaveLength(2);
   });
 
   it("terminal status closes once, clears the frame and store, and never retries", async () => {
@@ -653,31 +694,33 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
 });
 
 describe("shouldReconnectStream", () => {
-  it("reconnects non-terminal stream closes below the attempt limit", () => {
+  it("reconnects a clean server close, not only an abnormal one (SKY-14617)", () => {
     expect(
       shouldReconnectStream({
         closeCode: 1006,
         closeReason: "",
-        terminalStatusSeen: false,
+        streamFinished: false,
+        reconnectAttempts: 0,
+      }),
+    ).toBe(true);
+    // The server closes cleanly once its screencast loop ends, which for a live
+    // entity used to mean no reconnect at all and a frozen frame on screen.
+    expect(
+      shouldReconnectStream({
+        closeCode: 1000,
+        closeReason: "",
+        streamFinished: false,
         reconnectAttempts: 0,
       }),
     ).toBe(true);
   });
 
-  it("does not reconnect terminal, VNC fallback, normal, or exhausted stream closes", () => {
+  it("does not reconnect a finished, transport-switched, or exhausted stream", () => {
     expect(
       shouldReconnectStream({
         closeCode: 1000,
         closeReason: "",
-        terminalStatusSeen: true,
-        reconnectAttempts: 0,
-      }),
-    ).toBe(false);
-    expect(
-      shouldReconnectStream({
-        closeCode: 1000,
-        closeReason: "",
-        terminalStatusSeen: false,
+        streamFinished: true,
         reconnectAttempts: 0,
       }),
     ).toBe(false);
@@ -685,7 +728,7 @@ describe("shouldReconnectStream", () => {
       shouldReconnectStream({
         closeCode: 4001,
         closeReason: "use-vnc-streaming",
-        terminalStatusSeen: false,
+        streamFinished: false,
         reconnectAttempts: 0,
       }),
     ).toBe(false);
@@ -693,7 +736,7 @@ describe("shouldReconnectStream", () => {
       shouldReconnectStream({
         closeCode: 1006,
         closeReason: "",
-        terminalStatusSeen: false,
+        streamFinished: false,
         reconnectAttempts: 20,
       }),
     ).toBe(false);

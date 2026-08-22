@@ -105,6 +105,7 @@ class RealBrowserState(BrowserState):
         self._remote_driver_detached = False
         self._browser_state_diagnostic: BrowserStateDiagnostic | None = None
         self._ever_connected = browser_context is not None
+        self._close_requested = False
         self._disconnect_listener_context: BrowserContext | None = None
         self._disconnect_listener_browser: Browser | None = None
         if browser_context is not None:
@@ -285,6 +286,7 @@ class RealBrowserState(BrowserState):
             self.browser_cleanup = browser_cleanup
             self._browser_state_diagnostic = None
             self._ever_connected = True
+            self._close_requested = False
             self._register_disconnect_listeners(browser_context)
             # Strikes describe the browser that earned them; a replacement starts even.
             skyvern_context.record_browser_success()
@@ -582,13 +584,17 @@ class RealBrowserState(BrowserState):
             event=event,
             observation_source=observation_source,
         )
-        LOG.warning(
+        # A disconnect observed after close() was requested is the teardown we asked for; only an
+        # unrequested one is worth a warning.
+        log = LOG.info if self._close_requested else LOG.warning
+        log(
             "Browser state disconnected",
             browser_session_id=browser_session_id,
             disconnect_reason=reason,
             disconnect_event=event,
             disconnect_observed_at=disconnect_observed_at.isoformat(),
             disconnect_observation_source=observation_source,
+            close_requested=self._close_requested,
         )
 
     def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
@@ -825,6 +831,9 @@ class RealBrowserState(BrowserState):
                     "download interceptor disable",
                 )
         if close_browser_on_completion:
+            # Only a teardown that closes the context is a requested disconnect; the keep-alive path
+            # leaves the browser to a later owner, whose disconnects are still unrequested.
+            self._close_requested = True
             recording_finalized = await self._run_bounded_detachable(
                 self._teardown_context(),
                 BROWSER_CLOSE_TIMEOUT,

@@ -187,9 +187,19 @@ class StepModel(Base):
 
 class OrganizationModel(Base):
     __tablename__ = "organizations"
+    __table_args__ = (
+        Index(
+            "uq_organizations_slug",
+            "slug",
+            unique=True,
+            postgresql_where=text("slug IS NOT NULL"),
+            sqlite_where=text("slug IS NOT NULL"),
+        ),
+    )
 
     organization_id = Column(String, primary_key=True, default=generate_org_id)
     organization_name = Column(String, nullable=False)
+    slug = Column(String, nullable=True)
     webhook_callback_url = Column(UnicodeText)
     max_steps_per_run = Column(Integer, nullable=True)
     max_steps_per_workflow_run = Column(Integer, nullable=True)

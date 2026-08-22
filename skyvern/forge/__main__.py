@@ -85,11 +85,16 @@ if __name__ == "__main__":
         # Omit log_level= so uvicorn.Config.configure_logging() doesn't reset setup_logger()'s uvicorn.error WARNING.
         access_log=False,
         log_config={"version": 1, "disable_existing_loggers": False},
+        # The event loop is single-threaded, so an unbounded queue degrades every request in it,
+        # including the load balancer's health check. uvicorn's shed is path-blind, so this has to
+        # stay above real per-task connection counts or it costs the heartbeat it is protecting.
+        limit_concurrency=settings.API_LIMIT_CONCURRENCY,
         # uvloop can double-close a recycled fd after create_connection cancellation (MagicStack/uvloop#740).
         loop="asyncio",
         reload=reload,
         reload_excludes=reload_excludes,
         factory=True,
+        timeout_keep_alive=settings.UVICORN_TIMEOUT_KEEP_ALIVE,
         ws="websockets-sansio",
         # Let cdp_input emit its 120s setup-time close before Uvicorn's liveness timeout.
         ws_ping_interval=20.0,

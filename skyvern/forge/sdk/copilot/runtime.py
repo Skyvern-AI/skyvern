@@ -100,6 +100,12 @@ class BrowserProbeOutcome(StrEnum):
     could_not_determine = "could_not_determine"
 
 
+@dataclass(frozen=True)
+class BrowserProbeFault:
+    error_type: str
+    timed_out: bool
+
+
 def _browser_context_attachability(browser_context: object | None) -> BrowserProbeOutcome:
     if browser_context is None:
         return BrowserProbeOutcome.positively_unreachable
@@ -751,7 +757,9 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             if retiring:
                 retire_browser_session_id(ctx, browser_session_id)
                 raise CopilotBrowserSessionUnavailable(browser_session_id)
-            raise RuntimeError("No browser context for copilot session")
+            # Distinct wording on purpose: _is_unrecoverable_browser_session_error reads this text,
+            # and an undetermined signal must not count toward aborting the turn as session loss.
+            raise RuntimeError("Browser liveness for this copilot session could not be determined")
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -805,7 +813,9 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         reset_api_key_override(override_token)
 
 
-async def _probe_browser_session(ctx: AgentContext, session_id: str) -> BrowserProbeOutcome:
+async def _probe_browser_session(
+    ctx: AgentContext, session_id: str
+) -> tuple[BrowserProbeOutcome, BrowserProbeFault | None]:
     """Classify by what completed, never by exception type. Reaching `positively_unreachable`
     needs both a lookup that returned and a health signal that answered; either failing to
     complete is undetermined, since neither is evidence about the browser."""
@@ -816,25 +826,78 @@ async def _probe_browser_session(ctx: AgentContext, session_id: str) -> BrowserP
                 organization_id=ctx.organization_id,
             )
         if state is None:
-            return BrowserProbeOutcome.positively_unreachable
+            return BrowserProbeOutcome.positively_unreachable, None
         attachability = _browser_context_attachability(state.browser_context)
     except Exception as exc:
+        error_type = type(exc).__name__
         LOG.warning(
             "Browser state probe failed; liveness undetermined",
             session_id=session_id,
             organization_id=ctx.organization_id,
-            error_type=type(exc).__name__,
+            error_type=error_type,
             exc_info=True,
         )
-        return BrowserProbeOutcome.could_not_determine
-    return attachability
+        return BrowserProbeOutcome.could_not_determine, BrowserProbeFault(
+            error_type=error_type,
+            timed_out=isinstance(exc, TimeoutError),
+        )
+    return attachability, None
+
+
+def _unverified_browser_session_facts(fault: BrowserProbeFault | None) -> dict[str, Any]:
+    if fault is None:
+        cause = "the browser's connectivity signal never answered"
+    elif fault.timed_out:
+        cause = f"the liveness probe did not answer within {_BROWSER_PROBE_WAIT_SECONDS}s ({fault.error_type})"
+    else:
+        cause = f"the liveness probe raised {fault.error_type}"
+    return {
+        "ok": False,
+        "error": (
+            f"The browser session could not be verified: {cause}. "
+            "An indeterminate probe is not evidence the browser is dead."
+        ),
+        "probe_error_type": fault.error_type if fault is not None else None,
+        "probe_timed_out": fault is not None and fault.timed_out,
+    }
+
+
+async def _try_attach_verify_browser_session(
+    ctx: AgentContext, session_id: str
+) -> tuple[bool, BrowserProbeOutcome | None, BrowserProbeFault | None]:
+    """Complete the determination the probe could not, bounded at the probe's own deadline: this
+    re-enters the same lookup that just failed to answer."""
+    try:
+        async with asyncio.timeout(_BROWSER_PROBE_WAIT_SECONDS):
+            state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if state is None:
+            return False, BrowserProbeOutcome.positively_unreachable, None
+        attachability = _browser_context_attachability(state.browser_context)
+        if attachability == BrowserProbeOutcome.attachable:
+            return True, None, None
+        return False, attachability, None
+    except Exception as exc:
+        error_type = type(exc).__name__
+        LOG.warning(
+            "Browser session escalation failed; liveness still undetermined",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            error_type=error_type,
+            exc_info=True,
+        )
+        return (
+            False,
+            BrowserProbeOutcome.could_not_determine,
+            BrowserProbeFault(error_type=error_type, timed_out=isinstance(exc, TimeoutError)),
+        )
 
 
 async def ensure_browser_session(ctx: AgentContext, *, require_verified_session: bool = False) -> dict[str, Any] | None:
     """Create a browser session if needed. Returns None on success, error dict on failure.
 
     Callers that hand the id onward without ever attaching cannot discover a dead session, so they
-    pass require_verified_session=True to get an infrastructure error instead of an unverified id.
+    pass require_verified_session=True to have the determination completed here: the session is
+    attached, replaced, or reported unverified with the facts that prevented an answer.
 
     Exception: the self-heal path raises HealAdoptionFailed instead of returning an
     error dict, so a failed adoption aborts the turn rather than degrading to a normal
@@ -876,15 +939,19 @@ async def ensure_browser_session(ctx: AgentContext, *, require_verified_session:
 
     if ctx.browser_session_id:
         probed_session_id = ctx.browser_session_id
-        outcome = await _probe_browser_session(ctx, probed_session_id)
+        outcome, fault = await _probe_browser_session(ctx, probed_session_id)
         if outcome == BrowserProbeOutcome.attachable:
             return None
         if outcome == BrowserProbeOutcome.could_not_determine:
-            # Not evidence against the session, so it survives for callers that will attach and
-            # find out. A caller that never attaches gets the fault surfaced instead.
+            # A caller that never attaches gets the determination completed once here; anything
+            # short of a completed resolve leaves the session unjudged, so its id survives.
             if not require_verified_session:
                 return None
-            return {"ok": False, "error": "Could not verify the browser session; please retry"}
+            attached, attach_outcome, attach_fault = await _try_attach_verify_browser_session(ctx, probed_session_id)
+            if attached:
+                return None
+            if attach_outcome != BrowserProbeOutcome.positively_unreachable:
+                return _unverified_browser_session_facts(attach_fault or fault)
         LOG.warning(
             "Supplied browser_session_id is no longer attachable; auto-creating",
             session_id=probed_session_id,

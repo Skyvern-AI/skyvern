@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -143,7 +144,7 @@ def tool_activity_display_label(tool_name: str, tool_input: dict[str, Any] | Non
 
 
 def build_tool_call_activity(
-    tool_name: str, iteration: int, tool_call_id: str, display_label: str | None = None
+    tool_name: str, iteration: int, tool_call_id: str, *, timestamp: datetime, display_label: str | None = None
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
@@ -155,6 +156,7 @@ def build_tool_call_activity(
         "toolName": tool_name,
         "displayLabel": display_label,
         "id": f"tc-{tool_call_id}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -164,6 +166,8 @@ def build_tool_result_activity(
     success: bool,
     iteration: int,
     tool_call_id: str,
+    *,
+    timestamp: datetime,
     display_label: str | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
@@ -177,6 +181,7 @@ def build_tool_result_activity(
         "displayLabel": display_label,
         "success": success,
         "id": f"tr-{tool_call_id}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -186,6 +191,7 @@ def build_narration_activity(narration: str, iteration: int, timestamp: datetime
         "text": narration,
         "iteration": iteration,
         "id": f"n-{iteration}-{timestamp.isoformat()}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -920,6 +926,7 @@ async def narrator_poll_tick(
     block_state_map: dict[str, str] | None = None,
     block_started_at_map: dict[str, str] | None = None,
     block_ended_at_map: dict[str, str] | None = None,
+    block_run_identity_map: dict[str, BlockRunIdentity] | None = None,
     workflow_run_id: str | None = None,
 ) -> NarratorPollTickResult:
     """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
@@ -977,6 +984,11 @@ async def narrator_poll_tick(
                 event_ts_iso = event_ts.isoformat()
                 if block_state_map is not None:
                     block_state_map[event.block_label] = event.status
+                if block_run_identity_map is not None:
+                    block_run_identity_map[event.block_label] = BlockRunIdentity(
+                        workflow_run_block_id=event.block_id,
+                        iteration=state.current_iteration,
+                    )
                 if event.status == "running":
                     state.running_block_label = event.block_label
                 elif event.status in _TERMINAL_BLOCK_STATUSES and state.running_block_label == event.block_label:

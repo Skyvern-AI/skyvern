@@ -64,7 +64,7 @@ async def _invoke_no_call_continuation(
     step = make_step(now, task, step_id="cua-step", status=StepStatus.created, order=0, output=None)
 
     previous_response = SimpleNamespace(id="resp_prev", output=[])
-    scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES])
+    scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES], window_dimension=None)
 
     create_mock = AsyncMock(return_value=SimpleNamespace(id="resp_new", output=[], usage=_fake_usage()))
     monkeypatch.setattr(
@@ -115,6 +115,64 @@ async def test_no_computer_call_continuation_includes_answer_and_screenshot(
     assert expected_data_url in image_urls
 
 
+async def _capture_cua_tools(
+    monkeypatch: pytest.MonkeyPatch, window_dimension: dict[str, int] | None
+) -> list[dict[str, Any]]:
+    """Drive _generate_cua_actions once and return the `tools` the OpenAI Responses call declared."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization)
+    step = make_step(now, task, step_id="cua-step", status=StepStatus.created, order=0, output=None)
+
+    computer_call = SimpleNamespace(
+        type="computer_call",
+        call_id="call_dim",
+        action=SimpleNamespace(type="scroll"),
+        pending_safety_checks=[],
+    )
+    previous_response = SimpleNamespace(id="resp_prev", output=[computer_call])
+    scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES], window_dimension=window_dimension)
+
+    create_mock = AsyncMock(return_value=SimpleNamespace(id="resp_new", output=[], usage=_fake_usage()))
+    monkeypatch.setattr(
+        agent_module.app,
+        "OPENAI_CLIENT",
+        SimpleNamespace(responses=SimpleNamespace(create=create_mock)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_module.app,
+        "DATABASE",
+        SimpleNamespace(tasks=SimpleNamespace(update_step=AsyncMock())),
+        raising=False,
+    )
+    monkeypatch.setattr(agent_module, "parse_cua_actions", AsyncMock(return_value=[]))
+
+    await agent._generate_cua_actions(
+        task=task, step=step, scraped_page=scraped_page, previous_response=previous_response
+    )
+    return create_mock.await_args.kwargs["tools"]
+
+
+@pytest.mark.asyncio
+async def test_cua_tool_declares_live_viewport_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The computer tool's display size must be the live page viewport, so returned coordinates
+    map into the real (possibly-shrunk) page rather than a hardcoded 1920x1080."""
+    tools = await _capture_cua_tools(monkeypatch, {"width": 1440, "height": 810})
+
+    assert tools[0]["display_width"] == 1440
+    assert tools[0]["display_height"] == 810
+
+
+@pytest.mark.asyncio
+async def test_cua_tool_falls_back_to_settings_without_a_live_viewport(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = await _capture_cua_tools(monkeypatch, None)
+
+    assert tools[0]["display_width"] == agent_module.settings.BROWSER_WIDTH
+    assert tools[0]["display_height"] == agent_module.settings.BROWSER_HEIGHT
+
+
 @pytest.mark.asyncio
 async def test_truthy_answer_appends_execute_directive(monkeypatch: pytest.MonkeyPatch) -> None:
     create_mock = await _invoke_no_call_continuation(monkeypatch)
@@ -152,7 +210,7 @@ async def test_computer_call_output_continuation_shape_unchanged(monkeypatch: py
         pending_safety_checks=[],
     )
     previous_response = SimpleNamespace(id="resp_prev", output=[computer_call])
-    scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES])
+    scraped_page = SimpleNamespace(screenshots=[SCREENSHOT_BYTES], window_dimension=None)
 
     create_mock = AsyncMock(return_value=SimpleNamespace(id="resp_new", output=[], usage=_fake_usage()))
     monkeypatch.setattr(

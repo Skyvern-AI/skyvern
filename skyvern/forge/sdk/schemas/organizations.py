@@ -1,8 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.utils.organization_slug import is_valid_org_slug
 
 
 class Organization(BaseModel):
@@ -10,6 +11,7 @@ class Organization(BaseModel):
 
     organization_id: str
     organization_name: str
+    slug: str | None = None
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
     max_steps_per_workflow_run: int | None = None
@@ -185,6 +187,10 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 
 class OrganizationUpdate(BaseModel):
+    slug: str | None = Field(
+        default=None,
+        description="Set a stable organization slug. Omit this field to keep the current slug. Explicit null is rejected.",
+    )
     max_steps_per_run: int | None = Field(default=None, ge=1)
     max_steps_per_workflow_run: int | None = Field(default=None, ge=1)
     clear_max_steps_per_workflow_run: bool = Field(
@@ -245,3 +251,10 @@ class OrganizationUpdate(BaseModel):
             "exclusive with a non-null value in ``default_secondary_llm_key`` (the clear flag wins)."
         ),
     )
+
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_org_slug(value):
+            raise ValueError("slug must match ^[a-z0-9-]{1,20}$")
+        return value

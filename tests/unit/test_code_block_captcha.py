@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
@@ -444,9 +445,7 @@ async def test_real_sandbox_solve_captcha_rejects_inconclusive_token_baseline(
         token_values=["opaque-token"],
         frames=[FakeFrame(url="https://www.google.com/recaptcha/api2/anchor", anchor=anchor)],
     )
-    page.recaptcha_token.input_value = AsyncMock(
-        side_effect=[block_module.PlaywrightError("probe failed"), "opaque-token"]
-    )
+    page.recaptcha_token.input_value = AsyncMock(side_effect=[PlaywrightError("probe failed"), "opaque-token"])
     block = CodeBlock.model_construct(code="await solve_captcha(page)", label="captcha_anchor_unknown_baseline")
 
     await block.generate_async_user_function(block.code, page)()

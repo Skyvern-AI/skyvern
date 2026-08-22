@@ -187,8 +187,7 @@ from .run_execution import (
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
-from .scouting import _capture_scout_ambiguity as _capture_scout_ambiguity
-from .scouting import _capture_scout_role_name as _capture_scout_role_name
+from .scouting import _capture_scout_pre_action as _capture_scout_pre_action
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
 from .scouting import (
@@ -842,6 +841,10 @@ async def update_and_run_blocks_tool(
     parameters: dict[str, Any] | None = None,
 ) -> Any:
     """Update the workflow YAML and immediately run the specified blocks in one step.
+    This persists the workflow and remotely executes the selected frontier, waiting for it to
+    finish, so it is materially higher latency than a bounded page read. It is the surface for
+    testing durable behaviour, and for reaching a state that only execution can establish --
+    authentication, a credential or OTP step, or state an upstream block creates.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
 
@@ -1097,11 +1100,18 @@ async def inspect_page_for_composition_tool(
 ) -> str:
     """Inspect a known page before composing form/search workflow blocks.
 
+    This is a bounded read of known or current page state: it is the surface for uncertainty about
+    controls, selectors, visible state or layout, where no workflow execution is required.
     Use this after the entrypoint URL is known and before authoring blocks that
     fill fields, submit searches, filter results, or expand result rows. It
     can also inspect the current browser page after a run by passing
     target_url="current_page"; use that after partial/budgeted runs so you do
-    not replay a search that already advanced the page.
+    not replay a search that already advanced the page. Passing any other
+    `target_url` navigates the live browser there and reports the reached
+    `current_url`, so a further `navigate_browser` to that same URL is redundant. The packet
+    describes the page only as it is at that moment: a control that appears solely after an
+    interaction -- a Delete control after an Add click, a cart after add-to-cart, the secure area
+    after login -- is absent from it until that interaction has happened.
 
     Returns observed page evidence: current URL, title, navigation targets, form
     fields with labels and selectors, submit/search controls, result containers,

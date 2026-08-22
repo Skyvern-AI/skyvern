@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import jwt
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 
@@ -945,6 +945,57 @@ async def test_get_current_org_forwards_optional_attribution_header_to_authentic
 
     assert resolved == organization
     assert calls == [("clerk-token", "encoded-attribution")]
+
+
+def test_get_current_org_with_authentication_forwards_optional_attribution_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-attribution-authentication")
+    calls: list[tuple[str, str | None]] = []
+
+    async def authentication_callback(
+        token: str,
+        attribution_header: str | None = None,
+    ) -> Organization:
+        calls.append((token, attribution_header))
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    fastapi_app = FastAPI()
+
+    @fastapi_app.get("/organization")
+    async def get_organization(
+        current_organization: Organization = Depends(org_auth_service.get_current_org_with_authentication),
+    ) -> Organization:
+        return current_organization
+
+    parameters = fastapi_app.openapi()["paths"]["/organization"]["get"]["parameters"]
+    assert all(parameter["name"] != org_auth_service.POSTHOG_ATTRIBUTION_HEADER for parameter in parameters)
+
+    with TestClient(fastapi_app) as client:
+        attributed_response = client.get(
+            "/organization",
+            headers={
+                "Authorization": "Bearer clerk-token",
+                org_auth_service.POSTHOG_ATTRIBUTION_HEADER: "encoded-attribution",
+            },
+        )
+        un_attributed_response = client.get(
+            "/organization",
+            headers={"Authorization": "Bearer clerk-token"},
+        )
+
+    assert attributed_response.status_code == 200
+    assert un_attributed_response.status_code == 200
+    assert calls == [
+        ("clerk-token", "encoded-attribution"),
+        ("clerk-token", None),
+    ]
 
 
 @pytest.mark.asyncio

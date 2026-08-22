@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 
-from skyvern.cli.core import browser_ops, session_manager
+from skyvern.cli.core import browser_ops
+from skyvern.cli.core import result as result_mod
+from skyvern.cli.core import session_manager
 from skyvern.cli.core.browser_ops import (
     CustomSelectClassifyError,
     CustomSelectMatchError,
@@ -1413,6 +1415,21 @@ async def test_skyvern_type_ai_error_uses_exception_type_for_empty_message(
     assert result["error"]["code"] == mcp_browser.ErrorCode.AI_FALLBACK_FAILED
     assert result["error"]["message"] == "SilentFailure"
     assert result["error"]["details"] == {"exception_type": "SilentFailure"}
+
+
+@pytest.mark.asyncio
+async def test_select_option_reports_the_browser_attach_when_the_custom_path_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _action_page(monkeypatch, select_option=AsyncMock(return_value="us"))
+    result_mod._pending_attach.set(700)
+    try:
+        result = await mcp_browser.skyvern_select_option(selector="#country", value="us")
+    finally:
+        result_mod._pending_attach.set(None)
+
+    assert result["ok"] is True
+    assert result["timing_ms"].get("attach") == 700
 
 
 @pytest.mark.asyncio
