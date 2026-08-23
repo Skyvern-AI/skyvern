@@ -57,6 +57,23 @@ _STOPWORDS_JS = (
     "'inc','llc','ltd','corp'])"
 )
 
+# The roles this engine treats as controls. observe enumerates exactly these (its `q` selector is
+# this list expanded) and reports them on each record, so it is the single answer to "is this a
+# control?" rather than each probe keeping its own.
+_WIDGET_ROLES_JS = (
+    "['button','checkbox','radio','combobox','option','menuitem',"
+    "'menuitemcheckbox','menuitemradio','listbox','switch','spinbutton','tab']"
+)
+
+# The subset of those that can be a ROW in an opened menu. Derived rather than restated so the two
+# cannot drift. Excluded: combobox/listbox/spinbutton, which are the control or its container and
+# never one of its rows; and tab, which is navigational -- _FIND_SUGGESTION_JS refuses it for the
+# same reason, and a probe that called a tab strip a menu of options would invite a wrong move.
+_MENU_ROW_ROLES_JS = (
+    "new Set(" + _WIDGET_ROLES_JS + ".filter((r) => ['combobox','listbox','spinbutton','tab'].indexOf(r) === -1))"
+)
+
+
 # Every open shadow root on the page, document first, then each root in depth-first order. Web-component libraries put the
 # real input/button inside a shadow root, and `document.querySelector*` does not cross that boundary
 # while Playwright's selector engine does — so any probe that must agree with what an action tool
@@ -685,6 +702,13 @@ _CLICK_PRECHECK_JS = (
       el.getAttribute('style'), kids,
     ].join('|');
   };
+  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
+  // restructures cannot change this string, and only being picked can.
+  const selState = (el) => {
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+    ].join('|');
+  };
   const openRows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
   let target = null;
@@ -693,6 +717,9 @@ _CLICK_PRECHECK_JS = (
   let containsMenu = false;
   let optText = '';
   let optState = '';
+  let optSel = '';
+  let optKids = -1;
+  let optH = -1;
   if (target && openRows.length) {
     for (const el of openRows) {
       // The target being the row or inside it is an option pick. The target merely CONTAINING rows
@@ -702,6 +729,9 @@ _CLICK_PRECHECK_JS = (
         isOption = true;
         optText = (el.innerText || '').trim().slice(0, 80);
         optState = state(el);
+        optSel = selState(el);
+        optKids = el.children.length;
+        optH = Math.round(el.getBoundingClientRect().height);
         break;
       }
       if (pContains(target, el)) containsMenu = true;
@@ -709,7 +739,7 @@ _CLICK_PRECHECK_JS = (
   }
   preReset();
   pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
-  return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState };
+  return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH };
 }"""
 )
 
@@ -741,18 +771,34 @@ _MENU_AFTER_JS = (
       el.getAttribute('style'), kids,
     ].join('|');
   };
+  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
+  // restructures cannot change this string, and only being picked can.
+  const selState = (el) => {
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+    ].join('|');
+  };
   let stillOpen = 0;
   const rows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) { stillOpen++; rows.push(el); }
   let target = null;
   try { target = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { target = (arg.el && arg.el.isConnected ? arg.el : null); }
   let optState = '';
+  let optSel = '';
+  let optKids = -1;
+  let optH = -1;
   if (target) {
     for (const el of rows) {
-      if (el === target || pContains(el, target)) { optState = state(el); break; }
+      if (el === target || pContains(el, target)) {
+        optState = state(el);
+        optSel = selState(el);
+        optKids = el.children.length;
+        optH = Math.round(el.getBoundingClientRect().height);
+        break;
+      }
     }
   }
-  return { stillOpen, optState };
+  return { stillOpen, optState, optSel, optKids, optH };
 }"""
 )
 
@@ -770,6 +816,9 @@ _FIND_MENU_JS = (
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + r"""
+  const MENU_ROW_ROLES = """
+    + _MENU_ROW_ROLES_JS
+    + r""";
   const vis = (r) => r.width > 0 && r.height > 0;
   let trigger = null;
   try { trigger = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { return null; }
@@ -792,11 +841,14 @@ _FIND_MENU_JS = (
     if (!txt || txt.length > 80) continue;
     // Options are individually actionable rows. Requiring it per-row keeps a dialog's title/body
     // text from being listed as "options" (and a horizontal Confirm/Cancel button pair then fails
-    // the stacked-rows check below).
+    // the stacked-rows check below). The role set is observe's, minus the container and
+    // navigational ones: a single-select built as a radiogroup and a multi-select built as
+    // checkboxes are menus, and a probe that disagreed with observe about that left their rows
+    // untagged -- which silently disarms every commit check in _click_reaction.
     const role = el.getAttribute('role');
     let ptr = false;
     try { ptr = getComputedStyle(el).cursor === 'pointer'; } catch (e) { ptr = false; }
-    const clickable = tag === 'BUTTON' || tag === 'A' || role === 'option' || role === 'menuitem' || role === 'menuitemcheckbox' || role === 'menuitemradio' || ptr;
+    const clickable = tag === 'BUTTON' || tag === 'A' || MENU_ROW_ROLES.has(role) || ptr;
     if (!clickable) continue;
     rows.push({ el, r, txt });
   }
@@ -874,8 +926,9 @@ _OBSERVE_JS = (
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
-  const _WIDGET_ROLES = ['button', 'checkbox', 'radio', 'combobox', 'option', 'menuitem',
-                         'menuitemcheckbox', 'menuitemradio', 'listbox', 'switch', 'spinbutton', 'tab'];
+  const _WIDGET_ROLES = """
+    + _WIDGET_ROLES_JS
+    + r""";
   const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
   // Set wherever we learn that some region of the page cannot be read. Declared here because the
   // walk below is one of those places and it runs before the marker gather.
@@ -1596,7 +1649,7 @@ _OBSERVE_JS = (
 )
 
 
-def _menu_open_note(found: dict[str, Any], selector: str) -> str:
+def _menu_open_note(found: dict[str, Any], selector: str, *, clicked_row: bool = False) -> str:
     count = int(found.get("count") or 0)
     parts = []
     for o in (found.get("options") or [])[:15]:
@@ -1604,10 +1657,15 @@ def _menu_open_note(found: dict[str, Any], selector: str) -> str:
         text = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(o.get("text", "")))
         parts.append(f'[data-tv3-menu="{o.get("n")}"] {text!r}')
     overflow = f" (+{count - len(parts)} more — re-observe for the full list)" if count > len(parts) else ""
+    # Naming the raw selector would contradict the next sentence when the caller IS a menu row:
+    # this note has just renumbered every data-tv3-menu, so the selector clicked to get here is one
+    # of the ones it is about to declare stale.
+    closer = "the row you just clicked" if clicked_row else selector
     return (
         f"This click opened a menu of {count} options: {'; '.join(parts)}{overflow}. To select one, click "
-        f'its [data-tv3-menu="N"] selector NOW — clicking {selector} again or elsewhere closes the menu '
-        "and destroys these options."
+        f'its [data-tv3-menu="N"] selector NOW — clicking {closer} again or elsewhere closes the menu '
+        "and destroys these options. These numbers are freshly assigned: any data-tv3-menu selector "
+        "from an earlier result now points at a different row or at nothing."
     )
 
 
@@ -1936,20 +1994,72 @@ def build_browser_tools(
             # submenu opening (a cascading option commits nothing yet — reporting the child menu beats
             # a false error).
             baseline = pre.get("optState") or ""
+            sel_baseline = pre.get("optSel") or ""
+            kids_baseline = pre.get("optKids")
+            height_baseline = pre.get("optH")
 
             def _committed_state(after: dict[str, Any]) -> bool:
                 return bool(after.get("optState")) and after.get("optState") != baseline
 
-            async def _state_holds(state: str) -> bool:
-                # A real commit settles into its new state; self-updating row content (a countdown,
-                # a live price) keeps moving. Only a state that holds across two reads is evidence.
+            def _picked(after: dict[str, Any]) -> bool:
+                # One of the row's own selection attributes moved. Nothing a restructuring row does
+                # can reach these, so this is commit evidence on its own.
+                return bool(after.get("optSel")) and after.get("optSel") != sel_baseline
+
+            def _grew(after: dict[str, Any]) -> bool:
+                # The row got bigger of its own accord, which is the one shape where "it committed"
+                # has a competitor. Height as well as child count, because a row whose single wrapper
+                # is REPLACED by an expanded one keeps its count and still grows taller.
+                def _up(now: Any, before: Any, by: int) -> bool:
+                    ok = (int, float)
+                    if isinstance(now, bool) or isinstance(before, bool):
+                        return False
+                    return isinstance(now, ok) and isinstance(before, ok) and before >= 0 and now - before > by
+
+                return _up(after.get("optKids"), kids_baseline, 0) or _up(after.get("optH"), height_baseline, 2)
+
+            async def _state_holds(state: str, fallback: dict[str, Any]) -> dict[str, Any] | None:
+                # A real commit settles; self-updating content (a countdown, a live price) keeps
+                # moving, so only a state that holds across two reads is evidence. The second read is
+                # returned because 150ms later is the difference between measuring a CSS expansion
+                # and measuring it mid-flight.
                 await asyncio.sleep(0.15)
                 try:
                     again_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
                 except Exception:
-                    return True
+                    return fallback
                 again = again_raw if isinstance(again_raw, dict) else {}
-                return bool(again.get("optState") == state)
+                return again if again.get("optState") == state else None
+
+            async def _child_menu_note() -> str | None:
+                # A row that expands a sub-list mutates ITSELF, so the fingerprint cannot tell
+                # "committed" from "expanded" and the child rows can -- a cascading click that opened
+                # them committed nothing yet.
+                try:
+                    found = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
+                except Exception:
+                    return None
+                if isinstance(found, dict) and found.get("count"):
+                    return _menu_open_note(found, selector, clicked_row=True)
+                return None
+
+            async def _state_change_note(opt_text: str, after: dict[str, Any]) -> str:
+                picked = f"Selected option {opt_text!r} — its state changed (the menu stayed open)."
+                # A row that did not grow cannot have expanded into itself, so nothing competes with
+                # the commit reading and the probe is not worth its page walk -- which is the
+                # ordinary multi-select click.
+                if not _grew(after):
+                    return picked
+                child = await _child_menu_note()
+                if not child:
+                    return picked
+                # It grew AND opened child rows, so a selection attribute means it did both and
+                # dropping either half would be a false report. Without the "menu stayed open" clause:
+                # the child note has just renumbered the markers, so what the model was holding is
+                # precisely what did not stay.
+                if _picked(after):
+                    return f"Selected option {opt_text!r} — its state changed.\n{child}"
+                return child
 
             url_now = await _url(page)
             if url_before and url_now and url_now != url_before:
@@ -1962,8 +2072,10 @@ def build_browser_tools(
             after = after_raw if isinstance(after_raw, dict) else {}
             if not after.get("stillOpen"):
                 return f"Selected option {opt!r} — the menu closed.", None
-            if _committed_state(after) and await _state_holds(after.get("optState") or ""):
-                return f"Selected option {opt!r} — its state changed (the menu stayed open).", None
+            if _committed_state(after):
+                held = await _state_holds(after.get("optState") or "", after)
+                if held is not None:
+                    return await _state_change_note(opt, held), None
             # Menus routinely close through a fade or an async server ack; declaring "did not commit"
             # off the instantaneous read would turn those healthy commits into false errors. One
             # bounded settle, only on this would-be-error path.
@@ -1975,16 +2087,15 @@ def build_browser_tools(
             settled = settled_raw if isinstance(settled_raw, dict) else {}
             if not settled.get("stillOpen"):
                 return f"Selected option {opt!r} — the menu closed.", None
-            if _committed_state(settled) and await _state_holds(settled.get("optState") or ""):
-                return f"Selected option {opt!r} — its state changed (the menu stayed open).", None
+            if _committed_state(settled):
+                held = await _state_holds(settled.get("optState") or "", settled)
+                if held is not None:
+                    return await _state_change_note(opt, held), None
             # No-commit evidence is already established: a crash of this last informational probe must
-            # not fall through to the caller's fail-open bare ok.
-            try:
-                submenu = await page.evaluate(_FIND_MENU_JS, await _probe_arg(page, selector))
-            except Exception:
-                submenu = None
-            if isinstance(submenu, dict) and submenu.get("count"):
-                return _menu_open_note(submenu, selector), None
+            # not fall through to the caller's fail-open bare ok (_child_menu_note swallows).
+            late_child = await _child_menu_note()
+            if late_child:
+                return late_child, None
             return None, (
                 f"clicked option {opt!r} ({selector}) but the selection did not commit — the menu is "
                 "still open and unchanged. Do not repeat this click; press Enter on the option, or "
@@ -2052,6 +2163,13 @@ def build_browser_tools(
                 hovered = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
                 if isinstance(hovered, dict) and hovered.get("optState"):
                     pre["optState"] = hovered["optState"]
+                    # Every baseline the commit checks read, not some of them: whichever is left
+                    # behind describes the row before the hover, so the hover's own doing -- an
+                    # aria-selected mark, a row-hover toolbar that grows the row -- reads as the
+                    # click's.
+                    for key in ("optSel", "optKids", "optH"):
+                        if key in hovered:
+                            pre[key] = hovered[key]
             except Exception:
                 pass
         url_before = await _url(page)
