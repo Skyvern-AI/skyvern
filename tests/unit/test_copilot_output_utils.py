@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -140,6 +141,171 @@ def test_sanitize_run_blocks_debug_strips_block_screenshot_b64() -> None:
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     assert sanitized["data"]["blocks"][0]["screenshot_b64"].startswith("[base64 image omitted")
     assert sanitized["data"]["blocks"][0]["final_url"] == "https://portal.example.com/mfa"
+
+
+def test_sanitize_build_test_packet_bounds_facts_and_preserves_screenshot_provenance() -> None:
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_yaml": "w" * 30_010,
+        "canonical_workflow_source": "accepted_write_readback",
+        "canonical_workflow_yaml_complete": True,
+        "attempted_block_labels": [f"attempt_{index}" for index in range(30)],
+        "executed_block_labels": [f"executed_{index}" for index in range(30)],
+        "run": {"workflow_run_id": "wr_1", "status": "failed"},
+        "failure": {
+            "block_label": "read_total",
+            "block_status": "failed",
+            "reason": "missing total",
+            "action_trace": ["action " + "x" * 500 for _ in range(8)],
+            "page_state": {
+                "observed_after_workflow_run": True,
+                "form_summaries": ["form " + "x" * 500 for _ in range(10)],
+                "result_summaries": [],
+                "action_summaries": [],
+                "challenge_summaries": [],
+                "obstruction_summaries": [],
+            },
+        },
+        "registered_outputs": [
+            {"output_parameter_key": f"output_{index}", "value": "v" * 1_300} for index in range(13)
+        ],
+        "downloads": [{"artifact_id": f"artifact_{index}"} for index in range(13)],
+        "screenshot": {"present": True, "provenance": "data.screenshot_base64"},
+        "unfinished_items": [{"kind": "unverified_block", "label": f"block_{index}"} for index in range(25)],
+        "omission_notices": [],
+    }
+
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {"ok": False, "data": {"screenshot_base64": "raw-frame-bytes", "build_test_packet": packet}},
+    )
+    projected = sanitized["data"]["build_test_packet"]
+
+    assert len(projected["canonical_workflow_yaml"]) <= 30_000
+    assert projected["canonical_workflow_yaml_complete"] is False
+    assert len(projected["attempted_block_labels"]) == 24
+    assert len(projected["failure"]["action_trace"]) == 6
+    assert len(projected["failure"]["page_state"]["form_summaries"]) == 8
+    assert len(projected["registered_outputs"]) == 12
+    assert projected["registered_outputs"][0]["value_complete"] is False
+    assert len(projected["downloads"]) == 12
+    assert len(projected["unfinished_items"]) == 24
+    assert projected["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
+    assert "raw-frame-bytes" not in str(projected)
+    assert any("shortened" in notice for notice in projected["omission_notices"])
+    assert len(json.dumps(projected)) <= 47_000
+    assert next(iter(sanitized)) == "data"
+    assert next(iter(sanitized["data"])) == "build_test_packet"
+
+
+def test_sanitize_build_test_packet_exercises_aggregate_compaction() -> None:
+    long_identifier = "i" * 200
+    long_summary = "s" * 500
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_yaml": "w" * 30_010,
+        "canonical_workflow_source": "accepted_write_readback",
+        "canonical_workflow_yaml_complete": True,
+        "attempted_block_labels": [long_identifier for _ in range(30)],
+        "executed_block_labels": [long_identifier for _ in range(30)],
+        "run": {"workflow_run_id": long_identifier, "status": "failed"},
+        "failure": {
+            "block_label": long_identifier,
+            "block_status": long_identifier,
+            "reason": "r" * 1_300,
+            "action_trace": [long_summary for _ in range(8)],
+            "page_state": {
+                "current_origin": "https://" + "o" * 2_000,
+                "current_url": "https://" + "u" * 2_000,
+                "title": long_identifier,
+                "evidence_source": long_identifier,
+                "observed_after_workflow_run": True,
+                "form_summaries": [long_summary for _ in range(10)],
+                "result_summaries": [long_summary for _ in range(10)],
+                "action_summaries": [long_summary for _ in range(10)],
+                "challenge_summaries": [long_summary for _ in range(10)],
+                "obstruction_summaries": [long_summary for _ in range(10)],
+            },
+        },
+        "registered_outputs": [
+            {
+                "workflow_run_id": long_identifier,
+                "output_parameter_id": long_identifier,
+                "output_parameter_key": long_identifier,
+                "block_label": long_identifier,
+                "block_type": long_identifier,
+                "value": "v" * 1_300,
+            }
+            for _ in range(13)
+        ],
+        "downloads": [{"artifact_id": long_identifier, "file_name": long_identifier} for _ in range(13)],
+        "screenshot": {"present": False},
+        "unfinished_items": [
+            {
+                "kind": "unverified_block",
+                "label": long_identifier,
+                "output_path": long_identifier,
+                "reason_code": long_identifier,
+            }
+            for _ in range(25)
+        ],
+        "omission_notices": [],
+    }
+
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {"ok": False, "data": {"build_test_packet": packet}},
+    )
+    projected = sanitized["data"]["build_test_packet"]
+
+    assert "canonical_workflow_yaml" not in projected
+    assert projected["canonical_workflow_yaml_complete"] is False
+    assert len(projected["attempted_block_labels"]) == 12
+    assert len(projected["executed_block_labels"]) == 12
+    assert len(projected["failure"]["action_trace"]) == 2
+    assert len(projected["failure"]["page_state"]["form_summaries"]) == 2
+    assert len(projected["registered_outputs"]) == 6
+    assert projected["registered_outputs"][0]["value_complete"] is False
+    assert len(projected["downloads"]) == 6
+    assert len(projected["unfinished_items"]) == 12
+    assert any("repeated packet facts shortened further" in notice for notice in projected["omission_notices"])
+    assert len(json.dumps(projected)) <= 47_000
+
+
+def test_sanitize_build_test_packet_projection_failure_keeps_tool_result_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "canonical_workflow_source": "accepted_write_readback",
+        "run": {"workflow_run_id": "wr_1", "status": "failed"},
+        "screenshot": {"present": False},
+    }
+
+    def fail_projection(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.output_utils.project_build_test_packet_for_llm",
+        fail_projection,
+    )
+
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "failed",
+                "build_test_packet": packet,
+            },
+        },
+    )
+
+    assert sanitized["data"]["workflow_run_id"] == "wr_1"
+    assert sanitized["data"]["overall_status"] == "failed"
+    assert "build_test_packet" not in sanitized["data"]
+    assert sanitized["data"]["build_test_packet_omitted"] == "The internal packet projection failed."
 
 
 def test_sanitize_run_blocks_debug_preserves_post_run_page_evidence() -> None:
