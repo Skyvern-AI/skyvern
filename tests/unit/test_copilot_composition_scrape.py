@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_str
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
 from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 class _AsyncioSleepProxy:
@@ -47,6 +48,55 @@ def test_same_inspect_target_is_strict() -> None:
     assert _same_inspect_target("https://h/p?q=1", "https://h/p?q=2") is False
     assert _same_inspect_target("https://h/p", "https://h/p/") is False
     assert _same_inspect_target("current_page", "https://h/p") is False
+
+
+@pytest.mark.asyncio
+async def test_navigation_to_evaluate_session_replacement_records_mixed_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_before")
+    packet = parse_composition_structured(
+        {
+            "page_title": "Results",
+            "body_has_markup": True,
+            "forms": [{"fields": [{"selector": "#q", "name": "q"}], "submit_controls": []}],
+        },
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+    assert packet is not None
+
+    async def _page_info(_ctx: object, _session_id: str | None = None) -> tuple[str, str]:
+        return "https://example.com/start", "Start"
+
+    async def _navigate(_ctx: object, _url: str, **_kwargs: object) -> dict[str, object]:
+        ctx.browser_session_id = "pbs_after"
+        ctx.browser_session_continuity_generation += 1
+        return {"ok": True, "data": {"url": "https://example.com/results"}}
+
+    async def _capture(_ctx: object, **_kwargs: object) -> tuple[dict[str, object], None]:
+        return dict(packet), None
+
+    monkeypatch.setattr(tools.composition_capture, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_fallback_page_info", _page_info)
+    monkeypatch.setattr(tools.composition_capture, "_discovery_navigate", _navigate)
+    monkeypatch.setattr(tools.composition_capture, "_capture_composition_evidence", _capture)
+
+    result = await tools.composition_capture._inspect_page_for_composition_impl(
+        ctx,
+        "https://example.com/results",
+    )
+
+    assert result["ok"] is True
+    assert ctx.composition_page_evidence is not None
+    assert "mixed_browser_session_provenance" in ctx.composition_page_evidence["inspection_warnings"]
+    assert ctx.composition_page_evidence["browser_session_provenance"] == {
+        "mixed": True,
+        "start_browser_session_id": "pbs_before",
+        "end_browser_session_id": "pbs_after",
+        "start_generation": 0,
+        "end_generation": 1,
+    }
 
 
 def test_inspection_regression_guard_uses_safe_query_identity(monkeypatch: pytest.MonkeyPatch) -> None:
