@@ -226,6 +226,15 @@ class BrokerClient:
         await self.start()
         return await self._control_request("pairing.cancel", {}, 5.0)
 
+    async def grant_workstation(self) -> dict[str, Any]:
+        await self.start()
+        return await self._control_request("workstation.grant", {}, 5.0)
+
+    async def revoke_workstation(self, *, scope: str = "grant") -> dict[str, Any]:
+        await self.start()
+        args = {} if scope == "grant" else {"scope": scope}
+        return await self._control_request("workstation.revoke", args, 5.0)
+
     async def stop_broker(self) -> dict[str, Any]:
         await self.start()
         return await self._control_request("broker.stop", {}, 5.0)

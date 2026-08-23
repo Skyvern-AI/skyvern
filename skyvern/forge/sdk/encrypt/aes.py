@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from collections.abc import Iterable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -7,18 +8,18 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from skyvern.forge.sdk.encrypt.base import BaseEncryptor, EncryptMethod
 
-# The public defaults and fallback parameters retain the legacy MD5 normalization so
-# existing ciphertext remains decryptable. New ciphertext configured with an explicit
-# salt and IV uses SHA-256 normalization instead.
+# key/salt path: md5 output is fed into PBKDF2HMAC-SHA256 (100k iterations) inside
+# _derive_key(); md5 is only a string->16-byte normalizer, so usedforsecurity=False is
+# honest. Changing the hash would invalidate every stored ciphertext, so the
+# normalizer itself is locked-in until a re-key migration.
 #
-# The SHA-derived IV remains deterministic, matching the persisted ciphertext format.
-# A future authenticated-encryption migration can introduce random nonces stored with
-# each ciphertext; that requires a versioned payload and is separate from removing MD5
-# from the primary encryption path here.
-#
-# Fallback candidates are decrypt-only. They let deployments read values written before
-# this normalization change and naturally age out as those values are rewritten through
-# the primary path.
+# iv path (default_iv / self.iv below): md5 output becomes the AES-CBC IV directly,
+# so md5 *is* being used in a security-sensitive position there. But the real issue
+# is architectural — the IV is deterministic (same input string -> same IV every
+# time), which breaks AES-CBC semantic security. Swapping md5 for SHA-256 wouldn't
+# fix that. Fix requires random per-encryption IVs stored alongside ciphertext,
+# which is a breaking migration tracked separately. Those two md5() calls are left
+# without usedforsecurity=False on purpose so the alert keeps surfacing as debt.
 default_iv = hashlib.md5(b"deterministic_iv_0123456789").digest()
 default_salt = hashlib.md5(b"deterministic_salt_0123456789", usedforsecurity=False).digest()
 
@@ -30,28 +31,24 @@ class AES(BaseEncryptor):
         secret_key: str,
         salt: str | None = None,
         iv: str | None = None,
-        fallback_decrypt_keys: list[tuple[str | None, str | None]] | None = None,
+        fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None = None,
     ) -> None:
         self.secret_key = hashlib.md5(secret_key.encode("utf-8"), usedforsecurity=False).digest()
-        self.salt = hashlib.sha256(salt.encode("utf-8")).digest() if salt else default_salt
-        self.iv = hashlib.sha256(iv.encode("utf-8")).digest()[:16] if iv else default_iv
-        self._fallback_decrypt_params: list[tuple[bytes, bytes]] = [
-            (
-                hashlib.sha256(fb_salt.encode("utf-8")).digest() if fb_salt else default_salt,
-                hashlib.sha256(fb_iv.encode("utf-8")).digest()[:16] if fb_iv else default_iv,
-            )
-            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
+        self.salt, self.iv = self._encryption_params(salt, iv)
+        self._fallback_decrypt_params = [
+            self._encryption_params(fallback_salt, fallback_iv)
+            for fallback_salt, fallback_iv in (fallback_decrypt_keys or [])
         ]
-        self._fallback_decrypt_params.extend(
-            (
-                hashlib.md5(fb_salt.encode("utf-8"), usedforsecurity=False).digest() if fb_salt else default_salt,
-                hashlib.md5(fb_iv.encode("utf-8")).digest() if fb_iv else default_iv,
-            )
-            for fb_salt, fb_iv in (fallback_decrypt_keys or [])
-        )
 
     def method(self) -> EncryptMethod:
         return EncryptMethod.AES
+
+    @staticmethod
+    def _encryption_params(salt: str | None, iv: str | None) -> tuple[bytes, bytes]:
+        return (
+            hashlib.md5(salt.encode("utf-8"), usedforsecurity=False).digest() if salt else default_salt,
+            hashlib.md5(iv.encode("utf-8")).digest() if iv else default_iv,
+        )
 
     def _derive_key(self, salt: bytes | None = None) -> bytes:
         kdf = PBKDF2HMAC(
