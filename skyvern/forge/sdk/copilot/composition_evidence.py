@@ -131,7 +131,7 @@ def _challenge_kind(indicators: list[str]) -> str:
     if "access denied" in indicator_text:
         return "access_denied"
     if any(term in indicator_text for term in ("challenge", "human verification", "verify you are human")):
-        return "human_verification"
+        return "captcha"
     return "unknown" if indicators else "none"
 
 
@@ -278,7 +278,13 @@ def _usable_control(control: Any) -> bool:
     )
 
 
-def _satisfiable_form_path(forms: Any) -> bool:
+def _reachable_submit_control(control: Any, *, disabled_explained_by_empty_form: bool) -> bool:
+    if not isinstance(control, dict) or control.get("readonly") is True or control.get("visible") is False:
+        return False
+    return control.get("disabled") is not True or disabled_explained_by_empty_form
+
+
+def _satisfiable_form_path(forms: Any, *, challenge_markup_present: bool) -> bool:
     """True when the page offers an entry field plus an enabled submit control, so the turn can
     complete it without a person.
 
@@ -292,20 +298,32 @@ def _satisfiable_form_path(forms: Any) -> bool:
     for form in forms:
         if not isinstance(form, dict):
             continue
-        submit_controls = [control for control in form.get("submit_controls") or [] if isinstance(control, dict)]
-        if any(control.get("disabled") is True for control in submit_controls):
-            continue
-        has_entry_field = any(
-            _usable_control(field) and str(field.get("type") or "").strip() not in _NON_ENTRY_FIELD_TYPES
+        entry_fields = [
+            field
             for field in form.get("fields") or []
+            if _usable_control(field) and str(field.get("type") or "").strip() not in _NON_ENTRY_FIELD_TYPES
+        ]
+        if not entry_fields:
+            continue
+        submit_controls = [control for control in form.get("submit_controls") or [] if isinstance(control, dict)]
+        disabled_submits = [control for control in submit_controls if control.get("disabled") is True]
+        # A form whose every submit is disabled while its own entry fields are all empty is explained
+        # by the empty form -- a one-time-code form disables submit until the code is typed -- unless
+        # the page carries challenge-vendor markup, which an empty form does not account for.
+        disabled_explained_by_empty_form = (
+            bool(disabled_submits)
+            and len(disabled_submits) == len(submit_controls)
+            and not challenge_markup_present
+            and all(field.get("filled") is not True for field in entry_fields)
         )
-        if not has_entry_field:
+        if disabled_submits and not disabled_explained_by_empty_form:
             continue
         # A bare <button> in a form already captures as "submit"; an explicit type="button" is
         # JS-driven and indistinguishable from Cancel without reading its label, so it does not
         # count and the claim stands.
         if any(
-            _usable_control(control) and str(control.get("type") or "").strip() == "submit"
+            _reachable_submit_control(control, disabled_explained_by_empty_form=disabled_explained_by_empty_form)
+            and str(control.get("type") or "").strip() == "submit"
             for control in submit_controls
         ):
             return True
@@ -365,7 +383,10 @@ def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[s
     # carries the same gating claim; keying on the boolean alone would silently disable this.
     if visual_summary.get("submit_blocked") is not True and not blocked_claims:
         return True
-    return not _satisfiable_form_path(evidence.get("forms"))
+    return not _satisfiable_form_path(
+        evidence.get("forms"),
+        challenge_markup_present=bool(evidence.get("challenge_controls")),
+    )
 
 
 def merge_visual_composition_evidence(
@@ -2840,27 +2861,29 @@ def parse_composition_html(
                 continue
             if len(fields) >= _MAX_FIELDS_PER_FORM:
                 continue
-            fields.append(
-                {
-                    "name": str(node.get("name") or "")[:120],
-                    "id": str(node.get("id") or "")[:120],
-                    "label": _schema_text(_field_label(soup, node), 240),
-                    "type": field_type[:40],
-                    "value": _attr_value(node, "value")[:160],
-                    # Static HTML carries no live value, so this mirrors the attribute the parser can see.
-                    "filled": bool(_attr_value(node, "value")),
-                    "class": " ".join(_classes_for(node)[:5])[:160],
-                    "placeholder": _schema_text(str(node.get("placeholder") or ""), 240),
-                    "required": bool(
-                        node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"
-                    ),
-                    "disabled": _control_disabled(node),
-                    "readonly": _control_readonly(node),
-                    "checked": bool(node.has_attr("checked")),
-                    "options": _select_options(node) if tag_name == "select" else [],
-                    "selector": _bounded_selector(_selector_for(node)),
-                }
-            )
+            options = _select_options(node) if tag_name == "select" else []
+            field = {
+                "name": str(node.get("name") or "")[:120],
+                "id": str(node.get("id") or "")[:120],
+                "label": _schema_text(_field_label(soup, node), 240),
+                "type": field_type[:40],
+                "value": _attr_value(node, "value")[:160],
+                # Static HTML carries no live value, so this mirrors the attribute the parser can see.
+                "filled": bool(_attr_value(node, "value")),
+                "class": " ".join(_classes_for(node)[:5])[:160],
+                "placeholder": _schema_text(str(node.get("placeholder") or ""), 240),
+                "required": bool(node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"),
+                "disabled": _control_disabled(node),
+                "readonly": _control_readonly(node),
+                "checked": bool(node.has_attr("checked")),
+                "options": options,
+                "selector": _bounded_selector(_selector_for(node)),
+            }
+            if tag_name == "select":
+                option_count = len(node.find_all("option"))
+                field["option_count"] = option_count
+                field["options_omitted"] = option_count > len(options)
+            fields.append(field)
         forms.append(
             {
                 "id": str(form.get("id") or "")[:120],
@@ -3008,6 +3031,19 @@ def _structured_select_options(value: Any) -> list[dict[str, Any]]:
     return options
 
 
+def _structured_select_option_facts(node: dict[str, Any], options: list[dict[str, Any]]) -> dict[str, Any]:
+    reported_count = node.get("option_count")
+    option_count = (
+        reported_count
+        if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= len(options)
+        else len(options)
+    )
+    return {
+        "option_count": option_count,
+        "options_omitted": node.get("options_omitted") is True or option_count > len(options),
+    }
+
+
 def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     if not isinstance(value, list):
@@ -3080,6 +3116,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
             continue
         field_type = (_structured_str(node.get("type")) or "text").lower()
+        options = _structured_select_options(node.get("options"))
         field = {
             "name": _structured_str(node.get("name"))[:120],
             "id": _structured_str(node.get("id"))[:120],
@@ -3093,9 +3130,11 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "disabled": node.get("disabled") is True,
             "readonly": node.get("readonly") is True,
             "checked": node.get("checked") is True,
-            "options": _structured_select_options(node.get("options")),
+            "options": options,
             "selector": _bounded_selector(_structured_str(node.get("selector"))),
         }
+        if field_type == "select":
+            field.update(_structured_select_option_facts(node, options))
         if isinstance(node.get("visible"), bool):
             field["visible"] = node["visible"]
         fields.append(_attach_node_evidence(field, node))

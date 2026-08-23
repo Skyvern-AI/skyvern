@@ -73,6 +73,7 @@ _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
     ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "screenshot_pre_submit",
 }
 
 _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
@@ -80,6 +81,7 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
         ArtifactType.HTML,
         ArtifactType.HTML_SCRAPE,
         ArtifactType.HTML_ACTION,
+        ArtifactType.HTML_PRE_SUBMIT,
         ArtifactType.VISIBLE_ELEMENTS_TREE,
         ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
         ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
@@ -1280,6 +1282,10 @@ class ArtifactManager:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
+            return None
+        if artifact.artifact_type == ArtifactType.UNKNOWN:
+            # This image cannot tell whether the row's type is redactable; fail closed, write nothing.
+            LOG.warning("Refusing to update data of an artifact of unknown type", artifact_id=artifact_id)
             return None
         data = _maybe_redact_artifact_data(
             ArtifactType(artifact.artifact_type),

@@ -212,6 +212,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         target = Path(dump_dir)
         target.mkdir(parents=True, exist_ok=True)
         payload = {
+            "capture_case_id": getattr(ctx, "eval_capture_case_id", None),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,

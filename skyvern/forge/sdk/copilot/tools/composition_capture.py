@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 from typing import Any
 from urllib.parse import urlparse
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     stamp_page_evidence_provenance,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -61,6 +63,37 @@ LOG = structlog.get_logger()
 _POST_RUN_REPAIR_CAPTURE_TIMEOUT_SECONDS = 30.0
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
+
+
+def _model_facing_inspect_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Detach stored evidence and shed select options until the complete JSON packet fits, retaining
+    each select's selector, total option count, and explicit omission fact for targeted retrieval."""
+    if result.get("ok") is not True:
+        return result
+    shaped = copy.deepcopy(result)
+    if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
+        return shaped
+    data = shaped.get("data")
+    if not isinstance(data, dict):
+        return shaped
+    for form in data.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for field in form.get("fields") or []:
+            if not isinstance(field, dict) or field.get("type") != "select":
+                continue
+            options = field.get("options")
+            if not isinstance(options, list) or not options:
+                continue
+            option_count = field.get("option_count")
+            if not isinstance(option_count, int) or isinstance(option_count, bool) or option_count < len(options):
+                option_count = len(options)
+            field["option_count"] = option_count
+            field["options"] = []
+            field["options_omitted"] = option_count > 0
+            if len(json.dumps(shaped)) <= _RECENT_TOOL_OUTPUT_CHAR_CAP:
+                return shaped
+    return shaped
 
 
 async def _composition_get_screenshot(ctx: CopilotContext) -> dict[str, Any]:
@@ -110,15 +143,14 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "record rows, visible identifiers, quantities, statuses, prices, confirmations, search results, "
         "or selected values when legible. "
         "Classify any visible artificial barrier from the screenshot alone: a verification challenge is a "
-        "captcha or human-verification widget asking the visitor to prove they are human, an access-denied "
-        "block page, or a sign-in step waiting for a person to approve this login out of band on another "
-        "device or in an authenticator app; a page "
+        "widget asking the visitor to prove they are human, or an access-denied block page; a page "
         "obstruction is a dismissible layer such as a cookie/privacy consent dialog, promo or newsletter "
         "modal, chat widget, or loading overlay. "
         f"Use challenge_kind values: {', '.join(kind.value for kind in ChallengeKind)}. "
-        f"Use {ChallengeKind.DEVICE_APPROVAL.value} for a screen that can only advance when a person "
-        "approves the sign-in somewhere else, such as a 2-step verification screen waiting on a device "
-        "prompt, push notification, or authenticator approval. "
+        f"Use {ChallengeKind.CAPTCHA.value} for any widget asking the visitor to prove they are human — a "
+        "checkbox, image grid, slider, puzzle, or a field for characters shown on the page itself — "
+        "whatever brand it carries. A field for a one-time code the visitor was sent elsewhere is an "
+        "ordinary sign-in step, not a challenge: report challenge_detected false for it. "
         f"Use obstruction_kind values: {CONSENT_OBSTRUCTION_KIND}, promo_modal, chat_widget, "
         "loading_overlay, other. A cookie/privacy consent dialog is always a page obstruction, never a "
         "challenge: report it with page_obstruction_detected true and obstruction_kind "
@@ -847,5 +879,6 @@ async def _inspect_page_for_composition_impl(
     await _bind_login_credential_for_observed_url(copilot_ctx, str(current_url), result)
     if observation_step is not None:
         result["observation_step"] = observation_step
+    result = _model_facing_inspect_result(result)
     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
     return result

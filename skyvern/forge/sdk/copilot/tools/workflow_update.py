@@ -4142,23 +4142,17 @@ async def _update_workflow(
                         visible_credentials=visible_google_credentials,
                     )
                     capture_root = os.environ.get("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS")
-                    if (
-                        capture_root
-                        and next_google_connection_notices
-                        and not ctx.google_connection_notice_capture_written
-                    ):
+                    if capture_root and current_google_connection_bindings:
                         try:
                             write_google_connection_notice_capture(
                                 output_root=capture_root,
+                                turn_id=ctx.turn_id,
                                 turn_start_workflow=turn_start_workflow,
                                 final_workflow=workflow,
                                 accepted_workflow_yaml=workflow_yaml,
                                 visible_credentials=visible_google_credentials,
-                                observed_notices=ctx.google_connection_notices,
+                                observed_notices=next_google_connection_notices,
                             )
-                            ctx.google_connection_notice_capture_written = True
-                        except FileExistsError:
-                            ctx.google_connection_notice_capture_written = True
                         except Exception as capture_err:
                             LOG.warning("copilot_google_connection_notice_capture_failed", error=str(capture_err))
                     ctx.google_connection_notices = next_google_connection_notices

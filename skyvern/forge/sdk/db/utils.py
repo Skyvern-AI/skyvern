@@ -536,9 +536,18 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
             artifact_id=artifact_model.artifact_id,
         )
 
+    artifact_type = ArtifactType.__members__.get(artifact_model.artifact_type.upper())
+    if artifact_type is None:
+        LOG.warning(
+            "Unknown artifact type on read; reporting as UNKNOWN",
+            artifact_id=artifact_model.artifact_id,
+            artifact_type=artifact_model.artifact_type,
+        )
+        artifact_type = ArtifactType.UNKNOWN
+
     return Artifact(
         artifact_id=artifact_model.artifact_id,
-        artifact_type=ArtifactType[artifact_model.artifact_type.upper()],
+        artifact_type=artifact_type,
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
         checksum=artifact_model.checksum,

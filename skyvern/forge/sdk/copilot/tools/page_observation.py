@@ -232,7 +232,7 @@ def _normalize_evaluate_challenge_state(
     elif "turnstile" in indicator_text or "captcha" in indicator_text or "are you a robot" in indicator_text:
         kind = "captcha"
     elif detected:
-        kind = "human_verification"
+        kind = "unknown"
     else:
         kind = "none"
     gates_submit_controls = bool(detected and gated_controls)

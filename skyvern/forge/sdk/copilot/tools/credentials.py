@@ -23,7 +23,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -384,6 +384,25 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
         if credential.totp_identifier:
             entry["totp_identifier"] = credential.totp_identifier
+        if credential.totp_type in {TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT}:
+            scouting: dict[str, Any]
+            if credential.totp_type == TotpType.AUTHENTICATOR:
+                scouting = {
+                    "tool": "fill_credential_field",
+                    "credential_id": credential.credential_id,
+                    "field": "totp",
+                }
+            else:
+                scouting = {"available": False, "reason": "workflow_run_context_required"}
+            entry["one_time_code"] = {
+                "available": True,
+                "source": str(credential.totp_type),
+                "scouting": scouting,
+                "code": {
+                    "workflow_parameter_type": "credential_id",
+                    "accessor": "await <credential_parameter_key>.otp()",
+                },
+            }
     elif credential.card_last4:
         entry["card_last_four"] = credential.card_last4
         entry["card_brand"] = credential.card_brand

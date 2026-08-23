@@ -2286,6 +2286,9 @@ async def _new_copilot_chat_post(
                     persist_canonical_user_message=persist_canonical_user_message,
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
+                    eval_capture_case_id=(
+                        request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
+                    ),
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(

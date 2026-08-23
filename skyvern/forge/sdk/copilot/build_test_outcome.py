@@ -50,7 +50,6 @@ BuildTestOutcomeReasonCode = Literal[
     "outcome_not_demonstrated",
     "no_meaningful_output",
     "terminal_challenge_blocker",
-    "device_approval_challenge_blocker",
     "blocker_reported",
     "failed_run",
     "run_completed_unevaluated",
@@ -65,9 +64,7 @@ BuildTestOutcomeReasonCode = Literal[
     "definition_contract_unsatisfied",
     "fallback_floor_turn_unsatisfiable",
 ]
-_TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset(
-    {"terminal_challenge_blocker", "device_approval_challenge_blocker"}
-)
+_TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset({"terminal_challenge_blocker"})
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
 

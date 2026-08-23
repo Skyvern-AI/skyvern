@@ -35,6 +35,9 @@ MAX_RECENT_DIALOG_MESSAGES = 5
 # trace, etc.) cannot dominate the prompt budget.
 MAX_DIALOG_MESSAGE_CHARS = 500
 
+# Visible stand-in for a value scrubbed from the model's view via hide_from_model.
+MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
+
 
 def _unwired_authority() -> RuntimeOriginAuthority:
     # Same deferred-import reason as the TYPE_CHECKING block above: the policy core pulls the action
@@ -137,6 +140,10 @@ class SkyvernContext:
     # scoped so bare tasks with no workflow-run context are still redacted; unioned into
     # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
     runtime_secret_values: set[str] = field(default_factory=builtins.set)
+    # Subset of runtime_secret_values that must also never reach the model's own view of tool
+    # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
+    # code) that are only scrubbed from artifacts/logs.
+    model_hidden_values: set[str] = field(default_factory=builtins.set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -389,10 +396,25 @@ class SkyvernContext:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
 
-    def register_secret_value(self, value: str | None) -> None:
-        """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed)."""
+    def register_secret_value(self, value: str | None, *, hide_from_model: bool = False) -> None:
+        """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed).
+        When hide_from_model is True, also scrub it from the model's own view of tool output via hide_from_model()."""
         if value:
             self.runtime_secret_values.add(value)
+            if hide_from_model:
+                self.model_hidden_values.add(value)
+
+    def hide_from_model(self, text: str) -> str:
+        """Exact-match replace every model_hidden_values entry with MODEL_HIDDEN_PLACEHOLDER, longest
+        value first so a substring value can't fragment a longer one. Same object when nothing matches."""
+        if not self.model_hidden_values:
+            return text
+        for value in sorted(self.model_hidden_values, key=len, reverse=True):
+            if not value:
+                continue
+            if value in text:
+                text = text.replace(value, MODEL_HIDDEN_PLACEHOLDER)
+        return text
 
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""

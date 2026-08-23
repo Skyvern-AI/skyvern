@@ -894,6 +894,9 @@ class GoogleSheetsWriteBlock(Block):
         }
         _maybe_dump_sheets_write(
             {
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "credential_id": self.credential_id,
                 "spreadsheet_url": self.spreadsheet_url,
                 "sheet_name": self.sheet_name,
                 "range": self.range,

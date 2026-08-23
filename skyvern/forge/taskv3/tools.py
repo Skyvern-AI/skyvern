@@ -32,6 +32,10 @@ PageProvider = Callable[[], Awaitable[Any]]
 
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
+# Cap on the page URL observe() echoes. Callers that register a secret URL for exact-match redaction
+# must register this prefix too, or the truncated echo survives the scrub.
+OBSERVE_URL_MAX_CHARS = 300
+
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe. Either exists only where we set it, so one that matches nothing now cannot
 # reappear without a fresh observe / menu-opening click.
@@ -349,6 +353,28 @@ _SELECTOR_EXISTS_JS = (
     if (!found) found = (arg.el && arg.el.isConnected ? arg.el : null);
     return !!found;
   } catch (e) { return true; }
+}"""
+)
+
+# How many distinct elements a minted marker resolves to across open shadow roots: a re-render that
+# CLONES the marked node copies the attribute, and a non-strict click would land on the first match.
+# A root whose query throws is skipped without erasing duplicates already proven; with nothing proven
+# it reads as 1, so an unparseable marker takes the normal path, like _SELECTOR_EXISTS_JS.
+_MARKER_MATCH_COUNT_JS = (
+    r"""(arg) => {
+  const _roots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  const matches = new Set();
+  let unreadable = false;
+  try {
+    for (const root of _roots(document)) {
+      try { for (const e of root.querySelectorAll(arg.sel)) matches.add(e); } catch (e) { unreadable = true; }
+    }
+    if (matches.size === 0 && arg.el && arg.el.isConnected) matches.add(arg.el);
+  } catch (e) { unreadable = true; }
+  if (matches.size > 1) return matches.size;
+  return unreadable ? 1 : matches.size;
 }"""
 )
 
@@ -811,6 +837,11 @@ _CLICK_PRECHECK_JS = (
 }"""
 )
 
+# Planted on window before an option click; a navigation clears window, so its absence afterwards is
+# the page saying "different document" even when the post-click probe's own JS is what failed.
+_CLICK_DOC_PLANT_JS = "() => { window.__tv3_click_doc = 1; }"
+_CLICK_DOC_CHECK_JS = "() => window.__tv3_click_doc === 1"
+
 # Post-click menu state: how many previously-tagged menu rows are still visible (a closed menu — nodes
 # destroyed or hidden — reads 0), plus the clicked row's current state fingerprint for the multi-select
 # commit check. Field names are distinct from _CLICK_PRECHECK_JS's on purpose (tests dispatch on them).
@@ -981,11 +1012,119 @@ _FIND_MENU_JS = (
 }"""
 )
 
+# Page total for `group` text across one observe; per entry stays at 200 characters.
+OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
+
 # Raw DOM perception: collect visible interactive elements with a stable selector each.
 # Elements without a natural selector get a data-tv3 marker so later actions can target them.
 _OBSERVE_JS = (
     r"""
 () => {
+  const _GROUP_TEXT_TOTAL_CAP = """
+    + str(OBSERVE_GROUP_TEXT_TOTAL_CAP)
+    + r""";
+  const _GROUP_SEL = 'fieldset,[role=group],li,dd,.form-group,[class*="question"],[class*="field"]';
+  // A previous control ends the walk back for question text; ARIA widgets count as controls here
+  // exactly as they do in the element list, or a custom checkbox's own caption reads as the question.
+  const _CTRL_SEL = 'input:not([type=hidden]),textarea,select,button,[role=button],[role=checkbox],[role=radio],[role=combobox],[role=switch],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
+  const _normText = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  // A choice control takes its group's text only when the group is purely options: a container
+  // that also holds text fields has an innerText naming every question in it.
+  const _NONCHOICE_SEL = 'input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea,select,[role=combobox],[role=listbox],[role=spinbutton],[contenteditable]:not([contenteditable="false" i])';
+  const _CHOICE_SEL = 'input[type=checkbox],input[type=radio],[role=checkbox],[role=radio],[role=switch]';
+  // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
+  // shadow its own properties (<input name="matches"> makes form.matches that input).
+  const _getter = (proto, name) => {
+    const d = Object.getOwnPropertyDescriptor(proto, name);
+    return d && d.get ? d.get : function () { return this[name]; };
+  };
+  const _parentOf = _getter(Node.prototype, 'parentElement');
+  const _prevOf = _getter(Node.prototype, 'previousSibling');
+  const _nextOf = _getter(Node.prototype, 'nextSibling');
+  const _firstChildOf = _getter(Node.prototype, 'firstChild');
+  const _nodeTypeOf = _getter(Node.prototype, 'nodeType');
+  const _contentOf = _getter(Node.prototype, 'textContent');
+  const _innerTextOf = _getter(HTMLElement.prototype, 'innerText');
+  const _matches = Element.prototype.matches;
+  const _qs = Element.prototype.querySelector;
+  const _qsa = Element.prototype.querySelectorAll;
+  const _bcr = Element.prototype.getBoundingClientRect;
+  // A sibling the user cannot see is not the question: unrendered, transparent, aria-hidden, or a
+  // box under 2px (a zero-height clip, a 1px screen-reader-only hint). A display:contents wrapper
+  // has no box of its own and is judged by the innerText of its rendered children.
+  const _unseen = (s) => {
+    const cs = window.getComputedStyle(s);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return true;
+    if (s.getAttribute('aria-hidden') === 'true') return true;
+    if (cs.display === 'contents') return false;
+    const r = _bcr.call(s);
+    return r.width < 2 || r.height < 2;
+  };
+  // Text a user can see inside el: innerText still includes transparent, aria-hidden and
+  // screen-reader-only descendants, which _unseen excludes. Bounded to 4 levels.
+  const _visibleText = (el, depth) => {
+    if (depth > 4 || _unseen(el)) return '';
+    let out = '';
+    for (let c = _firstChildOf.call(el); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1) out += ' ' + _visibleText(c, depth + 1);
+    }
+    return _normText(out);
+  };
+  const _captionHost = (el) => {
+    if (_matches.call(el, _CHOICE_SEL)) return true;
+    if (!_qs.call(el, _CHOICE_SEL)) return false;
+    try { return _visibleText(el, 0).length < 2; } catch (e) { return true; }
+  };
+  // Question text for a control whose own name is weak. Choice controls take the text of the
+  // nearest group ancestor that has any (legend + options), if it is purely options. Text fields
+  // take the nearest text block that PRECEDES the control inside that ancestor, stopping at a
+  // previous control: a container holding several questions has an innerText naming all of them,
+  // and a group text that names the wrong question is the mis-association this field exists to
+  // end. The ancestor's own text is used only when it wraps this one control. Bounded to 6 levels
+  // and 8 siblings. Any throw yields no group text, never a dropped element.
+  const _groupText = (el, isChoice) => {
+    try {
+      let node = el;
+      for (let depth = 0; depth < 6; depth++) {
+        const parent = _parentOf.call(node);
+        if (!parent) break;
+        if (!isChoice) {
+          let scanned = 0;
+          for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+            const kind = _nodeTypeOf.call(s);
+            if (kind === 3) {
+              const t = _normText(_contentOf.call(s));
+              if (t.length >= 2) return t;
+              continue;
+            }
+            if (kind !== 1) continue;
+            if (_matches.call(s, _CTRL_SEL) || _qs.call(s, _CTRL_SEL)) break;
+            if (_unseen(s)) continue;
+            let t = '';
+            try { t = _normText(_innerTextOf.call(s)); } catch (e) { continue; }
+            // One character is decoration (a required marker), never a question.
+            if (t.length < 2) continue;
+            // Text right after a checkbox or radio -- bare, or in a wrapper with no text of its own --
+            // is that control's caption, not this one's question. A previous question block that
+            // happens to hold options is not a wrapper, and the text after it is the next question.
+            let before = _prevOf.call(s);
+            while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+            if (before && _nodeTypeOf.call(before) === 1 && _captionHost(before)) break;
+            return t;
+          }
+        }
+        node = parent;
+        if (!_matches.call(node, _GROUP_SEL)) continue;
+        const t = _normText(_innerTextOf.call(node));
+        if (!t) continue;
+        if (isChoice) return _qsa.call(node, _NONCHOICE_SEL).length === 0 ? t : '';
+        return _qsa.call(node, _CTRL_SEL).length === 1 ? t : '';
+      }
+    } catch (e) { /* fail open: the record keeps today's shape */ }
+    return '';
+  };
   const _isAutocomplete = """
     + _IS_AUTOCOMPLETE_JS
     + r""";
@@ -1375,6 +1514,7 @@ _OBSERVE_JS = (
   let truncated = 0;
   let truncatedInComponents = 0;
   let lastGroup = '';
+  let groupTotal = 0;
   for (let idx = 0; idx < els.length; idx++) {
    const el = els[idx].el;
    const host = els[idx].host;
@@ -1430,18 +1570,23 @@ _OBSERVE_JS = (
         mintedOn.push(minted);
       }
     }
-    let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
-    if (!label && el.labels && el.labels[0]) label = (el.labels[0].innerText || '').trim();
-    if (!label) {
-      const lbId = el.getAttribute('aria-labelledby');
-      // Tree-scoped for the same reason as _VISIBLE_PROXY_JS: the shadow walk feeds this loop
-      // elements whose label id lives in their own root, not in the document.
-      let lbRoot = null;
-      try { lbRoot = Node.prototype.getRootNode.call(el); } catch (e) { lbRoot = null; }
-      const lb = lbId && lbRoot && lbRoot.getElementById ? lbRoot.getElementById(String(lbId).trim().split(/\s+/)[0]) : null;
-      if (lb) label = (lb.innerText || '').trim();
-    }
-    if (!label) label = (el.innerText || (el.type === 'password' ? '' : el.value) || '').trim();
+    // Tree-scoped for the same reason as _VISIBLE_PROXY_JS: the shadow walk feeds this loop
+    // elements whose label id lives in their own root, not in the document.
+    let lbRoot = null;
+    try { lbRoot = Node.prototype.getRootNode.call(el); } catch (e) { lbRoot = null; }
+    const byId = (attr) => {
+      const id = el.getAttribute(attr);
+      const n = id && lbRoot && lbRoot.getElementById ? lbRoot.getElementById(String(id).trim().split(/\s+/)[0]) : null;
+      return n ? (n.innerText || '').trim() : '';
+    };
+    // The name the page gives the control, placeholder excluded: a placeholder is a hint shared by
+    // every field of a template, not a name, so it does not count as one below.
+    let strongLabel = (el.getAttribute('aria-label') || '').trim();
+    if (!strongLabel && el.labels && el.labels[0]) strongLabel = (el.labels[0].innerText || '').trim();
+    if (!strongLabel) strongLabel = byId('aria-labelledby');
+    if (!strongLabel) strongLabel = (el.innerText || '').trim();
+    let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim() || strongLabel;
+    if (!label) label = (el.type === 'password' ? '' : el.value || '').trim();
     const role = el.getAttribute('role');
     // el.type is only trustworthy where the UA normalises it to a known keyword. On INPUT, BUTTON
     // and SELECT it is a reflected enum; on <a>, <link>, <embed>, <object> and <source> it hands
@@ -1489,14 +1634,18 @@ _OBSERVE_JS = (
     // Flag typeahead/autocomplete inputs so the model treats them as combobox fills instead of typing
     // raw text that never registers as a valid selection (type() also auto-commits them). See _IS_AUTOCOMPLETE_JS.
     if (_isAutocomplete(el)) rec.autocomplete = true;
-    // Attach the surrounding question/group text for controls whose meaning lives in nearby
-    // non-interactive text (radio/checkbox groups, weakly-labeled fields) so the agent can answer
-    // without fetching raw HTML. Deduped against the previous element to keep grouped options compact.
-    if (isChoice || label.length < 3) {
-      const g = el.closest('fieldset,[role=group],li,dd,.form-group,[class*="question"],[class*="field"]');
-      if (g) {
-        const gt = (g.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 200);
-        if (gt && gt.length > label.length && gt !== lastGroup) { rec.group = gt; lastGroup = gt; }
+    // Attach the question text for controls whose meaning lives in nearby non-interactive text
+    // (radio/checkbox groups, fields named by nothing or only by a placeholder) so the agent can
+    // answer without fetching raw HTML. Deduped against the previous element to keep grouped
+    // options compact; capped per page so a long form cannot turn this into a second DOM dump.
+    if (isChoice || strongLabel.length < 3) {
+      // The description is the last rung: it is routinely a per-field hint ("This field is
+      // required") shared by every field, which would name nothing and dedupe to nothing.
+      const gt = (_groupText(el, isChoice) || byId('aria-describedby')).slice(0, 200);
+      if (gt && gt.length > strongLabel.length && gt !== lastGroup && groupTotal + gt.length <= _GROUP_TEXT_TOTAL_CAP) {
+        rec.group = gt;
+        lastGroup = gt;
+        groupTotal += gt.length;
       }
     }
     const pressed = el.getAttribute('aria-pressed');
@@ -1841,6 +1990,12 @@ def build_browser_tools(
         except Exception:
             return ""
 
+    def _is_context_teardown(exc: BaseException) -> bool:
+        # Playwright's wording when a navigation destroys the context an evaluate was running in.
+        # Matched by message because the driver raises a generic Error for it. Last resort only:
+        # the driver also rewrites some unrelated protocol errors into this message.
+        return "execution context was destroyed" in str(exc).lower()
+
     async def observe(_args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
@@ -1874,10 +2029,12 @@ def build_browser_tools(
         # Stripping forgery chars is not truncation: only the cap changes what the URL points at, so
         # the note is measured against the sanitized length rather than the raw one.
         sanitized_url = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", raw_url)
-        shown_url = sanitized_url[:300]
+        shown_url = sanitized_url[:OBSERVE_URL_MAX_CHARS]
         # Every other cap in this payload names itself; a URL cut mid-query-string looks complete and
         # is a different, invalid URL.
-        url_note = f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > 300 else ""
+        url_note = (
+            f" (url truncated from {len(sanitized_url)} chars)" if len(sanitized_url) > OBSERVE_URL_MAX_CHARS else ""
+        )
         lines = [f"url={shown_url}{url_note} title={data.get('title')!r} ({len(elements)} interactive elements)"]
         hidden_kept = data.get("hiddenListed") or 0
         if hidden_kept:
@@ -2039,6 +2196,7 @@ def build_browser_tools(
             "invalid_fields": sum(1 for e in elements if e.get("invalid")),
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
+            "group_texts_found": sum(1 for e in elements if e.get("group")),
         }
         return ToolResult.ok("\n".join(lines), data={"count": len(elements), "summary": summary})
 
@@ -2106,6 +2264,12 @@ def build_browser_tools(
             element = None
         return {"sel": selector, "el": element}
 
+    async def _marker_matches(page: Any, selector: str) -> int:
+        try:
+            return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, await _probe_arg(page, selector)))
+        except Exception:
+            return 1
+
     async def _clear_proxy_tags(page: Any) -> None:
         try:
             await page.evaluate(
@@ -2116,7 +2280,7 @@ def build_browser_tools(
             pass
 
     async def _click_reaction(
-        page: Any, selector: str, pre: dict[str, Any], url_before: str
+        page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
     ) -> tuple[str | None, str | None]:
         # Returns (note, commit_error) — at most one set. Raises are the caller's to swallow (fail-open:
         # a probe failure must degrade to the bare pre-feature ok, never fail the click).
@@ -2151,18 +2315,43 @@ def build_browser_tools(
 
                 return _up(after.get("optKids"), kids_baseline, 0) or _up(after.get("optH"), height_baseline, 2)
 
-            async def _state_holds(state: str, fallback: dict[str, Any]) -> dict[str, Any] | None:
+            async def _state_holds(state: str) -> tuple[dict[str, Any] | None, str | None]:
                 # A real commit settles; self-updating content (a countdown, a live price) keeps
                 # moving, so only a state that holds across two reads is evidence. The second read is
                 # returned because 150ms later is the difference between measuring a CSS expansion
-                # and measuring it mid-flight.
+                # and measuring it mid-flight. Three outcomes, not two: a re-read that could not be
+                # taken is neither "held" nor "moved" -- the second value names that failure.
                 await asyncio.sleep(0.15)
+                again, navigated = await _after_read()
+                if again is None:
+                    return None, "navigated" if navigated else "unreadable"
+                return (again if again.get("optState") == state else None), None
+
+            async def _after_read() -> tuple[dict[str, Any] | None, bool]:
+                # Returns (read, navigated); read is None only when the probe raised. A raise is NOT
+                # evidence of anything unless the page positively left -- a throwing probe, a detached
+                # node, or a CDP timeout must never read as a commit. Asked in order of reliability:
+                # the window token (the page itself says whether this is the same document, and
+                # history.pushState cannot fool it the way it fools the URL); the URL; and only when
+                # the page cannot be asked at all, the driver's own destroyed-context wording.
                 try:
-                    again_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
-                except Exception:
-                    return fallback
-                again = again_raw if isinstance(again_raw, dict) else {}
-                return again if again.get("optState") == state else None
+                    raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
+                except Exception as exc:
+                    same_document = await _same_document()
+                    if same_document is not None:
+                        return None, not same_document
+                    url_after = await _url(page)
+                    if url_before and url_after and url_after != url_before:
+                        return None, True
+                    return None, _is_context_teardown(exc)
+                return (raw if isinstance(raw, dict) else {}), False
+
+            def _unverified(why: str) -> tuple[str | None, str | None]:
+                return None, (
+                    f"clicked option {opt!r} ({selector}) but its effect could not be verified — the {why} "
+                    "read failed and the page did not navigate. The click was dispatched: do not repeat it "
+                    "blindly and do not assume the selection committed; re-observe first."
+                )
 
             async def _child_menu_note() -> str | None:
                 # A row that expands a sub-list mutates ITSELF, so the fingerprint cannot tell
@@ -2194,34 +2383,51 @@ def build_browser_tools(
                     return f"Selected option {opt_text!r} — its state changed.\n{child}"
                 return child
 
+            async def _same_document() -> bool | None:
+                # The page's own answer, or None when it cannot be asked.
+                if not doc_planted:
+                    return None
+                try:
+                    answer = await page.evaluate(_CLICK_DOC_CHECK_JS)
+                except Exception:
+                    return None
+                return answer if isinstance(answer, bool) else None
+
             url_now = await _url(page)
-            if url_before and url_now and url_now != url_before:
+            if url_before and url_now and url_now != url_before and await _same_document() is not True:
+                # A moved URL is a navigation unless the page says it is the same document --
+                # a menu that syncs its selection into the query string never left.
                 return f"Selected option {opt!r} — the page navigated.", None
-            try:
-                after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
-            except Exception:
-                # the page tearing down right after an option click is a navigation — commit evidence
+            after, navigated = await _after_read()
+            if after is None and navigated:
                 return f"Selected option {opt!r} — the page navigated.", None
-            after = after_raw if isinstance(after_raw, dict) else {}
-            if not after.get("stillOpen"):
+            if after is not None and not after.get("stillOpen"):
                 return f"Selected option {opt!r} — the menu closed.", None
-            if _committed_state(after):
-                held = await _state_holds(after.get("optState") or "", after)
+            if after is not None and _committed_state(after):
+                held, failure = await _state_holds(after.get("optState") or "")
+                if failure == "navigated":
+                    return f"Selected option {opt!r} — the page navigated.", None
+                if failure == "unreadable":
+                    return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
             # Menus routinely close through a fade or an async server ack; declaring "did not commit"
             # off the instantaneous read would turn those healthy commits into false errors. One
             # bounded settle, only on this would-be-error path.
             await asyncio.sleep(0.6)
-            try:
-                settled_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
-            except Exception:
-                return f"Selected option {opt!r} — the page navigated.", None
-            settled = settled_raw if isinstance(settled_raw, dict) else {}
+            settled, navigated = await _after_read()
+            if settled is None:
+                if navigated:
+                    return f"Selected option {opt!r} — the page navigated.", None
+                return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
                 return f"Selected option {opt!r} — the menu closed.", None
             if _committed_state(settled):
-                held = await _state_holds(settled.get("optState") or "", settled)
+                held, failure = await _state_holds(settled.get("optState") or "")
+                if failure == "navigated":
+                    return f"Selected option {opt!r} — the page navigated.", None
+                if failure == "unreadable":
+                    return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
             # No-commit evidence is already established: a crash of this last informational probe must
@@ -2263,12 +2469,8 @@ def build_browser_tools(
             return error
         selector = args["selector"]
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
-            missing = False
-            try:
-                missing = not await page.evaluate(_SELECTOR_EXISTS_JS, await _probe_arg(page, selector))
-            except Exception:
-                missing = False
-            if missing:
+            matches = await _marker_matches(page, selector)
+            if matches == 0:
                 # An absent marker cannot reappear without a re-observe, so Playwright's full 15s
                 # actionability wait is pure loss (4x in the specimen trace). Short attach grace
                 # tolerates a framework re-attaching the same node mid-render.
@@ -2280,6 +2482,16 @@ def build_browser_tools(
                         "page re-renders (a closed menu destroys its options). Re-observe and act on "
                         "fresh selectors from the new observation."
                     )
+                # The re-attach may have been a re-render that cloned the row, so the count is re-read.
+                matches = await _marker_matches(page, selector)
+            if matches > 1:
+                # A clone of the marked element carries the same marker; the click would silently
+                # land on whichever comes first in document order, so refuse before dispatching it.
+                return ToolResult.error(
+                    f"{selector} now matches {matches} elements — the page re-rendered and cloned the "
+                    "marked element, so the marker no longer identifies one control. Re-observe and act "
+                    "on fresh selectors from the new observation."
+                )
         pre: dict[str, Any] | None = None
         try:
             pre_raw = await page.evaluate(_CLICK_PRECHECK_JS, await _probe_arg(page, selector))
@@ -2306,6 +2518,13 @@ def build_browser_tools(
             except Exception:
                 pass
         url_before = await _url(page)
+        doc_planted = False
+        if pre is not None and pre.get("isOption"):
+            try:
+                await page.evaluate(_CLICK_DOC_PLANT_JS)
+                doc_planted = True
+            except Exception:
+                pass
         # One resolution for the whole pre-click phase: these run back to back with no mutation
         # between them, so re-asking the executor per probe would only buy round trips.
         pre_click_arg = await _probe_arg(page, selector)
@@ -2416,7 +2635,7 @@ def build_browser_tools(
         if pre is None:
             return ToolResult.ok(base)
         try:
-            note, commit_error = await _click_reaction(page, selector, pre, url_before)
+            note, commit_error = await _click_reaction(page, selector, pre, url_before, doc_planted=doc_planted)
         except Exception:
             LOG.debug("taskv3 click reaction probe failed", selector=selector, exc_info=True)
             return ToolResult.ok(base)

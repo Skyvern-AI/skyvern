@@ -86,6 +86,7 @@ from .composition_capture import _composition_visual_handler as _composition_vis
 from .composition_capture import _composition_visual_prompt as _composition_visual_prompt
 from .composition_capture import (
     _inspect_page_for_composition_impl,
+    _model_facing_inspect_result,
 )
 from .composition_capture import _normalized_inspect_url as _normalized_inspect_url
 from .composition_capture import _same_inspect_target as _same_inspect_target
@@ -407,8 +408,8 @@ async def edit_block_and_run_tool(
 
     Pass current non-secret values for runtime workflow parameters in ``parameters``. For sensitive
     values (password, secret, token, api_key, credential, totp, otp, one_time_code, private_key,
-    auth), do NOT pass an inline value; follow the CREDENTIAL HANDLING refusal rule in the system
-    prompt and bind an approved saved credential instead.
+    auth), do NOT pass an inline value. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with the raw value.
     """
     copilot_ctx = ctx.context
     copilot_ctx.completion_verification_result = None
@@ -505,6 +506,12 @@ async def add_block_tool(
     workflow parameters the block reads in `parameters` — a new block and the parameter it consumes
     have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
     code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
+
+    Each workflow parameter is a flat object. For example:
+    `{"parameter_type": "workflow", "key": "billing_history_path",
+    "workflow_parameter_type": "string", "default_value": "BillingHistory.jsp"}`.
+    Inspect or run the saved workflow to obtain a useful editable default when
+    the page can reveal it; do not nest these fields under `workflow`.
 
     To change a block that already exists use edit_block; to remove one use delete_block.
     """
@@ -733,11 +740,15 @@ async def run_blocks_tool(
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
 
-    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
-    If the complaint has no prior edit goal, inspect current workflow context
-    and existing run evidence before deciding whether a fresh run is needed.
-    If prior context establishes a resolvable edit, use `update_and_run_blocks`
-    instead of rerunning unchanged blocks.
+    If an existing saved block can establish the state you need, run that
+    block unchanged before scouting the resulting page. In particular, a saved
+    login block can use its bound credential during the workflow run even when
+    that credential is not authorized for direct debug-browser filling.
+
+    For diagnostic complaints with no prior edit goal, inspect the current
+    workflow and existing run evidence before deciding whether a fresh run is
+    needed. If prior context establishes a resolvable edit, use
+    `update_and_run_blocks` instead of rerunning unchanged blocks.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
@@ -747,8 +758,9 @@ async def run_blocks_tool(
     credential, totp, otp, one_time_code, private_key, auth) — call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`; stop and follow the CREDENTIAL
-    HANDLING refusal rule in the system prompt.
+    the inline value via `parameters`. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with
+    the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps before
     changing the workflow. If visible state is uncertain, inspect the live
@@ -858,10 +870,9 @@ async def update_and_run_blocks_tool(
     reusable domain value the user supplies, not the page widget or action used
     to enter it.
 
-    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
-    A complaint with no prior edit goal needs context inspection or
-    clarification first. A diagnostic follow-up after an explicit edit goal may
-    update/run once the correction is clear.
+    For diagnostic complaints with no prior edit goal, inspect the current
+    workflow and run evidence first. A diagnostic follow-up after an explicit
+    edit goal may update and run once the correction is clear.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
@@ -871,8 +882,9 @@ async def update_and_run_blocks_tool(
     credential, totp, otp, one_time_code, private_key, auth) — call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`; stop and follow the CREDENTIAL
-    HANDLING refusal rule in the system prompt.
+    the inline value via `parameters`. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with
+    the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps while
     building, editing, or debugging the workflow. Do not invent URL params,
@@ -1122,10 +1134,12 @@ async def inspect_page_for_composition_tool(
     `observation_step` is the side-channel id to pass in `block_observation_refs`
     when a newly authored block acts on this observed page. Do NOT paste the
     evidence into workflow YAML; use it to ground concise block prompts. If a
-    block run changes pages, inspect the reached page before authoring downstream
-    form/search/result blocks. If the
-    evidence shows required fields or controls that the user did not supply
-    enough information for, ASK_QUESTION with that observed missing input. If
+    select reports `options_omitted=true`, `option_count` is the observed total and
+    its selector remains available. If those options are needed, use one existing
+    `evaluate` call to read only that select; do not repeat the full-page inspection.
+    If a block run changes pages, inspect the reached page before authoring downstream
+    form/search/result blocks. If the evidence shows required fields or controls that
+    the user did not supply enough information for, ASK_QUESTION with that observed missing input. If
     evidence is sufficient, compose and run workflow blocks from the observed fields.
     `challenge_state` reports what the page looks like, which is not what a run will do:
     it does not establish that a submit/search path is closed, and a run settles that.
@@ -1147,7 +1161,8 @@ async def inspect_page_for_composition_tool(
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
-    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+    scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
+    return json.dumps(_model_facing_inspect_result(scrubbed_result))
 
 
 @function_tool(name_override="fill_credential_field", strict_mode=False)
@@ -1173,6 +1188,10 @@ async def fill_credential_field_tool(
     the fill; decide from that outcome whether the page still needs another action.
     An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
     the page left the one the fill acted on, so the field was cleared by its own submit.
+
+    Do not use this tool to reproduce an existing saved login block. Run that
+    block unchanged with `run_blocks_and_collect_debug`, then inspect the page
+    it reaches; the block's bound credential resolves in the workflow run.
 
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
