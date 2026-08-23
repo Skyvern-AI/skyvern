@@ -1,3 +1,4 @@
+import { RunEngine } from "@/api/types";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import {
@@ -60,6 +61,12 @@ function ActionEditorBody({
   blockId: string;
   data: ActionNodeData;
 }) {
+  const availableEngines = [
+    RunEngine.SkyvernV1,
+    RunEngine.SkyvernV3,
+    RunEngine.OpenaiCua,
+    RunEngine.AnthropicCua,
+  ];
   const { editable } = data;
   const update = useUpdate<ActionNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
@@ -156,6 +163,7 @@ function ActionEditorBody({
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"
+                  availableEngines={availableEngines}
                 />
               </div>
               <div className="space-y-2">

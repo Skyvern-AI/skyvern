@@ -8967,6 +8967,7 @@
           "screenshot_action",
           "screenshot_final",
           "screenshot_proxy",
+          "screenshot_pre_submit",
           "llm_prompt",
           "llm_request",
           "llm_response",
@@ -8982,13 +8983,15 @@
           "html",
           "html_scrape",
           "html_action",
+          "html_pre_submit",
           "trace",
           "har",
           "script_file",
           "pdf",
           "step_archive",
           "task_archive",
-          "download"
+          "download",
+          "unknown"
         ],
         "title": "ArtifactType"
       },

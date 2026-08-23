@@ -119,10 +119,8 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
 
     monkeypatch.setattr(agent_module, "datetime", _FixedDateTime)
     config = agent_module.CopilotConfig()
-    workflow_knowledge_base = agent_module.WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
     expected = agent_module.prompt_engine.load_prompt(
         template=config.prompt_template.removesuffix(".j2"),
-        workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=fixed_now.isoformat(),
         tool_usage_guide="tool guide",
         security_rules=config.security_rules,

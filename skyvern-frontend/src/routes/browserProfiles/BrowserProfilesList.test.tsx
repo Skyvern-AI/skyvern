@@ -73,10 +73,7 @@ function renderList(profiles: BrowserProfileApiResponse[]) {
 
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter
-        initialEntries={["/browser-profiles"]}
-        future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
-      >
+      <MemoryRouter initialEntries={["/browser-profiles"]}>
         <BrowserProfilesList />
       </MemoryRouter>
     </QueryClientProvider>,

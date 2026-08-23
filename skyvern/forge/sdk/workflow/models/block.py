@@ -15075,6 +15075,9 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
             return False
         if not _task_block_supports_v3(block):
             return False
+        # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
+        # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
+        # code/budget dynamics are unmeasured (SKY-14816).
         if block.totp_verification_url:
             return False
         reroutable_blocks += 1

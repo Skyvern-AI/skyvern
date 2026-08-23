@@ -929,9 +929,11 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "invalid_fields",
         "markers_minted",
         "markers_reused",
+        "group_texts_found",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
+    assert summary["group_texts_found"] == 0
     assert summary["hidden_listed"] == 1
     assert summary["iframes_in_component_roots"] == 1
     assert summary["text_dropped"] > 0
@@ -940,6 +942,209 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
     # The second pass finds the markers the first one wrote, so minted and reused trade places.
     assert second.data is not None
     assert second.data["summary"]["markers_reused"] == 1 and second.data["summary"]["markers_minted"] == 0
+
+
+def _question_card(question: str, control: str) -> str:
+    # The custom-question shape: question text in a preceding block, the control in a wrapper whose
+    # class contains "field", no <label for>, no aria-labelledby. The control's own class contains
+    # "field" too.
+    return (
+        '<li class="question"><div>'
+        f'<div class="question-label"><div class="text">{question} <span>*</span></div></div>'
+        f'<div class="question-field">{control}</div>'
+        "</div></li>"
+    )
+
+
+def _group_by_selector(data: dict[str, Any]) -> dict[str, str | None]:
+    # Radios get minted markers, so those are keyed by value; an ARIA checkbox by its caption.
+    def key(e: dict[str, Any]) -> str:
+        if e.get("type") == "radio":
+            return f"radio:{e['value']}"
+        if e.get("role") == "checkbox":
+            return f"checkbox:{e['label']}"
+        return str(e["selector"])
+
+    keyed = {key(e): e.get("group") for e in data["elements"]}
+    assert len(keyed) == len(data["elements"]), "fixture keys must be unique"
+    return keyed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_group_text_reaches_a_field_named_only_by_its_placeholder() -> None:
+    # A placeholder ("Type your response") is a hint, not a name. Two custom questions sharing it
+    # produced byte-identical records, and the model filled them by position -- the answer to one
+    # question landed under the other.
+    html = (
+        "<!doctype html><html><body><form><ul>"
+        + _question_card(
+            "Are you legally authorized to work in this country?",
+            '<input required class="field-input" type="text" placeholder="Type your response" name="f0">',
+        )
+        + _question_card(
+            "Will you require visa sponsorship?",
+            '<input required class="field-input" type="text" placeholder="Type your response" name="f1">',
+        )
+        + "</ul></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        groups = _group_by_selector(await _observe_data(page))
+    assert groups['input[name="f0"]'] == "Are you legally authorized to work in this country? *"
+    assert groups['input[name="f1"]'] == "Will you require visa sponsorship? *"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_group_text_is_not_the_control_itself() -> None:
+    # A label-less textarea whose own class matches the group selector resolved to itself and
+    # carried no group; the question sits in the preceding block of the enclosing card.
+    html = (
+        "<!doctype html><html><body><form><ul>"
+        + _question_card("How did you hear about us?", '<textarea class="field-input" name="t0"></textarea>')
+        + _question_card(
+            "Tell us about your background and motivation.", '<textarea class="field-input" name="t1"></textarea>'
+        )
+        + "</ul></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        groups = _group_by_selector(await _observe_data(page))
+    assert groups['textarea[name="t0"]'] == "How did you hear about us? *"
+    assert groups['textarea[name="t1"]'] == "Tell us about your background and motivation. *"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_group_text_never_names_a_sibling_question() -> None:
+    # Two questions in ONE container with no per-question wrapper: the container's text names both.
+    # Each control carries its own question only -- a group text naming the wrong question is the
+    # mis-association this field exists to end. Bare text nodes count as a question block too.
+    html = (
+        "<!doctype html><html><body><form>"
+        '<div class="form-group">'
+        "<div>Question A: years of experience?</div>"
+        '<input type="text" placeholder="Type your response" name="a">'
+        "<div>Question B: expected salary?</div>"
+        '<input type="text" placeholder="Type your response" name="b">'
+        "Question C: earliest start date?"
+        '<input type="text" placeholder="Type your response" name="c">'
+        '<div hidden>{"template":"Question D: hidden blob"}</div><style>.x{color:red}</style>'
+        '<input type="text" placeholder="Type your response" name="d">'
+        '<div style="display:contents"><span>Question F: notice period?</span></div>'
+        '<input type="text" placeholder="Type your response" name="f">'
+        "<div>Question G: expected salary?</div><span>*</span>"
+        '<span style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">This field is required</span>'
+        '<div style="opacity:0">Question A again</div><div aria-hidden="true">Question B again</div>'
+        '<input type="text" placeholder="Type your response" name="g">'
+        '<div>Question H: agree to the policy?</div><div role="checkbox" aria-checked="false">I agree to the terms</div>'
+        '<input type="text" placeholder="Type your response" name="h">'
+        "<div>Question I: describe your background</div><div contenteditable>I have 5 years of experience.</div>"
+        '<input type="text" placeholder="Type your response" name="i">'
+        '<div>Question J: preferred location?</div><div contenteditable="False">(not editable)</div>'
+        '<input type="text" placeholder="Type your response" name="j">'
+        '<input type="checkbox" name="opt_in"><span>Subscribe to the newsletter</span>'
+        '<input type="text" placeholder="Type your response" name="k">'
+        '<label><input type="checkbox" name="terms"></label><span>I agree to the terms</span>'
+        '<input type="text" placeholder="Type your response" name="l">'
+        '<div><input type="checkbox" name="mkt"><span style="opacity:0">Marketing emails</span></div>'
+        "<span>Toggle marketing emails</span>"
+        '<input type="text" placeholder="Type your response" name="o">'
+        '<fieldset><legend>Question M: remote?</legend><label><input type="radio" name="m" value="m1">Yes</label></fieldset>'
+        "<div>Question N: start date?</div>"
+        '<input type="text" placeholder="Type your response" name="n">'
+        "</div>"
+        '<input name="matches"><input name="querySelector"><input name="parentElement"><input name="previousSibling">'
+        '<div class="form-group"><div>Question E: remote or on-site?</div>'
+        '<input type="text" placeholder="Type your response" name="e"></div>'
+        '<fieldset><legend>Pick one</legend><label><input type="radio" name="r" value="1">Yes</label> '
+        '<label><input type="radio" name="r" value="2">No</label></fieldset>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+    groups = _group_by_selector(data)
+    assert groups['input[name="a"]'] == "Question A: years of experience?"
+    assert groups['input[name="b"]'] == "Question B: expected salary?"
+    assert groups['input[name="c"]'] == "Question C: earliest start date?"
+    # Unrendered siblings (hidden blobs, <style>) are not question text; the walk stops at the
+    # previous control rather than reaching back to Question C.
+    assert groups['input[name="d"]'] is None
+    # A box-less display:contents wrapper is rendered through its children: its text is the question,
+    # and the walk must not skip past it to an earlier block.
+    assert groups['input[name="f"]'] == "Question F: notice period?"
+    # A bare required marker, a screen-reader-only hint, a transparent or aria-hidden block are not
+    # the question; the walk reads past them.
+    assert groups['input[name="g"]'] == "Question G: expected salary?"
+    # A custom ARIA widget is a control: its own caption must not read as the next field's question,
+    # and it does not take the mixed container's text naming every question in it.
+    assert groups['input[name="h"]'] is None
+    assert groups["checkbox:I agree to the terms"] is None
+    # A bare contenteditable (no ="true") is a control too: its typed answer is not the next question.
+    assert groups['input[name="i"]'] is None
+    # contenteditable keywords are case-insensitive to the browser, so "False" is not a control.
+    assert groups['input[name="j"]'] == "(not editable)"
+    # A caption trailing a checkbox belongs to the checkbox, wrapped or not.
+    assert groups['input[name="k"]'] is None
+    assert groups['input[name="l"]'] is None
+    # A wrapper whose only text is invisible is still a caption wrapper.
+    assert groups['input[name="o"]'] is None
+    # A previous question block that holds options is not a caption wrapper.
+    assert groups['input[name="n"]'] == "Question N: start date?"
+    # The walk crosses the <form>, whose named controls shadow its methods and properties.
+    assert groups['input[name="e"]'] == "Question E: remote or on-site?"
+    # Choice controls keep the container's text (question + options), deduped across the group.
+    assert groups["radio:1"] == "Pick one Yes No"
+    assert groups["radio:2"] is None
+    assert r.data is not None and r.data["summary"]["group_texts_found"] == 10
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_group_text_falls_back_to_aria_describedby() -> None:
+    # The description is the only text tied to the control, and it follows the control. It is the
+    # last rung: a per-field hint shared by every field must not displace the question.
+    html = (
+        "<!doctype html><html><body><form>"
+        '<input type="text" placeholder="Type your response" name="d" aria-describedby="hint">'
+        '<p id="hint">Describe your relevant experience.</p>'
+        '<div class="form-group"><div>Question A: years of experience?</div>'
+        '<input type="text" placeholder="Type your response" name="a" aria-describedby="req-a">'
+        '<span id="req-a">This field is required.</span></div>'
+        '<div class="form-group"><div>Question B: expected salary?</div>'
+        '<input type="text" placeholder="Type your response" name="b" aria-describedby="req-b">'
+        '<span id="req-b">This field is required.</span></div>'
+        "</form></body></html>"
+    )
+    async with _content_page(html) as page:
+        groups = _group_by_selector(await _observe_data(page))
+    assert groups['input[name="d"]'] == "Describe your relevant experience."
+    assert groups['input[name="a"]'] == "Question A: years of experience?"
+    assert groups['input[name="b"]'] == "Question B: expected salary?"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_group_text_has_a_page_total_cap() -> None:
+    from skyvern.forge.taskv3.tools import OBSERVE_GROUP_TEXT_TOTAL_CAP  # noqa: PLC0415
+
+    question = "Q{i}: " + "x" * 180
+    html = (
+        "<!doctype html><html><body><form><ul>"
+        + "".join(
+            _question_card(question.format(i=i), f'<input type="text" placeholder="Type your response" name="q{i}">')
+            for i in range(500)
+        )
+        + "</ul></form></body></html>"
+    )
+    async with _content_page(html) as page:
+        data = await _observe_data(page)
+    groups = [e.get("group") for e in data["elements"]]
+    assert groups[0] is not None and groups[0].startswith("Q0: ")
+    assert all(len(g) <= 200 for g in groups if g)
+    assert sum(len(g) for g in groups if g) <= OBSERVE_GROUP_TEXT_TOTAL_CAP
+    assert groups[-1] is None
 
 
 @_skip_no_browser
@@ -2658,7 +2863,7 @@ async def test_download_signal_survives_compaction_end_to_end_through_loop(tmp_p
 class _ClickFakePage:
     """Fake page for the click reaction-probe control flow. `evaluate` dispatches on distinctive
     substrings of the real JS constants (mirroring _TypeaheadFakePage): 'return !!' => the
-    selector-exists probe, 'menuOpen' => the pre-click check, 'stillOpen' => the menu-state read
+    selector-exists probe, 'matches.size' => the marker match-count probe, 'menuOpen' => the pre-click check, 'stillOpen' => the menu-state read
     (consumed in call order from `after_states`, last one repeating — the handler reads it after
     hover, after click, and after the settle), 'clickable' => the new-menu finder."""
 
@@ -2673,15 +2878,20 @@ class _ClickFakePage:
         opt_sel: str = "|||",
         opt_kids: int = 0,
         opt_h: int = 26,
-        after_states: list[dict[str, Any]] | None = None,
+        after_states: list[dict[str, Any] | Exception] | None = None,
         found_menu: dict[str, Any] | None = None,
         probe_raises: bool = False,
         find_raises: bool = False,
         click_raises: Exception | None = None,
+        match_counts: list[int] | None = None,
+        doc_same: bool | None = True,
     ) -> None:
         self.url = "https://example.test/results"
+        # the post-click "is this still the same document" answer; None => the page cannot be asked
+        self._doc_same = doc_same
         self.calls: list[tuple[str, Any]] = []
         self._exists = exists
+        self._match_counts = list(match_counts or [])
         self._menu_open = menu_open
         self._is_option = is_option
         self._opt_text = opt_text
@@ -2699,6 +2909,16 @@ class _ClickFakePage:
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         if "return !!" in js:
             return self._exists
+        if "matches.size" in js:
+            if self._match_counts:
+                return self._match_counts.pop(0)
+            return 1 if self._exists else 0
+        if "__tv3_click_doc === 1" in js:
+            if self._doc_same is None:
+                raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+            return self._doc_same
+        if "__tv3_click_doc = 1" in js:
+            return None
         if self._probe_raises:
             raise RuntimeError("probe boom")
         if "menuOpen" in js:
@@ -2716,6 +2936,8 @@ class _ClickFakePage:
         if "stillOpen" in js:
             state = self._after_states[min(self._after_i, len(self._after_states) - 1)]
             self._after_i += 1
+            if isinstance(state, Exception):
+                raise state
             return state
         if "clickable" in js:
             if self._find_raises:
@@ -2733,7 +2955,7 @@ class _ClickFakePage:
 
     async def wait_for_selector(self, selector: str, state: str = "visible", timeout: int | None = None) -> None:
         self.calls.append(("wait_for_selector", (selector, timeout)))
-        if not self._exists:
+        if not self._exists and not self._match_counts:
             raise TimeoutError(f"waiting for {selector}")
 
 
@@ -2908,6 +3130,227 @@ async def test_click_option_no_commit_error_survives_submenu_probe_crash(monkeyp
     r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
     assert r.status == "error"
     assert "did not commit" in r.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["post-click", "settle"])
+async def test_click_option_after_read_exception_is_not_commit_evidence(
+    monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    # A post-click read that THROWS for a non-navigation reason (a JS error in the probe, a
+    # detached node, a CDP timeout) observed nothing. It must never become "the page navigated"
+    # + ok — a confident commit verdict for a click whose effect was never seen.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    boom = RuntimeError("Cannot read properties of null (reading 'innerText')")
+    states: list[dict[str, Any] | Exception] = [{"stillOpen": 7, "optState": "s0"}]
+    states += [boom] if which == "post-click" else [{"stillOpen": 7, "optState": "s0"}, boom]
+    page = _ClickFakePage(
+        menu_open=True, is_option=True, opt_text="Most popular", opt_state="s0", after_states=states, found_menu=None
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "error"
+    assert "navigated" not in r.content
+    assert f"the {which} read failed" in r.content
+    assert "Most popular" in r.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("which", ["post-click", "settle"])
+@pytest.mark.parametrize("signal", ["token-gone", "context-destroyed"])
+async def test_click_option_read_failing_because_the_page_left_is_still_a_commit(
+    monkeypatch: pytest.MonkeyPatch, which: str, signal: str
+) -> None:
+    # The real navigation case must not regress. Two positive signals: the token planted on window
+    # before the click is gone (the page answers even though the probe's JS blew up), or the page
+    # cannot be asked at all and the driver says the context was destroyed.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    if signal == "token-gone":
+        err: Exception = RuntimeError("Cannot read properties of null (reading 'innerText')")
+        doc_same: bool | None = False
+    else:
+        err = RuntimeError("Execution context was destroyed, most likely because of a navigation")
+        doc_same = None
+    states: list[dict[str, Any] | Exception] = [{"stillOpen": 7, "optState": "s0"}]
+    states += [err] if which == "post-click" else [{"stillOpen": 7, "optState": "s0"}, err]
+    page = _ClickFakePage(
+        menu_open=True, is_option=True, opt_text="Most popular", opt_state="s0", after_states=states, doc_same=doc_same
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "ok"
+    assert "Selected option 'Most popular'" in r.content
+    assert "navigated" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_pushstate_url_move_with_the_same_document_is_not_a_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A filter menu that syncs its selection into the query string moves the URL without leaving
+    # the page. The page's own answer ("same document") outranks the URL, so a failed read here is
+    # could-not-verify, not "the page navigated".
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}, RuntimeError("probe boom")],
+        doc_same=True,
+        found_menu=None,
+    )
+    orig_evaluate = page.evaluate
+
+    async def _evaluate(js: str, arg: Any = None) -> Any:
+        if "stillOpen" in js and page._after_i == 1:
+            page.url = "https://example.test/results?sort=popular"
+        return await orig_evaluate(js, arg)
+
+    page.evaluate = _evaluate  # type: ignore[method-assign]
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "error"
+    assert "the post-click read failed" in r.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doc_same", [True, False])
+async def test_click_option_url_move_before_the_read_defers_to_the_page(
+    monkeypatch: pytest.MonkeyPatch, doc_same: bool
+) -> None:
+    # The same pushState event must get the same verdict whether or not a later read happens to
+    # throw: with every read succeeding, a moved URL on the same document is judged by the menu
+    # (here: still open and unchanged → did not commit), while a moved URL on a new document is the
+    # navigation it looks like.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}],
+        found_menu=None,
+        doc_same=doc_same,
+    )
+    orig_click = page.click
+
+    async def _click(selector: str, timeout: int | None = None) -> None:
+        await orig_click(selector, timeout)
+        page.url = "https://example.test/results?sort=popular"
+
+    page.click = _click  # type: ignore[method-assign]
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    if doc_same:
+        assert r.status == "error"
+        assert "did not commit" in r.content
+    else:
+        assert r.status == "ok"
+        assert "navigated" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_destroyed_context_wording_is_overruled_by_the_page_still_being_there(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The driver rewrites some unrelated protocol errors into its destroyed-context message. When the
+    # page can still be asked and says the document never changed, the wording does not win.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    err = RuntimeError("Execution context was destroyed, most likely because of a navigation")
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}, err],
+        doc_same=True,
+        found_menu=None,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "error"
+    assert "could not be verified" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_opaque_read_error_with_url_change_is_a_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The other positive navigation signal: the page cannot be asked, the error text says nothing,
+    # but the URL moved under the click (read from the page, not inferred from the exception).
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[{"stillOpen": 7, "optState": "s0"}, RuntimeError("probe boom")],
+        doc_same=None,
+    )
+    # the URL moves while the read is in flight — after the pre-click URL was captured
+    orig_evaluate = page.evaluate
+
+    async def _evaluate(js: str, arg: Any = None) -> Any:
+        if "stillOpen" in js and page._after_i == 1:
+            page.url = "https://example.test/results?sort=popular"
+        return await orig_evaluate(js, arg)
+
+    page.evaluate = _evaluate  # type: ignore[method-assign]
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    assert r.status == "ok"
+    assert "navigated" in r.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left", [False, True])
+@pytest.mark.parametrize("seen_at", ["post-click", "settle"])
+async def test_click_option_state_hold_read_exception_is_not_held(
+    monkeypatch: pytest.MonkeyPatch, left: bool, seen_at: str
+) -> None:
+    # The hold re-read is the check that a state change is not self-updating content. A crash of
+    # that re-read is not "it held": with the page still there it is could-not-verify (never the
+    # confident "did not commit" either — a change WAS seen), and with the page gone it is the commit
+    # leaving the page.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Most popular",
+        opt_state="s0",
+        after_states=[
+            {"stillOpen": 7, "optState": "s0"},  # post-hover baseline
+            # the state change is seen on the instant read, or only on the settle read; either way
+            # the hold re-read that follows it crashes (and keeps crashing)
+            *([{"stillOpen": 7, "optState": "s0"}] if seen_at == "settle" else []),
+            {"stillOpen": 7, "optState": "s1"},
+            RuntimeError("probe boom"),
+        ],
+        found_menu=None,
+        doc_same=not left,
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="3"]'})
+    if left:
+        assert r.status == "ok"
+        assert "navigated" in r.content
+    else:
+        assert r.status == "error"
+        assert "the state-hold read failed" in r.content
+        assert "did not commit" not in r.content
 
 
 @pytest.mark.asyncio
@@ -3384,6 +3827,131 @@ async def test_click_stale_marker_fast_fails_without_15s_wait() -> None:
     # the short attach grace was attempted (re-attach tolerance), not a bare instant fail
     waited = [c for c in page.calls if c[0] == "wait_for_selector"]
     assert waited and waited[0][1][1] is not None and waited[0][1][1] <= 2000
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_shadow_root", [False, True])
+async def test_click_on_a_marker_the_page_cloned_never_silently_lands_on_the_clone(in_shadow_root: bool) -> None:
+    # observe mints data-tv3 on a control with no natural selector and hands that marker out as the
+    # element's only handle. A re-render that CLONES the marked row (an ordinary "add another row"
+    # control) copies the attribute, so two elements match; an existence-only guard says "present",
+    # and a non-strict click lands on the first match in document order — a silent wrong click on a
+    # destructive control, reported as ok. The destroy-shaped re-render already fails loud; the clone
+    # shape must fail loud too, or land on the originally-marked element. Never a different one.
+    # The guard must count inside open shadow roots too, where the shadow-DOM perception work mints
+    # markers; observe does not mint there yet, so that variant seeds the marker directly.
+    rows_html = '<div id="rows"><div class="row"><span>Alpha</span><button>Remove Alpha</button></div></div>'
+    mount = (
+        "document.getElementById('host').attachShadow({mode: 'open'}).innerHTML = " + json.dumps(rows_html) + ";"
+        if in_shadow_root
+        else ""
+    )
+    async with _live_page(
+        ("<ds-list id='host'></ds-list>" if in_shadow_root else rows_html)
+        + """<script>"""
+        + mount
+        + """
+        window.__clicked = [];
+        document.addEventListener('click', (e) => window.__clicked.push(e.composedPath()[0].textContent), true);
+        window.__cloneRow = () => {
+          const host = document.getElementById('host');
+          const rows = (host ? host.shadowRoot : document).getElementById('rows');
+          const clone = rows.firstElementChild.cloneNode(true);
+          clone.querySelector('span').textContent = 'Beta';
+          clone.querySelector('button').textContent = 'Remove Beta';
+          rows.prepend(clone);
+        };
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        if in_shadow_root:
+            selector = '[data-tv3="t0"]'
+            await page.evaluate(
+                "() => document.getElementById('host').shadowRoot.querySelector('button')"
+                ".setAttribute('data-tv3', 't0')"
+            )
+        else:
+            observed = await _tool(tools, "observe").handler({})
+            line = next(ln for ln in observed.content.splitlines() if "Remove Alpha" in ln)
+            selector = line[1 : line.index("] ")]
+            assert selector.startswith('[data-tv3="'), f"fixture must force a minted marker, got {line!r}"
+        await page.evaluate("() => window.__cloneRow()")
+        assert await page.locator(selector).count() == 2, "fixture is not armed: the clone must carry the marker"
+        assert await page.locator(selector).first.text_content() == "Remove Beta"
+
+        r = await _tool(tools, "click").handler({"selector": selector})
+
+        clicked = await page.evaluate("() => window.__clicked")
+        if r.status == "ok":
+            assert clicked == ["Remove Alpha"], f"status ok but the click landed on {clicked}"
+        else:
+            assert clicked == [], f"failed loud yet still dispatched a click on {clicked}"
+            assert "e-observe" in r.content, r.content
+            assert selector in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_marker_match_count_keeps_proven_duplicates_when_a_root_throws() -> None:
+    # A component whose root refuses querySelectorAll must not erase two duplicates already counted
+    # in the light DOM — Playwright would still resolve the selector and click the first copy. And a
+    # selector no root can parse still reads as 1, taking the normal path.
+    from skyvern.forge.taskv3.tools import _MARKER_MATCH_COUNT_JS  # noqa: PLC0415
+
+    async with _live_page(
+        """<button data-tv3="t0">Remove Beta</button><button data-tv3="t0">Remove Alpha</button>
+        <ds-hostile id="h"></ds-hostile><script>
+        const sr = document.getElementById('h').attachShadow({mode: 'open'});
+        sr.querySelectorAll = () => { throw new Error('sealed'); };
+        </script>"""
+    ) as page:
+        assert await page.evaluate(_MARKER_MATCH_COUNT_JS, {"sel": '[data-tv3="t0"]', "el": None}) == 2
+        assert await page.evaluate(_MARKER_MATCH_COUNT_JS, {"sel": '[data-tv3="t9"]', "el": None}) == 1
+        assert await page.evaluate(_MARKER_MATCH_COUNT_JS, {"sel": "[data-tv3=", "el": None}) == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_a_marker_the_page_destroyed_still_fails_loud() -> None:
+    # The neighbouring shape, pinned: a re-render that destroys the marked element keeps its loud
+    # re-observe error. Tightening the clone case must not loosen this one.
+    async with _live_page(
+        """<div id="rows"><div class="row"><span>Alpha</span><button>Remove Alpha</button></div></div>
+        <script>
+        window.__clicked = [];
+        document.addEventListener('click', (e) => window.__clicked.push(e.target.textContent), true);
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        line = next(ln for ln in observed.content.splitlines() if "Remove Alpha" in ln)
+        selector = line[1 : line.index("] ")]
+        assert selector.startswith('[data-tv3="'), line
+        await page.evaluate(
+            "() => { const r = document.getElementById('rows'); r.innerHTML = "
+            "'<div class=\"row\"><span>Alpha</span><button>Remove Alpha</button></div>'; }"
+        )
+        assert await page.locator(selector).count() == 0, "fixture is not armed"
+
+        r = await _tool(tools, "click").handler({"selector": selector})
+
+        assert r.status == "error"
+        assert "no longer exists" in r.content and "e-observe" in r.content
+        assert await page.evaluate("() => window.__clicked") == []
+
+
+@pytest.mark.asyncio
+async def test_click_recounts_a_marker_that_reattached_as_two_copies_during_the_grace() -> None:
+    # The attach grace admits a marker that briefly vanished; a framework that swaps the row out and
+    # back as two copies satisfies "attached" with both present, and the count must be re-read then.
+    page = _ClickFakePage(exists=False, match_counts=[0, 2])
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3="t7"]'})
+    assert r.status == "error"
+    assert "matches 2 elements" in r.content and "e-observe" in r.content
+    assert any(c[0] == "wait_for_selector" for c in page.calls)
+    assert not any(c[0] == "click" for c in page.calls)
 
 
 @pytest.mark.asyncio
@@ -6386,6 +6954,7 @@ def test_fake_page_dispatch_markers_are_unique_to_one_blob() -> None:
     blobs = {n: v for n in dir(_t) if n.endswith("_JS") and isinstance(v := getattr(_t, n), str)}
     for marker, expected in (
         ("return !!found", "_SELECTOR_EXISTS_JS"),
+        ("matches.size", "_MARKER_MATCH_COUNT_JS"),
         ("menuOpen", "_CLICK_PRECHECK_JS"),
         ("stillOpen", "_MENU_AFTER_JS"),
         ("clickable", "_FIND_MENU_JS"),

@@ -19,8 +19,12 @@ export function OverviewCodeBlock({
   const viewRef = useRef<EditorView | null>(null);
 
   return (
-    <div className="relative">
-      <div className="absolute right-2 top-2 z-10 flex gap-1">
+    <div className="flex flex-col gap-1">
+      <div
+        role="group"
+        aria-label="JSON actions"
+        className="flex items-center justify-end gap-1"
+      >
         <Button
           size="icon"
           variant="ghost"

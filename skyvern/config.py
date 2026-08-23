@@ -489,6 +489,9 @@ class Settings(BaseSettings):
     # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
     # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
     TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
+    # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
+    # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
+    TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False

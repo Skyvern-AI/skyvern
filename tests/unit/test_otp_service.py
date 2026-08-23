@@ -228,6 +228,58 @@ class TestResolveOtpValuePlaceholderFallthrough:
         poll.assert_awaited_once()
 
 
+class TestResolveOtpValueExpectedOtpTypeGating:
+    """resolve_otp_value must honor expected_otp_type for the credential-TOTP branch, the same way
+    has_otp_source already gates it: a credential TOTP can only ever answer a TOTP expectation."""
+
+    @staticmethod
+    def _task() -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id=None,
+            organization_id="o_test",
+            totp_verification_url=None,
+            totp_identifier="2fa.identifier",
+            navigation_payload=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_credential_totp_falls_through_to_polling_when_expecting_a_magic_link(self) -> None:
+        credential_value = OTPValue(value="424242", type=OTPType.TOTP)
+        polled_value = OTPValue(value="https://example.com/magic", type=OTPType.MAGIC_LINK)
+        with (
+            patch(
+                "skyvern.services.otp_service.try_generate_totp_from_credential",
+                return_value=credential_value,
+            ),
+            patch(
+                "skyvern.services.otp_service.poll_otp_value",
+                new=AsyncMock(return_value=polled_value),
+            ) as poll,
+        ):
+            result = await resolve_otp_value(self._task(), expected_otp_type=OTPType.MAGIC_LINK)
+
+        assert result is polled_value
+        poll.assert_awaited_once()
+        assert poll.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
+
+    @pytest.mark.asyncio
+    async def test_credential_totp_still_returned_when_expecting_a_totp(self) -> None:
+        credential_value = OTPValue(value="424242", type=OTPType.TOTP)
+        with (
+            patch(
+                "skyvern.services.otp_service.try_generate_totp_from_credential",
+                return_value=credential_value,
+            ) as credential,
+            patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock()) as poll,
+        ):
+            result = await resolve_otp_value(self._task(), expected_otp_type=OTPType.TOTP)
+
+        assert result is credential_value
+        credential.assert_called_once_with(None)
+        poll.assert_not_called()
+
+
 def _mock_org_token() -> MagicMock:
     token = MagicMock()
     token.token = "fake-token"
@@ -1166,6 +1218,60 @@ class TestParseOtpLogin:
 
 class TestPollOtpValueRetry:
     """poll_otp_value retries fetch failures across the full wall-clock timeout window."""
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_max_wait_shortens_the_window_and_raises_the_timeout_itself(
+        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
+    ) -> None:
+        # A caller polling in bounded slices gets the regular NoTOTPVerificationCodeFound at its own
+        # cap instead of cancelling the poll mid-request.
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_fetch.return_value = None
+
+        with pytest.raises(NoTOTPVerificationCodeFound):
+            await poll_otp_value(
+                organization_id="o_test",
+                task_id="tsk_test",
+                totp_verification_url="https://example.com/mfa",
+                max_wait_seconds=0.0,
+            )
+        assert mock_fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.settings")
+    async def test_poll_started_at_anchors_the_email_search_but_not_the_db_search(
+        self,
+        mock_settings: MagicMock,
+        mock_email: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_email.return_value = None
+        otp = OTPValue(value="123456")
+        mock_db.return_value = otp
+        first_slice_started = datetime.utcnow() - timedelta(minutes=3)
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            totp_identifier="otp@example.test",
+            max_wait_seconds=120.0,
+            poll_started_at=first_slice_started,
+        )
+
+        assert result == otp
+        assert mock_email.await_args is not None and mock_db.await_args is not None
+        assert mock_email.await_args.kwargs["created_after"] == first_slice_started
+        assert mock_db.await_args.kwargs["created_after"] is None
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -2685,3 +2791,28 @@ async def test_raw_otp_rows_are_skipped_without_expected_type() -> None:
         mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock()
         assert await _get_otp_value_from_db("o_test", "otp@example.test") is None
     mock_app.DATABASE.otp.get_raw_otp_codes.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("expected_otp_type", "expected"),
+    [
+        (OTPType.MAGIC_LINK, False),
+        (OTPType.TOTP, True),
+        (None, True),
+    ],
+)
+def test_has_otp_source_credential_totp_candidate_gated_on_expected_type(
+    monkeypatch: pytest.MonkeyPatch, expected_otp_type: OTPType | None, expected: bool
+) -> None:
+    # A credential-TOTP candidate can only ever yield a TOTP code, so it must not count as a
+    # source when the caller expects a magic link.
+    task = SimpleNamespace(
+        navigation_payload=None,
+        totp_verification_url=None,
+        totp_identifier=None,
+        organization_id="o_1",
+        workflow_run_id="wr_1",
+    )
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id: True)
+
+    assert otp_service.has_otp_source(task, expected_otp_type=expected_otp_type) is expected

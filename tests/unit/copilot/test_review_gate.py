@@ -179,6 +179,36 @@ def test_projection_binds_execution_evidence_to_the_exact_block_shape() -> None:
     assert projection["blocks"][0]["neverTested"] is True
 
 
+def test_a_drafted_sheets_append_is_never_tested_until_it_actually_runs() -> None:
+    persisted = _workflow("""    - block_type: task
+      label: count_posts
+      prompt: Count the posts
+""")
+    staged = _workflow("""    - block_type: task
+      label: count_posts
+      next_block_label: append_count
+      prompt: Count the posts
+    - block_type: google_sheets_write
+      label: append_count
+      spreadsheet_url: https://docs.google.com/spreadsheets/d/sheet
+      sheet_name: Sheet1
+      range: C1
+      write_mode: append
+      credential_id: goac_active
+      values: "[[\\"{{ count_posts_output }}\\"]]"
+""")
+
+    counted_only = {"count_posts": workflow_block_fingerprints(staged)["count_posts"]}
+
+    projection = build_review_projection(persisted, staged, counted_only)
+
+    assert projection is not None
+    assert projection["blocks"] == [
+        {"label": "count_posts", "blockType": "task", "change": "unchanged", "neverTested": False},
+        {"label": "append_count", "blockType": "google_sheets_write", "change": "added", "neverTested": True},
+    ]
+
+
 def test_parameter_default_change_invalidates_change_and_execution_identity() -> None:
     tested = _workflow(
         """    - block_type: task

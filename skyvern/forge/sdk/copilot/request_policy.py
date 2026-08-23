@@ -850,6 +850,9 @@ class RequestPolicy:
     # Active Google OAuth connections admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
     run_approved_google_connection_ids: list[str] = field(default_factory=list)
+    # The connection the user picked from the account card on this turn, if any. Recorded as
+    # durable approval at turn end; a draft binding is never a substitute for it.
+    selected_connected_account_id: str | None = None
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -4034,6 +4037,13 @@ def _ground_user_provided_sites(
     policy.user_site_url_sources = sources
 
 
+def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        record.credential_id for record in structured.approved_connections if record.credential_id.startswith("goac_")
+    }
+
+
 def _prior_approved_credential_ids(global_llm_context: str) -> set[str]:
     structured = StructuredContext.from_json_str(global_llm_context)
     return {
@@ -4427,7 +4437,9 @@ async def _build_request_policy_bootstrap(
     google_connection_candidates = {
         credential_id for credential_id in policy.persisted_workflow_credential_ids if credential_id.startswith("goac_")
     }
+    google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
     if selected_connected_account_id is not None:
+        policy.selected_connected_account_id = selected_connected_account_id
         google_connection_candidates.add(selected_connected_account_id)
     if google_connection_candidates:
         try:

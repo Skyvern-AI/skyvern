@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from typing import Any, Awaitable, Callable, Literal
 import structlog
 
 from skyvern.exceptions import SkyvernContextWindowExceededError
+from skyvern.forge.sdk.core import skyvern_context
 
 LOG = structlog.get_logger()
 
@@ -43,8 +45,8 @@ class ToolResult:
         return cls("ok", content, data)
 
     @classmethod
-    def error(cls, content: str) -> ToolResult:
-        return cls("error", content, None)
+    def error(cls, content: str, data: dict[str, Any] | None = None) -> ToolResult:
+        return cls("error", content, data)
 
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[ToolResult]]
@@ -186,6 +188,16 @@ PERCEPTION_STALL_SHADOW_EVENT = "taskv3 loop perception stall would fire"
 # another guard, so read it joined to the final status.
 PERCEPTION_STALL_SUPPRESSED_EVENT = "taskv3 loop perception stall suppressed_main_fire"
 
+# Guard-attribution hashes: sha256 over a per-run secret salt, truncated to 64 bits — enough to join a
+# firing to the value the guard compared within one run (cardinality ≤ max_tool_calls), while the salt
+# keeps a low-entropy input (a short typed text, a selector) non-enumerable, which truncation alone does not.
+TELEMETRY_HASH_HEX_LEN = 16
+
+
+def telemetry_hash(salt: str, *parts: str) -> str:
+    return hashlib.sha256("\x1f".join((salt, *parts)).encode()).hexdigest()[:TELEMETRY_HASH_HEX_LEN]
+
+
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
 # be recognised, so it is a detection limit and not a memory tuning knob.
 PERCEPTION_RING = 8
@@ -242,6 +254,9 @@ class _PerceptionLedger:
         self._tools: dict[str, tuple[str, int]] = {}
         self.shadow_reported = False
         self.suppressed_reported = False
+
+    def first_time(self, key: tuple[str, str]) -> bool:
+        return key not in self._probes
 
     def record(self, key: tuple[str, str], content_digest: str) -> _Snapshot:
         tool_name = key[0]
@@ -458,6 +473,9 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "turn",
         "batch_size",
         "batch_index",
+        "action_key_hash",
+        "snapshot_digest",
+        "probe_first_time",
     }
 )
 
@@ -739,6 +757,7 @@ async def run_agent_tool_loop(
     call_kwargs: dict[str, Any] | None = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
+    on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     max_tokens: int | None = None,
     deadline_seconds: float | None = None,
     retryable_call_exceptions: tuple[type[BaseException], ...] = (),
@@ -750,8 +769,14 @@ async def run_agent_tool_loop(
     action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
     activity: ActivityRecency | None = None,
     submit_watch: SubmitWatch | None = None,
+    telemetry_salt: str | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
+    # Per run, never logged: the hashes it keys are stable within this run (the only scope any guard
+    # decision spans) and uncorrelatable across runs, so page content and arguments cannot be
+    # fingerprinted across tenants from telemetry.
+    if telemetry_salt is None:
+        telemetry_salt = secrets.token_hex(16)
     openai_tools = [tool.to_openai_tool() for tool in tools]
 
     # We own the message array and assign it to the caller's message_history before
@@ -931,6 +956,19 @@ async def run_agent_tool_loop(
                 # Refreshed per call, not per turn: a batched action+finish turn must not defer on
                 # a stale turn-start snapshot (the conversion the headroom guard exists to prevent).
                 activity.tool_calls_remaining = max_tool_calls - total_tool_calls
+            # Submit-shaped actions (the failure-evidence predicate, minus captcha) are reported BEFORE
+            # dispatch, since after it the page may be the confirmation page. A failure here never fails
+            # the action, and the time is not billed to the tool.
+            if (
+                spec is not None
+                and on_pre_action is not None
+                and tool_name != "solve_captcha"
+                and _arms_failure_evidence(tool_name, args, True)
+            ):
+                try:
+                    await on_pre_action(tool_name, args)
+                except Exception:
+                    LOG.warning("taskv3 on_pre_action callback failed", tool=tool_name, exc_info=True)
             tool_started_at = time.monotonic()
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
@@ -950,6 +988,15 @@ async def run_agent_tool_loop(
             # record; its content is deliberately never logged. Gated on the tool, not the payload,
             # so every other tool's record keeps exactly today's fields.
             observe_summary = _observe_summary_fields(result) if tool_name == "observe" else {}
+            # The action-loop guard's key and the perception ledger's digest, computed here (pure) so
+            # their hashes ride the record below; the ledger itself is updated further down, unchanged.
+            action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
+            attribution: dict[str, Any] = {"action_key_hash": telemetry_hash(telemetry_salt, *action_key)}
+            content_digest: str | None = None
+            if spec is not None and spec.compactable and result.status == "ok":
+                content_digest = hashlib.sha256(result.content.encode()).hexdigest()
+                attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
+                attribution["probe_first_time"] = perception.first_time(action_key)
             # The only per-tool-call timing the engine has: tool execution is the majority of a v3
             # run's wall-clock and otherwise emits nothing at all. Names, sizes and booleans only —
             # argument values and result content carry end-user data and must not be logged.
@@ -969,14 +1016,18 @@ async def run_agent_tool_loop(
                 batch_size=len(tool_calls),
                 batch_index=idx,
                 **observe_summary,
+                **attribution,
             )
 
             if spec is not None and spec.compactable and result.status == "ok":
                 snapshot_indices.add(len(messages))  # index this successful snapshot will occupy, pre-append
+            model_facing_content = result.content
+            skyvern_ctx = skyvern_context.current()
+            if skyvern_ctx is not None:
+                model_facing_content = skyvern_ctx.hide_from_model(model_facing_content)
             messages.append(
-                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result.content}
+                {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": model_facing_content}
             )
-            action_key = (tool_name, json.dumps(args, sort_keys=True, default=str))
             result_data = result.data or {}
             if spec is not None and (result_data.get("download_notice") or result_data.get("page_state_changed")):
                 # A download landing or a navigation is progress no matter which tool witnessed it
@@ -984,8 +1035,7 @@ async def run_agent_tool_loop(
                 # (a "download next" flow), or re-trying after navigating to a fresh page, is a
                 # healthy loop, not a stuck one.
                 _clear_action_state()
-            if spec is not None and spec.compactable and result.status == "ok":
-                content_digest = hashlib.sha256(result.content.encode()).hexdigest()
+            if content_digest is not None:
                 snap = perception.record(action_key, content_digest)
                 if snap.progressed:
                     # This probe saw the page change since it last looked — fresh evidence of
@@ -996,7 +1046,13 @@ async def run_agent_tool_loop(
                 if activity is not None and stall_terminate_after is not None:
                     activity.perception_stall_imminent = perception.next_snapshot_can_trip(stall_terminate_after)
                 if stall_terminate_after is not None and snap.live >= stall_terminate_after:
-                    LOG.info("taskv3 loop perception stalled", tool=tool_name, identical_count=snap.live, turn=turns)
+                    LOG.info(
+                        "taskv3 loop perception stalled",
+                        tool=tool_name,
+                        identical_count=snap.live,
+                        turn=turns,
+                        **attribution,
+                    )
                     outcome = LoopOutcome(
                         "terminated",
                         f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive byte-identical snapshots from "
@@ -1017,6 +1073,7 @@ async def run_agent_tool_loop(
                         tool=tool_name,
                         identical_count=snap.tool_identical,
                         turn=turns,
+                        **attribution,
                     )
                 if (
                     stall_terminate_after is not None
@@ -1024,7 +1081,13 @@ async def run_agent_tool_loop(
                     and not perception.shadow_reported
                 ):
                     perception.shadow_reported = True
-                    LOG.info(PERCEPTION_STALL_SHADOW_EVENT, snapshots=snap.probe_revisits, tool=tool_name, turn=turns)
+                    LOG.info(
+                        PERCEPTION_STALL_SHADOW_EVENT,
+                        snapshots=snap.probe_revisits,
+                        tool=tool_name,
+                        turn=turns,
+                        **attribution,
+                    )
                 if stall_nudge_after is not None and snap.tool_identical == stall_nudge_after:
                     # Warn off the per-tool counter, not ``live``: it moves by one per read, so it
                     # crosses the threshold exactly once per streak and before any live verdict.
@@ -1045,7 +1108,13 @@ async def run_agent_tool_loop(
                     and first_turn < turns
                     and (action_nudge_after is None or action_key in action_warned)
                 ):
-                    LOG.info("taskv3 loop action repeated", tool=tool_name, repeat_count=repeat_count, turn=turns)
+                    LOG.info(
+                        "taskv3 loop action repeated",
+                        tool=tool_name,
+                        repeat_count=repeat_count,
+                        turn=turns,
+                        **attribution,
+                    )
                     outcome = LoopOutcome(
                         "terminated",
                         f"{ACTION_LOOP_REASON_PREFIX} {repeat_count} repeated {tool_name} attempts on "

@@ -122,7 +122,7 @@ async def _run_execute_task_v3(
     )
     # _execute_task_v3 builds auth tools, whose credential-candidate gate reads the workflow-run
     # context; stub it out so executor tests (which don't exercise auth) don't hit that lookup.
-    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.has_credential_totp_candidate", lambda *_a, **_k: False)
+    monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
 
     async def fake_update_step(
         step: Step, status: StepStatus | None = None, output: Any = None, **_kwargs: Any
@@ -1024,6 +1024,17 @@ async def test_execute_step_bare_task_dispatch_unchanged() -> None:
     step_engine_mock.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_execute_step_bare_task_with_verification_url_dispatches_to_v3() -> None:
+    # v3 resolves verification-URL codes via get_verification_code, so a URL no longer pins the task
+    # to the step engine.
+    v3_mock, step_engine_mock = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3, task_block=None, totp_verification_url="https://totp.example/poll"
+    )
+    v3_mock.assert_awaited_once()
+    step_engine_mock.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # P3: block-true budgets, task_type-aware goal framing, workflow-cancel detection
 # ---------------------------------------------------------------------------
@@ -1877,10 +1888,12 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     # context looks ambiguous and get_verification_code is never offered. The pin must be active
     # when build_auth_tools runs.
     seen_keys: list[str | None] = []
+    seen_providers: list[Any] = []
 
-    def capturing_build(task: Any) -> tuple[list[Any], str]:
+    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
+        seen_providers.append(page_provider)
         return [], ""
 
     monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
@@ -1895,6 +1908,41 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
         extracted_information_schema=None,
     )
     assert seen_keys == ["MyCreds"]
+    assert len(seen_providers) == 1 and callable(seen_providers[0])
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_page_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A page-free assessment never touches the live DOM, so the auth tools must not be handed a page to
+    # navigate; a page-aware run must be, or the sign-in-link tool is silently never offered.
+    seen_providers: list[Any] = []
+
+    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
+        seen_providers.append(page_provider)
+        return [], ""
+
+    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
+    monkeypatch.setattr("skyvern.forge.agent.build_auth_tools", capturing_build, raising=False)
+    outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(ValidationBlock, complete_criterion="The data is consistent"),
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert seen_providers[0] is None
+    assert callable(seen_providers[1])
 
 
 @pytest.mark.asyncio

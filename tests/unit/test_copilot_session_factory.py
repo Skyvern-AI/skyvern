@@ -249,13 +249,20 @@ class TestModelInputCapture:
             {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
         ]
 
-        copilot_call_model_input_filter(_mk_input_data(items, instructions="SYSTEM PROMPT"))
+        copilot_call_model_input_filter(
+            _mk_input_data(
+                items,
+                instructions="SYSTEM PROMPT",
+                context=SimpleNamespace(eval_capture_case_id="ask_or_build"),
+            )
+        )
 
         dumps = sorted(tmp_path.glob("call-*.json"))
         assert len(dumps) == 1
         payload = json.loads(dumps[0].read_text())
         assert payload["instructions"] == "SYSTEM PROMPT"
         assert payload["input"] == items
+        assert payload["capture_case_id"] == "ask_or_build"
         # A context the derivation helper cannot read must not cost the run its model call.
         assert payload["requested_output_paths"] == []
 

@@ -1183,6 +1183,7 @@ export type ModelsResponse = {
 export const RunEngine = {
   SkyvernV1: "skyvern-1.0",
   SkyvernV2: "skyvern-2.0",
+  SkyvernV3: "skyvern-3.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
   YutoriNavigator: "yutori-navigator",

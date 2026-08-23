@@ -432,6 +432,11 @@ class AgentContext:
     verified_terminal_proposal_ready: bool = False
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
+    # None means nobody has asked yet, which reads as unavailable: a challenge stays a wall until
+    # something proves this deployment can clear it. The answer is keyed by the page it was resolved
+    # against, because the gate behind it is a domain denylist.
+    captcha_solver_available: bool | None = None
+    captcha_solver_available_for_url: str | None = None
     # Pre-run page state pinned at the run seam before the post-run capture overwrites the slot;
     # stamped with the graded run id so a stale prior-run pin cannot anchor the absence scan.
     pre_run_page_reference: PreRunPageReference | None = None

@@ -36,6 +36,12 @@ const allEngineOptions: Array<EngineOption> = [
     badgeVariant: "default",
   },
   {
+    value: RunEngine.SkyvernV3,
+    label: "Skyvern 3.0",
+    badge: "Beta",
+    badgeVariant: "warning",
+  },
+  {
     value: RunEngine.OpenaiCua,
     label: "OpenAI CUA",
     badge: "Enterprise",

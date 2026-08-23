@@ -329,3 +329,23 @@ async def test_credential_check_runs_even_when_workflow_run_id_missing(monkeypat
     credential.assert_called_once_with(None)
     db_get.assert_not_awaited()
     poll.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_payload_of_another_type_falls_through_to_poll() -> None:
+    # A magic-link payload must not satisfy a TOTP request: the configured webhook is still polled.
+    task = _make_task(
+        navigation_payload={"verification_link": "https://example.test/magic"},
+        totp_verification_url="https://example.com/webhook",
+        workflow_run_id=None,
+    )
+    polled = _otp_value("777777")
+    with (
+        patch("skyvern.services.otp_service.try_generate_totp_from_credential", return_value=None),
+        patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock(return_value=polled)) as poll,
+    ):
+        result = await resolve_otp_value(task, expected_otp_type=OTPType.TOTP)
+
+    assert result is polled
+    poll.assert_awaited_once()
+    assert poll.await_args.kwargs["totp_verification_url"] == "https://example.com/webhook"

@@ -35,6 +35,33 @@ def test_omits_the_identifier_when_the_credential_carries_none() -> None:
 
     assert "totp_identifier" not in entry
     assert entry["totp_type"] == str(TotpType.AUTHENTICATOR)
+    assert entry["one_time_code"] == {
+        "available": True,
+        "source": "authenticator",
+        "scouting": {
+            "tool": "fill_credential_field",
+            "credential_id": "cred_1",
+            "field": "totp",
+        },
+        "code": {
+            "workflow_parameter_type": "credential_id",
+            "accessor": "await <credential_parameter_key>.otp()",
+        },
+    }
+
+
+def test_email_otp_is_code_only_during_scouting() -> None:
+    entry = _serialize_credential(_password_credential(totp_type=TotpType.EMAIL))
+
+    assert entry["one_time_code"] == {
+        "available": True,
+        "source": "email",
+        "scouting": {"available": False, "reason": "workflow_run_context_required"},
+        "code": {
+            "workflow_parameter_type": "credential_id",
+            "accessor": "await <credential_parameter_key>.otp()",
+        },
+    }
 
 
 def test_serializes_metadata_only_so_no_secret_or_vault_material_reaches_the_agent() -> None:
@@ -56,5 +83,6 @@ def test_serializes_metadata_only_so_no_secret_or_vault_material_reaches_the_age
         "username",
         "totp_type",
         "totp_identifier",
+        "one_time_code",
     }
     assert not any(SECRET_MARKER in str(value) for value in entry.values())

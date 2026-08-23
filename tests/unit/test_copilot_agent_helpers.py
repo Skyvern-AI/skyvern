@@ -25,7 +25,10 @@ from skyvern.forge.sdk.copilot.agent import (
     _rewrite_failed_test_response,
     _verified_workflow_or_none,
 )
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
+    CopilotToolBlockerSignal,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     PostRunPagePathFailure,
     RecordedBuildTestOutcome,
@@ -72,7 +75,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.request_slots import PROMPT_NAME as REQUEST_SLOTS_PROMPT_NAME
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.completion import (
@@ -907,24 +910,24 @@ class TestVerifiedGoalSatisfiedStop:
         assert fields["gate_built_unverified_repair_inert"] is False
         assert fields["gate_satisfied"] is False
 
-    def test_verified_turn_halt_keeps_terminal_challenge_blocker(self) -> None:
+    def test_a_verified_turn_still_raises_a_stashed_halt(self) -> None:
         ctx = _ctx()
         signal = CopilotToolBlockerSignal(
             blocker_kind="tool_error",
-            agent_steering_text="stop on terminal challenge",
-            user_facing_reason="The site requires human verification.",
+            agent_steering_text="stop, the browser session is gone",
+            user_facing_reason="The browser session was lost.",
             recovery_hint="stop",
-            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            internal_reason_code=BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.BROWSER_SESSION_LOST, blocker_signal=signal)
 
         with pytest.raises(CopilotTurnHalt):
             raise_if_turn_halt(ctx, verified=True)
 
     @pytest.mark.asyncio
-    async def test_wrapped_exception_resolver_surfaces_voluntary_challenge(self) -> None:
+    async def test_wrapped_exception_resolver_surfaces_a_halt_reason_over_a_success_claim(self) -> None:
         ctx = _ctx(
             last_workflow=SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[SimpleNamespace()])),
             last_workflow_yaml="workflow_definition:\n  blocks: []\n",
@@ -938,17 +941,17 @@ class TestVerifiedGoalSatisfiedStop:
             criterion_ids=["c0"],
             verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
         )
-        challenge_text = "The site requires a verification challenge I can't complete on my own."
+        challenge_text = "The browser session was lost before the workflow could be verified."
         signal = CopilotToolBlockerSignal(
             blocker_kind="tool_error",
-            agent_steering_text="stop on terminal challenge",
+            agent_steering_text="stop, the browser session is gone",
             user_facing_reason=challenge_text,
             recovery_hint="stop",
-            internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+            internal_reason_code=BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
             blocked_tool="update_and_run_blocks",
         )
         ctx.blocker_signal = signal
-        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=signal)
+        ctx.turn_halt = TurnHalt(kind=TurnHaltKind.BROWSER_SESSION_LOST, blocker_signal=signal)
 
         result = await _resolve_wrapped_exception_exit_result(
             ctx,
@@ -2659,10 +2662,10 @@ workflow_definition:
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
-    def test_goal_reached_false_flips_validated_proposal_to_unvalidated(self) -> None:
-        # Agent-emitted goal_reached=False must override last_test_ok=True so
-        # a draft the agent itself flagged as incomplete cannot auto-promote.
-        wf = SimpleNamespace(name="drafted-but-incomplete")
+    def test_legacy_goal_reached_key_cannot_downgrade_a_verified_proposal(self) -> None:
+        # A stale payload still carrying the retired key must not move the tier; the
+        # recorded run decides it.
+        wf = SimpleNamespace(name="drafted-and-tested")
         ctx = _ctx(
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
@@ -2670,42 +2673,7 @@ workflow_definition:
             last_full_workflow_test_ok=True,
             last_update_block_count=8,
         )
-        result = _fake_run_result(
-            {
-                "type": "REPLY",
-                "user_response": "Cookie modal is blocking the form; the workflow needs to dismiss it first.",
-                "goal_reached": False,
-            }
-        )
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.proposal_disposition == "review_untested"
-
-    @pytest.mark.parametrize(
-        "payload_extras",
-        [
-            # Backwards-compat: stale prompts that omit goal_reached must continue
-            # to surface a tested workflow as validated.
-            pytest.param({}, id="default_absent"),
-            pytest.param({"goal_reached": True}, id="explicit_true"),
-        ],
-    )
-    def test_goal_reached_true_keeps_verified_path(self, payload_extras: dict) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_update_block_count=3,
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", **payload_extras})
+        result = _fake_run_result({"type": "REPLY", "user_response": "Tested end to end.", "goal_reached": False})
         agent_result = asyncio.run(
             agent_module._translate_to_agent_result(
                 result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
@@ -2742,47 +2710,6 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "auto_applicable"
-
-    def test_goal_reached_string_false_is_coerced(self) -> None:
-        # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
-        # the gate the same as Python ``False``.
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_update_block_count=2,
-        )
-        result = _fake_run_result(
-            {"type": "REPLY", "user_response": "Cookie modal blocked the form.", "goal_reached": "false"}
-        )
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "review_untested"
-
-    def test_goal_reached_false_without_last_workflow_returns_no_proposal(self) -> None:
-        # The unvalidated WIP fallback only fires when ``ctx.last_workflow``
-        # exists. Self-reported failure on an empty context must not synthesize
-        # a proposal out of thin air.
-        ctx = _ctx(last_test_ok=None)
-        result = _fake_run_result(
-            {"type": "REPLY", "user_response": "I couldn't find the form.", "goal_reached": False}
-        )
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is None
-        assert agent_result.workflow_yaml is None
         assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
@@ -2861,30 +2788,6 @@ workflow_definition:
 
         assert "not independently verified" not in agent_result.user_response
         assert agent_result.updated_workflow is wf
-
-    def test_goal_reached_false_on_failed_test_does_not_double_unvalidate(self) -> None:
-        # Failed-test path already routes to unvalidated WIP. A redundant
-        # ``goal_reached: false`` from the agent must not change the outcome
-        # (no double-effect, no regression of the existing failed-test rewrite).
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=False,
-            last_test_failure_reason="A verification challenge is preventing submission.",
-        )
-        result = _fake_run_result({"type": "REPLY", "user_response": "Tried but blocked.", "goal_reached": False})
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.updated_workflow is wf
-        assert agent_result.proposal_disposition == "review_untested"
-        assert "test failed" in agent_result.user_response.lower()
-        assert "keep the draft" in agent_result.user_response.lower()
 
     def test_inline_replace_workflow_persists_clean_agent_yaml(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
@@ -3111,7 +3014,8 @@ class TestCredentialRefusalReachesAgent:
 
         assert "CREDENTIAL HANDLING - CRITICAL" in prompt
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
-        assert "MUST NOT build, update, or run a workflow" in prompt
+        assert "do not use the browser or run anything with it" in prompt
+        assert "persist only a redacted draft" in prompt
         assert "redacted from the outbound client stream" not in prompt
 
     def test_code_only_prompt_renders_policy_table_and_helper_validation_guidance(self) -> None:
@@ -3139,47 +3043,11 @@ class TestCredentialRefusalReachesAgent:
         assert "Do not call `validate_block`" not in prompt
         assert "native_allowed" not in prompt
 
-    def test_answer_only_prompt_is_content_neutral_and_has_no_tool_guidance(self) -> None:
-        prompt = agent_module._build_system_prompt(
-            tool_usage_guide="",
-            security_rules="",
-            answer_only=True,
-        )
+    def test_normal_prompt_does_not_embed_the_workflow_knowledge_base(self) -> None:
+        prompt = agent_module._build_system_prompt(tool_usage_guide="", security_rules="")
 
-        assert "Respond to the user's current request inline" in prompt
-        assert "No tools are available in this answer-only turn" in prompt
-        assert "Explain the answer in prose" in prompt
-        assert "Do not return serialized workflow YAML/JSON or literal credential values" in prompt
-        assert "product or workflow-concept question" not in prompt
-        assert "documentation question" not in prompt
-        assert "greeting" not in prompt
-        for unavailable_name in (
-            "update_workflow",
-            "update_and_run_blocks",
-            "navigate_browser",
-            "list_credentials",
-        ):
-            assert unavailable_name not in prompt
-
-    def test_code_only_docs_answer_prompt_has_no_authoring_appendix(self) -> None:
-        prompt = agent_module._build_system_prompt(
-            tool_usage_guide="",
-            config=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER),
-            answer_only=True,
-        )
-
-        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" not in prompt
-        assert "SYNTHESIZED CODE BLOCK" not in prompt
-        assert "update_workflow" not in prompt
-
-    def test_docs_answer_prompt_keeps_custom_security_rules(self) -> None:
-        prompt = agent_module._build_system_prompt(
-            tool_usage_guide="",
-            config=CopilotConfig(security_rules="CUSTOM SECURITY RULE"),
-            answer_only=True,
-        )
-
-        assert "CUSTOM SECURITY RULE" in prompt
+        assert "WORKFLOW KNOWLEDGE BASE" not in prompt
+        assert "SKYVERN WORKFLOW YAML KNOWLEDGE BASE" not in prompt
 
     @pytest.mark.asyncio
     async def test_run_copilot_agent_logs_resolved_block_authoring_policy(
@@ -3199,9 +3067,7 @@ class TestCredentialRefusalReachesAgent:
             del copilot_config, llm_key_override
             return "model-primary", object(), "PRIMARY", True
 
-        run_with_enforcement = AsyncMock(
-            return_value=_fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True})
-        )
+        run_with_enforcement = AsyncMock(return_value=_fake_run_result({"type": "REPLY", "user_response": "ok"}))
 
         monkeypatch.setattr(
             "skyvern.forge.sdk.copilot.agent._resolve_live_browser_session_id",
@@ -3252,23 +3118,21 @@ class TestCredentialRefusalReachesAgent:
         assert policy_event["workflow_copilot_chat_id"] == "chat-1"
         assert policy_event["turn_id"] == "turn-1"
 
-    def test_native_tools_carry_refusal_reference(self) -> None:
-        import re
-
+    def test_native_tools_carry_local_refusal_guidance(self) -> None:
         from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
 
         targets = {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}
         matched = {tool.name for tool in NATIVE_TOOLS if tool.name in targets}
         assert matched == targets, f"missing tools in NATIVE_TOOLS: {targets - matched}"
 
-        cross_ref = re.compile(r"CREDENTIAL\s+HANDLING refusal rule")
         for tool in NATIVE_TOOLS:
             if tool.name not in targets:
                 continue
             desc = tool.description
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
-            assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
+            assert "Ask the user to store it as a saved" in desc
+            assert "do not build or run with" in desc
 
 
 class TestNativeToolSurface:
@@ -4362,8 +4226,8 @@ class TestResponseTypeClassificationRuleReachesAgent:
         assert "RESPONSE-TYPE CLASSIFICATION" in prompt
         assert "required before you can continue" in prompt
         assert "this turn built or tested a partial workflow" in prompt
-        assert "goal_reached: false" in prompt
         assert "Classify by intent, not punctuation" in prompt
+        assert "goal_reached" not in prompt
         assert "does NOT imply REPLY" in prompt
         assert "explicitly asks for an untested draft" in prompt
         assert "workflow was drafted without testing as requested" in prompt
@@ -4422,7 +4286,7 @@ class TestCopilotConfig:
         run_with_enforcement = AsyncMock(
             side_effect=[
                 FakeRateLimitError("rate limit"),
-                _fake_run_result({"type": "REPLY", "user_response": "ok", "goal_reached": True}),
+                _fake_run_result({"type": "REPLY", "user_response": "ok"}),
             ]
         )
 
@@ -5120,8 +4984,8 @@ def test_transcript_anchor_blanked_when_retained_window_at_capacity() -> None:
 
 
 class TestTheModelOwnsItsClaim:
-    """The harness renders the run record beside the model's reply; it never composes the reply,
-    never ends the loop on the model's behalf, and never promotes over the model's own admission."""
+    """The harness renders the run record beside the model's reply; it never composes the reply and
+    never ends the loop on the model's behalf."""
 
     def test_model_reply_survives_a_clean_run(self) -> None:
         wf = SimpleNamespace(name="drafted")
@@ -5143,28 +5007,6 @@ class TestTheModelOwnsItsClaim:
         assert "extraction is next" in agent_result.user_response.lower()
         assert "created and tested the workflow successfully" not in agent_result.user_response.lower()
 
-    def test_goal_reached_false_is_not_overridden_by_a_demonstrated_record(self) -> None:
-        wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(
-            last_workflow=wf,
-            last_workflow_yaml="title: drafted",
-            last_test_ok=True,
-            last_full_workflow_test_ok=True,
-            last_run_outcome=RecordedRunOutcome(verdict="demonstrated"),
-        )
-        result = _fake_run_result(
-            {"type": "REPLY", "user_response": "Only the login is built so far.", "goal_reached": False}
-        )
-
-        agent_result = asyncio.run(
-            agent_module._translate_to_agent_result(
-                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
-            )
-        )
-
-        assert agent_result.proposal_disposition != "auto_applicable"
-        assert "only the login is built" in agent_result.user_response.lower()
-
     def test_a_non_demonstrated_record_does_not_rewrite_the_models_claim(self) -> None:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(
@@ -5176,7 +5018,7 @@ class TestTheModelOwnsItsClaim:
                 verdict="not_demonstrated", display_reason="Statement month was still April."
             ),
         )
-        result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
+        result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
 
         agent_result = asyncio.run(
             agent_module._translate_to_agent_result(
@@ -5460,6 +5302,7 @@ class TestToolFactOwnership:
     @pytest.mark.parametrize(
         ("tool", "fact"),
         [
+            ("get_workflow_knowledge", "authoritative Skyvern workflow concepts"),
             ("click", "instant and"),
             ("scroll", "below the fold"),
             ("select_option", "For free-text inputs"),

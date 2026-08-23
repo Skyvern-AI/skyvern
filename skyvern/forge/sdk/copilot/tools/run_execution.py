@@ -24,7 +24,6 @@ from skyvern.forge.sdk.copilot.active_run_session import (
     publish_active_run_session,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import (
-    CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -79,7 +78,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
-    TERMINAL_CHALLENGE_BLOCKER_REASON_CODES,
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
     RecordedRunOutcome,
     RunOutcomeReasonCode,
@@ -87,7 +85,6 @@ from skyvern.forge.sdk.copilot.run_outcome import (
     RunOutcomeVerdict,
     recorded_output_report,
     run_outcome_display_reason,
-    terminal_challenge_disposition,
     trusted_terminal_challenge_category_name,
 )
 from skyvern.forge.sdk.copilot.runtime import (
@@ -99,7 +96,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
-    clear_runtime_authoring_repair_context,
     inject_runtime_authoring_repair_context,
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
@@ -108,9 +104,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import (
-    stash_turn_halt_from_blocker_signal,
-)
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -3299,8 +3293,8 @@ def _record_run_blocks_result(
             }
 
     if terminal_challenge is not None:
-        clear_runtime_authoring_repair_context(copilot_ctx)
         result["ok"] = False
+        run_ok = False
         result.setdefault("error", terminal_challenge.reason)
         data = result.get("data")
         if isinstance(data, dict):
@@ -3320,25 +3314,6 @@ def _record_run_blocks_result(
         copilot_ctx.last_test_anti_bot = terminal_challenge.reason
         copilot_ctx.last_full_workflow_test_ok = False
         copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
-        signal = _terminal_challenge_blocker_signal(
-            terminal_challenge,
-            tool_name="update_and_run_blocks",
-            runs_this_turn=_runs_this_turn(copilot_ctx),
-            used_fresh_run_session=_recorded_fresh_run_session_fact(result),
-        )
-        stash_blocker_signal(copilot_ctx, signal)
-        stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
-        _update_verification_evidence_from_run_result(copilot_ctx, result)
-        recorded_outcome = RecordedRunOutcome(
-            verdict="not_demonstrated",
-            reason_code=terminal_challenge_disposition(
-                challenge_kind=terminal_challenge.challenge_kind
-            ).run_outcome_reason_code,
-            display_reason=run_outcome_display_reason(terminal_challenge.reason),
-            workflow_run_id=terminal_challenge.workflow_run_id,
-        )
-        _record_build_test_outcome(copilot_ctx, result, recorded_outcome)
-        return _stash_recorded_run_outcome(copilot_ctx, recorded_outcome)
 
     if run_ok:
         registered_output_identity_mismatch = bool(
@@ -3597,10 +3572,33 @@ def _mark_stored_post_run_failure_page(copilot_ctx: Any) -> None:
         _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
 
 
+async def _resolve_captcha_solver_availability(copilot_ctx: Any) -> None:
+    """Answer once, where we are async, whether this deployment can clear a captcha on this page.
+
+    The sync diagnosis and repair readers cannot await, and an unanswered question reads as no
+    solver, so resolving it here is what keeps a clearable captcha from being treated as a wall.
+    """
+    evidence = getattr(copilot_ctx, "composition_page_evidence", None)
+    url = None
+    if isinstance(evidence, dict):
+        url = evidence.get("current_url") or evidence.get("inspected_url")
+    try:
+        available = (
+            await app.AGENT_FUNCTION.captcha_solving_available(getattr(copilot_ctx, "organization_id", None), url)
+            is True
+        )
+    except Exception:
+        LOG.warning("copilot captcha solver availability lookup failed; treating as unavailable", exc_info=True)
+        available = False
+    copilot_ctx.captcha_solver_available = available
+    copilot_ctx.captcha_solver_available_for_url = url
+
+
 async def _verify_and_record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], _handler_start: float
 ) -> RecordedRunOutcome | None:
     """Record and emit the run fact once; no authoring judge may rewrite it."""
+    await _resolve_captcha_solver_availability(copilot_ctx)
     recorded = _record_run_blocks_result(copilot_ctx, result, completion_verification=None)
     if not result.get("ok"):
         _mark_stored_post_run_failure_page(copilot_ctx)
@@ -3642,76 +3640,8 @@ def _record_diagnosis_repair_contract(
     return contract
 
 
-def _terminal_challenge_blocker_signal(
-    evidence: TerminalChallengeEvidence,
-    *,
-    tool_name: str,
-    runs_this_turn: int | None = None,
-    used_fresh_run_session: bool | None = None,
-) -> CopilotToolBlockerSignal:
-    safe_evidence_reason = (
-        run_outcome_display_reason(evidence.reason) or "Structured challenge evidence reported a terminal blocker."
-    )
-    disposition = terminal_challenge_disposition(
-        challenge_kind=evidence.challenge_kind,
-        runs_this_turn=runs_this_turn,
-        used_fresh_run_session=used_fresh_run_session,
-    )
-    agent_steering = (
-        "The latest run produced structured anti-bot or challenge evidence: "
-        f"{safe_evidence_reason}. Do NOT call "
-        f"{tool_name} again in this turn, do NOT try another proxy/location in this turn, and "
-        "do NOT claim the workflow is verified end-to-end. Reply from the recorded blocker and preserved draft."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=agent_steering,
-        user_facing_reason=disposition.user_facing_reason,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=disposition.internal_reason_code,
-        blocked_tool=tool_name,
-        extra={
-            "run_outcome_reason_code": disposition.run_outcome_reason_code,
-            "challenge_kind": disposition.challenge_kind.value if disposition.challenge_kind else None,
-            "evidence_source": evidence.source,
-            "challenge_evidence_source": evidence.challenge_evidence_source,
-            "evidence_reason": safe_evidence_reason,
-            "workflow_run_id": evidence.workflow_run_id,
-            "block_labels": list(evidence.block_labels),
-        },
-    )
-
-
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
     result = {"ok": False, "error": error}
-    blocker_signal = getattr(copilot_ctx, "blocker_signal", None)
-    if (
-        isinstance(blocker_signal, CopilotToolBlockerSignal)
-        and blocker_signal.internal_reason_code in TERMINAL_CHALLENGE_BLOCKER_REASON_CODES
-    ):
-        reason = blocker_signal.extra.get("evidence_reason")
-        if not isinstance(reason, str) or not reason.strip():
-            reason = blocker_signal.user_facing_reason
-        category: dict[str, Any] = {
-            "category": "ANTI_BOT_DETECTION",
-            "confidence_float": 0.9,
-            "reasoning": "Structured page challenge evidence reported a terminal blocker.",
-        }
-        carrier_source = blocker_signal.extra.get("challenge_evidence_source")
-        if isinstance(carrier_source, str) and carrier_source:
-            category["evidence_source"] = carrier_source
-            LOG.info(
-                "copilot anti-bot evidence stamp",
-                anti_bot_evidence_source=carrier_source,
-                stamp_seam="diagnosis_repair_tool_error",
-            )
-        result["data"] = {
-            "failure_reason": reason,
-            "failure_categories": [category],
-        }
     _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
     return json.dumps(result)
 

@@ -1,16 +1,3 @@
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -22,8 +9,8 @@ import {
 import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
-import { DotFilledIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { DotFilledIcon } from "@radix-ui/react-icons";
+import { useEffect, useMemo, useRef } from "react";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -50,9 +37,7 @@ import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
   buildBlockOrderIndex,
   classifyUnexecutedDefinedBlocks,
-  collectTimelineSearchTargets,
   flattenTimelineChronologically,
-  type TimelineSearchTarget,
   type UnexecutedDefinedBlock,
 } from "./workflowTimelineUtils";
 
@@ -61,24 +46,14 @@ type Props = {
   activeIteration?: number | null;
   // When set, read this run's timeline instead of the URL's (studio shell).
   workflowRunId?: string;
-  // Studio owns live-status in its own header; let it hide this duplicate badge.
-  hideLiveBadge?: boolean;
   // In the studio the pane already paints this exact surface, so the card would
   // be a box drawn inside its own fill. Legacy sits in a sidebar column on the
   // page background, where the border does separate — so it keeps it.
   hideBorder?: boolean;
-  // Opt-in label search + jump-to-block; off by default so the legacy run
-  // view renders no search UI and stays unchanged.
-  enableSearch?: boolean;
   // Studio composes its own header (RunSummaryStrip: status, duration, counts,
   // search) above this list, so neither the label row nor the counts row
   // renders. Legacy keeps both — they are that page's only timeline title bar.
   hideHeader?: boolean;
-  // Studio surfaces the run's elapsed time here, next to the counts, with the
-  // created/queued/started/finished breakdown on its hover tooltip. Legacy
-  // passes neither and renders no duration.
-  elapsed?: string;
-  elapsedTitle?: string;
   onLiveStreamSelected: () => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
@@ -88,96 +63,6 @@ type Props = {
     iterationIndex: number,
   ) => void;
 };
-
-function filterTimelineSearchTargets(
-  targets: Array<TimelineSearchTarget>,
-  query: string,
-): Array<TimelineSearchTarget> {
-  const needle = query.trim().toLowerCase();
-  if (needle === "") {
-    return targets;
-  }
-  return targets.filter((target) =>
-    target.label.toLowerCase().includes(needle),
-  );
-}
-
-function TimelineBlockSearch({
-  targets,
-  onJump,
-}: {
-  targets: Array<TimelineSearchTarget>;
-  onJump: (target: TimelineSearchTarget) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const results = filterTimelineSearchTargets(targets, query);
-  const closeAndReset = () => {
-    setOpen(false);
-    setQuery("");
-  };
-  return (
-    <Popover
-      open={open}
-      onOpenChange={(next) => (next ? setOpen(true) : closeAndReset())}
-    >
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label="Search blocks"
-          // Mirrors studio/constants PANE_HEADER_ICON_BUTTON_CLASS; this shared
-          // module can't import from studio/.
-          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        >
-          <MagnifyingGlassIcon className="size-3.5" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="end" sideOffset={6} className="w-64 p-0">
-        <Command
-          shouldFilter={false}
-          onKeyDown={(event) => {
-            // Keep Escape local: Studio may mount the editor canvas beside the
-            // run view, whose window Escape handler would clear its selection.
-            if (event.key === "Escape") {
-              event.stopPropagation();
-              closeAndReset();
-            }
-          }}
-        >
-          <CommandInput
-            placeholder="Search blocks…"
-            value={query}
-            onValueChange={setQuery}
-          />
-          <CommandList>
-            <CommandEmpty>No blocks found.</CommandEmpty>
-            {results.length > 0 ? (
-              <CommandGroup>
-                {results.map((target) => (
-                  <CommandItem
-                    key={target.block.workflow_run_block_id}
-                    value={target.block.workflow_run_block_id}
-                    onSelect={() => {
-                      onJump(target);
-                      closeAndReset();
-                    }}
-                  >
-                    {target.order !== null ? (
-                      <span className="mr-2 shrink-0 text-muted-foreground">
-                        #{target.order}
-                      </span>
-                    ) : null}
-                    <span className="truncate">{target.label}</span>
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-            ) : null}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
 
 /**
  * The run's executed-block, credit, and action counts. Rendered by this
@@ -259,12 +144,8 @@ function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
   workflowRunId,
-  hideLiveBadge = false,
   hideBorder = false,
-  enableSearch = false,
   hideHeader = false,
-  elapsed,
-  elapsedTitle,
   onLiveStreamSelected,
   onActionItemSelected,
   onBlockItemSelected,
@@ -284,19 +165,6 @@ function WorkflowRunTimeline({
     () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
   );
-  const searchTargets = useMemo(
-    () =>
-      enableSearch
-        ? collectTimelineSearchTargets(displayTimeline, blockOrder)
-        : [],
-    [enableSearch, displayTimeline, blockOrder],
-  );
-  // Selecting is the whole jump: the row that becomes active scrolls itself
-  // into view (WorkflowRunTimelineBlockItem), which reaches nested rows a
-  // top-level element registry here never could.
-  const jumpToBlock = (target: TimelineSearchTarget) => {
-    onBlockItemSelected(target.block);
-  };
   const codeStepsByLabel = useMemo(
     () =>
       buildCodeStepsByLabel(
@@ -421,7 +289,7 @@ function WorkflowRunTimeline({
               Timeline
             </span>
             <div className="min-w-0 flex-1" />
-            {workflowRunIsNotFinalized && !hideLiveBadge && (
+            {workflowRunIsNotFinalized && (
               <button
                 type="button"
                 onClick={onLiveStreamSelected}
@@ -437,28 +305,12 @@ function WorkflowRunTimeline({
                 <span>Live</span>
               </button>
             )}
-            {enableSearch && (
-              <TimelineBlockSearch
-                targets={searchTargets}
-                onJump={jumpToBlock}
-              />
-            )}
           </div>
           {/* The run's counts sit on their own full-width row rather than in the
           header, so they are free to reflow to a second line. Crammed into the
           fixed-height header they broke *inside* each value in a narrow pane —
           "· 0/2 / blocks" — and the last one still clipped off the edge. */}
           <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1.5 text-xs">
-            {elapsed ? (
-              <span
-                className="whitespace-nowrap text-muted-foreground dark:text-slate-500"
-                title={elapsedTitle || undefined}
-              >
-                <span className="tabular-nums text-foreground dark:text-slate-300">
-                  {elapsed}
-                </span>
-              </span>
-            ) : null}
             <TimelineRunCounts
               workflowRun={workflowRun}
               timeline={workflowRunTimeline}
@@ -555,4 +407,4 @@ function WorkflowRunTimeline({
   );
 }
 
-export { TimelineBlockSearch, TimelineRunCounts, WorkflowRunTimeline };
+export { TimelineRunCounts, WorkflowRunTimeline };

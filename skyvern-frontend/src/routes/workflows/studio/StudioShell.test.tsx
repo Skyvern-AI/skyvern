@@ -72,6 +72,13 @@ describe("StudioPane header", () => {
     vi.clearAllMocks();
   });
 
+  test("gives each pane a clear two-pixel outline", () => {
+    const { pane } = renderPane();
+
+    expect(pane.className).toContain("border-2");
+    expect(pane.className).toContain("border-border");
+  });
+
   test("dragstart sets the drag payload synchronously but engages reorder on a later task", () => {
     const { reorder, header } = renderPane();
     const dt = dataTransfer();

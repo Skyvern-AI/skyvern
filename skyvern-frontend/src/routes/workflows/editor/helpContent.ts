@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Skyvern 1.0 is the default for new browser tasks. Existing V2 blocks remain supported.",
+    "Skyvern 1.0 is the default for new browser tasks. Skyvern 3.0 (Beta) pins this block to the new engine; blocks that rely on download completion fall back to 1.0. Existing V2 blocks remain supported.",
 } as const;
 
 export const basePlaceholderContent = {

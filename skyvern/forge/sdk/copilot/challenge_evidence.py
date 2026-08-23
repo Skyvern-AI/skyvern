@@ -24,10 +24,15 @@ class ChallengeKind(StrEnum):
     """Closed set the vision classifier picks from; ``challenge_state.kind`` stays free-form."""
 
     CAPTCHA = "captcha"
-    HUMAN_VERIFICATION = "human_verification"
-    DEVICE_APPROVAL = "device_approval"
     ACCESS_DENIED = "access_denied"
     OTHER = "other"
+
+
+# Kinds the code runtime has a solver arm for. Membership alone does not mean a given run can
+# clear one: the arms sit behind AGENT_FUNCTION, whose open-source base solves nothing and whose
+# cloud arm is enabled per organization and per domain, so callers must pair this with
+# ``captcha_solving_available``.
+RUNTIME_SOLVABLE_CHALLENGE_KINDS: frozenset[ChallengeKind] = frozenset({ChallengeKind.CAPTCHA})
 
 
 CHALLENGE_KIND_KEY = "challenge_kind"

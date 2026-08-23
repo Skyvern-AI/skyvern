@@ -7,6 +7,7 @@ from urllib.parse import urlsplit, urlunsplit
 import structlog
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
+    RUNTIME_SOLVABLE_CHALLENGE_KINDS,
     ChallengeKind,
     interactive_challenge_controls,
     is_carrier_backed_category_entry,
@@ -284,6 +285,28 @@ def same_run_typed_challenge_kind(evidence: dict[str, Any] | None, run_id: str |
     return typed_challenge_kind(evidence)
 
 
+def run_challenge_is_runtime_clearable(copilot_ctx: Any, run_id: str | None) -> bool:
+    """True when this run's typed challenge is one this deployment resolved that it can clear."""
+    evidence = getattr(copilot_ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    # A run-matched packet is the strongest reading, but only one authoring policy mints one, and the
+    # stop this releases fires from the run envelope on every policy. Requiring the packet would leave
+    # the release unreachable exactly where the stop still fires, so the packet's own typed kind
+    # stands in when no run-matched one exists.
+    challenge_kind = same_run_typed_challenge_kind(evidence, run_id) if run_id is not None else None
+    if challenge_kind is None:
+        challenge_kind = typed_challenge_kind(evidence)
+    if challenge_kind not in RUNTIME_SOLVABLE_CHALLENGE_KINDS:
+        return False
+    if getattr(copilot_ctx, "captcha_solver_available", None) is not True:
+        return False
+    # The gate behind the cached answer is a domain denylist, so the answer speaks only for the page
+    # it was resolved against; a later page pairs with no answer and keeps its wall.
+    resolved_for = getattr(copilot_ctx, "captcha_solver_available_for_url", None)
+    return bool(resolved_for) and resolved_for == (evidence.get("current_url") or evidence.get("inspected_url"))
+
+
 def _post_run_terminal_page_evidence(evidence: dict[str, Any]) -> bool:
     if evidence.get("observed_after_workflow_run") is not True:
         return False
@@ -373,6 +396,11 @@ def _policy_allows_runtime_authoring_repair(copilot_ctx: Any) -> bool:
     )
 
 
+def run_id_from_result_data(data: dict[str, Any]) -> str | None:
+    run_id = data.get("workflow_run_id")
+    return run_id if isinstance(run_id, str) and run_id.strip() else None
+
+
 def _error_text_requires_stop(copilot_ctx: Any, data: dict[str, Any], result: dict[str, Any] | None = None) -> bool:
     if getattr(copilot_ctx, "last_test_non_retriable_nav_error", None):
         return True
@@ -422,14 +450,18 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
     categories = data.get("failure_categories")
     if not isinstance(categories, list):
         return False
+    # Only the challenge branches yield to a clearable challenge. An unreachable sandbox stops the
+    # turn whatever else the page happened to be showing.
+    challenge_clearable = run_challenge_is_runtime_clearable(copilot_ctx, run_id_from_result_data(data))
     for entry in categories:
         if not isinstance(entry, dict):
             continue
         category = entry.get("category")
-        if category in {
-            "UNRECOVERABLE_TOOL_ERROR",
-            "ANTI_BOT_DETECTION",
-        } and is_carrier_backed_category_entry(entry):
+        if category == "UNRECOVERABLE_TOOL_ERROR" and is_carrier_backed_category_entry(entry):
+            return True
+        if challenge_clearable:
+            continue
+        if category == "ANTI_BOT_DETECTION" and is_carrier_backed_category_entry(entry):
             return True
         if trusted_terminal_challenge_category_name(entry):
             return True

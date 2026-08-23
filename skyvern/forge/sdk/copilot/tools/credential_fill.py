@@ -937,9 +937,8 @@ async def _fill_credential_field_impl_serial(
     observed_source_url = url if submitted else source_url
     observed_url = submit.result_url if submitted and submit is not None else url
     if submitted:
-        # Enforcement lets a filled one-time code supersede an earlier challenge only on a packet
-        # naming this tool. Submitting on a later turn left one behind; submitting here must too, or
-        # the challenge this fill just answered still halts the turn. It mints no page evidence.
+        # The submit mints no page evidence of its own, so without this observation the fill and
+        # its submit are invisible to anything that reconstructs what the scout touched.
         await _register_scout_interaction_observation(
             copilot_ctx,
             tool_name="fill_credential_field",

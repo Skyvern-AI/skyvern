@@ -878,7 +878,13 @@ for (const form of document.querySelectorAll('form')) {
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
-    fields.push({ name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: tag === 'select' ? selectOptions(node) : [], selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) });
+    const options = tag === 'select' ? selectOptions(node) : [];
+    const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
+    if (tag === 'select') {
+      field.option_count = node.querySelectorAll('option').length;
+      field.options_omitted = field.option_count > options.length;
+    }
+    fields.push(field);
   }
   forms.push({ id: attr(form, 'id'), name: attr(form, 'name'), action: attr(form, 'action'), method: attr(form, 'method'), fields: fields, submit_controls: submitControls });
 }

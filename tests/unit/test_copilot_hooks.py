@@ -710,6 +710,7 @@ class TestMCPToolOverlayCompleteness:
 
         alias_map = get_skyvern_mcp_alias_map()
         expected_aliases = {
+            "get_workflow_knowledge",
             "get_block_schema",
             "validate_block",
             "navigate_browser",

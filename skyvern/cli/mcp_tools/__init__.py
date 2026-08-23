@@ -50,6 +50,7 @@ from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
+    skyvern_workflow_knowledge,
 )
 from .browser import (
     skyvern_act,
@@ -438,6 +439,7 @@ mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Session Storage"))(skyve
 mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern_clear_local_storage)
 
 # -- Block discovery + validation (no browser needed) --
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Knowledge"))(skyvern_workflow_knowledge)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
@@ -615,6 +617,7 @@ __all__ = [
     "skyvern_clear_session_storage",
     "skyvern_clear_local_storage",
     # Block discovery + validation
+    "skyvern_workflow_knowledge",
     "skyvern_block_schema",
     "skyvern_block_validate",
     "skyvern_code_block_lint",

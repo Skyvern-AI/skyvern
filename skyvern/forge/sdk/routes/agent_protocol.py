@@ -2970,6 +2970,7 @@ async def get_artifact(
 _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.HTML_SCRAPE: "text/html; charset=utf-8",
     ArtifactType.HTML_ACTION: "text/html; charset=utf-8",
+    ArtifactType.HTML_PRE_SUBMIT: "text/html; charset=utf-8",
     ArtifactType.LLM_PROMPT: "text/plain; charset=utf-8",
     ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "text/plain; charset=utf-8",
     ArtifactType.BROWSER_CONSOLE_LOG: "text/plain; charset=utf-8",
@@ -2977,6 +2978,7 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "image/png",
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "image/png",
     ArtifactType.RECORDING: "video/webm",
     ArtifactType.AUDIO: "audio/webm",
     ArtifactType.SESSION_REPLAY: "video/mp4",
