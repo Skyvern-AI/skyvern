@@ -180,9 +180,7 @@ from .run_execution import (
 )
 from .run_execution import _progress_marker as _progress_marker
 from .run_execution import _read_progress_sources as _read_progress_sources
-from .run_execution import (
-    _record_diagnosis_repair_contract,
-)
+from .run_execution import _record_diagnosis_repair_contract as _record_diagnosis_repair_contract
 from .run_execution import _record_run_blocks_result as _record_run_blocks_result
 from .run_execution import (
     _run_blocks_and_collect_debug,
@@ -190,6 +188,9 @@ from .run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
+from .run_execution import (
+    finalize_build_test_result,
+)
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
 from .scouting import _capture_scout_pre_action as _capture_scout_pre_action
@@ -298,12 +299,13 @@ async def update_workflow_tool(
             _mark_credential_deferred_draft(copilot_ctx, result)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
-        if result.get("ok") is False:
-            _record_diagnosis_repair_contract(
-                copilot_ctx,
-                source_tool="update_workflow",
-                result=result,
-            )
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="update_workflow",
+            result=result,
+            workflow_updated=result.get("ok") is True,
+            diagnosis_shadow_eligible=result.get("ok") is False,
+        )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -334,8 +336,13 @@ async def _persist_block_scoped_edit(
         result = await _update_workflow(params, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-        if result.get("ok") is False:
-            _record_diagnosis_repair_contract(copilot_ctx, source_tool=tool_name, result=result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool=tool_name,
+            result=result,
+            workflow_updated=result.get("ok") is True,
+            diagnosis_shadow_eligible=result.get("ok") is False,
+        )
     return json.dumps(sanitize_tool_result_for_llm(tool_name, result))
 
 
@@ -369,7 +376,14 @@ async def edit_block_tool(
     arguments = {"label": label, "fields": fields, "has_code_edit": expected_code is not None}
     authority_error = _authority_tool_error(copilot_ctx, "edit_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     try:
         workflow_yaml = apply_block_edit(
             _stored_workflow_yaml(copilot_ctx),
@@ -381,7 +395,13 @@ async def edit_block_tool(
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
 
 
@@ -434,7 +454,13 @@ async def edit_block_and_run_tool(
             "error": f"block_labels must include the edited block {label!r} so this call tests the persisted repair.",
         }
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block_and_run", result))
     authority_error = _authority_tool_error(copilot_ctx, "edit_block_and_run")
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "edit_block_and_run", authority_error)
@@ -450,8 +476,12 @@ async def edit_block_and_run_tool(
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
-        _record_diagnosis_repair_contract(copilot_ctx, source_tool="edit_block_and_run", result=result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=result,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block_and_run", result))
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
@@ -463,7 +493,7 @@ async def edit_block_and_run_tool(
         _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool="edit_block_and_run",
             result=update_result,
@@ -523,7 +553,14 @@ async def add_block_tool(
     arguments = {"after_label": after_label, "parameters": parameters}
     authority_error = _authority_tool_error(copilot_ctx, "add_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="add_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("add_block", result))
     try:
         workflow_yaml = add_block_to_workflow(
             _stored_workflow_yaml(copilot_ctx),
@@ -534,7 +571,13 @@ async def add_block_tool(
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="add_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("add_block", result))
     return await _persist_block_scoped_edit(
         copilot_ctx,
         "add_block",
@@ -556,13 +599,26 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     arguments = {"label": label}
     authority_error = _authority_tool_error(copilot_ctx, "delete_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="delete_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     try:
         workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="delete_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
 
 
@@ -806,7 +862,7 @@ async def run_blocks_tool(
             )
         await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
             result=result,
@@ -961,7 +1017,7 @@ async def update_and_run_blocks_tool(
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool="update_and_run_blocks",
             result=update_result,
@@ -1010,7 +1066,7 @@ def _credential_deferred_combined_tool_result(
     }
     carry_author_time_findings(update_result, skip_result)
     record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
-    _record_diagnosis_repair_contract(
+    finalize_build_test_result(
         copilot_ctx,
         source_tool=tool_name,
         result=skip_result,
@@ -1021,7 +1077,7 @@ def _credential_deferred_combined_tool_result(
         tool_name=tool_name,
         workflow_permanent_id=copilot_ctx.workflow_permanent_id,
     )
-    return json.dumps(skip_result)
+    return json.dumps(sanitize_tool_result_for_llm(tool_name, skip_result))
 
 
 async def _run_updated_workflow_blocks(
@@ -1069,7 +1125,7 @@ async def _run_updated_workflow_blocks(
         await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool=tool_name,
             result=run_result,

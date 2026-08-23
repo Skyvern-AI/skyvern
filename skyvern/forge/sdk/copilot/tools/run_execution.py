@@ -27,6 +27,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
+    BuildTestEvidencePacket,
+    BuildTestPacketDownload,
+    BuildTestPacketFailure,
+    BuildTestPacketPageState,
+    BuildTestPacketRegisteredOutput,
+    BuildTestPacketRun,
+    BuildTestPacketScreenshot,
+    BuildTestPacketUnfinishedItem,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
     record_build_test_outcome,
@@ -72,8 +80,10 @@ from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    BUILD_TEST_PACKET_KEY,
     build_run_blocks_response,
     iter_failure_reasons,
+    sanitize_tool_result_for_llm,
     truncate_output,
 )
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
@@ -3682,10 +3692,299 @@ def _record_diagnosis_repair_contract(
     return contract
 
 
+def _packet_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _packet_string_list(value: Any) -> list[str]:
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+def _packet_workflow_readback(copilot_ctx: CopilotContext) -> tuple[str | None, str]:
+    accepted = copilot_ctx.last_workflow_yaml
+    if isinstance(accepted, str) and accepted.strip():
+        return accepted, "accepted_write_readback"
+    persisted = copilot_ctx.persisted_workflow_yaml
+    if isinstance(persisted, str) and persisted.strip():
+        return persisted, "turn_start_persisted_readback"
+    return None, "unavailable"
+
+
+def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> BuildTestPacketPageState | None:
+    repair_context = data.get("authoring_repair_context")
+    run_id = _packet_string(data.get("workflow_run_id"))
+    if run_id is None:
+        if isinstance(repair_context, Mapping):
+            omission_notices.append("failure.page_state omitted: page evidence has no recorded workflow run identity.")
+        return None
+    repair_run_id = (
+        _packet_string(repair_context.get("workflow_run_id")) if isinstance(repair_context, Mapping) else None
+    )
+    if isinstance(repair_context, Mapping) and repair_run_id != run_id:
+        omission_notices.append("failure.page_state omitted repair-context fields belonging to another or unknown run.")
+    repair = repair_context if isinstance(repair_context, Mapping) and repair_run_id == run_id else {}
+    current_url = _packet_string(repair.get("current_url")) or _packet_string(data.get("current_url"))
+    title = _packet_string(repair.get("current_title")) or _packet_string(data.get("page_title"))
+    page_state = BuildTestPacketPageState(
+        current_origin=_packet_string(repair.get("current_origin")),
+        current_url=current_url,
+        title=title,
+        evidence_source=_packet_string(repair.get("page_evidence_source")),
+        observed_after_workflow_run=repair.get("observed_after_workflow_run") is True,
+        form_summaries=_packet_string_list(repair.get("page_form_summaries")),
+        result_summaries=_packet_string_list(repair.get("page_result_summaries")),
+        action_summaries=_packet_string_list(repair.get("page_action_summaries")),
+        challenge_summaries=_packet_string_list(repair.get("page_challenge_summaries")),
+        obstruction_summaries=_packet_string_list(repair.get("page_obstruction_summaries")),
+    )
+    return (
+        page_state
+        if any(
+            (
+                page_state.current_origin,
+                page_state.current_url,
+                page_state.title,
+                page_state.evidence_source,
+                page_state.form_summaries,
+                page_state.result_summaries,
+                page_state.action_summaries,
+                page_state.challenge_summaries,
+                page_state.obstruction_summaries,
+            )
+        )
+        else None
+    )
+
+
+def _packet_registered_outputs(
+    data: Mapping[str, Any], run_id: str | None, omission_notices: list[str]
+) -> list[BuildTestPacketRegisteredOutput]:
+    raw_outputs = data.get("registered_output_parameter_values")
+    if not isinstance(raw_outputs, list):
+        return []
+    outputs: list[BuildTestPacketRegisteredOutput] = []
+    malformed = 0
+    other_run = 0
+    for raw_output in raw_outputs:
+        if not isinstance(raw_output, Mapping):
+            malformed += 1
+            continue
+        output_run_id = _packet_string(raw_output.get("workflow_run_id"))
+        if run_id is None or output_run_id != run_id:
+            other_run += 1
+            continue
+        try:
+            outputs.append(
+                BuildTestPacketRegisteredOutput(
+                    workflow_run_id=_packet_string(raw_output.get("workflow_run_id")),
+                    output_parameter_id=_packet_string(raw_output.get("output_parameter_id")),
+                    output_parameter_key=_packet_string(raw_output.get("output_parameter_key")),
+                    block_label=_packet_string(raw_output.get("block_label")),
+                    block_type=_packet_string(raw_output.get("block_type")),
+                    value=raw_output.get("value"),
+                )
+            )
+        except ValueError:
+            malformed += 1
+    if malformed:
+        omission_notices.append(f"registered_outputs omitted {malformed} non-JSON or malformed item(s).")
+    if other_run:
+        omission_notices.append(f"registered_outputs omitted {other_run} item(s) belonging to another or unknown run.")
+    return outputs
+
+
+def _packet_downloads(
+    copilot_ctx: CopilotContext,
+    data: Mapping[str, Any],
+    omission_notices: list[str],
+) -> list[BuildTestPacketDownload]:
+    run_id = _packet_string(data.get("workflow_run_id"))
+    if run_id is None:
+        return []
+    raw_blocks = data.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    outputs_by_label = {
+        label: extracted
+        for block in blocks
+        if isinstance(block, Mapping)
+        and isinstance((label := block.get("label")), str)
+        and isinstance((extracted := block.get("extracted_data")), Mapping)
+    }
+    artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label)
+    evidence = copilot_ctx.registered_artifact_evidence
+    names_by_id: dict[str, str | None] = {}
+    if isinstance(evidence, RegisteredArtifactEvidence):
+        if evidence.workflow_run_id == run_id:
+            names_by_id = {entry.artifact_id: entry.file_name for entry in evidence.entries}
+        elif artifact_ids:
+            omission_notices.append("downloads omitted file names from artifact evidence belonging to another run.")
+    return [
+        BuildTestPacketDownload(artifact_id=artifact_id, file_name=names_by_id.get(artifact_id))
+        for artifact_id in artifact_ids
+    ]
+
+
+def _packet_unfinished_items(
+    copilot_ctx: CopilotContext,
+    run_id: str | None,
+    omission_notices: list[str],
+) -> list[BuildTestPacketUnfinishedItem]:
+    outcome = copilot_ctx.latest_recorded_build_test_outcome
+    if run_id is None or outcome is None or outcome.workflow_run_id != run_id:
+        if copilot_ctx.last_unverified_block_labels or outcome is not None:
+            omission_notices.append("unfinished_items omitted: recorded unfinished evidence is not bound to this run.")
+        return []
+    unfinished = [
+        BuildTestPacketUnfinishedItem(kind="unverified_block", label=label)
+        for label in dict.fromkeys(copilot_ctx.last_unverified_block_labels)
+        if isinstance(label, str) and label
+    ]
+    for fact in outcome.missing_requested_output_facts:
+        output_path = _packet_string(fact.get("output_path"))
+        reason_code = _packet_string(fact.get("reason_code"))
+        if output_path is not None:
+            unfinished.append(
+                BuildTestPacketUnfinishedItem(
+                    kind="missing_requested_output",
+                    output_path=output_path,
+                    reason_code=reason_code,
+                )
+            )
+    return unfinished
+
+
+def build_test_evidence_packet(copilot_ctx: CopilotContext, result: Mapping[str, Any]) -> BuildTestEvidencePacket:
+    raw_data = result.get("data")
+    data = raw_data if isinstance(raw_data, Mapping) else {}
+    omission_notices: list[str] = []
+    workflow_yaml, workflow_source = _packet_workflow_readback(copilot_ctx)
+    if workflow_yaml is None:
+        omission_notices.append(
+            "canonical_workflow_yaml omitted: no accepted or turn-start persistence readback exists."
+        )
+
+    attempted_labels = _packet_string_list(data.get("requested_block_labels"))
+    executed_labels = _packet_string_list(data.get("executed_block_labels"))
+    run_id = _packet_string(data.get("workflow_run_id"))
+    run_status = _packet_string(data.get("overall_status"))
+    if run_id is None:
+        omission_notices.append("run.workflow_run_id omitted: no workflow run was recorded for this result.")
+    if run_status is None:
+        omission_notices.append("run.status omitted: no recorded run status exists for this result.")
+    if not attempted_labels:
+        omission_notices.append("attempted_block_labels omitted: no block run attempt was recorded.")
+    if not executed_labels:
+        omission_notices.append("executed_block_labels omitted: no block execution was recorded.")
+
+    raw_blocks = data.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    failed_block = next(
+        (block for block in blocks if isinstance(block, Mapping) and block.get("status") in _FAILED_BLOCK_STATUSES),
+        None,
+    )
+    action_trace = _packet_string_list(data.get("action_trace_summary"))
+    page_state = _packet_page_state(data, omission_notices)
+    failure: BuildTestPacketFailure | None = None
+    if failed_block is not None or result.get("ok") is False:
+        failure = BuildTestPacketFailure(
+            block_label=_packet_string(failed_block.get("label")) if failed_block is not None else None,
+            block_status=_packet_string(failed_block.get("status")) if failed_block is not None else run_status,
+            reason=(
+                _packet_string(failed_block.get("failure_reason"))
+                if failed_block is not None
+                else _packet_string(data.get("failure_reason")) or _packet_string(result.get("error"))
+            ),
+            action_trace=action_trace,
+            page_state=page_state,
+        )
+        if not action_trace:
+            omission_notices.append("failure.action_trace omitted: no failed action was recorded.")
+        if page_state is None:
+            omission_notices.append("failure.page_state omitted: no bounded same-run page state was recorded.")
+        if failure.reason is None:
+            omission_notices.append("failure.reason omitted: no recorded failure reason exists.")
+    else:
+        omission_notices.append("failure omitted: no failed run or failed block was recorded.")
+
+    registered_outputs = _packet_registered_outputs(data, run_id, omission_notices)
+    if not registered_outputs:
+        omission_notices.append("registered_outputs empty: no output parameter value was recorded.")
+    downloads = _packet_downloads(copilot_ctx, data, omission_notices)
+    if not downloads:
+        omission_notices.append("downloads empty: no registered download artifact was recorded.")
+
+    screenshot_present = (
+        run_id is not None and isinstance(data.get("screenshot_base64"), str) and bool(data.get("screenshot_base64"))
+    )
+    screenshot_provenance = "data.screenshot_base64" if screenshot_present else None
+    if not screenshot_present and run_id is not None:
+        failed_screenshot = next(
+            (
+                block
+                for block in blocks
+                if isinstance(block, Mapping)
+                and isinstance(block.get("screenshot_b64"), str)
+                and bool(block.get("screenshot_b64"))
+            ),
+            None,
+        )
+        if failed_screenshot is not None:
+            screenshot_present = True
+            screenshot_provenance = "data.blocks[].screenshot_b64"
+    if not screenshot_present:
+        omission_notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
+
+    unfinished_items = _packet_unfinished_items(copilot_ctx, run_id, omission_notices)
+    if not unfinished_items:
+        omission_notices.append("unfinished_items empty: recorded outcome and workflow evidence identify none.")
+
+    return BuildTestEvidencePacket(
+        workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+        canonical_workflow_yaml=workflow_yaml,
+        canonical_workflow_source=workflow_source,
+        canonical_workflow_yaml_complete=workflow_yaml is not None,
+        attempted_block_labels=attempted_labels,
+        executed_block_labels=executed_labels,
+        run=BuildTestPacketRun(workflow_run_id=run_id, status=run_status),
+        failure=failure,
+        registered_outputs=registered_outputs,
+        downloads=downloads,
+        screenshot=BuildTestPacketScreenshot(present=screenshot_present, provenance=screenshot_provenance),
+        unfinished_items=unfinished_items,
+        omission_notices=omission_notices,
+    )
+
+
+def finalize_build_test_result(
+    copilot_ctx: CopilotContext,
+    *,
+    source_tool: str,
+    result: dict[str, Any],
+    workflow_updated: bool = False,
+    diagnosis_shadow_eligible: bool = True,
+) -> dict[str, Any]:
+    """Finalize diagnosis state and attach the one shared factual packet."""
+    if diagnosis_shadow_eligible:
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool=source_tool,
+            result=result,
+            workflow_updated=workflow_updated,
+        )
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        result["data"] = data
+    data[BUILD_TEST_PACKET_KEY] = build_test_evidence_packet(copilot_ctx, result).model_dump(
+        mode="json", exclude_none=True
+    )
+    return result
+
+
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
     result = {"ok": False, "error": error}
-    _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
-    return json.dumps(result)
+    finalize_build_test_result(copilot_ctx, source_tool=source_tool, result=result)
+    return json.dumps(sanitize_tool_result_for_llm(source_tool, result))
 
 
 def _run_blocks_span_data(
