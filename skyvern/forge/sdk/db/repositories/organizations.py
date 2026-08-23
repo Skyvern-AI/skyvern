@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Literal, overload
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.id import generate_org_id
 from skyvern.forge.sdk.db.models import (
     OrganizationAuthTokenModel,
     OrganizationModel,
@@ -32,6 +35,12 @@ from skyvern.forge.sdk.schemas.organizations import (
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.organization_slug import (
+    OrganizationSlugCollisionError,
+    derive_org_slug,
+    is_org_slug_unique_violation,
+    iter_org_slug_candidates,
+)
 
 
 class OrganizationsRepository(BaseRepository):
@@ -130,27 +139,74 @@ class OrganizationsRepository(BaseRepository):
         max_retries_per_step: int | None = None,
         domain: str | None = None,
         organization_id: str | None = None,
+        slug: str | None = None,
+        derive_slug: bool = True,
     ) -> Organization:
-        async with self.Session() as session:
-            org = OrganizationModel(
-                organization_id=organization_id,
-                organization_name=organization_name,
-                webhook_callback_url=webhook_callback_url,
-                max_steps_per_run=max_steps_per_run,
-                max_retries_per_step=max_retries_per_step,
-                domain=domain,
-            )
-            session.add(org)
-            await session.commit()
-            await session.refresh(org)
+        resolved_organization_id = organization_id or generate_org_id()
+        if slug is None and derive_slug:
+            base_slug = derive_org_slug(organization_name, resolved_organization_id)
+            slug_candidates: Sequence[str | None] = tuple(iter_org_slug_candidates(base_slug, resolved_organization_id))
+        else:
+            slug_candidates = (slug,)
 
-        return convert_to_organization(org)
+        last_collision: IntegrityError | None = None
+        async with self.Session() as session:
+            for slug_candidate in slug_candidates:
+                organization = OrganizationModel(
+                    organization_id=resolved_organization_id,
+                    organization_name=organization_name,
+                    webhook_callback_url=webhook_callback_url,
+                    slug=slug_candidate,
+                    max_steps_per_run=max_steps_per_run,
+                    max_retries_per_step=max_retries_per_step,
+                    domain=domain,
+                )
+                session.add(organization)
+                try:
+                    await session.commit()
+                except IntegrityError as exc:
+                    await session.rollback()
+                    if slug is not None or not derive_slug or not is_org_slug_unique_violation(exc):
+                        raise
+                    last_collision = exc
+                    continue
+                await session.refresh(organization)
+                return convert_to_organization(organization)
+
+        raise OrganizationSlugCollisionError(
+            f"Could not assign a unique slug to organization {resolved_organization_id}"
+        ) from last_collision
+
+    @db_operation("set_organization_slug_if_missing", expected_errors=(IntegrityError,))
+    async def set_organization_slug_if_missing(self, organization_id: str, slug: str) -> Organization:
+        """Atomically fill a missing slug and return the stored winner."""
+        async with self.Session() as session:
+            organization = await session.scalar(
+                update(OrganizationModel)
+                .where(
+                    OrganizationModel.organization_id == organization_id,
+                    OrganizationModel.slug.is_(None),
+                )
+                .values(slug=slug, modified_at=datetime.now(timezone.utc))
+                .returning(OrganizationModel)
+            )
+            if organization is None:
+                organization = await session.scalar(
+                    select(OrganizationModel).where(OrganizationModel.organization_id == organization_id)
+                )
+            if organization is None:
+                raise NotFoundError
+            await session.commit()
+            await session.refresh(organization)
+            return convert_to_organization(organization)
 
     @db_operation("update_organization")
     async def update_organization(
         self,
         organization_id: str,
         organization_name: str | None = None,
+        slug: str | None = None,
+        update_slug: bool = False,
         webhook_callback_url: str | None = None,
         max_steps_per_run: int | None = None,
         max_steps_per_workflow_run: int | None = None,
@@ -158,6 +214,10 @@ class OrganizationsRepository(BaseRepository):
         max_retries_per_step: int | None = None,
         artifact_url_expiry_seconds: int | None = None,
         clear_artifact_url_expiry_seconds: bool = False,
+        default_llm_key: str | None = None,
+        clear_default_llm_key: bool = False,
+        default_secondary_llm_key: str | None = None,
+        clear_default_secondary_llm_key: bool = False,
     ) -> Organization:
         async with self.Session() as session:
             organization = (
@@ -167,6 +227,8 @@ class OrganizationsRepository(BaseRepository):
                 raise NotFoundError
             if organization_name:
                 organization.organization_name = organization_name
+            if update_slug:
+                organization.slug = slug
             # ``is not None`` (not truthy): "" clears the webhook, 0 disables retries.
             if webhook_callback_url is not None:
                 organization.webhook_callback_url = webhook_callback_url
@@ -185,6 +247,14 @@ class OrganizationsRepository(BaseRepository):
                 organization.artifact_url_expiry_seconds = None
             elif artifact_url_expiry_seconds is not None:
                 organization.artifact_url_expiry_seconds = artifact_url_expiry_seconds
+            if clear_default_llm_key:
+                organization.default_llm_key = None
+            elif default_llm_key is not None:
+                organization.default_llm_key = default_llm_key
+            if clear_default_secondary_llm_key:
+                organization.default_secondary_llm_key = None
+            elif default_secondary_llm_key is not None:
+                organization.default_secondary_llm_key = default_secondary_llm_key
             await session.commit()
             await session.refresh(organization)
             return Organization.model_validate(organization)
@@ -311,6 +381,24 @@ class OrganizationsRepository(BaseRepository):
                 )
             ).all()
             return [await convert_to_organization_auth_token(token, token_type) for token in tokens]
+
+    @db_operation("delete_org_auth_tokens")
+    async def delete_org_auth_tokens(
+        self,
+        organization_id: str,
+        token_type: OrganizationAuthTokenType,
+        token_ids: Sequence[str],
+    ) -> None:
+        if not token_ids:
+            return
+        async with self.Session() as session:
+            await session.execute(
+                delete(OrganizationAuthTokenModel)
+                .filter_by(organization_id=organization_id)
+                .filter_by(token_type=token_type)
+                .where(OrganizationAuthTokenModel.id.in_(token_ids))
+            )
+            await session.commit()
 
     @db_operation("get_valid_org_auth_tokens_by_type")
     async def get_valid_org_auth_tokens_by_type(

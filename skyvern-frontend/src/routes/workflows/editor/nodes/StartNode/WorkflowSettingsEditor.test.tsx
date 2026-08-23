@@ -13,6 +13,7 @@ const startNodeData: WorkflowStartNodeData = {
   webhookCallbackUrl: "",
   proxyLocation: null,
   persistBrowserSession: true,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
@@ -27,6 +28,7 @@ const startNodeData: WorkflowStartNodeData = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
@@ -98,6 +100,10 @@ vi.mock("@/components/KeyValueInput", () => ({
 
 vi.mock("@/components/TestWebhookDialog", () => ({
   TestWebhookDialog: () => <div data-testid="test-webhook-dialog" />,
+}));
+
+vi.mock("@/components/HelpTooltip", () => ({
+  HelpTooltip: ({ content }: { content: string }) => <span>{content}</span>,
 }));
 
 vi.mock("@/routes/workflows/hooks/useResetProfileMutation", () => ({
@@ -230,5 +236,78 @@ describe("WorkflowSettingsEditor browser profile key field", () => {
         ) as HTMLTextAreaElement
       ).value,
     ).toBe("{{ credential_id }}");
+  });
+});
+
+describe("WorkflowSettingsEditor browser session reuse", () => {
+  test("enabling reuse also stores profile persistence", () => {
+    renderSettings({
+      persistBrowserSession: false,
+      reuseBrowserSession: false,
+    });
+
+    const label = screen.getByText("Reuse browser session");
+    const toggle = label.parentElement?.parentElement?.querySelector(
+      'button[role="switch"]',
+    );
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+
+    expect(mockUpdateNodeData).toHaveBeenCalledWith("start", {
+      reuseBrowserSession: true,
+      persistBrowserSession: true,
+    });
+  });
+
+  test("disabling reuse keeps profile persistence enabled", () => {
+    renderSettings({
+      persistBrowserSession: true,
+      reuseBrowserSession: true,
+    });
+
+    const label = screen.getByText("Reuse browser session");
+    const toggle = label.parentElement?.parentElement?.querySelector(
+      'button[role="switch"]',
+    );
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+
+    expect(mockUpdateNodeData).toHaveBeenCalledWith("start", {
+      reuseBrowserSession: false,
+      persistBrowserSession: true,
+    });
+  });
+
+  test("shows profile persistence as enabled and locked while reuse is on", () => {
+    renderSettings({
+      persistBrowserSession: true,
+      reuseBrowserSession: true,
+    });
+
+    const label = screen.getByText("Save & reuse browser profile");
+    const toggle = label.parentElement?.querySelector('button[role="switch"]');
+    expect(toggle?.getAttribute("data-state")).toBe("checked");
+    expect(toggle?.hasAttribute("disabled")).toBe(true);
+  });
+});
+
+describe("WorkflowSettingsEditor mask secrets setting", () => {
+  test("renders the pinned tooltip and updates maskSecrets", () => {
+    renderSettings();
+
+    const label = screen.getByText("Mask Secrets");
+    expect(
+      screen.getByText(
+        "Mask secret values in this workflow's runs. Secrets are hidden while they are typed (screenshots, recordings, live browser view) and redacted from stored artifacts, network logs, and LLM prompts. Turning this on can make debugging harder because secret values are hidden.",
+      ),
+    ).toBeDefined();
+
+    const toggle = label.parentElement?.querySelector('button[role="switch"]');
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+
+    expect(mockUpdateNodeData).toHaveBeenCalledWith("start", {
+      maskSecrets: true,
+    });
   });
 });

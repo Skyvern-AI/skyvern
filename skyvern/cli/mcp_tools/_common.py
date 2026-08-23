@@ -1,19 +1,36 @@
-"""Backward-compatible re-exports from skyvern.cli.core.
-
-MCP tools import from here; the canonical implementations live in core/.
-"""
+"""Shared helpers for MCP tools: re-exports from skyvern.cli.core plus tool-surface constants."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from skyvern.cli.core.artifacts import get_artifact_dir, save_artifact
-from skyvern.cli.core.result import Artifact, BrowserContext, ErrorCode, Timer, make_error, make_result
+from skyvern.cli.core.result import (
+    Artifact,
+    BrowserContext,
+    ErrorCode,
+    Timer,
+    make_error,
+    make_result,
+    restore_pending_attach,
+)
 from skyvern.client.errors import NotFoundError
 
 DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
 AI_FALLBACK_DESCRIPTION = (
     "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector when known."
+)
+CODE_ONLY_POLICY_HINT = (
+    "If you did not pass code_only=true yourself, this server enforces code-only authoring by "
+    "organization policy — the rejection is intentional, not an error. Do not pass code_only=false "
+    "to bypass it unless the user explicitly asked for agentic (non-code) blocks."
+)
+CODE_ONLY_SCHEMA_GUIDANCE = (
+    "Omit `code_only` or pass null to use this server's default; organization policy may enforce "
+    "code-only, making rejection intentional."
+)
+CODE_ONLY_FIELD_DESCRIPTION = (
+    "When true, structurally reject non-code browser/page block types (code-only mode). " + CODE_ONLY_SCHEMA_GUIDANCE
 )
 
 
@@ -31,6 +48,22 @@ async def raw_http_put(path: str, json_body: dict[str, Any] | None = None) -> An
     Raises NotFoundError on 404, RuntimeError on other HTTP errors.
     """
     return await _raw_http_request("PUT", path, json_body=json_body)
+
+
+async def raw_http_post(path: str, json_body: dict[str, Any] | None = None) -> Any:
+    """POST request to Skyvern API for endpoints without SDK methods.
+
+    Raises NotFoundError on 404, RuntimeError on other HTTP errors.
+    """
+    return await _raw_http_request("POST", path, json_body=json_body)
+
+
+async def raw_http_delete(path: str) -> Any:
+    """DELETE request to Skyvern API for endpoints without SDK methods.
+
+    Raises NotFoundError on 404, RuntimeError on other HTTP errors.
+    """
+    return await _raw_http_request("DELETE", path)
 
 
 async def _raw_http_request(
@@ -77,7 +110,10 @@ __all__ = [
     "get_artifact_dir",
     "make_error",
     "make_result",
+    "raw_http_delete",
     "raw_http_get",
+    "raw_http_post",
+    "restore_pending_attach",
     "raw_http_put",
     "save_artifact",
 ]

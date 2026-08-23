@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from asyncio import CancelledError
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import litellm  # type: ignore[import-not-found]
+import openai
 import pytest  # type: ignore[import-not-found]
 
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -15,9 +20,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     GEMINI_SAFETY_SETTINGS,
     LLMAPIHandlerFactory,
     LLMCaller,
+    get_org_aware_secondary_llm_api_handler,
 )
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.api.llm.models import LLMConfig
-from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import DummyLogger, FakeLLMResponse
@@ -25,6 +32,94 @@ from tests.unit.helpers import DummyLogger, FakeLLMResponse
 
 def _custom_llm_config(model_name: str, api_base: str = "https://llm.example.test/v1") -> LLMConfig:
     return LLMConfig(model_name, [], False, False, {"api_key": "test-key", "api_base": api_base})
+
+
+def test_render_hashed_href_map_blocks_lipsum_globals_command(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = "{{ lipsum.__globals__['os'].popen('touch " + str(marker) + "').read() }}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_blocks_string_class_subclasses_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = (
+        "{% for cls in ''.__class__.__mro__[1].__subclasses__() %}"
+        "{% if cls.__name__ == 'catch_warnings' %}"
+        f"{{{{ cls()._module.__builtins__['__import__']('os').system('touch {marker}') }}}}"
+        "{% endif %}{% endfor %}"
+    )
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_blocks_cycler_globals_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "ssti_canary"
+    payload = f"{{{{ cycler.__init__.__globals__['os'].popen('touch {marker}').read() }}}}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert not marker.exists()
+    assert result == payload
+
+
+def test_render_hashed_href_map_replaces_only_hashed_url_placeholders_with_optional_spaces() -> None:
+    first_key = f"_{'a' * 64}"
+    second_key = f"_{'b' * 64}"
+    first_url = "https://example.test/a/very/long/path?with=query&and=more-query-parameters"
+    second_url = "https://example.test/another/path"
+    hashed_href_map = {first_key: first_url, second_key: second_url}
+    payload = (
+        '{"message":"Use the links without changing ordinary prose.",'
+        f'"links":["{{{{{first_key}}}}}","{{{{ {second_key} }}}}","{{{{{first_key}}}}}"],'
+        '"template":"{{ unknown_key }}"}'
+    )
+    expected = (
+        '{"message":"Use the links without changing ordinary prose.",'
+        f'"links":["{first_url}","{second_url}","{first_url}"],'
+        '"template":"{{ unknown_key }}"}'
+    )
+
+    assert api_handler_factory._render_hashed_href_map(f"{{{{{first_key}}}}}", hashed_href_map) == first_url
+    assert api_handler_factory._render_hashed_href_map(payload, hashed_href_map) == expected
+
+
+def test_render_hashed_href_map_removes_unknown_hash_and_preserves_other_placeholder() -> None:
+    unknown_hash = f"_{'c' * 64}"
+    other_placeholder = "ordinary prose with {{ unknown_key }} left intact"
+
+    assert api_handler_factory._render_hashed_href_map(f"{{{{{unknown_hash}}}}}", {}) == ""
+    assert api_handler_factory._render_hashed_href_map(other_placeholder, {}) == other_placeholder
+
+
+def test_render_hashed_href_map_returns_malformed_template_unchanged() -> None:
+    payload = "response with stray {{"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert result == payload
+
+
+def test_render_hashed_href_map_returns_self_calling_macro_unchanged() -> None:
+    payload = "{% macro m() %}{{ m() }}{% endmacro %}{{ m() }}"
+
+    result = api_handler_factory._render_hashed_href_map(payload, {})
+
+    assert result == payload
+
+
+def test_render_hashed_href_map_returns_expensive_templates_unchanged() -> None:
+    range_payload = "{% for i in range(10000000) %}x{% endfor %}"
+    multiplication_payload = "{{ 'a' * 1000000000 }}"
+
+    assert api_handler_factory._render_hashed_href_map(range_payload, {}) == range_payload
+    assert api_handler_factory._render_hashed_href_map(multiplication_payload, {}) == multiplication_payload
 
 
 @pytest.mark.parametrize(
@@ -78,6 +173,7 @@ async def test_custom_openrouter_client_is_scoped_to_request(
     completion = MagicMock()
     completion.model_dump.return_value = {}
     client = MagicMock()
+    client.max_retries = 0
     client.chat.completions.create = AsyncMock(return_value=completion, side_effect=request_error)
     client.close = AsyncMock()
     openai_client = MagicMock(return_value=client)
@@ -93,7 +189,538 @@ async def test_custom_openrouter_client_is_scoped_to_request(
         await caller._dispatch_llm_call(messages=[])
 
     assert openai_client.call_args.kwargs["http_client"].follow_redirects is False
+    assert openai_client.call_args.kwargs["max_retries"] == 0
     client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_extra_body_reaches_async_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_routing = {
+        "order": ["cloudflare", "parasail"],
+        "allow_fallbacks": False,
+        "quantizations": ["fp8"],
+    }
+    llm_config = LLMConfig(
+        "openrouter/deepseek/deepseek-v4-flash-0731",
+        [],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        max_completion_tokens=4096,
+        temperature=0.2,
+        reasoning_effort="medium",
+        litellm_params={
+            "extra_body": {
+                "provider": provider_routing,
+                "reasoning_effort": "high",
+                "temperature": 0.1,
+            }
+        },
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+
+    completion = MagicMock()
+    completion.model_dump.return_value = {"provider": "Cloudflare", "service_tier": "standard"}
+    client = MagicMock()
+    client.max_retries = 0
+    client.chat.completions.create = AsyncMock(return_value=completion)
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock(return_value=client))
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+
+    caller = LLMCaller("OPENROUTER_DEEPSEEK_V4_FLASH_0731")
+    active_parameters = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+    active_parameters.update(llm_config.litellm_params or {})
+    await caller._dispatch_llm_call(messages=[{"role": "user", "content": "test"}], **active_parameters)
+
+    request_kwargs = client.chat.completions.create.await_args.kwargs
+    assert request_kwargs["extra_body"] == {"provider": provider_routing}
+    assert request_kwargs["temperature"] == 0.2
+    assert request_kwargs["reasoning_effort"] == "medium"
+
+
+def _openrouter_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    create: Any,
+    *,
+    llm_key: str = "OPENROUTER_EXAMPLE",
+    max_retries: Any = 0,
+) -> tuple[LLMCaller, MagicMock]:
+    llm_config = _custom_llm_config("openrouter/example-model", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    client = MagicMock()
+    client.max_retries = max_retries
+    client.chat.completions.create = create
+    client.close = AsyncMock()
+    monkeypatch.setattr(api_handler_factory, "AsyncOpenAI", MagicMock(return_value=client))
+    monkeypatch.setattr(api_handler_factory.litellm, "ModelResponse", MagicMock())
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
+    return LLMCaller(llm_key), client
+
+
+def _set_hard_deadline_settings(monkeypatch: pytest.MonkeyPatch, *, enforce: bool, grace: float) -> None:
+    monkeypatch.setattr(api_handler_factory.settings, "ENFORCE_LLM_HARD_DEADLINE", enforce)
+    monkeypatch.setattr(api_handler_factory.settings, "LLM_HARD_DEADLINE_GRACE_SECONDS", grace)
+    monkeypatch.setattr(api_handler_factory, "_hard_deadline_disabled_reasons", set())
+
+
+@pytest.mark.parametrize(
+    ("enforce", "timeout", "attempts", "expected"),
+    [
+        (True, 300, 1, 310.0),
+        (True, 300, 3, 910.0),
+        (True, 300.5, 1, 310.5),
+        (False, 300, 1, None),
+        (True, 300, None, None),
+        (True, None, 1, None),
+        (True, 0, 1, None),
+        (True, -1, 1, None),
+        (True, "300", 1, None),
+        (True, True, 1, None),
+    ],
+)
+def test_llm_hard_deadline_seconds_only_extends_a_usable_timeout(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool, timeout: Any, attempts: int | None, expected: float | None
+) -> None:
+    _set_hard_deadline_settings(monkeypatch, enforce=enforce, grace=10.0)
+
+    assert api_handler_factory._llm_hard_deadline_seconds(timeout, attempts) == expected
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "expected"),
+    [(0, 1), (2, 3), (None, None), (-1, None), (True, None), ("2", None)],
+)
+def test_openai_client_attempts_reads_the_sdk_retry_budget(
+    monkeypatch: pytest.MonkeyPatch, max_retries: Any, expected: int | None
+) -> None:
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+    client = SimpleNamespace(max_retries=max_retries)
+
+    assert api_handler_factory._openai_client_attempts(client) == expected
+    if expected is None:
+        assert "client_max_retries" in api_handler_factory._hard_deadline_disabled_reasons
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_surfaces_as_retryable_from_the_public_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_call_cancelled = asyncio.Event()
+
+    async def _drip_forever(**kwargs: Any) -> Any:
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+        except CancelledError:
+            provider_call_cancelled.set()
+            raise
+
+    caller, _ = _openrouter_caller(monkeypatch, _drip_forever)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.05)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME, timeout=0.05)
+
+    assert provider_call_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_on_a_custom_openrouter_client_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _hang(**kwargs: Any) -> Any:
+        await asyncio.sleep(60)
+
+    caller, client = _openrouter_caller(monkeypatch, _hang, llm_key="CUSTOM_LLM_openrouter_deadline_test")
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.05)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME, timeout=0.05)
+
+    client.close.assert_awaited_once()
+    assert api_handler_factory.AsyncOpenAI.call_args.kwargs["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_scales_with_the_client_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client that retries twice may legitimately spend three timeouts, so 0.2s must survive a
+    0.1s timeout: the deadline covers 3 attempts, not one."""
+
+    async def _slower_than_one_attempt(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.2)
+        return SimpleNamespace(model_dump=lambda: {})
+
+    caller, _ = _openrouter_caller(monkeypatch, _slower_than_one_attempt, max_retries=2)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=0.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_raised_inside_the_request_is_not_relabelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _proxy_timeout(**kwargs: Any) -> Any:
+        raise TimeoutError("connection to proxy timed out")
+
+    caller, _ = _openrouter_caller(monkeypatch, _proxy_timeout)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(TimeoutError, match="connection to proxy timed out") as raised:
+        await caller._dispatch_llm_call(messages=[], timeout=300)
+
+    assert not isinstance(raised.value, api_handler_factory.LLMProviderError)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_landing_with_the_response_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run-stop that arrives in the same tick the response resolves must still stop the run.
+    Releasing the response and cancelling before the loop resumes the task pins that race."""
+    provider_call_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def _responds_when_released(**kwargs: Any) -> Any:
+        provider_call_started.set()
+        await release_response.wait()
+        return SimpleNamespace(model_dump=lambda: {})
+
+    caller, _ = _openrouter_caller(monkeypatch, _responds_when_released)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    dispatch = asyncio.create_task(caller._dispatch_llm_call(messages=[], timeout=300))
+    await provider_call_started.wait()
+    release_response.set()
+    dispatch.cancel()
+
+    with pytest.raises(CancelledError):
+        await dispatch
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_does_not_convert_an_external_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider_call_started = asyncio.Event()
+
+    async def _hang(**kwargs: Any) -> Any:
+        provider_call_started.set()
+        await asyncio.sleep(60)
+
+    caller, _ = _openrouter_caller(monkeypatch, _hang)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    dispatch = asyncio.create_task(caller._dispatch_llm_call(messages=[], timeout=60))
+    await provider_call_started.wait()
+    dispatch.cancel()
+
+    with pytest.raises(CancelledError):
+        await dispatch
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_leaves_a_fast_call_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    completion = MagicMock()
+    completion.model_dump.return_value = {"id": "chatcmpl-test"}
+    create = AsyncMock(return_value=completion)
+    caller, _ = _openrouter_caller(monkeypatch, create)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    await caller._dispatch_llm_call(messages=[{"role": "user", "content": "test"}], timeout=30)
+
+    assert create.await_args.kwargs["timeout"] == 30
+    api_handler_factory.litellm.ModelResponse.assert_called_once_with(id="chatcmpl-test")
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_disabled_lets_a_slow_call_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+
+    async def _slower_than_the_declared_timeout(**kwargs: Any) -> Any:
+        await asyncio.sleep(0.05)
+        return completion
+
+    caller, _ = _openrouter_caller(monkeypatch, _slower_than_the_declared_timeout)
+    _set_hard_deadline_settings(monkeypatch, enforce=False, grace=0.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=0.001)
+
+    completion.model_dump.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_disabled_skips_reading_the_client_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kill switch should fully silence the deadline machinery: it must not even read (and
+    potentially warn about) the client's retry budget when the flag is off."""
+    completion = MagicMock()
+    completion.model_dump.return_value = {}
+    create = AsyncMock(return_value=completion)
+    caller, client = _openrouter_caller(monkeypatch, create)
+    client.max_retries = -1  # malformed; would log if _openai_client_attempts ever inspected it
+    _set_hard_deadline_settings(monkeypatch, enforce=False, grace=10.0)
+
+    await caller._dispatch_llm_call(messages=[], timeout=30)
+
+    assert api_handler_factory._hard_deadline_disabled_reasons == set()
+
+
+@pytest.mark.asyncio
+async def test_unparseable_response_body_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _whitespace_only_200(**kwargs: Any) -> Any:
+        raise json.JSONDecodeError("Expecting value", "           ", 0)
+
+    caller, _ = _openrouter_caller(monkeypatch, _whitespace_only_200)
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+
+def _openai_rate_limit_error() -> Exception:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return openai.RateLimitError("Too Many Requests", response=httpx.Response(429, request=request), body=None)
+
+
+def _litellm_rate_limit_error() -> Exception:
+    return litellm.exceptions.RateLimitError("Too Many Requests", llm_provider="openrouter", model="example-model")
+
+
+@pytest.mark.parametrize(
+    "make_rate_limit_error", [_openai_rate_limit_error, _litellm_rate_limit_error], ids=["openai", "litellm"]
+)
+@pytest.mark.asyncio
+async def test_a_rate_limited_custom_client_call_is_retryable(
+    monkeypatch: pytest.MonkeyPatch, make_rate_limit_error: Any
+) -> None:
+    """max_retries=0 took away the SDK's silent retries on this path, so a 429 has to reach the
+    step-level retry rather than failing the step outright."""
+
+    async def _rate_limited(**kwargs: Any) -> Any:
+        raise make_rate_limit_error()
+
+    caller, _ = _openrouter_caller(monkeypatch, _rate_limited, llm_key="CUSTOM_LLM_openrouter_rate_limit_test")
+    _set_hard_deadline_settings(monkeypatch, enforce=True, grace=10.0)
+
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await caller.call(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+
+def test_json_error_body_length_tolerates_a_doc_less_error() -> None:
+    assert api_handler_factory._json_error_body_length(json.JSONDecodeError("Expecting value", "  ", 0)) == 2
+    assert api_handler_factory._json_error_body_length(json.JSONDecodeError.__new__(json.JSONDecodeError)) is None
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (SimpleNamespace(provider="Cloudflare"), "Cloudflare"),
+        (SimpleNamespace(_hidden_params={"custom_llm_provider": "openrouter"}), "openrouter"),
+        (SimpleNamespace(_hidden_params={}), None),
+        (SimpleNamespace(provider=None), None),
+        (SimpleNamespace(provider=123), None),
+        (SimpleNamespace(), None),
+    ],
+)
+def test_response_provider_is_string_or_none(response: object, expected: str | None) -> None:
+    assert api_handler_factory._response_provider(response) == expected
+
+
+def test_copilot_model_usage_extraction_preserves_response_model_for_malformed_usage() -> None:
+    class BrokenResponse:
+        model = "gpt-4.1"
+
+        @property
+        def usage(self) -> None:
+            raise RuntimeError("malformed usage")
+
+    event = api_handler_factory._copilot_model_usage_event(
+        BrokenResponse(),
+        request_model="gpt-4",
+        provider_name="openai",
+        cost=None,
+        prompt_name="workflow-copilot-narration",
+    )
+
+    assert event.log_fields() == {
+        "log_code": "copilot_model_usage",
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": "gpt-4",
+        "gen_ai.response.model": "gpt-4.1",
+        "gen_ai.provider.name": "openai",
+        "copilot.prompt_name": "workflow-copilot-narration",
+    }
+
+
+def test_copilot_model_usage_logging_failure_cannot_fail_a_completed_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    logger = MagicMock()
+    logger.info.side_effect = RuntimeError("logger unavailable")
+    logger.warning.side_effect = RuntimeError("logger unavailable")
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    api_handler_factory._emit_copilot_model_usage_for_response(
+        FakeLLMResponse("gpt-4.1"),
+        request_model="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        cost=None,
+    )
+
+
+def test_copilot_model_usage_metadata_failure_cannot_fail_a_completed_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenResponse:
+        @property
+        def provider(self) -> str:
+            raise RuntimeError("bad provider metadata")
+
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    api_handler_factory._emit_copilot_model_usage_for_response(
+        BrokenResponse(),
+        request_model="gpt-4",
+        prompt_name="workflow-copilot-narration",
+        cost=None,
+    )
+
+    assert any(event == "Failed to emit Copilot model usage" for event, _ in logger.warnings)
+
+
+def _stub_successful_llm_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    parse_error: Exception | None = None,
+) -> tuple[LLMCaller, DummyLogger]:
+    llm_config = LLMConfig(
+        model_name="gpt-4",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
+    response = FakeLLMResponse("openai/gpt-4.1")
+    response.provider = "openai"
+    response.usage.prompt_tokens = 7
+    response.usage.completion_tokens = 3
+    response.usage.prompt_tokens_details.cached_tokens = 0
+    response.usage.prompt_tokens_details.cache_write_tokens = 2
+    caller = LLMCaller("TEST_LLM_CALLER_USAGE")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+    monkeypatch.setattr(
+        caller,
+        "get_call_stats",
+        AsyncMock(
+            return_value=api_handler_factory.LLMCallStats(
+                input_tokens=7,
+                output_tokens=3,
+                cached_tokens=0,
+                reasoning_tokens=0,
+                llm_cost=0.25,
+                llm_cost_available=True,
+            )
+        ),
+    )
+    artifact_manager = MagicMock()
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+    if parse_error is None:
+        monkeypatch.setattr(api_handler_factory, "parse_api_response", lambda *args: {"actions": []})
+    else:
+        monkeypatch.setattr(api_handler_factory, "parse_api_response", MagicMock(side_effect=parse_error))
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    return caller, logger
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_one_copilot_model_usage_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+
+    result = await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert result == {"actions": []}
+    assert usage_events == [
+        {
+            "log_code": "copilot_model_usage",
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": "gpt-4",
+            "gen_ai.response.model": "openai/gpt-4.1",
+            "gen_ai.provider.name": "openai",
+            "gen_ai.usage.input_tokens": 7,
+            "gen_ai.usage.output_tokens": 3,
+            "gen_ai.usage.cache_read.input_tokens": 0,
+            "gen_ai.usage.cache_creation.input_tokens": 2,
+            "operation.cost": 0.25,
+            "copilot.prompt_name": "workflow-copilot-page-evidence-vision",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_usage_when_final_response_parsing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch, parse_error=ValueError("invalid response"))
+
+    with pytest.raises(ValueError, match="invalid response"):
+        await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["operation.cost"] == 0.25
+    assert usage_events[0]["copilot.prompt_name"] == "workflow-copilot-page-evidence-vision"
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_emits_usage_before_call_stats_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    monkeypatch.setattr(caller, "get_call_stats", AsyncMock(side_effect=RuntimeError("bad usage metadata")))
+
+    with pytest.raises(RuntimeError, match="bad usage metadata"):
+        await caller.call(prompt="test", prompt_name="workflow-copilot-page-evidence-vision")
+
+    usage_events = [fields for _, fields in logger.events if fields.get("log_code") == "copilot_model_usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["gen_ai.usage.input_tokens"] == 7
+    assert "operation.cost" not in usage_events[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_call_stats_treats_missing_cache_read_tokens_as_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_config = LLMConfig(
+        model_name="claude-sonnet-4-6",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    caller = LLMCaller("ANTHROPIC_TEST")
+    response = api_handler_factory.AnthropicMessage.model_validate(
+        {
+            "id": "msg_test",
+            "content": [],
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "type": "message",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_input_tokens": None,
+            },
+        }
+    )
+
+    stats = await caller.get_call_stats(response)
+
+    assert stats.cached_tokens == 0
+    assert stats.llm_cost == pytest.approx((3.0 * 100 + 15.0 * 10) / 1_000_000)
 
 
 @pytest.mark.asyncio
@@ -323,8 +950,10 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
         "anthropic/claude-opus-4-7",
         "anthropic/claude-opus-4-8",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
         "anthropic-claude-opus-4-8",
         "anthropic-claude-fable-5",
+        "anthropic-claude-opus-5",
     ],
 )
 def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str) -> None:
@@ -336,6 +965,7 @@ def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str)
     [
         "bedrock/us.anthropic.claude-opus-4-8",
         "bedrock/us.anthropic.claude-fable-5",
+        "bedrock/us.anthropic.claude-opus-5",
         "anthropic/claude-sonnet-4-6",
         None,
     ],
@@ -349,6 +979,7 @@ def test_requires_adaptive_thinking_does_not_rewrite_other_providers(model_name:
     [
         "anthropic/claude-opus-4-8",
         "anthropic/claude-fable-5",
+        "anthropic/claude-opus-5",
     ],
 )
 def test_apply_anthropic_thinking_optimization_uses_adaptive_shape(model_name: str) -> None:
@@ -396,7 +1027,6 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
     context.use_prompt_caching = False
     context.cached_static_prompt = None
     context.hashed_href_map = {}
-    context.use_artifact_bundling = False
     context.workflow_run_id = None
     context.task_id = None
 
@@ -460,6 +1090,32 @@ async def test_handler_persists_response_model_not_router_group(monkeypatch: pyt
     assert captured_kwargs.get("last_llm_model") == "gemini-2.5-flash"
 
 
+@pytest.mark.asyncio
+async def test_single_handler_maps_an_unparseable_body_to_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    llm_config = LLMConfig(
+        model_name="vertex_ai/gemini-2.5-flash",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+
+    async def _whitespace_only_200(*args: Any, **kwargs: Any) -> Any:
+        raise json.JSONDecodeError("Expecting value", "     ", 0)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", _whitespace_only_200)
+    LLMAPIHandlerFactory._handler_cache.pop("TEST_UNPARSEABLE_SINGLE", None)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_UNPARSEABLE_SINGLE")
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+
 def test_aiohttp_transport_disabled_for_per_request_timeouts() -> None:
     """Importing the LLM package disables litellm's aiohttp transport so per-request `timeout` is honored."""
     assert litellm.disable_aiohttp_transport is True
@@ -484,6 +1140,208 @@ def test_get_override_llm_api_handler_treats_empty_as_no_override(
 
     resolved = LLMAPIHandlerFactory.get_override_llm_api_handler(override, default=default_handler)
     assert resolved is default_handler
+
+
+def test_get_org_aware_secondary_llm_api_handler_returns_org_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    org_handler = MagicMock(name="org_handler")
+    registry_lookup = MagicMock(return_value=True)
+    handler_lookup = MagicMock(return_value=org_handler)
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(
+            organization_id="o_test",
+            org_default_secondary_llm_key="CUSTOM_LLM_oat_fast",
+        ),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: True)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", registry_lookup)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = get_org_aware_secondary_llm_api_handler(default=MagicMock(name="default_handler"))
+
+    assert result is org_handler
+    registry_lookup.assert_called_once_with("CUSTOM_LLM_oat_fast")
+    handler_lookup.assert_called_once_with("CUSTOM_LLM_oat_fast")
+
+
+def test_get_org_aware_secondary_llm_api_handler_warns_once_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_secondary_llm_key="CUSTOM_LLM_oat_deleted"),
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", MagicMock(return_value=False))
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = get_org_aware_secondary_llm_api_handler(default=default_handler)
+
+    assert result is default_handler
+    log.warning.assert_called_once()
+    assert log.warning.call_args.kwargs["llm_key"] == "CUSTOM_LLM_oat_deleted"
+
+
+def test_get_org_aware_secondary_llm_api_handler_is_safe_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform_handler = MagicMock(name="platform_handler")
+    registry_lookup = MagicMock(side_effect=AssertionError("registry must not be read without context"))
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", registry_lookup)
+    monkeypatch.setattr(api_handler_factory.app, "SECONDARY_LLM_API_HANDLER", platform_handler)
+
+    result = get_org_aware_secondary_llm_api_handler()
+
+    assert result is platform_handler
+    registry_lookup.assert_not_called()
+
+
+def test_get_override_llm_api_handler_falls_back_for_stale_org_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(org_default_llm_key="CUSTOM_LLM_oat_deleted"),
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_registered", MagicMock(return_value=False))
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_deleted",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    log.warning.assert_called_once()
+
+
+def test_get_override_llm_api_handler_rejects_foreign_org_custom_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("foreign custom key must not resolve"))
+    log = MagicMock()
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(organization_id="o_attacker"),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: False)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+    monkeypatch.setattr(api_handler_factory, "LOG", log)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_victim",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+    log.warning.assert_called_once()
+    assert log.warning.call_args.kwargs["organization_id"] == "o_attacker"
+
+
+def test_get_override_llm_api_handler_rejects_custom_key_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("custom key must not resolve without an org"))
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = LLMAPIHandlerFactory.get_override_llm_api_handler(
+        "CUSTOM_LLM_oat_orphan",
+        default=default_handler,
+    )
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+
+
+def test_get_org_aware_secondary_llm_api_handler_rejects_unowned_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_handler = MagicMock(name="default_handler")
+    handler_lookup = MagicMock(side_effect=AssertionError("unowned org default must not resolve"))
+    monkeypatch.setattr(
+        api_handler_factory.skyvern_context,
+        "current",
+        lambda: SkyvernContext(
+            organization_id="o_test",
+            org_default_secondary_llm_key="CUSTOM_LLM_oat_foreign",
+        ),
+    )
+    monkeypatch.setattr(api_handler_factory, "is_custom_llm_owned_by_organization", lambda _id, _org: False)
+    monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", handler_lookup)
+
+    result = get_org_aware_secondary_llm_api_handler(default=default_handler)
+
+    assert result is default_handler
+    handler_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("base_parameters", [None, {}])
+def test_get_llm_api_handler_caches_plain_registered_config_without_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    base_parameters: dict[str, Any] | None,
+) -> None:
+    llm_key = "TEST_PLAIN_HANDLER_CACHE"
+    llm_config = _custom_llm_config("openai/cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    try:
+        first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, base_parameters)
+        second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, base_parameters)
+    finally:
+        LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    assert second is first
+
+
+def test_get_llm_api_handler_cache_self_invalidates_after_reregistration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_key = "TEST_PLAIN_HANDLER_CACHE_REREGISTER"
+    current_config = _custom_llm_config("openai/first-cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: current_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    try:
+        first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+        current_config = _custom_llm_config("openai/second-cache-model")
+        second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key)
+    finally:
+        LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    assert second is not first
+
+
+def test_get_llm_api_handler_does_not_cache_nonempty_base_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm_key = "TEST_PARAMETERIZED_HANDLER_CACHE"
+    llm_config = _custom_llm_config("openai/parameterized-cache-model")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "is_router_config", lambda _: False)
+    LLMAPIHandlerFactory._handler_cache.pop(llm_key, None)
+
+    first = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, {"temperature": 0})
+    second = LLMAPIHandlerFactory.get_llm_api_handler(llm_key, {"temperature": 0})
+
+    assert second is not first
+    assert llm_key not in LLMAPIHandlerFactory._handler_cache
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +1501,69 @@ class TestGemini3ReasoningEffortExperiment:
         assert "reasoning_effort" not in params
         assert "thinking" not in params
         assert params["thinking_level"] == "minimal"
+
+
+class TestThinkingBudgetOptimization:
+    @pytest.mark.parametrize("reasoning_effort", ["medium", "high"])
+    def test_xai_reasoning_model_preserves_configured_reasoning_effort(
+        self, reasoning_effort: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="xai/grok-4.5",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            reasoning_effort=reasoning_effort,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == reasoning_effort
+
+    @pytest.mark.parametrize("reasoning_effort", ["medium", "high"])
+    def test_non_xai_reasoning_model_clamps_configured_reasoning_effort(
+        self, reasoning_effort: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="gpt-5",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            reasoning_effort=reasoning_effort,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == "low"
+
+    def test_other_reasoning_model_defaults_to_low_without_configured_reasoning_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(api_handler_factory.litellm, "supports_reasoning", lambda model: True)
+
+        llm_config = LLMConfig(
+            model_name="deepseek/deepseek-reasoner",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+        )
+        params = LLMAPIHandlerFactory.get_api_parameters(llm_config)
+
+        LLMAPIHandlerFactory._apply_thinking_budget_optimization(
+            params, new_budget=1024, llm_config=llm_config, prompt_name="extract-actions"
+        )
+
+        assert params["reasoning_effort"] == "low"
 
 
 # SKY-10200 — runtime tests for the router timeout-precedence fix and per-hop
@@ -886,6 +1807,33 @@ async def test_router_acompletion_does_not_pass_timeout_kwarg(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_router_handler_reports_an_unparseable_body_as_such(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The router ladder already treated this as retryable through its ValueError branch, which
+    logs every such failure as a token limit. Keep the classification, name the real cause."""
+
+    class _UnparseableRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> Any:
+            raise json.JSONDecodeError("Expecting value", "     ", 0)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _UnparseableRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=[])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_UNPARSEABLE_ROUTER", config=config)
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_UNPARSEABLE_ROUTER")
+    with pytest.raises(LLMProviderErrorRetryableTask):
+        await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    assert "LLM response body was not parseable JSON" in [event for event, _ in logger.warnings]
+    assert "LLM token limit exceeded" not in [event for event, _ in logger.exceptions]
+
+
+@pytest.mark.asyncio
 async def test_router_retries_content_filter_on_first_non_gemini_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Gemini's non-configurable content filter blocks a PII-heavy prompt, returning a *valid*
     empty ModelResponse that litellm's exception-driven router fallback never recovers. Retrying
@@ -985,294 +1933,6 @@ async def test_router_does_not_retry_content_filter_for_non_gemini_model(monkeyp
     assert calls == ["primary-group"], f"non-Gemini content_filter must not trigger Gemini fallback; got calls={calls}"
 
 
-class _FakeExperimentationProvider:
-    def __init__(self, variant: Any = None, error: Exception | None = None) -> None:
-        self.variant = variant
-        self.error = error
-        self.calls: list[tuple[str, str, dict | None]] = []
-
-    async def get_value_cached(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> Any:
-        self.calls.append((feature_name, distinct_id, properties))
-        if self.error is not None:
-            raise self.error
-        return self.variant
-
-
-def _stub_content_filter_rescue(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    llm_key: str,
-    variant: Any,
-    provider_error: Exception | None = None,
-    rescue_handler: Any = None,
-    factory_error: Exception | None = None,
-    variant_registered: bool = True,
-) -> tuple[_FakeExperimentationProvider, list[str]]:
-    """Wire a Gemini router that always content-filters, plus the rescue flag plumbing."""
-    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-
-    calls: list[str] = []
-
-    class _FilterThenSucceedRouter:
-        def __init__(self, **kwargs: Any) -> None:
-            pass
-
-        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
-            calls.append(model)
-            if model == "primary-group":
-                return FakeLLMResponse("gemini-3.1-flash-lite-preview", content=None, finish_reason="content_filter")
-            return FakeLLMResponse("gpt-5-fallback", content='{"actions": ["non-gemini-fallback"]}')
-
-    monkeypatch.setattr(api_handler_factory.litellm, "Router", _FilterThenSucceedRouter)
-    config = _make_three_tier_router_config(fallback_groups=["vertex-gemini-standard-fallback", "gpt-5-fallback"])
-    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
-
-    ctx = SkyvernContext(organization_id="o_test", workflow_run_id="wr_test", workflow_permanent_id="wpid_test")
-    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: ctx)
-
-    provider = _FakeExperimentationProvider(variant=variant, error=provider_error)
-    monkeypatch.setattr(api_handler_factory.app, "EXPERIMENTATION_PROVIDER", provider)
-    monkeypatch.setattr(api_handler_factory, "_content_filter_rescue_handler_cache", {})
-    monkeypatch.setattr(api_handler_factory, "_content_filter_rescue_logged", set())
-    monkeypatch.setattr(
-        api_handler_factory.LLMConfigRegistry,
-        "is_registered",
-        classmethod(lambda cls, llm_key: variant_registered),
-    )
-
-    def fake_factory(variant_key: str) -> Any:
-        if factory_error is not None:
-            raise factory_error
-        assert rescue_handler is not None, f"unexpected handler init for variant {variant_key}"
-        return rescue_handler
-
-    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(fake_factory))
-    return provider, calls
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_flag_routes_to_configured_handler(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With CONTENT_FILTER_RESCUE_LLM_NAME set, a Gemini content_filter block must be retried on
-    the configured llm_key's handler instead of the hardcoded first non-Gemini fallback group,
-    and the flag must be evaluated with run-level distinct_id + org/wpid properties (SKY-11766)."""
-    captured: dict[str, Any] = {}
-
-    async def fake_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
-        captured["prompt"] = prompt
-        captured["prompt_name"] = prompt_name
-        captured.update(kwargs)
-        return {"actions": ["rescued"]}
-
-    provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch, llm_key="TEST_RESCUE_FLAG_SET", variant="RESCUE_KEY", rescue_handler=fake_rescue_handler
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_FLAG_SET")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["rescued"]}
-    assert captured["prompt"] == '{"actions": []}'
-    assert captured["prompt_name"] == "check-user-goal"
-    assert "parameters" not in captured or captured["parameters"] is None, (
-        "rescue handler must derive parameters from its own llm_config, not inherit Gemini's"
-    )
-    assert router_calls == ["primary-group"], (
-        f"rescue must replace the in-router non-Gemini retry; got router calls={router_calls}"
-    )
-    assert provider.calls, "rescue flag was never evaluated"
-    feature_name, distinct_id, properties = provider.calls[0]
-    assert feature_name == "CONTENT_FILTER_RESCUE_LLM_NAME"
-    assert distinct_id == "wr_test"
-    assert properties == {"organization_id": "o_test", "workflow_permanent_id": "wpid_test"}
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_flag_unset_keeps_non_gemini_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag disabled (provider returns None) → exact pre-flag behavior: retry on the first
-    non-Gemini fallback group in the same router."""
-    _provider, router_calls = _stub_content_filter_rescue(monkeypatch, llm_key="TEST_RESCUE_FLAG_UNSET", variant=None)
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_FLAG_UNSET")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_variant_matching_blocked_key_is_ignored(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Variant pointing at the llm_key that just got blocked would recurse forever — it must be
-    ignored in favor of the default non-Gemini retry."""
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch, llm_key="TEST_RESCUE_SELF_KEY", variant="TEST_RESCUE_SELF_KEY"
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_SELF_KEY")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_provider_failure_keeps_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Flag resolution failing (PostHog down) must not change behavior."""
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch,
-        llm_key="TEST_RESCUE_PROVIDER_DOWN",
-        variant="RESCUE_KEY",
-        provider_error=RuntimeError("posthog down"),
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_PROVIDER_DOWN")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_unregistered_variant_never_builds_handler(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """get_config synthesizes a config for unknown keys (the typo'd variant would reach litellm
-    as a model name), so an unregistered variant must be rejected before any handler is built."""
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch,
-        llm_key="TEST_RESCUE_TYPO_VARIANT",
-        variant="GEMINI_2_5_FLASH_LITE_WITH_FALBACK",
-        variant_registered=False,
-    )
-    factory_calls: list[str] = []
-
-    def recording_factory(variant_key: str) -> Any:
-        factory_calls.append(variant_key)
-        raise AssertionError("handler must not be constructed for an unregistered variant")
-
-    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(recording_factory))
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_TYPO_VARIANT")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-    assert factory_calls == [], "unregistered variant must fail closed at resolve time, not call time"
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_custom_llm_variant_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Custom LLMs are org-owned BYO endpoints registered under global CUSTOM_LLM_* keys with no
-    ownership check on this path — a variant naming one must be rejected even though it IS a
-    registered llm_key, before any handler is constructed or cached."""
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch,
-        llm_key="TEST_RESCUE_CUSTOM_VARIANT",
-        variant="CUSTOM_LLM_cllm_123",
-        variant_registered=True,
-    )
-    factory_calls: list[str] = []
-
-    def recording_factory(variant_key: str) -> Any:
-        factory_calls.append(variant_key)
-        raise AssertionError("handler must not be constructed for a custom-LLM variant")
-
-    monkeypatch.setattr(LLMAPIHandlerFactory, "get_llm_api_handler", staticmethod(recording_factory))
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_CUSTOM_VARIANT")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-    assert factory_calls == [], "custom-LLM variant must never reach handler construction"
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_persists_blocked_response_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The rescued early return must pair the blocked content_filter response with the
-    already-recorded request instead of orphaning it — the blocked response is the debugging
-    evidence for why the rescue fired."""
-
-    async def fake_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
-        return {"actions": ["rescued"]}
-
-    _provider, _router_calls = _stub_content_filter_rescue(
-        monkeypatch, llm_key="TEST_RESCUE_ARTIFACTS", variant="RESCUE_KEY", rescue_handler=fake_rescue_handler
-    )
-    artifact_manager = MagicMock()
-    artifact_manager.prepare_llm_artifact = AsyncMock(return_value=None)
-    artifact_manager.bulk_create_artifacts = AsyncMock()
-    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.app.ARTIFACT_MANAGER", artifact_manager)
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.api.llm.api_handler_factory.app.DATABASE.tasks.update_step",
-        AsyncMock(return_value=MagicMock()),
-    )
-
-    now = datetime.now()
-    step = Step(
-        created_at=now,
-        modified_at=now,
-        task_id="tsk_test",
-        step_id="stp_test",
-        status=StepStatus.running,
-        order=0,
-        is_last=False,
-        retry_index=0,
-        organization_id="o_test",
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_ARTIFACTS")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal", step=step)
-
-    assert result == {"actions": ["rescued"]}
-    persisted_types = [
-        call.kwargs.get("artifact_type") for call in artifact_manager.prepare_llm_artifact.await_args_list
-    ]
-    assert ArtifactType.LLM_RESPONSE in persisted_types, (
-        "blocked content_filter response must be persisted on the rescued path"
-    )
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_handler_init_failure_keeps_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A registered variant whose handler construction fails (e.g. missing provider env vars)
-    must fall back to default behavior, not crash."""
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch,
-        llm_key="TEST_RESCUE_BAD_VARIANT",
-        variant="RESCUE_KEY_BAD_CONFIG",
-        factory_error=KeyError("RESCUE_KEY_BAD_CONFIG"),
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_BAD_VARIANT")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-
-
-@pytest.mark.asyncio
-async def test_content_filter_rescue_handler_failure_falls_back_to_non_gemini(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the rescue call itself fails, degrade to the default non-Gemini retry instead of
-    failing the whole LLM call."""
-
-    async def broken_rescue_handler(*, prompt: str, prompt_name: str, **kwargs: Any) -> dict[str, Any]:
-        raise RuntimeError("rescue provider outage")
-
-    _provider, router_calls = _stub_content_filter_rescue(
-        monkeypatch, llm_key="TEST_RESCUE_HANDLER_DOWN", variant="RESCUE_KEY", rescue_handler=broken_rescue_handler
-    )
-
-    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_RESCUE_HANDLER_DOWN")
-    result = await handler(prompt='{"actions": []}', prompt_name="check-user-goal")
-
-    assert result == {"actions": ["non-gemini-fallback"]}
-    assert router_calls == ["primary-group", "gpt-5-fallback"]
-
-
 def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypatch: pytest.MonkeyPatch) -> None:
     """Per-hop fallback expansion is constructed as strict suffixes — each
     non-terminal hop appears as a key at most once and each entry's chain
@@ -1317,9 +1977,42 @@ def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> 
     standard = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND"}})
     no_meta = SimpleNamespace(_hidden_params={})
 
-    assert LLMAPIHandlerFactory._completion_cost(flex) == pytest.approx(0.05)
-    assert LLMAPIHandlerFactory._completion_cost(standard) == pytest.approx(0.10)
-    assert LLMAPIHandlerFactory._completion_cost(no_meta) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(no_meta) == pytest.approx(0.10)
+
+
+def test_completion_cost_halves_long_context_openai_direct_gpt5_6_flex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A flex-tagged OpenAI-direct GPT-5.6 call over the 272k-token threshold bills at
+    litellm's untiered standard long-context rate (ModelInfo drops the *_flex threshold
+    keys), so the helper halves it itself. Azure, short prompts, and standard tier are not."""
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.10)
+
+    long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+    short_prompt_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=200_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+    azure_long_context_flex = SimpleNamespace(
+        service_tier="flex",
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "azure/my-luna-deployment"},
+    )
+    standard_tier_long_context = SimpleNamespace(
+        service_tier=None,
+        usage=SimpleNamespace(prompt_tokens=300_000),
+        _hidden_params={"litellm_model_name": "gpt-5.6-luna"},
+    )
+
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context_flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(short_prompt_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(azure_long_context_flex) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard_tier_long_context) == pytest.approx(0.10)
 
 
 def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1328,7 +2021,294 @@ def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(litellm, "completion_cost", _raise)
     resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
-    assert LLMAPIHandlerFactory._completion_cost(resp) == 0.0
+    assert LLMAPIHandlerFactory.completion_cost_or_none(resp) is None
+
+
+# OpenAI rejects tools + reasoning_effort on /v1/chat/completions for gpt-5.6, so
+# litellm bridges those calls through /v1/responses and its response translation drops
+# service_tier. completion_cost then misses the *_flex price keys and bills flex traffic at the
+# standard rate. The tier is recovered from the deployment that served the call.
+
+_TIER_TEST_MODEL = "gpt-5.6-unittest"
+_TIER_TEST_STANDARD = {"input_cost_per_token": 1e-07, "output_cost_per_token": 6e-07}
+_TIER_TEST_LONG_CONTEXT = {
+    "input_cost_per_token_above_272k_tokens": 2e-07,
+    "output_cost_per_token_above_272k_tokens": 9e-07,
+}
+
+
+@pytest.fixture
+def tier_priced_model() -> Any:
+    """A model registered with real flex price keys, so the cost assertions exercise litellm's
+    own tier pricing instead of a stubbed completion_cost."""
+    litellm.register_model(
+        {
+            _TIER_TEST_MODEL: {
+                "litellm_provider": "openai",
+                "mode": "chat",
+                "supports_service_tier": True,
+                **_TIER_TEST_STANDARD,
+                **{f"{key}_flex": value / 2 for key, value in _TIER_TEST_STANDARD.items()},
+                **_TIER_TEST_LONG_CONTEXT,
+                **{f"{key}_flex": value / 2 for key, value in _TIER_TEST_LONG_CONTEXT.items()},
+            }
+        }
+    )
+    yield _TIER_TEST_MODEL
+    litellm.model_cost.pop(_TIER_TEST_MODEL, None)
+    # register_model also registers the name as an OpenAI chat model; popping the cost map alone
+    # leaks it into every later test in the session.
+    litellm.open_ai_chat_completion_models.discard(_TIER_TEST_MODEL)
+
+
+def _bridge_response(
+    *,
+    model_id: str | None = "id:flex-leg",
+    service_tier: str | None = None,
+    prompt_tokens: int = 1000,
+    reasoning_tokens: int = 0,
+) -> litellm.ModelResponse:
+    """A ModelResponse shaped like one that came back through litellm's Responses-API bridge:
+    real usage and a serving deployment id, but no service_tier unless one is forced on."""
+    response = litellm.ModelResponse(
+        model=_TIER_TEST_MODEL,
+        choices=[{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}],
+    )
+    response.usage = litellm.Usage(
+        prompt_tokens=prompt_tokens, completion_tokens=1000, total_tokens=prompt_tokens + 1000
+    )
+    response.usage.completion_tokens_details = litellm.types.utils.CompletionTokensDetailsWrapper(
+        reasoning_tokens=reasoning_tokens
+    )
+    response._hidden_params = {"litellm_model_name": _TIER_TEST_MODEL, "custom_llm_provider": "openai"}
+    if model_id is not None:
+        response._hidden_params["model_id"] = model_id
+    if service_tier is not None:
+        response.service_tier = service_tier
+    return response
+
+
+class _TieredRouter:
+    """Router double whose deployments carry litellm_params the way litellm's do — the flex leg
+    declares a tier as a pydantic extra, the fallback leg declares none."""
+
+    def __init__(self) -> None:
+        self.deployments = {
+            "id:flex-leg": SimpleNamespace(
+                model_name="openai-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL, service_tier="flex"),
+            ),
+            "id:fallback-leg": SimpleNamespace(
+                model_name="openai-unittest-fallback",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL),
+            ),
+            "id:mixed-case-flex-leg": SimpleNamespace(
+                model_name="openai-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(model=_TIER_TEST_MODEL, service_tier="Flex"),
+            ),
+            "id:vertex-style-leg": SimpleNamespace(
+                model_name="vertex-unittest-flex",
+                litellm_params=litellm.types.router.LiteLLM_Params(
+                    model=_TIER_TEST_MODEL, service_tier="SERVICE_TIER_FLEX"
+                ),
+            ),
+        }
+
+    def get_deployment(self, model_id: str) -> Any:
+        return self.deployments.get(model_id)
+
+
+def test_served_tier_prefers_the_provider_over_the_deployment_it_ran_on(tier_priced_model: str) -> None:
+    """A tier the provider reported is authoritative even when it contradicts the leg we
+    dispatched on. Overwriting a downgrade would hide a real billing event and under-report."""
+    response = _bridge_response(model_id="id:flex-leg", service_tier="default")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == ("default", "reported")
+    assert response.service_tier == "default"
+    assert LLMAPIHandlerFactory.completion_cost_or_none(response) == pytest.approx(0.0007)
+
+
+def test_dropped_tier_is_recovered_from_the_serving_deployment() -> None:
+    response = _bridge_response(model_id="id:flex-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == ("flex", "inferred")
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+    # Never written onto the response itself: that object is persisted as the LLM_RESPONSE
+    # artifact, where a tier we synthesized would read as one the provider sent.
+    assert getattr(response, "service_tier", None) is None
+
+
+def test_unresolvable_deployment_is_reported_rather_than_passing_as_standard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing to resolve the serving deployment leaves the call priced at the standard rate,
+    which is exactly the bug's signature — it must not be indistinguishable from a real one."""
+    logger = DummyLogger()
+    monkeypatch.setattr(api_handler_factory, "LOG", logger)
+    response = _bridge_response(model_id=None)
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, "unresolved")
+    assert any(
+        event == "Router response carried no service tier and no resolvable deployment" for event, _ in logger.events
+    )
+
+
+def test_bridge_flex_call_is_costed_at_the_flex_rate_and_fallback_at_the_standard_rate(
+    tier_priced_model: str,
+) -> None:
+    """The headline accounting fix, against the real litellm price map: a flex-served call must
+    cost half a fallback-served one, where today both cost the same."""
+    router = _TieredRouter()
+    flex = _bridge_response(model_id="id:flex-leg")
+    fallback = _bridge_response(model_id="id:fallback-leg")
+
+    LLMAPIHandlerFactory._record_served_service_tier(router, flex)
+    LLMAPIHandlerFactory._record_served_service_tier(router, fallback)
+
+    flex_cost = LLMAPIHandlerFactory.completion_cost_or_none(flex)
+    fallback_cost = LLMAPIHandlerFactory.completion_cost_or_none(fallback)
+    assert fallback_cost == pytest.approx(0.0007)
+    assert flex_cost == pytest.approx(0.00035)
+
+
+def test_a_tier_litellm_cannot_price_is_not_recorded(tier_priced_model: str) -> None:
+    """Vertex deployments declare `service_tier="SERVICE_TIER_FLEX"`, which litellm does not map to
+    a price key — its flex tier travels as `provider_specific_fields.traffic_type` and is corrected
+    separately. Recording it would buy no discount and would put the working Vertex path through
+    this one."""
+    response = _bridge_response(model_id="id:vertex-style-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert tier is None
+    assert api_handler_factory._effective_service_tier(response) is None
+
+
+def test_a_recovered_tier_is_normalised_to_lower_case(tier_priced_model: str) -> None:
+    """litellm lower-cases before picking a price key, but our own >272k correction compares
+    exactly — so a deployment written as "Flex" would take the short-call discount and silently
+    lose the long-context halving, and would split the Datadog dimension in two."""
+    short = _bridge_response(model_id="id:mixed-case-flex-leg")
+    long_context = _bridge_response(model_id="id:mixed-case-flex-leg", prompt_tokens=300_000)
+
+    assert LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), short) == ("flex", "inferred")
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), long_context)
+
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context) == pytest.approx(0.03045)
+
+
+def test_a_reported_tier_outranks_a_previously_recovered_one(tier_priced_model: str) -> None:
+    """Pins the precedence itself, not just the write guard: with both values present on the same
+    response, the provider's must win. Inverting the order in `_effective_service_tier` would
+    otherwise stay green, because recording never produces both and no other test builds the pair.
+    Only the priced value is asserted — a response carrying both is unreachable in production, so
+    what the log would say about it is not a contract worth freezing."""
+    response = _bridge_response(model_id="id:flex-leg")
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+
+    response.service_tier = "default"
+
+    assert api_handler_factory._effective_service_tier(response) == "default"
+
+
+def test_a_deployment_with_no_tier_reports_no_provenance(tier_priced_model: str) -> None:
+    """A leg that declares no tier inferred nothing, so it must not claim "inferred". Most router
+    traffic is that shape — every Gemini router call among it — and labelling it would leave
+    `service_tier_source="inferred"` on millions of calls carrying no tier, which is the query
+    that is supposed to isolate the recovered ones."""
+    response = _bridge_response(model_id="id:fallback-leg")
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, None)
+    assert api_handler_factory._service_tier_with_provenance(response) == (None, None)
+
+
+def test_recovered_tier_does_not_double_discount_a_long_context_call(tier_priced_model: str) -> None:
+    """Pins the composite of litellm's pricing and Skyvern's >272k correction. litellm cannot
+    resolve the combined above-272k + flex price key today, so the correction supplies the
+    halving; if a litellm release starts resolving it, this fails instead of quietly billing
+    a quarter of the real cost."""
+    long_context = _bridge_response(model_id="id:flex-leg", prompt_tokens=300_000)
+    standard_reference = _bridge_response(model_id="id:fallback-leg", prompt_tokens=300_000)
+
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), long_context)
+
+    assert api_handler_factory._effective_service_tier(long_context) == "flex"
+    # litellm still prices the long-context flex call at the untiered rate, even when handed the
+    # tier explicitly — it cannot resolve the combined above-272k + flex key...
+    assert litellm.completion_cost(completion_response=long_context, service_tier="flex") == pytest.approx(0.0609)
+    # ...so exactly one halving reaches the books.
+    assert LLMAPIHandlerFactory.completion_cost_or_none(long_context) == pytest.approx(0.03045)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(standard_reference) == pytest.approx(0.0609)
+
+
+def test_vertex_flex_correction_survives_tier_restoration(tier_priced_model: str) -> None:
+    """No-regression for the working Vertex path: its flex tier travels as a traffic_type, which
+    the restoration must neither consume nor disturb, and which litellm still does not price."""
+    response = _bridge_response(model_id="id:fallback-leg")
+    response._hidden_params["provider_specific_fields"] = {"traffic_type": "ON_DEMAND_FLEX"}
+
+    tier, source = LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert (tier, source) == (None, None)
+    assert getattr(response, "service_tier", None) is None
+    # litellm prices ON_DEMAND_FLEX at the standard rate, which is why the halving below is ours.
+    assert litellm.completion_cost(completion_response=response) == pytest.approx(0.0007)
+    assert LLMAPIHandlerFactory.completion_cost_or_none(response) == pytest.approx(0.00035)
+
+
+@pytest.mark.asyncio
+async def test_llm_caller_logs_the_served_leg_and_where_the_tier_came_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`model` on this log line is the router group, which is identical for the flex and the
+    fallback leg — so the split between them, and the mispricing riding on it, was invisible."""
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    caller._router = _TieredRouter()  # type: ignore[assignment]
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=_bridge_response(model_id="id:flex-leg")))
+
+    await caller.call(prompt="test", prompt_name="taskv3-agent-loop")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["served_model_group"] == "openai-unittest-flex"
+    assert metrics["service_tier_source"] == "inferred"
+    assert metrics["service_tier"] == "flex"
+
+
+def test_recovered_tier_stays_out_of_the_persisted_response_artifact() -> None:
+    """The LLM_RESPONSE artifact is dumped from this object. A tier we recovered must not appear
+    there, or a later investigation reads our own inference as something the provider reported —
+    which is how the mispricing survived in the first place."""
+    response = _bridge_response(model_id="id:flex-leg")
+
+    LLMAPIHandlerFactory._record_served_service_tier(_TieredRouter(), response)
+
+    assert api_handler_factory._effective_service_tier(response) == "flex"
+    assert "service_tier" not in api_handler_factory._safe_model_dump_json(response)
+
+
+@pytest.mark.asyncio
+async def test_reported_tier_is_still_logged_with_its_provenance_without_a_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier logged with no source beside it is the same conflation, just relocated to the log."""
+    caller, logger = _stub_successful_llm_caller(monkeypatch)
+    response = _bridge_response(model_id=None, service_tier="flex")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", AsyncMock(return_value=response))
+
+    await caller.call(prompt="test", prompt_name="extract-actions")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["service_tier"] == "flex"
+    assert metrics["service_tier_source"] == "reported"
 
 
 @pytest.mark.asyncio
@@ -1467,6 +2447,29 @@ def _fallback_log_events(logger: DummyLogger) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+async def test_step_engine_router_logs_the_served_leg_on_its_metrics_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step engine has its own metrics log line, separate from LLMCaller's, and carries the
+    bulk of router traffic. `model` there is the router group for both legs, so without the served
+    deployment the flex/fallback split is as invisible as it was on the other path."""
+    logger, _ = _run_flex_router_test(
+        monkeypatch,
+        "TEST_ROUTER_METRICS_SERVED_GROUP",
+        [FakeLLMResponse("shared-model", hidden_params={"model_id": "id:primary-group"})],
+    )
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_ROUTER_METRICS_SERVED_GROUP")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    metrics = next(fields for event, fields in logger.events if event == "LLM API handler duration metrics")
+    assert metrics["served_model_group"] == "primary-group"
+    # The deployment declares no priceable tier, so there is nothing to infer and no provenance
+    # to claim — `served_model_group` alone carries the leg.
+    assert metrics["service_tier_source"] is None
+
+
+@pytest.mark.asyncio
 async def test_router_flex_served_primary_does_not_log_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request served by the flex primary returns the same provider label as the standard
     tier; the serving deployment id must prove it was the primary and suppress the log."""
@@ -1594,3 +2597,254 @@ async def test_truncation_retry_skipped_when_fallback_served(monkeypatch: pytest
         await handler(prompt='{"actions": []}', prompt_name="extract-actions")
 
     assert router_cls.last_instance.calls == ["primary-group"]
+
+
+@pytest.mark.asyncio
+async def test_extra_body_from_litellm_params_reaches_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """litellm_params["extra_body"] must survive to the acompletion call.
+
+    A top-level reasoning_effort is stripped by drop_params=True whenever LiteLLM
+    does not recognize the model as a reasoning model, which silently disables
+    thinking on custom OpenAI-compatible deployments. extra_body is the escape
+    hatch: LiteLLM forwards it verbatim, so it must not be swallowed en route.
+    """
+    context = MagicMock()
+    context.vertex_cache_name = None
+    context.use_prompt_caching = False
+    context.cached_static_prompt = None
+    context.hashed_href_map = {}
+
+    llm_config = LLMConfig(
+        model_name="openai/some-custom-deployment",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        litellm_params={
+            "api_key": "test-key",
+            "api_base": "https://llm.example.test/openai/v1",
+            "extra_body": {"reasoning_effort": "high"},
+        },
+    )
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.get_config", lambda _: llm_config
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.api.llm.api_handler_factory.LLMConfigRegistry.is_router_config", lambda _: False
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.llm.api_handler_factory.skyvern_context.current", lambda: context)
+    monkeypatch.setattr(
+        api_handler_factory, "llm_messages_builder", AsyncMock(return_value=[{"role": "user", "content": "test"}])
+    )
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda _: 0.0)
+
+    completion_params: dict[str, Any] = {}
+
+    async def mock_acompletion(*args: Any, **kwargs: Any) -> FakeLLMResponse:
+        completion_params.update(kwargs)
+        return FakeLLMResponse("some-custom-deployment")
+
+    monkeypatch.setattr(api_handler_factory.litellm, "acompletion", AsyncMock(side_effect=mock_acompletion))
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler("TEST_EXTRA_BODY_PASSTHROUGH")
+    await handler(prompt="test prompt", prompt_name=EXTRACT_ACTION_PROMPT_NAME)
+
+    assert completion_params["extra_body"] == {"reasoning_effort": "high"}
+
+
+# ---------------------------------------------------------------------------
+# LLMCaller router-config support (SKY: v3 / direct-call engines can use fallback/flex groups)
+# ---------------------------------------------------------------------------
+
+
+def test_llmcaller_builds_router_for_router_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    sentinel = MagicMock(name="litellm_router")
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: sentinel)
+
+    caller = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+
+    assert caller._router is sentinel
+    assert caller._router_model_group == router_config.main_model_group
+
+
+def test_llmcaller_no_router_for_direct_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        api_handler_factory.LLMConfigRegistry, "get_config", lambda _: _custom_llm_config("openai/example-model")
+    )
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+
+    caller = LLMCaller("SOME_DIRECT_KEY")
+
+    assert caller._router is None
+    assert caller._router_model_group is None
+
+
+@pytest.mark.asyncio
+async def test_llmcaller_dispatches_router_config_through_router(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: a router config used to crash LLMCaller (no .litellm_params on the config, and a
+    # bare group name handed to litellm.acompletion). It must now dispatch through the Router with
+    # model=main_model_group.
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    fake_router = MagicMock(name="litellm_router")
+    fake_router.acompletion = AsyncMock(return_value="ROUTED")
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: fake_router)
+    monkeypatch.setattr(api_handler_factory, "_validate_custom_llm_api_base", AsyncMock())
+
+    caller = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+    result = await caller._dispatch_llm_call(messages=[{"role": "user", "content": "hi"}], tools=None)
+
+    assert result == "ROUTED"
+    fake_router.acompletion.assert_awaited_once()
+    assert fake_router.acompletion.await_args.kwargs["model"] == router_config.main_model_group
+
+
+def test_llmcaller_router_is_cached_across_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    # v3 builds one LLMCaller per run; routers must be shared by key (one redis pool), not rebuilt.
+    router_config = _gemini_3_flash_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    build_calls: list[object] = []
+
+    def _fake_build(_cfg: object) -> MagicMock:
+        built = MagicMock(name="litellm_router")
+        build_calls.append(built)
+        return built
+
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", _fake_build)
+
+    first = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+    second = LLMCaller("GEMINI_3_FLASH_WITH_FALLBACK")
+
+    assert first._router is second._router
+    assert len(build_calls) == 1
+
+
+# Deployments have to be models litellm's *bundled* cost map knows: CI forces
+# LITELLM_LOCAL_MODEL_COST_MAP to match production, and a model that only the fetched map
+# carries would make the probe answer differently depending on which suite ran first.
+_TOOL_CHOICE_CAPABLE_MODEL = "gpt-4o"
+
+
+def _flex_fallback_router(*, fallback_deployment_model: str = _TOOL_CHOICE_CAPABLE_MODEL) -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="openai-flex-fallback-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="openai-flex",
+                litellm_params={"model": _TOOL_CHOICE_CAPABLE_MODEL},
+            ),
+            LLMRouterModelConfig(
+                model_name="openai-flex-fallback",
+                litellm_params={"model": fallback_deployment_model},
+            ),
+        ],
+        main_model_group="openai-flex",
+        fallback_model_group="openai-flex-fallback",
+    )
+
+
+def test_supports_tool_choice_resolves_router_through_its_deployments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe must resolve a router's tool_choice support through its deployments' underlying
+    litellm models, not the router's own group name -- litellm knows nothing about the latter."""
+    router_config = _flex_fallback_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+
+    caller = LLMCaller("FLEX_FALLBACK_ROUTER")
+
+    assert caller.supports_tool_choice() is True
+    # Pins why the probe must go through model_list: asking litellm about the router's own group
+    # name denies every router, which would make the feature a no-op on the model it targets.
+    assert litellm.utils.supports_tool_choice(model=router_config.model_name) is False
+
+
+def test_supports_tool_choice_denies_router_when_any_deployment_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # litellm.Router validates every deployment's model string at construction time, so the
+    # "unsupported" deployment must be a real, recognized model (just one litellm knows doesn't
+    # take tool_choice) rather than a made-up string, which would blow up LLMCaller.__init__.
+    router_config = _flex_fallback_router(fallback_deployment_model="openai/gpt-3.5-turbo-instruct")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+
+    caller = LLMCaller("FLEX_FALLBACK_ROUTER_PARTIAL")
+
+    assert caller.supports_tool_choice() is False
+
+
+def test_supports_tool_choice_follows_dispatch_order_for_anthropic_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A router-backed key dispatches through litellm.Router, which forwards tool_choice, even when
+    # its name contains ANTHROPIC. Denying on the substring alone would silently disable the lever.
+    router_config = _flex_fallback_router()
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: router_config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    monkeypatch.setattr(api_handler_factory, "_build_litellm_router", lambda cfg: MagicMock())
+
+    assert LLMCaller("BEDROCK_ANTHROPIC_CLAUDE5_OPUS_WITH_FALLBACK").supports_tool_choice() is True
+
+    # A direct ANTHROPIC key reaches _call_anthropic, which builds its provider kwargs from an
+    # explicit allowlist and would discard the parameter while the run still reported it applied.
+    direct_config = LLMConfig(
+        model_name="anthropic/claude-sonnet-4-6",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: direct_config)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+
+    assert LLMCaller("ANTHROPIC_CLAUDE4.6_SONNET").supports_tool_choice() is False
+
+
+def test_supports_tool_choice_denies_unrecognized_direct_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    llm_config = _custom_llm_config("not-a-real-model-xyz")
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+
+    caller = LLMCaller("UNRECOGNIZED_DIRECT_MODEL")
+
+    assert caller.supports_tool_choice() is False
+
+
+@pytest.mark.asyncio
+async def test_call_drops_tool_choice_the_model_cannot_take(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The shared helper hardcodes model_name="gpt-4" and patches get_config, so the "supported"
+    # arm cannot reuse it and is built inline against a real tool_choice-capable model.
+    caller, _ = _stub_successful_llm_caller(monkeypatch)
+    monkeypatch.setattr(caller, "supports_tool_choice", lambda: False)
+
+    await caller.call(prompt="test", prompt_name="taskv3-agent-loop", tool_choice="required")
+
+    dispatch_kwargs = caller._dispatch_llm_call.await_args.kwargs
+    assert "tool_choice" not in dispatch_kwargs
+
+    supported_llm_config = LLMConfig(
+        model_name="gpt-4.1",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: supported_llm_config)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(
+        api_handler_factory,
+        "llm_messages_builder_with_history",
+        AsyncMock(return_value=[{"role": "user", "content": "test"}]),
+    )
+    supported_caller = LLMCaller("TEST_LLM_CALLER_SUPPORTED_TOOL_CHOICE")
+    monkeypatch.setattr(supported_caller, "_dispatch_llm_call", AsyncMock(return_value=FakeLLMResponse("gpt-4.1")))
+    monkeypatch.setattr(api_handler_factory, "parse_api_response", lambda *args: {"actions": []})
+    artifact_manager = MagicMock()
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+
+    await supported_caller.call(prompt="test", prompt_name="taskv3-agent-loop", tool_choice="required")
+
+    supported_dispatch_kwargs = supported_caller._dispatch_llm_call.await_args.kwargs
+    assert supported_dispatch_kwargs["tool_choice"] == "required"

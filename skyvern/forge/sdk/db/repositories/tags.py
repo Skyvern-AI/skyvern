@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagEventType, TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
+    assert_tag_value_not_reserved,
     is_reserved_tag_key,
     normalize_optional_system_tag_key,
     normalize_tag_value,
@@ -118,6 +119,7 @@ def _normalize_system_tag_sets(sets: dict[str, str]) -> dict[str, str]:
         normalized_value = normalize_tag_value(value)
         if normalized_value == "*":
             raise ValueError("system tag values must not be exactly '*'")
+        assert_tag_value_not_reserved(normalized_value)
         normalized[normalized_key] = normalized_value
     return normalized
 

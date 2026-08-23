@@ -3,28 +3,27 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import structlog.testing
 
 from skyvern.forge.sdk.copilot.context import (
-    FillCarry,
-    LoadedResultTargetContext,
+    ApprovedCredential,
     ObservedPage,
     StructuredContext,
-    _fill_carry_from_scout_trajectory,
+    _carried_trajectory_from_scout_trajectory,
+    _merge_carried_trajectory,
     _merge_observed_acted_pages,
-    finalize_discovery_counter_in_global_llm_context,
-    render_loaded_result_context_for_prompt,
+    adopt_model_authored_context,
+    build_model_safe_global_llm_context,
+    finalize_observation_context,
+    record_approved_credentials_in_global_llm_context,
     sanitize_global_llm_context_for_prompt,
 )
-from skyvern.forge.sdk.copilot.result_evidence import (
-    loaded_result_composition_evidence_from_page,
-    loaded_result_target_structure_signature,
-)
-from tests.unit.copilot_test_helpers import make_raw_loaded_result_context
+from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 
 
 @pytest.mark.parametrize(
@@ -91,368 +90,6 @@ def test_resolved_credential_ids_survive_context_roundtrip() -> None:
     assert [check.credential_id for check in rehydrated.credentials_checked] == ["cred_amazon"]
 
 
-def test_loaded_result_targets_roundtrip_without_selector_fields_or_legacy_signature() -> None:
-    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-    ctx = StructuredContext(
-        loaded_result_targets=[
-            LoadedResultTargetContext(
-                selector="#results",
-                is_table=True,
-                row_selector="tr.statement",
-                row_count=2,
-                structure_signature="legacy-selector-derived-sig",
-            )
-        ]
-    )
-
-    raw = ctx.to_json_str()
-    rehydrated = StructuredContext.from_json_str(ctx.to_json_str())
-
-    assert "#results" not in raw
-    assert "tr.statement" not in raw
-    assert "legacy-selector-derived-sig" not in raw
-    assert rehydrated.loaded_result_targets == [
-        LoadedResultTargetContext(
-            is_table=True,
-            row_count=2,
-            structure_signature=expected_signature,
-        )
-    ]
-
-
-def test_sanitize_global_llm_context_strips_loaded_result_selectors_and_recomputes_legacy_signature() -> None:
-    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-    raw = make_raw_loaded_result_context(include_user_goal=True, include_sample_rows=True)
-
-    sanitized = sanitize_global_llm_context_for_prompt(raw)
-
-    assert "Jane" not in sanitized
-    assert "Customer" not in sanitized
-    assert "123456" not in sanitized
-    assert "987654321" not in sanitized
-    assert "legacy-selector-derived-sig" not in sanitized
-    payload = json.loads(sanitized)
-    assert payload["loaded_result_targets"] == [
-        {
-            "is_table": True,
-            "row_count": 2,
-            "structure_signature": expected_signature,
-        }
-    ]
-
-
-def test_sanitize_global_llm_context_recomputes_legacy_signature_without_selector_keys() -> None:
-    expected_signature = loaded_result_target_structure_signature(is_table=True, row_count=2)
-    raw = json.dumps(
-        {
-            "user_goal": "extract loaded results",
-            "loaded_result_targets": [
-                {
-                    "is_table": True,
-                    "row_count": 2,
-                    "structure_signature": "legacy-selector-derived-sig",
-                }
-            ],
-        }
-    )
-
-    sanitized = sanitize_global_llm_context_for_prompt(raw)
-
-    assert "legacy-selector-derived-sig" not in sanitized
-    payload = json.loads(sanitized)
-    assert payload["loaded_result_targets"] == [
-        {
-            "is_table": True,
-            "row_count": 2,
-            "structure_signature": expected_signature,
-        }
-    ]
-
-
-def test_finalize_context_persists_latest_loaded_result_targets_sanitizes_selectors() -> None:
-    selector = '#account-123456-JaneCustomer-results[data-customer="Jane Customer"]'
-    row_selector = 'tr[data-account="987654321"]'
-    pii_steer = loaded_result_composition_evidence_from_page(
-        {
-            "result_containers": [
-                {
-                    "tag": "table",
-                    "selector": selector,
-                    "row_selector": row_selector,
-                    "row_count": 2,
-                    "sample_rows": ["May 2026 $42.00"],
-                    "text": "Statement results",
-                    "evidence_source": "evaluate",
-                    "observation_id": "obs-1",
-                }
-            ]
-        }
-    )
-    generic_steer = loaded_result_composition_evidence_from_page(
-        {
-            "result_containers": [
-                {
-                    "tag": "table",
-                    "selector": "#results",
-                    "row_selector": "tr.statement",
-                    "row_count": 2,
-                    "sample_rows": ["May 2026 $42.00"],
-                    "text": "Statement results",
-                    "evidence_source": "evaluate",
-                    "observation_id": "obs-1",
-                }
-            ]
-        }
-    )
-    assert pii_steer is not None
-    assert generic_steer is not None
-    assert pii_steer.structure_signature == generic_steer.structure_signature
-    assert pii_steer.targets[0].structure_signature == generic_steer.targets[0].structure_signature
-
-    ctx = SimpleNamespace(
-        prior_discovery_calls_made=0,
-        discovery_calls_this_turn=0,
-        prior_page_inspection_calls_made=0,
-        page_inspection_calls_this_turn=0,
-        flow_evidence=[],
-        latest_evaluate_result_composition_steer=pii_steer,
-    )
-
-    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
-
-    assert raw is not None
-    assert selector not in raw
-    assert row_selector not in raw
-    assert "Jane" not in raw
-    assert "Customer" not in raw
-    assert "123456" not in raw
-    assert "987654321" not in raw
-    assert "May 2026 $42.00" not in raw
-    assert "Statement results" not in raw
-    assert "evaluate" not in raw
-    assert "obs-1" not in raw
-    persisted_target = json.loads(raw)["loaded_result_targets"][0]
-    assert persisted_target == {
-        "is_table": True,
-        "row_count": 2,
-        "structure_signature": generic_steer.targets[0].structure_signature,
-    }
-    structured = StructuredContext.from_json_str(raw)
-    assert structured.loaded_result_targets == [
-        LoadedResultTargetContext(
-            is_table=True,
-            row_count=2,
-            structure_signature=generic_steer.targets[0].structure_signature,
-        )
-    ]
-
-
-def test_finalize_context_clears_stale_loaded_result_targets_when_no_current_steer() -> None:
-    stale_context = StructuredContext(
-        user_goal="extract loaded results",
-        loaded_result_targets=[
-            LoadedResultTargetContext(
-                is_table=True,
-                row_count=2,
-                structure_signature=loaded_result_target_structure_signature(is_table=True, row_count=2),
-            )
-        ],
-    )
-    ctx = SimpleNamespace(
-        prior_discovery_calls_made=1,
-        discovery_calls_this_turn=0,
-        prior_page_inspection_calls_made=0,
-        page_inspection_calls_this_turn=0,
-        flow_evidence=[],
-        latest_evaluate_result_composition_steer=None,
-    )
-
-    raw = finalize_discovery_counter_in_global_llm_context(ctx, stale_context.to_json_str())
-
-    assert raw is not None
-    payload = json.loads(raw)
-    assert payload["loaded_result_targets"] == []
-    assert StructuredContext.from_json_str(raw).loaded_result_targets == []
-    assert render_loaded_result_context_for_prompt(raw) == ""
-
-
-def test_fill_carry_from_scout_trajectory_scrubs_raw_values_and_credential_names() -> None:
-    carry = _fill_carry_from_scout_trajectory(
-        [
-            {
-                "tool_name": "type_text",
-                "selector": "#lookup",
-                "source_url": "https://example.com/form",
-                "typed_length": 8,
-                "typed_value": "SKU-1234",
-                "raw_typed_value": "not-persisted",
-                "role": "textbox",
-                "accessible_name": "Product search",
-            },
-            {
-                "tool_name": "fill_credential_field",
-                "selector": "#password",
-                "source_url": "https://example.com/form",
-                "typed_length": 10,
-                "credential_id": "cred_123",
-                "credential_field": "password",
-                "credential_name": "Saved Login",
-            },
-        ]
-    )
-
-    assert carry == [
-        FillCarry(
-            source_url="https://example.com/form",
-            selector="#lookup",
-            tool_name="type_text",
-            role="textbox",
-            accessible_name="Product search",
-            typed_length=8,
-            typed_value="SKU-1234",
-        ),
-        FillCarry(
-            source_url="https://example.com/form",
-            selector="#password",
-            tool_name="fill_credential_field",
-            typed_length=10,
-            credential_id="cred_123",
-            credential_field="password",
-        ),
-    ]
-    dumped = json.dumps([item.model_dump() for item in carry])
-    assert "not-persisted" not in dumped
-    assert "Saved Login" not in dumped
-
-
-def test_finalize_context_persists_fill_carry() -> None:
-    ctx = SimpleNamespace(
-        prior_discovery_calls_made=0,
-        discovery_calls_this_turn=0,
-        prior_page_inspection_calls_made=0,
-        page_inspection_calls_this_turn=0,
-        flow_evidence=[],
-        latest_evaluate_result_composition_steer=None,
-        scout_trajectory=[
-            {
-                "tool_name": "type_text",
-                "selector": "#search",
-                "source_url": "https://example.com/form",
-                "typed_length": 8,
-                "typed_value": "SKU-1234",
-            }
-        ],
-    )
-
-    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
-
-    assert raw is not None
-    parsed = StructuredContext.from_json_str(raw)
-    assert parsed.fill_carry == [
-        FillCarry(
-            source_url="https://example.com/form",
-            selector="#search",
-            tool_name="type_text",
-            typed_length=8,
-            typed_value="SKU-1234",
-        )
-    ]
-
-
-def test_fill_carry_records_credential_field_inventory() -> None:
-    carry = _fill_carry_from_scout_trajectory(
-        [
-            {
-                "tool_name": "fill_credential_field",
-                "selector": "#user",
-                "source_url": "https://portal.example.test/login",
-                "typed_length": 10,
-                "credential_id": "cred_123",
-                "credential_field": "username",
-            }
-        ],
-        credential_field_inventory={"cred_123": frozenset({"username", "password"})},
-    )
-
-    assert [item.available_fields for item in carry] == [["password", "username"]]
-
-
-def test_fill_carry_without_inventory_serializes_like_legacy_payload() -> None:
-    carry = _fill_carry_from_scout_trajectory(
-        [
-            {
-                "tool_name": "fill_credential_field",
-                "selector": "#user",
-                "source_url": "https://portal.example.test/login",
-                "credential_id": "cred_123",
-                "credential_field": "username",
-            }
-        ]
-    )
-
-    assert [item.available_fields for item in carry] == [None]
-    serialized = StructuredContext(fill_carry=carry).to_json_str()
-    assert "available_fields" not in serialized
-    legacy_round_trip = StructuredContext.from_json_str(serialized)
-    assert legacy_round_trip.fill_carry[0].available_fields is None
-
-
-def test_finalize_context_persists_credential_inventory_on_fill_carry() -> None:
-    ctx = SimpleNamespace(
-        prior_discovery_calls_made=0,
-        discovery_calls_this_turn=0,
-        prior_page_inspection_calls_made=0,
-        page_inspection_calls_this_turn=0,
-        flow_evidence=[],
-        latest_evaluate_result_composition_steer=None,
-        scout_trajectory=[
-            {
-                "tool_name": "fill_credential_field",
-                "selector": "#user",
-                "source_url": "https://portal.example.test/login",
-                "typed_length": 10,
-                "credential_id": "cred_123",
-                "credential_field": "username",
-            }
-        ],
-        scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
-    )
-
-    raw = finalize_discovery_counter_in_global_llm_context(ctx, None)
-
-    assert raw is not None
-    parsed = StructuredContext.from_json_str(raw)
-    assert parsed.fill_carry[0].available_fields == ["password", "username"]
-
-
-def test_finalize_context_clears_fill_carry_when_current_turn_has_no_fills() -> None:
-    inbound = StructuredContext(
-        fill_carry=[
-            FillCarry(
-                source_url="https://example.com/form",
-                selector="#search",
-                tool_name="type_text",
-                typed_length=8,
-                typed_value="SKU-1234",
-            )
-        ]
-    ).to_json_str()
-    ctx = SimpleNamespace(
-        prior_discovery_calls_made=0,
-        discovery_calls_this_turn=1,
-        prior_page_inspection_calls_made=0,
-        page_inspection_calls_this_turn=0,
-        flow_evidence=[],
-        latest_evaluate_result_composition_steer=None,
-        scout_trajectory=[{"tool_name": "click", "selector": "#go", "source_url": "https://example.com/form"}],
-    )
-
-    raw = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
-
-    assert raw is not None
-    assert StructuredContext.from_json_str(raw).fill_carry == []
-
-
 def test_merge_turn_summary_falls_back_to_summary_without_structured_credentials() -> None:
     ctx = StructuredContext()
     ctx.merge_turn_summary([{"tool": "list_credentials", "summary": "Found 0 credential(s)"}])
@@ -478,81 +115,95 @@ def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
         ],
     )
 
-    by_url = {page.url: page for page in pages}
-    assert by_url["https://example.com/cart"].had_bounded_schema is True
-    assert by_url["https://example.com/cart"].reached_via == "interaction"
+    cart_fingerprint = page_location_fingerprint("https://example.com/cart")
+    cart = next(page for page in pages if page.location_fingerprint == cart_fingerprint)
+    assert cart.url == "https://example.com/"
+    assert cart.had_bounded_schema is True
+    assert cart.reached_via == "interaction"
 
 
-@dataclass
-class _Ctx:
-    prior_discovery_calls_made: int = 0
-    discovery_calls_this_turn: int = 0
-
-
-def test_structured_context_default_discovery_calls_made_is_zero() -> None:
-    assert StructuredContext().discovery_calls_made == 0
-
-
-def test_structured_context_round_trip_preserves_discovery_calls_made() -> None:
-    sc = StructuredContext(user_goal="x", discovery_calls_made=2)
-    raw = sc.to_json_str()
-    parsed = StructuredContext.from_json_str(raw)
-    assert parsed.discovery_calls_made == 2
-
-
-def test_finalize_writes_summed_counter_into_outgoing_context() -> None:
-    inbound = StructuredContext(user_goal="x", discovery_calls_made=1).to_json_str()
-    ctx = _Ctx(prior_discovery_calls_made=1, discovery_calls_this_turn=1)
-    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
-    assert out is not None
-    sc = StructuredContext.from_json_str(out)
-    assert sc.discovery_calls_made == 2
-    assert sc.user_goal == "x"
-
-
-def test_finalize_writes_zero_when_no_calls_made_and_no_prior() -> None:
-    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=0)
-    # No prior context + no this-turn activity -> no need to invent a context.
-    assert finalize_discovery_counter_in_global_llm_context(ctx, None) is None
-
-
-def test_finalize_writes_prior_when_this_turn_is_zero_and_prior_context_exists() -> None:
-    inbound = StructuredContext(user_goal="g", discovery_calls_made=2).to_json_str()
-    ctx = _Ctx(prior_discovery_calls_made=2, discovery_calls_this_turn=0)
-    out = finalize_discovery_counter_in_global_llm_context(ctx, inbound)
-    assert out is not None
-    sc = StructuredContext.from_json_str(out)
-    assert sc.discovery_calls_made == 2
+def test_finalize_returns_none_without_context_or_observations() -> None:
+    assert finalize_observation_context(SimpleNamespace(), None) is None
 
 
 def test_finalize_handles_string_only_inbound_context() -> None:
-    """Legacy `global_llm_context` was a plain string. The migration path in
-    `StructuredContext.from_json_str` should preserve the string in
-    user_goal and zero the counter."""
-    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
-    out = finalize_discovery_counter_in_global_llm_context(ctx, "legacy string context")
+    out = finalize_observation_context(SimpleNamespace(), "legacy string context")
     assert out is not None
     sc = StructuredContext.from_json_str(out)
-    assert sc.discovery_calls_made == 1
     assert sc.user_goal == "legacy string context"
 
 
 def test_finalize_handles_invalid_json_inbound() -> None:
-    ctx = _Ctx(prior_discovery_calls_made=0, discovery_calls_this_turn=1)
-    out = finalize_discovery_counter_in_global_llm_context(ctx, "{not valid json")
+    out = finalize_observation_context(SimpleNamespace(), "{not valid json")
     assert out is not None
-    sc = StructuredContext.from_json_str(out)
-    assert sc.discovery_calls_made == 1
+    assert StructuredContext.from_json_str(out).user_goal == "{not valid json"
 
 
-def test_finalize_treats_none_ctx_as_passthrough_in_factory() -> None:
+_ENTRYPOINT_A = "http://localhost:8955/analytics_console/pathfold/?date_from=-7d"
+_ENTRYPOINT_B = "http://localhost:8955/analytics_console/other/"
+
+
+def test_structured_context_entrypoint_url_round_trips() -> None:
+    sc = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A)
+    parsed = StructuredContext.from_json_str(sc.to_json_str())
+    assert parsed.entrypoint_url == _ENTRYPOINT_A
+
+
+def test_structured_context_legacy_json_without_entrypoint_url_deserializes_to_none() -> None:
+    legacy = StructuredContext(user_goal="g").to_json_str()
+    assert '"entrypoint_url"' in legacy
+    stripped = json.loads(legacy)
+    del stripped["entrypoint_url"]
+    parsed = StructuredContext.from_json_str(json.dumps(stripped))
+    assert parsed.entrypoint_url is None
+
+
+def test_finalize_persists_resolved_entrypoint_url_on_entrypoint_only_turn() -> None:
+    ctx = SimpleNamespace(
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_observation_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_cancel_arm_persists_entrypoint_never_none() -> None:
+    ctx = SimpleNamespace(
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_A,
+    )
+    out = finalize_observation_context(ctx, None)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_keeps_persisted_entrypoint_when_turn_resolves_nothing() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        resolved_discovery_entrypoint_url=None,
+    )
+    out = finalize_observation_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_A
+
+
+def test_finalize_in_turn_entrypoint_overwrites_persisted_slot() -> None:
+    inbound = StructuredContext(user_goal="g", entrypoint_url=_ENTRYPOINT_A).to_json_str()
+    ctx = SimpleNamespace(
+        resolved_discovery_entrypoint_url=_ENTRYPOINT_B,
+    )
+    out = finalize_observation_context(ctx, inbound)
+    assert out is not None
+    assert StructuredContext.from_json_str(out).entrypoint_url == _ENTRYPOINT_B
+
+
+def test_structured_context_round_trip_preserves_observation_count() -> None:
     """The factory in agent.py passes ctx=None for very-early errors (before
     CopilotContext is constructed). The finalizer itself isn't called in that
     branch — _make_agent_result skips it — but verify that the StructuredContext
-    round-trip itself still preserves a counter set by an earlier turn."""
-    inbound = StructuredContext(discovery_calls_made=2).to_json_str()
+    round-trip itself still preserves observations from an earlier turn."""
+    inbound = StructuredContext(page_inspection_calls_made=2).to_json_str()
     parsed = json.loads(inbound)
-    assert parsed["discovery_calls_made"] == 2
+    assert parsed["page_inspection_calls_made"] == 2
 
 
 class TestCopilotContext:
@@ -571,16 +222,9 @@ class TestCopilotContext:
         enforcement_fields = {
             "navigate_called",
             "observation_after_navigate",
-            "navigate_enforcement_done",
             "update_workflow_called",
             "test_after_update_done",
-            "post_update_nudge_count",
-            "coverage_nudge_count",
-            "format_nudge_count",
-            "explore_without_workflow_nudge_count",
             "user_message",
-            "consecutive_tool_tracker",
-            "failed_tool_step_tracker",
             "tool_activity",
             "last_workflow",
             "last_workflow_yaml",
@@ -603,17 +247,12 @@ class TestCopilotContext:
         )
         assert ctx.navigate_called is False
         assert ctx.update_workflow_called is False
-        assert ctx.coverage_nudge_count == 0
-        assert ctx.format_nudge_count == 0
-        assert ctx.explore_without_workflow_nudge_count == 0
         assert ctx.user_message == ""
-        assert ctx.consecutive_tool_tracker == []
-        assert ctx.failed_tool_step_tracker == {}
         assert ctx.tool_activity == []
         assert ctx.last_workflow is None
         assert ctx.workflow_persisted is False
 
-    def test_has_frontier_and_repeated_failure_fields(self) -> None:
+    def test_has_frontier_fields(self) -> None:
         import dataclasses
 
         from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -623,16 +262,16 @@ class TestCopilotContext:
             "verified_block_outputs",
             "verified_prefix_labels",
             "verified_prefix_current_url",
+            "verified_prefix_block_end_urls",
+            "verified_prefix_block_end_session_id",
+            "verified_prefix_terminal_label",
+            "frontier_resume_session_id",
             "last_run_blocks_workflow_run_id",
             "last_requested_block_labels",
             "last_executed_block_labels",
             "last_full_workflow_test_ok",
             "last_unverified_block_labels",
             "last_frontier_start_label",
-            "last_frontier_fingerprint",
-            "last_failure_signature",
-            "repeated_failure_streak_count",
-            "repeated_failure_nudge_emitted_at_streak",
         }
         missing = frontier_fields - field_names
         assert not missing, f"Missing frontier/failure fields: {missing}"
@@ -652,13 +291,525 @@ class TestCopilotContext:
         assert ctx.verified_block_outputs == {}
         assert ctx.verified_prefix_labels == []
         assert ctx.verified_prefix_current_url is None
+        assert ctx.verified_prefix_block_end_urls == {}
+        assert ctx.verified_prefix_block_end_session_id is None
+        assert ctx.verified_prefix_terminal_label is None
+        assert ctx.frontier_resume_session_id is None
         assert ctx.last_run_blocks_workflow_run_id is None
         assert ctx.last_requested_block_labels == []
         assert ctx.last_executed_block_labels == []
         assert ctx.last_full_workflow_test_ok is False
         assert ctx.last_unverified_block_labels == []
         assert ctx.last_frontier_start_label is None
-        assert ctx.last_frontier_fingerprint is None
-        assert ctx.last_failure_signature is None
-        assert ctx.repeated_failure_streak_count == 0
-        assert ctx.repeated_failure_nudge_emitted_at_streak == 0
+
+
+def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
+    return SimpleNamespace(
+        credential_pause_connected_credential_id=None,
+        request_policy=SimpleNamespace(
+            resolved_credentials=resolved,
+            credential_input_kind=credential_input_kind,
+            live_page_admitted_urls={},
+        ),
+    )
+
+
+def test_record_approved_credentials_persists_resolved_ids() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert records == [ApprovedCredential(credential_id="cred_portal")]
+
+
+def test_record_approved_credentials_is_idempotent_across_turns() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    first = record_approved_credentials_in_global_llm_context(ctx, None)
+    second = record_approved_credentials_in_global_llm_context(ctx, first)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(second).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_record_approved_credentials_caps_at_twenty() -> None:
+    prior = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id=f"cred_{i}") for i in range(20)]
+    ).to_json_str()
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_new", name="")])
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, prior)
+
+    records = StructuredContext.from_json_str(raw).approved_credentials
+    assert len(records) == 20
+    assert records[-1].credential_id == "cred_new"
+    assert "cred_0" not in {record.credential_id for record in records}
+
+
+def test_record_approved_credentials_survive_prompt_sanitization() -> None:
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+
+    recorded = record_approved_credentials_in_global_llm_context(ctx, None)
+    sanitized = sanitize_global_llm_context_for_prompt(recorded)
+
+    ids = [record.credential_id for record in StructuredContext.from_json_str(sanitized).approved_credentials]
+    assert ids == ["cred_portal"]
+
+
+def test_approved_credentials_survive_redaction_with_carried_password_label() -> None:
+    raw = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id="cred_portal")],
+        carried_trajectory=[{"tool_name": "fill", "selector": "#Password", "label": "Password:", "carried": True}],
+    ).to_json_str()
+
+    safe = build_model_safe_global_llm_context(raw)
+
+    json.loads(safe)
+    parsed = StructuredContext.from_json_str(safe)
+    assert [record.credential_id for record in parsed.approved_credentials] == ["cred_portal"]
+    assert parsed.carried_trajectory[0]["label"] == "Password:"
+
+
+def test_structured_redaction_removes_secret_values_and_preserves_structure() -> None:
+    secret_assignment = "password: hunter2-portal-secret"
+    api_key = "sk-" + "a" * 20
+    raw = StructuredContext(
+        user_goal=f"log in with {secret_assignment}",
+        approved_credentials=[ApprovedCredential(credential_id="cred_portal")],
+        carried_trajectory=[{"label": "Password:", "note": f"api_key={api_key}"}],
+    ).to_json_str()
+
+    safe = redact_raw_secrets_for_structured_prompt(raw)
+
+    assert "hunter2-portal-secret" not in safe
+    assert api_key not in safe
+    assert "[REDACTED_SECRET]" in safe
+    parsed = StructuredContext.from_json_str(safe)
+    assert [record.credential_id for record in parsed.approved_credentials] == ["cred_portal"]
+
+
+def test_structured_redaction_falls_back_to_lexical_for_non_json() -> None:
+    assert redact_raw_secrets_for_structured_prompt("password: hunter2") == "[REDACTED_SECRET]"
+    assert redact_raw_secrets_for_structured_prompt("") == ""
+
+
+def test_ordinary_field_labels_survive_structured_redaction() -> None:
+    raw = StructuredContext(
+        carried_trajectory=[{"label": "Password:"}, {"label": "Username:"}, {"label": "Email:"}]
+    ).to_json_str()
+
+    parsed = StructuredContext.from_json_str(redact_raw_secrets_for_structured_prompt(raw))
+
+    assert [entry["label"] for entry in parsed.carried_trajectory] == ["Password:", "Username:", "Email:"]
+
+
+def test_malformed_structured_context_fallback_logs_a_fingerprint() -> None:
+    broken = '{"user_goal": "x", "approved_credentials": ['
+
+    with structlog.testing.capture_logs() as logs:
+        parsed = StructuredContext.from_json_str(broken)
+
+    assert parsed.approved_credentials == []
+    assert parsed.user_goal == broken
+    events = [entry for entry in logs if entry.get("event") == "structured_context_parse_failed"]
+    assert len(events) == 1
+    assert events[0]["raw_length"] == len(broken)
+    assert broken not in str(events[0].values())
+
+
+def test_a_live_page_grant_does_not_carry_into_a_later_turn() -> None:
+    """The evidence is a page a later turn has not seen, whichever seam admitted it."""
+    ctx = _policy_ctx([SimpleNamespace(credential_id="cred_portal", name="mock-portal-login")])
+    ctx.request_policy.live_page_admitted_urls = {"cred_portal": "https://portal.example.com/login"}
+
+    raw = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    assert StructuredContext.from_json_str(raw).approved_credentials == []
+
+
+def test_record_approved_credentials_no_ops_without_resolved() -> None:
+    assert record_approved_credentials_in_global_llm_context(_policy_ctx([]), None) is None
+    assert record_approved_credentials_in_global_llm_context(SimpleNamespace(request_policy=None), "prior") == "prior"
+
+
+def test_model_authored_context_cannot_introduce_approved_credentials() -> None:
+    # Org membership is not evidence the user named a credential: an entry the model
+    # supplies must not survive into the recorded set, or the next turn would promote
+    # it into resolved_credentials and clear the unapproved-credential gate.
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+    model_authored = {
+        "user_goal": "log in",
+        "approved_credentials": [{"credential_id": "cred_never_named"}],
+    }
+
+    adopted = adopt_model_authored_context(trusted, model_authored)
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+    assert adopted.user_goal == "log in"
+
+
+def test_model_authored_context_cannot_drop_a_server_recorded_approval() -> None:
+    trusted = StructuredContext(approved_credentials=[ApprovedCredential(credential_id="cred_named")]).to_json_str()
+
+    adopted = adopt_model_authored_context(trusted, {"user_goal": "x", "approved_credentials": []})
+
+    assert [r.credential_id for r in adopted.approved_credentials] == ["cred_named"]
+
+
+def test_model_authored_context_cannot_introduce_a_carried_interaction() -> None:
+    # The record says what the browser was observed doing. An entry the model wrote would
+    # enter it as an observation nothing made, and downstream reads it as scouted fact.
+    trusted = StructuredContext(
+        carried_trajectory=[{"tool_name": "click", "selector": "#real", "carried": True}]
+    ).to_json_str()
+
+    adopted = adopt_model_authored_context(
+        trusted,
+        {
+            "user_goal": "log in",
+            "carried_trajectory": [
+                {"tool_name": "click", "selector": "#real", "carried": True},
+                {"tool_name": "read_value", "read_result_value": "9.42K", "carried": True},
+            ],
+        },
+    )
+
+    assert [entry["selector"] for entry in adopted.carried_trajectory] == ["#real"]
+
+
+def test_model_authored_context_cannot_displace_the_observed_record() -> None:
+    # Turn-end merge treats whatever arrives as the prior record and skips this turn's
+    # re-hydrated carried entries against it, so an adopted model list would survive and
+    # the observed one would not.
+    trusted = StructuredContext(
+        carried_trajectory=[{"tool_name": "fill_credential_field", "selector": "#email", "carried": True}]
+    ).to_json_str()
+
+    adopted = adopt_model_authored_context(trusted, {"carried_trajectory": []})
+
+    assert [entry["selector"] for entry in adopted.carried_trajectory] == ["#email"]
+
+
+def test_model_authored_free_text_context_is_preserved_without_approvals() -> None:
+    adopted = adopt_model_authored_context(None, "just some prose the model emitted")
+
+    assert adopted.user_goal == "just some prose the model emitted"
+    assert adopted.approved_credentials == []
+
+
+def test_carried_trajectory_from_scout_trajectory_scrubs_raw_values() -> None:
+    """Successor to ..._scrubs_raw_values_and_credential_names (SKY-13617).
+
+    The credential-name half pinned a disclosure rule at the wrong boundary: the next turn
+    is the same model, same chat, same user. Only the two fields ScoutedInteraction declares
+    turn-ephemeral are withheld. The durable-artifact seam still has its own checks.
+    """
+    carry = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "type_text",
+                "selector": "#lookup",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "input_id": "inp_sku",
+                "input_value": "not-persisted",
+                "role": "textbox",
+                "accessible_name": "Product search",
+            },
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "source_url": "https://example.com/form",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "password",
+                "credential_name": "Saved Login",
+            },
+        ]
+    )
+
+    assert [(entry["tool_name"], entry["selector"]) for entry in carry] == [
+        ("type_text", "#lookup"),
+        ("fill_credential_field", "#password"),
+    ]
+    assert carry[0]["input_id"] == "inp_sku"
+    assert carry[1]["credential_id"] == "cred_123"
+    assert "not-persisted" not in json.dumps(carry)
+
+
+def test_finalize_context_persists_carried_trajectory() -> None:
+    ctx = SimpleNamespace(
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        scout_trajectory=[
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/form",
+                "typed_length": 8,
+                "input_id": "inp_sku",
+            }
+        ],
+    )
+
+    raw = finalize_observation_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.carried_trajectory == [
+        {
+            "tool_name": "type_text",
+            "selector": "#search",
+            "source_url": "https://example.com/form",
+            "typed_length": 8,
+            "input_id": "inp_sku",
+        }
+    ]
+
+
+def test_carried_trajectory_records_credential_field_inventory() -> None:
+    carry = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        credential_field_inventory={"cred_123": frozenset({"username", "password"})},
+    )
+
+    assert [item.get("available_fields") for item in carry] == [["password", "username"]]
+
+
+def test_carried_trajectory_without_inventory_serializes_like_legacy_payload() -> None:
+    carry = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ]
+    )
+
+    assert [item.get("available_fields") for item in carry] == [None]
+    serialized = StructuredContext(carried_trajectory=carry).to_json_str()
+    assert "available_fields" not in serialized
+    legacy_round_trip = StructuredContext.from_json_str(serialized)
+    assert legacy_round_trip.carried_trajectory[0].get("available_fields") is None
+
+
+def test_finalize_context_persists_credential_inventory_on_carried_trajectory() -> None:
+    ctx = SimpleNamespace(
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        scout_trajectory=[
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#user",
+                "source_url": "https://portal.example.test/login",
+                "typed_length": 10,
+                "credential_id": "cred_123",
+                "credential_field": "username",
+            }
+        ],
+        scouted_credential_field_inventory_by_credential_id={"cred_123": frozenset({"username", "password"})},
+    )
+
+    raw = finalize_observation_context(ctx, None)
+
+    assert raw is not None
+    parsed = StructuredContext.from_json_str(raw)
+    assert parsed.carried_trajectory[0].get("available_fields") == ["password", "username"]
+
+
+def test_finalize_context_retains_prior_record_when_current_turn_has_no_fills() -> None:
+    """Successor to test_finalize_context_clears_fill_carry_when_current_turn_has_no_fills (SKY-13617).
+
+    That test pinned the decision that a turn without fills discards the record. It is the
+    zero-fill loss: the click survives nothing and the prior fill is dropped by a turn that
+    never touched it. The record now merges instead, so both cross the boundary.
+    """
+    inbound = StructuredContext(
+        carried_trajectory=[
+            {
+                "source_url": "https://example.com/form",
+                "selector": "#search",
+                "tool_name": "type_text",
+                "typed_length": 8,
+                "input_id": "inp_sku",
+            }
+        ]
+    ).to_json_str()
+    ctx = SimpleNamespace(
+        prior_page_inspection_calls_made=0,
+        page_inspection_calls_this_turn=0,
+        flow_evidence=[],
+        scout_trajectory=[{"tool_name": "click", "selector": "#go", "source_url": "https://example.com/form"}],
+    )
+
+    raw = finalize_observation_context(ctx, inbound)
+
+    assert raw is not None
+    carried = StructuredContext.from_json_str(raw).carried_trajectory
+    assert [(entry["tool_name"], entry["selector"]) for entry in carried] == [
+        ("type_text", "#search"),
+        ("click", "#go"),
+    ]
+
+
+def test_carried_trajectory_keeps_genuinely_repeated_interactions() -> None:
+    """A banner dismissed twice, or the same value read twice, is two interactions.
+
+    Found by replaying real captured records through the boundary: matching entries on
+    content collapsed the repeats and silently shortened the record.
+    """
+    interaction = {
+        "tool_name": "click",
+        "selector": "#onetrust-reject-all-handler",
+        "source_url": "https://example.com/login",
+    }
+    read = {"tool_name": "read_value", "source_url": "https://example.com/login"}
+
+    carried = _carried_trajectory_from_scout_trajectory([interaction, read, read, interaction])
+
+    assert [entry["tool_name"] for entry in carried] == ["click", "read_value", "read_value", "click"]
+
+
+def test_carried_trajectory_does_not_double_the_record_it_was_seeded_with() -> None:
+    """Hydration seeds this turn with the retained record; finalizing must not re-append it."""
+    prior = [{"tool_name": "click", "selector": "#a", "source_url": "https://example.com/"}]
+    this_turn = [
+        {"tool_name": "click", "selector": "#a", "source_url": "https://example.com/", "carried": True},
+        {"tool_name": "read_value", "source_url": "https://example.com/"},
+    ]
+
+    merged = _merge_carried_trajectory(prior, this_turn)
+
+    assert [entry["tool_name"] for entry in merged] == ["click", "read_value"]
+
+
+def test_carried_trajectory_admits_every_tool_not_just_fills() -> None:
+    carried = _carried_trajectory_from_scout_trajectory(
+        [
+            {"tool_name": "navigate", "source_url": "https://example.com/"},
+            {"tool_name": "click", "selector": "#reject-cookies", "source_url": "https://example.com/"},
+            {"tool_name": "read_value", "selector": "#total", "source_url": "https://example.com/bill"},
+            {"tool_name": "press_key", "selector": "#q", "source_url": "https://example.com/", "key": "Enter"},
+        ]
+    )
+
+    assert [entry["tool_name"] for entry in carried] == ["navigate", "click", "read_value", "press_key"]
+    assert carried[3]["key"] == "Enter"
+
+
+def test_carried_trajectory_drops_only_the_turn_ephemeral_fields() -> None:
+    """The two declared turn-ephemeral values are withheld; the input identity crosses.
+
+    ``input_value`` is the private same-turn literal and ``read_result_value`` the scalar a
+    read returned. ``input_id`` is the secret-safe identity the model already sees, so it
+    travels with the rest of the record.
+    """
+    carried = _carried_trajectory_from_scout_trajectory(
+        [
+            {
+                "tool_name": "fill_credential_field",
+                "selector": "#password",
+                "source_url": "https://example.com/login",
+                "credential_id": "cred_123",
+                "credential_field": "password",
+                "input_id": "inp_7f2a",
+                "input_value": "hunter2",
+                "read_result_value": "3927.75",
+                "a_field_invented_after_this_ticket": "carried anyway",
+            }
+        ]
+    )
+
+    assert len(carried) == 1
+    assert carried[0]["input_id"] == "inp_7f2a"
+    assert "input_value" not in carried[0]
+    assert "read_result_value" not in carried[0]
+    assert carried[0]["a_field_invented_after_this_ticket"] == "carried anyway"
+    assert carried[0]["credential_id"] == "cred_123"
+
+
+def test_legacy_fill_carry_payload_does_not_re_emit_the_retired_literal() -> None:
+    """A chat persisted before the record exposed input identities still holds typed_value."""
+    legacy = json.dumps(
+        {
+            "fill_carry": [
+                {
+                    "source_url": "https://example.com/form",
+                    "selector": "#search",
+                    "tool_name": "type_text",
+                    "typed_length": 8,
+                    "input_id": "inp_sku",
+                }
+            ]
+        }
+    )
+
+    parsed = StructuredContext.from_json_str(legacy)
+
+    assert [entry["tool_name"] for entry in parsed.carried_trajectory] == ["type_text"]
+    assert "typed_value" not in parsed.carried_trajectory[0]
+    assert "SKU-1234" not in parsed.to_json_str()
+
+
+def test_inbound_payload_cannot_reintroduce_the_turn_ephemeral_pair() -> None:
+    # Outbound never writes these, so an inbound entry holding one is a stale payload putting
+    # the private literal back into a record whose whole point is the secret-safe identity.
+    stale = json.dumps(
+        {
+            "carried_trajectory": [
+                {
+                    "source_url": "https://example.com/login",
+                    "selector": "#password",
+                    "tool_name": "type_text",
+                    "input_id": "inp_pw",
+                    "input_value": "hunter2",
+                    "read_result_value": "9.42K",
+                }
+            ]
+        }
+    )
+
+    parsed = StructuredContext.from_json_str(stale)
+
+    entry = parsed.carried_trajectory[0]
+    assert entry["input_id"] == "inp_pw"
+    assert "input_value" not in entry
+    assert "read_result_value" not in entry
+    assert "hunter2" not in parsed.to_json_str()
+
+
+def test_legacy_fill_carry_payload_still_loads() -> None:
+    legacy = json.dumps(
+        {
+            "fill_carry": [
+                {
+                    "source_url": "https://example.com/form",
+                    "selector": "#search",
+                    "tool_name": "type_text",
+                    "typed_length": 8,
+                    "input_id": "inp_sku",
+                }
+            ]
+        }
+    )
+
+    parsed = StructuredContext.from_json_str(legacy)
+
+    assert [(entry["tool_name"], entry["selector"]) for entry in parsed.carried_trajectory] == [
+        ("type_text", "#search")
+    ]

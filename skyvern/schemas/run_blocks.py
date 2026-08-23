@@ -1,15 +1,17 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing_extensions import Self
 
 from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.credential_type import CredentialType
 from skyvern.schemas.proxy_location import ProxyLocation
+from skyvern.utils.url_validators import WebhookUrl
 
 
 class BaseRunBlockRequest(BaseModel):
     """Base class for run block requests with common browser automation parameters"""
 
     url: str | None = Field(default=None, description="Website URL")
-    webhook_url: str | None = Field(default=None, description="Webhook URL to send status updates")
+    webhook_url: WebhookUrl | None = Field(default=None, description="Webhook URL to send status updates")
     proxy_location: ProxyLocation | None = Field(default=None, description="Proxy location to use")
     totp_identifier: str | None = Field(
         default=None, description="Identifier for TOTP (Time-based One-Time Password) if required"
@@ -23,6 +25,14 @@ class BaseRunBlockRequest(BaseModel):
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this run",
+    )
+    start_fresh_browser: bool = Field(
+        default=False,
+        description=(
+            "When true, start this run from a fresh, empty browser and ignore any saved browser "
+            "memory — no memory is read or written. A verified sign-in during the run still updates "
+            "the credential's saved login."
+        ),
     )
     browser_address: str | None = Field(
         default=None,
@@ -42,6 +52,33 @@ class BaseRunBlockRequest(BaseModel):
     max_screenshot_scrolling_times: MaxScreenshotScrolls = Field(
         default=None, description="Maximum number of times to scroll for screenshots"
     )
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_session(self) -> Self:
+        if self.start_fresh_browser and self.browser_session_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_session_id — "
+                "a live session is the browser for the run."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_profile(self) -> Self:
+        if self.start_fresh_browser and self.browser_profile_id:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_profile_id — "
+                "pick one: a fresh browser or a specific profile."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_start_fresh_with_address(self) -> Self:
+        if self.start_fresh_browser and self.browser_address:
+            raise ValueError(
+                "start_fresh_browser cannot be combined with browser_address — "
+                "connecting to an existing remote browser reuses its session state."
+            )
+        return self
 
 
 class LoginRequest(BaseRunBlockRequest):

@@ -12,18 +12,20 @@ from __future__ import annotations
 import asyncio
 import datetime
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
 import structlog
-from google.auth.exceptions import GoogleAuthError
+from google.auth.exceptions import GoogleAuthError, RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.cache.base import AsyncLock, NoopLock
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.id import generate_google_oauth_credential_id
 
@@ -45,6 +47,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthClientConfigSafe,
     GoogleOAuthCredentialBase,
 )
+from skyvern.forge.sdk.services import oauth_consent
 from skyvern.forge.sdk.settings_manager import SettingsManager
 
 LOG = structlog.get_logger()
@@ -55,11 +58,10 @@ GOOGLE_REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 
 # Spreadsheets + Drive scopes for the picker UX:
 # - spreadsheets: read/write sheet cells and create new spreadsheets
-# - drive.file: list/read spreadsheets this integration created or the user picked
 # - drive.metadata.readonly: list file metadata (required for the picker search)
+GOOGLE_SHEETS_DATA_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
+    GOOGLE_SHEETS_DATA_SCOPE,
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 )
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -78,10 +80,37 @@ GOOGLE_OAUTH_SCOPE_PROFILES: dict[str, tuple[str, ...]] = {
 }
 
 CONSENT_TTL_SECONDS = 600
+GOOGLE_ACCESS_TOKEN_CACHE_LOCK_TIMEOUT_SECONDS = 120
+GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS = 125
 
 
 def google_access_token_cache_key(organization_id: str, credential_id: str) -> str:
     return f"google:access_token:{organization_id}:{credential_id}"
+
+
+def google_access_token_cache_lock_key(organization_id: str, credential_id: str) -> str:
+    return f"{google_access_token_cache_key(organization_id, credential_id)}:lock"
+
+
+def google_access_token_cache_lock(organization_id: str, credential_id: str) -> AsyncLock:
+    get_lock = getattr(app.CACHE, "get_lock", None)
+    lock_name = google_access_token_cache_lock_key(organization_id, credential_id)
+    if get_lock is None:
+        return NoopLock(lock_name)
+    return get_lock(
+        lock_name,
+        blocking_timeout=GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS,
+        timeout=GOOGLE_ACCESS_TOKEN_CACHE_LOCK_TIMEOUT_SECONDS,
+    )
+
+
+async def invalidate_google_access_token_cache(organization_id: str, credential_id: str) -> None:
+    async with google_access_token_cache_lock(organization_id, credential_id):
+        await app.CACHE.set(
+            google_access_token_cache_key(organization_id, credential_id),
+            "",
+            ex=datetime.timedelta(seconds=30),
+        )
 
 
 class EncryptionNotConfiguredError(RuntimeError):
@@ -90,6 +119,22 @@ class EncryptionNotConfiguredError(RuntimeError):
 
 class MissingAccessTokenError(RuntimeError):
     """Raised when Google returns a 2xx token response without an access_token."""
+
+
+class ExpiredRefreshTokenError(MissingAccessTokenError):
+    """Raised when Google rejects the stored refresh token (invalid_grant) because it was revoked
+    or expired. Subclasses ``MissingAccessTokenError`` so existing reconnect handling still catches
+    it, while letting callers flip the credential to a "needs reconnect" state on this signal alone
+    (as opposed to a transient transport error)."""
+
+
+class RotatedRefreshTokenPersistenceError(RuntimeError):
+    pass
+
+
+class CredentialNotReauthorizableError(ValueError):
+    """Raised when an in-place re-auth targets a credential that does not exist for the org or is
+    not in a re-authorizable (active/error) state."""
 
 
 class InvalidRedirectURIError(ValueError):
@@ -116,6 +161,13 @@ class OrganizationClientConfigUnavailableError(RuntimeError):
     """Raised when a stored org OAuth client config exists (or cannot be ruled out) but cannot be loaded."""
 
 
+def _is_invalid_grant(exc: RefreshError) -> bool:
+    for detail in exc.args:
+        if isinstance(detail, Mapping):
+            return detail.get("error") == "invalid_grant"
+    return bool(exc.args and isinstance(exc.args[0], str) and exc.args[0].split(":", 1)[0] == "invalid_grant")
+
+
 @dataclass(frozen=True)
 class GoogleCredentialSecrets:
     """Decrypted credential material needed to mint an access token."""
@@ -123,6 +175,14 @@ class GoogleCredentialSecrets:
     refresh_token: str
     scopes: list[str] = field(default_factory=list)
     client_id: str | None = None
+    credential_version: datetime.datetime | None = None
+    encrypted_refresh_token: str | None = None
+
+
+@dataclass(frozen=True)
+class GoogleRefreshResult:
+    access_token: str
+    credential_version: datetime.datetime | None
 
 
 @dataclass(frozen=True)
@@ -436,7 +496,6 @@ def build_authorize_url(
     url, _returned_state = flow.authorization_url(
         access_type="offline",
         prompt="consent",
-        include_granted_scopes="true",
     )
     # Flow.code_verifier is None when autogenerate is False AND we didn't set
     # it; that path is unreachable here, but raise (not assert) so a future
@@ -459,8 +518,16 @@ async def start_authorization(
     scopes_requested: str | list[str] | tuple[str, ...] | None = None,
     scope_profile: str | None = None,
     app_origin: str | None = None,
+    credential_id: str | None = None,
+    initiator_id: str | None = None,
 ) -> GoogleAuthorizationStart:
-    """Insert a pending consent row, build the authorize URL, persist the PKCE verifier."""
+    """Start the consent flow, build the authorize URL, and persist the PKCE verifier.
+
+    When ``credential_id`` is provided, re-authorize that existing connection in place: the fresh
+    consent challenge is stamped onto the same row (keeping its live token working) and the callback
+    promotes it back to active, so the credential id — and every workflow referencing it — is
+    preserved. Otherwise a new pending credential is created.
+    """
     _require_encryption()
     resolved_config = await resolve_client_config(organization_id)
     if resolved_config.config is None:
@@ -469,52 +536,82 @@ async def start_authorization(
     if app_origin is not None:
         _validate_app_origin(app_origin, resolved_config.config)
 
-    credential_id = generate_google_oauth_credential_id()
-    nonce = secrets.token_urlsafe(32)
+    state = oauth_consent.generate_consent_state()
+    nonce = oauth_consent.consent_nonce(state, initiator_id)
     # Pre-generate the PKCE verifier so the pending row lands with the verifier
     # populated in a single DB write — a crash mid-flow can no longer leave a
     # pending row that the callback would see as missing the verifier.
     code_verifier = secrets.token_urlsafe(64)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-    requested_scopes = (
-        scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
-    )
+    consent_expires_at = now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS)
 
-    await app.DATABASE.google_oauth.insert_pending_credential(
-        credential_id=credential_id,
-        organization_id=organization_id,
-        credential_name=credential_name,
-        scopes_requested=requested_scopes,
-        consent_nonce=nonce,
-        consent_redirect_uri=redirect_uri,
-        consent_expires_at=now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS),
-        consent_app_origin=app_origin,
-        consent_code_verifier=code_verifier,
-        client_id=resolved_config.config.client_id,
-    )
+    if credential_id is not None:
+        # Re-request the scopes originally granted to this connection unless the caller overrides,
+        # so the reconnected credential stays usable by the same workflow blocks.
+        if scope_profile is not None:
+            requested_scopes_override = scopes_for_profile(scope_profile)
+        elif scopes_requested is not None:
+            requested_scopes_override = _coerce_scopes(scopes_requested)
+        else:
+            requested_scopes_override = None
+        reauth = await app.DATABASE.google_oauth.begin_reauthorization(
+            credential_id=credential_id,
+            organization_id=organization_id,
+            consent_nonce=nonce,
+            consent_redirect_uri=redirect_uri,
+            consent_expires_at=consent_expires_at,
+            consent_code_verifier=code_verifier,
+            now=now,
+            consent_app_origin=app_origin,
+            client_id=resolved_config.config.client_id,
+            requested_scopes=requested_scopes_override,
+            fallback_scopes=list(GOOGLE_SHEETS_SCOPES),
+        )
+        if reauth is None:
+            raise CredentialNotReauthorizableError("Google OAuth credential not found or not in a reconnectable state")
+        requested_scopes = _coerce_scopes(reauth.scopes_requested or reauth.scopes_granted)
+    else:
+        credential_id = generate_google_oauth_credential_id()
+        requested_scopes = (
+            scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
+        )
+        await app.DATABASE.google_oauth.insert_pending_credential(
+            credential_id=credential_id,
+            organization_id=organization_id,
+            credential_name=credential_name,
+            scopes_requested=requested_scopes,
+            consent_nonce=nonce,
+            consent_redirect_uri=redirect_uri,
+            consent_expires_at=consent_expires_at,
+            consent_app_origin=app_origin,
+            consent_code_verifier=code_verifier,
+            client_id=resolved_config.config.client_id,
+        )
 
     authorize_url, _ = build_authorize_url(
         redirect_uri=redirect_uri,
-        state=nonce,
+        state=state,
         scopes=requested_scopes,
         code_verifier=code_verifier,
         client_config=resolved_config.config,
     )
 
-    return GoogleAuthorizationStart(authorize_url=authorize_url, state=nonce)
+    return GoogleAuthorizationStart(authorize_url=authorize_url, state=state)
 
 
 async def promote_pending_credential(
     organization_id: str,
-    nonce: str,
+    state: str,
+    initiator_id: str | None,
     refresh_token: str,
     scopes_granted: str | list[str] | tuple[str, ...] | None,
 ) -> GoogleOAuthCredentialBase:
     """Encrypt the refresh token and promote the matching pending row to active."""
+    nonce = oauth_consent.consent_nonce(state, initiator_id)
     _require_encryption()
     encrypted_token = await encryptor.encrypt(refresh_token, EncryptMethod.AES)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-    return await app.DATABASE.google_oauth.promote_pending_to_active(
+    credential = await app.DATABASE.google_oauth.promote_pending_to_active(
         organization_id=organization_id,
         nonce=nonce,
         encrypted_refresh_token=encrypted_token,
@@ -522,13 +619,69 @@ async def promote_pending_credential(
         scopes_granted=_coerce_scopes(scopes_granted),
         now=now,
     )
+    # On a re-auth the credential id is reused, so serialize invalidation with token refreshes before
+    # dropping the cached token. The next call then mints from the freshly stored refresh token.
+    try:
+        await invalidate_google_access_token_cache(organization_id, credential.id)
+    except Exception:
+        LOG.warning(
+            "Failed to invalidate access-token cache after promotion",
+            credential_id=credential.id,
+            exc_info=True,
+        )
+    return credential
 
 
-async def load_pending_consent_context(organization_id: str, nonce: str) -> PendingConsentContext | None:
+async def mark_credential_expired(
+    organization_id: str,
+    credential_id: str,
+    expected_version: datetime.datetime | None = None,
+) -> None:
+    """Flip an active credential to the "needs reconnect" (``error``) state after its refresh token
+    is rejected upstream, and invalidate any cached access token. Best-effort: never raises, so the
+    token-minting path stays ``token | None``.
+    """
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    try:
+        flipped = await app.DATABASE.google_oauth.mark_needs_reconnect(
+            organization_id=organization_id,
+            credential_id=credential_id,
+            now=now,
+            expected_version=expected_version,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to mark Google OAuth credential as needing reconnect",
+            credential_id=credential_id,
+            exc_info=True,
+        )
+        return
+    if flipped is None:
+        return
+    LOG.info(
+        "Marked Google OAuth credential as needing reconnect after refresh token was rejected",
+        credential_id=credential_id,
+        organization_id=organization_id,
+    )
+    try:
+        await invalidate_google_access_token_cache(organization_id, credential_id)
+    except Exception:
+        LOG.warning(
+            "Failed to invalidate access-token cache after marking credential expired",
+            credential_id=credential_id,
+            exc_info=True,
+        )
+
+
+async def load_pending_consent_context(
+    organization_id: str,
+    state: str,
+    initiator_id: str | None,
+) -> PendingConsentContext | None:
     """Fetch the redirect_uri + PKCE verifier the callback needs to replay to Google."""
     return await app.DATABASE.google_oauth.load_pending_by_nonce(
         organization_id=organization_id,
-        nonce=nonce,
+        nonce=oauth_consent.consent_nonce(state, initiator_id),
     )
 
 
@@ -594,6 +747,10 @@ async def refresh_access_token(
     )
     try:
         await asyncio.to_thread(creds.refresh, GoogleAuthRequest())
+    except RefreshError as exc:
+        if _is_invalid_grant(exc):
+            raise ExpiredRefreshTokenError(f"Google rejected the refresh token: {exc}") from exc
+        raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     except GoogleAuthError as exc:
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     return {
@@ -618,6 +775,8 @@ async def load_credential_secrets(
         refresh_token=refresh_token,
         scopes=payload.scopes_granted,
         client_id=payload.client_id,
+        credential_version=payload.credential_version,
+        encrypted_refresh_token=payload.encrypted_refresh_token,
     )
 
 
@@ -672,11 +831,61 @@ async def credentials_from_secrets(
     )
     try:
         await asyncio.to_thread(creds.refresh, GoogleAuthRequest())
+    except RefreshError as exc:
+        if _is_invalid_grant(exc):
+            raise ExpiredRefreshTokenError(f"Google rejected the refresh token: {exc}") from exc
+        raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     except GoogleAuthError as exc:
         raise MissingAccessTokenError(f"Google token refresh failed: {exc}") from exc
     if not creds.token:
         raise MissingAccessTokenError("Google token response did not include access_token")
     return creds
+
+
+async def refresh_and_rotate(
+    *,
+    organization_id: str,
+    credential_id: str,
+    credential_secrets: GoogleCredentialSecrets,
+) -> GoogleRefreshResult:
+    creds = await credentials_from_secrets(credential_secrets, organization_id)
+    access_token = creds.token
+    if not isinstance(access_token, str) or not access_token:
+        raise MissingAccessTokenError("Google token response did not include access_token")
+
+    credential_version = credential_secrets.credential_version
+    new_refresh_token = creds.refresh_token
+    if (
+        isinstance(new_refresh_token, str)
+        and new_refresh_token
+        and new_refresh_token != credential_secrets.refresh_token
+    ):
+        try:
+            if credential_secrets.encrypted_refresh_token is None:
+                raise ValueError("Google OAuth credential is missing its encrypted refresh token")
+            encrypted_refresh_token = await encryptor.encrypt(new_refresh_token, EncryptMethod.AES)
+            now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+            updated = await app.DATABASE.google_oauth.update_active_refresh_token(
+                organization_id=organization_id,
+                credential_id=credential_id,
+                encrypted_refresh_token=encrypted_refresh_token,
+                encrypted_method=EncryptMethod.AES,
+                now=now,
+                expected_encrypted_refresh_token=credential_secrets.encrypted_refresh_token,
+            )
+            if not updated:
+                raise ValueError("Google OAuth credential changed during refresh-token rotation")
+            credential_version = now
+        except Exception as exc:
+            LOG.exception(
+                "Failed to persist rotated Google refresh token",
+                organization_id=organization_id,
+                credential_id=credential_id,
+            )
+            raise RotatedRefreshTokenPersistenceError(
+                "Failed to persist rotated Google refresh token; reconnect the Google account"
+            ) from exc
+    return GoogleRefreshResult(access_token=access_token, credential_version=credential_version)
 
 
 async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
@@ -686,6 +895,23 @@ async def get_credentials_for_org(organization_id: str) -> list[GoogleOAuthCrede
 
 async def get_visible_credentials_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
     return await app.DATABASE.google_oauth.list_visible_for_org(organization_id=organization_id)
+
+
+async def update_email_address(
+    *,
+    organization_id: str,
+    credential_id: str,
+    email_address: str,
+    only_if_null: bool,
+    expected_version: datetime.datetime | None = None,
+) -> bool:
+    return await app.DATABASE.google_oauth.update_email_address(
+        organization_id=organization_id,
+        credential_id=credential_id,
+        email_address=email_address,
+        only_if_null=only_if_null,
+        expected_version=expected_version,
+    )
 
 
 # google-auth 2.x has no first-class async revoke helper; keep the 10-line httpx POST.
@@ -714,7 +940,7 @@ async def rename_credential(
     credential_id: str,
     credential_name: str,
 ) -> GoogleOAuthCredentialBase | None:
-    """Rename an active Google OAuth credential. Returns None for not-found / wrong-state / wrong-org."""
+    """Rename a visible Google OAuth credential. Returns None for not-found / wrong-state / wrong-org."""
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
     return await app.DATABASE.google_oauth.rename_active(
         organization_id=organization_id,
@@ -756,8 +982,7 @@ async def revoke_credential(organization_id: str, credential_id: str) -> bool:
     if revoked_id is not None:
         try:
             # 30s tombstone outlives any in-flight token refresh that beat the revoke commit.
-            cache_key = google_access_token_cache_key(organization_id, credential_id)
-            await app.CACHE.set(cache_key, "", ex=datetime.timedelta(seconds=30))
+            await invalidate_google_access_token_cache(organization_id, credential_id)
         except Exception:
             LOG.warning(
                 "Failed to invalidate access-token cache on revoke",

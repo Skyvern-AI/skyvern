@@ -7,7 +7,8 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
 
@@ -253,7 +254,7 @@ function NodeHeader({
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
     useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
@@ -590,7 +591,13 @@ function NodeHeader({
           bl: label,
         });
         search.set(STUDIO_PANES_PARAM, panes.join(","));
-        navigate(`/agents/${workflowPermanentId}/studio?${search}`);
+        // Under the short /runs/{wr} URL the run id is the pathname, so keep it
+        // and only swap the search; from the editor it is a full studio path.
+        if (location.pathname.startsWith("/runs/")) {
+          navigate({ search: `?${search.toString()}` });
+        } else {
+          navigate(`/agents/${workflowPermanentId}/studio?${search}`);
+        }
       } else {
         navigate(
           `/agents/${workflowPermanentId}/${response.data.run_id}/${label}/build`,
@@ -896,6 +903,12 @@ function NodeHeader({
     isCanvasLocked,
   });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
+  const playInert =
+    workflowRunIsRunningOrQueued ||
+    !workflowPermanentId ||
+    debugSession === undefined ||
+    isRecording;
+
   const collapseToggleButton =
     isCollapsible &&
     (mode === "build" ||
@@ -950,32 +963,37 @@ function NodeHeader({
         </div>
       ) : null}
 
-      <header className="group !mt-0 flex h-[2.75rem] justify-between gap-2">
+      <header className="group relative !mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
           className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
-          {!isReadOnlyScope &&
-            (isBlockFinallyGated(
-              blockLabel,
-              workflowSettingsStore.finallyBlockLabel,
-            ) ? (
-              <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <div>
-                      <NodeGripHandle blockLabel={blockLabel} disabled />
-                    </div>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    Finally block runs last - reorder to a different position
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            ) : (
-              gripHandle
-            ))}
+          {/* Overlays the node cards' px-6 gutter instead of reserving flex
+          space for the hover-only grip. */}
+          {!isReadOnlyScope && (
+            <div className="absolute -left-6 top-0 flex w-6 justify-center">
+              {isBlockFinallyGated(
+                blockLabel,
+                workflowSettingsStore.finallyBlockLabel,
+              ) ? (
+                <TooltipProvider delayDuration={300}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <div>
+                        <NodeGripHandle blockLabel={blockLabel} disabled />
+                      </div>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      Finally block runs last - reorder to a different position
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : (
+                gripHandle
+              )}
+            </div>
+          )}
           <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-border dark:border-slate-600">
             {/* Without shrink-0, a long label or subtitle in the sibling
             column steals width from this box before its own min-content. */}
@@ -1040,45 +1058,76 @@ function NodeHeader({
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
-              <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
-                {cancelBlock.isPending ? (
-                  <ReloadIcon className="size-6 animate-spin" />
-                ) : (
-                  <StopIcon
-                    className="size-6"
-                    onClick={() => {
-                      handleOnCancel();
-                    }}
-                  />
-                )}
-              </button>
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Stop this block"
+                      disabled={cancelBlock.isPending}
+                      onClick={() => {
+                        handleOnCancel();
+                      }}
+                      className="nodrag nopan rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50"
+                    >
+                      {cancelBlock.isPending ? (
+                        <ReloadIcon className="size-6 animate-spin" />
+                      ) : (
+                        <StopIcon className="size-6" aria-hidden />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>Stop this block</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </div>
           )}
           {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
             isDebuggable && (
-              <button
-                disabled={workflowRunIsRunningOrQueued}
-                className={cn("rounded p-1 disabled:opacity-50", {
-                  "hover:bg-muted": workflowRunIsRunningOrQueued,
-                })}
-              >
-                {runBlock.isPending ? (
-                  <ReloadIcon className="size-6 animate-spin" />
-                ) : (
-                  <PlayIcon
-                    className={cn("size-6", {
-                      "pointer-events-none fill-gray-500 text-muted-foreground dark:text-gray-500":
-                        workflowRunIsRunningOrQueued ||
-                        !workflowPermanentId ||
-                        debugSession === undefined ||
-                        isRecording,
-                    })}
-                    onClick={() => {
-                      void handleOnPlay();
-                    }}
-                  />
-                )}
-              </button>
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Run this block"
+                      // Must match the click guard below: any inert state the
+                      // attribute misses is a control that still takes focus
+                      // and announces as enabled while doing nothing. isPending
+                      // adds the in-flight case, where the spinner branch used
+                      // to carry no handler and a second click would re-enter.
+                      disabled={playInert || runBlock.isPending}
+                      onClick={() => {
+                        // Same inert set the icon used to express with
+                        // pointer-events-none; the click now lands on the
+                        // button (its padding was a dead zone before).
+                        if (playInert) {
+                          return;
+                        }
+                        void handleOnPlay();
+                      }}
+                      className={cn(
+                        "nodrag nopan rounded p-1 disabled:opacity-50",
+                        {
+                          "hover:bg-muted": workflowRunIsRunningOrQueued,
+                        },
+                      )}
+                    >
+                      {runBlock.isPending ? (
+                        <ReloadIcon className="size-6 animate-spin" />
+                      ) : (
+                        <PlayIcon
+                          aria-hidden
+                          className={cn("size-6", {
+                            "fill-gray-500 text-muted-foreground dark:text-gray-500":
+                              playInert,
+                          })}
+                        />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>Run this block</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             )}
           {collapseToggleButton}
           {disabled ? null : (

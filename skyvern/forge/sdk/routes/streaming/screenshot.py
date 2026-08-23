@@ -24,11 +24,18 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.screencast import start_screencast_loop, wait_for_browser_state
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
+from skyvern.forge.sdk.routes.streaming.screencast import (
+    release_browser_state,
+    start_screencast_loop,
+    wait_for_browser_state,
+)
+from skyvern.forge.sdk.routes.streaming.verify import stream_transport
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSessionStatus, is_final_status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.webeye.cdp_frame_publisher import stream_key_for_task, stream_key_for_workflow_run
 
 LOG = structlog.get_logger()
 STREAMING_TIMEOUT = 300
@@ -64,6 +71,9 @@ async def task_stream(
 
     LOG.info("Started task streaming", task_id=task_id, organization_id=organization_id)
 
+    # A run streams the frames its own worker publishes (``CDPFramePublisher``), which reaches a
+    # browser this process does not hold — including an externally hosted one. Only a deployment
+    # that drives the browser in-process screencasts it directly.
     if settings.BROWSER_STREAMING_MODE == "cdp":
         await _local_screencast_for_task(websocket, task_id, organization_id)
         return
@@ -71,8 +81,12 @@ async def task_stream(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
+            if disconnected.done():
+                LOG.info("Client disconnected. Closing connection", task_id=task_id, organization_id=organization_id)
+                return
             # if no activity for 5 minutes, close the connection
             if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
                 LOG.info(
@@ -112,9 +126,10 @@ async def task_stream(
                 return
 
             if task.status == TaskStatus.running:
-                file_name = f"{task_id}.png"
+                file_name = stream_key_for_task(task_id)
                 if task.workflow_run_id:
-                    file_name = f"{task.workflow_run_id}.png"
+                    file_name = stream_key_for_workflow_run(task.workflow_run_id)
+                await app.AGENT_FUNCTION.mark_streaming_viewer_active(organization_id, file_name)
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
@@ -145,6 +160,8 @@ async def task_stream(
     except Exception:
         LOG.warning("Error while streaming", task_id=task_id, organization_id=organization_id, exc_info=True)
         return
+    finally:
+        disconnected.cancel()
     LOG.info("WebSocket connection closed successfully", task_id=task_id, organization_id=organization_id)
     return
 
@@ -193,8 +210,16 @@ async def workflow_run_streaming(
     # timestamp last time when streaming activity happens
     last_activity_timestamp = datetime.utcnow()
 
+    disconnected = watch_for_client_disconnect(websocket)
     try:
         while True:
+            if disconnected.done():
+                LOG.info(
+                    "WofklowRun Streaming: Client disconnected. Closing connection",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+                return
             # if no activity for 5 minutes, close the connection
             if (datetime.utcnow() - last_activity_timestamp).total_seconds() > STREAMING_TIMEOUT:
                 LOG.info(
@@ -247,7 +272,8 @@ async def workflow_run_streaming(
                 return
 
             if workflow_run.status in (WorkflowRunStatus.running, WorkflowRunStatus.paused):
-                file_name = f"{workflow_run_id}.png"
+                file_name = stream_key_for_workflow_run(workflow_run_id)
+                await app.AGENT_FUNCTION.mark_streaming_viewer_active(organization_id, file_name)
                 screenshot = await app.STORAGE.get_streaming_file(organization_id, file_name)
                 if screenshot:
                     encoded_screenshot = base64.b64encode(screenshot).decode("utf-8")
@@ -291,6 +317,8 @@ async def workflow_run_streaming(
             exc_info=True,
         )
         return
+    finally:
+        disconnected.cancel()
     LOG.info(
         "WofklowRun Streaming: WebSocket connection closed successfully",
         workflow_run_id=workflow_run_id,
@@ -305,6 +333,7 @@ async def browser_session_streaming(
     browser_session_id: str,
     apikey: str | None = None,
     token: str | None = None,
+    force_cdp: bool = False,
 ) -> None:
     try:
         await websocket.accept()
@@ -333,7 +362,10 @@ async def browser_session_streaming(
         organization_id=organization_id,
     )
 
-    if settings.BROWSER_STREAMING_MODE == "cdp":
+    # The browser-session page sets this only after its authorized RFB connection closes. The
+    # proxy and API can observe a transient lookup failure independently, so re-resolving the
+    # transport here must not strand that viewer on the failed RFB choice.
+    if force_cdp or await stream_transport(browser_session_id, organization_id) == "cdp":
         await _local_screencast_for_browser_session(websocket, browser_session_id, organization_id)
         return
 
@@ -352,10 +384,14 @@ async def _run_local_screencast(
     wait_for_running: Callable[[], Awaitable[str | None]],
     check_finalized: Callable[[], Awaitable[bool]],
     get_current_status: Callable[[], Awaitable[str | None]],
+    # Required: a browser this process does not own is reachable only through the session that
+    # holds it, and that lookup is organization-scoped. Defaulting this made the remote path
+    # silently unreachable for whichever caller forgot to pass it.
+    organization_id: str,
     get_workflow_run_id: Callable[[], str | None] | None = None,
-    organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
+    browser_state = None
     try:
         early_exit_status = await wait_for_running()
         if early_exit_status is not None:
@@ -371,7 +407,18 @@ async def _run_local_screencast(
         )
         if browser_state is None:
             LOG.warning("Timed out waiting for browser state", **{id_key: entity_id})
-            await _send_status(websocket, id_key, entity_id, "timeout")
+            stream_status = "timeout"
+            if entity_type == "browser_session":
+                try:
+                    current_status = await get_current_status()
+                except Exception:
+                    LOG.warning("Could not refresh browser session status", **{id_key: entity_id}, exc_info=True)
+                else:
+                    if current_status is not None and (
+                        current_status == "session_expired" or is_final_status(current_status)
+                    ):
+                        stream_status = current_status
+            await _send_status(websocket, id_key, entity_id, stream_status)
             return
 
         await start_screencast_loop(
@@ -397,6 +444,8 @@ async def _run_local_screencast(
         LOG.warning("WebSocket connection error during local screencast", **{id_key: entity_id})
     except Exception:
         LOG.warning("Error in local screencast", **{id_key: entity_id}, exc_info=True)
+    finally:
+        await release_browser_state(browser_state, entity_type, entity_id)
 
 
 async def _local_screencast_for_workflow_run(
@@ -447,6 +496,7 @@ async def _local_screencast_for_workflow_run(
         wait_for_running=wait_for_running,
         check_finalized=check_finalized,
         get_current_status=get_current_status,
+        organization_id=organization_id,
     )
 
 
@@ -493,8 +543,14 @@ async def _local_screencast_for_task(
         wait_for_running=wait_for_running,
         check_finalized=check_finalized,
         get_current_status=get_current_status,
+        organization_id=organization_id,
         get_workflow_run_id=lambda: task_workflow_run_id,
     )
+
+
+def _browser_session_stream_status(status: str | None) -> str | None:
+    # A finer expiry-versus-failure split must come from persisted session state, not this stream alias.
+    return "session_expired" if status == PersistentBrowserSessionStatus.timeout else status
 
 
 async def _local_screencast_for_browser_session(
@@ -515,7 +571,7 @@ async def _local_screencast_for_browser_session(
             )
             return "not_found"
         if is_final_status(session.status):
-            return session.status
+            return _browser_session_stream_status(session.status)
         return None
 
     async def check_finalized() -> bool:
@@ -530,7 +586,7 @@ async def _local_screencast_for_browser_session(
             session_id=browser_session_id,
             organization_id=organization_id,
         )
-        return s.status if s else None
+        return _browser_session_stream_status(s.status) if s else None
 
     await _run_local_screencast(
         websocket=websocket,

@@ -51,7 +51,7 @@ from skyvern.schemas.workflows import (
     WorkflowTriggerBlockYAML,
 )
 
-from ._common import ErrorCode, make_error, make_result
+from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
 
@@ -115,7 +115,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "goto_url": "Navigate directly to a URL without additional instructions",
     "download_to_s3": "Download a URL directly to S3 storage",
     "upload_to_s3": "Upload local content to S3",
-    "file_url_parser": "Parse a file (CSV/Excel/PDF/image) from a URL",
+    "file_url_parser": "Parse a file (CSV/Excel/PDF/image/DOCX) from a URL; ZIP archives are unzipped to a file list",
     "pdf_parser": "Extract structured data from a PDF document",
     "human_interaction": "Pause workflow for human approval via email",
     "print_page": "Print the current page to PDF",
@@ -244,6 +244,16 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "code": {
+        "block_type": "code",
+        "label": "collect_post_titles",
+        "prompt": "Open the news page and collect the top post titles",
+        "code": (
+            'await page.goto("https://example.com/news")\n'
+            'titles = await page.locator("h2.title").all_text_contents()\n'
+            'return {"titles": titles}'
+        ),
+    },
     "goto_url": {
         "block_type": "goto_url",
         "label": "open_cart",
@@ -270,6 +280,17 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "file_url": "{{ source_pdf_output }}",
         "prompt": "Split this combined PDF into one file per document; name each by document type.",
         "parameter_keys": ["source_pdf_output"],
+    },
+    "human_interaction": {
+        "block_type": "human_interaction",
+        "label": "approve_order",
+        "timeout_seconds": 3600,
+        "recipients": ["ops@example.com"],
+        "subject": "Approval needed before the order is submitted",
+        "body": "A workflow run is paused and needs someone to approve the order before it is submitted.",
+        "instructions": "Review the order total and line items, then approve to submit or reject to cancel the run.",
+        "positive_descriptor": "Approve order",
+        "negative_descriptor": "Cancel",
     },
     "google_sheets_read": {
         "block_type": "google_sheets_read",
@@ -490,9 +511,9 @@ async def skyvern_block_validate(
         Field(description="JSON string of a single block definition to validate"),
     ],
     code_only: Annotated[
-        bool,
-        Field(description="When true, structurally reject non-code browser/page block types (code-only mode)"),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
     it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
@@ -540,7 +561,7 @@ async def skyvern_block_validate(
                     ErrorCode.INVALID_INPUT,
                     f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
                     "In code-only mode, use a `code` block for durable browser/page work instead of "
-                    "task/navigation/extraction/etc.",
+                    "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
                 ),
             )
 
@@ -551,6 +572,11 @@ async def skyvern_block_validate(
         if block.block_type in ("task", "task_v2"):
             warnings.append(
                 f"'{block.block_type}' block type is deprecated. Use 'navigation' for actions and 'extraction' for data extraction."
+            )
+        if raw.get("block_type") == "code" and "prompt" not in raw:
+            warnings.append(
+                "Code block omits 'prompt'. Workflow create, or workflow update when adding this code block under a "
+                'new label, will inject the missing default `prompt: ""`; existing code block labels are not migrated.'
             )
         return make_result(
             action,

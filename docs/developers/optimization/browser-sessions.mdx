@@ -82,9 +82,9 @@ curl -X POST "https://api.skyvern.com/v1/browser_sessions" \
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `timeout` | integer | Session lifetime in minutes. Min: 5, Max: 1440 (24 hours). Default: `60` |
+| `timeout` | integer | Session lifetime in minutes. Min: 5. Max: 240 (4 hours) — requests above 240 are rejected. Default: `60` |
 | `proxy_location` | string | Geographic proxy location (Cloud only). See [Proxy & Geolocation](/developers/going-to-production/proxy-geolocation) for available options |
-| `browser_type` | string | Browser type: `chrome` or `msedge` |
+| `browser_type` | string | Browser type: `chrome` or `msedge`. If omitted, Skyvern picks a managed default that may be a hardened stealth Chromium build rather than Chrome. Set it explicitly to select the engine when no `browser_profile_id` is used — a supplied profile's source browser type takes precedence. See [Choose the right browser type](#choose-the-right-browser-type) |
 | `extensions` | array | Extensions to install: `ad-blocker`, `captcha-solver` |
 | `generate_browser_profile` | boolean | REST API only for now — not yet accepted by the SDK methods. Save the session's browser profile (cookies, localStorage, session files) when the session ends, so it can be turned into a reusable [browser profile](/developers/optimization/browser-profiles). Default: `false`. See [Save a session's profile](#save-a-sessions-profile) |
 
@@ -647,33 +647,40 @@ await client.runWorkflow({ body: { workflow_id: "wpid_abc" }, waitForCompletion:
 
 ### Choose the right browser type
 
-Chrome has the widest compatibility. Use Edge only when a site requires or detects it specifically.
+If you omit `browser_type`, Skyvern selects a managed default for your account — this may be a hardened stealth Chromium build rather than Google Chrome, so don't rely on the default being Chrome. Set `browser_type` explicitly when you need a specific engine. Note that if you load a session from a `browser_profile_id`, the profile's source browser type takes precedence over `browser_type`.
+
+Each engine has a trade-off:
+
+- **`chrome`** — Google Chrome. Can work better on some fingerprint-sensitive sites where the managed stealth default gets challenged, but does **not** support the CAPTCHA-solver extension. This varies by site — test for yours.
+- **`msedge`** — Microsoft Edge. Supports the CAPTCHA-solver extension, so use it (or the managed stealth default) when a site serves hCaptcha/reCAPTCHA and you need automatic solving.
+
+Site behavior varies: if a site both fingerprints aggressively and serves CAPTCHAs, test both engines to find the best fit.
 
 <CodeGroup>
 ```python Python
-# Chrome (default) - widest compatibility
+# Chrome - can help on some fingerprint-sensitive sites; no CAPTCHA-solver extension
 session = await client.create_browser_session(browser_type="chrome")
 
-# Edge - for sites that require or fingerprint Edge
+# Edge - supports the CAPTCHA-solver extension for hCaptcha/reCAPTCHA
 session = await client.create_browser_session(browser_type="msedge")
 ```
 
 ```typescript TypeScript
-// Chrome (default) - widest compatibility
+// Chrome - can help on some fingerprint-sensitive sites; no CAPTCHA-solver extension
 const chromeSession = await client.createBrowserSession({ browser_type: "chrome" });
 
-// Edge - for sites that require or fingerprint Edge
+// Edge - supports the CAPTCHA-solver extension for hCaptcha/reCAPTCHA
 const edgeSession = await client.createBrowserSession({ browser_type: "msedge" });
 ```
 
 ```bash cURL
-# Chrome (default) - widest compatibility
+# Chrome - can help on some fingerprint-sensitive sites; no CAPTCHA-solver extension
 curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"browser_type": "chrome"}'
 
-# Edge - for sites that require or fingerprint Edge
+# Edge - supports the CAPTCHA-solver extension for hCaptcha/reCAPTCHA
 curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
@@ -683,7 +690,7 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
 
 ### Use extensions strategically
 
-Extensions add startup time, so only enable them when needed. The ad-blocker removes overlay ads that can interfere with automation. The captcha-solver handles CAPTCHAs automatically but is only available on Cloud.
+Extensions add startup time, so only enable them when needed. The ad-blocker removes overlay ads that can interfere with automation. The captcha-solver handles CAPTCHAs automatically but is only available on Cloud, and it requires the `msedge` browser type (or the managed stealth default) — the `chrome` browser type does not support it.
 
 <CodeGroup>
 ```python Python

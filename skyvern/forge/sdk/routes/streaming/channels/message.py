@@ -27,11 +27,6 @@ from websockets.exceptions import ConnectionClosedError
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
-from skyvern.forge.sdk.routes.streaming.registries import (
-    add_message_channel,
-    del_message_channel,
-    get_vnc_channel,
-)
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
     loop_verify_workflow_run,
@@ -39,6 +34,11 @@ from skyvern.forge.sdk.routes.streaming.verify import (
     verify_workflow_run,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
+from skyvern.forge.sdk.streaming.registries import (
+    add_message_channel,
+    del_message_channel,
+    get_vnc_channel,
+)
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
@@ -565,10 +565,14 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel - cannot exfiltrate.",
                         message=message,
                         **message_channel.identity,
+                    )
+                    # Tell the client instead of dropping silently; it re-sends begin-exfiltration once the live view (re)connects.
+                    await send_error(
+                        message.kind, "Recording capture is not ready yet; retrying as live view connects."
                     )
                     return
 
@@ -669,7 +673,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel.",
                         message=message,
                         **message_channel.identity,
@@ -846,7 +850,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, str(exc))
                 except Exception:
                     # The target URL is user-controlled; log it server-side
-                    # but don't reflect it back in the toast.
+                    # but don't reflect it back in the toast. BlockedHost from the
+                    # destination check lands here deliberately rather than in the ValueError
+                    # branch above: naming the rejected host would let a caller tell "blocked
+                    # internal" from "unreachable" and enumerate internal ranges from the toast.
                     LOG.exception(
                         f"{class_name} failed to navigate.",
                         url=message.url,
@@ -872,7 +879,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
-                    LOG.error(
+                    LOG.warning(
                         f"{class_name} no vnc channel client found for message channel.",
                         message=message,
                         **message_channel.identity,
@@ -961,6 +968,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         for task in done:
             if task.exception() is not None:
                 raise t.cast(Exception, task.exception())
+    except (WebSocketDisconnect, ConnectionClosedError):
+        # Expected teardown: the frontend closed its live-stream tab. The child loop
+        # already logged this at debug (frontend_to_backend) before re-raising it here.
+        LOG.debug(f"{class_name} frontend disconnected; ending message channel stream.", **message_channel.identity)
     except Exception:
         LOG.exception(f"{class_name} An exception occurred in loop message channel stream.", **message_channel.identity)
     finally:

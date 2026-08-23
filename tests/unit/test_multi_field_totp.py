@@ -41,6 +41,7 @@ class _FakeWorkflowRunContext:
             self.placeholder: OnePasswordConstants.TOTP,
             self.totp_secret_value_key(self.placeholder): totp_secret,
         }
+        self.runtime_otp_values: set[str] = set()
 
     def get_original_secret_value_or_none(self, key: str) -> str | None:
         return self.secrets.get(key)
@@ -54,6 +55,9 @@ class _FakeWorkflowRunContext:
     def find_embedded_placeholder_tokens(self, text: str) -> list[str]:
         return [text]
 
+    def register_runtime_otp_value(self, value: str) -> None:
+        self.runtime_otp_values.add(value)
+
 
 def _patch_workflow_context(monkeypatch: pytest.MonkeyPatch, workflow_context: _FakeWorkflowRunContext) -> None:
     from skyvern.webeye.actions import handler
@@ -64,7 +68,9 @@ def _patch_workflow_context(monkeypatch: pytest.MonkeyPatch, workflow_context: _
         SimpleNamespace(
             WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
                 get_workflow_run_context=lambda _workflow_run_id: workflow_context,
-            )
+                mask_secrets_enabled_for_run=lambda _workflow_run_id: False,
+            ),
+            BROWSER_MANAGER=SimpleNamespace(get_for_task=lambda *_args, **_kwargs: None),
         ),
     )
 
@@ -132,6 +138,7 @@ async def test_cua_input_types_generated_totp_instead_of_placeholder(monkeypatch
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     type_text.assert_awaited_once_with(page, None, "654321")
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 @pytest.mark.asyncio
@@ -214,7 +221,14 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     element.find_blocking_element = AsyncMock(
         side_effect=lambda **_kwargs: events.append("blocking-check") or (None, False)
     )
+    element.apply_secret_visual_mask = AsyncMock()
     element.input = AsyncMock(side_effect=lambda _text: events.append("input"))
+    # An untyped input defaults to type=text, so the single-field TOTP write runs through the read-back path
+    # (SKY-13821): the generated code is filled atomically, read back, and confirmed.
+    element.input_sequentially = AsyncMock()
+    element.input_clear = AsyncMock()
+    element.input_fill = AsyncMock(side_effect=lambda **_kwargs: events.append("input"))
+    element.refresh_locator_if_stale = AsyncMock()
 
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
@@ -223,7 +237,8 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     frame.safe_wait_for_animation_end = AsyncMock(side_effect=lambda **_kwargs: events.append("animation-wait"))
     monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
     monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock())
-    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    # First read (current_text) stays empty; the second read is the TOTP read-back, which confirms the code.
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(side_effect=["", "654321"]))
     monkeypatch.setattr(handler, "_get_input_or_select_context", AsyncMock(return_value=None))
     scraped_page = SimpleNamespace(id_to_element_dict={"otp": {"tagName": "input"}})
 
@@ -238,7 +253,55 @@ async def test_dom_input_generates_totp_immediately_before_write(monkeypatch: py
     assert len(results) == 1
     assert isinstance(results[0], ActionSuccess)
     assert events == ["animation-wait", "blocking-check", "generate", "input"]
-    element.input.assert_awaited_once_with("654321")
+    element.input_fill.assert_awaited_once_with(text="654321")
+    element.input_sequentially.assert_not_awaited()
+    element.input.assert_not_awaited()
+    assert workflow_context.runtime_otp_values == {"654321"}
+
+
+@pytest.mark.asyncio
+async def test_blinking_cursor_input_registers_generated_totp_before_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.webeye.actions import handler
+
+    workflow_context = _FakeWorkflowRunContext(totp_secret="JBSWY3DPEHPK3PXP")
+    _patch_workflow_context(monkeypatch, workflow_context)
+    monkeypatch.setattr(handler, "generate_totp_code", MagicMock(return_value="654321"))
+
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    element = MagicMock()
+    element.get_id.return_value = "otp"
+    element.get_frame.return_value = MagicMock()
+    element.get_tag_name.return_value = "div"
+    element.get_locator.return_value = locator
+    element.get_selectable = AsyncMock(return_value=False)
+    element.is_disabled = AsyncMock(return_value=False)
+    element.supports_text_input = AsyncMock(return_value=True)
+    element.has_hidden_attr = AsyncMock(return_value=False)
+    element.is_readonly = AsyncMock(return_value=False)
+    element.get_attr = AsyncMock(side_effect=lambda name, **_kwargs: "blinking-cursor" if name == "class" else None)
+    element.apply_secret_visual_mask = AsyncMock()
+    element.press_fill = AsyncMock()
+
+    dom = MagicMock(get_skyvern_element_by_id=AsyncMock(return_value=element))
+    monkeypatch.setattr(handler, "DomUtil", MagicMock(return_value=dom))
+    monkeypatch.setattr(handler.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(handler, "IncrementalScrapePage", MagicMock())
+    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
+    monkeypatch.setattr(handler, "_get_input_or_select_context", AsyncMock(return_value=None))
+
+    results = await handle_input_text_action(
+        InputTextAction(element_id="otp", text=workflow_context.placeholder),
+        MagicMock(),
+        SimpleNamespace(id_to_element_dict={"otp": {"tagName": "div"}}),
+        SimpleNamespace(workflow_run_id="wr_test", task_id="task_test"),
+        SimpleNamespace(step_id="step_test"),
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionSuccess)
+    element.press_fill.assert_awaited_once_with(text="654321")
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 @pytest.mark.asyncio
@@ -298,6 +361,8 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
     element.get_frame.return_value = MagicMock()
     element.get_selectable = AsyncMock(return_value=True)
     element.is_disabled = AsyncMock(return_value=False)
+    element.supports_text_input = AsyncMock(return_value=True)
+    element.get_attr = AsyncMock(return_value=None)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
     dom_type = MagicMock(return_value=dom)
@@ -313,7 +378,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
         InputTextAction(element_id="otp", text=workflow_context.placeholder),
         MagicMock(),
         scraped_page,
-        SimpleNamespace(workflow_run_id="wr_test"),
+        SimpleNamespace(workflow_run_id="wr_test", task_id="task_test"),
         MagicMock(),
     )
 
@@ -322,6 +387,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
     select_action = select_mock.await_args.args[0]
     assert select_action.option.label == "654321"
     assert select_action.option.label != workflow_context.placeholder
+    assert workflow_context.runtime_otp_values == {"654321"}
 
 
 class TestAnnotateMultiFieldTotpSequence:
@@ -372,7 +438,7 @@ class TestHandleMultiFieldTotpSequence:
             patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
             patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
             patch("skyvern.webeye.actions.handler.time.time", return_value=44),
-            patch("skyvern.webeye.actions.handler.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+            patch("skyvern.webeye.actions.handler._totp_window_sleep", new_callable=AsyncMock) as sleep_mock,
         ):
             result = await _handle_multi_field_totp_sequence(
                 {"action_index": 5, "totp_secret": "otpauth://totp/example?secret=abc"},
@@ -621,3 +687,79 @@ class TestGetTotpDigitBasic:
                         digit_index=idx,
                     )
                     assert result == expected, f"Expected digit {expected} at index {idx}, got {result}"
+
+
+class TestMultiFieldTotpAbsoluteIndexExecution:
+    """Execution-path coverage for the multi-field TOTP absolute action-index contract.
+
+    ``ForgeAgent._is_multi_field_totp_sequence`` decides, per INPUT_TEXT action, whether the runtime
+    stamps ``totp_timing_info`` with the action's ABSOLUTE index in the whole batch, and
+    ``_handle_multi_field_totp_sequence`` only seeds the TOTP cache when that index is 0. These tests
+    prove the accepted ``[digits..., CLICK submit]`` plan reaches execution with digit indexes 0..N-1
+    and the handler generates/caches/reuses, while a leading action is not treated as a sequence."""
+
+    @staticmethod
+    def _digit(text: str) -> SimpleNamespace:
+        return SimpleNamespace(action_type=ActionType.INPUT_TEXT, text=text)
+
+    @staticmethod
+    def _click() -> SimpleNamespace:
+        return SimpleNamespace(action_type=ActionType.CLICK, text=None)
+
+    def _stamped_digit_indexes(self, actions: list) -> list[int]:
+        """Replicate the agent execution loop: stamp INPUT_TEXT actions with their absolute index only
+        when the batch is a multi-field TOTP sequence."""
+        from skyvern.forge.agent import ForgeAgent
+
+        agent = ForgeAgent.__new__(ForgeAgent)
+        if not agent._is_multi_field_totp_sequence(actions):
+            return []
+        return [action_idx for action_idx, action in enumerate(actions) if action.action_type == ActionType.INPUT_TEXT]
+
+    def test_digits_then_submit_click_reaches_execution_at_indexes_0_to_n(self) -> None:
+        actions = [self._digit(str(d)) for d in range(1, 7)] + [self._click()]
+        assert self._stamped_digit_indexes(actions) == [0, 1, 2, 3, 4, 5]
+
+    def test_leading_action_is_not_a_multi_field_sequence(self) -> None:
+        actions = [self._click()] + [self._digit(str(d)) for d in range(1, 7)]
+        assert self._stamped_digit_indexes(actions) == []
+
+    @pytest.mark.asyncio
+    async def test_stamped_indexes_drive_generate_then_reuse(self) -> None:
+        """The 0..N-1 indexes the accepted plan produces let the handler generate+cache at the first
+        digit and reuse the cache for a later digit without regenerating. Asserts cache is populated
+        (not its plaintext value) so no code/secret is exposed."""
+        actions = [self._digit(str(d)) for d in range(1, 7)] + [self._click()]
+        indexes = self._stamped_digit_indexes(actions)
+        assert indexes[0] == 0 and indexes[-1] == len(indexes) - 1
+
+        context = SimpleNamespace(totp_codes={})
+        fake_totp = _FakeTotp()
+        task = SimpleNamespace(task_id="task_exec")
+        cache_key = f"{task.task_id}_totp_cache"
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+        ):
+            first = await _handle_multi_field_totp_sequence(
+                {"action_index": indexes[0], "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+        assert first is None
+        assert context.totp_codes.get(cache_key)
+        generated_at_first = list(fake_totp.at_values)
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+            patch("skyvern.webeye.actions.handler._totp_window_sleep", new_callable=AsyncMock),
+        ):
+            later = await _handle_multi_field_totp_sequence(
+                {"action_index": indexes[-1], "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+        assert later is None
+        assert fake_totp.at_values == generated_at_first

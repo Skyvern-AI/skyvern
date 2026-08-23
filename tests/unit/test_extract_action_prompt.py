@@ -82,3 +82,15 @@ def test_static_template_is_prefix_when_flag_on(prompt_engine: PromptEngine) -> 
     full = prompt_engine.load_prompt("extract-action", **kwargs)
     static = prompt_engine.load_prompt("extract-action-static", **kwargs)
     assert full.startswith(static.rstrip())
+
+
+@pytest.mark.parametrize("template", ["extract-action", "extract-action-static"])
+def test_extra_action_guidance_renders_at_action_boundary(prompt_engine: PromptEngine, template: str) -> None:
+    guidance = "Use the organization-approved verification method when it is offered."
+
+    rendered = prompt_engine.load_prompt(
+        template,
+        **{**_EXTRACT_ACTION_KWARGS, "extra_action_guidance": guidance},
+    )
+
+    assert guidance in rendered

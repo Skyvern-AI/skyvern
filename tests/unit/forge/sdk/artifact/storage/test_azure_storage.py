@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5,9 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.config import settings
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.azure import StandardBlobTier
 from skyvern.forge.sdk.api.real_azure import RealAsyncAzureStorageClient
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
+from skyvern.forge.sdk.artifact.storage.base import SENSITIVE_SHARE_URL_EXPIRY_HOURS
+from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepared_recording
 
 # Test constants
 TEST_CONTAINER = "test-azure-container"
@@ -52,6 +57,7 @@ def mock_browser_session_artifact_create(monkeypatch: pytest.MonkeyPatch) -> Non
     fake_app = MagicMock()
     fake_app.ARTIFACT_MANAGER.create_browser_session_download_artifact = AsyncMock(return_value="a_test")
     fake_app.ARTIFACT_MANAGER.create_browser_session_recording_artifact = AsyncMock(return_value="a_test")
+    fake_app.ARTIFACT_MANAGER.create_download_artifact = AsyncMock(return_value="a_test")
     monkeypatch.setattr(azure_module, "app", fake_app)
 
 
@@ -65,19 +71,28 @@ class TestAzureStorageBrowserSessionFiles:
         """Test syncing a file with date in path (videos/har)."""
         test_file = tmp_path / "recording.webm"
         test_file.write_bytes(b"fake video data")
+        prepared_file = tmp_path / "recording.mp4"
+        prepared_file.write_bytes(b"fake mp4 data")
 
-        uri = await azure_storage.sync_browser_session_file(
-            organization_id=TEST_ORGANIZATION_ID,
-            browser_session_id=TEST_BROWSER_SESSION_ID,
-            artifact_type="videos",
-            local_file_path=str(test_file),
-            remote_path="recording.webm",
-            date="2025-01-15",
-        )
+        with patch(
+            "skyvern.forge.sdk.artifact.storage.azure.prepare_recording_for_upload",
+            lambda path: fake_prepared_recording(path, str(prepared_file)),
+        ):
+            with patch("skyvern.forge.sdk.artifact.storage.azure.sync_run_recording_clips", new=AsyncMock()):
+                uri = await azure_storage.sync_browser_session_file(
+                    organization_id=TEST_ORGANIZATION_ID,
+                    browser_session_id=TEST_BROWSER_SESSION_ID,
+                    artifact_type="videos",
+                    local_file_path=str(test_file),
+                    remote_path="recording.webm",
+                    date="2025-01-15",
+                )
 
-        expected_uri = f"azure://{TEST_CONTAINER}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.webm"
+        expected_uri = f"azure://{TEST_CONTAINER}/v1/{settings.ENV}/{TEST_ORGANIZATION_ID}/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/recording.mp4"
         assert uri == expected_uri
-        azure_storage.async_client.upload_file_from_path.assert_called_once()
+        azure_storage.async_client.upload_file_from_path.assert_called_once_with(
+            expected_uri, str(prepared_file), tier=StandardBlobTier.HOT, tags={"test": "tag"}
+        )
 
     async def test_sync_browser_session_file_without_date(
         self, azure_storage: AzureStorageForTests, tmp_path: Path
@@ -313,3 +328,61 @@ class TestAzureStorageContentType:
             call_kwargs = mock_container_client.upload_blob.call_args.kwargs
             assert call_kwargs["content_settings"] is not None
             assert call_kwargs["content_settings"].content_type == expected_content_type
+
+
+def make_artifact(uri: str, artifact_type: ArtifactType = ArtifactType.SCREENSHOT) -> Artifact:
+    return Artifact(
+        artifact_id="a_1",
+        artifact_type=artifact_type,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestAzureShareLinkSensitiveCap:
+    """Sensitive artifact types get hour-capped SAS URLs (SKY-12527)."""
+
+    async def test_share_links_route_sensitive_types_to_capped_expiry(
+        self, azure_storage: AzureStorageForTests
+    ) -> None:
+        recording = make_artifact(f"azure://{TEST_CONTAINER}/rec.webm", artifact_type=ArtifactType.RECORDING)
+        download = make_artifact(f"azure://{TEST_CONTAINER}/file.pdf", artifact_type=ArtifactType.DOWNLOAD)
+
+        async def fake_sas(uris: list[str], expiry_hours: int = 24) -> list[str]:
+            return [f"{uri}?h={expiry_hours}" for uri in uris]
+
+        azure_storage.async_client.create_sas_urls = AsyncMock(side_effect=fake_sas)
+        urls = await azure_storage.get_share_links([recording, download])
+        assert urls == [
+            f"{recording.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
+            f"{download.uri}?h=24",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_save_downloaded_files_partial_upload_failure_raises_after_saving_the_rest(
+    azure_storage: AzureStorageForTests, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "downloads" / "wr_partial"
+    run_dir.mkdir(parents=True)
+    (run_dir / "a.pdf").write_bytes(b"first")
+    (run_dir / "b.pdf").write_bytes(b"second")
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+    uploaded: list[str] = []
+
+    async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+        if uri.endswith("/a.pdf"):
+            raise RuntimeError("transient 503")
+        uploaded.append(uri)
+
+    monkeypatch.setattr(azure_storage.async_client, "upload_file_from_path", _upload)
+
+    with pytest.raises(DownloadSaveIncompleteError) as raised:
+        await azure_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+    assert raised.value.skipped_files == ["a.pdf"]
+    assert [uri.rsplit("/", 1)[-1] for uri in uploaded] == ["b.pdf"]

@@ -8,6 +8,7 @@ import {
   isViewportStranded,
   PANE_RESIZE_EPSILON_PX,
   paneRecenterViewport,
+  relayoutDriftCorrection,
   START_ANCHOR_MARGIN_X_PX,
   START_ANCHOR_MIN_ZOOM,
   START_ANCHOR_TOP_PX,
@@ -373,6 +374,44 @@ describe("paneRecenterViewport", () => {
         pane: { width: 800, height: 600 },
         bounds: chain,
         viewport: { x: 0, y: 0, zoom: 0 },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("relayoutDriftCorrection", () => {
+  const viewport = { x: 100, y: -50, zoom: 0.8 };
+
+  test("counter-translates x by an anchor node's x delta at the current zoom", () => {
+    // A collapsing/expanding container's width change shifts every node's x
+    // uniformly (Dagre re-centers each pass from scratch, so the anchor's
+    // own x is the only reliable "did the visible content move" signal —
+    // the union bounding box's left edge is a Dagre normalization artifact
+    // and does NOT track this). The viewport must slide the opposite way,
+    // at screen scale (delta * zoom), to keep the anchor visually put.
+    const corrected = relayoutDriftCorrection({
+      viewport,
+      xBefore: 0,
+      xAfter: 40,
+    });
+    expect(corrected).toEqual({ x: 100 - 40 * 0.8, y: -50, zoom: 0.8 });
+  });
+
+  test("a leftward shift (collapse) translates x the other way", () => {
+    const corrected = relayoutDriftCorrection({
+      viewport,
+      xBefore: 40,
+      xAfter: 0,
+    });
+    expect(corrected).toEqual({ x: 100 + 40 * 0.8, y: -50, zoom: 0.8 });
+  });
+
+  test("ignores sub-epsilon drift", () => {
+    expect(
+      relayoutDriftCorrection({
+        viewport,
+        xBefore: 0,
+        xAfter: 0.4,
       }),
     ).toBeNull();
   });

@@ -166,12 +166,14 @@ If you build agents in the Cloud UI, file operations use dedicated blocks instea
 | Block | Purpose |
 |-------|---------|
 | **File Download** | Download files during agent execution |
-| **File Parser** | Parse PDFs, CSVs, and Excel files |
+| **File Parser** | Parse PDFs, CSVs, Excel files, images, and DOCX files; unzip ZIP archives |
 | **Download to S3** | Save files from URLs to Skyvern's S3 |
 | **Upload to S3** | Upload agent files to S3 |
 | **File Upload** | Upload to your own S3 or Azure Blob Storage |
 
 Files downloaded during an agent run accumulate in a temporary directory and can be passed between blocks using agent parameters. See [Agent Blocks Reference](/cloud/building-agents/configure-blocks) for block configuration details.
+
+For ZIP inputs, File Parser outputs the extracted files as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
 
 ---
 

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Protocol
 
 from playwright.async_api import BrowserContext, Page, Playwright
 
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+from skyvern.exceptions import BrowserStateDiagnostic
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
+
+if TYPE_CHECKING:
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
+
+# URLs a tab reports when it holds no document — including ":" , which Chrome reports for a tab
+# whose only navigation turned into a download.
+BLANK_PAGE_URLS = {"about:blank", ":"}
 
 
 class BrowserState(Protocol):
@@ -17,6 +25,9 @@ class BrowserState(Protocol):
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
     pw: Playwright
+    # The per-run pinned engine (or None for states built outside the per-run engine seam), so
+    # recovery code can classify driver-native errors against THIS run's selected engine.
+    engine_selection: BrowserEngineSelection | None
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None: ...
 
@@ -36,6 +47,8 @@ class BrowserState(Protocol):
     ) -> None: ...
 
     def is_connected(self) -> bool: ...
+
+    def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None: ...
 
     async def reconnect(
         self,
@@ -92,7 +105,11 @@ class BrowserState(Protocol):
 
     async def reload_page(self, degradation: bool = False) -> None: ...
 
-    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> None: ...
+    async def close(self, close_browser_on_completion: bool = True, release_driver: bool | None = None) -> bool: ...
+
+    async def detach_remote_driver(self) -> None:
+        """Disable local CDP interception and stop only this process's Playwright driver."""
+        ...
 
     async def take_fullpage_screenshot(self, file_path: str | None = None) -> bytes: ...
 
@@ -115,4 +132,14 @@ class BrowserState(Protocol):
         support_empty_page: bool = False,
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
+        allow_transient_ui_suppression: bool = False,
     ) -> ScrapedPage: ...
+
+
+def get_browser_state_diagnostic(browser_state: BrowserState | None) -> BrowserStateDiagnostic | None:
+    """Read the latched disconnect snapshot without requiring every test double to implement it."""
+    if browser_state is None:
+        return None
+    getter = getattr(browser_state, "get_browser_state_diagnostic", None)
+    diagnostic = getter() if callable(getter) else None
+    return diagnostic if isinstance(diagnostic, BrowserStateDiagnostic) else None

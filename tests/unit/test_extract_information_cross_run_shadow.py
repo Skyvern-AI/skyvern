@@ -62,7 +62,11 @@ def test_cross_run_hit_schedules_shadow_check_with_sentinel_age(monkeypatch) -> 
     task = _make_task(workflow_run_id, workflow_permanent_id=workflow_permanent_id)
     step = MagicMock(step_id="stp_cross_run_args", retry_index=0)
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
+    )
 
     assert schedule_mock.call_count == 1
     kwargs = schedule_mock.call_args.kwargs
@@ -118,7 +122,11 @@ def test_in_run_hit_schedules_shadow_check_with_real_age(monkeypatch) -> None:
     task = _make_task(workflow_run_id, workflow_permanent_id=workflow_permanent_id)
     step = MagicMock(step_id="stp_in_run_args", retry_index=0)
 
-    asyncio.run(handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page))
+    asyncio.run(
+        handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
+    )
 
     assert schedule_mock.call_count == 1
     kwargs = schedule_mock.call_args.kwargs
@@ -183,7 +191,9 @@ def test_cross_run_hit_shadow_gate_runs_in_background_not_on_hot_path(monkeypatc
     step = MagicMock(step_id="stp_cross_run_bg", retry_index=0)
 
     async def _run_and_assert() -> Any:
-        result = await handler.extract_information_for_navigation_goal(task=task, step=step, scraped_page=scraped_page)
+        result = await handler.extract_information_for_navigation_goal(
+            task=task, step=step, scraped_page=scraped_page, page=MagicMock()
+        )
         # The slow gate appends to gate_calls only AFTER its sleep, so an empty
         # list here proves the handler returned without awaiting it.
         assert gate_calls == []

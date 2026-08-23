@@ -17,14 +17,19 @@ The unit-level tests below cover:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 import pytest
+from fastapi import HTTPException
 
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.routes.browser_sessions import base_router
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.webeye.schemas import BrowserSessionResponse
 
 _DUMMY_KEYRING_JSON = '{"current_kid": "k1", "keys": {"k1": {"secret": "0000000000000000000000000000000000000000000000000000000000000000"}}}'
 
@@ -107,7 +112,7 @@ async def test_create_browser_session_download_artifact_inserts_when_no_existing
     assert kwargs["organization_id"] == "o_1"
     assert kwargs["checksum"] == "sha-xyz"
     assert kwargs["file_size"] == 1234
-    # No run_id at write time — claim happens at run finalization.
+    # An unresolved producer still writes the row; the claim reconciles it later.
     assert kwargs.get("run_id") is None
 
 
@@ -143,6 +148,63 @@ async def test_create_browser_session_download_artifact_is_idempotent_per_sessio
 
     assert artifact_id == "a_existing"
     mock_db_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_download_artifact_fills_an_unbound_existing_row():
+    manager = ArtifactManager()
+    existing = _make_artifact("a_existing", "s3://bucket/pbs_1/downloads/file.pdf")
+    mock_bind = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            AsyncMock(return_value=existing),
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bind_session_download_artifact_producer",
+            mock_bind,
+        ),
+    ):
+        await manager.create_browser_session_download_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            run_id="wr_a",
+        )
+
+    mock_bind.assert_awaited_once()
+    assert mock_bind.call_args.kwargs["run_id"] == "wr_a"
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_download_artifact_never_restamps_a_bound_row():
+    """A download re-uploaded as it grows can be observed after the session changed hands; the
+    producer recorded on the first write must win."""
+    manager = ArtifactManager()
+    existing = _make_artifact("a_existing", "s3://bucket/pbs_1/downloads/file.pdf", run_id="wr_a")
+    mock_bind = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            AsyncMock(return_value=existing),
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bind_session_download_artifact_producer",
+            mock_bind,
+        ),
+    ):
+        await manager.create_browser_session_download_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="file.pdf",
+            run_id="wr_b",
+        )
+
+    mock_bind.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -591,3 +653,72 @@ async def test_delete_browser_session_file_swallows_db_failure_and_still_deletes
 # Watcher-level tests for browser_controller live under tests/cloud/ — the
 # browser_controller module imports cloud-only dependencies (redis client) and
 # can't load in the OSS-synced unit suite.
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_returns_retryable_503_when_download_lookup_times_out():
+    now = datetime.now(timezone.utc)
+    browser_session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_1",
+        organization_id="o_1",
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(side_effect=TimeoutError)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await BrowserSessionResponse.from_browser_session(browser_session, storage, fail_download_lookup=True)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {"code": "downloaded_files_unavailable", "retryable": True}
+
+
+@pytest.mark.asyncio
+async def test_browser_session_response_preserves_empty_downloads_on_timeout_by_default():
+    now = datetime.now(timezone.utc)
+    browser_session = PersistentBrowserSession(
+        persistent_browser_session_id="pbs_1",
+        organization_id="o_1",
+        status="running",
+        created_at=now,
+        modified_at=now,
+    )
+    storage = MagicMock()
+    storage.get_shared_downloaded_files_in_browser_session = AsyncMock(side_effect=TimeoutError)
+    storage.get_shared_recordings_in_browser_session = AsyncMock(return_value=[])
+
+    selector = AsyncMock(return_value=[])
+    with patch("skyvern.webeye.schemas.app") as app_mock:
+        app_mock.AGENT_FUNCTION.select_browser_session_recordings = selector
+        app_mock.AGENT_FUNCTION.resolve_browser_session_connect_url = AsyncMock(return_value=None)
+        response = await BrowserSessionResponse.from_browser_session(browser_session, storage)
+
+    assert response.downloaded_files == []
+    selector.assert_not_awaited()
+
+
+def test_get_browser_session_openapi_documents_download_unavailable_response():
+    route = next(
+        route
+        for route in base_router.routes
+        if getattr(route, "path", None) == "/browser_sessions/{browser_session_id}"
+        and "GET" in getattr(route, "methods", set())
+    )
+    response_schema = route.responses[503]["content"]["application/json"]["schema"]
+
+    assert response_schema == {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+            "detail": {
+                "type": "object",
+                "required": ["code", "retryable"],
+                "properties": {
+                    "code": {"type": "string", "enum": ["downloaded_files_unavailable"]},
+                    "retryable": {"type": "boolean"},
+                },
+            }
+        },
+    }

@@ -13,6 +13,7 @@ from botocore.exceptions import ClientError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.aws import AsyncAWSClient, S3StorageClass, S3Uri
 from skyvern.forge.sdk.api.files import (
@@ -20,22 +21,26 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     get_download_dir,
     get_skyvern_temp_dir,
-    make_temp_directory,
-    unzip_files,
+    unzip_bytes_to_temp_directory,
     wait_for_pending_extension_rename,
 )
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    download_checksums_by_uri,
+    key_is_org_scoped,
+    presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -56,12 +61,6 @@ def _safe_get_file_size(path: str) -> int | None:
     except OSError:
         LOG.warning("Failed to get file size", path=path, exc_info=True)
         return None
-
-
-def _replace_file_extension(path: str, extension: str) -> str:
-    normalized_extension = extension.lstrip(".")
-    stem, _ = os.path.splitext(path)
-    return f"{stem}.{normalized_extension}" if normalized_extension else path
 
 
 class S3Storage(BaseStorage):
@@ -224,11 +223,17 @@ class S3Storage(BaseStorage):
         return dict(pairs)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
-        share_urls = await self.async_client.create_presigned_urls([artifact.uri])
+        share_urls = await self.get_share_links([artifact])
         return share_urls[0] if share_urls else None
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
-        return await self.async_client.create_presigned_urls([artifact.uri for artifact in artifacts])
+        return await presign_with_sensitive_cap(
+            artifacts,
+            presign=self.async_client.create_presigned_urls,
+            presign_sensitive=lambda uris: self.async_client.create_presigned_urls(
+                uris, expires_in=min(settings.PRESIGNED_URL_EXPIRATION, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
+            ),
+        )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
         sc = await self._get_storage_class_for_org(artifact.organization_id, self.bucket, os.path.getsize(path))
@@ -242,7 +247,7 @@ class S3Storage(BaseStorage):
         )
         await self.async_client.upload_file_from_path(artifact.uri, path, storage_class=sc)
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
         from_path = f"{get_skyvern_temp_dir()}/{organization_id}/{file_name}"
         to_path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_SCREENSHOTS)
@@ -255,6 +260,7 @@ class S3Storage(BaseStorage):
             storage_class=sc,
         )
         await self.async_client.upload_file_from_path(to_path, from_path, storage_class=sc)
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str, use_default: bool = True) -> bytes | None:
         path = f"s3://{settings.AWS_S3_BUCKET_SCREENSHOTS}/{settings.ENV}/{organization_id}/{file_name}"
@@ -281,14 +287,7 @@ class S3Storage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(browser_session_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
-
-        temp_dir = make_temp_directory(prefix="skyvern_browser_session_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
-        return temp_dir
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_session_")
 
     async def delete_browser_session(self, organization_id: str, workflow_permanent_id: str) -> None:
         browser_session_uri = f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/{workflow_permanent_id}.zip"
@@ -305,20 +304,30 @@ class S3Storage(BaseStorage):
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to S3."""
         temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        # make_archive writes base_name + ".zip", a separate file the NamedTemporaryFile cleanup never
+        # removes. Name it up front and clean it in a finally that also covers the archive step, so a
+        # partial .zip from an archive that fails partway can't leak into TEMP_PATH.
+        zip_file_path = f"{temp_zip_file.name}.zip"
         profile_uri = (
             f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
         sc = await self._get_storage_class_for_org(organization_id, settings.AWS_S3_BUCKET_BROWSER_SESSIONS)
-        LOG.debug(
-            "Storing browser profile",
-            organization_id=organization_id,
-            profile_id=profile_id,
-            zip_file_path=zip_file_path,
-            profile_uri=profile_uri,
-            storage_class=sc,
-        )
-        await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
+        try:
+            # Off the event loop: the credential living-profile engine calls this mid-run, where a
+            # sync archive of a large profile dir would stall every other coroutine on the worker.
+            await asyncio.to_thread(shutil.make_archive, temp_zip_file.name, "zip", directory)
+            LOG.debug(
+                "Storing browser profile",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                zip_file_path=zip_file_path,
+                profile_uri=profile_uri,
+                storage_class=sc,
+            )
+            await self.async_client.upload_file_from_path(profile_uri, zip_file_path, storage_class=sc)
+        finally:
+            if os.path.exists(zip_file_path):
+                os.remove(zip_file_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from S3."""
@@ -328,17 +337,45 @@ class S3Storage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        temp_zip_file = create_named_temporary_file(delete=False)
-        temp_zip_file.write(downloaded_zip_bytes)
-        temp_zip_file_path = temp_zip_file.name
+        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
 
-        temp_dir = make_temp_directory(prefix="skyvern_browser_profile_")
-        unzip_files(temp_zip_file_path, temp_dir)
-        temp_zip_file.close()
-        return temp_dir
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Cheap existence check (head_object) — avoids downloading the archive just to know it exists."""
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        try:
+            await self.async_client.get_object_info(profile_uri)
+        except ClientError as exc:
+            if self.async_client._is_not_found_error(exc):
+                return False
+            # Transient/authz errors propagate so the has-content fail-safe treats a flaky read as
+            # existing content instead of reseeding a run to fresh and overwriting its saved archive.
+            raise
+        return True
 
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a browser profile from S3."""
+    async def get_browser_profile_etag(self, organization_id: str, profile_id: str) -> str | None:
+        profile_uri = (
+            f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        )
+        try:
+            info = await self.async_client.get_object_info(profile_uri)
+        except ClientError as exc:
+            if self.async_client._is_not_found_error(exc):
+                # Missing object = no prior version = no conflict possible → a full write is fine.
+                return None
+            # Transient/authz errors propagate: the write path skips this run rather than reading None
+            # as "unchanged" and fail-open overwriting a possibly-concurrently-updated archive.
+            raise
+        etag = info.get("ETag") if info else None
+        return str(etag) if etag else None
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a browser profile from S3. The bucket is Suspended (no versioning), so a plain
+        DeleteObject genuinely erases the single profile archive. hard_delete=True RAISES on an S3
+        failure so the caller can't falsely report a cookie-bearing archive erased (the reap then leaves
+        the profile row for retry/discovery instead of a silent orphan); soft delete is best-effort — a
+        reap failure must not break the promote or the soft-delete that triggered it."""
         profile_uri = (
             f"s3://{settings.AWS_S3_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
@@ -347,10 +384,11 @@ class S3Storage(BaseStorage):
             organization_id=organization_id,
             profile_id=profile_id,
             profile_uri=profile_uri,
+            hard_delete=hard_delete,
         )
-        # DeleteObject is idempotent: deleting a missing key is a no-op. Best-effort — log and
-        # swallow so a reap failure never breaks the promote or the soft-delete that triggered it.
-        await self.async_client.delete_file(profile_uri, log_exception=True)
+        # DeleteObject is idempotent: deleting a missing key is a no-op. A hard delete propagates a real
+        # failure (raise_on_error) so the erasure is never silently reported complete; soft delete swallows.
+        await self.async_client.delete_file(profile_uri, log_exception=True, raise_on_error=hard_delete)
 
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
@@ -696,6 +734,17 @@ class S3Storage(BaseStorage):
         """Save files from local download directory to S3."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        if not files:
+            return
+        already_saved = (
+            download_checksums_by_uri(
+                await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            )
+            if run_id is not None
+            else {}
+        )
+        skipped_files: list[str] = []
+        unchanged_file_count = 0
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -706,6 +755,11 @@ class S3Storage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+            # Cleanup runs repeatedly over a growing download dir; re-sending bytes that are
+            # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
+            if already_saved.get(uri) == checksum:
+                unchanged_file_count += 1
+                continue
             file_size = _safe_get_file_size(fpath)
             # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
             # emoji) would otherwise raise ParamValidationError at upload time.
@@ -733,6 +787,7 @@ class S3Storage(BaseStorage):
                     run_id=run_id,
                     exc_info=True,
                 )
+                skipped_files.append(file)
                 continue
 
             # Register the file as an Artifact so GET run output can serve it via
@@ -757,6 +812,17 @@ class S3Storage(BaseStorage):
                         run_id=run_id,
                         exc_info=True,
                     )
+                    skipped_files.append(file)
+        if unchanged_file_count:
+            LOG.info(
+                "Skipped downloaded files already saved with the same checksum",
+                organization_id=organization_id,
+                run_id=run_id,
+                unchanged_file_count=unchanged_file_count,
+                total_file_count=len(files),
+            )
+        if skipped_files:
+            raise DownloadSaveIncompleteError(skipped_files)
 
     async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
         # Artifact-first: when a run has DOWNLOAD artifact rows, return them as
@@ -771,10 +837,42 @@ class S3Storage(BaseStorage):
             artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
             if artifacts:
                 return await _file_infos_from_download_artifacts(artifacts)
+            if await self._skip_empty_downloads_listing(organization_id=organization_id, run_id=run_id):
+                return []
 
         # Legacy fallback — runs predating SKY-8861 (no artifact rows) and
         # OSS-default deployments without HMAC signing both arrive here.
         return await self._get_downloaded_files_via_s3_listing(organization_id=organization_id, run_id=run_id)
+
+    async def _skip_empty_downloads_listing(self, *, organization_id: str, run_id: str) -> bool:
+        """True when a run with zero DOWNLOAD rows may skip the legacy S3 LIST.
+
+        Only runs created at/after DOWNLOADS_EMPTY_S3_LISTING_CUTOVER qualify: they
+        register every download as an artifact row at save time, so an empty row set
+        means an empty S3 prefix. Anything unresolvable (cutover unset or unparseable,
+        run row missing, DB error) keeps the LIST fallback.
+        """
+        cutover_raw = settings.DOWNLOADS_EMPTY_S3_LISTING_CUTOVER
+        if not cutover_raw:
+            return False
+        try:
+            cutover = datetime.fromisoformat(cutover_raw)
+            run = await app.DATABASE.tasks.get_run(run_id=run_id, organization_id=organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve run for empty-downloads listing skip; using S3 LIST",
+                run_id=run_id,
+                exc_info=True,
+            )
+            return False
+        if run is None:
+            return False
+        created_at = run.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if cutover.tzinfo is None:
+            cutover = cutover.replace(tzinfo=timezone.utc)
+        return created_at >= cutover
 
     async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
         try:
@@ -881,6 +979,10 @@ class S3Storage(BaseStorage):
             return None
         return presigned_urls[0], uploaded_s3_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri, log_exception=True, raise_on_error=True)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -903,6 +1005,8 @@ class S3Storage(BaseStorage):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to S3."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -911,17 +1015,19 @@ class S3Storage(BaseStorage):
         if artifact_type == "videos":
             # Anchor per-run clip offsets to browser close, captured before the (potentially
             # slow) compress+upload below so a long upload doesn't shift every clip window.
-            recording_finalized_at = datetime.now(timezone.utc)
+            recording_finalized_at = recording_finalized_at or datetime.now(timezone.utc)
             # Compress finalized Playwright recordings before upload. The raw
             # local file remains the source of truth if ffmpeg fails; the S3
             # object and artifact metadata reflect the prepared upload file.
             async with prepare_recording_for_upload(local_file_path) as prepared_upload:
                 upload_file_path = prepared_upload.path
-                upload_remote_path = _replace_file_extension(remote_path, prepared_upload.file_extension)
+                upload_remote_path = replace_file_extension(remote_path, prepared_upload.file_extension)
                 uri = self._build_browser_session_uri(
                     organization_id, browser_session_id, artifact_type, upload_remote_path, date
                 )
-                await self.async_client.upload_file_from_path(uri, upload_file_path, storage_class=sc)
+                await self.async_client.upload_file_from_path(
+                    uri, upload_file_path, storage_class=sc, raise_exception=True
+                )
                 # Register the uploaded recording for signed artifact serving.
                 checksum = calculate_sha256_for_file(upload_file_path)
                 file_size = _safe_get_file_size(upload_file_path)
@@ -983,6 +1089,7 @@ class S3Storage(BaseStorage):
                 filename=os.path.basename(remote_path),
                 checksum=download_checksum,
                 file_size=download_file_size,
+                run_id=None if is_partial else producer_run_id,
             )
         return uri
 
@@ -1049,13 +1156,13 @@ class S3Storage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.key, allowed_prefixes):
                 return
 
         # Artifacts bucket: keys use v1/{env}/{org}/
         if parsed_uri.bucket == settings.AWS_S3_BUCKET_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.key.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.key, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

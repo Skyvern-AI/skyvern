@@ -1,9 +1,4 @@
-import { useState } from "react";
-
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Button } from "@/components/ui/button";
-import { useToast } from "@/components/ui/use-toast";
-import { getClient, setApiKeyHeader } from "@/api/AxiosClient";
 import {
   AuthStatusValue,
   useAuthDiagnostics,
@@ -12,6 +7,7 @@ import { useAuthIssueStore } from "@/store/AuthIssueStore";
 
 type BannerStatus =
   | Exclude<AuthStatusValue, "ok">
+  | "ui_session_failed"
   | "request_auth_error"
   | "error";
 
@@ -19,39 +15,41 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
   switch (status) {
     case "missing_api_key":
       return {
-        title: "Frontend API key missing",
+        title: "UI credential missing",
         description:
-          "The UI is not sending an x-api-key header. The backend server can still run locally, but authenticated requests from the UI will fail until VITE_SKYVERN_API_KEY is set or a runtime key is stored.",
+          "The UI has no runtime credential. Authenticated requests will fail until the UI server can mint a session or a runtime key is stored.",
       };
     case "invalid_format":
       return {
         title: "Skyvern API key is invalid",
-        description:
-          "The configured key cannot be decoded. Regenerate a new key to continue using the UI.",
+        description: "The configured key cannot be decoded.",
       };
     case "invalid":
       return {
         title: "Skyvern API key not recognized",
-        description:
-          "The backend rejected the configured key. Regenerate it to refresh local auth.",
+        description: "The backend rejected the configured key.",
       };
     case "expired":
       return {
         title: "Skyvern API key expired",
-        description:
-          "The current key is no longer valid. Generate a fresh key to restore connectivity.",
+        description: "The current key is no longer valid.",
       };
     case "not_found":
       return {
         title: "Local organization missing",
+        description: "The backend could not find the local organization.",
+      };
+    case "ui_session_failed":
+      return {
+        title: "The UI server could not mint a browser session",
         description:
-          "The backend could not find the Skyvern-local organization. Regenerate the key to recreate it.",
+          "The UI holds a short-lived session token rather than the organization API key, and the UI server was unable to issue one. Until it can, every request from this page is unauthenticated.",
       };
     case "request_auth_error":
       return {
         title: "Skyvern API requests are unauthorized",
         description:
-          "The backend rejected a UI request. This usually means the frontend API key, backend API key, and local Docker database are out of sync.",
+          "The backend rejected a UI request. This usually means UI session minting, the backend API key, and the local database are out of sync.",
       };
     case "error":
     default:
@@ -66,105 +64,35 @@ function getCopy(status: BannerStatus): { title: string; description: string } {
 function SelfHealApiKeyBanner() {
   const diagnosticsQuery = useAuthDiagnostics();
   const authIssue = useAuthIssueStore((state) => state.issue);
-  const clearAuthIssue = useAuthIssueStore((state) => state.clearAuthIssue);
-  const { toast } = useToast();
-  const [isRepairing, setIsRepairing] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const isProductionBuild = !import.meta.env.DEV;
+  const uiSessionFailure = useAuthIssueStore((state) => state.uiSessionFailure);
 
-  const { data, error, isLoading, refetch } = diagnosticsQuery;
+  const { data, error } = diagnosticsQuery;
 
   const rawStatus = data?.status;
+  // A failed mint is the cause and a rejected request is only its symptom, so it outranks
+  // the generic unauthorized banner.
   const bannerStatus: BannerStatus | null = error
     ? "error"
     : rawStatus && rawStatus !== "ok"
       ? rawStatus
-      : authIssue
-        ? "request_auth_error"
-        : null;
+      : uiSessionFailure
+        ? "ui_session_failed"
+        : authIssue
+          ? "request_auth_error"
+          : null;
 
-  if (!bannerStatus && !errorMessage) {
-    if (isLoading) {
-      return null;
-    }
+  if (!bannerStatus) {
     return null;
   }
 
-  const copy = getCopy(bannerStatus ?? "missing_api_key");
+  const copy = getCopy(bannerStatus);
   const queryErrorMessage = error?.message ?? null;
-
-  const handleRepair = async () => {
-    setIsRepairing(true);
-    setErrorMessage(null);
-    try {
-      const client = await getClient(null);
-      const response = await client.post<{
-        fingerprint?: string;
-        api_key?: string;
-        backend_env_path?: string;
-        frontend_env_path?: string;
-      }>("/internal/auth/repair");
-
-      const {
-        fingerprint,
-        api_key: apiKey,
-        backend_env_path: backendEnvPath,
-        frontend_env_path: frontendEnvPath,
-      } = response.data;
-
-      if (!apiKey) {
-        throw new Error("Repair succeeded but no API key was returned.");
-      }
-
-      setApiKeyHeader(apiKey);
-      clearAuthIssue();
-
-      const fingerprintSuffix = fingerprint
-        ? ` (fingerprint ${fingerprint})`
-        : "";
-
-      const pathsElements = [];
-      if (backendEnvPath) {
-        pathsElements.push(<div key="backend">Backend: {backendEnvPath}</div>);
-      }
-      if (frontendEnvPath) {
-        pathsElements.push(
-          <div key="frontend">Frontend: {frontendEnvPath}</div>,
-        );
-      }
-
-      toast({
-        title: "API key regenerated",
-        description: (
-          <div>
-            <div>
-              Requests now use the updated key automatically{fingerprintSuffix}{" "}
-              persisted to sessionStorage and written to the following .env
-              paths:
-            </div>
-            {pathsElements.length > 0 && (
-              <div className="mt-2 space-y-2">{pathsElements}</div>
-            )}
-            {isProductionBuild && (
-              <div className="mt-3">
-                Restart the UI server for more robust API key persistence.
-              </div>
-            )}
-          </div>
-        ),
-      });
-
-      await refetch({ throwOnError: false });
-    } catch (fetchError) {
-      const message =
-        fetchError instanceof Error
-          ? fetchError.message
-          : "Unable to repair API key";
-      setErrorMessage(message);
-    } finally {
-      setIsRepairing(false);
-    }
-  };
+  // The diagnostics endpoint only exists in a local backend, so its statuses are the only
+  // ones where local-development advice is the right next step.
+  const isLocalDiagnosticsStatus =
+    bannerStatus !== "error" &&
+    bannerStatus !== "ui_session_failed" &&
+    bannerStatus !== "request_auth_error";
 
   return (
     <div className="px-4 pt-4">
@@ -173,59 +101,33 @@ function SelfHealApiKeyBanner() {
           {copy.title}
         </AlertTitle>
         <AlertDescription className="space-y-3 text-center text-sm leading-6">
-          {bannerStatus !== "error" ? (
-            <>
-              <p>
-                {copy.description} Update <code>VITE_SKYVERN_API_KEY</code> in{" "}
-                <code className="mx-1">skyvern-frontend/.env</code>
-                by running <code>skyvern init</code> or click the button below
-                to regenerate it automatically.
-              </p>
-              {data?.detail ? (
-                <p className="text-xs text-slate-300">{data.detail}</p>
-              ) : null}
-              {data?.next_step ? (
-                <p className="text-xs text-slate-300">{data.next_step}</p>
-              ) : null}
-              {authIssue ? (
-                <p className="text-xs text-slate-300">
-                  Last failed request: HTTP {authIssue.statusCode}
-                  {authIssue.path ? ` at ${authIssue.path}` : ""}
-                  {authIssue.detail ? ` (${authIssue.detail})` : ""}
-                </p>
-              ) : null}
-              {bannerStatus === "request_auth_error" ? (
-                <p className="text-yellow-300">
-                  Run <code>skyvern doctor --fix</code> from the cloned Skyvern
-                  directory, then restart Docker Compose if the command asks you
-                  to.
-                </p>
-              ) : null}
-              {isProductionBuild && (
-                <p className="text-yellow-300">
-                  When running a production build, the regenerated API key is
-                  stored in sessionStorage. Closing this tab or browser window
-                  will lose the key. Restart the UI server for more robust
-                  persistence.
-                </p>
-              )}
-              <div className="flex justify-center">
-                <Button
-                  onClick={handleRepair}
-                  disabled={isRepairing}
-                  variant="secondary"
-                >
-                  {isRepairing ? "Regenerating…" : "Regenerate API key"}
-                </Button>
-              </div>
-            </>
-          ) : (
-            <p>{copy.description}</p>
-          )}
-          {errorMessage ? (
-            <p className="text-xs text-rose-200">{errorMessage}</p>
+          <p>
+            {copy.description}
+            {isLocalDiagnosticsStatus ? (
+              <>
+                {" "}
+                For local development, set <code>SKYVERN_API_KEY</code> in{" "}
+                <code className="mx-1">skyvern-frontend/.env</code> and restart{" "}
+                <code>npm run dev</code>. Otherwise run{" "}
+                <code>skyvern doctor --fix</code> in the project directory, then
+                restart local services if prompted.
+              </>
+            ) : null}
+          </p>
+          {data?.detail ? (
+            <p className="text-xs text-slate-300">{data.detail}</p>
           ) : null}
-          {queryErrorMessage && !errorMessage ? (
+          {uiSessionFailure?.detail ? (
+            <p className="text-xs text-slate-300">{uiSessionFailure.detail}</p>
+          ) : null}
+          {authIssue ? (
+            <p className="text-xs text-slate-300">
+              Last failed request: HTTP {authIssue.statusCode}
+              {authIssue.path ? ` at ${authIssue.path}` : ""}
+              {authIssue.detail ? ` (${authIssue.detail})` : ""}
+            </p>
+          ) : null}
+          {queryErrorMessage ? (
             <p className="text-xs text-rose-200">{queryErrorMessage}</p>
           ) : null}
         </AlertDescription>

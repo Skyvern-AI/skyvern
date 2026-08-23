@@ -12,6 +12,8 @@ class ArtifactType(StrEnum):
     AUDIO = "audio"
     SESSION_REPLAY = "session_replay"
     EVAL_SCORE = "eval_score"
+    EVAL_TRAJECTORY = "eval_trajectory"
+    EVAL_RUBRICS = "eval_rubrics"
     BROWSER_CONSOLE_LOG = "browser_console_log"
     BROWSER_SESSION_ACTION_LOG = "browser_session_action_log"
 
@@ -25,6 +27,7 @@ class ArtifactType(StrEnum):
     SCREENSHOT_LLM = "screenshot_llm"
     SCREENSHOT_ACTION = "screenshot_action"
     SCREENSHOT_FINAL = "screenshot_final"
+    SCREENSHOT_PROXY = "screenshot_proxy"
 
     LLM_PROMPT = "llm_prompt"
     LLM_REQUEST = "llm_request"

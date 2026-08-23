@@ -8,6 +8,24 @@ import { type AppNode, isWorkflowBlockNode } from "../nodes";
 
 export const SELECTED_BLOCK_SEARCH_PARAM = "selected-block";
 
+// Marks the current ?selected-block= as a machine-origin focus — the copilot
+// following its own build — rather than a block the user picked. Same role as
+// SYSTEM_RUN_FOCUS_PARAM for ?wr=: consumers that act on the selection must not
+// treat a follow as a choice. Valued with the label it applies to, so the
+// mirror below drops it as soon as a different block is selected.
+export const SYSTEM_BLOCK_FOCUS_PARAM = "sbs";
+
+// Mark the selection the caller is about to make as machine-origin. Merge
+// against the LIVE URL, same rule as the mirror below.
+export function searchWithSystemBlockFocus(
+  search: string,
+  label: string,
+): string {
+  const params = new URLSearchParams(search);
+  params.set(SYSTEM_BLOCK_FOCUS_PARAM, label);
+  return toReadableSearch(params);
+}
+
 function getStartNodeId(nodes: Array<AppNode>): string | null {
   return nodes.find((node) => node.type === "start")?.id ?? null;
 }
@@ -179,6 +197,11 @@ export function useSelectedBlockUrlSync({
       next.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
     } else {
       next.delete(SELECTED_BLOCK_SEARCH_PARAM);
+    }
+    // The marker names the one selection it was set for; any other block is the
+    // user taking the canvas back, and their pick must reach the run pin.
+    if (next.get(SYSTEM_BLOCK_FOCUS_PARAM) !== selectedBlockLabel) {
+      next.delete(SYSTEM_BLOCK_FOCUS_PARAM);
     }
     navigate({ search: toReadableSearch(next) }, { replace: true });
   }, [

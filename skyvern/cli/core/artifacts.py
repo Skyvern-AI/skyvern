@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,6 +8,9 @@ from .result import Artifact
 
 
 def get_artifact_dir(session_id: str | None = None, run_id: str | None = None) -> Path:
+    override = os.environ.get("SKYVERN_MCP_ARTIFACT_DIR")
+    if override:
+        return Path(override).expanduser() / (session_id or run_id or "anonymous") / "screenshots"
     base = Path.home() / ".skyvern" / "artifacts" / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if session_id:
         return base / session_id

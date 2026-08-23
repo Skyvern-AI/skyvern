@@ -13,6 +13,7 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.block import (
     Block,
+    FileParserBlock,
     ForLoopBlock,
     JinjaBranchCriteria,
     LoopBlockExecutedResult,
@@ -702,3 +703,129 @@ class TestLoopBlockExecutedResultIsCompletedWithNaturalCompletion:
             natural_completion=False,
         )
         assert result.is_completed() is False
+
+
+class TestForLoopSkipsUnparseableFile:
+    """A loop over files whose parser carries ``next_loop_on_failure=True`` must
+    abandon only the iteration whose file failed to parse and keep going, rather
+    than stopping the whole loop on the first unparseable file.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unparseable_file_skips_its_iteration_and_the_loop_finishes(self) -> None:
+        parse_file = FileParserBlock(
+            label="parse_file",
+            output_parameter=_make_output_param("parse_file"),
+            file_url="{{ each_file.file_path }}",
+            next_loop_on_failure=True,
+        )
+        store_rows = TaskBlock(label="store_rows", output_parameter=_make_output_param("store_rows"))
+        loop_block = ForLoopBlock(
+            label="each_file",
+            output_parameter=_make_output_param("each_file"),
+            loop_blocks=[parse_file, store_rows],
+        )
+
+        executed: list[tuple[str, str]] = []
+
+        async def fake_execute_safe(block: Block, **kwargs: Any) -> BlockResult:
+            loop_value = kwargs["current_value"]
+            executed.append((block.label, loop_value))
+            if block.label == "parse_file" and loop_value == "huge.csv":
+                return _failed_block_result(
+                    block.output_parameter,
+                    "Failed to parse csv file: parsing timed out after 300 seconds",
+                )
+            return _completed_block_result(block.output_parameter)
+
+        workflow_run_context = MagicMock()
+        workflow_run_context.has_value.return_value = False
+
+        with (
+            patch.object(Block, "execute_safe", autospec=True, side_effect=fake_execute_safe),
+            patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+
+            result = await loop_block.execute_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=workflow_run_context,
+                loop_over_values=["small.csv", "huge.csv", "other.csv"],
+                organization_id="org_test",
+            )
+
+        assert executed == [
+            ("parse_file", "small.csv"),
+            ("store_rows", "small.csv"),
+            ("parse_file", "huge.csv"),
+            ("parse_file", "other.csv"),
+            ("store_rows", "other.csv"),
+        ]
+        assert result.natural_completion is True
+
+        status, success, failure_reason = result.resolve_status(parent_next_loop_on_failure=False)
+        assert status == BlockStatus.completed
+        assert success is True
+        assert failure_reason is None
+
+    @pytest.mark.asyncio
+    async def test_without_the_flag_the_first_unparseable_file_stops_the_loop(self) -> None:
+        parse_file = FileParserBlock(
+            label="parse_file",
+            output_parameter=_make_output_param("parse_file"),
+            file_url="{{ each_file.file_path }}",
+        )
+        store_rows = TaskBlock(label="store_rows", output_parameter=_make_output_param("store_rows"))
+        loop_block = ForLoopBlock(
+            label="each_file",
+            output_parameter=_make_output_param("each_file"),
+            loop_blocks=[parse_file, store_rows],
+        )
+
+        executed: list[tuple[str, str]] = []
+
+        async def fake_execute_safe(block: Block, **kwargs: Any) -> BlockResult:
+            loop_value = kwargs["current_value"]
+            executed.append((block.label, loop_value))
+            if block.label == "parse_file" and loop_value == "huge.csv":
+                return _failed_block_result(block.output_parameter, "Failed to parse csv file")
+            return _completed_block_result(block.output_parameter)
+
+        workflow_run_context = MagicMock()
+        workflow_run_context.has_value.return_value = False
+
+        with (
+            patch.object(Block, "execute_safe", autospec=True, side_effect=fake_execute_safe),
+            patch.object(ForLoopBlock, "get_loop_block_context_parameters", return_value=[]),
+            patch.object(Block, "record_output_parameter_value", new_callable=AsyncMock),
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch("skyvern.forge.sdk.workflow.models.block.skyvern_context") as mock_skyvern_ctx,
+        ):
+            mock_skyvern_ctx.current.return_value = None
+            mock_app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter = AsyncMock()
+            mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+
+            result = await loop_block.execute_loop_helper(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_loop",
+                workflow_run_context=workflow_run_context,
+                loop_over_values=["small.csv", "huge.csv", "other.csv"],
+                organization_id="org_test",
+            )
+
+        assert executed == [
+            ("parse_file", "small.csv"),
+            ("store_rows", "small.csv"),
+            ("parse_file", "huge.csv"),
+        ]
+        assert result.natural_completion is False
+
+        status, success, _ = result.resolve_status(parent_next_loop_on_failure=False)
+        assert status == BlockStatus.failed
+        assert success is False

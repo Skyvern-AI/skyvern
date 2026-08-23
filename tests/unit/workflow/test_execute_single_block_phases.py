@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     ConditionalBlock,
@@ -27,6 +29,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import DebugSessionProfileDecision, WorkflowService
 from skyvern.schemas.scripts import ScriptBlock
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -83,6 +86,7 @@ def _workflow_run(ai_fallback: bool | None = None) -> MagicMock:
     workflow_run.status = WorkflowRunStatus.running
     workflow_run.run_with = None
     workflow_run.ai_fallback = ai_fallback
+    workflow_run.start_fresh_browser = False
     return workflow_run
 
 
@@ -118,6 +122,7 @@ async def _run_single_block(
     workflow_run: MagicMock | None = None,
     is_script_run: bool = False,
     script_blocks_by_label: dict | None = None,
+    loaded_script_module: Any = None,
     blocks_to_update: set[str] | None = None,
 ) -> tuple:
     organization = MagicMock()
@@ -132,7 +137,7 @@ async def _run_single_block(
         workflow_run_id="wr_test",
         browser_session_id=None,
         script_blocks_by_label=script_blocks_by_label if script_blocks_by_label is not None else {},
-        loaded_script_module=None,
+        loaded_script_module=loaded_script_module,
         is_script_run=is_script_run,
         blocks_to_update=blocks_to_update if blocks_to_update is not None else set(),
     )
@@ -259,6 +264,7 @@ async def test_ai_fallback_disabled_keeps_script_failure(monkeypatch: pytest.Mon
         workflow_run=_workflow_run(ai_fallback=False),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 / 0")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     execute_safe.assert_not_awaited()
@@ -292,6 +298,7 @@ async def test_script_success_skips_agent_execution(monkeypatch: pytest.MonkeyPa
         block,
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     execute_safe.assert_not_awaited()
@@ -366,16 +373,59 @@ async def test_login_block_with_saved_profile_rewrites_goal_and_persists_profile
     page.url = "https://example.com/home"
     browser_state = AsyncMock()
     browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.browser_artifacts = BrowserArtifacts(applied_browser_profile_id="bp_123")
+    # No browser open yet: the credential profile loads into a fresh browser (the seed path this test
+    # covers). A pre-existing browser would instead degrade to fresh (see the cached-browser guard).
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *a, **k: None)
     monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", AsyncMock(return_value=browser_state))
     execute_safe = AsyncMock(return_value=_completed_result(block))
     monkeypatch.setattr(LoginBlock, "execute_safe", execute_safe)
 
     await _run_single_block(service, block)
 
-    update_run.assert_awaited_once_with(workflow_run_id="wr_test", browser_profile_id="bp_123")
+    update_run.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="bp_123",
+        browser_seed_source=BrowserSeedSource.credential,
+    )
     assert block.navigation_goal is not None
     assert block.navigation_goal.startswith("A saved browser session has been loaded.")
     assert "Original goal: log in" in block.navigation_goal
+    execute_safe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_login_block_does_not_clobber_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowService()
+    block = _login_block("login", "https://example.com/home")
+    monkeypatch.setattr(WorkflowService, "_apply_login_block_credential_proxy_pin", AsyncMock())
+    monkeypatch.setattr(
+        WorkflowService, "_resolve_login_block_browser_profile_id", AsyncMock(return_value="bp_credential")
+    )
+    decision = AsyncMock(
+        return_value=DebugSessionProfileDecision(attach_browser_session_id=None, incompatible_reason=None)
+    )
+    monkeypatch.setattr(WorkflowService, "_evaluate_debug_session_profile_decision", decision)
+    update_run = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", update_run)
+    get_or_create = AsyncMock()
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_or_create_for_workflow_run", get_or_create)
+    execute_safe = AsyncMock(return_value=_completed_result(block))
+    monkeypatch.setattr(LoginBlock, "execute_safe", execute_safe)
+
+    workflow_run = _workflow_run()
+    workflow_run.browser_seed_source = BrowserSeedSource.override
+
+    await _run_single_block(service, block, workflow_run=workflow_run)
+
+    # An explicit per-run override must survive the login block: no re-stamp, no credential boot, no
+    # goal rewrite — just a normal login into the overridden profile.
+    update_run.assert_not_awaited()
+    decision.assert_not_awaited()
+    get_or_create.assert_not_awaited()
+    assert block.navigation_goal == "log in"
     execute_safe.assert_awaited_once()
 
 
@@ -415,6 +465,7 @@ async def test_adaptive_caching_script_failure_records_and_updates_fallback_epis
         workflow=_adaptive_workflow(),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     record_episode.assert_awaited_once()
@@ -443,15 +494,10 @@ async def test_non_adaptive_script_failure_skips_fallback_episode(monkeypatch: p
     record_episode = AsyncMock(return_value=("ep_1", None))
     monkeypatch.setattr(WorkflowService, "_record_fallback_episode", record_episode)
     monkeypatch.setattr(WorkflowService, "_mark_script_fallback_triggered", AsyncMock())
-    monkeypatch.setattr(
-        NavigationBlock,
-        "execute_safe",
-        AsyncMock(
-            return_value=BlockResult(
-                success=True, output_parameter=block.output_parameter, status=BlockStatus.completed
-            )
-        ),
+    execute_safe = AsyncMock(
+        return_value=BlockResult(success=True, output_parameter=block.output_parameter, status=BlockStatus.completed)
     )
+    monkeypatch.setattr(NavigationBlock, "execute_safe", execute_safe)
     update_episode = AsyncMock()
     monkeypatch.setattr(app.DATABASE.scripts, "update_fallback_episode", update_episode)
 
@@ -463,8 +509,13 @@ async def test_non_adaptive_script_failure_skips_fallback_episode(monkeypatch: p
         workflow=_workflow(),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
+    # The script path must actually have run (script executed, DB row says failed, mid-block
+    # fallback to the agent) for this test to say anything about the non-adaptive-caching skip;
+    # otherwise these assertions would hold vacuously because the script path was never entered.
+    execute_safe.assert_awaited_once()
     record_episode.assert_not_awaited()
     update_episode.assert_not_awaited()
 

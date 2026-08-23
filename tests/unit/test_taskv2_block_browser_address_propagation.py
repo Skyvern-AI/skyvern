@@ -53,7 +53,12 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
         cdp_connect_headers={"x-cdp-auth": "tok"},
     )
     child_workflow_run = SimpleNamespace(failure_reason=None)
-    organization = SimpleNamespace(organization_id="org_1", organization_name="Org 1")
+    organization = SimpleNamespace(
+        organization_id="org_1",
+        organization_name="Org 1",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
 
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(

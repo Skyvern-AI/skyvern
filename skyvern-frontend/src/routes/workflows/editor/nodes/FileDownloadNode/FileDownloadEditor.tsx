@@ -201,6 +201,29 @@ function FileDownloadEditorBody({
           </DestinationField>
         )}
 
+        {downloadTarget !== "website" && (
+          <DestinationField
+            label={
+              downloadTarget === "google_drive"
+                ? "Google Account"
+                : "Google Drive Source Account (Optional)"
+            }
+            help={
+              downloadTarget === "google_drive"
+                ? "The connected Google account used for Drive downloads and uploads."
+                : "Select a connected Google account to download private Google Drive links before sending the file to this destination."
+            }
+          >
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              optional={downloadTarget !== "google_drive"}
+            />
+          </DestinationField>
+        )}
+
         {downloadTarget === "s3" && (
           <>
             <DestinationField
@@ -313,30 +336,17 @@ function FileDownloadEditorBody({
         )}
 
         {downloadTarget === "google_drive" && (
-          <>
-            <DestinationField
-              label="Google Account"
-              help="The connected Google account used for Drive uploads."
-            >
-              <GoogleOAuthCredentialSelector
-                nodeId={blockId}
-                value={googleCredentialId ?? ""}
-                onChange={(value) => update({ googleCredentialId: value })}
-                requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
-              />
-            </DestinationField>
-            <DestinationField
-              label="Google Drive Folder ID (Required)"
-              help="Required destination Google Drive folder ID. You can paste a Drive folder URL or a bare folder ID."
-            >
-              <WorkflowBlockInputTextarea
-                nodeId={blockId}
-                onChange={(value) => update({ googleDriveFolderId: value })}
-                value={googleDriveFolderId ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-          </>
+          <DestinationField
+            label="Google Drive Folder ID (Optional)"
+            help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
+          >
+            <WorkflowBlockInputTextarea
+              nodeId={blockId}
+              onChange={(value) => update({ googleDriveFolderId: value })}
+              value={googleDriveFolderId ?? ""}
+              className="nopan text-xs"
+            />
+          </DestinationField>
         )}
 
         {downloadTarget === "sftp" && (

@@ -108,7 +108,12 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         cdp_connect_headers=None,
     )
     child_workflow_run = SimpleNamespace(failure_reason=None)
-    organization = SimpleNamespace(organization_id="org_1", organization_name="Org 1")
+    organization = SimpleNamespace(
+        organization_id="org_1",
+        organization_name="Org 1",
+        default_llm_key=None,
+        default_secondary_llm_key=None,
+    )
     a_zip = _file("file:///app/downloads/wr_parent/a.zip", "a.zip", "abc")
     b_zip = _file("file:///app/downloads/wr_parent/b.zip", "b.zip", "def")
 

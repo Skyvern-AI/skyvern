@@ -1,5 +1,6 @@
 """Tests for the open-tabs context section and CLOSE_PAGE gate in extract-action prompts."""
 
+import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -76,8 +77,8 @@ class TestOpenTabsContextSection:
         assert "Open browser tabs" in rendered
         assert "tab_index" in rendered
         assert "[current]" in rendered
-        assert "https://main.test" in rendered
-        assert "https://pdf.test/viewer" in rendered
+        assert re.search(r"https://main\.test", rendered) is not None
+        assert re.search(r"https://pdf\.test/viewer", rendered) is not None
 
     @pytest.mark.parametrize("template", ["extract-action", "extract-action-dynamic"])
     def test_omits_tab_listing_when_no_context(self, template: str) -> None:
@@ -132,6 +133,51 @@ class TestCacheVariant:
         )
         assert "vc" in result
         assert "cp" in result
+
+    def test_complete_criterion_variant_keys_on_presence_only(self) -> None:
+        first = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion="The first outcome is visible",
+        )
+        second = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion="A different outcome is visible",
+        )
+        absent = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+        )
+
+        assert first == second
+        assert first != absent
+
+    def test_guidance_text_has_a_stable_collision_resistant_tag(self) -> None:
+        first = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method A.",
+        )
+        repeated = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method A.",
+        )
+        second = ForgeAgent._build_extract_action_cache_variant(
+            verification_code_check=False,
+            show_close_page_action=False,
+            complete_criterion=None,
+            extra_action_guidance="Use verification method B.",
+        )
+
+        assert first == repeated
+        assert first.startswith("g")
+        assert len(first) == 9
+        assert first != second
 
 
 class TestNewTabSwitchTabGate:

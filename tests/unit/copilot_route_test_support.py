@@ -56,6 +56,16 @@ def setup_new_copilot_mocks(
         agent_result.narrative_summary = None
     if not hasattr(agent_result, "narrative_payload"):
         agent_result.narrative_payload = None
+    if not hasattr(agent_result, "executed_block_fingerprints"):
+        agent_result.executed_block_fingerprints = {}
+    if not hasattr(agent_result, "cancellation_iteration"):
+        agent_result.cancellation_iteration = None
+    if not hasattr(agent_result, "cancellation_last_recorded_phase"):
+        agent_result.cancellation_last_recorded_phase = None
+    if not hasattr(original_workflow, "modified_at"):
+        original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
+    if not hasattr(original_workflow, "model_dump"):
+        original_workflow.model_dump = MagicMock(return_value={"workflow_id": original_workflow.workflow_id})
 
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -84,6 +94,15 @@ def setup_new_copilot_mocks(
         create_workflow_copilot_chat_message=AsyncMock(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
         ),
+        start_copilot_turn=AsyncMock(
+            return_value=SimpleNamespace(
+                workflow_copilot_chat_message_id="wccm-user-1",
+                created_at=datetime(2026, 4, 14, tzinfo=timezone.utc),
+            )
+        ),
+        replace_workflow_copilot_chat_message=AsyncMock(),
+        claim_pending_copilot_turn=AsyncMock(return_value=True),
+        clear_pending_copilot_turn=AsyncMock(),
     )
     app.DATABASE.workflow_params = workflow_params
     app.DATABASE.workflows = SimpleNamespace(

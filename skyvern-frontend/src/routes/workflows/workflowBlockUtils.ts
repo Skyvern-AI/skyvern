@@ -1,4 +1,8 @@
-import { getReadableActionType } from "@/api/types";
+import {
+  ActionTypes,
+  getReadableActionType,
+  type ActionsApiResponse,
+} from "@/api/types";
 
 import {
   isNestedLoopWorkflowBlock,
@@ -23,19 +27,52 @@ export function findWorkflowBlockByLabel(
   return found;
 }
 
+// Pre-order in reading order: the next_block_label chain, a conditional's
+// branches before its merge block, a loop's body right after the loop. The
+// editor serializes conditional-branch children after the top-level chain, so
+// plain array order would list the merge block ahead of the branches.
 export function visitWorkflowBlocks(
   blocks: Array<WorkflowBlock>,
   visit: (block: WorkflowBlock) => void | false,
-) {
-  for (const block of blocks) {
+): boolean {
+  const byLabel = new Map(blocks.map((block) => [block.label, block]));
+  const visited = new Set<string>();
+
+  const walk = (
+    label: string | null | undefined,
+    stop: string | null,
+  ): boolean => {
+    const block = label ? byLabel.get(label) : undefined;
+    if (!block || label === stop || visited.has(block.label)) {
+      return true;
+    }
+    visited.add(block.label);
     if (visit(block) === false) {
       return false;
     }
-
-    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks.length > 0) {
-      if (visitWorkflowBlocks(block.loop_blocks, visit) === false) {
-        return false;
+    if (
+      isNestedLoopWorkflowBlock(block) &&
+      block.loop_blocks.length > 0 &&
+      !visitWorkflowBlocks(block.loop_blocks, visit)
+    ) {
+      return false;
+    }
+    if (block.block_type === "conditional") {
+      const merge = block.next_block_label ?? stop;
+      for (const branch of block.branch_conditions) {
+        if (!walk(branch.next_block_label, merge)) {
+          return false;
+        }
       }
+    }
+    return walk(block.next_block_label, stop);
+  };
+
+  // Array order seeds the walk: the head of the chain first, then whatever a
+  // chain never reached (v1 fall-through, orphans) so nothing is skipped.
+  for (const block of blocks) {
+    if (!walk(block.label, null)) {
+      return false;
     }
   }
 
@@ -110,4 +147,83 @@ export function findCodeStepForLine(
         codeLine <= (step.line_end ?? step.line_start),
     ) ?? null
   );
+}
+
+export function normalizeInlineText(
+  value: string | null | undefined,
+): string | null {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  return normalized ? normalized : null;
+}
+
+// The code-block recorder writes `description` two ways: a "<receiver>.<method> <selector>"
+// trace for ordinary calls, or the author's own prompt text for page.extract/complete. Only
+// the first is machine syntax, and only these three receivers are ever emitted.
+const RECORDER_CALL_TEXT = /^(?:locator|page|keyboard)\.[A-Za-z_]+(?:\s|$)/;
+
+export function isRecorderCallText(
+  description: string | null | undefined,
+): boolean {
+  const text = normalizeInlineText(description);
+  return text !== null && RECORDER_CALL_TEXT.test(text);
+}
+
+/**
+ * Reader-facing text for one recorded action, in descending order of specificity: the definition
+ * step it fired from, whatever prose the action carries, the author's own prompt, then the one
+ * recorder argument worth reading.
+ *
+ * Returns null when nothing beats the action's own type name, so a caller that already renders
+ * the type does not print it twice. A raw Playwright selector is never returned.
+ */
+export function describeRecordedAction(
+  action: ActionsApiResponse,
+  matchedStep: CodeBlockStep | null,
+): string | null {
+  // Line numbers drift when a code block is edited between runs, so a step only names
+  // this action when their kinds also agree; otherwise a stale outline labels the wrong step.
+  if (matchedStep && matchedStep.action_type === action.action_type) {
+    const stepText = normalizeInlineText(getCodeStepPlainText(matchedStep));
+    if (stepText) {
+      return stepText;
+    }
+  }
+
+  const authored =
+    normalizeInlineText(action.reasoning) ??
+    normalizeInlineText(action.text) ??
+    normalizeInlineText(action.response);
+  if (authored) {
+    return authored;
+  }
+
+  if (!isRecorderCallText(action.description)) {
+    const prompt = normalizeInlineText(action.description);
+    if (prompt) {
+      return prompt;
+    }
+  }
+
+  // Only base-Action fields are readable here: the timeline serializes actions as
+  // `list[Action]`, so subclass-only fields (url, keys) never reach the client.
+  if (action.action_type === ActionTypes.DownloadFile) {
+    const fileName = normalizeInlineText(action.file_name);
+    if (fileName) {
+      return `Download ${fileName}`;
+    }
+  }
+
+  // `_describe` builds "<receiver>.<method> <argument>"; for a navigation the argument is the
+  // destination, which is the one recorder argument worth reading.
+  if (action.action_type === ActionTypes.GotoUrl) {
+    const target = normalizeInlineText(action.description)
+      ?.split(/\s+/)
+      .slice(1)
+      .join(" ");
+    if (target) {
+      return `Open ${target}`;
+    }
+  }
+
+  return null;
 }

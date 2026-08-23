@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
+
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -14,22 +17,53 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { getRuntimeApiKey } from "@/util/env";
+import {
+  useRuntimeCredential,
+  type RuntimeCredential,
+} from "@/hooks/useRuntimeCredential";
 import { HiddenCopyableInput } from "@/components/ui/hidden-copyable-input";
 import { OnePasswordTokenForm } from "@/components/OnePasswordTokenForm";
 import { BitwardenCredentialForm } from "@/components/BitwardenCredentialForm";
 import { AzureClientSecretCredentialTokenForm } from "@/components/AzureClientSecretCredentialTokenForm";
 import { CustomCredentialServiceConfigForm } from "@/components/CustomCredentialServiceConfigForm";
 import { CustomLLMConfigForm } from "@/components/CustomLLMConfigForm";
+import { OrgLLMDefaultsCard } from "@/components/OrgLLMDefaultsCard";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { useVersionQuery } from "@/hooks/useVersionQuery";
 import { formatVersion, getAppVersion } from "@/util/version";
 
+// The browser holds a scoped session token rather than the organization key, so a value copied
+// from here stops working at expiry. Say which one is on screen.
+function describeRuntimeCredential(credential: RuntimeCredential): string {
+  if (!credential.apiKey) {
+    return "The UI server mints this credential after the page loads.";
+  }
+  if (credential.expiresAt === null) {
+    return "Currently active API key";
+  }
+  return (
+    `Short-lived browser session token, valid until ${new Date(credential.expiresAt * 1000).toLocaleTimeString()}. ` +
+    "For SDK, CI, or scheduled callers, use the organization API key from your server configuration."
+  );
+}
+
 function Settings() {
+  const { hash } = useLocation();
   const { environment, organization, setEnvironment, setOrganization } =
     useSettingsStore();
-  const apiKey = getRuntimeApiKey();
+  const credential = useRuntimeCredential();
   const { data: versionData } = useVersionQuery();
+
+  useEffect(() => {
+    if (!hash) {
+      return;
+    }
+
+    document.getElementById(hash.slice(1))?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, [hash]);
 
   return (
     <div className="flex flex-col gap-8">
@@ -70,10 +104,14 @@ function Settings() {
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">API Key</CardTitle>
-          <CardDescription>Currently active API key</CardDescription>
+          <CardDescription>
+            {describeRuntimeCredential(credential)}
+          </CardDescription>
         </CardHeader>
         <CardContent className="p-8">
-          <HiddenCopyableInput value={apiKey ?? "API key not found"} />
+          <HiddenCopyableInput
+            value={credential.apiKey ?? "Waiting for a browser session token"}
+          />
         </CardContent>
       </Card>
       <Card>
@@ -138,7 +176,7 @@ function Settings() {
           <GoogleOAuthClientConfigForm />
         </CardContent>
       </Card>
-      <Card>
+      <Card id="custom-llms">
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">Custom LLMs</CardTitle>
           <CardDescription>
@@ -149,6 +187,7 @@ function Settings() {
           <CustomLLMConfigForm />
         </CardContent>
       </Card>
+      <OrgLLMDefaultsCard />
       {(getAppVersion() !== "development" || versionData?.version) && (
         <p className="text-center text-xs text-muted-foreground/50">
           {getAppVersion() !== "development" && (

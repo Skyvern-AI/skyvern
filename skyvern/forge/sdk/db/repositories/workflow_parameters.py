@@ -6,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import defer
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
@@ -15,7 +16,7 @@ from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -50,6 +51,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotPendingTurn,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
@@ -76,6 +78,32 @@ from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
+
+PENDING_TURN_RETENTION = timedelta(days=30)
+
+
+def _pending_turn_id_for_idempotency_digest(
+    pending_turns: Mapping[str, object], idempotency_digest: str | None
+) -> str | None:
+    if not idempotency_digest:
+        return None
+    for turn_id, value in pending_turns.items():
+        if isinstance(value, Mapping) and value.get("idempotency_digest") == idempotency_digest:
+            return turn_id
+    return None
+
+
+def _completed_turn_id_for_idempotency_digest(
+    turn_outcomes: list[object], idempotency_digest: str | None
+) -> str | None:
+    if not idempotency_digest:
+        return None
+    for value in turn_outcomes:
+        if not isinstance(value, Mapping) or value.get("idempotency_digest") != idempotency_digest:
+            continue
+        turn_id = value.get("copilot_turn_id")
+        return turn_id if isinstance(turn_id, str) and turn_id else None
+    return None
 
 
 def _floor_rekeyed_association_is_coherent(item: Mapping[str, object]) -> bool:
@@ -122,7 +150,10 @@ def _decode_completion_criteria_set(
                 not _floor_rekeyed_association_is_coherent(item)
                 or any(
                     field in item and item[field] != canonical_value
-                    for field, canonical_value in criterion_authority_projection(criterion).items()
+                    for field, canonical_value in criterion_authority_projection(
+                        criterion,
+                        stored_item=item,
+                    ).items()
                 )
                 or ("antecedent_family" in item and item["antecedent_family"] is None)
                 for item, criterion in zip(inner, decoded)
@@ -166,6 +197,32 @@ def _decode_completion_criteria_set(
         completion_criteria_set_id=row.completion_criteria_set_id,
         goal_epoch=row.goal_epoch,
     )
+
+
+def _parse_pending_turn_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
+    """Drop markers too old to still be worth reconciling, so the column cannot grow without bound."""
+    if not isinstance(pending_turns, dict):
+        return {}
+    cutoff = datetime.now(timezone.utc) - PENDING_TURN_RETENTION
+    kept: dict[str, Any] = {}
+    for turn_id, entry in pending_turns.items():
+        if not isinstance(entry, dict):
+            continue
+        started_at = _parse_pending_turn_timestamp(entry.get("started_at"))
+        if started_at is not None and started_at < cutoff:
+            continue
+        kept[turn_id] = entry
+    return kept
 
 
 class WorkflowParametersRepository(BaseRepository):
@@ -663,6 +720,190 @@ class WorkflowParametersRepository(BaseRepository):
             await session.refresh(new_message)
             return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
 
+    @db_operation("start_copilot_turn")
+    async def start_copilot_turn(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        pending_turn: CopilotPendingTurn,
+        user_message: str,
+        audio_artifact_id: str | None = None,
+    ) -> WorkflowCopilotChatMessage:
+        """Write the turn's user row and its pending marker in one transaction.
+
+        Two separate commits would leave a crash window in which the user
+        message exists with no marker to reconcile it.
+        """
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
+            pending = _prune_pending_turns(chat.pending_turns)
+            existing_turn_id = _pending_turn_id_for_idempotency_digest(
+                pending,
+                pending_turn.idempotency_digest,
+            )
+            if existing_turn_id is not None:
+                raise DuplicateCopilotTurnError(existing_turn_id)
+            if pending_turn.idempotency_digest is not None:
+                completed_outcomes = list(
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel.turn_outcome)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome.is_not(None))
+                    )
+                )
+                completed_turn_id = _completed_turn_id_for_idempotency_digest(
+                    completed_outcomes,
+                    pending_turn.idempotency_digest,
+                )
+                if completed_turn_id is not None:
+                    raise DuplicateCopilotTurnError(completed_turn_id)
+            new_message = WorkflowCopilotChatMessageModel(
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                organization_id=organization_id,
+                sender=WorkflowCopilotChatSender.USER,
+                content=user_message,
+                audio_artifact_id=audio_artifact_id,
+            )
+            session.add(new_message)
+            await session.flush()
+            pending[pending_turn.turn_id] = pending_turn.model_copy(
+                update={"user_message_id": new_message.workflow_copilot_chat_message_id}
+            ).model_dump(mode="json")
+            chat.pending_turns = pending
+            await session.commit()
+            await session.refresh(new_message)
+            return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    @db_operation("claim_pending_copilot_turn")
+    async def claim_pending_copilot_turn(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        claim_before: datetime,
+    ) -> bool:
+        """Stamp ``recovering_at`` on one pending turn, returning whether this caller won it.
+
+        A recovery that itself crashes leaves the stamp behind; a later reader
+        reclaims it once the stamp predates ``claim_before``.
+        """
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return False
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return False
+            recovering_at = _parse_pending_turn_timestamp(entry.get("recovering_at"))
+            if recovering_at is not None and recovering_at > claim_before:
+                return False
+            pending[turn_id] = {**entry, "recovering_at": datetime.now(timezone.utc).isoformat()}
+            chat.pending_turns = pending
+            await session.commit()
+            return True
+
+    @db_operation("clear_pending_copilot_turn")
+    async def clear_pending_copilot_turn(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            if pending.pop(turn_id, None) is None:
+                return
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("record_pending_copilot_turn_canonical_write")
+    async def record_pending_copilot_turn_canonical_write(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        fingerprint: str,
+    ) -> None:
+        """Stamp what this turn left canonical as, so reconcile can tell its own write from anyone else's."""
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            pending[turn_id] = {**entry, "canonical_write_fingerprint": fingerprint}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("replace_workflow_copilot_chat_message")
+    async def replace_workflow_copilot_chat_message(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_message_id: str,
+        content: str,
+        global_llm_context: str | None,
+        turn_outcome: TurnOutcome | None,
+        narrative_payload: TurnNarrativePayload | dict[str, Any] | None,
+    ) -> WorkflowCopilotChatMessage | None:
+        async with self.Session() as session:
+            message = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
+                        == workflow_copilot_chat_message_id
+                    )
+                )
+            ).first()
+            if message is None:
+                return None
+            message.content = content
+            message.global_llm_context = global_llm_context
+            message.turn_outcome = turn_outcome.model_dump(mode="json") if turn_outcome else None
+            message.narrative_payload = narrative_payload
+            await session.commit()
+            await session.refresh(message)
+            return WorkflowCopilotChatMessage.model_validate(message)
+
     @db_operation("get_workflow_copilot_chat_messages")
     async def get_workflow_copilot_chat_messages(
         self,
@@ -745,6 +986,7 @@ class WorkflowParametersRepository(BaseRepository):
             )
             query = (
                 select(WorkflowCopilotChatModel, first_message.c.title)
+                .options(defer(WorkflowCopilotChatModel.pending_turns))
                 .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
                 .where(WorkflowCopilotChatModel.organization_id == organization_id)
             )
@@ -903,6 +1145,7 @@ class WorkflowParametersRepository(BaseRepository):
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(
         self,
+        organization_id: str,
         user_prompt_hash: str,
         query_window_hours: int = settings.PROMPT_CACHE_WINDOW_HOURS,
     ) -> TaskGeneration | None:
@@ -910,9 +1153,11 @@ class WorkflowParametersRepository(BaseRepository):
         async with self.Session() as session:
             query = (
                 select(TaskGenerationModel)
-                .filter_by(user_prompt_hash=user_prompt_hash)
+                .filter_by(organization_id=organization_id, user_prompt_hash=user_prompt_hash)
                 .filter(TaskGenerationModel.llm.is_not(None))
                 .filter(TaskGenerationModel.created_at > before_time)
+                .order_by(TaskGenerationModel.created_at.desc())
+                .limit(1)
             )
             task_generation = (await session.scalars(query)).first()
             if not task_generation:
@@ -944,6 +1189,8 @@ class WorkflowParametersRepository(BaseRepository):
                 screenshot_artifact_id=action.screenshot_artifact_id,
                 action_json=raw_action_payload,
                 confidence_float=action.confidence_float,
+                started_at=action.started_at,
+                finished_at=action.finished_at,
                 created_by=action.created_by,
             )
             session.add(new_action)
@@ -979,6 +1226,8 @@ class WorkflowParametersRepository(BaseRepository):
             "screenshot_artifact_id": action.screenshot_artifact_id,
             "action_json": action.model_dump(),
             "confidence_float": action.confidence_float,
+            "started_at": action.started_at,
+            "finished_at": action.finished_at,
             "created_by": action.created_by,
         }
         async with self.Session() as session:
@@ -988,7 +1237,11 @@ class WorkflowParametersRepository(BaseRepository):
                 set_={
                     "screenshot_artifact_id": stmt.excluded.screenshot_artifact_id,
                     "action_json": stmt.excluded.action_json,
-                    "modified_at": datetime.now(timezone.utc),
+                    # coalesce: an upsert writer that carries no execution timestamps must
+                    # never overwrite real stamps with NULL.
+                    "started_at": func.coalesce(stmt.excluded.started_at, ActionModel.started_at),
+                    "finished_at": func.coalesce(stmt.excluded.finished_at, ActionModel.finished_at),
+                    "modified_at": stmt.excluded.modified_at,
                 },
             )
             await session.execute(stmt)
@@ -1034,4 +1287,7 @@ class WorkflowParametersRepository(BaseRepository):
             )
 
             actions = (await session.scalars(query)).all()
-            return [Action.model_validate(action) for action in actions]
+            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
+            # validating the row directly drops every subclass field a cached action was recorded
+            # with. Matches every other retrieval site.
+            return [hydrate_action(action) for action in actions]

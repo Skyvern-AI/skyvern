@@ -5,6 +5,7 @@ Save and restore cookies, localStorage, and sessionStorage across sessions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Annotated, Any
@@ -13,13 +14,22 @@ from urllib.parse import urlparse
 import structlog
 from pydantic import Field
 
+from skyvern.forge import app
+
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import BrowserNotAvailableError, get_current_session, get_page, no_browser_error
 
 LOG = structlog.get_logger(__name__)
 
+_MCP_STATE_NAMESPACE_DIR = ".mcp-state"
 
-def _validate_state_path(file_path: str, *, must_exist: bool = False) -> Path:
+
+def _validate_state_path(
+    file_path: str,
+    *,
+    must_exist: bool = False,
+    organization_id: str | None = None,
+) -> Path:
     """Validate and resolve state file path. Prevents path traversal.
 
     Restricts paths to the current working directory or ~/.skyvern/.
@@ -30,12 +40,31 @@ def _validate_state_path(file_path: str, *, must_exist: bool = False) -> Path:
         raise ValueError(f"Symlinks not allowed for state files: {raw}")
     resolved = raw.resolve()
     allowed_roots = [Path.cwd().resolve(), (Path.home() / ".skyvern").resolve()]
-    if not any(resolved == root or str(resolved).startswith(str(root) + "/") for root in allowed_roots):
+    matching_roots = [root for root in allowed_roots if resolved == root or resolved.is_relative_to(root)]
+    if not matching_roots:
         raise ValueError(f"State file must be under working directory or ~/.skyvern/: {resolved}")
-    if must_exist and not resolved.exists():
-        raise FileNotFoundError(f"State file not found: {resolved}")
+
+    if organization_id is not None:
+        allowed_root = max(matching_roots, key=lambda root: len(root.parts))
+        namespace_parent = (allowed_root / _MCP_STATE_NAMESPACE_DIR).resolve()
+        namespace_id = hashlib.sha256(organization_id.encode()).hexdigest()
+        namespace_root = namespace_parent / namespace_id
+
+        if resolved == namespace_parent or resolved.is_relative_to(namespace_parent):
+            if resolved != namespace_root and not resolved.is_relative_to(namespace_root):
+                raise ValueError("State file is outside the authenticated organization namespace")
+        else:
+            namespaced = namespace_root / resolved.relative_to(allowed_root)
+            if namespaced.is_symlink():
+                raise ValueError(f"Symlinks not allowed for state files: {namespaced}")
+            resolved = namespaced.resolve()
+            if resolved != namespace_root and not resolved.is_relative_to(namespace_root):
+                raise ValueError("State file is outside the authenticated organization namespace")
+
     if resolved.suffix not in (".json", ""):
         raise ValueError(f"State file must have .json extension or no extension: {resolved}")
+    if must_exist and not resolved.exists():
+        raise FileNotFoundError(f"State file not found: {resolved}")
     return resolved
 
 
@@ -50,12 +79,13 @@ async def skyvern_state_save(
     """Save browser auth state (cookies + localStorage + sessionStorage) to a JSON file for later restore via state_load."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("state_save", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("state_save", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
-            resolved = _validate_state_path(file_path)
+            organization_id = app.AGENT_FUNCTION.get_mcp_request_organization_id()
+            resolved = _validate_state_path(file_path, organization_id=organization_id)
             resolved.parent.mkdir(parents=True, exist_ok=True)
 
             session = get_current_session()
@@ -115,12 +145,13 @@ async def skyvern_state_load(
     """Restore browser auth state from a JSON file. Navigate to the target site BEFORE loading so cookie domain filtering works."""
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError:
-        return make_result("state_load", ok=False, error=no_browser_error())
+    except BrowserNotAvailableError as exc:
+        return make_result("state_load", ok=False, error=no_browser_error(exc))
 
     with Timer() as timer:
         try:
-            resolved = _validate_state_path(file_path, must_exist=True)
+            organization_id = app.AGENT_FUNCTION.get_mcp_request_organization_id()
+            resolved = _validate_state_path(file_path, must_exist=True, organization_id=organization_id)
 
             session = get_current_session()
             browser = session.browser

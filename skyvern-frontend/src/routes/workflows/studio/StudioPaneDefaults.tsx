@@ -7,18 +7,23 @@ import { useStudioShellStore } from "@/store/StudioShellStore";
 
 import { liveSearch } from "./liveSearch";
 import {
+  copilotContextForSearch,
   DEFAULT_STUDIO_PANES,
   fitPanesToWidth,
   panesFitWidth,
   resolveOpenPanes,
+  searchWithRunReference,
   STUDIO_PANE_IDS,
   type StudioPaneId,
+  withCopilotSelection,
 } from "./panes";
 import {
   StudioPaneDefaultsContext,
   type PaneClamp,
   type PaneWrite,
 } from "./StudioPaneDefaultsContext";
+import { useStudioRunId } from "./useStudioRunId";
+import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 // Drop unknown ids and duplicates; return null when the result is empty/invalid.
 function sanitizeLearnedPanes(
@@ -55,6 +60,8 @@ export function StudioPaneDefaultsProvider({
   children: ReactNode;
 }) {
   const location = useLocation();
+  const studioRunId = useStudioRunId();
+  const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
 
   // hasBlocks gates only the learned-layout lookup, not the factory default
   // itself — empty agents never restore a saved arrangement.
@@ -72,13 +79,28 @@ export function StudioPaneDefaultsProvider({
     sanitizeLearnedPanes(useStudioShellStore.getState().paneLayouts.run),
   );
 
-  const [initialPanes] = useState<readonly StudioPaneId[]>(() =>
+  const [initialUrlPanes] = useState<readonly StudioPaneId[]>(() =>
     resolveOpenPanes(
-      liveSearch(location.search),
+      searchWithRunReference(liveSearch(location.search), studioRunId),
       defaultPanes,
       learnedRunPanes,
     ),
   );
+
+  const [initialPanes] = useState<readonly StudioPaneId[]>(() => {
+    const search = searchWithRunReference(
+      liveSearch(location.search),
+      studioRunId,
+    );
+    const resolved = initialUrlPanes;
+    const selection =
+      useStudioShellStore.getState().copilotSelectionByLayout[
+        copilotContextForSearch(search)
+      ];
+    return workflowDeleted
+      ? resolved
+      : withCopilotSelection(resolved, selection);
+  });
 
   const [clamp, setClamp] = useState<PaneClamp | null>(null);
   const stageElRef = useRef<HTMLElement | null>(null);
@@ -99,16 +121,37 @@ export function StudioPaneDefaultsProvider({
       }
       measuredRef.current = true;
       const fitted = fitPanesToWidth(initialPanes, width);
-      if (fitted.length !== initialPanes.length) {
-        setClamp({ source: initialPanes, presented: fitted });
+      const urlFitted = fitPanesToWidth(initialUrlPanes, width);
+      if (
+        fitted.length !== initialPanes.length ||
+        urlFitted.length !== initialUrlPanes.length
+      ) {
+        setClamp({
+          source: initialPanes,
+          presented: fitted,
+          urlSource: initialUrlPanes,
+          urlPresented: urlFitted,
+        });
       }
     },
-    [initialPanes],
+    [initialPanes, initialUrlPanes],
   );
 
   const notePaneWrite = useCallback((change: PaneWrite) => {
     wroteRef.current = true;
-    setClamp((current) => (current === null ? current : null));
+    setClamp((current) => {
+      if (current === null) {
+        return current;
+      }
+      if (change.nextRuntimeSource !== undefined) {
+        return {
+          ...current,
+          source: [...change.nextRuntimeSource],
+          presented: [...change.next],
+        };
+      }
+      return null;
+    });
     const firstRun = useStudioFirstRunStore.getState();
     // Toggling a pane is the lesson the coach mark teaches.
     if (!firstRun.coachMarkSeen) {

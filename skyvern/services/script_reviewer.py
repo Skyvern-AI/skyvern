@@ -25,6 +25,7 @@ from skyvern.core.script_generations.script_validators import (
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import is_sensitive_workflow_parameter
 from skyvern.schemas.scripts import ScriptBranchHit, ScriptFallbackEpisode
@@ -999,7 +1000,7 @@ class ScriptReviewer:
         )
 
         try:
-            response = await app.SECONDARY_LLM_API_HANDLER(
+            response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=triage_prompt,
                 prompt_name="script-failure-triage",
                 step=None,
@@ -1977,7 +1978,9 @@ class ScriptReviewer:
     # Anything not in the set triggers a retry so the LLM fixes its code.
     _METHOD_KWARGS: dict[str, frozenset[str]] = {
         "classify": frozenset({"options", "url_patterns", "text_patterns"}),
-        "click": frozenset({"selector", "prompt", "ai", "intention", "data", "timeout", "recoverable_marker_id"}),
+        "click": frozenset(
+            {"selector", "prompt", "ai", "intention", "data", "timeout", "recoverable_marker_id", "desired_state"}
+        ),
         "fill": frozenset(
             {
                 "selector",

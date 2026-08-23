@@ -17,6 +17,24 @@ describe("StudioShellStore", () => {
     expect(useStudioShellStore.getState().pipMinimized).toBe(false);
   });
 
+  test("keeps edit and run Copilot selections independent and unpersisted", () => {
+    useStudioShellStore
+      .getState()
+      .setCopilotSelection("edit", { open: false, index: 0 });
+    useStudioShellStore
+      .getState()
+      .setCopilotSelection("run", { open: true, index: 2 });
+
+    expect(useStudioShellStore.getState().copilotSelectionByLayout).toEqual({
+      edit: { open: false, index: 0 },
+      run: { open: true, index: 2 },
+    });
+    const raw = localStorage.getItem(STUDIO_SHELL_STORAGE_KEY);
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).state).not.toHaveProperty(
+      "copilotSelectionByLayout",
+    );
+  });
   test("persists PiP, pane widths, and pane layouts", () => {
     useStudioShellStore.getState().setPipMinimized(true);
 

@@ -181,8 +181,8 @@ class LocalStorage(BaseStorage):
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str] | None:
         return [artifact.uri for artifact in artifacts] or None
 
-    async def save_streaming_file(self, organization_id: str, file_name: str) -> None:
-        return
+    async def save_streaming_file(self, organization_id: str, file_name: str) -> bool | None:
+        return None
 
     async def get_streaming_file(self, organization_id: str, file_name: str) -> bytes | None:
         # make the directory if it doesn't exist
@@ -329,8 +329,15 @@ class LocalStorage(BaseStorage):
             return None
         return str(stored_folder_path)
 
-    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
-        """Delete a browser profile from local storage. Best-effort: a missing profile is a no-op."""
+    async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
+        """Non-destructive existence check — stat the stored directory, never retrieve/delete it."""
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
+        return stored_folder_path is not None and stored_folder_path.exists()
+
+    async def delete_browser_profile(self, organization_id: str, profile_id: str, hard_delete: bool = False) -> None:
+        """Delete a browser profile from local storage. Best-effort: a missing profile is a no-op.
+        Local storage keeps no old versions, so a terminal dir delete is full erasure; under hard_delete
+        a delete failure is RAISED (not swallowed) so the caller reports reap_failed, not a false erasure."""
         stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
         if stored_folder_path is None:
             LOG.warning(
@@ -351,6 +358,8 @@ class LocalStorage(BaseStorage):
                 profile_id=profile_id,
                 path=str(stored_folder_path),
             )
+            if hard_delete:
+                raise
 
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass
@@ -500,6 +509,10 @@ class LocalStorage(BaseStorage):
             "Legacy file storage is not implemented for LocalStorage. Please use a different storage backend."
         )
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        Path(parse_uri_to_path(uri)).unlink(missing_ok=True)
+
     def _build_browser_session_path(
         self,
         organization_id: str,
@@ -529,6 +542,8 @@ class LocalStorage(BaseStorage):
         local_file_path: str,
         remote_path: str,
         date: str | None = None,
+        recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to local storage."""
         target_path = self._build_browser_session_path(
@@ -582,6 +597,7 @@ class LocalStorage(BaseStorage):
             raise PermissionError(f"No permission to access storage URI: {uri}") from e
 
         allowed_dirs = (
+            (Path(self.artifact_path) / organization_id).resolve(),
             (Path(self.artifact_path) / settings.ENV / organization_id).resolve(),
             (Path(self.artifact_path) / DOWNLOAD_FILE_PREFIX / settings.ENV / organization_id).resolve(),
         )

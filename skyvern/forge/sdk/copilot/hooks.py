@@ -7,13 +7,13 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from agents.agent import Agent
+from agents.agent import Agent, AgentBase
+from agents.items import TResponseInputItem
 from agents.lifecycle import RunHooksBase
-from agents.run_context import RunContextWrapper
+from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
 
 from skyvern.forge.sdk.copilot.enforcement import (
-    CopilotGoalSatisfied,
     gate_decision_trace_fields,
     outcome_fully_verified,
 )
@@ -34,7 +34,7 @@ LOG = structlog.get_logger()
 # entry as a short preview. This is a hooks-side concern (what to record),
 # not a registry of the tools themselves.
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
-    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks"}
+    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
 )
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
@@ -57,7 +57,7 @@ def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
 
 
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
-    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
+    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}:
         return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
@@ -75,6 +75,30 @@ class CopilotRunHooks(RunHooksBase):
 
     def __init__(self, ctx: CopilotContext) -> None:
         self._ctx = ctx
+
+    async def on_llm_start(
+        self,
+        context: RunContextWrapper,
+        agent: Agent,
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        try:
+            self._ctx.model_calls_this_turn += 1
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_llm_start counting failed",
+                **_copilot_log_fields(self._ctx),
+            )
+
+    async def on_agent_start(self, context: AgentHookContext, agent: AgentBase) -> None:
+        try:
+            self._ctx.enforcement_pass_count += 1
+        except Exception:
+            LOG.warning(
+                "CopilotRunHooks.on_agent_start counting failed",
+                **_copilot_log_fields(self._ctx),
+            )
 
     async def on_tool_end(
         self,
@@ -104,6 +128,11 @@ class CopilotRunHooks(RunHooksBase):
             if tool_name == "list_credentials" and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 listed = data.get("credentials", []) if isinstance(data, dict) else []
+                if not isinstance(listed, list):
+                    listed = []
+                exact = data.get("credential") if isinstance(data, dict) else None
+                if not listed and isinstance(exact, dict):
+                    listed = [exact]
                 resolved = [
                     {"credential_id": c.get("credential_id"), "name": c.get("name")}
                     for c in listed
@@ -134,7 +163,6 @@ class CopilotRunHooks(RunHooksBase):
                 "CopilotRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
             return
 
@@ -146,8 +174,10 @@ class CopilotRunHooks(RunHooksBase):
         raise_if_turn_halt(self._ctx, verified=outcome_fully_verified(self._ctx))
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
+            # The run record satisfying the ask is the model's cue to wrap up, not the
+            # harness's cue to end the loop and speak for it.
             LOG.info(
-                "copilot tool satisfied goal; stopping agent loop",
+                "copilot tool satisfied goal; model composes the reply",
                 tool_name=tool_name,
                 workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
                 if isinstance(parsed.get("data"), dict)
@@ -156,4 +186,3 @@ class CopilotRunHooks(RunHooksBase):
             )
             self._ctx.goal_satisfied_tool_name = tool_name
             self._ctx.goal_satisfied_tool_output = dict(parsed)
-            raise CopilotGoalSatisfied()

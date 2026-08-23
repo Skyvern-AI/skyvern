@@ -45,6 +45,7 @@ class SkyvernPageAi(Protocol):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        value_is_sensitive: bool = False,
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value.

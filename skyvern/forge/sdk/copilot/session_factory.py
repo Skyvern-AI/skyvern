@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
+from itertools import count
+from pathlib import Path
 from typing import Any
 
 import structlog
 from agents.memory.sqlite_session import SQLiteSession
 from agents.run_config import CallModelData, ModelInputData
+from agents.run_context import RunContextWrapper
+from pydantic import BaseModel
 
+from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.sdk.agents.context import (
     compact_agent_messages_for_llm,
     get_agent_message_field,
+    pair_tool_calls_with_outputs,
     replace_agent_message_field,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -26,12 +35,23 @@ from skyvern.forge.sdk.copilot.enforcement import (
     estimate_tokens,
     is_screenshot_message,
     is_synthetic_user_message,
+    log_recent_tool_output_truncation,
+    pending_screenshot_message,
 )
 
 LOG = structlog.get_logger()
 
 RECENT_REAL_TURNS = 2
+TOOL_OUTPUT_TRUNCATE_SOFT = 2000
 TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
+
+
+def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
+    truncated_items = [_truncate_tool_output(item, cap) for item in items]
+    truncated_count = sum(1 for old, new in zip(items, truncated_items) if new is not old)
+    if truncated_count:
+        LOG.warning("copilot_tool_output_emergency_truncated", truncated_count=truncated_count, cap=cap)
+    return truncated_items
 
 
 def create_copilot_session(chat_id: str) -> SQLiteSession:
@@ -47,7 +67,19 @@ def _compact_tool_items(items: list[Any]) -> list[Any]:
         summarize_tool_output=_summarize_tool_output,
         summarize_tool_arguments=_summarize_tool_arguments,
         tool_output_truncation_suffix=_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+        on_recent_truncation=log_recent_tool_output_truncation,
     )
+
+
+def _screenshot_with_image(item: Any) -> bool:
+    """A sentinel-prefixed item only counts as the keepable frame when it actually
+    carries an image part; text-only lookalikes and placeholders must not shadow it."""
+    if not is_screenshot_message(item):
+        return False
+    content = get_agent_message_field(item, "content")
+    if not isinstance(content, list):
+        return False
+    return any(get_agent_message_field(block, "type") == "input_image" for block in content)
 
 
 def copilot_session_input_callback(
@@ -58,12 +90,12 @@ def copilot_session_input_callback(
     payloads in the middle region.
 
     Keeps the original goal (first item) at full fidelity and preserves the
-    last ``RECENT_REAL_TURNS`` real user turns. Within the remaining middle
-    region, older ``function_call_output`` / ``function_call`` items are
-    compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
-    ``enforcement._prune_input_list`` uses in the non-session path, so
-    first-turn transcripts with a long tool chain get compacted identically
-    regardless of user-turn count.
+    last ``RECENT_REAL_TURNS`` real user turns — in production every injected
+    copilot message is synthetic, so the whole post-goal history is the middle
+    region. Within it, older ``function_call_output`` / ``function_call`` items
+    are compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
+    ``enforcement._prune_input_list`` uses in the non-session path, and the
+    newest screenshot survives unless a newer one rides in recent/new items.
     """
     if not history_items:
         return new_items
@@ -88,9 +120,17 @@ def copilot_session_input_callback(
         recent = []
 
     pruned_middle = _compact_tool_items(middle)
+    # The newest frame must survive the merge: with every injected message classified
+    # synthetic, the whole post-goal history is middle, and blanket-replacing would
+    # blind the agent to the frame it just captured once it rotates into history.
+    middle_screenshots = [i for i, item in enumerate(pruned_middle) if _screenshot_with_image(item)]
+    has_newer_screenshot = any(_screenshot_with_image(item) for item in list(recent) + list(new_items))
+    keep_screenshot = middle_screenshots[-1] if middle_screenshots and not has_newer_screenshot else None
     pruned_middle = [
-        {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if is_screenshot_message(item) else item
-        for item in pruned_middle
+        {"role": "user", "content": SCREENSHOT_PLACEHOLDER}
+        if is_screenshot_message(item) and i != keep_screenshot
+        else item
+        for i, item in enumerate(pruned_middle)
     ]
 
     return [history_items[0]] + pruned_middle + list(recent) + list(new_items)
@@ -107,21 +147,102 @@ def copilot_call_model_input_filter(data: CallModelData[Any]) -> ModelInputData:
     return _copilot_call_model_input_filter(data, token_budget=TOKEN_BUDGET)
 
 
+def _log_tool_pair_repair(moved: int, size_delta: int) -> None:
+    LOG.info("copilot_tool_pair_repaired", moved=moved, size_delta=size_delta)
+
+
+def _run_context(data: CallModelData[Any]) -> Any:
+    """CallModelData carries the run context itself; only some entry points hand over a wrapper."""
+    return data.context.context if isinstance(data.context, RunContextWrapper) else data.context
+
+
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
+    items = list(data.model_data.input)
+    # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
+    # retry or model fallback re-running this filter still carries the frame.
+    screenshot_msg = pending_screenshot_message(_run_context(data))
+    if screenshot_msg is not None:
+        LOG.info(
+            "Injecting screenshot user message",
+            count=len(screenshot_msg["content"]) - 1,
+            path="model_input_filter",
+        )
+        items.append(screenshot_msg)
+
+    budgeted = _filter_to_budget(items, data.model_data.instructions, token_budget=token_budget)
+    # Last thing before the request leaves: every budget rung above reorders nothing, but
+    # history assembly upstream can seat a result after a later assistant turn, which the
+    # provider rejects outright. Repair here so no path can emit an invalid pairing.
+    model_data = ModelInputData(
+        input=pair_tool_calls_with_outputs(list(budgeted.input), on_repair=_log_tool_pair_repair),
+        instructions=budgeted.instructions,
+    )
+    _maybe_dump_model_input(data, model_data)
+    return model_data
+
+
+_MODEL_CALL_SEQ = count()
+
+
+def _jsonable(item: Any) -> Any:
+    if isinstance(item, BaseModel):
+        return item.model_dump(mode="json")
+    return item
+
+
+def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
+    """Record the exact model input so a prompt or tool-schema change can be replayed offline.
+
+    Written here rather than at the Runner call because this is the only point that sees what the
+    model actually receives — after session merge, compaction, and every budget layer above. That
+    includes page text and tool results, so writing takes both an explicit path and a local
+    environment rather than the path alone.
+    """
+    dump_dir = os.getenv("COPILOT_DUMP_MODEL_INPUTS")
+    if not dump_dir or settings.ENV != "local":
+        return
+    try:
+        from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
+
+        ctx = _run_context(data)
+        try:
+            requested_output_paths = sorted(requested_output_paths_for_derivation(ctx)) if ctx else []
+        except Exception:
+            requested_output_paths = []
+        target = Path(dump_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "instructions": model_data.instructions,
+            "input": [_jsonable(item) for item in model_data.input],
+            "requested_output_paths": requested_output_paths,
+        }
+        parameters = getattr(ctx, "codeblock_redaction_parameters", {})
+        if parameters:
+            payload = app.AGENT_FUNCTION.redact_codeblock_parameter_values(payload, parameters)
+        if not isinstance(payload, dict):
+            payload = {}
+        path = target / f"call-{next(_MODEL_CALL_SEQ):04d}.json"
+        serialized = json.dumps(payload, indent=2, default=str)
+        if parameters:
+            serialized = app.AGENT_FUNCTION.redact_codeblock_parameter_values(serialized, parameters)
+        path.write_text(serialized if isinstance(serialized, str) else "")
+    except Exception:
+        LOG.warning("Failed to dump copilot model input")
+
+
+def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budget: int) -> ModelInputData:
     """Token-budget enforcement applied just before each model call.
 
     Graduated pruning:
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
     2. If still over budget: drop all screenshots except the most recent.
-    3. If still over budget: truncate ALL tool outputs to 300 chars.
+    3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
+       then to 300 only if the softer pass was not enough.
     4. If still over budget: aggressive prune as last resort.
     """
-    model_data = data.model_data
-    items = list(model_data.input)
-
     if not items:
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     est = estimate_tokens(items)
     LOG.info("Token estimate before filtering", tokens=est)
@@ -136,7 +257,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after tool trim", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 2: Drop all screenshots except the most recent
     screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
@@ -150,15 +271,24 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after screenshot drop", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
-    # Layer 3: Truncate ALL tool outputs to 300 chars
-    items = [_truncate_tool_output(item, TOOL_OUTPUT_TRUNCATE_EMERGENCY) for item in items]
+    # Layer 3a: bring every tool output down to the pre-raise bound before resorting
+    # to the harsher pass, so a code-bearing recent output degrades gracefully.
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_SOFT)
+
+    est = estimate_tokens(items)
+    if est <= token_budget:
+        LOG.info("Within budget after soft emergency truncation", tokens=est)
+        return ModelInputData(input=items, instructions=instructions)
+
+    # Layer 3b: Truncate ALL tool outputs to 300 chars
+    items = _emergency_truncate_all(items, TOOL_OUTPUT_TRUNCATE_EMERGENCY)
 
     est = estimate_tokens(items)
     if est <= token_budget:
         LOG.info("Within budget after emergency truncation", tokens=est)
-        return ModelInputData(input=items, instructions=model_data.instructions)
+        return ModelInputData(input=items, instructions=instructions)
 
     # Layer 4: Aggressive prune as last resort
     LOG.warning("Aggressive prune needed", tokens=est, budget=token_budget)
@@ -166,7 +296,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
 
     est = estimate_tokens(items)
     LOG.info("Final token estimate after aggressive prune", tokens=est)
-    return ModelInputData(input=items, instructions=model_data.instructions)
+    return ModelInputData(input=items, instructions=instructions)
 
 
 def _truncate_tool_output(item: Any, max_chars: int) -> Any:

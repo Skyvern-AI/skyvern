@@ -13,6 +13,7 @@ export type WorkflowCreateYAMLRequest = {
   proxy_location?: ProxyLocation | null;
   webhook_callback_url?: string | null;
   persist_browser_session?: boolean;
+  reuse_browser_session?: boolean;
   pin_saved_session_ip?: boolean;
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
@@ -31,6 +32,7 @@ export type WorkflowCreateYAMLRequest = {
   enable_self_healing?: boolean;
   adaptive_caching?: boolean;
   code_version?: number | null;
+  mask_secrets?: boolean | null;
   run_sequentially?: boolean;
   sequential_key?: string | null;
   folder_id?: string | null;
@@ -348,6 +350,7 @@ export type CodeBlockYAML = BlockYAMLBase & {
   block_type: "code";
   code: string;
   parameter_keys?: Array<string> | null;
+  error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
 };
@@ -401,6 +404,11 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   smtp_port_secret_parameter_key?: string;
   smtp_username_secret_parameter_key?: string;
   smtp_password_secret_parameter_key?: string;
+
+  custom_smtp_host?: string | null;
+  custom_smtp_port?: number | null;
+  custom_smtp_username?: string | null;
+  custom_smtp_password?: string | null;
 
   sender: string;
   recipients: Array<string>;

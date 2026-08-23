@@ -506,6 +506,7 @@ def compute_cache_key(
     previous_extracted_information: Any = None,
     llm_key: str | None = None,
     workflow_system_prompt: str | None = None,
+    virtualized_grid_rows: str | None = None,
 ) -> str:
     """Return a stable sha256 hex digest for the inputs that affect extraction output.
 
@@ -546,6 +547,8 @@ def compute_cache_key(
         _s(llm_key),
         _s(workflow_system_prompt),
     ]
+    if virtualized_grid_rows is not None:
+        parts.append(virtualized_grid_rows)
     joined = "\x1f".join(parts).encode("utf-8", errors="replace")
     return hashlib.sha256(joined).hexdigest()
 

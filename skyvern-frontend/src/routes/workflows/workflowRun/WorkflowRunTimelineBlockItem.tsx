@@ -16,11 +16,7 @@ import {
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
-import {
-  CODE_BLOCK_FALLBACK_TITLE,
-  getCodeBlockTitle,
-  workflowBlockTitle,
-} from "../editor/nodes/types";
+import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
@@ -36,7 +32,12 @@ import {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { type CodeBlockStep, WorkflowBlockTypes } from "../types/workflowTypes";
-import { findCodeStepForLine } from "../workflowBlockUtils";
+import {
+  describeRecordedAction,
+  findCodeStepForLine,
+  isRecorderCallText,
+  normalizeInlineText,
+} from "../workflowBlockUtils";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
@@ -89,11 +90,24 @@ const INDENT_PX = 14;
 const MAX_INDENT_RAIL_DEPTH = 6;
 const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
 const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
+export const TIMELINE_DESCRIPTOR_SEPARATOR = "·";
 
 const railHighlightStyle = {
   marginLeft: `-${RAIL_HIGHLIGHT_OFFSET_PX}px`,
   paddingLeft: `${RAIL_CONTENT_PADDING_PX}px`,
 };
+
+// How long a revealed row keeps moving while an ancestor's Collapsible height
+// animates open (animate-collapsible-down-fade, 0.22s in tailwind.config.js).
+// Scrolling before it settles aims at where the row started, not where it lands.
+const COLLAPSIBLE_SETTLE_MS = 250;
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
 
 function IndentRails({ depth }: { depth: number }) {
   // Render guide rails only for nested rows. Top-level rows should start with
@@ -149,11 +163,6 @@ function StatusDot({
   );
 }
 
-function normalizeInlineText(value: string | null | undefined): string | null {
-  const normalized = value?.replace(/\s+/g, " ").trim();
-  return normalized ? normalized : null;
-}
-
 function getActionSummary(action: ActionsApiResponse): string | null {
   return (
     normalizeInlineText(action.reasoning) ??
@@ -190,6 +199,8 @@ type ActionRowPresentation = {
   icon: ReactNode;
   label: string;
   summary: string | null;
+  // Raw recorder text (a Playwright selector); shown on hover, never as the primary line.
+  detail: string | null;
   tone: "default" | "error";
 };
 
@@ -217,15 +228,13 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  const stepText =
-    !isCodeError && matchedStep
-      ? (normalizeInlineText(matchedStep.title) ??
-        normalizeInlineText(matchedStep.description))
-      : null;
   const parts = [
-    stepText ??
-      getActionSummary(action) ??
-      normalizeInlineText(action.description),
+    // This row hides its label from sighted users, so it falls back to the readable type
+    // where the chat, which always shows the label, prints nothing.
+    isCodeError
+      ? getActionSummary(action)
+      : (describeRecordedAction(action, matchedStep) ??
+        getReadableActionType(action.action_type, { nullActionLabel: "Step" })),
     codeLine !== null ? `line ${codeLine}` : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
@@ -233,6 +242,10 @@ function getCodeActionRowPresentation(
     icon,
     label,
     summary: parts.length > 0 ? parts.join(" · ") : null,
+    detail:
+      !isCodeError && isRecorderCallText(action.description)
+        ? normalizeInlineText(action.description)
+        : null,
     tone: isCodeError ? "error" : "default",
   };
 }
@@ -251,8 +264,19 @@ function countSchemaFields(value: WorkflowRunBlock["data_schema"]): number {
 }
 
 function getTimelineDescriptor(block: WorkflowRunBlock): string {
+  const description = normalizeInlineText(block.description);
+
+  if (block.block_type === WorkflowBlockTypes.Code) {
+    return (
+      description ??
+      normalizeInlineText(block.prompt) ??
+      normalizeInlineText(block.instructions) ??
+      "Code block"
+    );
+  }
+
   const explicit =
-    normalizeInlineText(block.description) ??
+    description ??
     normalizeInlineText(block.navigation_goal) ??
     normalizeInlineText(block.data_extraction_goal) ??
     normalizeInlineText(block.prompt) ??
@@ -287,23 +311,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-// getCodeBlockTitle ends at the bare "Code" label for prompt-less runs, which
-// dropped the reasoning subtitle the timeline used to show. Fall back to the
-// block reasoning (description) before bare "Code", normalized like a prompt.
-function getCodeBlockTimelineName(
-  block: WorkflowRunBlock,
-  steps: Array<CodeBlockStep>,
-): string {
-  const title = getCodeBlockTitle({ prompt: block.prompt, steps });
-  if (title !== CODE_BLOCK_FALLBACK_TITLE) {
-    return title;
-  }
-  const reasoning = normalizeInlineText(block.description);
-  return reasoning
-    ? getCodeBlockTitle({ prompt: reasoning, steps: [] })
-    : title;
 }
 
 function getLoopIterationGroups(
@@ -520,7 +527,7 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
@@ -532,6 +539,7 @@ function TimelineActionRows({
               icon: timelineActionIcons[action.action_type],
               label: getReadableActionType(action.action_type),
               summary: getActionSummary(action),
+              detail: null,
               tone: "default" as const,
             };
 
@@ -557,6 +565,7 @@ function TimelineActionRows({
                   onActionClick({ block, action });
                 }}
                 aria-pressed={isActive}
+                title={detail ?? undefined}
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
               >
                 <StatusDot
@@ -988,12 +997,8 @@ function WorkflowRunTimelineBlockItem({
   const definitionCodeSteps = isCodeBlock
     ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
     : [];
-  const blockName = isCodeBlock
-    ? getCodeBlockTimelineName(block, definitionCodeSteps)
-    : (block.label ?? block.title ?? blockTypeTitle);
-  const descriptor = isCodeBlock
-    ? (block.label ?? "Code block")
-    : getTimelineDescriptor(block);
+  const blockName = block.label ?? blockTypeTitle;
+  const descriptor = getTimelineDescriptor(block);
   const showsActionRows = hasActions;
   // Code blocks without recorded actions fall back to their definition step
   // outline so the timeline still reflects what the block was meant to do.
@@ -1081,6 +1086,7 @@ function WorkflowRunTimelineBlockItem({
       !hasRenderableNestedChildren,
   );
   const userToggledRef = useRef(false);
+  const rowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     userToggledRef.current = false;
@@ -1108,6 +1114,48 @@ function WorkflowRunTimelineBlockItem({
     isLoopWithSelectedIteration,
   ]);
 
+  // A selection landing inside this block outranks an earlier collapse: that
+  // collapse was a choice about the previous selection, not this one, and a
+  // selection nobody can see is worse than a container reopening. Keyed on the
+  // selection's id, not the containment boolean — the boolean doesn't change
+  // when the selection moves between two children of the same collapsed
+  // container, and the activeItem object is rebuilt by every timeline poll.
+  const activeKey = isWorkflowRunBlock(activeItem)
+    ? activeItem.workflow_run_block_id
+    : isAction(activeItem)
+      ? activeItem.action_id
+      : isObserverThought(activeItem)
+        ? activeItem.thought_id
+        : activeItem;
+  useEffect(() => {
+    if (hasActiveDescendant || isLoopWithSelectedIteration) {
+      userToggledRef.current = false;
+      setExpanded(true);
+    }
+  }, [activeKey, hasActiveDescendant, isLoopWithSelectedIteration]);
+
+  // Follow the selection with the viewport, wherever it came from — the editor
+  // canvas, a deep link, the search jump, or the block detail. "nearest" makes
+  // this a no-op for a row that is already on screen, so clicking a visible row
+  // never moves the list under the pointer.
+  useEffect(() => {
+    if (!isActiveBlock) {
+      return;
+    }
+    // An ancestor revealing this row animates its height (see
+    // animate-collapsible-down-fade, 0.22s in tailwind.config.js), so the row
+    // is still travelling when this effect runs; scrolling now would aim at
+    // where it started. ponytail: one settle beats wiring animationend up
+    // through every container.
+    const id = window.setTimeout(() => {
+      rowRef.current?.scrollIntoView({
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+        block: "nearest",
+      });
+    }, COLLAPSIBLE_SETTLE_MS);
+    return () => window.clearTimeout(id);
+  }, [isActiveBlock]);
+
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
   // Loop inline counter (e.g. 3/8).
@@ -1121,7 +1169,7 @@ function WorkflowRunTimelineBlockItem({
 
   return (
     <div className="min-w-0">
-      <div className="flex min-h-[28px] items-stretch text-xs">
+      <div ref={rowRef} className="flex min-h-[28px] items-stretch text-xs">
         <IndentRails depth={depth} />
         <div
           className={cn(
@@ -1185,7 +1233,7 @@ function WorkflowRunTimelineBlockItem({
               {blockName}
             </span>
             <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
-              · {descriptor}
+              {TIMELINE_DESCRIPTOR_SEPARATOR} {descriptor}
             </span>
             {isFinallyBlock && (
               <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">
@@ -1535,5 +1583,5 @@ function LoopIterationRow({
   );
 }
 
-export { WorkflowRunTimelineBlockItem };
+export { StatusDot, WorkflowRunTimelineBlockItem };
 export type { SkippedBranchGroup };

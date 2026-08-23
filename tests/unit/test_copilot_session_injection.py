@@ -12,6 +12,7 @@ import pytest
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import SessionState, scoped_session
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
 from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
 
@@ -191,13 +192,14 @@ class TestMcpBrowserContextBridge:
             # that resolve_browser(session_id=...) relies on.
             args = register_mock.call_args.args
             assert args[0] == ctx.browser_session_id
+            assert register_mock.call_args.kwargs == {"organization_id": ctx.organization_id}
             registered_state = args[1]
             assert isinstance(registered_state, SessionState)
             assert registered_state.context.session_id == ctx.browser_session_id
 
         assert register_mock.call_count == 1
         assert unregister_mock.call_count == 1
-        unregister_mock.assert_called_with(ctx.browser_session_id)
+        unregister_mock.assert_called_with(ctx.browser_session_id, organization_id=ctx.organization_id)
         # Override installed then reset.
         assert [c[0] for c in override_calls] == ["set", "reset"]
 
@@ -274,12 +276,16 @@ class TestMcpBrowserContextBridge:
         monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", manager)
 
         ctx = _make_ctx()
+        # Read before the call: a completed resolve that finds nothing attachable retires the id.
+        supplied_session_id = ctx.browser_session_id
         with pytest.raises(RuntimeError, match="No browser context for copilot session") as exc_info:
             async with mcp_browser_context(ctx):
                 pytest.fail("should not enter body")
 
         # Session id must not leak into the user/LLM-visible exception message.
-        assert ctx.browser_session_id not in str(exc_info.value)
+        assert supplied_session_id is not None
+        assert supplied_session_id not in str(exc_info.value)
+        assert ctx.browser_session_id is None
 
     @pytest.mark.asyncio
     async def test_exception_during_yield_still_tears_down(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -408,7 +414,12 @@ class TestClickAdapter:
         from skyvern.forge.sdk.copilot.tools import _click_post_hook
 
         ctx = _make_ctx()
-        raw = {"browser_context": {"url": "https://ex.com", "title": "Page"}}
+        raw = {
+            "browser_context": {
+                "url": "https://ex.com/magic/29f4ed70-8c9a-4db6-b68d-f53a87bd2147?code=secret",
+                "title": "Page",
+            }
+        }
         result = {
             "ok": True,
             "data": {"selector": "#btn", "intent": None, "sdk_equivalent": "..."},
@@ -417,7 +428,7 @@ class TestClickAdapter:
         adapted = await _click_post_hook(result, raw, ctx)
 
         assert adapted["data"]["selector"] == "#btn"
-        assert adapted["data"]["url"] == "https://ex.com"
+        assert adapted["data"]["url"] == "https://ex.com/"
         assert adapted["data"]["title"] == "Page"
         assert "sdk_equivalent" not in adapted["data"]
 
@@ -543,7 +554,11 @@ class TestUpdateWorkflowDirect:
         """update_workflow uses direct path even when api_key is set."""
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key="sk-test-key", workflow_permanent_id="wpid_abc123")
+        ctx = _make_ctx(
+            api_key="sk-test-key",
+            workflow_permanent_id="wpid_abc123",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         mock_workflow = MagicMock()
         mock_workflow.title = "Test"
@@ -575,7 +590,10 @@ class TestUpdateWorkflowDirect:
         """update_workflow uses direct path when api_key is None."""
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key=None)
+        ctx = _make_ctx(
+            api_key=None,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         mock_workflow = MagicMock()
         mock_workflow.title = "Test"
@@ -605,7 +623,10 @@ class TestUpdateWorkflowDirect:
 
         from skyvern.forge.sdk.copilot.tools import _update_workflow
 
-        ctx = _make_ctx(api_key="sk-test-key")
+        ctx = _make_ctx(
+            api_key="sk-test-key",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
 
         def raise_yaml_error(**kwargs: Any) -> None:
             raise _yaml.YAMLError("bad yaml")
@@ -646,86 +667,6 @@ class TestUpdateWorkflowDirect:
         await _update_workflow({"workflow_yaml": "new broken yaml"}, ctx)
 
         assert ctx.workflow_yaml == "original yaml"
-
-    @pytest.mark.asyncio
-    async def test_rejects_stale_block_metadata_before_persistence(self) -> None:
-        from skyvern.forge.sdk.copilot.tools import _update_workflow
-
-        prior_yaml = """
-title: Count example.com topic alpha results
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: search_topic_alpha
-      title: Search Topic Alpha
-      next_block_label: null
-      navigation_goal: Search example.com for topic alpha.
-"""
-        submitted_yaml = """
-title: Count example.com sample beta results
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: search_topic_alpha
-      title: Search Topic Alpha
-      next_block_label: null
-      navigation_goal: Search example.com for sample beta.
-"""
-        ctx = _make_ctx(workflow_yaml=prior_yaml)
-
-        result = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
-
-        assert result["ok"] is False
-        assert "corrected block metadata still appears stale" in result["error"]
-        assert "search_topic_alpha" in result["error"]
-        assert ctx.workflow_yaml == prior_yaml
-
-    @pytest.mark.asyncio
-    async def test_stale_check_prefers_in_turn_emission_over_turn_start_yaml(self) -> None:
-        # Cross-path flow: an earlier inline REPLACE_WORKFLOW left
-        # ctx.last_workflow_yaml at the renamed state. A subsequent
-        # update_workflow call submits a regression that re-stales the label
-        # — this must compare against ctx.last_workflow_yaml, not the older
-        # ctx.workflow_yaml that still points at turn-start.
-        from skyvern.forge.sdk.copilot.tools import _update_workflow
-
-        turn_start_yaml = """
-title: Alpha workflow
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: review_alpha_one
-      title: Review Alpha One
-      next_block_label: null
-      navigation_goal: Review the alpha one records on the directory.
-"""
-        in_turn_emission_yaml = """
-title: Beta workflow
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: review_beta_two
-      title: Review Beta Two
-      next_block_label: null
-      navigation_goal: Review the beta two records on the directory.
-"""
-        regressed_yaml = """
-title: Beta workflow
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: review_beta_two
-      title: Review Beta Two
-      next_block_label: null
-      navigation_goal: Review the gamma three records on the directory.
-"""
-        ctx = _make_ctx(workflow_yaml=turn_start_yaml)
-        ctx.last_workflow_yaml = in_turn_emission_yaml
-
-        result = await _update_workflow({"workflow_yaml": regressed_yaml}, ctx)
-
-        assert result["ok"] is False
-        assert "review_beta_two" in result["error"]
 
 
 class TestWorkflowUpdatePersistence:

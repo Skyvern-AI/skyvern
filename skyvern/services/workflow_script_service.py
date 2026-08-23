@@ -41,11 +41,49 @@ LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
 strict_jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 
+# Block types that produce cached ScriptBlock functions. Other block types
+# (goto/code/etc.) are deterministic already and get inlined into main.py
+# without ScriptBlock rows — treating them as "missing" forces regeneration
+# on every mint.
+BLOCK_TYPES_THAT_SHOULD_BE_CACHED = {
+    BlockType.TASK,
+    BlockType.TaskV2,
+    BlockType.ACTION,
+    BlockType.NAVIGATION,
+    BlockType.EXTRACTION,
+    BlockType.LOGIN,
+    BlockType.FILE_DOWNLOAD,
+    BlockType.FOR_LOOP,
+    BlockType.WHILE_LOOP,
+}
+
+
+def cacheable_missing_labels(workflow_blocks: list[dict[str, Any]], cached_labels: set[str]) -> set[str]:
+    return {
+        block["label"]
+        for block in workflow_blocks
+        if block.get("label")
+        and block.get("block_type") in BLOCK_TYPES_THAT_SHOULD_BE_CACHED
+        and block["label"] not in cached_labels
+    }
+
+
 # Shared regex for parsing @skyvern.cached decorator lines in main.py source.
 _CACHED_DECORATOR_RE = re.compile(
     r"^@skyvern\.cached\(\s*cache_key\s*=\s*['\"]([^'\"]+)['\"]\s*\)",
     re.MULTILINE,
 )
+
+
+def _validate_main_py(source: str) -> bytes:
+    content = base64.b64encode(source.encode("utf-8")).decode("utf-8")
+    file = ScriptFileCreate(
+        path="main.py",
+        content=content,
+        encoding=FileEncoding.BASE64,
+        mime_type="text/x-python",
+    )
+    return script_service.validate_uploaded_script_files([file])[file.path]
 
 
 def _cached_label_from_decorator(decorator: ast.expr) -> str | None:
@@ -482,10 +520,34 @@ async def generate_or_update_pending_workflow_script(
     context = skyvern_context.current()
     if not context:
         return
+
     script_id = context.script_id
+    script_revision_id = context.script_revision_id
     script = None
-    if script_id:
-        script = await app.DATABASE.scripts.get_script(script_id=script_id, organization_id=organization_id)
+    if script_id and script_revision_id:
+        # A pending mint can outlive finalize. Bind it to the revision captured
+        # when the mint began; resolving the latest script version here can
+        # overwrite finalize's newly published main.py.
+        script = await app.DATABASE.scripts.get_script_revision(
+            script_revision_id=script_revision_id,
+            organization_id=organization_id,
+        )
+        if not script or script.script_id != script_id:
+            LOG.warning(
+                "Skipping pending script mint with unavailable revision lease",
+                workflow_run_id=workflow_run.workflow_run_id,
+                script_id=script_id,
+                script_revision_id=script_revision_id,
+            )
+            return
+    elif script_id or script_revision_id:
+        LOG.warning(
+            "Skipping pending script mint with incomplete revision lease",
+            workflow_run_id=workflow_run.workflow_run_id,
+            script_id=script_id,
+            script_revision_id=script_revision_id,
+        )
+        return
 
     if not script:
         script = await app.DATABASE.scripts.create_script(
@@ -823,6 +885,65 @@ async def _load_cached_script_block_sources(
     return cached_blocks
 
 
+async def _record_workflow_script_mapping(
+    *,
+    workflow: Workflow,
+    workflow_run: WorkflowRun,
+    script: Script,
+    rendered_cache_key_value: str,
+    pending: bool,
+) -> None:
+    existing_workflow_script = await app.DATABASE.scripts.get_workflow_script(
+        organization_id=workflow.organization_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        statuses=[ScriptStatus.pending, ScriptStatus.published],
+    )
+
+    if pending:
+        if existing_workflow_script:
+            return
+        await app.DATABASE.scripts.create_workflow_script(
+            organization_id=workflow.organization_id,
+            script_id=script.script_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            cache_key=workflow.cache_key or "",
+            cache_key_value=rendered_cache_key_value,
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            status=ScriptStatus.pending,
+        )
+        return
+
+    if existing_workflow_script and existing_workflow_script.script_id == script.script_id:
+        # Promote the run's own pending mapping instead of minting a duplicate
+        # published row for the same content (SKY-13659).
+        await app.DATABASE.scripts.update_workflow_script_status(
+            workflow_script_id=existing_workflow_script.workflow_script_id,
+            organization_id=workflow.organization_id,
+            status=ScriptStatus.published,
+        )
+        LOG.info(
+            "Promoted pending workflow script to published",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            script_id=script.script_id,
+            cache_key_value=rendered_cache_key_value,
+        )
+        return
+
+    await app.DATABASE.scripts.create_workflow_script(
+        organization_id=workflow.organization_id,
+        script_id=script.script_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        cache_key=workflow.cache_key or "",
+        cache_key_value=rendered_cache_key_value,
+        workflow_id=workflow.workflow_id,
+        workflow_run_id=workflow_run.workflow_run_id,
+        status=ScriptStatus.published,
+    )
+
+
 async def generate_workflow_script(
     workflow_run: WorkflowRun,
     workflow: Workflow,
@@ -862,7 +983,7 @@ async def generate_workflow_script(
         else:
             updated_block_labels = set(updated_block_labels)
 
-        missing_labels = {label for label in block_labels if label and label not in cached_block_sources}
+        missing_labels = cacheable_missing_labels(codegen_input.workflow_blocks, set(cached_block_sources))
         updated_block_labels.update(missing_labels)
         updated_block_labels.add(settings.WORKFLOW_START_BLOCK_LABEL)
 
@@ -998,31 +1119,16 @@ async def generate_workflow_script(
         script_version=script.version,
         script_revision_id=script.script_revision_id,
         pending=pending,
+        allow_invalid_python_syntax=True,
     )
 
-    # check if an existing draft workflow script exists for this workflow run
-    existing_pending_workflow_script = None
-    status = ScriptStatus.published
-    if pending:
-        status = ScriptStatus.pending
-        existing_pending_workflow_script = await app.DATABASE.scripts.get_workflow_script(
-            organization_id=workflow.organization_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            statuses=[status],
-        )
-    if not existing_pending_workflow_script:
-        # Record the workflow->script mapping for cache lookup
-        await app.DATABASE.scripts.create_workflow_script(
-            organization_id=workflow.organization_id,
-            script_id=script.script_id,
-            workflow_permanent_id=workflow.workflow_permanent_id,
-            cache_key=workflow.cache_key or "",
-            cache_key_value=rendered_cache_key_value,
-            workflow_id=workflow.workflow_id,
-            workflow_run_id=workflow_run.workflow_run_id,
-            status=status,
-        )
+    await _record_workflow_script_mapping(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        script=script,
+        rendered_cache_key_value=rendered_cache_key_value,
+        pending=pending,
+    )
 
     # 5) Mint-time static audit — only on published mints, not pending
     # intermediate revisions. The pending path fires per-block during a
@@ -1978,7 +2084,7 @@ async def create_script_version_from_review(
                         )
                         return new_script
 
-            patched_bytes = patched_main.encode("utf-8")
+            patched_bytes = _validate_main_py(patched_main)
             patched_hash = hashlib.sha256(patched_bytes).hexdigest()
 
             main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
@@ -2163,6 +2269,8 @@ async def create_script_version_from_full_code(
             )
             return None
 
+        main_bytes = _validate_main_py(full_main_py)
+
         # Compile the full main.py BEFORE creating the new version. A broken
         # rewrite should not persist any artifacts or DB rows.
         try:
@@ -2208,7 +2316,6 @@ async def create_script_version_from_full_code(
             )
 
         # Write the full main.py verbatim.
-        main_bytes = full_main_py.encode("utf-8")
         main_hash = hashlib.sha256(main_bytes).hexdigest()
 
         main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(

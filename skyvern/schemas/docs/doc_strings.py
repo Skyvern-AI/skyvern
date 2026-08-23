@@ -62,6 +62,10 @@ WEBHOOK_URL_DOC_STRING = """
 After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
 """
 
+RUN_FILE_IDS_DOC_STRING = """
+Ids of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.
+"""
+
 TOTP_IDENTIFIER_DOC_STRING = """
 Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
 """

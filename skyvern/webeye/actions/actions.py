@@ -6,7 +6,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.errors.errors import UserDefinedError
-from skyvern.utils.action_redaction import redact_input_text_payload_for_log
+from skyvern.utils.action_redaction import redact_action_payload_for_log, redact_input_text_payload_for_log
 from skyvern.webeye.actions.action_types import ActionType
 
 LOG = structlog.get_logger()
@@ -28,6 +28,25 @@ class ActionStatus(StrEnum):
     skipped = "skipped"
     failed = "failed"
     completed = "completed"
+
+
+class TelInputStrategy(StrEnum):
+    legacy_sequential = "legacy_sequential"
+    formatted_sequential = "formatted_sequential"
+    sequential_national = "sequential_national"
+    atomic_national = "atomic_national"
+    atomic_e164 = "atomic_e164"
+
+
+class TelInputOutcome(BaseModel):
+    flag_enabled: bool
+    final_element_id: str
+    strategy: TelInputStrategy
+    expected_digit_count: int
+    actual_digit_count: int | None = None
+    browser_valid: bool | None = None
+    attempt_count: int
+    retargeted: bool
 
 
 class SelectOption(BaseModel):
@@ -103,6 +122,10 @@ class InputOrSelectContext(BaseModel):
 class ClickContext(BaseModel):
     thought: str | None = None
     single_option_click: bool | None = None
+    # Level-triggered toggle intent set by the planner: True = leave the control
+    # selected/checked/on, False = leave it unselected/unchecked/off, None = ordinary
+    # edge-triggered click. Old persisted actions and absent field decode to None.
+    desired_state: bool | None = None
 
 
 class Action(BaseModel):
@@ -166,6 +189,25 @@ class Action(BaseModel):
     # batched action would clobber an in-action combobox selection.
     stop_batch_after_dropdown_select: bool = Field(default=False, exclude=True)
 
+    # Transient (never serialized): opts an INPUT_TEXT into the type-to-filter path for a wrapper-marked
+    # combobox. Lives on the base Action (like the flags above) because handle_input_text_action runs with
+    # hydrated/replayed base Action objects, not only InputTextAction — reading it must never raise.
+    prefilter_typeahead: bool = Field(default=False, exclude=True)
+
+    tel_input_outcome: TelInputOutcome | None = Field(default=None, exclude=True)
+
+    # Transient (never serialized): the observation epoch this action was planned under (SKY-12874).
+    # It must not reach the database — an epoch is run-local, so a value read back from a stored row
+    # could collide with a live run's counter and make a stale action look freshly observed.
+    observation_epoch: int | None = Field(default=None, exclude=True)
+
+    # Transient (never serialized): digest of the element hashes the observation covered. The epoch
+    # above is positional and a stray integer can match it by luck; this cannot, so provenance is
+    # bound to what was actually seen rather than to a counter's value.
+    observation_digest: str | None = Field(default=None, exclude=True)
+
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime | None = None
     modified_at: datetime | None = None
     created_by: str | None = None
@@ -315,6 +357,20 @@ class InputTextAction(WebAction):
         return self.__repr__()
 
 
+class PasteTextAction(WebAction):
+    action_type: ActionType = ActionType.PASTE_TEXT
+    text: str
+
+    def __repr__(self) -> str:
+        payload = redact_action_payload_for_log({"action_type": self.action_type, "text": self.text})
+        return (
+            f"PasteTextAction(element_id={self.element_id}, text={payload['text']}, tool_call_id={self.tool_call_id})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
 class UploadFileAction(WebAction):
     action_type: ActionType = ActionType.UPLOAD_FILE
     file_url: str
@@ -435,7 +491,7 @@ class DragAction(Action):
     action_type: ActionType = ActionType.DRAG
     start_x: int | None = None
     start_y: int | None = None
-    path: list[tuple[int, int]] = []
+    path: list[tuple[int, int]] = Field(default_factory=list, max_length=1_000)
 
 
 class VerificationCodeAction(Action):

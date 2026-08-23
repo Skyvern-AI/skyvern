@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -54,9 +55,13 @@ class MaxStepsReasonResponse(BaseModel):
 
 
 PROMPT_HARD_CEILING_TOKENS = 180_000
+_CEILING_SAFETY_MARGIN_TOKENS = 2_000
+_MIN_USEFUL_ELEMENT_TOKENS = 20_000
+_MAX_ELEMENT_TRIM_ROUNDS = 3
 
 CEILING_FALLBACK_KEYS_BY_TEMPLATE: dict[str, list[str]] = {
     "extract-information": [
+        "virtualized_grid_rows",
         "previous_extracted_information",
         "extracted_information_schema",
         "extracted_text",
@@ -123,6 +128,9 @@ def load_prompt_with_elements_tracked(
         **kwargs,
     )
     token_count = count_tokens(prompt)
+    # Invariant: equals count_tokens(prompt) for the current prompt; re-set on every rebuild
+    # below so the ceiling helper and telemetry can reuse it without re-encoding an identical string.
+    current_prompt_token_count = token_count
     if token_count > DEFAULT_MAX_TOKENS and element_tree_builder.support_economy_elements_tree():
         # get rid of all the secondary elements like SVG, etc
         # NOTE: economy fallback drops the lean recipe — context-overflow firefighting
@@ -133,6 +141,7 @@ def load_prompt_with_elements_tracked(
         )
         prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
         economy_token_count = count_tokens(prompt)
+        current_prompt_token_count = economy_token_count
         LOG.warning(
             "Prompt is longer than the max tokens. Going to use the economy elements tree.",
             template_name=template_name,
@@ -152,6 +161,7 @@ def load_prompt_with_elements_tracked(
             )
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
             token_count_after_dump = count_tokens(prompt)
+            current_prompt_token_count = token_count_after_dump
             LOG.warning(
                 "Prompt is still longer than the max tokens. Will only keep the first 2/3 of the html context.",
                 template_name=template_name,
@@ -161,26 +171,26 @@ def load_prompt_with_elements_tracked(
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
 
-    final_prompt, final_kwargs = enforce_prompt_ceiling_tracked(
+    def _mirror_trimmed_elements(trimmed: str) -> None:
+        if element_tree_builder.last_used_element_tree_html is not None:
+            element_tree_builder.last_used_element_tree_html = trimmed
+
+    final_prompt, final_kwargs, final_token_count = _enforce_prompt_ceiling_counted(
         prompt,
         prompt_engine=prompt_engine,
         template_name=template_name,
         kwargs=kwargs,
         elements=elements,
+        precomputed_token_count=current_prompt_token_count,
+        on_elements_trimmed=_mirror_trimmed_elements,
     )
 
-    # SKY-9718: stash per-prompt token breakdown on SkyvernContext so the
-    # downstream LLM API handler log can attach html_token_count / html_pct
-    # alongside input_tokens / llm_cost.
+    # SKY-9718: stash the locally-counted prompt size on SkyvernContext so the downstream
+    # LLM API handler log can attach it alongside the provider's input_tokens / llm_cost.
     ctx = skyvern_context.current()
     if ctx is not None:
-        html_tokens = count_tokens(elements) if elements else 0
-        total_tokens_local = count_tokens(final_prompt)
-        html_pct = (html_tokens / total_tokens_local) if total_tokens_local else None
         ctx.last_prompt_breakdown = {
-            "html_token_count": html_tokens,
-            "total_tokens_local": total_tokens_local,
-            "html_pct": round(html_pct, 4) if html_pct is not None else None,
+            "total_tokens_local": final_token_count,
             "template_name": template_name,
         }
 
@@ -213,6 +223,161 @@ def load_prompt_with_elements(
     return prompt
 
 
+def _truncate_elements_at_tag_boundary(elements: str, keep_chars: int) -> str:
+    if keep_chars >= len(elements):
+        return elements
+    # Cut on a tag boundary so the tail isn't a half-written tag or attribute.
+    last_tag_end = elements.rfind(">", 0, keep_chars)
+    return elements[: last_tag_end + 1] if last_tag_end != -1 else elements[:keep_chars]
+
+
+def _trim_elements_to_fit(
+    prompt: str,
+    *,
+    prompt_engine: PromptEngine,
+    template_name: str,
+    kwargs: dict[str, Any],
+    elements: str,
+    token_count: int,
+    min_useful_element_tokens: int,
+) -> tuple[str, str, int]:
+    """Trim the rendered element tree until the prompt fits under the hard ceiling.
+
+    Returns the (possibly unchanged) prompt, elements, and token count. The tree is left
+    alone when the non-element inputs are what blow the budget — trimming it then costs
+    page context without getting the prompt under the ceiling.
+    """
+    target_tokens = PROMPT_HARD_CEILING_TOKENS - _CEILING_SAFETY_MARGIN_TOKENS
+    trimmed = elements
+    for _ in range(_MAX_ELEMENT_TRIM_ROUNDS):
+        element_tokens = count_tokens(trimmed)
+        if element_tokens == 0:
+            break
+        element_budget = target_tokens - (token_count - element_tokens)
+        if element_budget < min_useful_element_tokens:
+            break
+        keep_chars = int(element_budget * (len(trimmed) / element_tokens))
+        if keep_chars >= len(trimmed):
+            break
+        trimmed = _truncate_elements_at_tag_boundary(trimmed, keep_chars)
+        prompt = prompt_engine.load_prompt(template_name, elements=trimmed, **kwargs)
+        token_count = count_tokens(prompt)
+        if token_count <= PROMPT_HARD_CEILING_TOKENS:
+            break
+    return prompt, trimmed, token_count
+
+
+def _enforce_prompt_ceiling_counted(
+    prompt: str,
+    *,
+    prompt_engine: PromptEngine,
+    template_name: str,
+    kwargs: dict[str, Any],
+    elements: Any | None = None,
+    precomputed_token_count: int | None = None,
+    on_elements_trimmed: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, Any], int]:
+    """Count-aware core of the hard-ceiling enforcement, returning the final prompt's token count.
+
+    ``precomputed_token_count`` is trusted only for the first ceiling check and must be the count
+    of exactly this ``prompt``. Any prompt mutation inside the drop loop is re-encoded — a count is
+    never reused across a changed prompt.
+    """
+    working_kwargs = dict(kwargs)
+    final_token_count = precomputed_token_count if precomputed_token_count is not None else count_tokens(prompt)
+    if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
+        return prompt, working_kwargs, final_token_count
+
+    original_elements: str | None = elements if isinstance(elements, str) else None
+    # Mirrors the `elements` parameter so the pass-through to load_prompt is unchanged for
+    # callers that render without one; only a non-empty rendered tree is ever trimmed.
+    working_elements: Any | None = elements
+
+    def _fitted() -> tuple[str, dict[str, Any], int]:
+        if (
+            original_elements is not None
+            and isinstance(working_elements, str)
+            and working_elements != original_elements
+        ):
+            LOG.warning(
+                "Prompt exceeded hard ceiling; trimmed the element tree to fit",
+                template_name=template_name,
+                elements_char_count_before=len(original_elements),
+                elements_char_count_after=len(working_elements),
+                final_token_count=final_token_count,
+                hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+            )
+            if on_elements_trimmed is not None:
+                on_elements_trimmed(working_elements)
+        return prompt, working_kwargs, final_token_count
+
+    # The element tree is usually what blows the ceiling, and no combination of fallback
+    # drops can rescue a prompt whose tree alone is over budget. Trim it first so those
+    # drops aren't spent for nothing; `_MIN_USEFUL_ELEMENT_TOKENS` keeps this from gutting
+    # the page when a large non-element input is the real cause.
+    if isinstance(working_elements, str) and working_elements:
+        prompt, working_elements, final_token_count = _trim_elements_to_fit(
+            prompt,
+            prompt_engine=prompt_engine,
+            template_name=template_name,
+            kwargs=working_kwargs,
+            elements=working_elements,
+            token_count=final_token_count,
+            min_useful_element_tokens=_MIN_USEFUL_ELEMENT_TOKENS,
+        )
+        if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
+            return _fitted()
+
+    fallback_keys = CEILING_FALLBACK_KEYS_BY_TEMPLATE.get(template_name, [])
+    drops_applied = 0
+    for drop_key in fallback_keys:
+        if working_kwargs.get(drop_key) is None:
+            continue
+        LOG.warning(
+            "Prompt exceeds hard ceiling; dropping fallback key",
+            template_name=template_name,
+            drop_key=drop_key,
+            final_token_count=final_token_count,
+            hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+        )
+        working_kwargs[drop_key] = None
+        drops_applied += 1
+        if working_elements is None:
+            prompt = prompt_engine.load_prompt(template_name, **working_kwargs)
+        else:
+            prompt = prompt_engine.load_prompt(template_name, elements=working_elements, **working_kwargs)
+        final_token_count = count_tokens(prompt)
+        if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
+            return _fitted()
+
+    # Last resort: the drops freed whatever they could, so trim the tree as far as it takes.
+    # A degraded view of the page still lets the step run; raising ends the run outright.
+    if isinstance(working_elements, str) and working_elements:
+        prompt, working_elements, final_token_count = _trim_elements_to_fit(
+            prompt,
+            prompt_engine=prompt_engine,
+            template_name=template_name,
+            kwargs=working_kwargs,
+            elements=working_elements,
+            token_count=final_token_count,
+            min_useful_element_tokens=0,
+        )
+        if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
+            return _fitted()
+
+    LOG.error(
+        "Prompt still exceeds hard ceiling",
+        template_name=template_name,
+        final_token_count=final_token_count,
+        hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+        fallback_keys_configured=len(fallback_keys),
+        drops_applied=drops_applied,
+        elements_char_count=len(original_elements) if original_elements else None,
+        elements_char_count_after_trim=len(working_elements) if working_elements else None,
+    )
+    raise SkyvernContextWindowExceededError(prompt_name=template_name)
+
+
 def enforce_prompt_ceiling_tracked(
     prompt: str,
     *,
@@ -227,36 +392,14 @@ def enforce_prompt_ceiling_tracked(
     returned kwargs so requests that render to the same final LLM prompt
     (because dropped fields differed but were both dropped) share a key.
     """
-    working_kwargs = dict(kwargs)
-    final_token_count = count_tokens(prompt)
-    if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-        return prompt, working_kwargs
-    fallback_keys = CEILING_FALLBACK_KEYS_BY_TEMPLATE.get(template_name, [])
-    for drop_key in fallback_keys:
-        if working_kwargs.get(drop_key) is None:
-            continue
-        LOG.warning(
-            "Prompt exceeds hard ceiling; dropping fallback key",
-            template_name=template_name,
-            drop_key=drop_key,
-            final_token_count=final_token_count,
-            hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
-        )
-        working_kwargs[drop_key] = None
-        if elements is None:
-            prompt = prompt_engine.load_prompt(template_name, **working_kwargs)
-        else:
-            prompt = prompt_engine.load_prompt(template_name, elements=elements, **working_kwargs)
-        final_token_count = count_tokens(prompt)
-        if final_token_count <= PROMPT_HARD_CEILING_TOKENS:
-            return prompt, working_kwargs
-    LOG.error(
-        "Prompt still exceeds hard ceiling after all fallback drops",
+    final_prompt, working_kwargs, _ = _enforce_prompt_ceiling_counted(
+        prompt,
+        prompt_engine=prompt_engine,
         template_name=template_name,
-        final_token_count=final_token_count,
-        hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
+        kwargs=kwargs,
+        elements=elements,
     )
-    raise SkyvernContextWindowExceededError(prompt_name=template_name)
+    return final_prompt, working_kwargs
 
 
 def enforce_prompt_ceiling(

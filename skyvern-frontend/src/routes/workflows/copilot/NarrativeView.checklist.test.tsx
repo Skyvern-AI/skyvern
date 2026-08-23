@@ -35,12 +35,13 @@ const runningBlock = (overrides: Partial<BlockState> = {}): BlockState => ({
   endedAt: null,
   ...overrides,
 });
+const LONG_OUTCOME_REASON =
+  "The verification challenge kept reappearing after submit, and each retry landed back on the same gate instead of the requested destination page.";
 
 const liveExploreTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   designStarted: true,
   terminal: null,
   designActivity: [
@@ -57,7 +58,6 @@ const testActiveTurn = (): TurnNarrativeState => ({
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "build",
   designStarted: true,
   designEnded: true,
   terminal: null,
@@ -133,61 +133,14 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     expect(doneLabel.closest("button")).toBeNull();
   });
 
-  it("names the redraft iteration in the shimmered Draft placeholder after a failed verify", () => {
-    const redraftTurn: TurnNarrativeState = {
-      ...EMPTY_NARRATIVE,
-      turnId: "turn-1",
-      turnIndex: 0,
-      mode: "build",
-      designStarted: true,
-      designEnded: true,
-      terminal: null,
-      authoringCount: 1,
-      activitySeq: 3,
-      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
-      blocks: [
-        runningBlock({
-          state: "completed",
-          endedAt: "2026-06-10T00:00:10Z",
-        }),
-      ],
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "outcome not confirmed",
-        activitySeqAtVerdict: 2,
-      },
-      designActivity: [
-        activityEntry({
-          id: "tc-1",
-          kind: "tool_call",
-          toolName: "navigate_browser",
-        }),
-        activityEntry({
-          id: "tc-2",
-          kind: "tool_call",
-          toolName: "update_and_run_blocks",
-        }),
-        activityEntry({ id: "n-1", kind: "narration" }),
-      ],
-    };
-    render(<NarrativeView turn={redraftTurn} uxV1 />);
-    expect(
-      screen.getByText(
-        /Draft v2 — revising after failed verify: outcome not confirmed/,
-      ),
-    ).toBeTruthy();
-  });
-
-  it("REGRESSION PIN: never shows redraft copy on an ordinary first build with no prior verdict (Codex catch)", () => {
+  it("renders the generic Draft placeholder on an ordinary first build", () => {
     const firstBuildDraftActive: TurnNarrativeState = {
       ...EMPTY_NARRATIVE,
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       designStarted: true,
       terminal: null,
       authoringCount: 1,
-      activitySeq: 1,
       lastRunOutcome: null,
       designActivity: [
         activityEntry({
@@ -199,7 +152,43 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     };
     render(<NarrativeView turn={firstBuildDraftActive} uxV1 />);
     expect(screen.getByText("Writing the workflow code…")).toBeTruthy();
-    expect(screen.queryByText(/revising after failed verify/)).toBeNull();
+  });
+
+  it("REGRESSION PIN (SKY-12969): a mid-login code-only offer render keeps Explore active — no premature done, no 'Writing the workflow code…'", () => {
+    // The synthesis lane renders an offer (turn.draft) while the scout is still
+    // filling credentials, with zero authoring tools. Explore must stay active
+    // and Draft must not claim the phase.
+    const codeOnlyMidScout: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-1",
+      turnIndex: 0,
+      designStarted: true,
+      terminal: null,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      designActivity: [
+        activityEntry({
+          id: "tc-1",
+          kind: "tool_call",
+          toolName: "navigate_browser",
+          displayLabel: "Opening page",
+        }),
+        activityEntry({
+          id: "tc-2",
+          kind: "tool_call",
+          toolName: "fill_credential_field",
+          displayLabel: "Filling credentials",
+        }),
+      ],
+    };
+    render(<NarrativeView turn={codeOnlyMidScout} uxV1 />);
+    const exploreLabel = screen.getByText("Explore site");
+    // Active rows render inert (no toggle button) with a spinner + sr-only word;
+    // a completed row would render neither.
+    expect(exploreLabel.closest("button")).toBeNull();
+    const exploreRow = exploreLabel.closest("div")!;
+    expect(exploreRow.querySelector(".animate-spin")).toBeTruthy();
+    expect(exploreRow.textContent).toContain("Active");
+    expect(screen.queryByText("Writing the workflow code…")).toBeNull();
   });
 
   it("REGRESSION PIN: Test-run stays expandable when blocks exist even with an empty test-activity bucket (Codex catch)", () => {
@@ -207,7 +196,6 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
       ...EMPTY_NARRATIVE,
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       designStarted: true,
       designEnded: true,
       terminal: "response",
@@ -227,12 +215,101 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
     expect(screen.getByTitle("Highlight block_1 on canvas")).toBeTruthy();
   });
 
+  it("shows a truncated not-demonstrated reason in the collapsed block row and hides it without the verdict", () => {
+    const notConfirmedBlock = runningBlock({
+      state: "completed",
+      outcome: "not_demonstrated",
+      endedAt: "2026-06-10T00:00:10Z",
+    });
+    const turnWithVerdict: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-3",
+      turnIndex: 0,
+      designStarted: true,
+      designEnded: true,
+      terminal: "response",
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [notConfirmedBlock],
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: LONG_OUTCOME_REASON,
+      },
+      designActivity: [],
+    };
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    const { rerender } = render(<NarrativeView turn={turnWithVerdict} uxV1 />);
+    const testRow = screen.getByRole("button", { name: /Test-run/ });
+    fireEvent.click(testRow);
+    expect(
+      screen.getByText(
+        (text) =>
+          text.includes("run finished without showing the goal was met") &&
+          text.includes(expectedPreview),
+      ),
+    ).toBeTruthy();
+
+    rerender(
+      <NarrativeView
+        turn={{ ...turnWithVerdict, lastRunOutcome: null }}
+        uxV1
+      />,
+    );
+    const rerenderedTestRow = screen.getByRole("button", { name: /Test-run/ });
+    if (rerenderedTestRow.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(rerenderedTestRow);
+    }
+    expect(screen.queryByText(expectedPreview)).toBeNull();
+  });
+
+  it("uses hydrated block outcomeReason for the collapsed block-row preview when lastRunOutcome is absent", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-4",
+      turnIndex: 0,
+      responseType: "REPLY",
+      designStarted: true,
+      designEnded: true,
+      draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "block_1",
+          blockType: "task",
+          state: "completed",
+          outcome: "not_demonstrated",
+          outcomeReason: LONG_OUTCOME_REASON,
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-06-10T00:00:00Z",
+          endedAt: "2026-06-10T00:00:10Z",
+        },
+      ],
+      terminal: "response",
+      terminalMessage: "Built and tested the workflow.",
+      narrativeSummary: "Built and tested the workflow.",
+      priorBlockCount: null,
+      designActivity: [],
+      startedAt: "2026-06-10T00:00:00Z",
+      endedAt: "2026-06-10T00:00:10Z",
+    })!;
+    expect(hydrated.lastRunOutcome).toBeNull();
+    const expectedPreview = `${LONG_OUTCOME_REASON.slice(0, 137).trimEnd()}...`;
+    render(<NarrativeView turn={hydrated} uxV1 />);
+    const testRow = screen.getByRole("button", { name: /Test-run/ });
+    fireEvent.click(testRow);
+    expect(
+      screen.getByText(
+        (text) =>
+          text.includes("run finished without showing the goal was met") &&
+          text.includes(expectedPreview),
+      ),
+    ).toBeTruthy();
+  });
+
   it("hydration no-replay pin: a reloaded terminal build turn renders all stubs — zero spinners, zero open nests, no pending timers", () => {
     vi.useFakeTimers();
     const payload = {
       turnId: "turn-1",
       turnIndex: 0,
-      mode: "build",
       designStarted: true,
       designEnded: true,
       draft: { blockCount: 1, blockLabels: ["block_1"], summary: null },
@@ -292,7 +369,6 @@ describe("NarrativeView — phase checklist (SKY-11970)", () => {
       ...EMPTY_NARRATIVE,
       turnId: "turn-2",
       turnIndex: 0,
-      mode: "clarify",
       designStarted: true,
       terminal: "response",
       responseType: "ASK_QUESTION",

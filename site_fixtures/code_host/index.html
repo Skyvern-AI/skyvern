@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wyrmhold</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --ink:#e6edf3; --muted:#8d96a0; --link:#4493f8;
+          --green:#238636; --btn:#21262d; --badge:#30363d; --done:#8957e5; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--ink); font-size:14px; }
+  a, .linklike { color:var(--link); text-decoration:none; cursor:pointer; background:none; border:none; font-size:inherit; font-family:inherit; padding:0; }
+  a:hover, .linklike:hover { text-decoration:underline; }
+  button { font-family:inherit; }
+
+  /* ---------- Chrome ---------- */
+  .topbar { display:flex; align-items:center; gap:14px; padding:12px 18px; border-bottom:1px solid var(--line); background:#010409; }
+  .topbar .mark { font-size:26px; }
+  .topbar .crumb { font-size:15px; }
+  .topbar .crumb strong { font-weight:600; }
+  .topbar .spacer { flex:1; }
+  .topbar input { background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--ink); padding:6px 10px; width:240px; }
+  .repotabs { display:flex; gap:4px; padding:0 12px; border-bottom:1px solid var(--line); background:#010409; }
+  .repotabs button { background:none; border:none; color:var(--ink); padding:10px 14px; font-size:14px; cursor:pointer;
+                     border-bottom:2px solid transparent; display:flex; gap:7px; align-items:center; }
+  .repotabs button:hover { border-bottom-color:var(--muted); }
+  .repotabs button.on { border-bottom-color:#f78166; font-weight:600; }
+  .repotabs .count { background:var(--badge); border-radius:10px; padding:1px 8px; font-size:12px; }
+
+  /* ---------- Repo home ---------- */
+  .layout { display:flex; gap:28px; max-width:1280px; margin:0 auto; padding:22px 24px 60px; }
+  .maincol { flex:1; min-width:0; }
+  .sidecol { width:300px; flex:0 0 300px; }
+  .repohead { display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
+  .repohead h1 { font-size:20px; font-weight:600; margin:0; }
+  .vis { border:1px solid var(--line); border-radius:12px; padding:1px 8px; font-size:12px; color:var(--muted); }
+  .repohead .actions { margin-left:auto; display:flex; gap:8px; }
+  .pill { background:var(--btn); border:1px solid var(--line); border-radius:6px; color:var(--ink); padding:5px 12px; font-size:13px; cursor:pointer; }
+  .pill .n { background:var(--badge); border-radius:10px; padding:0 7px; margin-left:6px; font-size:12px; }
+  .files { border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:18px; }
+  .files .commitrow { background:var(--panel); padding:10px 14px; display:flex; gap:10px; font-size:13px; color:var(--muted); }
+  .files .commitrow strong { color:var(--ink); font-weight:600; }
+  .files .row { display:flex; padding:9px 14px; border-top:1px solid var(--line); font-size:14px; }
+  .files .row .name { width:280px; color:var(--ink); }
+  .files .row .msg { flex:1; color:var(--muted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .files .row .when { color:var(--muted); width:120px; text-align:right; }
+  .readme { border:1px solid var(--line); border-radius:6px; }
+  .readme__tabs { border-bottom:1px solid var(--line); padding:10px 16px; font-weight:600; font-size:14px; }
+  .readme__body { padding:28px 34px; line-height:1.6; }
+  .readme__body h1 { text-align:center; font-size:26px; letter-spacing:.08em; }
+  .readme__body .dragon { text-align:center; font-size:44px; margin:6px 0; }
+  .readme__body .tagline { text-align:center; font-size:16px; margin:4px 0 22px; }
+  .readme__body h2 { border-bottom:1px solid var(--line); padding-bottom:8px; margin-top:34px; font-size:22px; }
+  .readme__body p { font-size:15px; }
+  .about h3 { font-size:16px; margin:0 0 10px; }
+  .about p { font-size:14px; margin:0 0 12px; }
+  .about .tags { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:16px; }
+  .about .tag { background:rgba(56,139,253,.15); color:var(--link); border-radius:12px; padding:3px 10px; font-size:12px; }
+  .about ul { list-style:none; padding:0; margin:0; border-top:1px solid var(--line); }
+  .about li { padding:8px 0; color:var(--muted); font-size:13px; }
+  .about li strong { color:var(--ink); }
+
+  /* ---------- Pulse ---------- */
+  .pulse h2.period { font-size:22px; font-weight:600; margin:0; }
+  .pulse .periodrow { display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); padding-bottom:14px; margin-bottom:18px; }
+  .pulse .periodbtn { background:var(--btn); border:1px solid var(--line); border-radius:6px; color:var(--ink); padding:6px 12px; font-size:13px; cursor:pointer; }
+  .pulse .periodbtn .k { color:var(--muted); }
+  .overview { border:1px solid var(--line); border-radius:6px; }
+  .overview h3 { margin:0; padding:12px 16px; border-bottom:1px solid var(--line); font-size:14px; background:var(--panel); }
+  .ovgrid { display:flex; flex-wrap:wrap; }
+  .ovcell { width:50%; padding:18px 20px; }
+  .bar { display:flex; height:10px; border-radius:5px; overflow:hidden; margin-bottom:12px; }
+  .bar span { display:block; height:100%; }
+  .stat { display:inline-block; margin-right:26px; }
+  .stat .n { font-size:22px; font-weight:600; display:block; }
+  .stat .k { color:var(--muted); font-size:13px; }
+  .summary { padding:16px 20px; border-top:1px solid var(--line); font-size:15px; }
+  .summary strong { font-weight:600; }
+  .authors { padding:0 20px 18px; color:var(--muted); font-size:13px; }
+
+  /* ---------- 404 (logged-out private) ---------- */
+  .nf { position:relative; }
+  .nf__hero { background:linear-gradient(180deg,#79b8ff 0%,#e8d9b5 55%,#d8c49a 100%); color:#2f4858; padding:70px 40px 90px; text-align:center; }
+  .nf__404 { font-size:96px; font-weight:800; color:#fff; text-shadow:0 2px 0 rgba(0,0,0,.15); }
+  .nf__bubble { display:inline-block; background:#fff; border-radius:10px; padding:16px 22px; font-size:24px; font-weight:700; margin-top:8px; }
+  .signin-pop { position:absolute; top:26px; right:40px; width:340px; background:#010409; border:1px solid var(--line); border-radius:10px; padding:22px; text-align:left; box-shadow:0 8px 28px rgba(0,0,0,.5); }
+  .signin-pop h2 { font-size:19px; margin:0 0 14px; }
+  .signin-pop label { display:block; font-size:14px; font-weight:600; margin:12px 0 6px; }
+  .signin-pop .lblrow { display:flex; justify-content:space-between; align-items:baseline; }
+  .signin-pop input[type=text], .signin-pop input[type=password] {
+    width:100%; padding:8px 10px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--ink); font-size:14px; }
+  .signin-pop .go { width:100%; margin-top:16px; padding:9px; background:var(--green); border:1px solid rgba(240,246,252,.1); border-radius:6px; color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
+  .signin-pop .alt { display:block; text-align:center; margin-top:14px; }
+  #signinError { color:#ff7b72; font-size:13px; min-height:18px; margin:10px 0 0; }
+  .nf__search { padding:34px 40px 50px; border-bottom:1px solid var(--line); }
+  .nf__search p { margin:0 0 10px; font-size:16px; }
+  .nf__search .row { display:flex; gap:10px; }
+  .nf__search input { flex:1; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--ink); padding:9px 12px; }
+  .nf__search button { background:var(--btn); border:1px solid var(--line); border-radius:6px; color:var(--ink); padding:9px 18px; cursor:pointer; }
+  .nf__foot { text-align:center; color:var(--muted); padding:22px; font-size:14px; }
+
+  /* ---------- 2FA ---------- */
+  .tfa { max-width:340px; margin:60px auto; text-align:center; }
+  .tfa .coin { font-size:44px; }
+  .tfa h1 { font-size:24px; font-weight:300; margin:12px 0 6px; }
+  .tfa .sub { color:var(--muted); font-size:14px; margin:0 0 22px; }
+  .tfa .card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:18px; text-align:center; }
+  .tfa .primary { width:100%; padding:9px; background:var(--green); border:1px solid rgba(240,246,252,.1); border-radius:6px; color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
+  .tfa .secondary { width:100%; padding:9px; background:var(--btn); border:1px solid var(--line); border-radius:6px; color:var(--ink); font-size:14px; cursor:pointer; margin-top:14px; }
+  .tfa input#app_totp { width:100%; padding:10px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--ink);
+                        font-size:20px; text-align:center; letter-spacing:.2em; margin-bottom:10px; }
+  .tfa .alts { list-style:none; margin:12px 0 0; padding:0; display:none; }
+  .tfa .alts.open { display:block; }
+  .tfa .alts li button { width:100%; padding:9px; background:var(--btn); border:1px solid var(--line); border-radius:6px; color:var(--ink); font-size:14px; cursor:pointer; margin-top:8px; }
+  .tfa .notice { color:var(--muted); font-size:13px; margin-top:12px; }
+  #tfaError { color:#ff7b72; font-size:13px; min-height:18px; margin-top:10px; }
+  .sr-only { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+/* Wyrmhold — a code-hosting fixture (SKY-12764): a public repo (home + Pulse) and a
+   private repo behind sign-in -> passkey screen -> "More options" -> authenticator
+   code. Auth pages follow saved DOM captures of a real code host; branding is
+   fixture-owned and repo content comes from our own open-source README. */
+
+const BRAND = "Wyrmhold";
+const ORG = "Skyvern-AI";
+const REPO = (location.pathname.split("/").filter(Boolean)[1] || "skyvern");
+const IS_PRIVATE = REPO === "skyvern-cloud";
+
+const DEMO_USERS = ["demo_business_user", "demo.analyst@example.com"];
+const DEMO_PASS = "Demo!Pass123";
+const BAD_CREDS = "Incorrect username or password.";
+
+// Public repo carries our real OSS pulse shape; the private repo's numbers are
+// fixture-owned so no internal data lands in the mock.
+const PULSE = {
+  "skyvern": { authors:17, main:195, all:232, activePRs:12, activeIssues:34,
+               merged:209, openPRs:15, closed:24, newIssues:31 },
+  "skyvern-cloud": { authors:21, main:301, all:640, activePRs:58, activeIssues:22,
+                     merged:298, openPRs:41, closed:12, newIssues:9 },
+};
+const FILES = [
+  { name:".github", msg:"ci: skip sdk-release when target version…", when:"last month" },
+  { name:"docs", msg:"Copilot uses a saved credential matchin…", when:"4 hours ago" },
+  { name:"skyvern", msg:"Keep date-driven row select…", when:"2 hours ago" },
+  { name:"skyvern-frontend", msg:"Copilot chat reads run-outcome facts fr…", when:"4 hours ago" },
+  { name:"tests", msg:"Keep date-driven row select…", when:"2 hours ago" },
+  { name:"README.md", msg:"Add packaged UI pip install flow", when:"2 months ago" },
+];
+
+const app = document.getElementById("app");
+const S = sessionStorage;
+
+function chrome(tab) {
+  const counts = { Issues: 39, "Pull requests": 186 };
+  const tabs = ["Code", "Issues", "Pull requests", "Actions", "Insights"];
+  return `
+  <div class="topbar">
+    <span class="mark">&#128009;</span>
+    <span class="crumb">${ORG} / <strong>${REPO}</strong></span>
+    <div class="spacer"></div>
+    <input placeholder="Type / to search" />
+    <span style="color:var(--muted)">demo_business_user</span>
+  </div>
+  <div class="repotabs">
+    ${tabs.map(t => `<button class="${t === tab ? "on" : ""}" onclick="onTab('${t}')">${t}${counts[t] ? `<span class=\"count\">${counts[t]}</span>` : ""}</button>`).join("")}
+  </div>`;
+}
+
+function onTab(tab) {
+  if (tab === "Insights") { renderPulse(); return; }
+  renderRepo();
+}
+
+/* =====================  Gate chain (private repo only)  ===================== */
+function advancePastGates() {
+  if (!IS_PRIVATE) { S.getItem("wh_view") === "pulse" ? renderPulse() : renderRepo(); return; }
+  if (S.getItem("wh_authed") !== "1") { renderNotFound(); return; }
+  if (S.getItem("wh_mfa_passed") !== "1") { renderTfaPasskey(); return; }
+  S.getItem("wh_view") === "pulse" ? renderPulse() : renderRepo();
+}
+
+/* =====================  404 + sign-in (logged-out private repo)  =====================
+   The real host answers a logged-out private-repo URL with a 404 that hides the
+   repo's existence, carrying an inline sign-in popover — not a login redirect. */
+function renderNotFound(errorText) {
+  document.title = `Page not found · ${BRAND}`;
+  app.innerHTML = `
+  <div class="nf">
+    <div class="nf__hero">
+      <div class="nf__404">404</div>
+      <div class="nf__bubble">This is not the web page you are looking for.</div>
+    </div>
+    <div class="signin-pop">
+      <h2>Sign in to ${BRAND}</h2>
+      <form onsubmit="event.preventDefault(); onSignIn();">
+        <label for="login_field">Username or email address</label>
+        <input type="text" name="login" id="login_field" autocapitalize="off" autocorrect="off" autocomplete="username" autofocus />
+        <div class="lblrow"><label for="password">Password</label><a href="javascript:void(0)">Forgot password?</a></div>
+        <input type="password" name="password" id="password" autocomplete="current-password" />
+        <p id="signinError" role="alert">${errorText || ""}</p>
+        <input type="submit" name="commit" value="Sign in" class="go" data-disable-with="Signing in&#8230;" />
+      </form>
+      <button class="linklike alt" onclick="onOtherMethods()">or continue with other methods</button>
+    </div>
+    <div class="nf__search">
+      <p>Find code, projects, and people on ${BRAND}:</p>
+      <div class="row"><input id="not-found-search" name="q" type="text" /><button>Search</button></div>
+    </div>
+    <div class="nf__foot">Contact Support &mdash; ${BRAND} Status</div>
+  </div>`;
+}
+
+function onOtherMethods() {
+  document.getElementById("signinError").textContent =
+    "Other sign-in methods are unavailable for this workspace. Use your username and password.";
+}
+
+function onSignIn() {
+  const u = (document.getElementById("login_field").value || "").trim();
+  const p = document.getElementById("password").value || "";
+  if (!DEMO_USERS.includes(u) || p !== DEMO_PASS) {
+    document.getElementById("signinError").textContent = BAD_CREDS;
+    return;
+  }
+  S.setItem("wh_authed", "1");
+  advancePastGates();
+}
+
+/* =====================  Two-factor: passkey first, then authenticator  ===================== */
+function tfaShell(subtitle, cardHtml) {
+  document.title = `Two-factor authentication · ${BRAND}`;
+  return `
+  <div class="tfa">
+    <div class="coin">&#128009;</div>
+    <h1>Two-factor authentication</h1>
+    <p class="sub">${subtitle}</p>
+    ${cardHtml}
+  </div>`;
+}
+
+function renderTfaPasskey() {
+  app.innerHTML = tfaShell("Authenticate using your passkey.", `
+    <div class="card">
+      <button class="primary" data-retry-message="Retry passkey" onclick="onPasskey()">Use passkey</button>
+      <p id="tfaError" role="alert"></p>
+      <button class="secondary" aria-expanded="false" aria-controls="two-factor-alternatives-body" onclick="onMoreOptions(this)">More options &#9662;</button>
+      <ul class="alts" id="two-factor-alternatives-body">
+        <li><button onclick="renderTfaTotp()">Authenticator app</button></li>
+        <li><button onclick="onAltUnavailable()">Recovery code</button></li>
+      </ul>
+    </div>`);
+}
+
+function onPasskey() {
+  document.getElementById("tfaError").textContent =
+    "This browser or device is reporting partial passkey support. Use another method below.";
+}
+
+function onMoreOptions(btn) {
+  const list = document.getElementById("two-factor-alternatives-body");
+  const open = list.classList.toggle("open");
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function onAltUnavailable() {
+  document.getElementById("tfaError").textContent = "That method is unavailable for this account.";
+}
+
+// Input contract from the saved capture: name=app_otp, id=app_totp, numeric six
+// digits or a 5-5 recovery code, XXXXXX placeholder, auto-verify at six digits.
+function renderTfaTotp(errorText) {
+  app.innerHTML = tfaShell("Enter the code from your two-factor authentication app or browser extension below.", `
+    <div class="card">
+      <form onsubmit="event.preventDefault(); onVerify();">
+        <label id="session-otp-input-label" class="sr-only" for="app_totp">Enter the verification code</label>
+        <input type="text" name="app_otp" id="app_totp" aria-labelledby="session-otp-input-label"
+               autocomplete="off" autofocus inputmode="numeric"
+               pattern="([0-9]{6})|([0-9a-fA-F]{5}-?[0-9a-fA-F]{5})" placeholder="XXXXXX"
+               oninput="if(/^[0-9]{6}$/.test(this.value)) onVerify();" />
+        <button class="primary" type="submit" data-disable-with="Verifying&#8230;">Verify</button>
+      </form>
+      <p id="tfaError" role="alert">${errorText || ""}</p>
+      <button class="secondary" aria-expanded="false" aria-controls="two-factor-alternatives-body" onclick="onMoreOptions(this)">More options &#9662;</button>
+      <ul class="alts" id="two-factor-alternatives-body">
+        <li><button onclick="renderTfaPasskey()">Passkey</button></li>
+        <li><button onclick="onAltUnavailable()">Recovery code</button></li>
+      </ul>
+    </div>`);
+}
+
+function onVerify() {
+  const code = (document.getElementById("app_totp").value || "").trim();
+  if (!/^([0-9]{6})|([0-9a-fA-F]{5}-?[0-9a-fA-F]{5})$/.test(code) || !/^[0-9]{6}$/.test(code)) {
+    renderTfaTotp("Two-factor authentication failed. Enter the six-digit code from your app.");
+    return;
+  }
+  S.setItem("wh_mfa_passed", "1");
+  advancePastGates();
+}
+
+/* =====================  Repo home  ===================== */
+function renderRepo() {
+  S.setItem("wh_view", "code");
+  document.title = `${ORG}/${REPO}: Automate browser based workflows with AI`;
+  const vis = IS_PRIVATE ? "Private" : "Public";
+  app.innerHTML = chrome("Code") + `
+  <div class="layout">
+    <div class="maincol">
+      <div class="repohead">
+        <h1>${REPO}</h1><span class="vis">${vis}</span>
+        <div class="actions">
+          <button class="pill">&#128065; Watch<span class="n">101</span></button>
+          <button class="pill">&#127860; Fork<span class="n">2.1k</span></button>
+          <button class="pill">&#11088; Star<span class="n">${IS_PRIVATE ? "3" : "22.6k"}</span></button>
+        </div>
+      </div>
+      <div class="files">
+        <div class="commitrow"><strong>pedrohsdb</strong> Render the copil&#8230; <span style="margin-left:auto">6,073 Commits</span></div>
+        ${FILES.map(f => `<div class="row"><span class="name">&#128193; ${f.name}</span><span class="msg">${f.msg}</span><span class="when">${f.when}</span></div>`).join("")}
+      </div>
+      <div class="readme">
+        <div class="readme__tabs">README</div>
+        <div class="readme__body">
+          <div class="dragon">&#128009;</div>
+          <h1>SKYVERN</h1>
+          <p class="tagline">&#128009; Automate Browser-based workflows using LLMs and Computer Vision &#128009;</p>
+          <p><a>Skyvern</a> automates browser-based workflows using LLMs and computer vision. It provides a
+          Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code
+          workflow builder to help both technical and non-technical users automate manual workflows on any
+          website, replacing brittle or unreliable automation solutions.</p>
+          <p>Traditional approaches to browser automations required writing custom scripts for websites,
+          often relying on DOM parsing and XPath-based interactions which would break whenever the website
+          layouts changed.</p>
+          <p>Instead of only relying on code-defined XPath interactions, Skyvern relies on Vision LLMs to
+          learn and interact with the websites.</p>
+          <h2>How it works</h2>
+          <p>Skyvern was inspired by the Task-Driven autonomous agent design popularized by BabyAGI and
+          AutoGPT &mdash; with one major bonus: we give Skyvern the ability to interact with websites using
+          browser automation libraries like Playwright.</p>
+          <p>Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions.</p>
+        </div>
+      </div>
+    </div>
+    <div class="sidecol about">
+      <h3>About</h3>
+      <p>${IS_PRIVATE ? "Cloud service layer for the Skyvern platform." : "Automate browser based workflows with AI"}</p>
+      <div class="tags">${["python","api","workflow","automation","browser","ai","playwright","llm"].map(t => `<span class="tag">${t}</span>`).join("")}</div>
+      <ul>
+        <li>&#128214; <strong>Readme</strong></li>
+        <li>&#9878; <strong>AGPL-3.0</strong> license</li>
+        <li>&#11088; <strong>${IS_PRIVATE ? "3" : "22.6k"}</strong> stars</li>
+        <li>&#128065; <strong>101</strong> watching</li>
+        <li>&#127860; <strong>2.1k</strong> forks</li>
+      </ul>
+    </div>
+  </div>`;
+}
+
+/* =====================  Pulse (Insights)  ===================== */
+function renderPulse() {
+  S.setItem("wh_view", "pulse");
+  document.title = `Pulse · ${ORG}/${REPO}`;
+  const p = PULSE[REPO];
+  const prTotal = p.merged + p.openPRs, isTotal = p.closed + p.newIssues;
+  const mergedPct = Math.round(100 * p.merged / prTotal), closedPct = Math.round(100 * p.closed / isTotal);
+  app.innerHTML = chrome("Insights") + `
+  <div class="layout"><div class="maincol pulse">
+    <div class="periodrow">
+      <h2 class="period">July 15, 2026 &ndash; July 22, 2026</h2>
+      <button class="periodbtn"><span class="k">Period:</span> 1 week &#9662;</button>
+    </div>
+    <div class="overview">
+      <h3>Overview</h3>
+      <div class="ovgrid">
+        <div class="ovcell">
+          <div class="bar">
+            <span role="progressbar" aria-label="Merged pull requests" aria-valuenow="${mergedPct}" style="width:${mergedPct}%;background:var(--done)"></span>
+            <span role="progressbar" aria-label="Open pull requests" aria-valuenow="${100 - mergedPct}" style="width:${100 - mergedPct}%;background:var(--green)"></span>
+          </div>
+          <span class="stat"><span class="n">${p.merged}</span><span class="k">Merged pull requests</span></span>
+          <span class="stat"><span class="n">${p.openPRs}</span><span class="k">Open pull requests</span></span>
+        </div>
+        <div class="ovcell">
+          <div class="bar">
+            <span role="progressbar" aria-label="Closed issues" aria-valuenow="${closedPct}" style="width:${closedPct}%;background:#f78166"></span>
+            <span role="progressbar" aria-label="New issues" aria-valuenow="${100 - closedPct}" style="width:${100 - closedPct}%;background:var(--green)"></span>
+          </div>
+          <span class="stat"><span class="n">${p.closed}</span><span class="k">Closed issues</span></span>
+          <span class="stat"><span class="n">${p.newIssues}</span><span class="k">New issues</span></span>
+        </div>
+      </div>
+      <div class="summary">
+        <span>Excluding merges, </span><strong>${p.authors} authors</strong><span> have pushed </span>
+        <strong>${p.main} commits</strong><span> to main and </span><strong>${p.all} commits</strong><span> to all branches.</span>
+      </div>
+      <div class="authors">${p.activePRs} Active pull requests &middot; ${p.activeIssues} Active issues</div>
+    </div>
+  </div></div>`;
+}
+
+advancePastGates();
+</script>
+</body>
+</html>

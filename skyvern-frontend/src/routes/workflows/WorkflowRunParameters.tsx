@@ -8,11 +8,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ProxyLocation } from "@/api/types";
 import { getInitialValues } from "./utils";
 import { isMaskedHeaders } from "@/util/secretHeaders";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
   const { workflowPermanentId } = useParams();
   const location = useLocation();
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
 
   const { data: workflow, isFetching } = useQuery<WorkflowApiResponse>({
     queryKey: ["workflow", workflowPermanentId],
@@ -87,12 +89,17 @@ function WorkflowRunParameters() {
           proxyLocation ?? workflow.proxy_location ?? ProxyLocation.Residential,
         webhookCallbackUrl:
           webhookCallbackUrl ?? workflow.webhook_callback_url ?? "",
+        reuseBrowserSession: workflow.reuse_browser_session ?? false,
         maxScreenshotScrolls:
           maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
         extraHttpHeaders:
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
-        browserProfileId:
-          browserProfileId ?? workflow.browser_profile_id ?? null,
+        // Under browser memory the run form's control is a one-run override that
+        // rests on Auto (the workflow's own profile is resolved server-side), so
+        // only carry an explicit per-run/rerun override — not the inherited default.
+        browserProfileId: browserMemoryEnabled
+          ? browserProfileId
+          : (browserProfileId ?? workflow.browser_profile_id ?? null),
         cdpConnectHeaders: cdpConnectHeaders ?? storedCdpConnectHeaders,
         cdpAddress: null,
         runWith,

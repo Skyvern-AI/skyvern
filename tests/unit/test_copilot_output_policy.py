@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
+import string
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -12,30 +14,26 @@ from agents import GuardrailFunctionOutput, OutputGuardrail, ToolInputGuardrailD
 from agents.run_context import RunContextWrapper
 from agents.tool_context import ToolContext
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.enforcement import (
-    PRESENT_COMPLETION_CONTRACT_ASK_RETRY,
-    _response_coverage_nudge,
+from skyvern.forge.sdk.copilot import output_policy as output_policy_module
+from skyvern.forge.sdk.copilot.author_time_block import (
+    AUTHOR_TIME_HARD_BLOCKS,
+    BANNED_BLOCKS_BLOCK_ID,
+    CODE_SAFETY_BLOCK_ID,
+    CREDENTIAL_SCOUT_BLOCK_ID,
+    AuthorTimeBlock,
 )
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
-from skyvern.forge.sdk.copilot.output_contracts import OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE
 from skyvern.forge.sdk.copilot.output_policy import (
-    ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
-    ACTUATION_OBLIGATION_STEER_REASON_CODE,
-    ACTUATION_OBLIGATION_UNMET_REASON_CODE,
-    ActuationObligationStatus,
-    CannotActReason,
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
     _contains_internal_tool_vocab_leak,
     _contains_yaml_authoring_vocab_leak,
+    demote_author_time_steer_reasons,
     derive_output_kind,
-    evaluate_actuation_obligation,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
     normalize_response_scaffolding,
@@ -45,8 +43,19 @@ from skyvern.forge.sdk.copilot.tools import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     NATIVE_TOOLS,
 )
-from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+
+# Assembled at runtime so the source never contains a token-shaped literal for secret scanners to flag.
+_FAKE_OPENAI_KEY = "sk-" + string.ascii_lowercase[:24]
+_FAKE_JWT = ".".join(
+    (
+        *(
+            base64.urlsafe_b64encode(json.dumps(part, separators=(",", ":")).encode()).decode().rstrip("=")
+            for part in ({"alg": "HS256"}, {"sub": "1234567890"})
+        ),
+        "x" * 20,
+    )
+)
 
 
 def _credential(credential_id: str = "cred_safe", tested_url: str = "https://login.example.test/login") -> object:
@@ -73,16 +82,11 @@ def _ctx(**overrides: object) -> CopilotContext:
     return CopilotContext(**defaults)
 
 
-def _browser_actuation_intent() -> TurnIntent:
-    return TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        required_context=[RequiredContextKey.BROWSER_STATE],
-        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
-    )
-
-
 def _live_fill_policy() -> RequestPolicy:
     return _policy(
+        authoring_intent="defer_authoring",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
         completion_criteria=[
             CompletionCriterion(
                 id="c0",
@@ -90,23 +94,15 @@ def _live_fill_policy() -> RequestPolicy:
                 kind="terminal_action",
                 terminal_action_family="form",
             )
-        ]
+        ],
     )
 
 
-def _unknown_browser_actuation_intent() -> TurnIntent:
-    return TurnIntent(
-        mode=TurnIntentMode.UNKNOWN,
-        required_context=[RequiredContextKey.BROWSER_STATE],
-        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
-    )
-
-
-def _browser_actuation_intent_without_browser_state(*, mode: TurnIntentMode) -> TurnIntent:
-    return TurnIntent(
-        mode=mode,
-        required_context=[],
-        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+def _defer_authoring_policy() -> RequestPolicy:
+    return _policy(
+        authoring_intent="defer_authoring",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
     )
 
 
@@ -257,19 +253,6 @@ def test_rejects_raw_secret_echo_in_user_response() -> None:
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
 
-def test_output_policy_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        user_response="I used password: hunter2 to test the login.",
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
-
-
 @pytest.mark.parametrize(
     ("response_type", "user_response", "expected_type", "expected_response"),
     [
@@ -410,35 +393,37 @@ def test_does_not_infer_arbitrary_prose_secret_echoes(user_response: str) -> Non
     assert verdict.allowed
 
 
-def test_rejects_raw_secret_in_workflow_yaml() -> None:
+def test_rejects_raw_secret_in_the_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(navigation_goal="Log in with password: hunter2."),
+        user_response="Log in with password: hunter2.",
     )
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
 
-def test_rejects_raw_secret_in_structured_tool_arguments() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        tool_arguments={"workflow_yaml": {"navigation_goal": "Type password: hunter2 into the field."}},
-    )
+def test_a_draft_carrying_the_same_value_is_not_a_disclosure_surface() -> None:
+    # Persistence scrubbing and credential rebinding own what reaches storage. Refusing the draft
+    # only refused the user their own workflow, and judged the YAML encoding rather than the value.
+    for draft_kwargs in (
+        {"workflow_yaml": _workflow_yaml(navigation_goal="Log in with password: hunter2.")},
+        {"tool_arguments": {"workflow_yaml": {"navigation_goal": "Type password: hunter2 into the field."}}},
+    ):
+        verdict = evaluate_output_policy(request_policy=_policy(), **draft_kwargs)
 
-    assert not verdict.allowed
-    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+        assert verdict.allowed, draft_kwargs
 
 
 class TestSanctionedSecretReferenceIdiom:
     """`password = parameters[...]` / attribute-chain reads are references to bound
-    values, not leaks — the code-only authoring idiom must pass the syntactic
-    backstop while literal values keep blocking."""
+    values, not leaks — quoting the code-only authoring idiom back to the user must pass the
+    syntactic backstop while literal values keep blocking."""
 
     def test_allows_parameters_subscript_assignment_in_tool_arguments(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  password = parameters["login_credential"]'},
+            user_response=('code: |\n  password = parameters["login_credential"]'),
         )
 
         assert verdict.allowed
@@ -446,7 +431,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_credential_attribute_read_in_workflow_yaml(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            workflow_yaml=(
+            user_response=(
                 "code: |\n"
                 "  username = login_credential.username\n"
                 "  password = login_credential.password\n"
@@ -459,7 +444,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_awaited_credential_otp_assignment_in_workflow_yaml(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            workflow_yaml=(
+            user_response=(
                 'code: |\n  passcode = await login_credentials.otp()\n  await page.locator("#code").fill(passcode)\n'
             ),
         )
@@ -469,7 +454,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_keyword_secret_reference_to_awaited_credential_otp_in_tool_arguments(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  token = await login_credential.otp()"},
+            user_response=("code: |\n  token = await login_credential.otp()"),
         )
 
         assert verdict.allowed
@@ -477,9 +462,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_rejects_literal_secret_even_when_same_line_has_credential_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={
-                "workflow_yaml": "code: |\n  password = 'hunter2'; password_ref = login_credential.password"
-            },
+            user_response="code: |\n  password = 'hunter2'; password_ref = login_credential.password",
         )
 
         assert not verdict.allowed
@@ -488,7 +471,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_str_wrapped_parameter_reference(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  token = str(parameters.get("api_token"))'},
+            user_response=('code: |\n  token = str(parameters.get("api_token"))'),
         )
 
         assert verdict.allowed
@@ -501,7 +484,7 @@ class TestSanctionedSecretReferenceIdiom:
         ):
             verdict = evaluate_output_policy(
                 request_policy=_policy(),
-                tool_arguments={"workflow_yaml": f"code: |\n  password = {rhs}"},
+                user_response=(f"code: |\n  password = {rhs}"),
             )
 
             assert not verdict.allowed, rhs
@@ -510,7 +493,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_awaited_non_credential_secret_source(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  passcode = await page.locator('#code').inner_text()"},
+            user_response=("code: |\n  passcode = await page.locator('#code').inner_text()"),
         )
 
         assert not verdict.allowed
@@ -519,7 +502,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_allows_keyword_argument_reference_with_closing_paren(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  await do_login(password=parameters["cred"])'},
+            user_response=('code: |\n  await do_login(password=parameters["cred"])'),
         )
 
         assert verdict.allowed
@@ -528,7 +511,7 @@ class TestSanctionedSecretReferenceIdiom:
         # A dotted literal (JWT-shaped) must not pass as an "attribute chain".
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  token = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"},
+            user_response=("code: |\n  token = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"),
         )
 
         assert not verdict.allowed
@@ -537,7 +520,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_dotted_literal_not_ending_in_credential_field(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "code: |\n  password = admin.password123"},
+            user_response=("code: |\n  password = admin.password123"),
         )
 
         assert not verdict.allowed
@@ -546,7 +529,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_quoted_literal_assignment(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": 'code: |\n  password = "hunter2"'},
+            user_response=('code: |\n  password = "hunter2"'),
         )
 
         assert not verdict.allowed
@@ -555,7 +538,94 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_bare_literal_assignment(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={"workflow_yaml": "password: hunter2"},
+            user_response=("password: hunter2"),
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_allows_lexical_token_parsed_out_of_page_text(self) -> None:
+        for rhs in (
+            "parts[0]",
+            "text.split(' logs found')[0]",
+            "m.group(1)",
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  first_token = {rhs}"),
+            )
+
+            assert verdict.allowed, rhs
+
+    def test_verdict_does_not_depend_on_how_the_yaml_escapes_the_code(self) -> None:
+        block_scalar = 'code: |\n  _entry = page.locator("#password")\n  count_token = evidence_text.split(" ")[0]\n'
+        escaped_scalar = (
+            'code: "_entry = page.locator(\\"#password\\")\\ncount_token = evidence_text.split(\\" \\")[0]"'
+        )
+
+        for workflow_yaml in (block_scalar, escaped_scalar):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(workflow_yaml),
+            )
+
+            assert verdict.allowed, workflow_yaml
+
+    def test_allows_a_newline_literal_the_block_scalar_keeps_as_code_data(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            user_response=('code: |\n  count_token = text.split("\\n")[0]\n'),
+        )
+
+        assert verdict.allowed
+
+    def test_a_value_shaped_secret_inside_a_call_argument_still_blocks(self) -> None:
+        # The lexical-token exemption clears only the keyword-assignment match; the value-shaped
+        # patterns scan the whole text independently, so hiding a real secret as a call argument
+        # does not ride out on the exemption.
+        for rhs in (
+            f'cache.get("{_FAKE_OPENAI_KEY}")',
+            f'store.lookup("{_FAKE_JWT}")',
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=f"code: |\n  token = {rhs}",
+            )
+
+            assert not verdict.allowed, rhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_literal_secret_under_a_lexical_token_name(self) -> None:
+        # The literal deliberately contains no secret keyword, so only the token arm can reject it.
+        for lhs in ("first_token", "result_token", "token"):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  {lhs} = 'ghp_abcdefghijklmnopqrstuvwxyz'"),
+            )
+
+            assert not verdict.allowed, lhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_a_literal_secret_wrapped_to_look_parsed(self) -> None:
+        for rhs in (
+            'identity("ghp_abcdefghijklmnopqrstuvwxyz")',
+            '("ghp_abcdefghijklmnopqrstuvwxyz", parts)[0]',
+            '["ghp_abcdefghijklmnopqrstuvwxyz"][0]',
+            '"ghp_abcdefghijklmnopqrstuvwxyz".strip()',
+            'str("ghp_abcdefghijklmnopqrstuvwxyz")',
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                user_response=(f"code: |\n  first_token = {rhs}"),
+            )
+
+            assert not verdict.allowed, rhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_page_read_into_an_unambiguous_secret_name(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            user_response=("code: |\n  password_token = await page.locator('#p').inner_text()"),
         )
 
         assert not verdict.allowed
@@ -564,9 +634,7 @@ class TestSanctionedSecretReferenceIdiom:
     def test_still_rejects_email_password_pair_next_to_reference_idiom(self) -> None:
         verdict = evaluate_output_policy(
             request_policy=_policy(),
-            tool_arguments={
-                "workflow_yaml": 'code: |\n  password = parameters["cred"]\nnotes: qa.user@example.test:FakePass123!'
-            },
+            user_response=('code: |\n  password = parameters["cred"]\nnotes: qa.user@example.test:FakePass123!'),
         )
 
         assert not verdict.allowed
@@ -581,12 +649,10 @@ class TestSanctionedSecretReferenceIdiom:
         assert _raw_secret_detected('password = parameters["cred"]')
 
 
-def test_rejects_bulk_colon_delimited_credentials_in_tool_arguments() -> None:
+def test_rejects_bulk_colon_delimited_credentials_in_the_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        tool_arguments={
-            "parameters": {"account_list": "alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"}
-        },
+        user_response="alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!",
     )
 
     assert not verdict.allowed
@@ -615,10 +681,10 @@ def test_does_not_hard_block_on_prior_global_context_secret() -> None:
     assert verdict.allowed
 
 
-def test_rejects_raw_secret_even_when_workflow_contains_jinja_placeholder() -> None:
+def test_rejects_raw_secret_in_a_reply_that_also_contains_a_jinja_placeholder() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
-        workflow_yaml="navigation_goal: Use {{ parameters.username }} and password: hunter2.",
+        user_response="Use {{ parameters.username }} and password: hunter2.",
     )
 
     assert not verdict.allowed
@@ -636,34 +702,18 @@ def test_allows_sensitive_jinja_placeholder_in_navigation_goal() -> None:
     assert verdict.allowed
 
 
-def test_rejects_reply_when_request_policy_required_clarification() -> None:
+def test_generic_request_policy_clarification_does_not_adjudicate_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
         response_type="REPLY",
-        user_response="I created the workflow with the credential.",
+        user_response="Here is the requested explanation.",
     )
 
-    assert not verdict.allowed
-    assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
+    assert verdict.allowed
+    assert verdict.reason_codes == []
 
 
-def test_request_policy_clarification_still_blocks_with_author_time_log_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    verdict = evaluate_output_policy(
-        request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
-        response_type="REPLY",
-        user_response="I created the workflow with the credential.",
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
-
-
-def test_avoidable_output_field_confirmation_is_hard_blocked() -> None:
+def test_output_field_confirmation_is_not_interactively_adjudicated() -> None:
     policy = _policy(
         user_response_policy="proceed",
         completion_contract_status="present",
@@ -681,8 +731,8 @@ def test_avoidable_output_field_confirmation_is_hard_blocked() -> None:
     )
     hard = hard_block_output_policy_verdict(verdict)
 
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
-    assert hard.reason_codes == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION]
+    assert verdict.allowed
+    assert hard.allowed
 
 
 def test_output_field_confirmation_allowed_when_request_policy_requires_clarification() -> None:
@@ -704,7 +754,6 @@ def test_output_field_confirmation_allowed_when_request_policy_requires_clarific
         workflow_attempted=False,
     )
 
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
     assert verdict.allowed is True
 
 
@@ -719,20 +768,7 @@ def test_url_clarification_does_not_trigger_output_field_confirmation_guard() ->
         workflow_attempted=False,
     )
 
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
-
-
-def test_classifies_unbacked_workflow_delivery_claim() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in verdict.reason_codes
-    assert OutputPolicyReason.MISSING_PROPOSAL_STATE in verdict.reason_codes
+    assert verdict.allowed
 
 
 def test_flags_block_yaml_pasted_into_user_response() -> None:
@@ -787,47 +823,6 @@ def test_allows_workflow_delivery_language_after_failed_workflow_attempt() -> No
         user_response="I created a draft workflow and tested it, but the test failed.",
         has_workflow_proposal=False,
         workflow_attempted=True,
-    )
-
-    assert verdict.allowed
-
-
-def test_classifies_missing_unvalidated_proposal_affordance() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="I drafted the workflow but did not finish testing.",
-        has_workflow_proposal=True,
-        unvalidated=True,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in verdict.reason_codes
-
-
-def test_rejects_incidental_accept_discard_language_for_unvalidated_proposal() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="I accept that the test failed, but I can't discard the login block without more info.",
-        has_workflow_proposal=True,
-        unvalidated=True,
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in verdict.reason_codes
-
-
-def test_allows_unvalidated_proposal_affordance_copy() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response=(
-            "Use Review to inspect it, Accept to save it, or Reject to discard it. "
-            "It has not been tested or verified end-to-end."
-        ),
-        has_workflow_proposal=True,
-        unvalidated=True,
     )
 
     assert verdict.allowed
@@ -938,13 +933,12 @@ def test_allows_single_task_block_reference_without_deprecated_identifier() -> N
 @pytest.mark.parametrize(
     "user_response",
     [
-        "TurnIntent classified this turn as `edit`, but we couldn't proceed. safe_reason_code=turn_intent_no_mutation_run_blocked.",
+        "RequestPolicy blocked this turn. safe_reason_code=request_policy_clarification.",
         "Skipping: safe_reason_code=request_policy_clarification this turn.",
-        "Blocked by `TurnIntent`: please rephrase.",
-        "Hit turn_intent_unresolved_edit_target while routing.",
+        "Blocked by `RequestPolicy`: please rephrase.",
         "RequestPolicy blocked this turn for clarification.",
-        "TurnIntent requires clarification before proceeding.",
-        "Trace shows safe_reason_code = turn_intent_no_mutation_run_blocked at exit.",
+        "RequestPolicy requires clarification before proceeding.",
+        "Trace shows safe_reason_code = request_policy_clarification at exit.",
         "Final safe_reason_code : request_policy_clarification reported.",
     ],
 )
@@ -982,9 +976,6 @@ def test_allows_benign_prose_referencing_classifier_terms(user_response: str) ->
     [
         "Saw [copilot:nudge] in the trace before the failure.",
         "[copilot:screenshot] context truncated to keep this prompt small.",
-        "LOOP DETECTED: same tool dispatched three times in a row.",
-        "Loop Detected: same tool dispatched three times in a row.",
-        "loop detected: same tool dispatched three times in a row.",
         "[Copilot:nudge] surfaced in the trace before the failure.",
         "[COPILOT:NUDGE] surfaced in the trace before the failure.",
         "Couldn't finish the diagnostic step on this nudge turn.",
@@ -1024,7 +1015,6 @@ def test_allows_benign_prose_referencing_tool_names(user_response: str) -> None:
     "user_response",
     [
         "Use `update_workflow` to apply that change.",
-        "LOOP DETECTED: same tool dispatched three times in a row.",
         "Couldn't finish the diagnostic step on this nudge turn.",
         "Saw [copilot:nudge] in the trace before the failure.",
         "Trace shows get_run_results was the last tool dispatched on this turn.",
@@ -1270,19 +1260,6 @@ def test_rejects_approved_credential_on_different_login_origin() -> None:
     assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
 
 
-def test_credential_scope_still_blocks_with_author_time_log_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_AUTHOR_TIME_GATE_LOG_ONLY", True)
-
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
 def test_rejects_approved_credential_on_templated_login_origin() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -1303,7 +1280,7 @@ def test_derive_output_kind_uses_state_over_response_type() -> None:
             workflow_attempted=True,
             unvalidated=False,
         )
-        == CopilotOutputKind.CLARIFICATION_REQUEST
+        == CopilotOutputKind.WORKFLOW_RUN_RESULT
     )
     assert (
         derive_output_kind(
@@ -1373,7 +1350,7 @@ def test_persistence_state_mismatch_is_a_hard_block() -> None:
 def test_output_policy_verdict_reason_codes_force_blocked_state() -> None:
     verdict = OutputPolicyVerdict(
         allowed=True,
-        reason_codes=[OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS],
+        reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK],
     )
 
     assert not verdict.allowed
@@ -1393,7 +1370,7 @@ def test_sdk_agent_guardrail_builders_use_policy_names() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sdk_request_policy_guardrail_trips_on_required_clarification() -> None:
+async def test_sdk_input_guardrail_trips_only_on_raw_secret_safety_block() -> None:
     from agents import GuardrailFunctionOutput, InputGuardrail
     from agents.run_context import RunContextWrapper
 
@@ -1402,7 +1379,13 @@ async def test_sdk_request_policy_guardrail_trips_on_required_clarification() ->
         SimpleNamespace(),
         "input",
         RunContextWrapper(
-            context=_ctx(request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False))
+            context=_ctx(
+                request_policy=_policy(
+                    user_response_policy="ask_clarification",
+                    raw_secret_detected=True,
+                    raw_secret_handling="block",
+                )
+            )
         ),
     )
 
@@ -1431,134 +1414,15 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     }
 
 
-def test_actuation_obligation_steers_zero_action_informational_reply() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=None,
-    )
-
-    assert evaluation.status == ActuationObligationStatus.STEER
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
+def test_actuation_adjudicator_symbols_are_deleted() -> None:
+    assert not hasattr(output_policy_module, "evaluate_actuation_obligation")
+    assert not hasattr(output_policy_module, "request_policy_requires_actuation")
+    assert not hasattr(output_policy_module, "actuation_obligation_key")
 
 
-def test_actuation_obligation_steers_unknown_browser_only_intent() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_unknown_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=None,
-    )
-
-    assert evaluation.status == ActuationObligationStatus.STEER
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
-
-
-def test_actuation_obligation_allows_typed_cannot_act_reason() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=CannotActReason.MISSING_FIELD_VALUE,
-        prior_turn_outcome=None,
-    )
-
-    assert evaluation.status == ActuationObligationStatus.ALLOWED
-    assert evaluation.cannot_act_reason == CannotActReason.MISSING_FIELD_VALUE
-
-
-def test_actuation_obligation_repeats_as_terminal() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=TurnOutcome(
-            response_kind=ResponseKind.CLARIFY,
-            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
-            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
-        ),
-    )
-
-    assert evaluation.status == ActuationObligationStatus.TERMINAL
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
-
-
-def test_actuation_obligation_prior_unmet_stays_terminal() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=TurnOutcome(
-            response_kind=ResponseKind.CLARIFY,
-            reason_code=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
-            terminal_reason=ACTUATION_OBLIGATION_UNMET_REASON_CODE,
-            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
-        ),
-    )
-
-    assert evaluation.status == ActuationObligationStatus.TERMINAL
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_UNMET_REASON_CODE
-
-
-def test_actuation_obligation_unrelated_prior_steer_stays_recoverable() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=TurnOutcome(
-            response_kind=ResponseKind.CLARIFY,
-            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
-            actuation_obligation_key="other",
-        ),
-    )
-
-    assert evaluation.status == ActuationObligationStatus.STEER
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
-
-
-@pytest.mark.parametrize("mode", [TurnIntentMode.DOCS_ANSWER, TurnIntentMode.DIAGNOSE])
-def test_actuation_obligation_allows_non_actuation_intents(mode: TurnIntentMode) -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=TurnIntent(mode=mode, authority=TurnIntentAuthority(may_update_workflow=False)),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=None,
-    )
-
-    assert evaluation.status == ActuationObligationStatus.ALLOWED
-
-
-def test_sdk_output_guardrail_steers_actuation_required_zero_action_reply() -> None:
-    evaluation = evaluate_actuation_obligation(
-        turn_intent=_browser_actuation_intent(),
-        response_type="REPLY",
-        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
-        successful_mutating_browser_actions=0,
-        cannot_act_reason=None,
-        prior_turn_outcome=None,
-    )
-
-    assert evaluation.status == ActuationObligationStatus.STEER
-    assert evaluation.reason_code == ACTUATION_OBLIGATION_STEER_REASON_CODE
-
-
-def test_sdk_output_guardrail_steers_actuation_required_reply() -> None:
+def test_sdk_output_guardrail_does_not_adjudicate_actuation_claim() -> None:
     ctx = _ctx(
-        turn_intent=_browser_actuation_intent(),
+        request_policy=_defer_authoring_policy(),
         tool_activity=[{"tool": "evaluate"}, {"tool": "get_browser_screenshot"}],
     )
 
@@ -1568,16 +1432,13 @@ def test_sdk_output_guardrail_steers_actuation_required_reply() -> None:
     )
 
     assert response_type == "REPLY"
-    assert not verdict.allowed
-    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
-    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
-    assert diagnostics["successful_mutating_browser_actions"] == 0
-    assert diagnostics.get("deferred_to_recycle", False) is False
+    assert verdict.allowed
+    assert "actuation_obligation_reason_code" not in diagnostics
 
 
 @pytest.mark.asyncio
-async def test_sdk_output_guardrail_trips_actuation_steer() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
+async def test_sdk_output_guardrail_does_not_trip_for_actuation_claim() -> None:
+    ctx = _ctx(request_policy=_defer_authoring_policy())
     output_guardrails = agent_module._build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
     result = await output_guardrails[0].run(
         RunContextWrapper(context=ctx),
@@ -1585,32 +1446,30 @@ async def test_sdk_output_guardrail_trips_actuation_steer() -> None:
         {"type": "REPLY", "user_response": "I can fill those fields for you."},
     )
 
-    assert result.output.tripwire_triggered is True
-    assert result.output.output_info["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
+    assert result.output.tripwire_triggered is False
+    assert "actuation_obligation_reason_code" not in result.output.output_info
 
 
-def test_sdk_output_guardrail_repeated_actuation_steer_terminalizes() -> None:
+def test_sdk_output_guardrail_does_not_terminalize_historical_actuation_trace() -> None:
     ctx = _ctx(
-        turn_intent=_browser_actuation_intent(),
+        request_policy=_defer_authoring_policy(),
         prior_turn_outcome=TurnOutcome(
             response_kind=ResponseKind.CLARIFY,
-            reason_code=ACTUATION_OBLIGATION_STEER_REASON_CODE,
-            actuation_obligation_key=ACTUATION_OBLIGATION_BROWSER_ACTION_KEY,
+            reason_code="actuation_obligation_steer",
+            actuation_obligation_key="browser_state:build:no_update:no_run",
         ),
     )
     output = {"type": "REPLY", "user_response": "I can fill those fields for you."}
 
     verdict, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, output)
 
-    assert not verdict.allowed
-    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_UNMET]
-    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.TERMINAL.value
-    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_UNMET_REASON_CODE
+    assert verdict.allowed
+    assert "actuation_obligation_status" not in diagnostics
 
 
-def test_sdk_output_guardrail_rejects_uncorroborated_model_typed_cannot_act_reason() -> None:
+def test_sdk_output_guardrail_ignores_model_typed_cannot_act_reason() -> None:
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        _ctx(turn_intent=_browser_actuation_intent()),
+        _ctx(request_policy=_defer_authoring_policy()),
         {
             "type": "REPLY",
             "user_response": "I need the field value before I can continue.",
@@ -1619,52 +1478,12 @@ def test_sdk_output_guardrail_rejects_uncorroborated_model_typed_cannot_act_reas
     )
 
     assert response_type == "REPLY"
-    assert not verdict.allowed
-    assert diagnostics["cannot_act_reason"] is None
-    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
-
-
-def test_sdk_output_guardrail_allows_structural_blocker_reason() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="missing_required_context",
-        agent_steering_text="Ask which field value to use.",
-        user_facing_reason="I need the field value before I can continue.",
-        recovery_hint="ask_user_clarifying",
-    )
-
-    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        ctx,
-        {"type": "REPLY", "user_response": "I need the field value before I can continue."},
-    )
-
-    assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics["cannot_act_reason"] == "missing_field_value"
+    assert "cannot_act_reason" not in diagnostics
 
 
-def test_sdk_output_guardrail_allows_explicit_structural_blocker_reason_code() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="Report the unavailable output source.",
-        user_facing_reason="The values are not observable on this page.",
-        recovery_hint="report_blocker_to_user",
-        internal_reason_code=OUTPUT_SOURCE_UNOBSERVABLE_REASON_CODE,
-    )
-
-    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        ctx,
-        {"type": "REPLY", "user_response": "The values are not observable on this page."},
-    )
-
-    assert response_type == "REPLY"
-    assert verdict.allowed
-    assert diagnostics["cannot_act_reason"] == "structural_blocker"
-
-
-def test_sdk_output_guardrail_rejects_generic_report_blocker_reason() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
+def test_sdk_output_guardrail_allows_generic_report_blocker_reason() -> None:
+    ctx = _ctx(request_policy=_defer_authoring_policy())
     ctx.blocker_signal = CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text="Report the blocker.",
@@ -1679,13 +1498,12 @@ def test_sdk_output_guardrail_rejects_generic_report_blocker_reason() -> None:
     )
 
     assert response_type == "REPLY"
-    assert not verdict.allowed
-    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
-    assert diagnostics["cannot_act_reason"] is None
+    assert verdict.allowed
+    assert "cannot_act_reason" not in diagnostics
 
 
 def test_sdk_output_guardrail_allows_successful_mutating_browser_action() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent())
+    ctx = _ctx(request_policy=_defer_authoring_policy())
     ctx.scout_trajectory.append({"tool_name": "click"})
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
@@ -1695,11 +1513,11 @@ def test_sdk_output_guardrail_allows_successful_mutating_browser_action() -> Non
 
     assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics["successful_mutating_browser_actions"] == 1
+    assert "successful_mutating_browser_actions" not in diagnostics
 
 
-def test_sdk_output_guardrail_rejects_form_fill_click_only_reply() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+def test_sdk_output_guardrail_does_not_grade_form_fill_click_only_reply() -> None:
+    ctx = _ctx(request_policy=_live_fill_policy())
     ctx.scout_trajectory.append({"tool_name": "click"})
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
@@ -1708,17 +1526,12 @@ def test_sdk_output_guardrail_rejects_form_fill_click_only_reply() -> None:
     )
 
     assert response_type == "REPLY"
-    assert not verdict.allowed
-    assert verdict.reason_codes == [OutputPolicyReason.ACTUATION_OBLIGATION_STEER]
-    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
-    assert diagnostics["successful_mutating_browser_actions"] == 1
-    assert diagnostics["successful_durable_browser_fills"] == 0
-    assert diagnostics["durable_fill_required"] is True
+    assert verdict.allowed
+    assert "actuation_obligation_reason_code" not in diagnostics
 
 
-def test_sdk_output_guardrail_requires_browser_state_for_form_fill_obligation() -> None:
+def test_classifier_browser_state_does_not_create_actuation_obligation() -> None:
     ctx = _ctx(
-        turn_intent=_browser_actuation_intent_without_browser_state(mode=TurnIntentMode.BUILD),
         request_policy=_live_fill_policy(),
     )
     ctx.scout_trajectory.append({"tool_name": "click"})
@@ -1730,14 +1543,11 @@ def test_sdk_output_guardrail_requires_browser_state_for_form_fill_obligation() 
 
     assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics.get("deferred_to_recycle", False) is False
     assert "durable_fill_required" not in diagnostics
 
 
 def test_sdk_output_guardrail_allows_non_form_click_reply() -> None:
-    ctx = _ctx(
-        turn_intent=_browser_actuation_intent_without_browser_state(mode=TurnIntentMode.UNKNOWN),
-    )
+    ctx = _ctx()
     ctx.scout_trajectory.append({"tool_name": "click"})
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
@@ -1747,12 +1557,11 @@ def test_sdk_output_guardrail_allows_non_form_click_reply() -> None:
 
     assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics.get("deferred_to_recycle", False) is False
     assert "durable_fill_required" not in diagnostics
 
 
 def test_sdk_output_guardrail_allows_live_fill_after_durable_fill() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+    ctx = _ctx(request_policy=_live_fill_policy())
     ctx.scout_trajectory.append({"tool_name": "type_text", "typed_length": 3})
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
@@ -1762,13 +1571,11 @@ def test_sdk_output_guardrail_allows_live_fill_after_durable_fill() -> None:
 
     assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics.get("deferred_to_recycle", False) is False
-    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.ALLOWED.value
-    assert diagnostics["successful_durable_browser_fills"] == 1
+    assert "actuation_obligation_status" not in diagnostics
 
 
-def test_sdk_output_guardrail_rejects_live_fill_after_noop_type_text() -> None:
-    ctx = _ctx(turn_intent=_browser_actuation_intent(), request_policy=_live_fill_policy())
+def test_sdk_output_guardrail_does_not_grade_noop_type_text() -> None:
+    ctx = _ctx(request_policy=_live_fill_policy())
     ctx.scout_trajectory.append({"tool_name": "type_text", "typed_length": 0, "typed_value": ""})
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
@@ -1777,21 +1584,19 @@ def test_sdk_output_guardrail_rejects_live_fill_after_noop_type_text() -> None:
     )
 
     assert response_type == "REPLY"
-    assert not verdict.allowed
-    assert diagnostics["actuation_obligation_reason_code"] == ACTUATION_OBLIGATION_STEER_REASON_CODE
-    assert diagnostics["successful_durable_browser_fills"] == 0
-    assert diagnostics["durable_fill_required"] is True
+    assert verdict.allowed
+    assert "actuation_obligation_reason_code" not in diagnostics
 
 
 def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker() -> None:
-    ctx = _ctx(turn_intent=_unknown_browser_actuation_intent())
+    ctx = _ctx(request_policy=_defer_authoring_policy())
     ctx.scout_trajectory.append({"tool_name": "click"})
     ctx.blocker_signal = CopilotToolBlockerSignal(
         blocker_kind="authority_denied",
         agent_steering_text="Use browser tools.",
         user_facing_reason="I'll respond with the information I already have.",
         recovery_hint="report_blocker_to_user",
-        internal_reason_code="turn_intent_no_mutation_run_blocked",
+        internal_reason_code="request_policy_blocks_update_workflow",
         blocked_tool="update_and_run_blocks",
         classifier_mode="unknown",
     )
@@ -1803,16 +1608,13 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
 
     assert response_type == "REPLY"
     assert verdict.allowed
-    assert diagnostics.get("deferred_to_recycle", False) is False
-    assert diagnostics["actuation_obligation_status"] == ActuationObligationStatus.ALLOWED.value
-    assert diagnostics["cannot_act_reason"] is None
-    assert diagnostics["successful_mutating_browser_actions"] == 1
+    assert "actuation_obligation_status" not in diagnostics
 
 
 @pytest.mark.parametrize(
     ("reason", "expected_terms"),
     [
-        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "credential id")),
         (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
@@ -1928,7 +1730,7 @@ workflow_definition:
 
     assert result.response_type == "ASK_QUESTION"
     assert "credential" in result.user_response.lower()
-    assert "confirm" in result.user_response.lower()
+    assert "credential id" in result.user_response.lower()
     assert "I could not safely return" not in result.user_response
 
 
@@ -1984,6 +1786,7 @@ def test_sdk_output_guardrail_defers_raw_question_after_untested_draft() -> None
         ),
     )
     ctx.allow_untested_workflow_draft = True
+    ctx.last_run_skipped_unbound_credentials = True
     ctx.last_workflow = object()
     ctx.last_update_block_count = 9
     ctx.last_workflow_yaml = """
@@ -2027,6 +1830,7 @@ def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() ->
         ),
     )
     ctx.allow_untested_workflow_draft = True
+    ctx.last_run_skipped_unbound_credentials = True
     ctx.last_workflow = object()
     ctx.last_update_block_count = 9
     ctx.workflow_persisted = True
@@ -2070,7 +1874,7 @@ workflow_definition:
 
 
 @pytest.mark.asyncio
-async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_secret() -> None:
+async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_admit_raw_secret() -> None:
     guarded_tools = {
         tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
     }
@@ -2082,7 +1886,7 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
     ctx.failed_tool_step_tracker = {"sentinel": 2}
 
-    rejected_yaml = """
+    raw_secret_yaml = """
 workflow_definition:
   blocks:
     - block_type: navigation
@@ -2095,16 +1899,18 @@ workflow_definition:
                 context=ctx,
                 tool_name="update_and_run_blocks",
                 tool_call_id="call-1",
-                tool_arguments=json.dumps({"workflow_yaml": rejected_yaml}),
+                tool_arguments=json.dumps({"workflow_yaml": raw_secret_yaml}),
             ),
             agent=SimpleNamespace(),
         )
     )
 
-    assert result.behavior["type"] == "reject_content"
-    assert "raw_secret_leak" in result.behavior["message"]
+    # A raw credential on an authoring argument is admitted here — the log and persistence seams own it —
+    # so the turn survives and no failed-tool boundary is recorded.
+    assert result.behavior["type"] == "allow"
     assert ctx.consecutive_tool_tracker == [
-        tool_step_identity("update_and_run_blocks", {"workflow_yaml": rejected_yaml})
+        tool_step_identity("update_workflow"),
+        tool_step_identity("update_workflow"),
     ]
     assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
@@ -2138,259 +1944,6 @@ workflow_definition:
 
     assert result.behavior["type"] == "allow"
     assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
-
-
-@pytest.mark.asyncio
-async def test_update_and_run_blocks_rejects_unobserved_page_before_workflow_update(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    workflow_yaml = """
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: goto_url
-      label: open_lookup
-      url: https://example.com/lookup
-    - block_type: navigation
-      label: search_lookup
-      navigation_goal: Enter the observed field and submit.
-"""
-    ctx = _ctx(
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
-    )
-
-    async def unexpected_prior_definition(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before reading prior workflow")
-
-    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before updating workflow")
-
-    sanitized_tool_names: list[str] = []
-
-    def fake_sanitize_tool_result_for_llm(tool_name: str, result: dict[str, object]) -> dict[str, object]:
-        sanitized_tool_names.append(tool_name)
-        return result
-
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", unexpected_prior_definition)
-    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
-    monkeypatch.setattr(tools_module, "sanitize_tool_result_for_llm", fake_sanitize_tool_result_for_llm)
-
-    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps(
-            {
-                "workflow_yaml": workflow_yaml,
-                "block_labels": ["search_lookup"],
-                "parameters": {},
-            }
-        ),
-    )
-
-    payload = json.loads(result)
-    assert payload["ok"] is False
-    assert "inspect_page_for_composition" in payload["error"]
-    assert "https://example.com/lookup" in payload["error"]
-    assert ctx.block_observation_refs == {}
-    assert sanitized_tool_names == ["update_and_run_blocks"]
-
-
-@pytest.mark.asyncio
-async def test_update_workflow_runs_composition_evidence_precheck_before_saving(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    workflow_yaml = """
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: goto_url
-      label: open_lookup
-      url: https://example.com/lookup
-    - block_type: navigation
-      label: search_lookup
-      navigation_goal: Enter the observed field and submit.
-    - block_type: action
-      label: expand_first_result
-      navigation_goal: Expand the first result row.
-"""
-    ctx = _ctx(
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
-        request_policy=RequestPolicy(),
-    )
-
-    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
-        raise AssertionError("composition evidence precheck must run before update_workflow saves")
-
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-
-    result = await tools_module.update_workflow_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_workflow"),
-        json.dumps({"workflow_yaml": workflow_yaml}),
-    )
-
-    payload = json.loads(result)
-    assert payload["ok"] is False
-    assert "page-dependent build blocks need observed page evidence" in payload["error"]
-    assert "https://example.com/lookup" in payload["error"]
-
-
-@pytest.mark.asyncio
-async def test_update_and_run_blocks_precheck_uses_proposed_block_observation_refs(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot import tools as tools_module
-
-    workflow_yaml = """
-workflow_definition:
-  parameters: []
-  blocks:
-    - block_type: goto_url
-      label: open_home
-      url: https://example.com/
-    - block_type: action
-      label: open_results
-      navigation_goal: Open the observed result list.
-    - block_type: extraction
-      label: read_results
-      data_extraction_goal: Read the visible result rows.
-"""
-    ctx = _ctx(
-        build_phase=BuildPhase.COMPOSING,
-        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
-        flow_evidence=[
-            {
-                "step": 0,
-                "reached_via": "navigate",
-                "url": "https://example.com/",
-                "had_bounded_schema": True,
-                "evidence": {
-                    "source_tool": "inspect_page_for_composition",
-                    "inspected_url": "https://example.com/",
-                    "current_url": "https://example.com/",
-                    "forms": [{"fields": [{"name": "q", "selector": "#q"}], "submit_controls": []}],
-                    "navigation_targets": [],
-                    "result_containers": [],
-                    "challenge_controls": [],
-                },
-            },
-            {
-                "step": 1,
-                "reached_via": "interaction",
-                "url": "https://example.com/results",
-                "had_bounded_schema": True,
-                "evidence": {
-                    "source_tool": "inspect_page_for_composition",
-                    "inspected_url": "https://example.com/results",
-                    "current_url": "https://example.com/results",
-                    "forms": [],
-                    "navigation_targets": [],
-                    "result_containers": [{"selector": "#results"}],
-                    "challenge_controls": [],
-                },
-            },
-        ],
-    )
-
-    captured: dict[str, object] = {}
-
-    async def fake_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
-        captured["payload"] = payload
-        workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "open_results"}]})
-        update_ctx.last_workflow = workflow
-        update_ctx.last_update_block_count = 2
-        return {"ok": True, "_workflow": workflow, "data": {"block_count": 2}}
-
-    async def fake_run_blocks(params: dict, run_ctx: CopilotContext, **kwargs: object) -> dict:
-        return {
-            "ok": True,
-            "data": {
-                "workflow_run_id": "wr-1",
-                "overall_status": "completed",
-                "blocks": [],
-            },
-        }
-
-    async def fake_prior_definition(update_ctx: CopilotContext) -> object:
-        return None
-
-    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
-    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
-    monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-    monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["open_results"], {}, "open_results"))
-    monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
-    monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
-    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
-
-    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
-        json.dumps(
-            {
-                "workflow_yaml": workflow_yaml,
-                "block_labels": ["open_results", "read_results"],
-                "block_observation_refs": [
-                    {"label": "open_results", "observation_step": 0},
-                    {"label": "read_results", "observation_step": 1},
-                ],
-                "code_artifact_metadata": _code_artifact_metadata(),
-                "parameters": {},
-            }
-        ),
-    )
-
-    assert json.loads(result)["ok"] is True
-    assert captured["payload"]["workflow_yaml"] == workflow_yaml
-    assert captured["payload"]["block_observation_refs"] == {
-        "open_results": 0,
-        "read_results": 1,
-    }
-    assert [ref.model_dump() for ref in captured["payload"]["raw_block_observation_refs"]] == [
-        {"label": "open_results", "observation_step": 0},
-        {"label": "read_results", "observation_step": 1},
-    ]
-    assert captured["payload"]["code_artifact_metadata"][0]["block_label"] == "open_results"
-    assert captured["payload"]["code_artifact_metadata"][0]["claimed_outcomes"][0]["id"] == "claim:open_results"
-    assert (
-        captured["payload"]["code_artifact_metadata"][0]["evidence_refs"][0]["evidence_ref"] == "evidence:result_link"
-    )
-    assert [
-        item.model_dump(mode="json", exclude_none=True) for item in captured["payload"]["raw_code_artifact_metadata"]
-    ] == captured["payload"]["code_artifact_metadata"]
-    assert ctx.block_observation_refs == {}
-
-
-@pytest.mark.asyncio
-async def test_update_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
-    from skyvern.forge.sdk.copilot.tools import _update_workflow
-
-    process_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
-
-    result = await _update_workflow(
-        {
-            "workflow_yaml": """
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: login
-      navigation_goal: Type password: hunter2 into the password field.
-"""
-        },
-        _ctx(),
-        allow_missing_credentials=True,
-    )
-
-    assert result["ok"] is False
-    assert "raw_secret_leak" in result["error"]
-    assert "<key>.password" in result["error"]
-    assert "do not split, concatenate, or obfuscate" in result["error"]
-    process_mock.assert_not_called()
 
 
 def test_inline_replace_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
@@ -2490,27 +2043,6 @@ def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:
     assert "workflow draft is still saved" in agent_result.user_response
 
 
-def test_timeout_exit_scrubs_recorded_late_block_running_leak_and_preserves_draft() -> None:
-    ctx = _ctx()
-    saved_workflow = object()
-    ctx.last_workflow = saved_workflow
-    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
-    ctx.last_update_block_count = 5
-    ctx.last_test_ok = False
-    ctx.last_test_failure_reason = (
-        "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
-        "Do NOT retry block-running tools."
-    )
-
-    agent_result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
-
-    assert agent_result.updated_workflow is saved_workflow
-    assert agent_result.clear_proposed_workflow is False
-    assert agent_result.proposal_disposition == "review_untested"
-    assert "Do NOT retry" not in agent_result.user_response
-    assert "draft workflow proposal" in agent_result.user_response
-
-
 def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
     result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
 
@@ -2592,8 +2124,8 @@ def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
 
 def test_translate_to_agent_result_rewrites_internal_classifier_vocab_leak() -> None:
     leak = (
-        "TurnIntent classified this turn as `edit`, so the request couldn't continue. "
-        "safe_reason_code=turn_intent_no_mutation_run_blocked."
+        "RequestPolicy blocked this turn, so the request couldn't continue. "
+        "safe_reason_code=request_policy_clarification."
     )
     result = _fake_run_result({"type": "REPLY", "user_response": leak})
 
@@ -2607,7 +2139,7 @@ def test_translate_to_agent_result_rewrites_internal_classifier_vocab_leak() -> 
         )
     )
 
-    assert "TurnIntent" not in agent_result.user_response
+    assert "RequestPolicy" not in agent_result.user_response
     assert "safe_reason_code" not in agent_result.user_response
     assert "Tell me what you'd like to do next" in agent_result.user_response
     diagnostics = agent_result.output_policy_diagnostics or {}
@@ -2698,7 +2230,7 @@ def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> 
 
 
 def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:
-    classifier_leak = "TurnIntent classified this turn as edit, safe_reason_code=turn_intent_no_mutation_run_blocked."
+    classifier_leak = "RequestPolicy blocked this turn, safe_reason_code=request_policy_clarification."
     self_prescriptive_leak = "Please send 'continue debugging' next and I'll keep going."
     tool_name_leak = "Use `get_run_results` to fetch the prior run output."
 
@@ -2714,7 +2246,7 @@ def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:
 
 
 def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None:
-    classifier_leak = "TurnIntent classified this turn as edit, safe_reason_code=turn_intent_no_mutation_run_blocked."
+    classifier_leak = "RequestPolicy blocked this turn, safe_reason_code=request_policy_clarification."
     self_prescriptive_leak = "Please send 'continue debugging' next and I'll keep going."
     tool_name_leak = "Use `get_run_results` to fetch the prior run output."
 
@@ -2743,7 +2275,6 @@ def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None
 @pytest.mark.parametrize(
     "user_response,expected",
     [
-        ("LOOP DETECTED: same tool dispatched three times in a row.", True),
         ("Saw [copilot:nudge] in the trace before the failure.", True),
         ("Couldn't finish the diagnostic step on this nudge turn.", True),
         ("nudge-turn was cleared before the next iteration.", True),
@@ -2894,25 +2425,6 @@ def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() 
     assert agent_result.updated_workflow is workflow
 
 
-def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:
-    workflow = SimpleNamespace(name="draft")
-    result = _fake_run_result({"type": "REPLY", "user_response": "I drafted the workflow."})
-
-    agent_result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            result,
-            _ctx(last_workflow=workflow, last_workflow_yaml="title: draft", last_test_ok=None),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
-        )
-    )
-
-    assert agent_result.updated_workflow is workflow
-    assert "Accept to save" in agent_result.user_response
-    assert "Reject to discard" in agent_result.user_response
-
-
 def _two_credential_workflow_yaml() -> str:
     return """
 workflow_definition:
@@ -3056,7 +2568,7 @@ def _present_contract_confirmation_policy() -> RequestPolicy:
     )
 
 
-def test_genuine_attempt_true_suppresses_avoidable_backstop() -> None:
+def test_genuine_attempt_output_schema_ask_is_allowed() -> None:
     verdict = evaluate_output_policy(
         request_policy=_present_contract_confirmation_policy(),
         response_type="ASK_QUESTION",
@@ -3065,19 +2577,7 @@ def test_genuine_attempt_true_suppresses_avoidable_backstop() -> None:
         workflow_attempted=True,
     )
 
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION not in verdict.reason_codes
-
-
-def test_genuine_attempt_true_suppresses_unbacked_delivery_claim() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-        workflow_attempted=True,
-    )
-
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM not in verdict.reason_codes
+    assert verdict.allowed
 
 
 class _CaptureSentinel(Exception):
@@ -3118,23 +2618,6 @@ def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkey
     assert captured["evaluate"] == ctx.has_genuine_workflow_attempt()
 
 
-def test_watchdog_run_id_only_counts_as_genuine_and_suppresses_unbacked() -> None:
-    ctx = _run_id_only_ctx()
-    legacy_two_field_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
-    assert legacy_two_field_attempted is False
-    assert ctx.has_genuine_workflow_attempt() is True
-
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        response_type="REPLY",
-        user_response="Here's the workflow.",
-        has_workflow_proposal=False,
-        workflow_attempted=ctx.has_genuine_workflow_attempt(),
-    )
-
-    assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM not in verdict.reason_codes
-
-
 def test_agent_no_longer_derives_workflow_attempted_from_two_marker_fields() -> None:
     source = inspect.getsource(agent_module)
     assert "last_update_block_count is not None or ctx.last_test_ok is not None" not in source
@@ -3145,17 +2628,6 @@ _AVOIDABLE_ASK = {
     "type": "ASK_QUESTION",
     "user_response": "Please confirm the output fields before I build this workflow.",
 }
-
-
-def _recoverable_authoring_intent(*, may_update_workflow: bool = True) -> TurnIntent:
-    return TurnIntent(
-        mode=TurnIntentMode.BUILD,
-        authority=TurnIntentAuthority(
-            may_update_workflow=may_update_workflow,
-            may_run_blocks=may_update_workflow,
-            requires_user_input=False,
-        ),
-    )
 
 
 def _present_contract_ask_policy(**overrides: object) -> RequestPolicy:
@@ -3174,34 +2646,27 @@ def _present_contract_ask_policy(**overrides: object) -> RequestPolicy:
 def _recoverable_ask_ctx(
     *,
     policy: RequestPolicy | None = None,
-    turn_intent: TurnIntent | None = None,
     **marker: object,
 ) -> CopilotContext:
-    ctx = _ctx(
-        request_policy=policy or _present_contract_ask_policy(),
-        turn_intent=turn_intent or _recoverable_authoring_intent(),
-    )
+    ctx = _ctx(request_policy=policy or _present_contract_ask_policy())
     for name, value in marker.items():
         setattr(ctx, name, value)
     return ctx
 
 
-def test_seam_ordering_avoidable_ask_defers_then_recycle_fires() -> None:
+def test_ask_passes_without_output_policy_deferral_or_recycle() -> None:
     ctx = _recoverable_ask_ctx()
 
     verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, _AVOIDABLE_ASK)
 
     assert response_type == "ASK_QUESTION"
     assert verdict.allowed is True
-    assert diagnostics["deferred_to_recycle"] is True
-    assert diagnostics["deferred_reason_codes"] == [OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION.value]
+    assert diagnostics.get("deferred_to_recycle", False) is False
     assert diagnostics["final_output_policy_allowed"] is True
-
-    assert _response_coverage_nudge(ctx, _AVOIDABLE_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
 
 
 @pytest.mark.asyncio
-async def test_sdk_output_guardrail_defers_avoidable_ask_without_tripwire() -> None:
+async def test_sdk_output_guardrail_allows_output_schema_ask_without_tripwire() -> None:
     output_guardrails = agent_module._build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
     result = await output_guardrails[0].run(
         RunContextWrapper(context=_recoverable_ask_ctx()),
@@ -3210,11 +2675,11 @@ async def test_sdk_output_guardrail_defers_avoidable_ask_without_tripwire() -> N
     )
 
     assert result.output.tripwire_triggered is False
-    assert result.output.output_info["deferred_to_recycle"] is True
+    assert result.output.output_info.get("deferred_to_recycle", False) is False
 
 
 @pytest.mark.parametrize(
-    ("policy_overrides", "marker", "may_author", "expected_admit"),
+    ("policy_overrides", "marker", "policy_may_author", "_expected_admit"),
     [
         pytest.param({}, {}, True, True, id="recoverable_admits"),
         pytest.param({}, {"test_after_update_done": True}, True, True, id="scout_only_admits"),
@@ -3227,71 +2692,53 @@ async def test_sdk_output_guardrail_defers_avoidable_ask_without_tripwire() -> N
         pytest.param({}, {}, False, False, id="non_authoring"),
     ],
 )
-def test_avoidable_deferral_iff_recycle_admits(
+def test_output_schema_ask_never_enters_deleted_recycle_plane(
     policy_overrides: dict[str, object],
     marker: dict[str, object],
-    may_author: bool,
-    expected_admit: bool,
+    policy_may_author: bool,
+    _expected_admit: bool,
 ) -> None:
+    policy = _present_contract_ask_policy(**policy_overrides)
+    policy.allow_update_workflow = policy_may_author
+    policy.allow_run_blocks = policy_may_author
     ctx = _recoverable_ask_ctx(
-        policy=_present_contract_ask_policy(**policy_overrides),
-        turn_intent=_recoverable_authoring_intent(may_update_workflow=may_author),
+        policy=policy,
         **marker,
     )
 
-    recycle_admits = _response_coverage_nudge(ctx, _AVOIDABLE_ASK) == PRESENT_COMPLETION_CONTRACT_ASK_RETRY
-    assert recycle_admits is expected_admit
-
     _, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, _AVOIDABLE_ASK)
-    assert diagnostics.get("deferred_to_recycle", False) is recycle_admits
+    assert diagnostics.get("deferred_to_recycle", False) is False
 
 
 @pytest.mark.parametrize(
-    ("policy_overrides", "may_author"),
+    ("policy_overrides", "policy_may_author"),
     [
         pytest.param({"clarification_reason": "credential_name_unresolved"}, True, id="clarification_reason"),
         pytest.param({}, False, id="non_authoring"),
     ],
 )
-def test_backstop_trips_as_failsafe_when_recycle_does_not_admit(
+def test_deleted_backstop_does_not_block_output_schema_ask(
     policy_overrides: dict[str, object],
-    may_author: bool,
+    policy_may_author: bool,
 ) -> None:
+    policy = _present_contract_ask_policy(**policy_overrides)
+    policy.allow_update_workflow = policy_may_author
+    policy.allow_run_blocks = policy_may_author
     ctx = _recoverable_ask_ctx(
-        policy=_present_contract_ask_policy(**policy_overrides),
-        turn_intent=_recoverable_authoring_intent(may_update_workflow=may_author),
+        policy=policy,
     )
 
     verdict, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, _AVOIDABLE_ASK)
 
-    assert verdict.allowed is False
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
+    assert verdict.allowed is True
     assert diagnostics.get("deferred_to_recycle", False) is False
 
 
-def test_defer_avoidable_ask_requires_ask_shape_and_sole_avoidable_code() -> None:
-    ctx = _recoverable_ask_ctx()
-    avoidable = OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION
-
-    assert agent_module._defer_avoidable_ask_to_recycle(
-        ctx, OutputPolicyVerdict(reason_codes=[avoidable]), "ASK_QUESTION"
-    ) == [avoidable]
-
-    mixed = OutputPolicyVerdict(reason_codes=[avoidable, OutputPolicyReason.RAW_SECRET_LEAK])
-    assert agent_module._defer_avoidable_ask_to_recycle(ctx, mixed, "ASK_QUESTION") is None
-
-    assert (
-        agent_module._defer_avoidable_ask_to_recycle(ctx, OutputPolicyVerdict(reason_codes=[avoidable]), "REPLY")
-        is None
-    )
-
-    wrong = OutputPolicyVerdict(reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH])
-    assert agent_module._defer_avoidable_ask_to_recycle(ctx, wrong, "ASK_QUESTION") is None
-
-    assert agent_module._defer_avoidable_ask_to_recycle(ctx, OutputPolicyVerdict(), "ASK_QUESTION") is None
+def test_avoidable_ask_recycle_helper_is_deleted() -> None:
+    assert not hasattr(agent_module, "_defer_avoidable_ask_to_recycle")
 
 
-def test_avoidable_ask_with_co_firing_secret_leak_is_not_deferred() -> None:
+def test_output_schema_ask_with_secret_leak_keeps_only_the_safety_block() -> None:
     ctx = _recoverable_ask_ctx()
     ask = {
         "type": "ASK_QUESTION",
@@ -3303,6 +2750,131 @@ def test_avoidable_ask_with_co_firing_secret_leak_is_not_deferred() -> None:
     verdict, _, diagnostics = agent_module._evaluate_copilot_final_output_policy(ctx, ask)
 
     assert verdict.allowed is False
-    assert OutputPolicyReason.AVOIDABLE_OUTPUT_FIELD_CONFIRMATION in verdict.reason_codes
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
     assert diagnostics.get("deferred_to_recycle", False) is False
+
+
+_AUTHOR_TIME_KEEP_HARD_REASONS = frozenset(
+    {
+        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
+        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+    }
+)
+
+# Reads as "does not refuse", not "reaches data['findings']". Only schema_incompatibility,
+# code_artifact_metadata_incomplete and synthesized_code_block_not_imposed populate that bucket;
+# demoted OutputPolicyReason members land in the guardrail's steered_reason_codes log line.
+_FINDING = "finding"
+
+# Enumerated by hand on purpose: deriving it from the enum would auto-classify a new refusal
+# source and defeat the ratchet. See architecture/output-policy-disposition.md.
+_AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
+    "code_safety": CODE_SAFETY_BLOCK_ID,
+    "credential_scout": CREDENTIAL_SCOUT_BLOCK_ID,
+    "banned_blocks": BANNED_BLOCKS_BLOCK_ID,
+    "raw_secret_leak": _FINDING,
+    "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
+    "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
+    "unbacked_workflow_delivery_claim": _FINDING,
+    "missing_proposal_state": _FINDING,
+    "persistence_state_mismatch": _FINDING,
+    "internal_tool_instruction_leak": _FINDING,
+    "output_policy_context_missing": _FINDING,
+    "internal_block_taxonomy_leak": _FINDING,
+    "internal_classifier_vocab_leak": _FINDING,
+    "self_prescriptive_phrase_leak": _FINDING,
+    "workflow_yaml_in_reply": _FINDING,
+}
+
+
+def test_every_authoring_seam_refusal_source_is_classified() -> None:
+    """An unclassified refusal source fails here rather than becoming a wall in production."""
+    sources = {reason.value for reason in OutputPolicyReason} | set(AUTHOR_TIME_HARD_BLOCKS)
+
+    assert sources == set(_AUTHORING_SEAM_REFUSAL_SOURCES)
+    for source, disposition in _AUTHORING_SEAM_REFUSAL_SOURCES.items():
+        assert disposition in AUTHOR_TIME_HARD_BLOCKS or disposition == _FINDING, source
+
+
+@pytest.mark.parametrize("source", sorted(_AUTHORING_SEAM_REFUSAL_SOURCES))
+def test_only_a_hard_block_identity_can_refuse(source: str) -> None:
+    disposition = _AUTHORING_SEAM_REFUSAL_SOURCES[source]
+    if disposition == _FINDING:
+        with pytest.raises(ValueError):
+            AuthorTimeBlock(block_id=source, error="steer")
+        return
+    assert AuthorTimeBlock(block_id=disposition, error="refuse").block_id in AUTHOR_TIME_HARD_BLOCKS
+
+
+@pytest.mark.parametrize("reason", list(OutputPolicyReason))
+def test_tool_input_disposition_matches_classification_table(reason: OutputPolicyReason) -> None:
+    """Pins every reason code to its reviewed verdict in
+    cloud_docs/workflow-copilot/architecture/output-policy-disposition.md."""
+    verdict = OutputPolicyVerdict(reason_codes=[reason])
+    steered = demote_author_time_steer_reasons(verdict)
+
+    if reason in _AUTHOR_TIME_KEEP_HARD_REASONS:
+        assert verdict.allowed is False
+        assert verdict.reason_codes == [reason]
+        assert steered == []
+    else:
+        assert verdict.allowed is True
+        assert verdict.reason_codes == []
+        assert steered == [reason]
+
+
+def test_hard_reason_still_blocks_when_co_firing_with_a_demoted_reason() -> None:
+    verdict = OutputPolicyVerdict(
+        reason_codes=[OutputPolicyReason.WORKFLOW_YAML_IN_REPLY, OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
+    )
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert verdict.allowed is False
+    assert verdict.reason_codes == [OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
+    assert steered == [OutputPolicyReason.WORKFLOW_YAML_IN_REPLY]
+
+
+def test_demoting_every_reason_leaves_the_authoring_call_allowed() -> None:
+    demoted = [reason for reason in OutputPolicyReason if reason not in _AUTHOR_TIME_KEEP_HARD_REASONS]
+    verdict = OutputPolicyVerdict(reason_codes=list(demoted))
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert verdict.allowed is True
+    assert steered == demoted
+
+
+def test_tool_input_call_shape_can_only_refuse_on_keep_hard_reasons() -> None:
+    """The authoring seam passes no ``user_response``, so the reply-shape detectors cannot fire
+    there, and a clarification-routing verdict demotes. Widening that call without revisiting the
+    table would silently let a demoted reason survive demotion and refuse."""
+    leaky = (
+        "Call get_run_results now. RequestPolicy blocked this turn. "
+        "Send me a normal instruction like 'continue' next. "
+        "Use the navigation block, extraction block, and validation block. "
+        "I have delivered the workflow. It is not tested; accept to save or reject."
+    )
+    for request_policy in (None, RequestPolicy(), RequestPolicy(user_response_policy="ask_clarification")):
+        verdict = evaluate_output_policy(
+            request_policy=request_policy,
+            workflow_yaml=leaky,
+            tool_arguments={"workflow_yaml": leaky, "user_response": leaky},
+        )
+        demote_author_time_steer_reasons(verdict)
+
+        assert set(verdict.reason_codes) <= _AUTHOR_TIME_KEEP_HARD_REASONS
+
+
+def test_generic_clarification_policy_does_not_create_an_authoring_verdict() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=RequestPolicy(user_response_policy="ask_clarification"),
+        workflow_yaml="title: Registry lookup\n",
+        tool_arguments={"workflow_yaml": "title: Registry lookup\n"},
+    )
+    assert verdict.reason_codes == []
+
+    steered = demote_author_time_steer_reasons(verdict)
+
+    assert steered == []
+    assert verdict.allowed is True

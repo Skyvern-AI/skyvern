@@ -88,6 +88,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
@@ -226,6 +234,36 @@ const proposalResponse = (
     proposal_disposition: "review_untested",
     turn_id: "turn-1",
     narrative_payload: proposalNarrativePayload(),
+    ...overrides,
+  }) as WorkflowCopilotStreamResponseUpdate;
+
+// The v1 (Ask-mode) backend streams no narrative frames at all: no turn_start,
+// and a terminal frame carrying only the schema defaults for turn_id and
+// narrative_payload. It never stamps _copilot_unvalidated either, so its
+// proposal reads Tested.
+const legacyProposalResponse = (
+  message: string,
+  overrides: Partial<WorkflowCopilotStreamResponseUpdate> &
+    Record<string, unknown> = {},
+): WorkflowCopilotStreamResponseUpdate =>
+  ({
+    type: "response",
+    workflow_copilot_chat_id: "chat-1",
+    message,
+    updated_workflow: {
+      workflow_id: "wf_proposed",
+      title: "Draft workflow",
+    },
+    response_time: "2026-07-09T00:00:05Z",
+    total_tokens: null,
+    response_type: "REPLY",
+    proposal_disposition: "auto_applicable",
+    workflow_applied: false,
+    cancelled: false,
+    output_policy_diagnostics: null,
+    turn_id: null,
+    narrative_summary: null,
+    narrative_payload: null,
     ...overrides,
   }) as WorkflowCopilotStreamResponseUpdate;
 
@@ -391,7 +429,7 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
     expect(screen.queryByText("1 proposal pending · Review")).toBeNull();
   });
 
-  it("clears a stale bypassed gate when a later turn auto-applies (stale Accept can't reapply over the newer canvas)", async () => {
+  it("clears a stale pending gate when a later turn is auto-applied (stale Accept can't reapply over the newer canvas)", async () => {
     flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
     await renderChat();
 
@@ -403,7 +441,7 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
     });
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
 
-    // Bypass: this follow-up comes back auto-applied instead of another gate.
+    // Always-accept echo: this follow-up comes back auto-applied instead of another gate.
     await submit("actually just fix the typo directly");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(streamCalls[1]!.body.keep_pending_proposal).toBe(true);
@@ -430,6 +468,25 @@ describe("WorkflowCopilotChat — g2 review gate (flag-on, SKY-12136)", () => {
       expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
     );
     expect(screen.queryByText("1 proposal pending · Review")).toBeNull();
+  });
+
+  it("shows the gate live on a narrative-less turn, not only after a reload (SKY-14099)", async () => {
+    flagMap.current = { [COPILOT_UX_V1_FLAG]: true };
+    await renderChat();
+
+    await submit("rename the blocks.");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(legacyProposalResponse("Renamed the blocks."));
+      streamCalls[0]!.resolve();
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy(),
+    );
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(screen.getByText("Proposed changes")).toBeTruthy();
+    expect(screen.queryByText("Tested")).toBeNull();
   });
 
   it("clears the proposal and shows a discarded receipt on a late Reject", async () => {

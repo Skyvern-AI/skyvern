@@ -9,7 +9,6 @@ const turn = (
   ...EMPTY_NARRATIVE,
   turnId: "turn-1",
   turnIndex: 0,
-  mode: "diagnose",
   terminal: "response",
   ...overrides,
 });

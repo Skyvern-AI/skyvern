@@ -34,6 +34,7 @@ from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.self_heal import SelfHealRepository
 from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.db.repositories.uploaded_files import UploadedFilesRepository
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.repositories.workflow_run_credential_selections import (
     WorkflowRunCredentialSelectionsRepository,
@@ -368,10 +369,20 @@ class AgentDB(BaseAlchemyDB):
         self._sqlite_schedule_lock: asyncio.Lock | None = (
             asyncio.Lock() if self.engine.dialect.name == "sqlite" else None
         )
+        # ponytail: Embedded SQLite is single-user; use keyed locks if concurrent local creates become material.
+        self._sqlite_workflow_creation_lock: asyncio.Lock | None = (
+            asyncio.Lock() if self.engine.dialect.name == "sqlite" else None
+        )
 
         # -- Zero-dependency repositories --
         self.tasks = TasksRepository(self.Session, debug_enabled, self.is_retryable_error)
-        self.workflows = WorkflowsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.workflows = WorkflowsRepository(
+            self.Session,
+            debug_enabled,
+            self.is_retryable_error,
+            db_engine=self.engine,
+            sqlite_workflow_creation_lock=self._sqlite_workflow_creation_lock,
+        )
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_run_credential_selections = WorkflowRunCredentialSelectionsRepository(
             self.Session, debug_enabled, self.is_retryable_error
@@ -385,6 +396,7 @@ class AgentDB(BaseAlchemyDB):
         self.self_heal = SelfHealRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.tags = TagsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(

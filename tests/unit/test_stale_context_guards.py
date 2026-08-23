@@ -6,17 +6,19 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.exceptions import MissingElement
+from skyvern.exceptions import MissingElement, MissingElementDict, MultipleElementsFound
 from skyvern.webeye.utils.dom import SkyvernElement, is_element_detached_error, resolve_locator
 
 _DETACHED_ERROR = "ElementHandle.content_frame: Element is not attached to the DOM"
 _FRAME_DETACHED_ERROR = "Locator.count: Frame was detached"
+_FRAME_HAS_BEEN_DETACHED_ERROR = "Frame.frame_element: Frame has been detached."
 _TYPE_TIMEOUT_ERROR = "Locator.type: Timeout 10000ms exceeded."
 
 
 def test_predicate_matches_detached_errors() -> None:
     assert is_element_detached_error(PlaywrightError(_DETACHED_ERROR)) is True
     assert is_element_detached_error(PlaywrightError(_FRAME_DETACHED_ERROR)) is True
+    assert is_element_detached_error(PlaywrightError(_FRAME_HAS_BEEN_DETACHED_ERROR)) is True
     assert is_element_detached_error(PlaywrightTimeoutError(_TYPE_TIMEOUT_ERROR)) is False
 
 
@@ -102,7 +104,43 @@ async def test_input_sequentially_reresolves_stale_locator_by_xpath(monkeypatch:
 
     frame.locator.assert_called_once_with("xpath=//form/input")
     assert element.get_locator() is fresh_locator
+    assert typed_with.await_args is not None
     assert typed_with.await_args.args[0] is fresh_locator
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_reresolves_ambiguous_locator_by_xpath(monkeypatch: pytest.MonkeyPatch) -> None:
+    fresh_locator = _locator_with_counts(1)
+    frame = MagicMock()
+    frame.locator.return_value = fresh_locator
+    element = _make_element(_locator_with_counts(16), frame=frame, xpath="//div/pre[3]")
+
+    typed_with = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.input_sequentially", typed_with)
+    await element.input_sequentially("hello")
+
+    frame.locator.assert_called_once_with("xpath=//div/pre[3]")
+    assert element.get_locator() is fresh_locator
+    assert typed_with.await_args is not None
+    assert typed_with.await_args.args[0] is fresh_locator
+
+
+@pytest.mark.asyncio
+async def test_input_sequentially_rejects_ambiguous_locator_without_unique_xpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ambiguous_locator = _locator_with_counts(16)
+    frame = MagicMock()
+    frame.locator.return_value = _locator_with_counts(2)
+    element = _make_element(ambiguous_locator, frame=frame, xpath="//div/pre")
+
+    typed_with = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.actions.handler_utils.input_sequentially", typed_with)
+
+    with pytest.raises(MultipleElementsFound):
+        await element.input_sequentially("hello")
+
+    typed_with.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -166,3 +204,22 @@ async def test_press_fill_classifies_timeout_when_element_gone(monkeypatch: pyte
     monkeypatch.setattr("skyvern.webeye.utils.dom.EventStrategyFactory.type_text", _raise)
     with pytest.raises(MissingElement):
         await element.press_fill("hello")
+
+
+@pytest.mark.asyncio
+async def test_find_label_for_returns_none_when_for_control_was_not_scraped() -> None:
+    # The label's for= control is live (found once, carries a unique id) but is absent from the scraped dict.
+    control_locator = MagicMock()
+    control_locator.count = AsyncMock(return_value=1)
+    control_locator.get_attribute = AsyncMock(return_value="AACH")
+    frame = MagicMock()
+    frame.locator = MagicMock(return_value=control_locator)
+    label = SkyvernElement(MagicMock(), frame, {"id": "AABQ", "tagName": "label", "attributes": {"for": "ctl"}})
+    dom = MagicMock()
+    dom.get_skyvern_element_by_id = AsyncMock(side_effect=MissingElementDict("AACH"))
+
+    assert await label.find_label_for(dom) is None
+
+    mapped = object()
+    dom.get_skyvern_element_by_id = AsyncMock(return_value=mapped)
+    assert await label.find_label_for(dom) is mapped

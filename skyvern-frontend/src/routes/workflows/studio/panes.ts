@@ -2,10 +2,30 @@ export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
 // "edit" = no run in URL; "run" = run present, no block label; null = block-iterate (never learned).
 export type StudioLayoutClass = "edit" | "run";
+export type CopilotPaneSelection = {
+  open: boolean;
+  index: number | undefined;
+};
+
+// Marks ?wr= as a system-transient focus (the copilot following its own test
+// run) rather than a user opening a run. Layout classification ignores such a
+// run reference: the user never navigated, so their arrangement must not remap.
+export const SYSTEM_RUN_FOCUS_PARAM = "wrs";
+
+// Copilot has one selection for live editing and one for inspected runs.
+// Block-run labels do not create a third context.
+export function copilotContextForSearch(search: string): StudioLayoutClass {
+  const params = new URLSearchParams(search);
+  if (params.get(SYSTEM_RUN_FOCUS_PARAM) !== null) return "edit";
+  return params.get("wr") !== null || params.get("active") !== null
+    ? "run"
+    : "edit";
+}
 
 export function layoutClassForSearch(search: string): StudioLayoutClass | null {
   const params = new URLSearchParams(search);
   if (params.get("bl") !== null) return null;
+  if (params.get(SYSTEM_RUN_FOCUS_PARAM) !== null) return "edit";
   // Same run test as panesFromDeepLink: ?active= is a run reference too.
   if (params.get("wr") !== null || params.get("active") !== null) {
     return "run";
@@ -44,17 +64,22 @@ export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "overview",
 ];
 
-// Panes that mutate the workflow (Copilot builds, Editor saves) are blocked
-// while the shell shows a run of a deleted agent; run viewing stays.
-export const DELETED_WORKFLOW_BLOCKED_PANES: readonly StudioPaneId[] = [
+// Panes that mutate the workflow (Copilot builds, Editor saves), as opposed to
+// the ones that only watch a run. The top bar keys its authoring controls off
+// this, and it is also what a deleted agent blocks.
+export const WORKFLOW_AUTHORING_PANES: readonly StudioPaneId[] = [
   "copilot",
   "editor",
 ];
 
+export function isAuthoringLayout(panes: readonly StudioPaneId[]): boolean {
+  return panes.some((id) => WORKFLOW_AUTHORING_PANES.includes(id));
+}
+
 export function panesWithoutDeletedBlocked(
   panes: readonly StudioPaneId[],
 ): StudioPaneId[] {
-  return panes.filter((id) => !DELETED_WORKFLOW_BLOCKED_PANES.includes(id));
+  return panes.filter((id) => !WORKFLOW_AUTHORING_PANES.includes(id));
 }
 
 // Copilot / Editor / Overview share one narrow floor; the browser viewport
@@ -143,12 +168,16 @@ export function panesFromDeepLink(
     runId: string | null;
     active: string | null;
     blockLabel: string | null;
+    systemFocus?: boolean;
   },
   defaultPanes: readonly StudioPaneId[] = DEFAULT_STUDIO_PANES,
   learnedRunPanes?: readonly StudioPaneId[] | null,
 ): StudioPaneId[] {
   if (params.runId && params.blockLabel) {
     return ["editor", "browser", "overview"];
+  }
+  if (params.runId && params.systemFocus) {
+    return [...defaultPanes];
   }
   if (params.runId) {
     return learnedRunPanes ? [...learnedRunPanes] : [...RUN_APPEND_PANES];
@@ -178,6 +207,7 @@ export function resolveOpenPanes(
       runId: params.get("wr"),
       active: params.get("active"),
       blockLabel: params.get("bl"),
+      systemFocus: params.get(SYSTEM_RUN_FOCUS_PARAM) !== null,
     },
     defaultPanes,
     learnedRunPanes,
@@ -215,12 +245,51 @@ export function withPaneClosed(
 ): StudioPaneId[] {
   return panes.filter((p) => p !== id);
 }
+export function withCopilotSelection(
+  panes: readonly StudioPaneId[],
+  selection: CopilotPaneSelection | undefined,
+): StudioPaneId[] {
+  if (selection === undefined) {
+    return [...panes];
+  }
+  if (!selection.open) {
+    return withPaneClosed(panes, "copilot");
+  }
+  const currentIndex = panes.indexOf("copilot");
+  const targetIndex =
+    selection.index ?? (currentIndex === -1 ? panes.length : currentIndex);
+  const next = withPaneClosed(panes, "copilot");
+  next.splice(Math.min(Math.max(targetIndex, 0), next.length), 0, "copilot");
+  return next;
+}
 
 // Commas are legal unencoded in query values and parse back identically; keep
 // ?panes=copilot,browser readable no matter which writer serialized last.
 export function toReadableSearch(params: URLSearchParams): string {
   const raw = params.toString().replace(/%2C/g, ",");
   return raw ? `?${raw}` : "";
+}
+
+// The pane layout keys the focused run off ?wr=; the short /runs/{wr} URL carries
+// it in the path instead, so pane RESOLUTION runs against a search that reflects
+// that run. This is never written back — the address bar stays paramless.
+export function searchWithRunReference(
+  search: string,
+  runId: string | undefined,
+): string {
+  if (!runId) {
+    return search;
+  }
+  const params = new URLSearchParams(search);
+  if (params.has("wr")) {
+    return search;
+  }
+  params.set("wr", runId);
+  // This run came from outside the query, so it is the user's, not a copilot
+  // focus. Any marker left in the search belongs to a run that is gone —
+  // keeping it would pin a genuine run view to the edit class.
+  params.delete(SYSTEM_RUN_FOCUS_PARAM);
+  return toReadableSearch(params);
 }
 
 // Serialize the open list into a search string, preserving unrelated params.

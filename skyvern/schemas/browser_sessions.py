@@ -3,23 +3,35 @@ from pydantic import BaseModel, Field, field_validator
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.proxy_pinning import validate_proxy_session_id
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 from skyvern.services.browser_recording.types import RecordingDraftStep
-
-MIN_TIMEOUT = 5
-MAX_TIMEOUT = 60 * 24  # 24 hours
-DEFAULT_TIMEOUT = 60
+from skyvern.utils.url_validators import validate_url
 
 
 class CreateBrowserSessionRequest(BaseModel):
+    url: str | None = Field(
+        default=None,
+        description="Optional URL to open when the standalone browser session starts.",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_start_url(cls, value: str | None) -> str | None:
+        if not value:
+            return value
+        return validate_url(value)
+
+    # No le bound: the route caps values above MAX_TIMEOUT and returns a warning on the
+    # response instead of failing the request with pydantic's 422.
     timeout: int | None = Field(
         default=DEFAULT_TIMEOUT,
         description=f"Timeout in minutes for the session. Timeout is applied after the session is started. Must be between {MIN_TIMEOUT} and {MAX_TIMEOUT}. Defaults to {DEFAULT_TIMEOUT}.",
         ge=MIN_TIMEOUT,
-        le=MAX_TIMEOUT,
     )
+
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
@@ -70,6 +82,13 @@ class CreateBrowserSessionRequest(BaseModel):
         "when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid "
         "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
         "persist their profile regardless of this flag.",
+    )
+
+    needs_live_view: bool = Field(
+        default=False,
+        description="Whether a person will watch this session's browser live. Defaults to false, which suits "
+        "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
+        "a capability, not a particular browser, and cannot be used to select where the session runs.",
     )
 
 

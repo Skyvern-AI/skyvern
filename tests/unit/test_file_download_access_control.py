@@ -14,6 +14,7 @@ from skyvern.constants import DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.api import files
 from skyvern.utils.url_validators import MAX_SAFE_REDIRECTS
+from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 ATTACKER_ORG_ID = "o_attacker"
 VICTIM_ORG_ID = "o_victim"
@@ -60,6 +61,35 @@ def storage(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(files, "app", SimpleNamespace(STORAGE=storage))
     return storage
+
+
+def test_validate_download_url_allows_canonical_legacy_download(legacy_download_uris: dict[str, str]) -> None:
+    assert files.validate_download_url(legacy_download_uris["canonical"]) is True
+
+
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+def test_validate_download_url_rejects_legacy_path_escape(legacy_download_uris: dict[str, str], case: str) -> None:
+    assert files.validate_download_url(legacy_download_uris[case]) is False
+
+
+@pytest.mark.asyncio
+async def test_download_file_returns_canonical_legacy_download(legacy_download_uris: dict[str, str]) -> None:
+    safe_path = files.parse_uri_to_path(legacy_download_uris["canonical"])
+    assert await files.download_file(legacy_download_uris["canonical"]) == os.path.realpath(safe_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+async def test_download_file_rejects_legacy_path_escape(
+    legacy_download_uris: dict[str, str], case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client_session = MagicMock()
+    monkeypatch.setattr(files.aiohttp, "ClientSession", client_session)
+
+    with pytest.raises(PermissionError, match="outside the downloads directory"):
+        await files.download_file(legacy_download_uris[case])
+
+    client_session.assert_not_called()
 
 
 def test_validate_download_url_rejects_cross_org_s3_uri() -> None:

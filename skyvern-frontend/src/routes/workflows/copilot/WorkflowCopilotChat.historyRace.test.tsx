@@ -65,6 +65,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
@@ -288,40 +296,6 @@ describe("WorkflowCopilotChat — history-race action-card gating (item 1)", () 
 
     await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
   });
-
-  it("hides the docked FixCard while a chat switch is loading (flag-off)", async () => {
-    await renderChat({ docked: true });
-    await flushHistory(
-      historyData({
-        chat_history: [
-          aiHistoryMessage(
-            narrativePayload({
-              terminal: "error",
-              terminalMessage: "The last run hit an error.",
-              narrativeSummary: "The last run hit an error.",
-            }),
-            "The last run hit an error.",
-          ),
-        ],
-      }),
-    );
-
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Fix with Copilot" }),
-      ).toBeTruthy(),
-    );
-
-    fireEvent.click(screen.getByText("mock-select-history-chat"));
-
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("button", { name: "Fix with Copilot" }),
-      ).toBeNull(),
-    );
-
-    await flushHistory(historyData({ workflow_copilot_chat_id: "chat_other" }));
-  });
 });
 
 // Item 2 (SKY-12384): a live_browser prompt queued before the initial history
@@ -341,7 +315,7 @@ describe("WorkflowCopilotChat — queued prompt survives initial history load (i
       ).toBeTruthy(),
     );
     expect(
-      screen.getByRole("button", { name: "Cancel queued message" }),
+      screen.getByRole("button", { name: "Edit queued message" }),
     ).toBeTruthy();
 
     // History resolves and replaces messages, dropping the queued bubble — the
@@ -354,7 +328,7 @@ describe("WorkflowCopilotChat — queued prompt survives initial history load (i
       screen.getByText("Prompt queued. Waiting for live browser..."),
     ).toBeTruthy();
     const cancel = screen.getByRole("button", {
-      name: "Cancel queued message",
+      name: "Edit queued message",
     });
 
     await act(async () => {

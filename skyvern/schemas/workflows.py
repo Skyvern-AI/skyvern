@@ -1,14 +1,19 @@
 import abc
+import ast
 import functools
+import re
+import textwrap
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
@@ -73,6 +78,57 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
         if llm_key and llm_key not in reverse_mapping:
             reverse_mapping[llm_key] = model_name
     return reverse_mapping
+
+
+class _LLMSelectionBlock(Protocol):
+    label: str
+    model: dict[str, Any] | None
+    llm_key: str | None
+
+
+_LLMSelectionBlockT = TypeVar("_LLMSelectionBlockT", bound=_LLMSelectionBlock)
+
+
+def _normalize_llm_selection(
+    block: _LLMSelectionBlockT,
+    *,
+    unrecognized_message: str,
+) -> _LLMSelectionBlockT:
+    raw_llm_key = block.llm_key.strip() if block.llm_key else None
+
+    if block.model:
+        block.llm_key = None
+        return block
+
+    if not raw_llm_key:
+        block.llm_key = None
+        return block
+
+    if _has_jinja_syntax(raw_llm_key):
+        block.llm_key = raw_llm_key
+        return block
+
+    model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+    if model_name:
+        block.model = {"model_name": model_name}
+        block.llm_key = None
+        return block
+
+    if is_custom_llm_key(raw_llm_key):
+        LOG.warning(
+            "Rejecting raw custom LLM key on block llm_key; use the model selector instead",
+            label=block.label,
+        )
+        block.llm_key = None
+        return block
+
+    if raw_llm_key in LLMConfigRegistry.get_model_names():
+        block.llm_key = raw_llm_key
+        return block
+
+    LOG.warning(unrecognized_message, label=block.label, llm_key=raw_llm_key)
+    block.llm_key = None
+    return block
 
 
 def _replace_references_in_value(value: Any, old_key: str, new_key: str) -> Any:
@@ -835,6 +891,113 @@ class CodeBlockStepYAML(BaseModel):
     line_end: int | None = None
 
 
+ERROR_CODE_MAX_LENGTH = 128
+ERROR_CODE_REASONING_MAX_LENGTH = 2000
+ERROR_CODE_MAPPING_MAX_ENTRIES = 64
+ERROR_CODE_MAPPING_MAX_UTF8_BYTES = 32768
+
+
+def _contains_unicode_category_c(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _validate_code_block_error_code_mapping(mapping: Any) -> None:
+    if mapping is None:
+        return
+    if type(mapping) is not dict:
+        raise ValueError("error_code_mapping must be a dictionary")
+    if len(mapping) > ERROR_CODE_MAPPING_MAX_ENTRIES:
+        raise ValueError("error_code_mapping must contain at most 64 entries")
+    aggregate_size = 0
+    for code, description in mapping.items():
+        if type(code) is not str or not code or code != code.strip() or len(code) > ERROR_CODE_MAX_LENGTH:
+            raise ValueError("error code keys must be trimmed, non-empty strings of at most 128 characters")
+        if _contains_unicode_category_c(code):
+            raise ValueError("error code keys must not contain Unicode category-C characters")
+        if (
+            type(description) is not str
+            or not description
+            or description != description.strip()
+            or len(description) > ERROR_CODE_REASONING_MAX_LENGTH
+        ):
+            raise ValueError("error code descriptions must be trimmed, non-empty strings of at most 2000 characters")
+        if _contains_unicode_category_c(description):
+            raise ValueError("error code descriptions must not contain Unicode category-C characters")
+        aggregate_size += len(code.encode("utf-8")) + len(description.encode("utf-8"))
+    if aggregate_size > ERROR_CODE_MAPPING_MAX_UTF8_BYTES:
+        raise ValueError("error_code_mapping keys and values must total at most 32768 UTF-8 bytes")
+
+
+def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
+    sanitized = re.sub(
+        r"\{%.*?%\}",
+        lambda match: "\n".join("# __JINJA_BLOCK__" for _ in range(match.group().count("\n") + 1)),
+        textwrap.dedent(code),
+        flags=re.DOTALL,
+    )
+    try:
+        tree = ast.parse(sanitized)
+    except SyntaxError as exc:
+        raise ValueError(f"CodeBlock code is invalid Python: {exc.msg} at line {exc.lineno}") from exc
+    direct: set[tuple[int, str]] = set()
+    accepted: set[int] = set()
+    raises = [node for node in ast.walk(tree) if isinstance(node, ast.Raise)]
+    raise_count_by_line: dict[int, int] = {}
+    for raise_node in raises:
+        for line in range(raise_node.lineno, (raise_node.end_lineno or raise_node.lineno) + 1):
+            raise_count_by_line[line] = raise_count_by_line.get(line, 0) + 1
+    ambiguous_lines = {
+        line
+        for node in raises
+        if isinstance(node.exc, ast.Call) and isinstance(node.exc.func, ast.Name) and node.exc.func.id == "ErrorCode"
+        for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)
+        if raise_count_by_line[line] > 1
+    }
+    if ambiguous_lines:
+        raise ValueError("ErrorCode must be constructed directly in an unambiguous raise statement")
+    for node in ast.walk(tree):
+        if (
+            (isinstance(node, ast.Name) and node.id == "ErrorCode" and isinstance(node.ctx, ast.Store))
+            or (isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ErrorCode")
+            or (isinstance(node, ast.arg) and node.arg == "ErrorCode")
+            or (isinstance(node, ast.ExceptHandler) and node.name == "ErrorCode")
+            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == "ErrorCode")
+            or (isinstance(node, ast.MatchMapping) and node.rest == "ErrorCode")
+        ):
+            raise ValueError("ErrorCode cannot be shadowed")
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            alias.asname == "ErrorCode" or (alias.asname is None and alias.name == "ErrorCode") for alias in node.names
+        ):
+            raise ValueError("ErrorCode cannot be imported or aliased")
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Name) and node.exc.id == "ErrorCode":
+            raise ValueError("ErrorCode must be raised as ErrorCode('literal', reasoning)")
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "ErrorCode":
+            raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if isinstance(call.func, ast.Name) and call.func.id == "ErrorCode":
+            if call.keywords or len(call.args) != 2:
+                raise ValueError("ErrorCode requires exactly two positional arguments")
+            code_node = call.args[0]
+            if not isinstance(code_node, ast.Constant) or type(code_node.value) is not str:
+                raise ValueError("ErrorCode code must be a direct string literal")
+            direct.add((node.lineno, code_node.value))
+            accepted.add(id(call))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ErrorCode":
+            if id(node) not in accepted:
+                raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id == "ErrorCode":
+            raise ValueError("ErrorCode aliases are not allowed")
+    return direct
+
+
+def _validate_code_block_error_code_calls(code: str) -> set[tuple[int, str]]:
+    """Validate ErrorCode call shape at execution time, immediately before exec()."""
+    return _direct_code_block_error_code_raises(code)
+
+
 class CodeBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -843,18 +1006,29 @@ class CodeBlockYAML(BlockYAML):
     block_type: Literal[BlockType.CODE] = BlockType.CODE  # type: ignore
 
     code: str
+    error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
-    prompt: str | None = None
-    steps: list[CodeBlockStepYAML] | None = None
+    prompt: str | None = Field(
+        default=None,
+        description="Plain-language goal of this code block, shown as the block's Goal in the editor",
+    )
+    steps: list[CodeBlockStepYAML] | None = Field(
+        default=None,
+        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+    )
 
     @model_validator(mode="before")
     @classmethod
     def reject_parameters_field(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "error_code" in data:
+            raise ValueError("Code blocks do not accept 'error_code'; use 'error_code_mapping'")
         if isinstance(data, dict) and "parameters" in data:
             raise ValueError(
                 "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
                 "(a list of workflow parameter names) to inject parameters into the code block."
             )
+        if isinstance(data, dict):
+            _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
         return data
 
 
@@ -872,39 +1046,12 @@ class TextPromptBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "TextPromptBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            # `model` is the stable public contract; ignore any raw llm_key override
-            # once a model has been selected.
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=(
+                "Unrecognized text prompt llm_key; defaulting to Skyvern Optimized/default model path"
+            ),
         )
-        self.llm_key = None
-        return self
 
 
 class DownloadToS3BlockYAML(BlockYAML):
@@ -959,10 +1106,17 @@ class SendEmailBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.SEND_EMAIL] = BlockType.SEND_EMAIL  # type: ignore
 
-    smtp_host_secret_parameter_key: str
-    smtp_port_secret_parameter_key: str
-    smtp_username_secret_parameter_key: str
-    smtp_password_secret_parameter_key: str
+    # On the platform path an omitted key is provisioned and a key that is set must name a
+    # declared AWS secret. With custom_smtp_host these are never read, so any key resolves to
+    # an inert placeholder.
+    smtp_host_secret_parameter_key: str | None = None
+    smtp_port_secret_parameter_key: str | None = None
+    smtp_username_secret_parameter_key: str | None = None
+    smtp_password_secret_parameter_key: str | None = None
+    custom_smtp_host: str | None = None
+    custom_smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    custom_smtp_username: str | None = None
+    custom_smtp_password: str | None = None
     sender: str
     recipients: list[str]
     subject: str
@@ -988,9 +1142,11 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
+    engine: RunEngine = RunEngine.skyvern_v1
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
     without_page_information: bool = False
@@ -1007,6 +1163,7 @@ class ActionBlockYAML(BlockYAML):
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
+    max_steps_per_run: int | None = None
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1036,6 +1193,7 @@ class NavigationBlockYAML(BlockYAML):
     totp_identifier: str | None = None
     disable_cache: bool = False
     complete_criterion: str | None = None
+    complete_criterion_is_untrusted: bool = False
     terminate_criterion: str | None = None
     complete_verification: bool = True
     include_action_history_in_verification: bool = False
@@ -1087,12 +1245,12 @@ class HumanInteractionBlockYAML(BlockYAML):
     instructions: str = "Please review and approve or reject to continue the workflow."
     positive_descriptor: str = "Approve"
     negative_descriptor: str = "Reject"
-    timeout_seconds: int
+    timeout_seconds: int = 60 * 60 * 2
 
-    sender: str
+    sender: str = "hello@skyvern.com"
     recipients: list[str]
-    subject: str
-    body: str
+    subject: str = "Human interaction required for workflow run"
+    body: str = "Your interaction is required for a workflow run!"
 
 
 class FileDownloadBlockYAML(BlockYAML):
@@ -1147,8 +1305,16 @@ class TaskV2BlockYAML(BlockYAML):
     url: str | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
-    max_iterations: int = settings.MAX_ITERATIONS_PER_TASK_V2
-    max_steps: int = settings.MAX_STEPS_PER_TASK_V2
+    # These documented defaults must stay literals; reading the setting here would put an
+    # environment value back into the published OpenAPI document.
+    max_iterations: int = Field(
+        default_factory=lambda: settings.MAX_ITERATIONS_PER_TASK_V2,
+        json_schema_extra={"default": 50},
+    )
+    max_steps: int = Field(
+        default_factory=lambda: settings.MAX_STEPS_PER_TASK_V2,
+        json_schema_extra={"default": 25},
+    )
     disable_cache: bool = False
 
 
@@ -1197,37 +1363,10 @@ class PdfFillBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "PdfFillBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=("Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path"),
         )
-        self.llm_key = None
-        return self
 
 
 class SplitPdfBlockYAML(BlockYAML):
@@ -1239,37 +1378,10 @@ class SplitPdfBlockYAML(BlockYAML):
 
     @model_validator(mode="after")
     def normalize_llm_selection(self) -> "SplitPdfBlockYAML":
-        raw_llm_key = self.llm_key.strip() if self.llm_key else None
-
-        if self.model:
-            self.llm_key = None
-            return self
-
-        if not raw_llm_key:
-            self.llm_key = None
-            return self
-
-        if _has_jinja_syntax(raw_llm_key):
-            self.llm_key = raw_llm_key
-            return self
-
-        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
-        if model_name:
-            self.model = {"model_name": model_name}
-            self.llm_key = None
-            return self
-
-        if raw_llm_key in LLMConfigRegistry.get_model_names():
-            self.llm_key = raw_llm_key
-            return self
-
-        LOG.warning(
-            "Unrecognized split pdf llm_key; defaulting to Skyvern Optimized/default model path",
-            label=self.label,
-            llm_key=raw_llm_key,
+        return _normalize_llm_selection(
+            self,
+            unrecognized_message=("Unrecognized split pdf llm_key; defaulting to Skyvern Optimized/default model path"),
         )
-        self.llm_key = None
-        return self
 
 
 class WorkflowTriggerBlockYAML(BlockYAML):
@@ -1391,6 +1503,10 @@ class WorkflowDefinitionYAML(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+    completion_contract: dict[str, Any] | None = Field(
+        default=None,
+        description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
+    )
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
@@ -1430,6 +1546,12 @@ class WorkflowCreateYAMLRequest(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     persist_browser_session: bool = False
+    reuse_browser_session: bool = False
+    mask_secrets: bool | None = Field(
+        default=None,
+        title="Mask Secrets",
+        description="Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text.",
+    )
     pin_saved_session_ip: bool = False
     browser_profile_id: str | None = None
     browser_profile_key: str | None = None

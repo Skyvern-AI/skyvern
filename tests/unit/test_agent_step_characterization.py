@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -314,6 +315,47 @@ async def test_failed_action_with_continue_flag_executes_remaining(monkeypatch: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("skip", "expected_calls"), [(True, 1), (False, 2)])
+async def test_failed_action_skip_remaining_controls_duplicate_element_retry(
+    monkeypatch: pytest.MonkeyPatch, skip: bool, expected_calls: int
+) -> None:
+    first, duplicate = _click("node-1"), _click("node-1")
+    failure = ActionFailure(Exception("unverified click"))
+    failure.skip_remaining_actions = skip
+    action_handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[first, duplicate], action_handler=action_handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert action_handler.await_count == expected_calls
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == ([first] if skip else [first, duplicate])
+
+
+@pytest.mark.asyncio
+async def test_freetext_mismatch_failure_stops_duplicate_element_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (SKY-13631 review): a free-text mismatch failure from the heal seam must terminally stop the
+    # batch even when a queued Submit targets the SAME element id (the duplicate-element-id branch). The heal
+    # builds its failures through _freetext_mismatch_failure, which sets skip_remaining_actions=True, so the
+    # loop marks the step failed and returns instead of continuing into the duplicate Submit.
+    from skyvern.exceptions import FreeTextInputMismatch
+    from skyvern.webeye.actions.handler import _freetext_mismatch_failure
+
+    input_action, submit = _click("node-1"), _click("node-1")  # same element id -> duplicate linked node
+    failure = _freetext_mismatch_failure(FreeTextInputMismatch(element_id="node-1", intended_length=30))
+    handler = AsyncMock(return_value=[failure])
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[input_action, submit], action_handler=handler)
+
+    step, output = await rig.run()
+
+    assert step.status == StepStatus.failed
+    assert handler.await_count == 1  # the duplicate Submit was NOT dispatched
+    assert output.actions_and_results is not None
+    assert [action for action, _ in output.actions_and_results] == [input_action]
+
+
+@pytest.mark.asyncio
 async def test_skip_remaining_actions_stops_batch_but_step_completes(monkeypatch: pytest.MonkeyPatch) -> None:
     first, second = _click("node-1"), _click("node-2")
     handler = AsyncMock(return_value=[ActionResult(success=True, skip_remaining_actions=True)])
@@ -338,6 +380,29 @@ async def test_refresh_working_page_signal_reloads_and_skips_batch(monkeypatch: 
     assert output.actions_and_results is not None
     assert output.actions_and_results[0][0].action_type == ActionType.RELOAD_PAGE
     assert rig.context.refresh_working_page is False
+
+
+@pytest.mark.asyncio
+async def test_reload_action_window_encloses_the_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """started_at is captured BEFORE the reload, so the recorded window encloses it instead of
+    collapsing to a zero-duration stamp taken after the reload already finished."""
+    rig = make_agent_step_rig(monkeypatch)
+    rig.context.refresh_working_page = True
+    during_reload: list[datetime] = []
+
+    async def observed_reload() -> None:
+        await asyncio.sleep(0.01)
+        during_reload.append(datetime.now(UTC).replace(tzinfo=None))
+
+    rig.browser_state.reload_page = AsyncMock(side_effect=observed_reload)
+
+    _step, output = await rig.run()
+
+    assert during_reload, "reload side effect never ran; the test is not exercising the reload path"
+    assert output.actions_and_results is not None
+    reload_action = output.actions_and_results[0][0]
+    assert reload_action.started_at is not None and reload_action.finished_at is not None
+    assert reload_action.started_at <= during_reload[0] <= reload_action.finished_at
 
 
 @pytest.mark.asyncio

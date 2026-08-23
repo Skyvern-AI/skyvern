@@ -52,6 +52,21 @@ async def _mint_access_token(organization_id: str, credential_id: str) -> str:
         )
     try:
         return await google_oauth_service.access_token_from_secrets(secrets, organization_id=organization_id)
+    except google_oauth_service.ExpiredRefreshTokenError as exc:
+        # Google rejected the refresh token as revoked/expired; record the needs-reconnect state so
+        # the integrations UI reflects it, then route the caller to the reconnect flow.
+        await google_oauth_service.mark_credential_expired(
+            organization_id,
+            credential_id,
+            expected_version=secrets.credential_version,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "reconnect_required",
+                "message": str(exc),
+            },
+        )
     except google_oauth_service.MissingAccessTokenError as exc:
         # Google rejected the refresh token (invalid_grant after revoke/expiry);
         # only a fresh consent round can recover, so route to the reconnect flow.

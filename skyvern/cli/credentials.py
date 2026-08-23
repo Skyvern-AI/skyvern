@@ -15,7 +15,7 @@ import os
 import typer
 from rich.table import Table
 
-from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern._cli_bootstrap import CLOUD_URL_OPT_IN_MESSAGE, prepare_cli_runtime
 from skyvern.client import Skyvern
 from skyvern.client.types.non_empty_credit_card_credential import NonEmptyCreditCardCredential
 from skyvern.client.types.non_empty_password_credential import NonEmptyPasswordCredential
@@ -46,12 +46,14 @@ def credentials_callback(
     ctx.obj["api_key"] = api_key
 
 
-def _get_client(api_key: str | None = None) -> Skyvern:
+def _get_client(api_key: str | None = None, *, action: str = "", json_mode: bool = False) -> Skyvern:
     """Instantiate a Skyvern SDK client using environment variables."""
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
     from skyvern.config import settings  # noqa: PLC0415
 
     key = api_key or os.getenv("SKYVERN_API_KEY") or settings.SKYVERN_API_KEY
+    if key != "PLACEHOLDER" and not settings.is_skyvern_base_url_explicitly_configured:
+        output_error(CLOUD_URL_OPT_IN_MESSAGE, action=action, json_mode=json_mode)
     return Skyvern(base_url=settings.SKYVERN_BASE_URL, api_key=key)
 
 
@@ -128,7 +130,7 @@ def add_credential(
             json_mode=json_output,
         )
 
-    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None, action="credentials.add", json_mode=json_output)
 
     if credential_type == "password":
         username = require_interactive_or_flag(
@@ -269,7 +271,7 @@ def list_credentials(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """List stored credentials (metadata only, never passwords)."""
-    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None, action="credentials.list", json_mode=json_output)
 
     try:
         credentials = client.get_credentials(page=page, page_size=page_size)
@@ -319,7 +321,7 @@ def get_credential(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
     """Show metadata for a single credential."""
-    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None, action="credentials.get", json_mode=json_output)
 
     try:
         cred = client.get_credential(credential_id)
@@ -383,7 +385,9 @@ def delete_credential(
             console.print("Aborted.")
             raise typer.Exit()
 
-    client = _get_client(ctx.obj.get("api_key") if ctx.obj else None)
+    client = _get_client(
+        ctx.obj.get("api_key") if ctx.obj else None, action="credentials.delete", json_mode=json_output
+    )
 
     try:
         client.delete_credential(credential_id)

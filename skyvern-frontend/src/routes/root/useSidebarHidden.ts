@@ -1,6 +1,8 @@
 import { useMatch, useSearchParams } from "react-router-dom";
 
+import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useAgentsPathMatch } from "@/routes/workflows/useAgentsPathMatch";
+import { useStudioRunRouteMatch } from "@/routes/workflows/useStudioRunRouteMatch";
 
 type Options = {
   hideBrowserSessions?: boolean;
@@ -9,6 +11,8 @@ type Options = {
 function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
+  const studioEnabled = useWorkflowStudioEnabled();
+  const runStudioMatch = useStudioRunRouteMatch();
   const workflowEditMatch = useAgentsPathMatch("/:workflowPermanentId/edit");
   const workflowStudioMatch = useAgentsPathMatch(
     "/:workflowPermanentId/studio",
@@ -27,6 +31,7 @@ function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
   );
 
   return Boolean(
+    (studioEnabled && runStudioMatch) ||
     workflowEditMatch ||
     workflowStudioMatch ||
     workflowBuildMatch ||

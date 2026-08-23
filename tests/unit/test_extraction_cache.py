@@ -98,6 +98,13 @@ def test_cache_key_is_stable_for_equivalent_inputs() -> None:
         assert first == second, case_id
 
 
+def test_virtualized_grid_rows_preserve_old_key_when_absent_and_change_identity_when_present() -> None:
+    golden_key = "55bc627fe85bf9ecf316cac99d3ff220de2ae16680b3f6ce5aff4a510a911f56"
+
+    assert _key(virtualized_grid_rows=None) == golden_key
+    assert _key(virtualized_grid_rows='Total rows: 1 (complete)\n[{"col0":"value"}]') != golden_key
+
+
 def test_compute_cache_key_rejects_legacy_local_datetime_kwarg() -> None:
     with pytest.raises(TypeError):
         extraction_cache.compute_cache_key(call_path="test", local_datetime="2026-04-10T00:00:00")  # type: ignore[call-arg]

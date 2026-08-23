@@ -197,6 +197,33 @@ describe("useSelectedBlockUrlSync", () => {
     });
   });
 
+  test("keeps the machine-origin marker on the block it names, drops it on the next", async () => {
+    // The copilot's build-follow sets ?sbs= before focusing, so the marker has
+    // to ride through the mirror write it was set for — and die the moment the
+    // user picks something else, or their pick never reaches the run pin.
+    const { result } = renderHook(() => useTestHarness(), {
+      wrapper: makeWrapper("/workflows/wpid_abc/studio?sbs=Checkout+step"),
+    });
+
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("checkout-node");
+    });
+
+    await waitFor(() => {
+      expect(result.current.search).toBe(
+        "?sbs=Checkout+step&selected-block=Checkout+step",
+      );
+    });
+
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("login-node");
+    });
+
+    await waitFor(() => {
+      expect(result.current.search).toBe("?selected-block=Login");
+    });
+  });
+
   test("removes the selected-block param when the selected block is missing", async () => {
     const { result } = renderHook(() => useTestHarness(), {
       wrapper: makeWrapper(

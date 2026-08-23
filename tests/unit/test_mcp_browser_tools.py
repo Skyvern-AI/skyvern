@@ -11,23 +11,31 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call
 import pytest
 
 from skyvern.cli.core import browser_ops
+from skyvern.cli.core import result as result_mod
+from skyvern.cli.core import session_manager
 from skyvern.cli.core.browser_ops import (
     CustomSelectClassifyError,
     CustomSelectMatchError,
     CustomSelectOpenError,
     CustomSelectPasswordError,
+    NavigateResult,
     do_select_option,
 )
-from skyvern.cli.core.result import BrowserContext, set_concise_responses
+from skyvern.cli.core.result import Artifact, BrowserContext, set_concise_responses
+from skyvern.cli.mcp_tools import _element_state
 from skyvern.cli.mcp_tools import browser as mcp_browser
+from skyvern.cli.mcp_tools import cdp_input as mcp_cdp_input
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
+from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
 from tests.unit._mcp_browser_fakes import (
+    make_mock_page,
     make_probe_locator,
     make_real_wait_for_timeout,
     make_select_like_page,
     make_select_option_page,
     make_skyvern_page,
+    patch_get_page,
 )
 
 
@@ -204,11 +212,11 @@ async def test_skyvern_run_task_timeout_returns_timeout_code(monkeypatch: pytest
 async def test_browser_tool_targeting_schema_prefers_direct_params() -> None:
     tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
     expectations = {
-        "skyvern_click": (("selector",), ("intent",)),
+        "skyvern_click": (("selector", "x", "y"), ("intent",)),
         "skyvern_drag": (("source_selector", "target_selector"), ("source_intent", "target_intent")),
         "skyvern_file_upload": (("selector",), ("intent",)),
         "skyvern_hover": (("selector",), ("intent",)),
-        "skyvern_type": (("selector",), ("intent",)),
+        "skyvern_type": (("selector", "x", "y"), ("intent",)),
         "skyvern_screenshot": (("selector",), ()),
         "skyvern_scroll": (("selector",), ("intent",)),
         "skyvern_select_option": (("selector",), ("intent",)),
@@ -294,6 +302,212 @@ def _direct_type_page(
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return fill, locator
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_coordinates_dispatches_raw_mouse_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+    resolve_ai_mode = Mock(side_effect=AssertionError("coordinate clicks must not resolve AI mode"))
+    select_native_option = AsyncMock(side_effect=AssertionError("coordinate clicks must not resolve selectors"))
+    monkeypatch.setattr(mcp_browser, "_resolve_ai_mode", resolve_ai_mode)
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", select_native_option)
+
+    result = await mcp_browser.skyvern_click(x=12.5, y=24.0, button="right", click_count=2)
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(12.5, 24.0, button="right", click_count=2)
+    assert result["data"]["resolved_target"] == "coordinates (12.5, 24.0)"
+    assert result["data"]["sdk_equivalent"] == ("await page.mouse.click(12.5, 24.0, button='right', click_count=2)")
+    resolve_ai_mode.assert_not_called()
+    select_native_option.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_focuses_then_types(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(18.0, 36.5)
+    page.keyboard.type.assert_awaited_once_with("Noor")
+    page.keyboard.press.assert_not_awaited()
+    assert result["data"]["resolved_target"] == "coordinates (18.0, 36.5)"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_refuses_password_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=True)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="not-a-secret", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "password" in result["error"]["message"].lower()
+    page.keyboard.type.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_coordinates_refuses_unverifiable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=None)
+    context = BrowserContext(mode="local")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+
+    result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5, clear=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert result["error"]["message"] == browser_ops.COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE
+    page.keyboard.type.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_requires_both_coordinates_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for invalid coordinates"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_click(x=12.5)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "x" in result["error"]["message"] and "y" in result["error"]["message"]
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("x", "y"),
+    [
+        pytest.param(-1.0, 0.0, id="negative"),
+        pytest.param(float("inf"), 0.0, id="infinite"),
+        pytest.param(float("nan"), 0.0, id="nan"),
+    ],
+)
+async def test_skyvern_click_rejects_invalid_coordinates_before_session(
+    monkeypatch: pytest.MonkeyPatch,
+    x: float,
+    y: float,
+) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for invalid coordinates"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_click(x=x, y=y)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_rejects_selector_with_coordinates_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for conflicting targets"))
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_type(text="Noor", selector="#first_name", x=18.0, y=36.5)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    assert "selector" in result["error"]["message"].lower()
+    assert "coordinates" in result["error"]["message"].lower()
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_execute_click_coordinates_flow_through_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    context = BrowserContext(mode="local")
+    get_page = patch_get_page(monkeypatch, mcp_browser, page, context)
+    get_page.return_value[0]._working_frame = None
+
+    result = await mcp_browser.skyvern_execute(
+        steps=[{"tool": "click", "params": {"x": 12.5, "y": 24.0, "button": "middle"}}]
+    )
+
+    assert result["ok"] is True, result
+    assert result["data"]["steps_completed"] == 1
+    page.mouse.click.assert_awaited_once_with(12.5, 24.0, button="middle", click_count=1)
+
+
+@pytest.mark.asyncio
+async def test_skyvern_execute_type_coordinates_flow_through_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="local")
+    get_page = patch_get_page(monkeypatch, mcp_browser, page, context)
+    get_page.return_value[0]._working_frame = None
+
+    result = await mcp_browser.skyvern_execute(
+        steps=[
+            {
+                "tool": "type",
+                "params": {
+                    "text": "Noor",
+                    "x": 18.0,
+                    "y": 36.5,
+                    "clear_first": False,
+                    "press_enter": True,
+                },
+            }
+        ]
+    )
+
+    assert result["ok"] is True, result
+    page.mouse.click.assert_awaited_once_with(18.0, 36.5)
+    page.keyboard.type.assert_awaited_once_with("Noor")
+    page.keyboard.press.assert_awaited_once_with("Enter")
+
+
+@pytest.mark.asyncio
+async def test_coordinate_actions_record_explicit_trajectory_coordinates(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.mouse.click = AsyncMock()
+    page.keyboard.type = AsyncMock()
+    page.keyboard.press = AsyncMock()
+    page.evaluate = AsyncMock(return_value=False)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    patch_get_page(monkeypatch, mcp_browser, page, context)
+    append_trajectory = Mock()
+    monkeypatch.setattr(mcp_browser, "append_trajectory_entry", append_trajectory)
+    monkeypatch.setattr(mcp_browser, "current_api_key_hash", lambda: None)
+
+    click_result = await mcp_browser.skyvern_click(x=12.5, y=24.0)
+    type_result = await mcp_browser.skyvern_type(text="Noor", x=18.0, y=36.5)
+
+    assert click_result["ok"] is True, click_result
+    assert type_result["ok"] is True, type_result
+    click_entry, type_entry = (entry.kwargs["entry"] for entry in append_trajectory.call_args_list)
+    assert "selector" not in click_entry
+    assert (click_entry["x"], click_entry["y"]) == (12.5, 24.0)
+    assert click_entry["sdk_equivalent"] == click_result["data"]["sdk_equivalent"]
+    assert "locator" not in click_entry["sdk_equivalent"]
+    assert "selector" not in type_entry
+    assert (type_entry["x"], type_entry["y"]) == (18.0, 36.5)
+    assert type_entry["sdk_equivalent"] == type_result["data"]["sdk_equivalent"]
+    assert "locator" not in type_entry["sdk_equivalent"]
+    assert "coordinates (" not in repr([click_entry, type_entry])
 
 
 # Default (resilient) keeps the shared MCP surface unchanged for external callers: a selector
@@ -460,6 +674,93 @@ async def test_skyvern_click_direct_failure_reports_element_state(
     assert result["error"]["hint"]
     click.assert_awaited_once()
     locator.count.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "bad_str",
+    [
+        pytest.param(lambda self: (_ for _ in ()).throw(RuntimeError("boom")), id="raising"),
+        pytest.param(lambda self: 7, id="non_str"),
+    ],
+)
+def test_a_hostile_dunder_str_cannot_raise_out_of_the_element_state_detail(bad_str) -> None:  # noqa: ANN001
+    """Reading the message must not turn a handled actionability failure into an unhandled one."""
+
+    class Hostile(Exception):
+        __str__ = bad_str
+
+    assert _element_state._redacted_exception_detail(Hostile()) == ""
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_returns_the_underlying_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = (
+        "Locator.click: Timeout 5000ms exceeded.\n"
+        'Call log:\n  - <div class="privacy-notice-veil">Accept</div> intercepts pointer events'
+    )
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(message),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    details = result["error"]["details"]
+    assert "privacy-notice-veil" in details["exception_detail"]
+    assert "intercepts pointer events" in details["exception_detail"]
+    assert details["exception_detail"] != details["exception_type"]
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_redacts_a_secret_bearing_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(
+            "Locator.click: navigating to https://example.com/callback?access_token=abcd1234efgh5678 failed"
+        ),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    assert "abcd1234efgh5678" not in result["error"]["details"]["exception_detail"]
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_masks_a_parameter_straddling_the_detail_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The codeblock redactor replaces parameter values by exact match, so bounding the text before
+    # it runs would leave a cut value behind as an unmatchable fragment.
+    parameter_value = "vault-secret-" + "q" * 40
+    prefix = "Locator.click: Timeout 5000ms exceeded. Call log: navigating to "
+    message = prefix.ljust(_element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS - 30, "-") + parameter_value + " failed"
+    cut = message[: _element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS]
+    assert parameter_value[:20] in cut and parameter_value not in cut
+
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(message),
+    )
+
+    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]")):
+        result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    detail = result["error"]["details"]["exception_detail"]
+    assert len(detail) <= _element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS
+    assert "vault-secret" not in detail
 
 
 @pytest.mark.asyncio
@@ -670,14 +971,19 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
     assert click.await_args.kwargs.get("mode") != "direct"
 
 
-def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> None:
-    page = make_skyvern_page(MagicMock()) if skyvern_page else SimpleNamespace(page=MagicMock())
+def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> object:
+    page = (
+        make_skyvern_page(MagicMock())
+        if skyvern_page
+        else SimpleNamespace(page=MagicMock(), url="https://example.test/two-factor")
+    )
     if skyvern_page:
         page.evaluate = AsyncMock(return_value=False)
     for name, method in methods.items():
         setattr(page, name, method)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return page
 
 
 def _native_option_page(
@@ -724,7 +1030,7 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
         press=AsyncMock(),
         scroll_into_view_if_needed=AsyncMock(),
     )
-    raw_page = SimpleNamespace(locator=MagicMock(return_value=locator))
+    raw_page = SimpleNamespace(locator=MagicMock(return_value=locator), url="https://example.test")
     run_task_result = SimpleNamespace(
         run_id="wr_test",
         status="completed",
@@ -735,9 +1041,10 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     page = SimpleNamespace(
         page=raw_page,
-        _working_frame=object(),
+        _working_frame=SimpleNamespace(url="https://example.test/frame"),
+        url="https://example.test",
         agent=SimpleNamespace(run_task=AsyncMock(return_value=run_task_result)),
-        click=AsyncMock(side_effect=lambda *, selector=None, **_: selector),
+        click=AsyncMock(side_effect=lambda **kwargs: kwargs.get("selector")),
         evaluate=AsyncMock(return_value=False),
         fill=AsyncMock(),
         keyboard=SimpleNamespace(press=AsyncMock()),
@@ -749,12 +1056,13 @@ def _sdk_equivalent_page(monkeypatch: pytest.MonkeyPatch) -> None:
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setenv("SKYVERN_DISABLE_CUSTOM_SELECT", "1")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    monkeypatch.setattr(mcp_browser, "validate_fetch_url", lambda url: url)
     monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(_working_frame=None))
     monkeypatch.setattr(mcp_browser, "clear_session_ref_map", Mock())
     monkeypatch.setattr(
         mcp_browser,
         "do_navigate",
-        AsyncMock(return_value=SimpleNamespace(url="https://example.test", title="Example")),
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example")),
     )
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={})))
     monkeypatch.setattr(mcp_browser, "do_act", AsyncMock(return_value=SimpleNamespace(prompt="done", completed=True)))
@@ -1199,6 +1507,21 @@ async def test_skyvern_type_ai_error_uses_exception_type_for_empty_message(
 
 
 @pytest.mark.asyncio
+async def test_select_option_reports_the_browser_attach_when_the_custom_path_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _action_page(monkeypatch, select_option=AsyncMock(return_value="us"))
+    result_mod._pending_attach.set(700)
+    try:
+        result = await mcp_browser.skyvern_select_option(selector="#country", value="us")
+    finally:
+        result_mod._pending_attach.set(None)
+
+    assert result["ok"] is True
+    assert result["timing_ms"].get("attach") == 700
+
+
+@pytest.mark.asyncio
 async def test_skyvern_select_option_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     select = AsyncMock(return_value="us")
     _action_page(monkeypatch, select_option=select)
@@ -1330,6 +1653,10 @@ async def test_do_select_option_recognizes_aria_custom_selects(
     page, control = make_select_like_page(target)
     dom_options = [{"selector": "#music", "role": "option", "name": "Music"}]
     monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    # do_select_option's deadline is real wall clock (started_at + timeout/1000), so a
+    # loaded runner can blow the 100ms budget before the option loop ticks. Freeze the
+    # clock: this asserts the success path, not the deadline.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
     control.evaluate.side_effect = [
         target,
         [{"selector": "#music", "label": "Music", "value": "music"}],
@@ -1369,6 +1696,8 @@ async def test_do_select_option_scan_observed_control_uses_widened_shape(
         {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
         {"text": "Music", "value": "", "dataValues": ["music"], "expanded": "false", "optionSelected": False},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     result = await do_select_option(page, "#category", "music", timeout=100)
 
@@ -1452,6 +1781,42 @@ async def test_do_select_option_accepts_idempotent_exact_committed_value(
     assert await do_select_option(page, "#state", "or", timeout=100) == "OR"
     assert control.click.await_count == 2
     assert control.evaluate.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_do_select_option_still_scans_and_probes_once_when_opening_ate_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stalled event loop between the open click and the first scan (a loaded CI shard) must not
+    # turn the budget into "no option looked at": the deadline bounds waiting, not the first tick.
+    target = {"tag": "button", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    monkeypatch.setattr(
+        browser_ops,
+        "_get_dom_observe_elements",
+        AsyncMock(return_value=[{"selector": "#oregon", "role": "option", "name": "OR"}]),
+    )
+    committed = {
+        "text": "Oregon",
+        "value": "OR",
+        "dataValues": [],
+        "expanded": "false",
+        "optionVisible": False,
+        "optionSelected": False,
+    }
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#oregon", "label": "OR", "value": "OR"}],
+        committed,
+        committed,
+    ]
+
+    async def stalled_click(**_: object) -> None:
+        await asyncio.sleep(0.02)
+
+    control.click = AsyncMock(side_effect=stalled_click)
+
+    assert await do_select_option(page, "#state", "or", timeout=1) == "OR"
 
 
 @pytest.mark.asyncio
@@ -1569,6 +1934,8 @@ async def test_do_select_option_scan_observed_bare_input_uses_typeahead(
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": False},
         {"text": "", "value": "Fairview", "dataValues": [], "expanded": None, "optionSelected": True},
     ]
+    # SKY-12634: freeze the wall clock so a loaded CI runner cannot blow the 100ms budget.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#town", "Fairview", timeout=100) == "Fairview"
     control.fill.assert_awaited_once_with("Fairview", timeout=100)
@@ -1786,6 +2153,10 @@ async def test_do_select_option_keeps_editable_list_close_as_channel_free_fallba
         before,
         {**before, "expanded": "false", "optionVisible": False},
     ]
+    # do_select_option's deadline is real wall clock (started_at + timeout/1000), so a
+    # loaded runner can blow the 100ms budget before the commit is observed. Freeze the
+    # clock: this asserts the success path, not the deadline.
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
 
     assert await do_select_option(page, "#city", "Lakewood", timeout=100) == "Lakewood"
 
@@ -2450,3 +2821,636 @@ async def test_skyvern_select_option_blank_selector_with_intent_uses_proactive_a
 
     assert result["ok"] is True
     assert select.await_args.kwargs["ai"] == "proactive"
+
+
+def _write_grid_page(*, focused_is_password: bool) -> tuple[SimpleNamespace, SimpleNamespace]:
+    cdp = SimpleNamespace(send=AsyncMock(), detach=AsyncMock())
+    raw_page = SimpleNamespace(context=SimpleNamespace(new_cdp_session=AsyncMock(return_value=cdp)))
+    page = SimpleNamespace(
+        page=raw_page,
+        click=AsyncMock(),
+        evaluate=AsyncMock(return_value=focused_is_password),
+    )
+    return page, cdp
+
+
+@pytest.mark.asyncio
+async def test_write_grid_password_focus_selector_preflight_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page should not be called for a credential target"))
+    monkeypatch.setattr(mcp_cdp_input, "get_page", get_page)
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["a"]], focus_selector="#login-password")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_cdp_input.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_write_grid_blocks_when_focus_lands_on_a_password_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    # skyvern_type checks the DOM type of its target; write_grid types into whatever holds focus,
+    # so the equivalent guard is on the focused element rather than on a named selector.
+    page, cdp = _write_grid_page(focused_is_password=True)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["s3cr3t"]], focus_selector="#A1", screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_cdp_input.ErrorCode.INVALID_INPUT
+    assert not any(c.args[0] == "Input.insertText" for c in cdp.send.await_args_list)
+    cdp.detach.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_write_grid_writes_when_focus_is_not_a_password_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    page, cdp = _write_grid_page(focused_is_password=False)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["a", "b"]], focus_selector="#A1", screenshot=False)
+
+    assert result["ok"] is True, result
+    assert result["data"]["cells"] == 2
+    inserted = [c.args[1]["text"] for c in cdp.send.await_args_list if c.args[0] == "Input.insertText"]
+    assert inserted == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_write_grid_blocks_password_field_reached_after_first_cell(monkeypatch: pytest.MonkeyPatch) -> None:
+    page, cdp = _write_grid_page(focused_is_password=False)
+    page.evaluate = AsyncMock(side_effect=[False, True])
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["allowed", "blocked"]], screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_cdp_input.ErrorCode.INVALID_INPUT
+    inserted = [call.args[1]["text"] for call in cdp.send.await_args_list if call.args[0] == "Input.insertText"]
+    assert inserted == ["allowed"]
+
+
+@pytest.mark.asyncio
+async def test_write_grid_password_check_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    page, cdp = _write_grid_page(focused_is_password=False)
+    page.evaluate = AsyncMock(side_effect=RuntimeError("evaluation failed"))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["blocked"]], screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_cdp_input.ErrorCode.INVALID_INPUT
+    assert not any(call.args[0] == "Input.insertText" for call in cdp.send.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_write_grid_rejects_oversize_row_before_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_page = AsyncMock(side_effect=AssertionError("get_page must not run"))
+    monkeypatch.setattr(mcp_cdp_input, "get_page", get_page)
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["cell"] * 51], screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_cdp_input.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "extra_kwargs"),
+    [
+        pytest.param("skyvern_navigate_and_screenshot", {}, id="navigate-and-screenshot"),
+        pytest.param(
+            "skyvern_navigate_extract_and_screenshot", {"prompt": "read the page"}, id="navigate-extract-screenshot"
+        ),
+    ],
+)
+async def test_navigating_paired_tools_invalidate_refs_around_navigation(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, extra_kwargs: dict[str, object]
+) -> None:
+    """Parity with skyvern_navigate: prior refs cannot survive navigation.
+
+    Invalidate before AND after, because a failed goto can partially replace the
+    document and a concurrent observe can publish while navigation is in flight.
+    """
+    _sdk_equivalent_page(monkeypatch)
+    events: list[str] = []
+
+    async def navigate(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        return NavigateResult(url="https://example.test", title="Example", load_state="load")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
+
+    result = await getattr(mcp_browser, tool_name)(url="https://example.test", **extra_kwargs)
+
+    assert result["ok"] is True, result
+    assert events == ["invalidate", "navigate", "invalidate"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_reports_ok_with_a_warning_when_the_page_settles_below_the_requested_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page that never fires `load` is navigated, not failed — say so instead of ACTION_FAILED."""
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert result["data"]["url"] == "https://example.test"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
+
+
+@pytest.mark.asyncio
+async def test_navigate_does_not_warn_when_the_requested_state_is_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(
+            return_value=NavigateResult(url="https://example.test", title="Example", load_state="domcontentloaded")
+        ),
+    )
+
+    result = await mcp_browser.skyvern_navigate(url="https://example.test", wait_until="domcontentloaded")
+
+    assert result["ok"] is True, result
+    assert result["warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_navigating_paired_tools_surface_the_degraded_load_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(
+        mcp_browser,
+        "do_navigate",
+        AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
+    )
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+    assert any("never reached 'load'" in warning for warning in result["warnings"]), result
+
+
+@pytest.mark.asyncio
+async def test_navigating_paired_tools_invalidate_refs_even_when_navigation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    events: list[str] = []
+
+    async def fail_navigation(*_args: object, **_kwargs: object) -> NavigateResult:
+        events.append("navigate")
+        raise RuntimeError("net::ERR_ABORTED")
+
+    monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=fail_navigation))
+    invalidate = Mock(side_effect=lambda **_kwargs: events.append("invalidate"))
+    monkeypatch.setattr(mcp_browser, "invalidate_session_ref_map", invalidate)
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert events == ["invalidate", "navigate", "invalidate"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_session_expired_result_for_cdp_4408(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # session_manager.get_page() (SKY-14282/14283/14307/14279 fix) now always wraps a
+    # connect/session-lifecycle failure in BrowserSessionConnectionError before it reaches a
+    # caller -- mock at that same shape rather than a bare RuntimeError so this test still
+    # reflects what get_page() can actually raise.
+    expired_error = session_manager.BrowserSessionConnectionError(
+        "BrowserType.connect_over_cdp: Target page, context or browser has been closed\n"
+        "Browser logs: session expired\n"
+        "Call log: <ws disconnected> code=4408 reason=session expired"
+    )
+    get_page = AsyncMock(side_effect=expired_error)
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SESSION_EXPIRED
+    assert result["error"]["message"] == "Browser session expired or closed."
+    assert "new browser session" in result["error"]["hint"]
+    get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_sdk_error_result_for_unclassified_connect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Before the fix, a connection failure that didn't match the narrow 4408 signature
+    # bubbled out of _run_paired_capture as a raw exception -- past every MCP tool's
+    # `except BrowserNotAvailableError` guard and out to the client as an unsanitized
+    # fastmcp ToolError (SKY-14283/SKY-14279), including the raw session-router hostname and
+    # nginx response body for 14283. It must now degrade to a structured envelope, never raise.
+    # This shape (no target-closed marker) isn't a dead session -- SESSION_EXPIRED would be
+    # misleading, and so would the generic "no browser" hint to pass session_id, since one was
+    # already given -- so it gets a distinct SDK_ERROR with a fully sanitized detail.
+    other_close = session_manager.BrowserSessionConnectionError(
+        "BrowserType.connect_over_cdp: WebSocket error: wss://sessions.skyvern.com/pbs_123/tok "
+        "401 Unauthorized <html><body>nginx</body></html> "
+        "Call log: <ws disconnected> code=4401 reason=unauthorized"
+    )
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=other_close))
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SDK_ERROR
+    assert "sessions.skyvern.com" not in result["error"]["message"]
+    assert "wss://" not in result["error"]["message"]
+    assert "nginx" not in result["error"]["message"]
+    assert "code=4401" not in result["error"]["message"]
+    assert "transient" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_and_screenshot_returns_sdk_error_with_type_name_for_empty_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-14279: the underlying failure can be an exception with an empty str() (e.g. an
+    # httpx.ReadError on the loopback call that fetches the session row, before any CDP connect
+    # is even attempted). The tool must still report something identifiable, not a blank message.
+    class ReadError(Exception):
+        pass
+
+    blank_error = session_manager._wrap_browser_connection_failure(ReadError())
+    assert blank_error.raw_detail == "ReadError"
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=blank_error))
+
+    result = await mcp_browser.skyvern_navigate_and_screenshot(url="https://example.test")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SDK_ERROR
+    assert "ReadError" in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "call_kwargs", "raw_detail", "expected_code"),
+    [
+        # SKY-14307: skyvern_navigate, driver connection severed -- target-closed family.
+        pytest.param(
+            "skyvern_navigate",
+            {"url": "https://example.test"},
+            "BrowserType.connect_over_cdp: Connection closed while reading from the driver",
+            "SESSION_EXPIRED",
+            id="sky-14307-navigate-driver-closed",
+        ),
+        # SKY-14283: skyvern_screenshot, session-router rejected a stale cdp_url with a raw
+        # nginx 401 body -- not a target-closed marker, so it's the sanitized SDK_ERROR bucket.
+        pytest.param(
+            "skyvern_screenshot",
+            {},
+            (
+                "BrowserType.connect_over_cdp: WebSocket error: "
+                "wss://sessions.skyvern.com/pbs_563919350820380452/MTAuMC4zNy4xNjg6cGJz.659ded3d7b0cfbb0/"
+                "devtools/browser/04d5140b-cf5d-4b7e-864b-3b3d9b6cb015 401 Unauthorized "
+                "<html><head><title>401 Authorization Required</title></head>"
+                "<body><center><h1>401 Authorization Required</h1></center>"
+                "<hr><center>nginx</center></body></html>"
+            ),
+            "SDK_ERROR",
+            id="sky-14283-screenshot-nginx-401",
+        ),
+        # SKY-14279: skyvern_click, the underlying failure had no message at all.
+        pytest.param(
+            "skyvern_click",
+            {"selector": "#submit"},
+            "",
+            "SDK_ERROR",
+            id="sky-14279-click-empty-message",
+        ),
+        # SKY-14282: skyvern_navigate_extract_and_screenshot, the composite/paired-capture path.
+        pytest.param(
+            "skyvern_navigate_extract_and_screenshot",
+            {"url": "https://example.test", "prompt": "get the title"},
+            "BrowserContext.new_page: Target page, context or browser has been closed",
+            "SESSION_EXPIRED",
+            id="sky-14282-navigate-extract-and-screenshot-target-closed",
+        ),
+    ],
+)
+async def test_atomic_browser_tools_never_leak_raw_connect_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    call_kwargs: dict[str, object],
+    raw_detail: str,
+    expected_code: str,
+) -> None:
+    # Reproduces SKY-14307/14283/14279 end to end on the exact atomic tools they were filed
+    # against: before the fix, get_page() let the raw driver/CDP exception escape uncaught past
+    # this tool's `except BrowserNotAvailableError` guard, and fastmcp surfaced it to the MCP
+    # client as an unsanitized ToolError carrying the raw text (including, for 14283, the
+    # session-router hostname and a raw nginx response body).
+    error = (
+        session_manager.BrowserSessionConnectionError(raw_detail)
+        if raw_detail
+        else (session_manager._wrap_browser_connection_failure(Exception()))
+    )
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(side_effect=error))
+
+    tool = getattr(mcp_browser, tool_name)
+    result = await tool(**call_kwargs)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == getattr(mcp_browser.ErrorCode, expected_code)
+    assert "sessions.skyvern.com" not in result["error"]["message"]
+    assert "wss://" not in result["error"]["message"]
+    assert "nginx" not in result["error"]["message"]
+    assert "401 Authorization Required" not in result["error"]["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "call_kwargs", "expected_steps"),
+    [
+        pytest.param(
+            "skyvern_navigate_and_screenshot",
+            {
+                "url": "https://example.test",
+                "timeout": 45000,
+                "wait_until": "domcontentloaded",
+                "full_page": True,
+                "inline": True,
+            },
+            [
+                {
+                    "tool": "navigate",
+                    "params": {
+                        "url": "https://example.test",
+                        "timeout": 45000,
+                        "wait_until": "domcontentloaded",
+                    },
+                },
+                {"tool": "screenshot", "params": {"full_page": True, "inline": True}},
+            ],
+            id="navigate",
+        ),
+        pytest.param(
+            "skyvern_evaluate_and_screenshot",
+            {"expression": "document.title", "full_page": True, "inline": True},
+            [
+                {"tool": "evaluate", "params": {"expression": "document.title"}},
+                {"tool": "screenshot", "params": {"full_page": True, "inline": True}},
+            ],
+            id="evaluate",
+        ),
+        pytest.param(
+            "skyvern_extract_and_screenshot",
+            {"prompt": "read the page"},
+            [
+                {"tool": "extract", "params": {"prompt": "read the page", "schema": None}},
+                {"tool": "screenshot", "params": {"full_page": False, "inline": False}},
+            ],
+            id="extract",
+        ),
+        pytest.param(
+            "skyvern_navigate_extract_and_screenshot",
+            {"url": "https://example.test", "prompt": "read the page"},
+            [
+                {"tool": "navigate", "params": {"url": "https://example.test", "timeout": 30000, "wait_until": None}},
+                {"tool": "extract", "params": {"prompt": "read the page", "schema": None}},
+                {"tool": "screenshot", "params": {"full_page": False, "inline": False}},
+            ],
+            id="navigate-extract",
+        ),
+    ],
+)
+async def test_paired_tools_delegate_to_existing_primitives_and_log_the_paired_action(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    call_kwargs: dict[str, object],
+    expected_steps: list[dict[str, object]],
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    expected_operations = tuple(f"skyvern_{step['tool']}" for step in expected_steps)
+    operation_mocks = {
+        name: AsyncMock(return_value={"ok": True, "data": {"sdk_equivalent": f"{name}()"}})
+        for name in expected_operations
+    }
+    operation_mocks["skyvern_screenshot"].return_value = {
+        "data": {"path": "/tmp/shot.png", "sdk_equivalent": "skyvern_screenshot()"},
+        "artifacts": [{"kind": "screenshot", "path": "/tmp/shot.png"}],
+    }
+    for name, operation in operation_mocks.items():
+        monkeypatch.setattr(mcp_browser, name, operation)
+    enqueue = Mock()
+    monkeypatch.setattr(mcp_browser, "enqueue_action_event", enqueue)
+
+    result = await getattr(mcp_browser, tool_name)(
+        **call_kwargs,
+        session_id="pbs_test",
+        cdp_url="ws://browser.test",
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == tool_name
+    assert result["data"]["screenshot"]["path"] == "/tmp/shot.png"
+    assert result["data"]["sdk_equivalent"] == "; ".join(f"{name}()" for name in expected_operations)
+    assert result["artifacts"][0]["path"] == "/tmp/shot.png"
+    for name, step in zip(expected_operations, expected_steps, strict=True):
+        operation_mocks[name].assert_awaited_once_with(
+            **step.get("params", {}), session_id="pbs_test", cdp_url="ws://browser.test"
+        )
+    assert any(call.kwargs["tool"] == tool_name for call in enqueue.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "call_kwargs", "failed_operation", "error_code"),
+    [
+        ("skyvern_extract_and_screenshot", {"prompt": "read"}, "skyvern_extract", "SDK_ERROR"),
+        ("skyvern_evaluate_and_screenshot", {"expression": "throw 1"}, "skyvern_evaluate", "ACTION_FAILED"),
+    ],
+)
+async def test_paired_read_failure_keeps_screenshot_and_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    call_kwargs: dict[str, object],
+    failed_operation: str,
+    error_code: str,
+) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    screenshot = AsyncMock(
+        return_value={
+            "ok": True,
+            "data": {"path": "/tmp/shot.png"},
+            "artifacts": [{"kind": "screenshot", "path": "/tmp/shot.png"}],
+        }
+    )
+    monkeypatch.setattr(
+        mcp_browser, failed_operation, AsyncMock(return_value={"ok": False, "error": {"code": error_code}})
+    )
+    monkeypatch.setattr(mcp_browser, "skyvern_screenshot", screenshot)
+
+    result = await getattr(mcp_browser, tool_name)(**call_kwargs)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == error_code
+    assert result["data"]["extracted" if failed_operation == "skyvern_extract" else "result"] is None
+    assert result["data"]["screenshot"]["path"] == "/tmp/shot.png"
+    assert result["artifacts"][0]["path"] == "/tmp/shot.png"
+
+
+@pytest.mark.asyncio
+async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    artifact = Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)
+    monkeypatch.setattr(mcp_browser, "save_artifact", Mock(return_value=artifact))
+
+    result = await mcp_browser.skyvern_screenshot(inline=True)
+
+    assert result["data"]["path"] == artifact.path
+    assert result["artifacts"] == [artifact.to_dict()]
+
+
+def _either_wait_page(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: dict[str, float | Exception],
+) -> list[asyncio.Task]:
+    """Fake a page whose per-selector waits resolve after a delay, raise, or time out: an outcome of
+    None means the selector never appears, so that waiter times out the way Playwright's does. Returns
+    the waiter tasks so a caller can assert the tool drained them.
+    """
+    waiters: list[asyncio.Task] = []
+
+    async def wait_for_selector(selector: str, timeout: float = 30000, **_: object) -> SimpleNamespace:
+        task = asyncio.current_task()
+        if task is not None:
+            waiters.append(task)
+        outcome = outcomes.get(selector)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is None:
+            await asyncio.sleep(timeout / 1000)
+            raise mcp_browser.PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
+        await asyncio.sleep(outcome)
+        return SimpleNamespace(selector=selector)
+
+    _action_page(monkeypatch, wait_for_selector=AsyncMock(side_effect=wait_for_selector))
+    return waiters
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_on_one_selector_points_at_the_two_state_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout is the moment the caller learns its guess was wrong — the error is where MCP puts
+    feedback a model can act on, so it names the form that would not have cost the ceiling."""
+    _either_wait_page(monkeypatch, {"#login": None})
+
+    result = await mcp_browser.skyvern_wait(selector="#login", timeout=1000)
+
+    assert result["ok"] is False
+    assert "skyvern_wait_for_either_state" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("appears", "expected"), [("#login", "selector_a"), ("#home", "selector_b")])
+async def test_wait_for_either_state_names_the_side_that_matched(
+    monkeypatch: pytest.MonkeyPatch,
+    appears: str,
+    expected: str,
+) -> None:
+    """One tool, one operation: both states are required, so the answer is always which one it is."""
+    absent = "#home" if appears == "#login" else "#login"
+    _either_wait_page(monkeypatch, {appears: 0.01, absent: None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+
+    assert result["ok"] is True
+    assert result["data"]["matched_selector"] == appears
+    assert result["data"]["matched"] == expected
+    assert isinstance(result["data"]["observed_wait_ms"], int)
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_reports_the_observed_failed_wait_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _either_wait_page(monkeypatch, {"#login": None, "#home": None})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(
+        selector_a="#login",
+        selector_b="#home",
+        timeout=1000,
+    )
+
+    assert result["ok"] is False
+    assert result["data"]["observed_wait_ms"] >= 1000
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_rejects_states_where_absence_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    _either_wait_page(monkeypatch, {"#login": 0.01, "#home": 0.01})
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#a", selector_b="#b", state="hidden")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize("concise", [True, False])
+def test_either_state_output_schema_accepts_both_envelope_modes(concise: bool) -> None:
+    """Declared schemas are enforced at runtime, and the two envelope modes disagree on absent fields."""
+    import jsonschema
+
+    from skyvern.cli.core.result import set_concise_responses
+
+    set_concise_responses(concise)
+    try:
+        for envelope in (
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                browser_context=BrowserContext(mode="local"),
+                data={"matched_selector": "#home", "matched": "selector_b"},
+                timing_ms={"total": 5},
+            ),
+            mcp_browser.make_result(
+                "skyvern_wait_for_either_state",
+                ok=False,
+                browser_context=BrowserContext(mode="local"),
+                error=mcp_browser.make_error(mcp_browser.ErrorCode.TIMEOUT, "nope", "hint"),
+            ),
+        ):
+            jsonschema.validate(envelope, mcp_browser.EITHER_STATE_OUTPUT_SCHEMA)
+    finally:
+        set_concise_responses(False)

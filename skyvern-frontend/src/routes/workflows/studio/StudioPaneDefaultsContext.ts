@@ -3,13 +3,20 @@ import { createContext, useContext } from "react";
 import { DEFAULT_STUDIO_PANES, type StudioPaneId } from "./panes";
 
 export type PaneClamp = {
+  // Runtime-selected panes and their fitting prefix.
   source: readonly StudioPaneId[];
   presented: readonly StudioPaneId[];
+  // URL/default panes stay independent from runtime Copilot selection.
+  urlSource: readonly StudioPaneId[];
+  urlPresented: readonly StudioPaneId[];
 };
 
 export type PaneWrite = {
   previous: readonly StudioPaneId[];
   next: readonly StudioPaneId[];
+  // A write that changes only Copilot updates the runtime clamp without
+  // exposing panes that the mount-time viewport clamp hid.
+  nextRuntimeSource?: readonly StudioPaneId[];
 };
 
 export type StudioPaneDefaultsValue = {

@@ -26,6 +26,7 @@ _DEVTOOLS_ACTIVE_PORT_TIMEOUT_SECONDS = 2.0
 if TYPE_CHECKING:
     from playwright.async_api import Playwright
 
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
@@ -589,6 +590,14 @@ class Skyvern(AsyncSkyvern):
         browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
         return SkyvernBrowser(self, browser_context, browser_address=cdp_url)
 
+    async def connect_to_browser_extension(self, runtime: BrowserExtensionRuntime) -> SkyvernBrowser:
+        from skyvern.library.skyvern_browser import SkyvernBrowser  # noqa: PLC0415
+
+        playwright = await self._get_playwright()
+        browser = await playwright.chromium.connect_over_cdp(runtime.cdp_ws_url)
+        browser_context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        return SkyvernBrowser(self, browser_context)
+
     async def connect_to_cloud_browser_session(self, browser_session_id: str) -> SkyvernBrowser:
         """Connect to an existing cloud-hosted browser session by ID.
 
@@ -625,7 +634,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60.
+                Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
             extensions: Browser extensions to install in the session.
@@ -667,7 +676,7 @@ class Skyvern(AsyncSkyvern):
 
         Args:
             timeout: Timeout in minutes for the session. Timeout is applied after the session is started.
-                Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
+                Must be between 5 and 240; values above 240 are rejected with a 400. Defaults to 60. Only used when creating a new session.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud. Only used when creating a new session.
 

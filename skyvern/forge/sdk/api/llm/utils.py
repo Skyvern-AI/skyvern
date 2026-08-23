@@ -152,7 +152,50 @@ async def llm_messages_builder_with_history(
     return messages
 
 
-def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
+def _dedupe_consecutive_dicts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        if deduped and deduped[-1] == item:
+            continue
+        deduped.append(item)
+    return deduped
+
+
+# Prompts consumed as an actions array; only these wrap a bare action_type-dict
+# list into {"actions": [...]}. Single-object callers (custom-select) must not.
+_ACTIONS_ARRAY_PROMPT_NAMES = frozenset({"extract-actions", "decisive-criterion-validate"})
+
+
+def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool) -> dict[str, Any] | None:
+    """Recover the intended single-object response when a model splits it into
+    several top-level JSON values. "action_type" is the Action model's
+    discriminator field, so its presence identifies action dicts structurally.
+    Returns None when the list doesn't match a recoverable shape.
+    """
+    dicts = [item for item in response if isinstance(item, dict)]
+    lists = [item for item in response if isinstance(item, list)]
+
+    # Reasoning object + nested action array. This shape is unambiguous (exactly one
+    # nested action array beside dicts that carry no decision of their own), so it
+    # never collides with single-object prompts and is recovered regardless of
+    # caller. An unescaped quote inside the reasoning text ends that string early
+    # and strands the remainder as extra fragments, so surplus non-action fragments
+    # are tolerated as long as only one action array survives.
+    action_lists = [
+        item for item in lists if item and all(isinstance(entry, dict) and "action_type" in entry for entry in item)
+    ]
+    if dicts and len(action_lists) == 1 and all("actions" not in d and "action_type" not in d for d in dicts):
+        return {**dicts[0], "actions": action_lists[0]}
+
+    # Bare list of action dicts. Collides with single-object callers whose object
+    # carries action_type, so only wrap when the caller consumes an actions array.
+    if allow_action_list_wrap and dicts and not lists and all("action_type" in d for d in dicts):
+        return {"actions": _dedupe_consecutive_dicts(dicts)}
+
+    return None
+
+
+def _coerce_response_to_dict(response: Any, prompt_name: str | None = None) -> dict[str, Any]:
     """Ensure parsed LLM responses expose a dict interface to callers."""
     if isinstance(response, dict):
         return response
@@ -161,15 +204,27 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
         "Parsed LLM response is not a dict",
         response_type=type(response).__name__,
         response=response,
+        prompt_name=prompt_name,
     )
 
     if isinstance(response, list):
+        reassembled = _reassemble_list_response(response, prompt_name in _ACTIONS_ARRAY_PROMPT_NAMES)
+        if reassembled is not None:
+            LOG.info(
+                "Recovered single-object response from list-shaped LLM output",
+                response_length=len(response),
+                recovered_keys=list(reassembled.keys()),
+                prompt_name=prompt_name,
+            )
+            return reassembled
+
         first_dict = next((item for item in response if isinstance(item, dict)), None)
         LOG.warning(
             "Parsed LLM response is a list; using first dict element",
             response_length=len(response),
             first_item_type=type(response[0]).__name__ if response else None,
             first_item_keys=list(first_dict.keys()) if first_dict else None,
+            prompt_name=prompt_name,
         )
         if first_dict is not None:
             return first_dict
@@ -205,7 +260,10 @@ def is_content_filtered_response(response: litellm.ModelResponse) -> bool:
 
 
 def parse_api_response(
-    response: litellm.ModelResponse, add_assistant_prefix: bool = False, force_dict: bool = True
+    response: litellm.ModelResponse,
+    add_assistant_prefix: bool = False,
+    force_dict: bool = True,
+    prompt_name: str | None = None,
 ) -> dict[str, Any] | Any:
     if is_truncated_response(response):
         usage = response.usage if hasattr(response, "usage") and response.usage else None
@@ -236,7 +294,7 @@ def parse_api_response(
         parsed = json_repair.loads(content)
         if not force_dict:
             return parsed
-        return _coerce_response_to_dict(parsed)
+        return _coerce_response_to_dict(parsed, prompt_name)
 
     except Exception:
         LOG.warning(
@@ -250,7 +308,7 @@ def parse_api_response(
             parsed = commentjson.loads(content)
             if not force_dict:
                 return parsed
-            return _coerce_response_to_dict(parsed)
+            return _coerce_response_to_dict(parsed, prompt_name)
         except Exception as e:
             if content:
                 LOG.warning(
@@ -262,7 +320,7 @@ def parse_api_response(
                     parsed = _fix_and_parse_json_string(content)
                     if not force_dict:
                         return parsed
-                    return _coerce_response_to_dict(parsed)
+                    return _coerce_response_to_dict(parsed, prompt_name)
                 except Exception as e2:
                     LOG.exception("Failed to auto-fix LLM response.", error=str(e2))
                     raise InvalidLLMResponseFormat(str(response)) from e2

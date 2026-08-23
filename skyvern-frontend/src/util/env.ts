@@ -14,11 +14,6 @@ const browserStreamingMode = (
   (import.meta.env.VITE_BROWSER_STREAMING_MODE as string | undefined) || "vnc"
 ).toLowerCase();
 
-const buildTimeApiKey: string | null =
-  typeof import.meta.env.VITE_SKYVERN_API_KEY === "string"
-    ? import.meta.env.VITE_SKYVERN_API_KEY
-    : null;
-
 const artifactApiBaseUrl = import.meta.env.VITE_ARTIFACT_API_BASE_URL;
 
 if (!artifactApiBaseUrl) {
@@ -28,10 +23,12 @@ if (!artifactApiBaseUrl) {
 const apiPathPrefix = import.meta.env.VITE_API_PATH_PREFIX ?? "";
 
 const API_KEY_STORAGE_KEY = "skyvern.apiKey";
+const API_KEY_EXPIRES_AT_STORAGE_KEY = "skyvern.apiKeyExpiresAt";
 
 const lsKeys = {
   browserSessionId: "skyvern.browserSessionId",
   apiKey: API_KEY_STORAGE_KEY,
+  apiKeyExpiresAt: API_KEY_EXPIRES_AT_STORAGE_KEY,
 };
 
 const wssBaseUrl = import.meta.env.VITE_WSS_BASE_URL;
@@ -62,6 +59,32 @@ const runsApiBaseUrl = (() => {
 
 let runtimeApiKey: string | null | undefined;
 
+// Self-hosted mints the browser credential after boot, so callers that authenticate a request
+// must wait for the first mint to land instead of sending it unauthenticated.
+let runtimeCredentialReady: Promise<unknown> = Promise.resolve();
+const runtimeCredentialListeners = new Set<() => void>();
+
+function setRuntimeCredentialReady(ready: Promise<unknown>): void {
+  runtimeCredentialReady = ready;
+}
+
+function whenRuntimeCredentialReady(): Promise<unknown> {
+  return runtimeCredentialReady;
+}
+
+function subscribeToRuntimeCredential(listener: () => void): () => void {
+  runtimeCredentialListeners.add(listener);
+  return () => {
+    runtimeCredentialListeners.delete(listener);
+  };
+}
+
+function notifyRuntimeCredentialChanged(): void {
+  for (const listener of runtimeCredentialListeners) {
+    listener();
+  }
+}
+
 function readPersistedApiKey(): string | null {
   if (typeof window === "undefined") {
     return null;
@@ -75,38 +98,52 @@ function getRuntimeApiKey(): string | null {
     return runtimeApiKey;
   }
 
-  const persisted = readPersistedApiKey();
-  const candidate = persisted ?? buildTimeApiKey;
-
-  // Treat placeholder / example values as missing so they are never sent
-  // as real credentials (e.g. from .env.example or an un-replaced Docker placeholder).
-  // The Docker sentinel is matched by its suffix on purpose: the prebuilt-image
-  // entrypoint sed-replaces every occurrence of the full sentinel in the bundle
-  // with the real API key, so spelling it out here would put the real key in its
-  // own deny-list and strip the x-api-key header from every request.
-  const isPlaceholder =
-    candidate === "YOUR_API_KEY" || candidate?.endsWith("_PLACEHOLDER__");
-  runtimeApiKey = candidate && isPlaceholder ? null : candidate;
+  runtimeApiKey = readPersistedApiKey();
   return runtimeApiKey;
 }
 
-function persistRuntimeApiKey(value: string): void {
+function getRuntimeApiKeyExpiresAt(): number | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const expiresAt = Number(
+    window.sessionStorage.getItem(API_KEY_EXPIRES_AT_STORAGE_KEY),
+  );
+  return Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null;
+}
+
+function persistRuntimeApiKey(value: string, expiresAt?: number): void {
   runtimeApiKey = value;
   if (typeof window !== "undefined") {
     window.sessionStorage.setItem(API_KEY_STORAGE_KEY, value);
+    if (expiresAt !== undefined && Number.isFinite(expiresAt)) {
+      window.sessionStorage.setItem(
+        API_KEY_EXPIRES_AT_STORAGE_KEY,
+        String(expiresAt),
+      );
+    } else {
+      window.sessionStorage.removeItem(API_KEY_EXPIRES_AT_STORAGE_KEY);
+    }
   }
+  notifyRuntimeCredentialChanged();
 }
 
 function clearRuntimeApiKey(): void {
   runtimeApiKey = null;
   if (typeof window !== "undefined") {
     window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    window.sessionStorage.removeItem(API_KEY_EXPIRES_AT_STORAGE_KEY);
   }
+  notifyRuntimeCredentialChanged();
 }
 
 async function getCredentialParam(
   credentialGetter: (() => Promise<string | null>) | null,
 ): Promise<string> {
+  if (!credentialGetter) {
+    await whenRuntimeCredentialReady();
+  }
   const params = new URLSearchParams();
   const apiKey = getRuntimeApiKey();
   if (apiKey) {
@@ -140,8 +177,12 @@ export {
   newWssBaseUrl,
   getCredentialParam,
   getRuntimeApiKey,
+  getRuntimeApiKeyExpiresAt,
   persistRuntimeApiKey,
   clearRuntimeApiKey,
+  setRuntimeCredentialReady,
+  whenRuntimeCredentialReady,
+  subscribeToRuntimeCredential,
   useNewRunsUrl,
   enable2faNotifications,
 };

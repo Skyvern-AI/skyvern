@@ -1,7 +1,7 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
@@ -31,7 +31,7 @@ import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const edges = useEdges();
   const nodes = useNodes();
   const debugStore = useDebugStore();

@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 
+import pytest
 import yaml
 
+from skyvern.forge.sdk.copilot.code_block_steps import fill_code_block_error_code_mappings_in_yaml
 from skyvern.forge.sdk.routes.workflow_copilot import _ensure_copilot_workflow_yaml, _workflow_to_copilot_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
@@ -129,3 +131,30 @@ workflow_definition:
     _ensure_copilot_workflow_yaml(chat_request, _saved_workflow())
 
     assert chat_request.workflow_yaml == client_yaml
+
+
+def _code_block_yaml(*, manifest: object = ...) -> str:
+    block = {"block_type": "code", "label": "regenerated", "code": "return {'ok': True}"}
+    if manifest is not ...:
+        block["error_code_mapping"] = manifest
+    return yaml.safe_dump({"workflow_definition": {"parameters": [], "blocks": [block]}}, sort_keys=False)
+
+
+def test_code_block_regeneration_preserves_omitted_manifest_by_label() -> None:
+    prior = _code_block_yaml(manifest={"ACCOUNT_LOCKED": "Account is locked"})
+
+    result = fill_code_block_error_code_mappings_in_yaml(_code_block_yaml(), prior_yaml=prior)
+
+    block = yaml.safe_load(result)["workflow_definition"]["blocks"][0]
+    assert block["error_code_mapping"] == {"ACCOUNT_LOCKED": "Account is locked"}
+
+
+@pytest.mark.parametrize("explicit_removal", [None, {}])
+def test_code_block_regeneration_honors_explicit_manifest_removal(explicit_removal: object) -> None:
+    prior = _code_block_yaml(manifest={"ACCOUNT_LOCKED": "Account is locked"})
+
+    result = fill_code_block_error_code_mappings_in_yaml(_code_block_yaml(manifest=explicit_removal), prior_yaml=prior)
+
+    block = yaml.safe_load(result)["workflow_definition"]["blocks"][0]
+    assert "error_code_mapping" in block
+    assert block["error_code_mapping"] == explicit_removal

@@ -2,6 +2,12 @@ class NotFoundError(Exception):
     pass
 
 
+class DuplicateCopilotTurnError(Exception):
+    def __init__(self, turn_id: str) -> None:
+        super().__init__(f"Copilot turn {turn_id} already owns this idempotency key")
+        self.turn_id = turn_id
+
+
 class ScheduleLimitExceededError(Exception):
     """Raised when attempting to create a schedule that would exceed the org-wide tier limit."""
 

@@ -1,11 +1,12 @@
+import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from skyvern.forge.agent import ForgeAgent, SpeculativePlan, StepPromptResult
-from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -160,13 +161,11 @@ async def test_speculate_next_step_plan_skips_in_script_mode(monkeypatch: pytest
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
 
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
-
     build_prompt_mock = AsyncMock()
     monkeypatch.setattr(agent, "build_and_record_step_prompt", build_prompt_mock)
 
     browser_state, _scraped_page, _page = make_browser_state()
+    browser_state.get_working_page = AsyncMock(return_value=None)
 
     context = SkyvernContext(
         task_id=task.task_id,
@@ -187,17 +186,15 @@ async def test_speculate_next_step_plan_skips_in_script_mode(monkeypatch: pytest
         )
 
     assert plan is None
-    # No prompt build, no sleep — we exited before either.
+    # No prompt build — we exited before speculative work.
     build_prompt_mock.assert_not_called()
-    sleep_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Sanity check: without ctx.script_mode, speculation proceeds past the gate
-    (builds the prompt, sleeps for the verification head-start, calls the LLM)."""
+    """Without ctx.script_mode, speculation proceeds past the gate and builds a plan."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
 
@@ -205,9 +202,6 @@ async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
     task = make_task(now, organization)
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
-
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
 
     browser_state, scraped_page, page = make_browser_state()
     browser_state.get_working_page = AsyncMock(return_value=page)
@@ -253,7 +247,6 @@ async def test_speculate_next_step_plan_proceeds_when_not_in_script_mode(
 
     assert plan is not None
     build_prompt_mock.assert_awaited_once()
-    sleep_mock.assert_awaited()  # verification head-start
 
 
 @pytest.mark.asyncio
@@ -410,12 +403,11 @@ async def test_speculate_next_step_plan_skips_for_cua_engine(monkeypatch: pytest
     current_step = make_step(now, task, step_id="step-cur", status=StepStatus.completed, order=0, output=None)
     next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
 
-    sleep_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr("skyvern.forge.agent.asyncio.sleep", sleep_mock)
     build_prompt_mock = AsyncMock()
     monkeypatch.setattr(agent, "build_and_record_step_prompt", build_prompt_mock)
 
     browser_state, _scraped_page, _page = make_browser_state()
+    browser_state.get_working_page = AsyncMock(return_value=None)
 
     context = SkyvernContext(
         task_id=task.task_id,
@@ -438,7 +430,6 @@ async def test_speculate_next_step_plan_skips_for_cua_engine(monkeypatch: pytest
 
     assert plan is None
     build_prompt_mock.assert_not_called()
-    sleep_mock.assert_not_called()
 
 
 def test_task_validate_update_requires_extracted_information() -> None:
@@ -739,8 +730,8 @@ def _make_scrape_test_fixtures(now, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With USE_ARTIFACT_BUNDLING on, all 6 scrape fields go into a single archive call."""
+async def test_persist_scrape_artifacts_uses_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All six scrape fields are collected in one archive call."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
     task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
@@ -755,7 +746,6 @@ async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.Mon
         workflow_run_id=task.workflow_run_id,
         tz_info=ZoneInfo("UTC"),
     )
-    context.use_artifact_bundling = True
 
     await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
 
@@ -765,79 +755,6 @@ async def test_persist_scrape_artifacts_bundling_enabled(monkeypatch: pytest.Mon
     assert "node-1" in call_kwargs["id_css_map"].decode()
     assert "node-1" in call_kwargs["id_frame_map"].decode()
     assert call_kwargs["element_tree_in_prompt"] == b"<full>"
-    full_tree_mock.assert_called_once()
-    economy_tree_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_persist_scrape_artifacts_bundling_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With USE_ARTIFACT_BUNDLING off (default), 6 individual create_artifact calls are made."""
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
-    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
-
-    create_artifact_mock = AsyncMock()
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", create_artifact_mock)
-
-    context = SkyvernContext(
-        task_id=task.task_id,
-        step_id=None,
-        organization_id=task.organization_id,
-        workflow_run_id=task.workflow_run_id,
-        tz_info=ZoneInfo("UTC"),
-    )
-    context.use_artifact_bundling = False  # default — individual uploads
-
-    await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
-
-    assert create_artifact_mock.await_count == 6
-    artifact_types = [call.kwargs["artifact_type"] for call in create_artifact_mock.await_args_list]
-    assert ArtifactType.HTML_SCRAPE in artifact_types
-    assert ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP in artifact_types
-    assert ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP in artifact_types
-    assert ArtifactType.VISIBLE_ELEMENTS_TREE in artifact_types
-    assert ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED in artifact_types
-    assert ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT in artifact_types
-    full_tree_mock.assert_called_once()
-    economy_tree_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_persist_scrape_artifacts_bundling_disabled_logs_and_reraises_failures(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """All scrape artifact uploads run to completion; failures are logged and the first is re-raised."""
-    agent = ForgeAgent()
-    now = datetime.now(UTC)
-    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
-
-    expected_error = RuntimeError("artifact upload failed")
-
-    async def _create_artifact(*, step: Step, artifact_type: ArtifactType, data: bytes) -> str:
-        if artifact_type == ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP:
-            raise expected_error
-        return f"artifact-{artifact_type.value}"
-
-    create_artifact_mock = AsyncMock(side_effect=_create_artifact)
-    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", create_artifact_mock)
-
-    context = SkyvernContext(
-        task_id=task.task_id,
-        step_id=None,
-        organization_id=task.organization_id,
-        workflow_run_id=task.workflow_run_id,
-        tz_info=ZoneInfo("UTC"),
-    )
-    context.use_artifact_bundling = False
-
-    with pytest.raises(RuntimeError, match="artifact upload failed"):
-        await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
-
-    assert create_artifact_mock.await_count == 6
-    assert any(
-        "Failed to persist scrape artifact" in record.message and "visible_elements_id_css_map" in record.message
-        for record in caplog.records
-    )
     full_tree_mock.assert_called_once()
     economy_tree_mock.assert_not_called()
 
@@ -967,3 +884,90 @@ async def test_speculative_plan_null_response_does_not_unbind_without_page_infor
     # is that agent_step completes (pass or fail) without raising
     # UnboundLocalError for without_page_information.
     assert step.status in (StepStatus.completed, StepStatus.failed)
+
+
+@pytest.mark.asyncio
+async def test_discarded_speculative_plan_cost_write_survives_task_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The speculative extract-actions call is billed even when its plan is thrown away, so
+    the write that attributes its cost has to reach the DB. It is started in the background
+    (the completion path must not wait on an LLM call it no longer needs) and drained in
+    clean_up_task, which is the choke point every terminal path funnels through. Before the
+    drain existed the task was orphaned: nothing held a reference and nothing awaited it, so
+    the write was dropped at teardown.
+    """
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization, navigation_goal=None, workflow_run_id="wr-1")
+
+    step = make_step(
+        now,
+        task,
+        step_id="step-123",
+        status=StepStatus.completed,
+        order=0,
+        output=AgentStepOutput(action_results=[], actions_and_results=[]),
+    )
+    next_step = make_step(now, task, step_id="step-next", status=StepStatus.created, order=1, output=None)
+
+    setup_parallel_verification_mocks(
+        agent,
+        step=step,
+        task=task,
+        monkeypatch=monkeypatch,
+        next_step=next_step,
+        complete_action=CompleteAction(reasoning="done", verified=True),
+        handle_action_responses=[[ActionSuccess()]],
+    )
+
+    # Stands in for the speculative LLM call still being in flight when the completion path
+    # returns. call_later rather than sleep: the shared mocks replace asyncio.sleep.
+    speculative_call_finished = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.2, speculative_call_finished.set)
+    persisted_steps: list[str] = []
+
+    async def slow_persist(discarded_step: Step, speculative_task: Any, *, cancel_step: bool = False) -> None:
+        await speculative_call_finished.wait()
+        persisted_steps.append(discarded_step.step_id)
+
+    monkeypatch.setattr(agent, "_persist_speculative_metadata_for_discarded_plan", slow_persist)
+
+    context = SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id)
+    skyvern_context.set(context)
+    try:
+        browser_state, scraped_page, page = make_browser_state()
+        completed, _, _ = await agent._handle_completed_step_with_parallel_verification(
+            organization=organization,
+            task=task,
+            step=step,
+            page=page,
+            browser_state=browser_state,
+            scraped_page=scraped_page,
+            engine=RunEngine.skyvern_v1,
+        )
+
+        assert completed is True
+        # The completion path returned without waiting on the still-running speculative call.
+        assert persisted_steps == []
+
+        with (
+            patch("skyvern.forge.agent.analytics.capture"),
+            patch.object(agent, "_finalize_downloaded_files_for_task", AsyncMock(return_value=[])),
+            patch("skyvern.forge.agent.app") as mock_app,
+        ):
+            mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+            mock_app.STORAGE.save_downloaded_files = AsyncMock()
+            await agent.clean_up_task(
+                task,
+                last_step=step,
+                need_final_screenshot=False,
+                need_call_webhook=False,
+                close_browser_on_completion=False,
+            )
+
+        assert persisted_steps == [next_step.step_id]
+        assert context.pending_speculative_persist_tasks == []
+    finally:
+        skyvern_context.reset()

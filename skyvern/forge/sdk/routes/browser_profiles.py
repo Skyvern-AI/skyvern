@@ -42,29 +42,11 @@ from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_pers
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
 
 LOG = structlog.get_logger()
 
 DEFAULT_PROFILE_BROWSER_TYPES = ("chrome", "chromium")
-DEFAULT_PROFILE_COPY_IGNORE = {
-    "Snapshots",
-    "GrShaderCache",
-    "ShaderCache",
-    "GraphiteDawnCache",
-    "DawnCache",
-    "DawnGraphiteCache",
-    "DawnWebGPUCache",
-    "Guest Profile",
-    "Profile 2",
-    "Profile 3",
-    "BrowserMetrics",
-    "Crashpad",
-    "CrashpadMetrics-active.pma",
-    "SingletonCookie",
-    "SingletonLock",
-    "SingletonSocket",
-    "DevToolsActivePort",
-}
 
 
 def _normalize_proxy_pin_fields(
@@ -572,13 +554,22 @@ def _versioned_browser_profile_template_candidates(base_dir: FilePath, browser_t
     return [path for _, path in candidates]
 
 
+def _browser_profile_template_identity(directory: FilePath) -> str | None:
+    if (
+        not directory.is_dir()
+        or (directory / ".skyvern_corrupt").exists()
+        or not (directory / "Default").is_dir()
+        or not (directory / "Default" / "Preferences").is_file()
+        or not (directory / "Local State").is_file()
+    ):
+        return None
+    if directory.name in DEFAULT_PROFILE_BROWSER_TYPES:
+        return valid_operator_profile_generation(str(directory.parent), directory.name, str(directory))
+    return ""
+
+
 def _is_valid_browser_profile_template(directory: FilePath) -> bool:
-    return (
-        directory.is_dir()
-        and (directory / "Default").is_dir()
-        and (directory / "Default" / "Preferences").is_file()
-        and (directory / "Local State").is_file()
-    )
+    return _browser_profile_template_identity(directory) is not None
 
 
 def _clear_directory(directory: FilePath) -> None:
@@ -591,7 +582,7 @@ def _clear_directory(directory: FilePath) -> None:
 
 def _copy_browser_profile_template(source_dir: FilePath, destination_dir: FilePath) -> None:
     for source_child in source_dir.iterdir():
-        if source_child.name in DEFAULT_PROFILE_COPY_IGNORE:
+        if source_child.name in FRESH_PROFILE_COPY_IGNORE:
             continue
 
         destination_child = destination_dir / source_child.name
@@ -610,10 +601,13 @@ def _seed_minimal_empty_browser_profile_directory(profile_dir: FilePath) -> None
 
 def _seed_empty_browser_profile_directory(profile_dir: FilePath) -> None:
     for template_dir in _default_browser_profile_template_candidates():
-        if not _is_valid_browser_profile_template(template_dir):
+        template_identity = _browser_profile_template_identity(template_dir)
+        if template_identity is None:
             continue
         try:
             _copy_browser_profile_template(template_dir, profile_dir)
+            if _browser_profile_template_identity(template_dir) != template_identity:
+                raise OSError("Default browser profile template was invalidated while copying")
             LOG.info(
                 "Seeded empty browser profile from default profile template",
                 template_dir=str(template_dir),
@@ -881,7 +875,13 @@ async def _create_profile_from_workflow_run(
         )
         raise WorkflowNotFound(workflow_id=workflow_run.workflow_id)
 
-    if not getattr(workflow, "persist_browser_session", False):
+    # Flag-off orgs keep the legacy immediate 400 when the workflow doesn't persist. Under the engine a
+    # plain picked profile is a living sink even without persist, so archive-presence is the gate — the
+    # poll below decides (it also serves the run's browser_sink_profile_id), not persist_browser_session.
+    if (
+        not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled_for_org(organization_id)
+        and not workflow.persist_browser_session
+    ):
         LOG.warning(
             "Workflow does not persist browser sessions",
             organization_id=organization_id,

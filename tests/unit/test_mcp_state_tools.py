@@ -153,6 +153,58 @@ class TestValidateStatePath:
         result = _validate_state_path(str(skyvern_dir / "state.json"))
         assert ".skyvern" in str(result)
 
+    def test_organization_paths_use_distinct_namespaces(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        first = _validate_state_path("state.json", organization_id="org_1")
+        second = _validate_state_path("state.json", organization_id="org_2")
+
+        assert first.name == second.name == "state.json"
+        assert first.parent != second.parent
+        assert first.parents[1] == second.parents[1] == tmp_path / ".mcp-state"
+
+    def test_organization_path_rejects_foreign_namespace(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        foreign_path = _validate_state_path("state.json", organization_id="org_1")
+        foreign_path.parent.mkdir(parents=True)
+        foreign_path.write_text("{}")
+
+        with pytest.raises(ValueError, match="organization namespace"):
+            _validate_state_path(str(foreign_path), must_exist=True, organization_id="org_2")
+
+    def test_organization_path_rejects_traversal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ValueError, match="must be under working directory"):
+            _validate_state_path("../../../etc/passwd", organization_id="org_1")
+
+    def test_organization_path_rejects_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "real.json"
+        target.write_text("{}")
+        namespaced_link = _validate_state_path("link.json", organization_id="org_1")
+        namespaced_link.parent.mkdir(parents=True)
+        namespaced_link.symlink_to(target)
+
+        with pytest.raises(ValueError, match="Symlinks not allowed"):
+            _validate_state_path("link.json", organization_id="org_1")
+
 
 # ═══════════════════════════════════════════════════
 # skyvern_state_save
@@ -400,9 +452,19 @@ async def test_state_save_load_roundtrip(
     ctx = BrowserContext(mode="local")
     _patch_get_page(monkeypatch, page, ctx)
     _patch_session(monkeypatch, _make_session_state(browser))
+    organization_resolver = MagicMock(return_value=None)
+    monkeypatch.setattr(
+        mcp_state,
+        "app",
+        SimpleNamespace(
+            AGENT_FUNCTION=SimpleNamespace(get_mcp_request_organization_id=organization_resolver),
+        ),
+        raising=False,
+    )
 
     save_result = await mcp_state.skyvern_state_save(file_path="roundtrip.json")
     assert save_result["ok"] is True
+    assert save_result["data"]["file_path"] == str(tmp_path / "roundtrip.json")
 
     page.evaluate = AsyncMock(return_value=None)
     load_result = await mcp_state.skyvern_state_load(file_path="roundtrip.json")
@@ -411,3 +473,4 @@ async def test_state_save_load_roundtrip(
     assert load_result["data"]["local_storage_count"] == 1
     assert load_result["data"]["session_storage_count"] == 1
     assert load_result["data"]["skipped_cookies"] == 0
+    assert organization_resolver.call_count == 2

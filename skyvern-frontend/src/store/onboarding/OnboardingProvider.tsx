@@ -109,6 +109,7 @@ function OnboardingProvider({ children }: Readonly<Props>) {
         updateState,
         isNewUser,
         abVariant,
+        recoveryGuidanceAssignment: data?.recovery_guidance_assignment ?? null,
       }}
     >
       {children}

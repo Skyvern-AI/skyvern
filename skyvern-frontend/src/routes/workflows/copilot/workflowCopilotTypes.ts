@@ -11,6 +11,13 @@ export type ProposalDisposition =
   | "review_tested";
 export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
+export interface ConnectedAccountChoice {
+  connection_id: string;
+  name: string;
+  state: string;
+  email_address?: string | null;
+}
+
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
   organization_id: string;
@@ -42,9 +49,13 @@ export interface WorkflowCopilotChatRequest {
   mode?: "ask" | "build" | null;
   code_block?: boolean | null;
   cancel_token?: string;
+  idempotency_key?: string | null;
   target_block_label?: string | null;
-  fix_origin?: boolean;
+  // Ambient fact: the block selected on the studio canvas when the message was
+  // sent — context for "this block" references, never a directive.
+  selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
+  product_action?: "test_end_to_end" | null;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
@@ -61,7 +72,10 @@ export interface WorkflowCopilotChatHistoryMessage {
   created_at: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.
-  turn_outcome?: { response_kind?: string | null } | null;
+  turn_outcome?: {
+    response_kind?: string | null;
+    connected_account_choices?: ConnectedAccountChoice[] | null;
+  } | null;
   narrative_payload?: Record<string, unknown> | null;
 }
 
@@ -106,11 +120,13 @@ export type WorkflowCopilotStreamMessageType =
   | "condensing"
   | "narration"
   | "block_progress"
+  | "run_started"
   | "run_outcome"
   | "turn_start"
   | "design_start"
   | "design_end"
   | "workflow_draft"
+  | "title_update"
   | "credential_required";
 
 export interface WorkflowCopilotProcessingUpdate {
@@ -148,7 +164,6 @@ export interface WorkflowCopilotTurnStartUpdate {
   type: "turn_start";
   turn_id: string;
   turn_index: number;
-  mode: string;
   timestamp: string;
   // Block count of the canonical workflow at turn entry. Drives the FE's
   // edit-vs-build chip; the snap-back source is captured client-side at
@@ -178,6 +193,16 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   workflow?: WorkflowApiResponse | null;
 }
 
+// Emitted once the backend has persisted a derived agent name, before any block
+// exists. Clients must not treat it as authoritative over a user-chosen title.
+export interface WorkflowCopilotTitleUpdate {
+  type: "title_update";
+  turn_id: string;
+  workflow_permanent_id: string;
+  title: string;
+  timestamp: string;
+}
+
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
 // surfaces a credential card. reason stays a raw string here — CredentialCard
 // tolerates unknown reason tokens, so a newer backend can't break the wiring.
@@ -202,16 +227,19 @@ export interface WorkflowCopilotToolCallUpdate {
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotToolResultUpdate {
   type: "tool_result";
   tool_name: string;
+  display_label?: string | null;
   success: boolean;
   summary: string;
   iteration: number;
   tool_call_id: string;
   detail?: string | null;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -240,11 +268,19 @@ export interface WorkflowCopilotBlockProgressUpdate {
   timestamp: string;
 }
 
+export interface WorkflowCopilotRunStartedUpdate {
+  type: "run_started";
+  workflow_run_id: string;
+  timestamp: string;
+}
+
 export type WorkflowCopilotRunOutcomeVerdict =
   | "evaluating"
   | "demonstrated"
   | "not_demonstrated"
   | "not_evaluated";
+
+export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";
@@ -252,6 +288,7 @@ export interface WorkflowCopilotRunOutcomeUpdate {
   workflow_run_block_ids: string[];
   block_labels: string[];
   verdict: WorkflowCopilotRunOutcomeVerdict;
+  role?: RunOutcomeRole;
   reason_code?: string | null;
   display_reason?: string | null;
   iteration: number;

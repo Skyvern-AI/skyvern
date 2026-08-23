@@ -4,8 +4,15 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.exceptions import InputToInvisibleElement, InvalidElementForTextInput, SkyvernException
+from skyvern.exceptions import (
+    FailedToClearInputField,
+    InputToInvisibleElement,
+    InvalidElementForTextInput,
+    SkyvernException,
+)
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
@@ -130,6 +137,7 @@ def _mock_span_segment_element() -> MagicMock:
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=False)
     el.supports_text_input = AsyncMock(return_value=False)
+    el.find_deepest_interactable_descendant_in_single_chain = MagicMock(return_value=None)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
     el.is_auto_completion_input = AsyncMock(return_value=False)
@@ -227,6 +235,7 @@ def _mock_iframe_element(*, hidden: bool = False) -> MagicMock:
     el.get_locator.return_value = locator
     el.is_disabled = AsyncMock(return_value=False)
     el.supports_text_input = AsyncMock(return_value=False)
+    el.find_deepest_interactable_descendant_in_single_chain = MagicMock(return_value=None)
     el.get_selectable = AsyncMock(return_value=False)
     el.has_hidden_attr = AsyncMock(return_value=hidden)
     el.is_readonly = AsyncMock(return_value=False)
@@ -315,3 +324,147 @@ async def test_hidden_iframe_keeps_non_blocking_invisible_failure() -> None:
     assert results[0].stop_execution_on_failure is False
     el.input_clear.assert_not_called()
     el.input_fill.assert_not_called()
+
+
+def _mock_prefilled_text_input(clear_error: Exception) -> MagicMock:
+    el = MagicMock()
+    el.get_id.return_value = "AATr"
+    el.get_tag_name.return_value = "input"
+    el.get_frame.return_value = MagicMock()
+    el.get_frame_id.return_value = "frame-1"
+    locator = MagicMock()
+    locator.focus = AsyncMock()
+    el.get_locator.return_value = locator
+    el.is_disabled = AsyncMock(return_value=False)
+    el.get_selectable = AsyncMock(return_value=False)
+    el.has_hidden_attr = AsyncMock(return_value=False)
+    el.is_readonly = AsyncMock(return_value=False)
+    el.get_attr = AsyncMock(return_value=None)
+    el.is_spinbtn_input = AsyncMock(return_value=False)
+    el.is_editable = AsyncMock(return_value=True)
+    el.supports_text_input = AsyncMock(return_value=True)
+    # A raw input skips the typeahead/select-option probe, isolating the clear step under test.
+    el.is_raw_input = AsyncMock(return_value=True)
+    el.is_auto_completion_input = AsyncMock(return_value=False)
+    el.find_deepest_interactable_descendant_in_single_chain = MagicMock(return_value=None)
+    el.is_visible = AsyncMock(return_value=True)
+    el.find_blocking_element = AsyncMock(return_value=(None, False))
+    el.get_element_handler = AsyncMock(return_value=MagicMock())
+    el.scroll_into_view = AsyncMock()
+    el.input_clear = AsyncMock(side_effect=clear_error)
+    el.input_fill = AsyncMock()
+    el.input_sequentially = AsyncMock()
+    return el
+
+
+async def _run_clear_failure_on_real_input(clear_error: Exception, *, is_date_related: bool) -> list:
+    el = _mock_prefilled_text_input(clear_error)
+
+    dom_instance = MagicMock()
+    dom_instance.get_skyvern_element_by_id = AsyncMock(return_value=el)
+
+    inc = MagicMock()
+    inc.start_listen_dom_increment = AsyncMock()
+    inc.stop_listen_dom_increment = AsyncMock()
+    inc.get_incremental_element_tree = AsyncMock(return_value=[])
+
+    skyvern_frame = MagicMock()
+    skyvern_frame.safe_wait_for_animation_end = AsyncMock()
+
+    scraped_page = MagicMock()
+    scraped_page.id_to_element_dict = {"AATr": {"tagName": "input"}}
+
+    action = InputTextAction(element_id="AATr", text="01/02/2026", reasoning="set the from date")
+    resolved = InputOrSelectContext(field="From date", is_date_related=is_date_related)
+
+    with (
+        patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=skyvern_frame),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc),
+        # A non-empty current value is what opens the clear step for a real <input>.
+        patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(return_value="12/31/2025")),
+        patch(
+            "skyvern.webeye.actions.handler.get_actual_value_of_parameter_if_secret_with_task",
+            return_value="01/02/2026",
+        ),
+        patch(
+            "skyvern.webeye.actions.handler._get_input_or_select_context",
+            new=AsyncMock(return_value=resolved),
+        ),
+    ):
+        return await handle_input_text_action(
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+        )
+
+
+@pytest.mark.asyncio
+async def test_clear_timeout_on_real_input_is_not_reported_as_unsupported_element() -> None:
+    results = await _run_clear_failure_on_real_input(PlaywrightTimeoutError("clear timeout"), is_date_related=True)
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == FailedToClearInputField.__name__
+    message = results[0].exception_message or ""
+    assert "doesn't support text input" not in message
+    # The calendar hint would send the agent hunting for a date picker instead of retrying a typeable field.
+    assert "calendar" not in message.lower()
+    assert "AATr" in message
+
+
+@pytest.mark.asyncio
+async def test_generic_driver_clear_failure_is_not_reported_as_unsupported_element() -> None:
+    results = await _run_clear_failure_on_real_input(
+        PlaywrightError("Element is not attached to the DOM"), is_date_related=False
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == FailedToClearInputField.__name__
+    assert "doesn't support text input" not in (results[0].exception_message or "")
+
+
+@pytest.mark.asyncio
+async def test_incompatible_live_node_during_clear_still_reports_unsupported_element() -> None:
+    results = await _run_clear_failure_on_real_input(
+        InvalidElementForTextInput(element_id="AATr", tag_name="input"), is_date_related=True
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == InvalidElementForTextInput.__name__
+    message = results[0].exception_message or ""
+    assert "doesn't support text input" in message
+    assert "calendar" in message.lower() or "date picker" in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_raw_incompatible_node_error_during_clear_reports_unsupported_element() -> None:
+    """The case above injects InvalidElementForTextInput directly, so it passes on the isinstance
+    arm alone. This one raises the driver error, which is the only way to exercise the
+    _is_selected_engine_error(...) and is_incompatible_text_input_error(...) arm."""
+    results = await _run_clear_failure_on_real_input(
+        PlaywrightError("Element is not an <input>, <textarea> or [contenteditable] element"),
+        is_date_related=False,
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == InvalidElementForTextInput.__name__
+
+
+@pytest.mark.asyncio
+async def test_non_fillable_input_type_during_clear_reports_unsupported_element() -> None:
+    """A checkbox passes supports_text_input() on its tag alone, so it reaches clear() and
+    Playwright rejects it by TYPE rather than by tag. That is still a genuinely unsupported
+    control and must not be downgraded to a clear failure."""
+    results = await _run_clear_failure_on_real_input(
+        PlaywrightError('Input of type "checkbox" cannot be filled'),
+        is_date_related=False,
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionFailure)
+    assert results[0].exception_type == InvalidElementForTextInput.__name__

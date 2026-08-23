@@ -74,7 +74,6 @@ from .types.workflow_tags_batch_response import WorkflowTagsBatchResponse
 
 if typing.TYPE_CHECKING:
     from .agents.client import AgentsClient, AsyncAgentsClient
-    from .artifacts.client import ArtifactsClient, AsyncArtifactsClient
     from .schedules.client import AsyncSchedulesClient, SchedulesClient
     from .scripts.client import AsyncScriptsClient, ScriptsClient
 # this is used as the default value for optional parameters
@@ -147,7 +146,6 @@ class Skyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = RawSkyvern(client_wrapper=self._client_wrapper)
-        self._artifacts: typing.Optional[ArtifactsClient] = None
         self._scripts: typing.Optional[ScriptsClient] = None
         self._schedules: typing.Optional[SchedulesClient] = None
         self._agents: typing.Optional[AgentsClient] = None
@@ -2135,6 +2133,7 @@ class Skyvern:
     def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -2149,8 +2148,11 @@ class Skyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -2222,6 +2224,7 @@ class Skyvern:
         client.create_browser_session()
         """
         _response = self._raw_client.create_browser_session(
+            url=url,
             timeout=timeout,
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
@@ -2382,7 +2385,7 @@ class Skyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2490,6 +2493,7 @@ class Skyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2517,6 +2521,9 @@ class Skyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2550,6 +2557,7 @@ class Skyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -2565,6 +2573,7 @@ class Skyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -2595,6 +2604,9 @@ class Skyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -2630,6 +2642,7 @@ class Skyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -3858,14 +3871,6 @@ class Skyvern:
         return _response.data
 
     @property
-    def artifacts(self):
-        if self._artifacts is None:
-            from .artifacts.client import ArtifactsClient  # noqa: E402
-
-            self._artifacts = ArtifactsClient(client_wrapper=self._client_wrapper)
-        return self._artifacts
-
-    @property
     def scripts(self):
         if self._scripts is None:
             from .scripts.client import ScriptsClient  # noqa: E402
@@ -3956,7 +3961,6 @@ class AsyncSkyvern:
             timeout=_defaulted_timeout,
         )
         self._raw_client = AsyncRawSkyvern(client_wrapper=self._client_wrapper)
-        self._artifacts: typing.Optional[AsyncArtifactsClient] = None
         self._scripts: typing.Optional[AsyncScriptsClient] = None
         self._schedules: typing.Optional[AsyncSchedulesClient] = None
         self._agents: typing.Optional[AsyncAgentsClient] = None
@@ -6275,6 +6279,7 @@ class AsyncSkyvern:
     async def create_browser_session(
         self,
         *,
+        url: typing.Optional[str] = OMIT,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[CreateBrowserSessionRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
@@ -6289,8 +6294,11 @@ class AsyncSkyvern:
 
         Parameters
         ----------
+        url : typing.Optional[str]
+            Optional URL to open when the standalone browser session starts.
+
         timeout : typing.Optional[int]
-            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 1440. Defaults to 60.
+            Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.
 
         proxy_location : typing.Optional[CreateBrowserSessionRequestProxyLocation]
 
@@ -6370,6 +6378,7 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.create_browser_session(
+            url=url,
             timeout=timeout,
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
@@ -6554,7 +6563,7 @@ class AsyncSkyvern:
             The timestamp when the TOTP code expires
 
         type : typing.Optional[OtpType]
-            Optional. If provided, forces extraction of this specific OTP type (totp or magic_link). Use this when the content contains multiple OTP types and you want to specify which one to extract.
+            Deprecated compatibility field. Skyvern auto-detects the OTP type from content, so this value does not constrain extraction.
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6678,6 +6687,7 @@ class AsyncSkyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -6705,6 +6715,9 @@ class AsyncSkyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6746,6 +6759,7 @@ class AsyncSkyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -6761,6 +6775,7 @@ class AsyncSkyvern:
         proxy_location: typing.Optional[CreateCredentialRequestProxyLocation] = OMIT,
         proxy_session_id: typing.Optional[str] = OMIT,
         rotate_proxy_session_id: typing.Optional[bool] = OMIT,
+        tested_url: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> CredentialResponse:
         """
@@ -6791,6 +6806,9 @@ class AsyncSkyvern:
 
         rotate_proxy_session_id : typing.Optional[bool]
             Rotate the Skyvern-managed proxy sticky-session id when updating this credential.
+
+        tested_url : typing.Optional[str]
+            Login page URL used during the credential test
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -6834,6 +6852,7 @@ class AsyncSkyvern:
             proxy_location=proxy_location,
             proxy_session_id=proxy_session_id,
             rotate_proxy_session_id=rotate_proxy_session_id,
+            tested_url=tested_url,
             request_options=request_options,
         )
         return _response.data
@@ -8250,14 +8269,6 @@ class AsyncSkyvern:
             workflow_permanent_id, template=template, request_options=request_options
         )
         return _response.data
-
-    @property
-    def artifacts(self):
-        if self._artifacts is None:
-            from .artifacts.client import AsyncArtifactsClient  # noqa: E402
-
-            self._artifacts = AsyncArtifactsClient(client_wrapper=self._client_wrapper)
-        return self._artifacts
 
     @property
     def scripts(self):

@@ -21,7 +21,10 @@ import type {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import type { CodeBlockStep } from "../types/workflowTypes";
-import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
+import {
+  TIMELINE_DESCRIPTOR_SEPARATOR,
+  WorkflowRunTimelineBlockItem,
+} from "./WorkflowRunTimelineBlockItem";
 
 function buildBlock(
   overrides: Partial<WorkflowRunBlock> = {},
@@ -79,6 +82,14 @@ function expectNoPillChrome(element: HTMLElement) {
   expect(element.className).not.toMatch(
     /\b(?:rounded|border(?:-\S+)?|bg-\S+|p[xy]-\S+)\b/,
   );
+}
+
+function expectRowSummary(name: string, descriptor: string) {
+  const row = screen.getByRole("button", { pressed: true });
+  expect(row.textContent).toContain(
+    `${name}${TIMELINE_DESCRIPTOR_SEPARATOR} ${descriptor}`,
+  );
+  return row;
 }
 
 afterEach(() => {
@@ -411,12 +422,17 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
+    // Rows read as plain language; the raw recorder trace is demoted to the row tooltip.
     const gotoRow = screen.getByText(
-      /page\.goto https:\/\/example\.com · line 1 · 1m 5s/,
+      /Open https:\/\/example\.com · line 1 · 1m 5s/,
     );
-    const clickRow = screen.getByText(
-      /locator\.click #submit · line 3 · 1\.5s/,
-    );
+    const clickRow = screen.getByText(/Click · line 3 · 1\.5s/);
+    expect(screen.queryByText(/locator\.click/)).toBeNull();
+    expect(
+      within(container)
+        .getAllByRole("button")
+        .some((el) => el.getAttribute("title") === "locator.click #submit"),
+    ).toBe(true);
     expect(
       gotoRow.compareDocumentPosition(clickRow) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -427,7 +443,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(within(container).getByText("Click").className).toContain("sr-only");
     expect(
       within(container).getByRole("button", {
-        name: /Goto URL.*page\.goto https:\/\/example\.com/,
+        name: /Goto URL.*Open https:\/\/example\.com/,
       }),
     ).toBeDefined();
   });
@@ -704,7 +720,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(screen.getByText("L3-5")).toBeDefined();
   });
 
-  it("uses the code block prompt as the row name", () => {
+  it("renders the code block label as the row name and prompt as the descriptor", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_code_prompt_title",
       block_type: "code",
@@ -727,14 +743,17 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.getByText("Collect invoice details")).toBeDefined();
+    expectRowSummary("run_script", "Collect invoice details");
   });
 
-  it("falls back to the first code step title for the row name", () => {
+  it("uses the code fallback instead of the container task URL", () => {
+    const containerTaskUrl = "https://example.com/current-page";
     const block = buildBlock({
       workflow_run_block_id: "wrb_code_step_title",
       block_type: "code",
       label: "run_script",
+      task_id: "tsk_code_container",
+      url: containerTaskUrl,
       prompt: null,
       actions: [],
     });
@@ -753,37 +772,13 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.getByText("Summarize the page")).toBeDefined();
+    const row = expectRowSummary("run_script", "Code block");
+    expect(row.textContent).not.toContain(containerTaskUrl);
+    expect(row.textContent).not.toContain("Summarize the page");
+    expect(screen.getByText(/Summarize the page/)).toBeDefined();
   });
 
-  it("falls back to the block reasoning before bare 'Code' for prompt-less code blocks", () => {
-    const block = buildBlock({
-      workflow_run_block_id: "wrb_code_reasoning",
-      block_type: "code",
-      label: "block_1",
-      prompt: null,
-      description: "Planning to extract current top post details.",
-      actions: [],
-    });
-
-    render(
-      <WorkflowRunTimelineBlockItem
-        activeItem={block}
-        block={block}
-        subItems={[]}
-        onActionClick={noop}
-        onBlockItemClick={noop}
-      />,
-    );
-
-    // The reasoning is surfaced as the row name (it would otherwise be lost to
-    // the bare "Code" fallback); the label remains the descriptor subtitle.
-    expect(
-      screen.getByText("Planning to extract current top post details."),
-    ).toBeDefined();
-  });
-
-  it("prefers the code block prompt over the reasoning for the row name", () => {
+  it("prefers the code block description over its prompt in the descriptor", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_code_prompt_over_reasoning",
       block_type: "code",
@@ -803,23 +798,24 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(screen.getByText("Run the homepage flow")).toBeDefined();
-    expect(
-      screen.queryByText("Planning to extract current top post details."),
-    ).toBeNull();
+    const row = expectRowSummary(
+      "block_1",
+      "Planning to extract current top post details.",
+    );
+    expect(row.textContent).not.toContain("Run the homepage flow");
   });
 
-  it("shows the bare 'Code' name for a prompt-less code block with no reasoning", () => {
+  it("falls back to Code when a code block has no label", () => {
     const block = buildBlock({
       workflow_run_block_id: "wrb_code_bare",
       block_type: "code",
-      label: "block_2",
+      label: null,
       prompt: null,
       description: null,
       actions: [],
     });
 
-    const { container } = render(
+    render(
       <WorkflowRunTimelineBlockItem
         activeItem={block}
         block={block}
@@ -829,7 +825,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       />,
     );
 
-    expect(within(container).getAllByText("Code").length).toBe(1);
+    expectRowSummary("Code", "Code block");
   });
 
   it("selects the block when a code step row is clicked", () => {
@@ -893,7 +889,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ] as unknown as WorkflowRunBlock["actions"],
     });
     const steps: Array<CodeBlockStep> = [
-      { action_type: "goto", title: "Open the homepage", line_start: 1 },
+      { action_type: "goto_url", title: "Open the homepage", line_start: 1 },
       { action_type: "click", title: "Submit the form", line_start: 3 },
       { action_type: "extract", title: "Read the result", line_start: 5 },
       {
@@ -1127,7 +1123,7 @@ describe("WorkflowRunTimelineBlockItem", () => {
     );
 
     expect(
-      screen.getByText(/page\.goto https:\/\/example\.com · line 1/),
+      screen.getByText(/Open https:\/\/example\.com · line 1/),
     ).toBeDefined();
     expect(screen.queryByText("Outline step that should be hidden")).toBeNull();
   });

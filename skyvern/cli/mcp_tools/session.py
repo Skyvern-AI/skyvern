@@ -5,6 +5,8 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
@@ -18,6 +20,7 @@ from skyvern.cli.core.session_ops import (
 )
 from skyvern.cli.core.trajectory_store import delete_session_trajectories
 from skyvern.client.types.extensions import Extensions
+from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.runs import proxy_location_to_request
 
 from ._common import BrowserContext, ErrorCode, Timer, make_error, make_result
@@ -30,6 +33,53 @@ from ._session import (
     resolve_browser,
     set_current_session,
 )
+
+
+def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+    if pairing_opened:
+        return (
+            "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
+            "the Skyvern Agent confirmation tab (one click), then retry."
+        )
+    return (
+        "Skyvern browser extension is not connected and the pairing tab could not be opened automatically. Run "
+        "`skyvern browser extension-pair`, approve pairing in the Skyvern Agent confirmation tab (one click), "
+        "and retry."
+    )
+
+
+def _broker_extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+    if pairing_opened:
+        return (
+            "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
+            "the Skyvern Agent confirmation tab (one click), then retry."
+        )
+    return (
+        "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
+        "To open the one-click pairing page, run `skyvern browser extension-pair`."
+    )
+
+
+def _broker_extension_not_connected_hint() -> str:
+    return (
+        "Verify that Chrome is running and the Skyvern Agent extension is enabled. "
+        "The extension checks for the broker every 30 seconds."
+    )
+
+
+def _browser_extension_start_hint(error: Exception) -> str:
+    if isinstance(error, BrowserExtensionBrokerError):
+        if error.code in {"INVALID_READINESS", "STARTUP_TIMEOUT"}:
+            return (
+                "Inspect ~/.skyvern/run/browser-extension/<port>/startup.log, stop any stale Skyvern MCP "
+                "process, and retry."
+            )
+        if error.code == "PORT_IN_USE":
+            return (
+                "Stop the process using the configured localhost port, or set SKYVERN_BROWSER_EXTENSION_PORT "
+                "to a free port and use the same port in the Skyvern Agent popup."
+            )
+    return "Failed to start or connect to the Skyvern browser extension"
 
 
 def _session_api_key_hash() -> str | None:
@@ -46,6 +96,10 @@ def _should_default_to_cdp() -> tuple[bool, str | None]:
         cdp_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL", "http://127.0.0.1:9222")
         return True, cdp_url
     return False, None
+
+
+def _should_default_to_extension() -> bool:
+    return os.environ.get("BROWSER_TYPE", "") == "extension-connect"
 
 
 def _session_create_data(
@@ -65,7 +119,9 @@ def _session_create_data(
 
 
 async def skyvern_browser_session_create(
-    timeout: Annotated[int | None, Field(description="Session timeout in minutes (5-1440)")] = 60,
+    timeout: Annotated[
+        int | None, Field(description=f"Session timeout in minutes (min {MIN_TIMEOUT}, max {MAX_TIMEOUT})")
+    ] = DEFAULT_TIMEOUT,
     proxy_location: Annotated[
         str | dict[str, Any] | None,
         Field(
@@ -111,10 +167,96 @@ async def skyvern_browser_session_create(
 
     Use local=true for a local Chromium instance.
     The session persists across tool calls until explicitly closed.
+    When the server runs in browser-extension mode, the session is implicit: no session_id is
+    returned and browser tools are called without one.
     """
-    # When BROWSER_TYPE=cdp-connect, auto-connect to the user's local browser via CDP.
-    # resolve_browser() stores the browser in session state via set_current_session()
-    # internally, so we don't need to call it again here.
+    if _should_default_to_extension() and not local:
+        with Timer() as timer:
+            if is_stateless_http_mode():
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.SDK_ERROR,
+                        "The Skyvern browser extension requires the MCP server to run on the stdio transport. "
+                        "Restart with: skyvern mcp --browser-extension",
+                        "",
+                    ),
+                )
+            try:
+                broker_mode = broker_mode_enabled()
+                runtime = await BrowserExtensionRuntime.get_or_start()
+                pairing_opened = False
+                if not await runtime.wait_for_extension(8.0):
+                    # One-step pairing: open the approval page now and wait for the
+                    # user's single click instead of failing and demanding a retry.
+                    pairing_opened = await runtime.begin_pairing()
+                    if pairing_opened:
+                        remaining_wait = 30.0
+                    elif broker_mode:
+                        remaining_wait = 27.0
+                    else:
+                        remaining_wait = 2.0
+                    if not await runtime.wait_for_extension(remaining_wait):
+                        guidance = (
+                            _broker_extension_not_connected_guidance(pairing_opened=pairing_opened)
+                            if broker_mode
+                            else _extension_not_connected_guidance(pairing_opened=pairing_opened)
+                        )
+                        timer.mark("sdk")
+                        return make_result(
+                            "skyvern_browser_session_create",
+                            ok=False,
+                            timing_ms=timer.timing_ms,
+                            error=make_error(
+                                ErrorCode.BROWSER_NOT_FOUND,
+                                guidance,
+                                _broker_extension_not_connected_hint() if broker_mode else "",
+                            ),
+                        )
+            except Exception as e:
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.SDK_ERROR,
+                        str(e),
+                        _browser_extension_start_hint(e),
+                    ),
+                )
+
+            try:
+                _browser, ctx = await resolve_browser(extension_runtime=runtime)
+                timer.mark("sdk")
+            except Exception:
+                guidance = (
+                    _broker_extension_not_connected_guidance(pairing_opened=False)
+                    if broker_mode
+                    else _extension_not_connected_guidance(pairing_opened=False)
+                )
+                return make_result(
+                    "skyvern_browser_session_create",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.BROWSER_NOT_FOUND,
+                        guidance,
+                        _broker_extension_not_connected_hint() if broker_mode else "",
+                    ),
+                )
+        return make_result(
+            "skyvern_browser_session_create",
+            browser_context=ctx,
+            data={
+                "browser": "extension",
+                "session": "implicit",
+                "note": "Extension sessions are implicit; call browser tools without a session_id.",
+            },
+            timing_ms=timer.timing_ms,
+        )
+
     use_cdp, cdp_url = _should_default_to_cdp()
     if use_cdp and not local and cdp_url:
         if browser_profile_id is not None or generate_browser_profile:
@@ -212,6 +354,10 @@ async def skyvern_browser_session_create(
                 generate_browser_profile=generate_browser_profile,
                 local=local,
                 headless=headless,
+                # Keep the MCP process from claiming the session's initial page.
+                # Code blocks connect through the backend's persistent-session manager,
+                # so an MCP-side CDP connection here can leave that manager with zero pages.
+                connect_browser=local,
             )
             timer.mark("sdk")
 
@@ -225,7 +371,7 @@ async def skyvern_browser_session_create(
                 )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
-            app_url = browser.app_url
+            app_url = result.app_url if browser is None else browser.app_url
 
         except ValueError as e:
             return make_result(
@@ -309,6 +455,7 @@ async def skyvern_browser_session_close(
     """
     current = get_current_session()
     await drain_action_log_events()
+    closed_id: str | None = None
 
     with Timer() as timer:
         try:
@@ -329,10 +476,9 @@ async def skyvern_browser_session_close(
                 except Exception as e:
                     close_error = e
 
-                if matching_cloud_session:
-                    if current.browser is None:
-                        set_current_session(SessionState())
-                        raise RuntimeError("Expected active browser for matching cloud session")
+                # A cloud session connects its browser lazily, so the matching session may
+                # have no local browser to tear down.
+                if matching_cloud_session and current.browser is not None:
                     try:
                         await current.browser.close()
                     except Exception as browser_err:
@@ -351,6 +497,23 @@ async def skyvern_browser_session_close(
 
                 timer.mark("sdk")
                 recording_data = await _fetch_session_recording_data(skyvern, session_id)
+                return make_result(
+                    "skyvern_browser_session_close",
+                    data=_session_close_data(result.session_id, result.closed, recording_data),
+                    timing_ms=timer.timing_ms,
+                )
+
+            if current.browser is None and current.context and current.context.session_id:
+                skyvern = get_skyvern()
+                closed_id = current.context.session_id
+                try:
+                    result = await do_session_close(skyvern, closed_id)
+                finally:
+                    clear_session_ref_map(session_id=closed_id)
+                    delete_session_trajectories(closed_id)
+                    set_current_session(SessionState())
+                timer.mark("sdk")
+                recording_data = await _fetch_session_recording_data(skyvern, closed_id)
                 return make_result(
                     "skyvern_browser_session_close",
                     data=_session_close_data(result.session_id, result.closed, recording_data),

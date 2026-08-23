@@ -8,12 +8,8 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  Link,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
 import { SaveIcon } from "@/components/icons/SaveIcon";
@@ -56,6 +52,7 @@ import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { StudioPaneToggles } from "./StudioPaneToggles";
+import { isAuthoringLayout } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
@@ -64,7 +61,7 @@ export function TitleSection({ editable = true }: { editable?: boolean }) {
   const { title, setTitle } = useWorkflowTitleStore();
   const setHasChanges = useWorkflowHasChangesStore((s) => s.setHasChanges);
   const isRecording = useRecordingStore((s) => s.isRecording);
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const canEdit = editable && !isRecording;
   return (
     <div className="flex min-w-0 max-w-[19rem] items-center gap-1">
@@ -142,9 +139,9 @@ export function SaveButton() {
     <>
       <ControlTooltip content="Save workflow" blocked={isRecording}>
         <Button
-          variant="outline"
+          variant="ghost"
           size="icon"
-          className="relative h-8 w-8 border-border bg-transparent shadow-none"
+          className="relative h-8 w-8 text-muted-foreground"
           disabled={isRecording}
           onClick={() => {
             // Recompute dirtiness synchronously from the same source as the
@@ -237,12 +234,12 @@ function PanelToggle({
   const isOpen = state.active && state.content === content;
   const button = (
     <Button
-      variant="outline"
+      variant="ghost"
       size={icon ? "icon" : "default"}
       disabled={isRecording}
       aria-pressed={isOpen}
       className={cn(
-        "border-border bg-transparent shadow-none",
+        "text-muted-foreground",
         icon ? "h-8 w-8" : "h-8 px-3 text-xs",
         isOpen && "bg-accent text-accent-foreground hover:bg-accent/80",
       )}
@@ -268,7 +265,7 @@ function PanelToggle({
 // land here and must be stoppable — render Stop when active, nothing otherwise.
 export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const navigate = useNavigate();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const runId = useStudioRunId();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -392,8 +389,8 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
               <DialogTitle>Start a full run?</DialogTitle>
               <DialogDescription>
                 A block run is still executing. It will keep running — you can
-                watch it in the Browser pane while the Overview pane switches to
-                the new full run.
+                watch it in the Browser pane while the Run pane switches to the
+                new full run.
               </DialogDescription>
             </DialogHeader>
             <DialogFooter>
@@ -412,24 +409,43 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   if (stopOnly) {
     return null;
   }
+  // The label alone doesn't say what a re-run carries; the tooltip does.
   return (
-    <Button
-      size="default"
-      className="h-8 border border-transparent px-3"
-      disabled={isRecording}
-      onClick={startFullRun}
+    <ControlTooltip
+      content={
+        rerunEligible
+          ? "Re-run with this run's inputs (opens the run form pre-filled)"
+          : "Run workflow"
+      }
+      blocked={isRecording}
     >
-      <PlayIcon className="mr-2 size-4" />
-      {rerunEligible ? "Re-run" : "Run"}
-    </Button>
+      <Button
+        size="default"
+        className="h-8 border border-transparent px-3"
+        disabled={isRecording}
+        onClick={startFullRun}
+      >
+        <PlayIcon className="mr-2 size-4" />
+        {rerunEligible ? "Re-run" : "Run"}
+      </Button>
+    </ControlTooltip>
   );
 }
 
 export function StudioTopBar() {
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
-  const { setOpenPanes } = useStudioPanes();
+  const { panes, setOpenPanes } = useStudioPanes();
   const toggleHistoryPanel = useToggleHistoryPanel();
+  const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
+  const hasChanges = useWorkflowHasChangesStore((s) => s.hasChanges);
+  // Watching a run and authoring one are different jobs sharing this bar. The
+  // workflow-mutating controls only earn their place while an authoring pane is
+  // open — otherwise the bar's "Inputs" (workflow parameters) sits next to the
+  // Run pane's own "Inputs" (this run's values), same word, different thing.
+  const authoring = isAuthoringLayout(panes);
+  // Unsaved work always keeps Save reachable, whichever panes are open.
+  const showSave = authoring || contentDirty || hasChanges;
   // Version comparison renders in the editor canvas: collapse to an
   // editor-only layout on entry (an explicit override, like the full-run
   // reset). Exiting doesn't restore the previous set — reopen as needed.
@@ -445,7 +461,8 @@ export function StudioTopBar() {
       <div className="min-w-3 flex-1" />
       {workflowDeletedAt ? (
         // Legacy run-header tag idiom; every workflow-mutating action (save,
-        // schedule, inputs, run) is gone with the agent.
+        // schedule, inputs, run) is gone with the agent. Run history stays
+        // reachable from the run control.
         <span
           title={basicTimeFormat(workflowDeletedAt)}
           className="shrink-0 text-xs text-muted-foreground"
@@ -459,22 +476,32 @@ export function StudioTopBar() {
         </div>
       ) : (
         <div data-tour="editor-actions" className="flex items-center gap-2">
-          <div className="flex items-center gap-1">
-            <SaveButton />
-            <PanelToggle
-              content="schedules"
-              label="Schedule"
-              icon={<CalendarIcon className="size-4" />}
-            />
-            <EditorOverflowMenu
-              triggerClassName="h-8 w-8 rounded-md border border-border bg-transparent shadow-none"
-              onVersionHistory={openVersionHistory}
-              embedded
-            />
-          </div>
-          <div className="h-6 w-px bg-border" aria-hidden />
+          {showSave ? (
+            <>
+              <div className="flex items-center gap-1">
+                <SaveButton />
+                {authoring ? (
+                  <>
+                    <PanelToggle
+                      content="schedules"
+                      label="Schedule"
+                      icon={<CalendarIcon className="size-4" />}
+                    />
+                    <EditorOverflowMenu
+                      triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onVersionHistory={openVersionHistory}
+                      embedded
+                    />
+                  </>
+                ) : null}
+              </div>
+              <div className="h-6 w-px bg-border" aria-hidden />
+            </>
+          ) : null}
           <div className="flex items-center gap-2">
-            <PanelToggle content="parameters" label="Inputs" />
+            {authoring ? (
+              <PanelToggle content="parameters" label="Inputs" />
+            ) : null}
             <RunStopButton />
           </div>
         </div>

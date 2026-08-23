@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import http.client
 import json
+import os
+import shutil
+import socket
+import stat
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -14,6 +21,14 @@ if TYPE_CHECKING:
 
 import typer
 
+from skyvern._cli_bootstrap import prepare_cli_runtime
+from skyvern.browser_extension.auth import load_or_create_pairing_token
+from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.broker_protocol import is_valid_nonce
+from skyvern.browser_extension.broker_server import run_broker_daemon
+from skyvern.browser_extension.broker_state import enable_broker_state
+from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
 from skyvern.cli.commands._output import (
     console,
 )
@@ -58,6 +73,7 @@ from skyvern.cli.lazy import SkyvernTyperGroup
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
+from skyvern.utils.env_paths import EnvIntent
 
 browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
 session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
@@ -70,6 +86,14 @@ browser_app.add_typer(frame_app, name="frame")
 browser_app.add_typer(state_app, name="state")
 browser_app.add_typer(storage_app, name="storage")
 browser_app.add_typer(network_app, name="network")
+
+
+@browser_app.callback()
+def browser_callback(ctx: typer.Context) -> None:
+    """Load environment and mark the CLI runtime so credential-bearing clients hit the base-URL guard."""
+    if ctx.invoked_subcommand == "extension-broker-daemon":
+        return
+    prepare_cli_runtime(intent=EnvIntent.CLOUD)
 
 
 @dataclass(frozen=True)
@@ -86,15 +110,21 @@ def _resolve_connection(session: str | None, cdp: str | None) -> ConnectionTarge
     if session:
         return ConnectionTarget(mode="cloud", session_id=session)
     if cdp:
+        if cdp.startswith("pbs_"):
+            return ConnectionTarget(mode="cloud", session_id=cdp)
         return ConnectionTarget(mode="cdp", cdp_url=cdp)
 
     state = load_state()
     if state:
         if state.mode == "cdp" and state.cdp_url:
+            if state.cdp_url.startswith("pbs_"):
+                return ConnectionTarget(mode="cloud", session_id=state.cdp_url)
             return ConnectionTarget(mode="cdp", cdp_url=state.cdp_url)
         if state.session_id:
             return ConnectionTarget(mode="cloud", session_id=state.session_id)
         if state.cdp_url:
+            if state.cdp_url.startswith("pbs_"):
+                return ConnectionTarget(mode="cloud", session_id=state.cdp_url)
             return ConnectionTarget(mode="cdp", cdp_url=state.cdp_url)
 
     raise typer.BadParameter(
@@ -180,6 +210,413 @@ def _handle_tool_error(e: Exception, *, tool: str, hint: str, json_output: bool)
         output_error(str(e), hint=e.hint, json_mode=json_output)
     else:
         output_error(str(e), hint=hint, json_mode=json_output)
+
+
+def _clipboard_command() -> list[str] | None:
+    if sys.platform == "darwin":
+        executable = shutil.which("pbcopy")
+        return [executable] if executable else None
+    if sys.platform.startswith("linux"):
+        executable = shutil.which("xclip")
+        if executable:
+            return [executable, "-selection", "clipboard"]
+        executable = shutil.which("xsel")
+        if executable:
+            return [executable, "--clipboard", "--input"]
+    return None
+
+
+def _copy_pairing_token_to_clipboard(token: str) -> bool:
+    command = _clipboard_command()
+    if command is None:
+        return False
+    try:
+        subprocess.run(
+            command,
+            input=token,
+            text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def _open_chrome_extensions() -> bool:
+    url = "chrome://extensions"
+    command: list[str] | None = None
+    if sys.platform == "darwin":
+        executable = shutil.which("open")
+        if executable:
+            command = [executable, "-a", "Google Chrome", url]
+    elif sys.platform.startswith("linux"):
+        for browser_name in ("google-chrome", "chromium", "chromium-browser"):
+            executable = shutil.which(browser_name)
+            if executable:
+                command = [executable, url]
+                break
+    if command is None:
+        return False
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def _pairing_token_file_status() -> tuple[bool, str]:
+    token_path = Path.home() / ".skyvern" / "browser_extension_token"
+    try:
+        file_status = token_path.lstat()
+    except FileNotFoundError:
+        return False, "not applicable (file does not exist)"
+    except OSError:
+        return False, "NOT OK (file cannot be inspected)"
+
+    permissions_ok = stat.S_ISREG(file_status.st_mode) and not (stat.S_IMODE(file_status.st_mode) & 0o177)
+    if hasattr(os, "getuid"):
+        permissions_ok = permissions_ok and file_status.st_uid == os.getuid()
+    return True, "OK" if permissions_ok else "NOT OK"
+
+
+def _bridge_is_listening(port: int) -> bool:
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+    except OSError:
+        return False
+    try:
+        connection.close()
+    except OSError:
+        pass
+    return True
+
+
+def _request_pairing_nonce(port: int, token: str) -> str:
+    proof = hmac.new(token.encode("utf-8"), b"skyvern-pair-begin-v1", hashlib.sha256).hexdigest()
+    body = json.dumps({"v": 1, "proof": proof}, separators=(",", ":"))
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+    try:
+        connection.request("POST", "/pair/begin", body=body, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        response_body = response.read(65_537)
+    except OSError as exc:
+        raise BrowserExtensionError("The browser extension bridge did not accept the pairing request") from exc
+    finally:
+        connection.close()
+    if response.status != 200:
+        raise BrowserExtensionError("The browser extension bridge rejected the pairing request")
+    if len(response_body) > 65_536:
+        raise BrowserExtensionError("The browser extension bridge returned an invalid pairing response")
+    try:
+        payload = json.loads(response_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BrowserExtensionError("The browser extension bridge returned an invalid pairing response") from exc
+    nonce = (
+        payload.get("nonce")
+        if isinstance(payload, dict) and type(payload.get("v")) is int and payload["v"] == 1
+        else None
+    )
+    if not isinstance(nonce, str) or not nonce:
+        raise BrowserExtensionError("The browser extension bridge returned an invalid pairing response")
+    return nonce
+
+
+def _open_pairing_url(url: str) -> bool:
+    return BrowserExtensionRuntime.open_extension_url(url)
+
+
+def _launch_extension_pairing(port: int) -> None:
+    token = load_or_create_pairing_token()
+    nonce = _request_pairing_nonce(port, token)
+    url = f"http://127.0.0.1:{port}/pair#{nonce}"
+    if not _open_pairing_url(url):
+        console.print(url, markup=False, soft_wrap=True)
+    console.print("Approve the pairing in your browser.")
+
+
+async def _broker_client(port: int, *, auto_spawn: bool = True, operator: bool = False) -> BrokerClient:
+    async def _ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    client = BrokerClient(port, _ignore_event, auto_spawn=auto_spawn, operator=operator)
+    await client.start()
+    return client
+
+
+def _broker_status_output(port: int) -> None:
+    async def _run() -> dict[str, Any]:
+        client = await _broker_client(port, auto_spawn=False, operator=True)
+        try:
+            return await client.broker_status()
+        finally:
+            await client.stop()
+
+    try:
+        status = asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(f"broker not running ({exc})")
+        return
+    console.print("bridge mode: persistent broker")
+    console.print(f"broker ready on {port}")
+    console.print(f"extension connected: {'yes' if status.get('extensionConnected') else 'no'}")
+    console.print(f"authenticated clients: {status.get('clientCount', 0)}")
+
+
+def _begin_broker_pairing(port: int, *, cancel_pending: bool) -> None:
+    async def _run() -> dict[str, Any]:
+        client = await _broker_client(port, operator=True)
+        try:
+            if cancel_pending:
+                await client.cancel_pairing()
+            return await client.begin_pairing()
+        finally:
+            await client.stop()
+
+    result = asyncio.run(_run())
+    if result.get("opened") is not True:
+        pairing_url = result.get("pairingUrl")
+        prefix = f"http://127.0.0.1:{port}/pair#"
+        nonce = pairing_url.removeprefix(prefix) if isinstance(pairing_url, str) else ""
+        if not isinstance(pairing_url, str) or not pairing_url.startswith(prefix) or not is_valid_nonce(nonce):
+            raise BrowserExtensionBrokerError(
+                "PAIRING_OPEN_FAILED",
+                "The broker could not open the pairing page in Chrome or return a safe fallback URL",
+            )
+        console.print(pairing_url, markup=False, soft_wrap=True)
+    console.print("Approve the pairing in your browser.")
+
+
+@browser_app.command("extension-path")
+def extension_path() -> None:
+    console.print(str(BrowserExtensionRuntime.extension_dir().resolve()), markup=False, soft_wrap=True)
+
+
+@browser_app.command("extension-token")
+def extension_token() -> None:
+    """Copy the pairing token for manual popup-paste fallback."""
+    if broker_mode_enabled():
+        console.print("The extension credential is broker-owned and cannot be copied in broker mode.")
+        raise typer.Exit(code=1)
+    token = load_or_create_pairing_token()
+    if _copy_pairing_token_to_clipboard(token):
+        console.print("Pairing token copied to clipboard.")
+    else:
+        console.print(
+            "Pairing token was not printed. Copy it from ~/.skyvern/browser_extension_token "
+            "or SKYVERN_BROWSER_EXTENSION_TOKEN."
+        )
+    console.print("Paste this token into the Skyvern browser extension popup.")
+    console.print("Click Connect.")
+
+
+@browser_app.command("extension-status")
+def extension_status() -> None:
+    console.print(
+        f"extension directory: {BrowserExtensionRuntime.extension_dir().resolve()}",
+        markup=False,
+        soft_wrap=True,
+    )
+
+    if broker_mode_enabled():
+        try:
+            port = BrowserExtensionRuntime.configured_port()
+        except BrowserExtensionError as exc:
+            console.print(f"broker configuration invalid ({exc})")
+            return
+        _broker_status_output(port)
+        return
+
+    environment_configured = bool(os.environ.get("SKYVERN_BROWSER_EXTENSION_TOKEN", "").strip())
+    token_file_exists, permissions = _pairing_token_file_status()
+    if environment_configured:
+        console.print("pairing token: configured (environment override)")
+    elif token_file_exists:
+        console.print("pairing token: configured (file exists)")
+    else:
+        console.print("pairing token: not configured")
+    console.print(f"pairing token file permissions: {permissions}")
+
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+    except BrowserExtensionError as exc:
+        console.print(f"bridge configuration invalid ({exc})")
+        return
+
+    if not _bridge_is_listening(port):
+        console.print("bridge not running (start your MCP server with --browser-extension)")
+    else:
+        console.print(f"bridge listening on {port}")
+
+
+def _extension_pair(cancel_pending: bool) -> None:
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+    except BrowserExtensionError:
+        console.print("Start your MCP server first: skyvern run mcp --browser-extension")
+        raise typer.Exit(code=1) from None
+    if broker_mode_enabled():
+        if cancel_pending and not typer.confirm("Cancel the pending broker pairing flow and start a new one?"):
+            raise typer.Exit(code=1)
+        try:
+            _begin_broker_pairing(port, cancel_pending=cancel_pending)
+        except (BrowserExtensionError, OSError) as exc:
+            console.print(str(exc))
+            raise typer.Exit(code=1) from None
+        return
+    if not _bridge_is_listening(port):
+        console.print("Start your MCP server first: skyvern run mcp --browser-extension")
+        raise typer.Exit(code=1)
+    try:
+        _launch_extension_pairing(port)
+    except BrowserExtensionError as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+@browser_app.command("extension-pair")
+def extension_pair(
+    cancel_pending: bool = typer.Option(False, "--cancel-pending", help="Cancel an existing broker pairing flow."),
+) -> None:
+    _extension_pair(cancel_pending)
+
+
+def extension_broker_enable() -> None:
+    """Idempotently enable and start the default persistent POSIX extension broker."""
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+        _paths, source = enable_broker_state(port)
+
+        async def _run() -> None:
+            client = await _broker_client(port, operator=True)
+            await client.stop()
+
+        asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    console.print(f"Browser-extension broker enabled on port {port} ({source} credential).")
+    console.print(
+        "Broker-backed extension sessions are the default; set SKYVERN_BROWSER_EXTENSION_BROKER=0 to opt out."
+    )
+
+
+def extension_broker_pair(
+    cancel_pending: bool = typer.Option(False, "--cancel-pending", help="Cancel an existing pairing flow."),
+) -> None:
+    """Start an explicit pairing flow through authenticated broker control."""
+    if cancel_pending and not typer.confirm("Cancel the pending broker pairing flow and start a new one?"):
+        raise typer.Exit(code=1)
+    try:
+        _begin_broker_pairing(BrowserExtensionRuntime.configured_port(), cancel_pending=cancel_pending)
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+def extension_broker_status() -> None:
+    """Report sanitized broker and extension connectivity status."""
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+    except BrowserExtensionError as exc:
+        console.print(f"broker configuration invalid ({exc})")
+        return
+    _broker_status_output(port)
+
+
+def extension_broker_stop() -> None:
+    """Explicitly stop the persistent broker and release its configured port."""
+    port = BrowserExtensionRuntime.configured_port()
+
+    async def _run() -> None:
+        client = await _broker_client(port, auto_spawn=False, operator=True)
+        try:
+            await client.stop_broker()
+        finally:
+            await client.stop()
+
+    try:
+        asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    console.print(f"Browser-extension broker stop requested; port {port} will no longer be reserved.")
+
+
+def extension_broker_daemon(
+    port: int = typer.Option(..., "--port", min=1, max=65535),
+) -> None:
+    """Internal fixed-command entry point for the persistent broker."""
+    try:
+        asyncio.run(run_broker_daemon(port))
+    except BrowserExtensionBrokerError as exc:
+        if os.environ.get("SKYVERN_BROWSER_EXTENSION_BROKER_READY_FD") is None:
+            console.print(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+browser_app.command("extension-broker-enable")(extension_broker_enable)
+browser_app.command("extension-broker-pair")(extension_broker_pair)
+browser_app.command("extension-broker-status")(extension_broker_status)
+browser_app.command("extension-broker-stop")(extension_broker_stop)
+browser_app.command("extension-broker-daemon", hidden=True)(extension_broker_daemon)
+
+
+@browser_app.command("extension-install")
+def extension_install() -> None:
+    extension_dir = BrowserExtensionRuntime.extension_dir().resolve()
+    console.print(str(extension_dir), markup=False, soft_wrap=True)
+
+    if broker_mode_enabled():
+        if _open_chrome_extensions():
+            console.print("Opened chrome://extensions.")
+        else:
+            console.print("chrome://extensions", markup=False)
+        console.print("1. Enable Developer mode.")
+        console.print("2. Click Load unpacked.")
+        console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
+        console.print(
+            "4. Start your extension-mode MCP server; its first broker start enables broker state automatically."
+        )
+        console.print("5. Run skyvern browser extension-pair to start explicit pairing.")
+        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        return
+
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+        bridge_listening = _bridge_is_listening(port)
+    except BrowserExtensionError:
+        port = None
+        bridge_listening = False
+
+    if not bridge_listening:
+        token = load_or_create_pairing_token()
+        if _copy_pairing_token_to_clipboard(token):
+            console.print("Pairing token copied to clipboard.")
+        else:
+            console.print("No clipboard tool found. Use skyvern browser extension-token for the manual fallback.")
+
+    if _open_chrome_extensions():
+        console.print("Opened chrome://extensions.")
+    else:
+        console.print("chrome://extensions", markup=False)
+
+    console.print("1. Enable Developer mode.")
+    console.print("2. Click Load unpacked.")
+    console.print(f"3. Select {extension_dir}.", markup=False, soft_wrap=True)
+    if bridge_listening and port is not None:
+        console.print("4. Approve pairing in the Skyvern Agent confirmation tab (one click).")
+        console.print('5. Add tabs to the "Skyvern Controlled" group.')
+        try:
+            _launch_extension_pairing(port)
+        except BrowserExtensionError:
+            console.print("Automatic pairing could not start. Run skyvern browser extension-pair after setup.")
+    else:
+        console.print("4. Open the Skyvern Agent popup.")
+        console.print("5. Paste the pairing token and click Connect.")
+        console.print('6. Add tabs to the "Skyvern Controlled" group.')
+        console.print("When your MCP server is running, pair with: skyvern browser extension-pair")
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +1015,7 @@ def navigate(
             cli_state.frame_name = None
             cli_state.frame_index = None
             save_state(cli_state)
-        return {"url": result.url, "title": result.title}
+        return {"url": result.url, "title": result.title, "load_state": result.load_state}
 
     try:
         data = asyncio.run(_run())

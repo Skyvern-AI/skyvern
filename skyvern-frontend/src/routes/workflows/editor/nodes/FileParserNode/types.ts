@@ -31,6 +31,7 @@ export const fileParserNodeDefaultData: FileParserNodeData = {
   fileUrl: "",
   fileType: "auto_detect",
   continueOnFailure: false,
+  nextLoopOnFailure: false,
   jsonSchema: "null",
   model: null,
   ignoreWorkflowSystemPrompt: false,

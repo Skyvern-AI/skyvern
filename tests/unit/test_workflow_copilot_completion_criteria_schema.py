@@ -2,19 +2,15 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from skyvern.forge import app
-from skyvern.forge.sdk.copilot.completion_criteria_store import StoredCriteriaSnapshot
+from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import WorkflowCopilotCompletionCriteriaSetModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
-from skyvern.forge.sdk.routes.workflow_copilot import _load_completion_criteria_snapshot
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     NonAdoptableCriteriaSet,
     WorkflowCopilotCompletionCriteriaSet,
@@ -199,6 +195,60 @@ async def test_loader_rejects_present_authority_field_that_decode_would_normaliz
 
 
 @pytest.mark.asyncio
+async def test_loader_rejects_malformed_neutral_boolean_authority_projection() -> None:
+    request_slot_id = "a" * 64
+    criteria = [
+        {
+            "id": request_slot_id,
+            "outcome": "The run reports whether public form exists.",
+            "antecedent_family": "unconditional",
+            "expected_output_shape": "goal_judgment_boolean",
+            "requested_output_evidence_source": "independent_run_evidence",
+            "kind": "outcome",
+            "classification_output_key": "public_form_exists",
+            "request_slot_id": request_slot_id,
+            "pinability": "shapeless_valid",
+            "mint_disposition": "decidable",
+            "requested_output_floor_rekeyed": True,
+            "floor_rekeyed_from_path": "output.login_only",
+        }
+    ]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert isinstance(loaded, NonAdoptableCriteriaSet)
+    assert loaded.reason == "undecodable_v1_criteria"
+
+
+@pytest.mark.asyncio
+async def test_loader_admits_exact_legacy_floor_marked_neutral_boolean_tuple() -> None:
+    request_slot_id = "a" * 64
+    criteria = [
+        {
+            "id": request_slot_id,
+            "outcome": "The run reports whether public form exists.",
+            "antecedent_family": "unconditional",
+            "expected_output_shape": "goal_judgment_boolean",
+            "requested_output_evidence_source": "independent_run_evidence",
+            "kind": "outcome",
+            "classification_output_key": "public_form_exists",
+            "request_slot_id": request_slot_id,
+            "pinability": "shapeless_valid",
+            "mint_disposition": "decidable",
+            "requested_output_floor_rekeyed": True,
+            "floor_rekeyed_from_path": "output.public_form_exists",
+        }
+    ]
+
+    loaded = await _load_latest(_make_row(criteria=criteria))
+
+    assert not isinstance(loaded, NonAdoptableCriteriaSet)
+    (criterion,) = criteria_from_json(loaded.criteria)
+    assert criterion.requested_output_floor_rekeyed is False
+    assert criterion.floor_rekeyed_from_path is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "criteria_value",
     [
@@ -314,48 +364,30 @@ async def test_loader_absorbs_v1_scaffold_validation_failure_as_non_adoptable() 
 
 
 @pytest.mark.asyncio
-async def test_snapshot_maps_non_adoptable_to_no_active_set_and_next_epoch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    disposition = NonAdoptableCriteriaSet(
-        reason="unknown_shape",
-        completion_criteria_set_id="wccs_x",
-        goal_epoch=3,
-    )
-    monkeypatch.setattr(
-        app.DATABASE,
-        "workflow_params",
-        SimpleNamespace(get_latest_workflow_copilot_completion_criteria_set=AsyncMock(return_value=disposition)),
-    )
-    chat = SimpleNamespace(organization_id="o_1", workflow_copilot_chat_id="wcc_1")
-
-    snapshot = await _load_completion_criteria_snapshot(chat)
-
-    assert snapshot == StoredCriteriaSnapshot(active=None, next_epoch=4)
-
-
-@pytest.mark.asyncio
-async def test_snapshot_absorbs_adopted_row_criteria_decode_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(UTC)
-    adopted = WorkflowCopilotCompletionCriteriaSet.model_validate(
+async def test_loader_admits_value_present_requested_output_criterion() -> None:
+    request_slot_id = "a" * 64
+    criteria = [
         {
-            "completion_criteria_set_id": "wccs_2",
-            "organization_id": "o_1",
-            "workflow_copilot_chat_id": "wcc_1",
-            "goal_epoch": 2,
-            "status": "active",
-            "criteria": [{"id": "c0", "outcome": "done", "pinability": []}],
-            "created_at": now,
-            "modified_at": now,
+            "id": request_slot_id,
+            "outcome": "The run returns the number of stars.",
+            "antecedent_family": "unconditional",
+            "expected_output_shape": "value_present",
+            "requested_output_evidence_source": "runtime_output",
+            "kind": "outcome",
+            "output_path": "output.star_count",
+            "request_slot_id": request_slot_id,
+            "pinability": "shapeless_valid",
+            "mint_disposition": "decidable",
         }
-    )
-    monkeypatch.setattr(
-        app.DATABASE,
-        "workflow_params",
-        SimpleNamespace(get_latest_workflow_copilot_completion_criteria_set=AsyncMock(return_value=adopted)),
-    )
-    chat = SimpleNamespace(organization_id="o_1", workflow_copilot_chat_id="wcc_1")
+    ]
 
-    snapshot = await _load_completion_criteria_snapshot(chat)
+    loaded = await _load_latest(_make_row(criteria=criteria))
 
-    assert snapshot == StoredCriteriaSnapshot(active=None, next_epoch=3)
+    assert not isinstance(loaded, NonAdoptableCriteriaSet)
+    (criterion,) = criteria_from_json(loaded.criteria)
+    assert criterion.output_path == "output.star_count"
+    assert criterion.expected_output_shape == "value_present"
+    assert criterion.pinability == "shapeless_valid"
+    assert criterion.mint_disposition == "decidable"
+    assert criterion.classification_output_key is None
+    assert criterion.requested_output_floor_rekeyed is False

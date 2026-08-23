@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from skyvern.cli.mcp_tools._common import CODE_ONLY_POLICY_HINT
 from skyvern.cli.mcp_tools.blocks import skyvern_block_validate
 from skyvern.forge.sdk.copilot.tools.banned_blocks import collect_code_only_banned_items
 
@@ -18,12 +19,23 @@ def _navigation_block() -> dict[str, str]:
     }
 
 
+def _assert_code_only_rejection(result: dict[str, Any], *, label: str) -> None:
+    assert result["ok"] is False
+    error = result["error"]
+    assert isinstance(error, dict)
+    assert "not allowed in code-only mode" in str(error["message"])
+    assert label in str(error["message"])
+    assert "use a `code` block" in str(error["hint"])
+    # Exact-string on purpose: the guidance text is the behavior surface under test — a
+    # keyword check would pass on inverted advice ("pass code_only=false to continue").
+    assert CODE_ONLY_POLICY_HINT in str(error["hint"])
+
+
 @pytest.mark.asyncio
 async def test_navigation_block_rejected_in_code_only_mode() -> None:
     result = await skyvern_block_validate(json.dumps(_navigation_block()), code_only=True)
 
-    assert result["ok"] is False
-    assert "code-only" in result["error"]["message"].lower()
+    _assert_code_only_rejection(result, label="do_search")
 
 
 @pytest.mark.asyncio
@@ -33,8 +45,7 @@ async def test_label_less_navigation_block_rejected_in_code_only_mode() -> None:
 
     result = await skyvern_block_validate(json.dumps(block), code_only=True)
 
-    assert result["ok"] is False
-    assert "code-only" in result["error"]["message"].lower()
+    _assert_code_only_rejection(result, label="(unlabeled)")
 
 
 @pytest.mark.asyncio
@@ -47,8 +58,7 @@ async def test_task_block_rejected_in_code_only_mode() -> None:
     }
     result = await skyvern_block_validate(json.dumps(block), code_only=True)
 
-    assert result["ok"] is False
-    assert "code-only" in result["error"]["message"].lower()
+    _assert_code_only_rejection(result, label="do_search")
 
 
 @pytest.mark.asyncio

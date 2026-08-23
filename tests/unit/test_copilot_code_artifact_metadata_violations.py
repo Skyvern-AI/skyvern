@@ -5,7 +5,6 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 
 from __future__ import annotations
 
-import copy
 import re
 import textwrap
 
@@ -16,8 +15,10 @@ from skyvern.forge.sdk.copilot.outcome_verification_trace import (
 from skyvern.forge.sdk.copilot.output_utils import _sanitize_failure_text
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _code_artifact_metadata_shape_errors,
     _code_block_returns_flat_string,
     _code_block_returns_uninvoked_structured_function,
+    _download_descriptor_leak_finding,
     _normalize_code_artifact_metadata_detailed,
 )
 
@@ -103,13 +104,6 @@ class TestAccumulateAllViolations:
         assert "requires `depends_on`" in error
         assert "is `satisfied` but has no" in error
 
-    def test_non_conforming_artifact_id_is_imposed_not_rejected(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata["artifact_id"] = "not-prefixed"
-        normalized, error = _normalize_code_artifact_metadata([metadata], _code_block_yaml("my_block"))
-        assert error is None
-        assert normalized["my_block"]["artifact_id"] == "code_artifact:my_block"
-
     def test_single_violation_is_not_numbered(self) -> None:
         metadata = _valid_metadata("my_block")
         metadata["claimed_outcomes"][0].pop("depends_on")
@@ -144,15 +138,15 @@ class TestAccumulateAllViolations:
         assert "block_one" in error
         assert "block_two" in error
 
-    def test_unknown_label_is_dropped_and_other_artifacts_still_validated(self) -> None:
+    def test_unknown_label_is_rejected_and_other_artifacts_still_validated(self) -> None:
         normalized, error = _normalize_code_artifact_metadata(
             [_broken_metadata("ghost_label"), _broken_metadata("my_block")], _code_block_yaml("my_block")
         )
         assert normalized == {}
         assert error is not None
-        # The stale entry is pruned, never rejected; the anchored artifact's
-        # shape violations are still surfaced.
-        assert "ghost_label" not in error
+        # The stale identity and the anchored artifact's shape violations are both surfaced;
+        # the server never silently drops or rekeys the submitted row.
+        assert "ghost_label" in error
         assert "requires `source_tool`" in error
 
     def test_valid_metadata_passes(self) -> None:
@@ -171,230 +165,15 @@ class TestAccumulateAllViolations:
             "<fill: output JSON path(s) carrying requested goal values>"
         ]
 
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
+        errors = _code_artifact_metadata_shape_errors("my_block", metadata, reject_unfilled_goal_value_paths=True)
 
-        assert normalized == {}
-        assert error is not None
-        assert "claim `claim:x`" in error
-        assert "terminal verifier expectation `exp`" in error
-        assert "has unfilled `goal_value_paths`" in error
+        assert any("claim `claim:x`" in error for error in errors)
+        assert any("terminal verifier expectation `exp`" in error for error in errors)
+        assert all("has unfilled `goal_value_paths`" in error for error in errors)
 
     def test_empty_metadata_is_noop(self) -> None:
         assert _normalize_code_artifact_metadata(None, _code_block_yaml("my_block")) == ({}, None)
         assert _normalize_code_artifact_metadata([], _code_block_yaml("my_block")) == ({}, None)
-
-
-_SCOUT_TRAJECTORY = [
-    {
-        "tool_name": "click",
-        "selector": "#search-submit",
-        "source_url": "https://registry.example.com/search",
-        "role": "button",
-        "accessible_name": "Search",
-        "trajectory_index": 0,
-    },
-]
-
-
-def _assert_passes_full_validator(row: dict) -> None:
-    """The imposed row must conform without any trajectory-driven defaulting."""
-    renormalized, error = _normalize_code_artifact_metadata([row], _code_block_yaml(row["block_label"]))
-    assert error is None, error
-    assert list(renormalized.keys()) == [row["block_label"]]
-
-
-def _assert_passes_skeleton_validator(row: dict) -> None:
-    """Skeleton rows may keep fill-placeholders until the authoring imposition pass."""
-    placeholder = row["terminal_verifier_expectations"][0]["goal_value_paths"][0]
-    assert placeholder.startswith("<fill:")
-    validator_row = copy.deepcopy(row)
-    validator_row["claimed_outcomes"][0]["goal_value_paths"] = [placeholder]
-    # This helper exercises the non-imposition validator path, where skeleton
-    # placeholders are intentionally preserved for the later authoring pass.
-    _assert_passes_full_validator(validator_row)
-
-
-class TestSeamImposition:
-    def test_minimal_metadata_is_fully_defaulted(self) -> None:
-        metadata = {
-            "block_label": "my_block",
-            "declared_goal": "Search the registry and expand result rows",
-            "terminal_verifier_expectations": [{"goal_value_paths": ["records[].number"]}],
-        }
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        row = normalized["my_block"]
-        assert row["artifact_id"] == "code_artifact:my_block"
-        assert row["page_dependencies"]
-        assert row["claimed_outcomes"]
-        assert row["completion_criteria"]
-        assert row["terminal_verifier_expectations"]
-        assert row["observation_refs"]
-        _assert_passes_full_validator(row)
-
-    def test_unfilled_goal_value_path_is_not_propagated_as_default(self) -> None:
-        metadata = {
-            "block_label": "my_block",
-            "declared_goal": "Search the registry and expand result rows",
-            "claimed_outcomes": [
-                {
-                    "text": "records visible",
-                    "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
-                }
-            ],
-        }
-
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-
-        assert normalized == {}
-        assert error is not None
-        assert "has unfilled `goal_value_paths`" in error
-        assert "terminal verifier expectation" in error
-        assert "requires `goal_value_paths` for terminal criteria" in error
-
-    def test_omitted_page_dependencies_filled_from_trajectory(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("page_dependencies")
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        dependency = normalized["my_block"]["page_dependencies"][0]
-        assert dependency["status"] == "observed_not_verified"
-        assert dependency["url_hint"] == "https://registry.example.com/search"
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_omitted_claims_derived_from_declared_goal(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("claimed_outcomes")
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        claim = normalized["my_block"]["claimed_outcomes"][0]
-        assert claim["text"] == "g"
-        assert claim["status"] == "observed_not_verified"
-        assert claim["depends_on"] == ["dependency:p"]
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_omitted_criteria_derived_from_claims(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("completion_criteria")
-        metadata["claimed_outcomes"][0].pop("covered_criteria")
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        row = normalized["my_block"]
-        criterion = row["completion_criteria"][0]
-        assert criterion["level"] == "terminal"
-        assert criterion["text"] == "x"
-        assert row["claimed_outcomes"][0]["covered_criteria"] == [criterion["id"]]
-        _assert_passes_full_validator(row)
-
-    def test_omitted_expectations_linked_to_criteria(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("terminal_verifier_expectations")
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        expectation = normalized["my_block"]["terminal_verifier_expectations"][0]
-        assert expectation["criteria_ids"] == ["criterion:c"]
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_omitted_artifact_refs_default_to_scout_observation(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("observation_refs")
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        ref = normalized["my_block"]["observation_refs"][0]
-        assert ref["source_tool"] == "scout_interaction"
-        assert ref["status"] == "observed_not_verified"
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_missing_ref_source_tool_and_scope_filled(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata["observation_refs"] = [{"observation_ref": "obs1", "status": "observed_not_verified"}]
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        ref = normalized["my_block"]["observation_refs"][0]
-        assert ref["source_tool"] == "scout_interaction"
-        assert ref["dependency_id"] == "dependency:p"
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_contradictory_checkpoint_advance_dropped(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata["observation_refs"][0]["checkpoint_next_mode"] = "advance"
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        assert "checkpoint_next_mode" not in normalized["my_block"]["observation_refs"][0]
-
-    def test_satisfied_claim_without_evidence_is_undefaultable(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata["claimed_outcomes"][0]["status"] = "satisfied"
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "is `satisfied` but has no" in error
-
-    def test_no_imposition_when_not_imposing(self) -> None:
-        metadata = {"block_label": "my_block", "declared_goal": "g"}
-        normalized, error = _normalize_code_artifact_metadata([metadata], _code_block_yaml("my_block"))
-        assert normalized == {}
-        assert error is not None
-        assert "requires non-empty" in error
-
-    def test_imposition_works_without_scout_trajectory(self) -> None:
-        # The run-3 class: model-authored per-entry refs missing the scoped id
-        # and source_tool must be normalized, not rejected, even when no scout
-        # interaction was recorded before authoring.
-        metadata = {
-            "block_label": "my_block",
-            "declared_goal": "g",
-            "terminal_verifier_expectations": [{"goal_value_paths": ["records[].number"]}],
-            "observation_refs": [{"observation_ref": "obs1", "status": "observed_not_verified"}],
-        }
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True
-        )
-        assert error is None
-        ref = normalized["my_block"]["observation_refs"][0]
-        assert ref["dependency_id"]
-        assert ref["source_tool"] == "scout_interaction"
-        assert "url_hint" not in normalized["my_block"]["page_dependencies"][0]
-        _assert_passes_full_validator(normalized["my_block"])
-
-    def test_imposition_fills_missing_mechanical_ids(self) -> None:
-        metadata = {
-            "block_label": "my_block",
-            "declared_goal": "g",
-            "claimed_outcomes": [{"text": "rows visible", "goal_value_paths": ["records[].number"]}],
-            "completion_criteria": [{"text": "rows shown"}],
-        }
-        normalized, error = _normalize_code_artifact_metadata(
-            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
-        )
-        assert error is None
-        row = normalized["my_block"]
-        assert row["claimed_outcomes"][0]["id"]
-        assert row["claimed_outcomes"][0]["scope"] == "outcome"
-        assert row["completion_criteria"][0]["id"]
-        _assert_passes_full_validator(row)
 
 
 class TestPerLabelSalvage:
@@ -421,85 +200,13 @@ class TestPerLabelSalvage:
         assert "block_two" in error
         assert "block_one" not in error
 
-    def test_unknown_label_dropped_alone(self) -> None:
+    def test_unknown_label_rejected_without_discarding_valid_sibling(self) -> None:
         normalized, error = _normalize_code_artifact_metadata(
             [_valid_metadata("ghost_label"), _valid_metadata("my_block")], _code_block_yaml("my_block")
         )
         assert list(normalized.keys()) == ["my_block"]
-        assert error is None
-
-
-class TestStaleLabelRekey:
-    def test_single_stale_entry_rekeys_to_single_uncovered_label(self) -> None:
-        normalized, error = _normalize_code_artifact_metadata(
-            [_valid_metadata("stale_label")], _code_block_yaml("my_block")
-        )
-        assert error is None
-        assert list(normalized.keys()) == ["my_block"]
-        assert normalized["my_block"]["block_label"] == "my_block"
-        assert normalized["my_block"]["artifact_id"] == "code_artifact:my_block"
-
-    def test_label_less_entry_rekeys_to_single_uncovered_label(self) -> None:
-        metadata = _valid_metadata("my_block")
-        metadata.pop("block_label")
-        normalized, error = _normalize_code_artifact_metadata([metadata], _code_block_yaml("my_block"))
-        assert error is None
-        assert list(normalized.keys()) == ["my_block"]
-
-    def test_multiple_stale_entries_are_dropped_not_rekeyed(self) -> None:
-        normalized, error = _normalize_code_artifact_metadata(
-            [_valid_metadata("ghost_a"), _valid_metadata("ghost_b")], _code_block_yaml("my_block")
-        )
-        assert normalized == {}
-        assert error is None
-
-    def test_dropped_stale_entry_leaves_skeleton_for_uncovered_label_when_imposing(self) -> None:
-        normalized, error = _normalize_code_artifact_metadata(
-            [_valid_metadata("ghost_a"), _valid_metadata("ghost_b")],
-            _code_block_yaml("my_block"),
-            impose_defaults=True,
-            scout_trajectory=_SCOUT_TRAJECTORY,
-        )
-        assert error is None
-        assert list(normalized.keys()) == ["my_block"]
-        row = normalized["my_block"]
-        assert row["declared_goal"]
-        assert row["page_dependencies"]
-        assert row["observation_refs"]
-        _assert_passes_skeleton_validator(row)
-
-    def test_partial_coverage_gets_skeleton_for_uncovered_label_when_imposing(self) -> None:
-        yaml = textwrap.dedent(
-            """
-            workflow_definition:
-              blocks:
-                - block_type: code
-                  label: block_one
-                  code: |
-                    await page.goto("https://example.com/")
-                - block_type: code
-                  label: block_two
-                  code: |
-                    await page.goto("https://example.com/")
-            """
-        ).strip()
-        normalized, error = _normalize_code_artifact_metadata(
-            [_valid_metadata("block_one")],
-            yaml,
-            impose_defaults=True,
-            scout_trajectory=_SCOUT_TRAJECTORY,
-        )
-        assert error is None
-        assert sorted(normalized.keys()) == ["block_one", "block_two"]
-        _assert_passes_skeleton_validator(normalized["block_two"])
-
-    def test_duplicate_label_keeps_first_entry(self) -> None:
-        first = _valid_metadata("my_block")
-        second = _valid_metadata("my_block")
-        second["declared_goal"] = "different"
-        normalized, error = _normalize_code_artifact_metadata([first, second], _code_block_yaml("my_block"))
-        assert error is None
-        assert normalized["my_block"]["declared_goal"] == "g"
+        assert error is not None
+        assert "ghost_label" in error
 
 
 def _extraction_code_block_yaml(label: str, code: str) -> str:
@@ -981,7 +688,27 @@ def _download_intent_metadata(label: str) -> dict:
     return metadata
 
 
-class TestDownloadReturnShape:
+class TestDownloadDescriptorLeak:
+    """A run cannot reveal this arm: the run succeeds and the path lands in workflow output.
+    The registration-detection arms were deleted precisely because a run does reveal those."""
+
+    def test_returned_path_or_url_is_flagged(self) -> None:
+        for code in (
+            'return {"downloaded_file_path": p}',
+            'return {"download_url": u}',
+            'out = {"download_url": u}\nreturn out',
+        ):
+            assert _download_descriptor_leak_finding("b", code) is not None
+
+    def test_clean_descriptor_and_registration_keys_are_not_flagged(self) -> None:
+        assert _download_descriptor_leak_finding("b", 'return {"saved_as": n}') is None
+        assert _download_descriptor_leak_finding("b", 'return {"downloaded_files": [f]}') is None
+
+
+class TestDownloadShapesThatMustNotBeFlagged:
+    """Negative space for the surviving descriptor-leak arm: a clean descriptor, an extraction
+    block, and a non-download block must all normalize without a violation."""
+
     def test_expect_download_idiom_with_descriptor_passes(self) -> None:
         code = """
         async with page.expect_download() as dl_info:
@@ -995,93 +722,6 @@ class TestDownloadReturnShape:
         assert error is None
         assert list(normalized.keys()) == ["dl_block"]
 
-    def test_self_asserted_keys_without_idiom_is_rejected(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_plain_click_fabricated_dict_is_rejected(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_file_name": "statement.pdf", "evidence": "ok"}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_static_fetch_body_is_rejected(self) -> None:
-        code = """
-        import requests
-        body = requests.get("https://example.com/statement.pdf").content
-        return {"downloaded_files": [body]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
-    def test_idiom_but_returns_registration_keys_is_rejected(self) -> None:
-        code = """
-        async with page.expect_download() as dl_info:
-            await page.click("a#statement-pdf")
-        return {"downloaded_files": [await dl_info.value.path()]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "downloaded_files" in error
-        assert "self-certifies" in error
-
-    def test_idiom_but_returns_raw_path_or_url_descriptor_keys_is_rejected(self) -> None:
-        code = """
-        async with page.expect_download() as dl_info:
-            await page.click("a#statement-pdf")
-        payload = dict(
-            download_url="https://example.com/statement.pdf",
-            downloaded_file_path=await dl_info.value.path(),
-            downloaded_file_name="statement.pdf",
-        )
-        return payload
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "raw download path/URL descriptor keys" in error
-
-    def test_self_asserted_keys_detected_without_goal_path_declaration(self) -> None:
-        code = """
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_non_extraction_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
-
     def test_extraction_block_is_not_treated_as_download_intent(self) -> None:
         code = """
         await page.goto("https://example.com/")
@@ -1093,20 +733,6 @@ class TestDownloadReturnShape:
         )
         assert error is None
         assert list(normalized.keys()) == ["ex_block"]
-
-    def test_bare_expect_download_attribute_does_not_satisfy_the_idiom(self) -> None:
-        code = """
-        _ = page.expect_download
-        await page.click("a#statement-pdf")
-        return {"downloaded_files": ["/tmp/statement.pdf"]}
-        """
-        normalized, error = _normalize_code_artifact_metadata(
-            [_download_intent_metadata("dl_block")],
-            _extraction_code_block_yaml("dl_block", code),
-        )
-        assert normalized == {}
-        assert error is not None
-        assert "expect_download" in error
 
     def test_non_download_non_extraction_block_passes(self) -> None:
         code = """

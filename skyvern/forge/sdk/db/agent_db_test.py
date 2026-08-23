@@ -32,11 +32,13 @@ async def test_create_organization(agent_db: AgentDB) -> None:
     assert organization is not None
     assert organization.organization_name == org_name
     assert organization.domain == domain
+    assert organization.slug == "test-organization"
 
     retrieved_org = await agent_db.organizations.get_organization(organization.organization_id)
     assert retrieved_org is not None
     assert retrieved_org.organization_name == org_name
     assert retrieved_org.domain == domain
+    assert retrieved_org.slug == "test-organization"
 
     retrieved_by_domain = await agent_db.organizations.get_organization_by_domain(domain=domain)
     assert retrieved_by_domain is not None
@@ -58,6 +60,32 @@ async def test_create_organization_with_explicit_id(agent_db: AgentDB) -> None:
     assert retrieved_org is not None
     assert retrieved_org.organization_name == "Explicit Id Organization"
     assert retrieved_org.domain == "explicit.test"
+
+
+@pytest.mark.asyncio
+async def test_create_organization_retries_derived_slug_collision(agent_db: AgentDB) -> None:
+    first = await agent_db.organizations.create_organization("Shared Name")
+    second = await agent_db.organizations.create_organization("Shared Name")
+
+    assert first.slug == "shared-name"
+    assert second.slug == "shared-name-2"
+
+
+@pytest.mark.asyncio
+async def test_set_organization_slug_if_missing_preserves_existing_slug(agent_db: AgentDB) -> None:
+    organization = await agent_db.organizations.create_organization("Shared Name", derive_slug=False)
+
+    winner = await agent_db.organizations.set_organization_slug_if_missing(
+        organization_id=organization.organization_id,
+        slug="first-slug",
+    )
+    loser = await agent_db.organizations.set_organization_slug_if_missing(
+        organization_id=organization.organization_id,
+        slug="stale-slug",
+    )
+
+    assert winner.slug == "first-slug"
+    assert loser.slug == "first-slug"
 
 
 @pytest.mark.asyncio

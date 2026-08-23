@@ -131,15 +131,23 @@ type NodeSettleDeps = {
   getInternalNode: (nodeId: string) => InternalNodeLike | undefined;
   requestFrame?: (callback: () => void) => void;
   now?: () => number;
+  // True while a collapse-triggered Dagre relayout is scheduled or in
+  // flight (e.g. use-debounce's `.pending()`). A batched ancestor expand
+  // fires that relayout asynchronously, so position can look unchanged in
+  // the dead window before it lands — stability alone would resolve on
+  // stale geometry. Defaults to "never pending" for callers (branch switch)
+  // whose relayout isn't debounced through that path.
+  isRelayoutPending?: () => boolean;
 };
 
 /**
- * Resolves once `nodeId` is visible and its canvas position has held still
- * for a few consecutive frames. A branch switch cascades visibility (the
- * BranchesEditor effect) and then a full re-layout (Workspace's
- * conditional-branch-changed listener) on staggered timeouts, so positions
- * read before this settles are stale. Times out rather than hanging when the
- * node never becomes visible.
+ * Resolves once `nodeId` is visible, no collapse-triggered relayout is
+ * pending, and its canvas position has held still for a few consecutive
+ * frames. A branch switch cascades visibility (the BranchesEditor effect)
+ * and then a full re-layout (Workspace's conditional-branch-changed
+ * listener) on staggered timeouts, so positions read before this settles
+ * are stale. Times out rather than hanging when the node never becomes
+ * visible.
  */
 export function waitForNodeSettle(
   nodeId: string,
@@ -149,6 +157,7 @@ export function waitForNodeSettle(
     deps.requestFrame ??
     ((callback) => window.requestAnimationFrame(() => callback()));
   const now = deps.now ?? (() => performance.now());
+  const isRelayoutPending = deps.isRelayoutPending ?? (() => false);
   const startedAt = now();
   let lastX: number | null = null;
   let lastY: number | null = null;
@@ -165,7 +174,8 @@ export function waitForNodeSettle(
         visible &&
         position !== null &&
         position.x === lastX &&
-        position.y === lastY
+        position.y === lastY &&
+        !isRelayoutPending()
       ) {
         stableFrames += 1;
       } else {
@@ -197,6 +207,9 @@ export type FocusBlockDeps = {
     options: { duration: number },
   ) => void;
   selectBlock: (nodeId: string) => void;
+  // Gives the canvas a synchronous point to arm its relayout gate before an
+  // expand schedules React effects and the delayed dimension relayout.
+  beforeExpand?: (label: string) => void;
   expandBlock: (label: string) => void;
   // Writes activeBranchId into the conditional's node data — the same write
   // the branch tab click makes (the binding supplies the dirty-state guards).
@@ -268,6 +281,10 @@ export async function focusBlockTarget(
   nodeId: string,
   deps: FocusBlockDeps,
 ): Promise<boolean> {
+  const expandContainer = (label: string) => {
+    deps.beforeExpand?.(label);
+    deps.expandBlock(label);
+  };
   const findNode = (id: string) =>
     deps.getNodes().find((candidate) => candidate.id === id);
   const target = findNode(nodeId);
@@ -282,7 +299,7 @@ export async function focusBlockTarget(
       deps.selectBlock(conditionalId);
       // A collapsed conditional renders header-only without its BranchesEditor,
       // whose mounted effect is what applies the branch visibility switch.
-      deps.expandBlock(conditionalLabel);
+      expandContainer(conditionalLabel);
       anchorViewportToNode(conditional, deps);
     }
     deps.switchBranch(conditionalId, branchId);
@@ -301,7 +318,7 @@ export async function focusBlockTarget(
     );
     if (ancestorLabels.length > 0) {
       for (const label of ancestorLabels) {
-        deps.expandBlock(label);
+        expandContainer(label);
       }
       await deps.waitForSettle(nodeId);
     }

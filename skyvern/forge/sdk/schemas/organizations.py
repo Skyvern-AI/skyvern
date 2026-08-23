@@ -1,8 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.utils.organization_slug import is_valid_org_slug
 
 
 class Organization(BaseModel):
@@ -10,6 +11,7 @@ class Organization(BaseModel):
 
     organization_id: str
     organization_name: str
+    slug: str | None = None
     webhook_callback_url: str | None = None
     max_steps_per_run: int | None = None
     max_steps_per_workflow_run: int | None = None
@@ -26,6 +28,8 @@ class Organization(BaseModel):
             "Bounded between 1 hour (3600) and 7 days (604800)."
         ),
     )
+    default_llm_key: str | None = None
+    default_secondary_llm_key: str | None = None
 
     created_at: datetime
     modified_at: datetime
@@ -183,6 +187,10 @@ class GetOrganizationAPIKeysResponse(BaseModel):
 
 
 class OrganizationUpdate(BaseModel):
+    slug: str | None = Field(
+        default=None,
+        description="Set a stable organization slug. Omit this field to keep the current slug. Explicit null is rejected.",
+    )
     max_steps_per_run: int | None = Field(default=None, ge=1)
     max_steps_per_workflow_run: int | None = Field(default=None, ge=1)
     clear_max_steps_per_workflow_run: bool = Field(
@@ -215,3 +223,38 @@ class OrganizationUpdate(BaseModel):
             "``artifact_url_expiry_seconds`` (the clear flag wins)."
         ),
     )
+    default_llm_key: str | None = Field(
+        None,
+        description=(
+            "Custom LLM registry key to use as the org's Smart LLM. Pass null to leave the current value unchanged. "
+            "Set ``clear_default_llm_key`` to true to use the Skyvern Default."
+        ),
+    )
+    clear_default_llm_key: bool = Field(
+        False,
+        description=(
+            "When true, resets ``default_llm_key`` to NULL so the org uses the Skyvern Default. Mutually exclusive "
+            "with a non-null value in ``default_llm_key`` (the clear flag wins)."
+        ),
+    )
+    default_secondary_llm_key: str | None = Field(
+        None,
+        description=(
+            "Custom LLM registry key to use as the org's Fast LLM. Pass null to leave the current value unchanged. "
+            "Set ``clear_default_secondary_llm_key`` to true to use the Skyvern Default."
+        ),
+    )
+    clear_default_secondary_llm_key: bool = Field(
+        False,
+        description=(
+            "When true, resets ``default_secondary_llm_key`` to NULL so the org uses the Skyvern Default. Mutually "
+            "exclusive with a non-null value in ``default_secondary_llm_key`` (the clear flag wins)."
+        ),
+    )
+
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, value: str | None) -> str | None:
+        if value is not None and not is_valid_org_slug(value):
+            raise ValueError("slug must match ^[a-z0-9-]{1,20}$")
+        return value

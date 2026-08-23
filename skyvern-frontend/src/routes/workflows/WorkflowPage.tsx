@@ -8,7 +8,7 @@ import {
 } from "@radix-ui/react-icons";
 
 import { Tip } from "@/components/Tip";
-import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
+import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
@@ -98,7 +98,8 @@ import {
 } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { RunBulkActionBar } from "@/routes/runs/RunBulkActionBar";
-import { RunRowContextMenu } from "@/routes/runs/RunRowContextMenu";
+import { RunRowActions } from "@/routes/runs/RunRowActions";
+import { parseStatusParam } from "@/routes/runs/statusFilterParam";
 import { WorkflowReliabilityPanel } from "./workflowRun/WorkflowReliabilityPanel";
 import { RunOutcomeRiskMarker } from "./workflowRun/RunOutcomeRiskMarker";
 import { useRunsHealSummaryBatchQuery } from "./hooks/useRunsHealSummaryBatchQuery";
@@ -120,13 +121,22 @@ function WorkflowPage() {
     [searchParams],
   );
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
-  const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
+  const statusFilters = useMemo(
+    () => parseStatusParam(searchParams.get("status")),
+    [searchParams],
+  );
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
 
   const PAGE_SIZE_OPTIONS = ["10", "25", "50"];
   const pageSize = Number(searchParams.get("page_size") || "10");
-  const [search, setSearch] = useState("");
+  // The URL owns the query so a navigate-in-then-back round trip restores it;
+  // the mirrored state keeps typing instant instead of awaiting the navigation.
+  const searchParam = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(searchParam);
+  useEffect(() => {
+    setSearch(searchParam);
+  }, [searchParam]);
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
   const { matchesParameter } = useKeywordSearch(debouncedSearch);
@@ -359,6 +369,11 @@ function WorkflowPage() {
                   onChange={(value) => {
                     setSearch(value);
                     const params = new URLSearchParams(searchParams);
+                    if (value === "") {
+                      params.delete("search");
+                    } else {
+                      params.set("search", value);
+                    }
                     params.set("page", "1");
                     setSearchParams(params, { replace: true });
                   }}
@@ -382,7 +397,16 @@ function WorkflowPage() {
                 ) : null}
                 <StatusFilterDropdown
                   values={statusFilters}
-                  onChange={setStatusFilters}
+                  onChange={(filters) => {
+                    const params = new URLSearchParams(searchParams);
+                    if (filters.length === 0) {
+                      params.delete("status");
+                    } else {
+                      params.set("status", filters.join(","));
+                    }
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
                 />
               </div>
             </div>
@@ -444,13 +468,13 @@ function WorkflowPage() {
                         workflowRun.workflow_run_id,
                       );
                       const runPath = studioEnabled
-                        ? `/agents/${workflowPermanentId}/studio?wr=${workflowRun.workflow_run_id}`
+                        ? `/runs/${workflowRun.workflow_run_id}`
                         : legacyRunDetailPath(
                             workflowPermanentId,
                             workflowRun.workflow_run_id,
                           );
 
-                      const mainRow = (
+                      const mainRow = (kebab: React.ReactNode) => (
                         <TableRow
                           onClick={(event) => {
                             if (event.ctrlKey || event.metaKey) {
@@ -529,6 +553,11 @@ function WorkflowPage() {
                                     <Button
                                       size="icon"
                                       variant="ghost"
+                                      aria-label={
+                                        isExpanded
+                                          ? "Hide inputs"
+                                          : "Show inputs"
+                                      }
                                       onClick={(event) => {
                                         event.stopPropagation();
                                         toggleParametersExpanded(
@@ -549,6 +578,7 @@ function WorkflowPage() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
+                              {kebab}
                             </div>
                           </TableCell>
                         </TableRow>
@@ -556,24 +586,21 @@ function WorkflowPage() {
 
                       return (
                         <React.Fragment key={workflowRun.workflow_run_id}>
-                          {taggingEnabled ? (
-                            <RunRowContextMenu
-                              workflowRunId={workflowRun.workflow_run_id}
-                              runPath={runPath}
-                              currentTags={runTags ?? []}
-                              tagKeys={tagFilterKeys}
-                              labelSuggestions={runTagSuggestions?.labels ?? []}
-                              valueSuggestionsByKey={
-                                runTagSuggestions?.valuesByKey
-                              }
-                              selectedCount={selectedRuns.length}
-                              onNavigate={navigate}
-                            >
-                              {mainRow}
-                            </RunRowContextMenu>
-                          ) : (
-                            mainRow
-                          )}
+                          <RunRowActions
+                            runId={workflowRun.workflow_run_id}
+                            runPath={runPath}
+                            taggable={taggingEnabled}
+                            currentTags={runTags ?? []}
+                            tagKeys={tagFilterKeys}
+                            labelSuggestions={runTagSuggestions?.labels ?? []}
+                            valueSuggestionsByKey={
+                              runTagSuggestions?.valuesByKey
+                            }
+                            selectedCount={selectedRuns.length}
+                            onNavigate={navigate}
+                          >
+                            {mainRow}
+                          </RunRowActions>
                           {/* Expanded parameters section */}
                           {isExpanded && (
                             <TableRow

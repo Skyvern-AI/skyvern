@@ -1,7 +1,9 @@
+import ast
 import asyncio
 import copy
 import json
 import string
+import textwrap
 from datetime import UTC, datetime
 from typing import Any
 
@@ -13,6 +15,7 @@ from skyvern.config import settings
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.exceptions import (
     FailedToSendWebhook,
+    ScreenshotTargetClosed,
     TaskTerminationError,
     TaskV2NotFound,
     UrlGenerationFailure,
@@ -20,7 +23,10 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLMAPIHandlerFactory,
+    get_org_aware_primary_llm_api_handler,
+)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CustomLLMNotFoundError,
     ensure_custom_llm_model_registered_for_org,
@@ -34,6 +40,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import (
+    TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL,
     TaskV2,
     TaskV2Metadata,
     TaskV2Status,
@@ -43,8 +50,10 @@ from skyvern.forge.sdk.schemas.task_v2 import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
+    CodeBlock,
     ExtractionBlock,
     ForLoopBlock,
     NavigationBlock,
@@ -67,6 +76,7 @@ from skyvern.schemas.workflows import (
     PARAMETER_YAML_TYPES,
     BlockResult,
     BlockStatus,
+    CodeBlockYAML,
     ContextParameterYAML,
     ExtractionBlockYAML,
     ForLoopBlockYAML,
@@ -77,14 +87,15 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
     WorkflowStatus,
 )
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services import planner_levers
+from skyvern.services.webhook_delivery import deliver_webhook_with_retries, describe_delivery_error
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.actions import ActionType
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
-from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context
+from skyvern.webeye.utils.page import SkyvernFrame, build_open_tabs_context, capture_open_tab_screenshots
 
 LOG = structlog.get_logger()
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -124,7 +135,9 @@ async def _validate_task_v2_model_for_org(organization: Organization, model: dic
 
 
 def _get_task_v2_llm_api_handler(task_v2: TaskV2) -> Any:
-    return LLMAPIHandlerFactory.get_override_llm_api_handler(task_v2.llm_key, default=app.LLM_API_HANDLER)
+    return LLMAPIHandlerFactory.get_override_llm_api_handler(
+        task_v2.llm_key, default=get_org_aware_primary_llm_api_handler()
+    )
 
 
 def _generate_data_extraction_schema_for_loop(loop_values_key: str) -> dict:
@@ -160,7 +173,12 @@ async def _summarize_max_steps_failure_reason(
         if page is None:
             return "Failed to get the current browser page", None
 
-        screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=str(task_v2.url), draw_boxes=False)
+        screenshots = await SkyvernFrame.take_split_screenshots(
+            page=page,
+            url=str(task_v2.url),
+            draw_boxes=False,
+            engine_selection=browser_state.engine_selection,
+        )
 
         run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
             workflow_run_id=task_v2.workflow_run_id,
@@ -306,6 +324,8 @@ async def initialize_task_v2(
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
+    browser_profile_id: str | None = None,
+    start_fresh_browser: bool = False,
     extra_http_headers: dict[str, str] | None = None,
     cdp_connect_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
@@ -360,6 +380,8 @@ async def initialize_task_v2(
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
+                browser_profile_id=browser_profile_id,
+                start_fresh_browser=start_fresh_browser,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
@@ -542,12 +564,16 @@ async def run_task_v2(
     workflow, workflow_run = None, None
     parent_context = skyvern_context.current()
     current_run_id = parent_context.run_id if parent_context and parent_context.run_id else task_v2_id
-    # Carry trigger_type + use_flex_llm_routing forward from the parent context (set in
-    # scripts/run_task_v2.py at worker boot) so flex routing eligibility persists into the
-    # scoped TaskV2 execution context.
+    # Carry trigger_type, use_flex_llm_routing, and the execution-start transient-UI capture arm
+    # forward from the parent context (set in scripts/run_task_v2.py at worker boot). scoped() takes
+    # a wholesale replacement context, so any field not copied here is dropped for the scope; without
+    # the arm fields the boot resolution would be lost and TaskV2 would re-resolve (or run off) before
+    # its first capture.
     context = SkyvernContext(
         organization_id=organization_id,
         organization_name=organization.organization_name,
+        org_default_llm_key=organization.default_llm_key,
+        org_default_secondary_llm_key=organization.default_secondary_llm_key,
         root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
         task_v2_id=task_v2_id,
         run_id=current_run_id,
@@ -557,6 +583,14 @@ async def run_task_v2(
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
         consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
+        # The parent run body's asyncio.timeout stays binding inside this scope; dropping the
+        # deadline would let long-blocking work (e.g. a throttled vendor create) wait past it
+        # and be cancelled instead of giving up in time to degrade.
+        max_elapsed_deadline=parent_context.max_elapsed_deadline if parent_context else None,
+        preserve_transient_ui_capture=parent_context.preserve_transient_ui_capture if parent_context else None,
+        preserve_transient_ui_capture_resolved=(
+            parent_context.preserve_transient_ui_capture_resolved if parent_context else False
+        ),
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
@@ -633,6 +667,32 @@ def _resolve_max_iterations(max_iterations_override: str | int | None) -> int:
                 max_iterations_override=max_iterations_override,
             )
     return DEFAULT_MAX_ITERATIONS
+
+
+def _converge_iterations_remaining(i: int, max_iterations: int, converge_pct: int) -> int | None:
+    """Iterations left (including the current one) once inside the final converge_pct% window, else None.
+
+    Returns >=1 inside the window so the planner can interpolate urgency; never 0. 0 pct disables.
+    """
+    if converge_pct <= 0:
+        return None
+    remaining = max_iterations - i
+    window = max(1, (max_iterations * converge_pct) // 100)
+    return remaining if remaining <= window else None
+
+
+def _should_run_post_block_completion_check(
+    block_success: bool | None,
+    task_type: str,
+    *,
+    navigate_completion_check_enabled: bool,
+    skip_completion_check_after_navigate: bool,
+) -> bool:
+    if block_success is not True:
+        return False
+    if skip_completion_check_after_navigate and task_type == "navigate" and navigate_completion_check_enabled:
+        return False
+    return True
 
 
 async def run_task_v2_helper(
@@ -748,12 +808,29 @@ async def run_task_v2_helper(
     yaml_parameters: list[PARAMETER_YAML_TYPES] = []
     current_url: str | None = None
 
+    if browser_session_id:
+        # Task V2 bypasses WorkflowService's normal browser-session acquisition path. Establish
+        # the same immutable workflow lease here before the public BrowserManager call so the
+        # worker can prove ownership without recomputing it later from mutable task/context data.
+        lease_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+            browser_session_id=browser_session_id,
+            runnable_type="workflow_run",
+            runnable_id=root_workflow_run_id,
+            organization_id=organization_id,
+        )
+        context.browser_session_runnable_id = root_workflow_run_id
+        context.browser_session_runnable_generation_id = lease_generation_id
+
     browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
         workflow_run=workflow_run,
         url=str(task_v2.url) if task_v2.url else None,
         browser_session_id=browser_session_id,
         browser_profile_id=workflow_run.browser_profile_id,
         navigate=False,
+        browser_session_runnable_id=root_workflow_run_id if browser_session_id else None,
+        browser_session_runnable_generation_id=(
+            context.browser_session_runnable_generation_id if browser_session_id else None
+        ),
     )
 
     page = await browser_state.get_working_page()
@@ -773,6 +850,13 @@ async def run_task_v2_helper(
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
     max_iterations = _resolve_max_iterations(max_iterations_override)
+
+    # Only advertise the compute task type to the planner when CodeBlock execution is available
+    # for this org; otherwise the planner would emit compute steps that fail at execution.
+    compute_enabled = await app.AGENT_FUNCTION.has_code_block_access(organization_id)
+    # the planner's prior-iteration required_subgoals leg-checklist, carried forward when enabled
+    prior_required_subgoals: list[dict] | None = None
+    complete_criterion: str | None = None
 
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
@@ -853,6 +937,10 @@ async def run_task_v2_helper(
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
+        skip_completion_check_after_navigate_enabled = await planner_levers.skip_completion_check_after_navigate(
+            organization_id
+        )
+
         if i == 0 and current_url != url:
             if should_fallback:
                 plan = f"Go to Google because the intended website ({url}) failed to load properly."
@@ -875,11 +963,16 @@ async def run_task_v2_helper(
             try:
                 scraped_page = await browser_state.scrape_website(
                     url=url,
-                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                        engine_selection=browser_state.engine_selection
+                    ),
                     scrape_exclude=app.scrape_exclude,
                 )
                 if page is None:
                     page = await browser_state.get_working_page()
+            except ScreenshotTargetClosed:
+                LOG.warning("Skipping task v2 iteration because the browser target closed", iteration=i, url=url)
+                continue
             except Exception:
                 LOG.exception(
                     "Failed to get browser state or scrape website in task v2 iteration", iteration=i, url=url
@@ -887,11 +980,16 @@ async def run_task_v2_helper(
                 continue
             current_url = current_url if current_url else str(await SkyvernFrame.get_url(frame=page) if page else url)
 
+            iterations_remaining = _converge_iterations_remaining(
+                i, max_iterations, await planner_levers.converge_pct(organization_id)
+            )
             try:
                 open_tabs_context = await build_open_tabs_context(browser_state, page)
             except Exception:
                 LOG.warning("Failed to build open-tabs context for the planner", exc_info=True)
                 open_tabs_context = None
+            planner_mini_goal_improvements = await _is_planner_mini_goal_improvements_enabled(organization_id)
+            carry_subgoals_enabled = await planner_levers.carry_subgoals(organization_id)
             task_v2_prompt = load_prompt_with_elements(
                 scraped_page,
                 prompt_engine,
@@ -901,6 +999,11 @@ async def run_task_v2_helper(
                 task_history=task_history,
                 open_tabs_context=open_tabs_context,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                compute_enabled=compute_enabled,
+                prior_required_subgoals=prior_required_subgoals if carry_subgoals_enabled else None,
+                iterations_remaining=iterations_remaining,
+                step_budget=organization.max_steps_per_run or settings.MAX_STEPS_PER_RUN,
+                planner_mini_goal_improvements=planner_mini_goal_improvements,
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -935,6 +1038,14 @@ async def run_task_v2_helper(
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
             task_type = task_v2_response.get("task_type", "")
+            complete_criterion = (
+                (task_v2_response.get("complete_criterion") or None) if planner_mini_goal_improvements else None
+            )
+            complete_criterion_is_untrusted = bool(complete_criterion)
+            if carry_subgoals_enabled:
+                _subgoals = task_v2_response.get("required_subgoals")
+                if _subgoals:
+                    prior_required_subgoals = _subgoals
             # Create and save task thought
             await app.DATABASE.observer.update_thought(
                 thought_id=thought.observer_thought_id,
@@ -993,6 +1104,7 @@ async def run_task_v2_helper(
                 task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
                     failure_reason="Skyvern failed to generate a task. Please try again later.",
                 )
                 break
@@ -1015,6 +1127,7 @@ async def run_task_v2_helper(
                     task_v2 = await mark_task_v2_as_failed(
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
                         failure_reason="Failed to generate the extraction task.",
                     )
                     break
@@ -1029,6 +1142,8 @@ async def run_task_v2_helper(
                     navigation_goal=navigation_goal,
                     totp_verification_url=task_v2.totp_verification_url,
                     totp_identifier=task_v2.totp_identifier,
+                    complete_criterion=complete_criterion,
+                    complete_criterion_is_untrusted=complete_criterion_is_untrusted,
                 )
                 task_history_record = {"type": task_type, "task": plan}
             elif task_type == "loop":
@@ -1042,6 +1157,7 @@ async def run_task_v2_helper(
                         browser_state=browser_state,
                         original_url=url,
                         scraped_page=scraped_page,
+                        planner_mini_goal_improvements=planner_mini_goal_improvements,
                     )
                     task_history_record = {
                         "type": task_type,
@@ -1054,7 +1170,26 @@ async def run_task_v2_helper(
                     task_v2 = await mark_task_v2_as_failed(
                         task_v2_id=task_v2_id,
                         workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
                         failure_reason="Failed to generate the loop.",
+                    )
+                    break
+            elif task_type == "compute":
+                try:
+                    block, block_yaml_list, parameter_yaml_list = await _generate_compute_task(
+                        task_v2=task_v2,
+                        workflow_id=workflow_id,
+                        plan=plan,
+                        task_history=task_history,
+                    )
+                    task_history_record = {"type": task_type, "task": plan}
+                except Exception:
+                    LOG.exception("Failed to generate compute task")
+                    task_v2 = await mark_task_v2_as_failed(
+                        task_v2_id=task_v2_id,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                        failure_reason="Failed to generate the compute task.",
                     )
                     break
             else:
@@ -1062,6 +1197,7 @@ async def run_task_v2_helper(
                 task_v2 = await mark_task_v2_as_failed(
                     task_v2_id=task_v2_id,
                     workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
                     failure_reason=f"Unsupported task block type gets generated: {task_type}",
                 )
                 break
@@ -1154,7 +1290,12 @@ async def run_task_v2_helper(
                 organization_id=organization_id,
             )
             break
-        if block_result.success is True:
+        if _should_run_post_block_completion_check(
+            block_result.success,
+            task_type,
+            navigate_completion_check_enabled=bool(complete_criterion),
+            skip_completion_check_after_navigate=skip_completion_check_after_navigate_enabled,
+        ):
             completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
             completion_open_tabs_context: str | None = None
@@ -1167,7 +1308,9 @@ async def run_task_v2_helper(
                 )
                 completion_scraped_page = await browser_state.scrape_website(
                     url=url,
-                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
+                    cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
+                        engine_selection=browser_state.engine_selection
+                    ),
                     scrape_exclude=app.scrape_exclude,
                 )
                 completion_screenshots = completion_scraped_page.screenshots
@@ -1181,7 +1324,6 @@ async def run_task_v2_helper(
                 except Exception:
                     LOG.warning("Failed to build open-tabs context for completion check", exc_info=True)
 
-            # validate completion only happens at the last iteration
             task_v2_completion_prompt = prompt_engine.load_prompt(
                 "task_v2_check_completion",
                 user_goal=user_prompt,
@@ -1302,8 +1444,8 @@ async def run_task_v2_helper(
             task_v2 = await mark_task_v2_as_failed(
                 task_v2_id=task_v2_id,
                 workflow_run_id=workflow_run_id,
-                failure_reason=full_failure_reason,
                 organization_id=organization_id,
+                failure_reason=full_failure_reason,
                 failure_category=failure_category,
                 summary=summary_description,
                 output=summarized_output,
@@ -1337,8 +1479,8 @@ async def run_task_v2_helper(
         task_v2 = await mark_task_v2_as_failed(
             task_v2_id=task_v2_id,
             workflow_run_id=workflow_run_id,
-            failure_reason=max_iterations_failure_reason,
             organization_id=organization_id,
+            failure_reason=max_iterations_failure_reason,
             failure_category=max_iterations_failure_category,
             summary=summary_description,
             output=summarized_output,
@@ -1362,7 +1504,7 @@ async def handle_block_result(
             "Block with type {block.block_type} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1378,7 +1520,7 @@ async def handle_block_result(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1387,7 +1529,7 @@ async def handle_block_result(
                 f"Block with type {block.block_type} failed but will continue executing the workflow run {workflow_run_id}",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run.workflow_run_id,
-                block_result=block_result,
+                block_status=block_result.status,
                 continue_on_failure=block.continue_on_failure,
                 block_type_var=block.block_type,
                 block_label=block.label,
@@ -1398,7 +1540,7 @@ async def handle_block_result(
             f"Block with type {block.block_type} was terminated for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1407,7 +1549,7 @@ async def handle_block_result(
                 f"Block with type {block.block_type} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run.workflow_run_id,
-                block_result=block_result,
+                block_status=block_result.status,
                 continue_on_failure=block.continue_on_failure,
                 block_type_var=block.block_type,
                 block_label=block.label,
@@ -1440,7 +1582,23 @@ async def _set_up_workflow_context(workflow: Workflow, workflow_run_id: str, org
         [],
         None,
         workflow,
+        mask_secrets=getattr(workflow, "mask_secrets", False),
     )
+
+
+async def _is_planner_mini_goal_improvements_enabled(organization_id: str) -> bool:
+    """Resolve the org-gated flag for specific self-contained mini goals, per-block complete_criterion,
+    and inline loop_values, falling back to the settings default when the provider is unavailable."""
+    try:
+        if await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+            "PLANNER_MINI_GOAL_IMPROVEMENTS", organization_id, properties={"organization_id": organization_id}
+        ):
+            return True
+    except Exception:
+        LOG.warning(
+            "Failed to resolve PLANNER_MINI_GOAL_IMPROVEMENTS feature flag; using settings default", exc_info=True
+        )
+    return settings.PLANNER_MINI_GOAL_IMPROVEMENTS
 
 
 async def _generate_loop_task(
@@ -1452,6 +1610,7 @@ async def _generate_loop_task(
     browser_state: BrowserState,
     original_url: str,
     scraped_page: ScrapedPage,
+    planner_mini_goal_improvements: bool = False,
 ) -> tuple[ForLoopBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES], dict[str, Any], dict[str, Any]]:
     for_loop_parameter_yaml_list: list[PARAMETER_YAML_TYPES] = []
     loop_value_extraction_goal = prompt_engine.load_prompt(
@@ -1496,7 +1655,6 @@ async def _generate_loop_task(
         output_parameter=loop_value_extraction_output_parameter,
     )
 
-    # execute the extraction block
     extraction_block_result = await extraction_block_for_loop.execute_safe(
         workflow_run_id=workflow_run_id,
         organization_id=task_v2.organization_id,
@@ -1507,11 +1665,9 @@ async def _generate_loop_task(
             "Failed to execute the extraction block for the loop task",
             extraction_block_result=extraction_block_result,
         )
-        # wofklow run and task v2 status update is handled in the upper caller layer
         raise Exception("extraction_block failed")
-    # validate output parameter
     try:
-        output_value_obj: dict[str, Any] = extraction_block_result.output_parameter_value.get("extracted_information")  # type: ignore
+        output_value_obj = extraction_block_result.output_parameter_value.get("extracted_information")  # type: ignore
         if not output_value_obj or not isinstance(output_value_obj, dict):
             raise Exception("Invalid output parameter of the extraction block for the loop task")
         if loop_values_key not in output_value_obj:
@@ -1526,6 +1682,7 @@ async def _generate_loop_task(
             extraction_block_result=extraction_block_result,
         )
         raise
+    extraction_output_value = extraction_block_result.output_parameter_value
 
     # update the thought
     await app.DATABASE.observer.update_thought(
@@ -1550,7 +1707,7 @@ async def _generate_loop_task(
     await app.WORKFLOW_CONTEXT_MANAGER.set_parameter_values_for_output_parameter_dependent_blocks(
         workflow_run_id=workflow_run_id,
         output_parameter=loop_value_extraction_output_parameter,
-        value=extraction_block_result.output_parameter_value,
+        value=extraction_output_value,
     )
     url: str | None = None
     task_parameters: list[PARAMETER_TYPE] = []
@@ -1587,6 +1744,7 @@ async def _generate_loop_task(
         local_datetime=datetime.now(context.tz_info).isoformat(),
         is_link=is_loop_value_link,
         loop_values=loop_values,
+        planner_mini_goal_improvements=planner_mini_goal_improvements,
     )
     thought_task_in_loop = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -1757,6 +1915,160 @@ async def _generate_extraction_task(
     )
 
 
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+class ComputeTaskError(Exception):
+    """Raised when a compute task cannot be generated (e.g. no gathered data to compute over)."""
+
+
+# Names the compute sandbox exposes (or builtins it must not reach) that data-only synthesis must
+# never touch: the live browser page (SSRF/exfiltration), the OTP secret fetcher, async primitives,
+# the regex engine (ReDoS), and dynamic-exec builtins. is_safe_code does not block these as bare
+# names, so compute validates against this list separately.
+_COMPUTE_FORBIDDEN_NAMES = frozenset({"page", "otp", "asyncio", "sleep", "re", "eval", "exec", "compile"})
+# Attributes that defeat the no-dunder guarantee: str.format/format_map interpret dunders inside the
+# format string at runtime (e.g. "{x.__class__}".format_map(...)), which is_safe_code cannot see.
+_COMPUTE_FORBIDDEN_ATTRS = frozenset({"format", "format_map"})
+
+
+def _build_compute_code(gathered: list[dict], snippet: str) -> str:
+    """Prepend the gathered data as a json.loads literal so it is in scope for the snippet."""
+    # Dedent first: generate_async_user_function re-indents the whole body, so a uniformly-indented
+    # snippet concatenated after the zero-indent injection line would break under the wrapper indent.
+    # Hex-escape brace/percent in the data literal: CodeBlock.execute Jinja-renders the code before
+    # exec, so {{ }} / {% %} in web data would be corrupted or resolve secrets. Python decodes the
+    # escapes back at runtime, but the rendered source contains no Jinja markers.
+    literal = repr(json.dumps(gathered, default=str))
+    literal = literal.replace("{", "\\x7b").replace("}", "\\x7d").replace("%", "\\x25")
+    body = textwrap.dedent(snippet).strip("\n")
+    return f"gathered_data = json.loads({literal})\n{body}\n"
+
+
+def _assert_compute_code_safe(code: str) -> None:
+    """Validate that compute code is data-only, bounded, and ends with the output contract."""
+    # is_safe_code blocks imports/dunders/blocked-attrs but not the browser/async/regex/exec names
+    # the sandbox exposes, not unbounded loops, not the .format dunder escape, and not a guarded or
+    # nested return that falls through to captured locals. Raise InsecureCodeDetected (caught by the
+    # regenerate loop) on violation.
+    # CodeBlock.execute Jinja-renders the whole code string before exec, and CODE blocks resolve
+    # real secrets (is_safe_block_for_secrets=True). The gathered-data literal is hex-escaped in
+    # _build_compute_code, so any opening Jinja tag here is from the LLM snippet body — e.g.
+    # "{{ <param>_real_password }}" would render a live secret into the output. Fail closed.
+    if "{{" in code or "{%" in code or "{#" in code:
+        raise InsecureCodeDetected("compute code may not contain Jinja markers ({{, {%, or {#)")
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Await, ast.AsyncFunctionDef, ast.AsyncFor, ast.AsyncWith)):
+            raise InsecureCodeDetected("compute code must be synchronous (no await/async)")
+        if isinstance(node, (ast.While,)):
+            raise InsecureCodeDetected("compute code may not use while loops")
+        if isinstance(node, ast.Name) and node.id in _COMPUTE_FORBIDDEN_NAMES:
+            raise InsecureCodeDetected(f"compute code may not reference '{node.id}'")
+        if isinstance(node, ast.Attribute) and node.attr in _COMPUTE_FORBIDDEN_ATTRS:
+            raise InsecureCodeDetected(f"compute code may not call '.{node.attr}'")
+    # The deliverable must be the unconditional final statement. A guarded (`if x: return {...}`) or
+    # nested return validates but falls through at runtime to the wrapper's captured-locals return,
+    # leaking gathered_data instead of producing the output.
+    last = tree.body[-1] if tree.body else None
+    if not (
+        isinstance(last, ast.Return)
+        and isinstance(last.value, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "output" for k in last.value.keys)
+    ):
+        raise InsecureCodeDetected('compute code must end with `return {"output": ...}` as the final statement')
+
+
+async def _generate_compute_task(
+    task_v2: TaskV2,
+    workflow_id: str,
+    plan: str,
+    task_history: list[dict] | None = None,
+) -> tuple[CodeBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
+    LOG.info("Generating compute task", plan=plan)
+    context = skyvern_context.ensure_context()
+    gathered = [record for record in (task_history or []) if record.get("extracted_data") is not None]
+    if not gathered:
+        raise ComputeTaskError("compute task generated without any gathered extracted_data in the task history")
+
+    max_attempts = 3
+    safe_code: str | None = None
+    last_error: Exception | None = None
+    prior_attempt: str | None = None
+    safety_error: str | None = None
+    for attempt in range(max_attempts):
+        compute_prompt = prompt_engine.load_prompt(
+            "task_v2_generate_compute_code",
+            user_goal=task_v2.prompt,
+            plan=plan,
+            gathered_data=json.dumps(gathered, indent=2, default=str),
+            local_datetime=datetime.now(context.tz_info).isoformat(),
+            prior_attempt=prior_attempt,
+            safety_error=safety_error,
+        )
+        compute_response = await _get_task_v2_llm_api_handler(task_v2)(
+            compute_prompt,
+            task_v2=task_v2,
+            prompt_name="task_v2_generate_compute_code",
+            organization_id=task_v2.organization_id,
+            system_prompt=task_v2.workflow_system_prompt,
+        )
+        snippet = _strip_code_fences(str(compute_response.get("code") or ""))
+        if not snippet.strip():
+            last_error = InsecureCodeDetected("compute code generation returned empty code")
+            prior_attempt = ""
+            safety_error = 'You returned no code. Return a non-empty Python snippet ending with return {"output": ...}.'
+            LOG.warning("Compute code generation returned empty code, retrying", attempt=attempt + 1)
+            continue
+        candidate = _build_compute_code(gathered, snippet)
+        try:
+            CodeBlock.is_safe_code(candidate)
+            _assert_compute_code_safe(candidate)
+            safe_code = candidate
+            break
+        except (InsecureCodeDetected, SyntaxError) as e:
+            LOG.warning(
+                "Generated compute code failed safety validation, retrying",
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                error=str(e),
+            )
+            last_error = e
+            prior_attempt = snippet
+            safety_error = str(e)
+
+    if safe_code is None:
+        raise last_error or InsecureCodeDetected("Failed to synthesize safe compute code")
+
+    label = f"compute_{generate_random_string()}"
+    # A non-null prompt is what makes the editor render the code-first node; "" is runtime-neutral
+    # (every backend prompt check is truthiness based) and leaves the Goal for the user, because a
+    # fabricated one would arm runtime self-heal on a data-only block.
+    code_block_yaml = CodeBlockYAML(label=label, code=safe_code, prompt="")
+    output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
+        workflow_id=workflow_id,
+        block_yaml=code_block_yaml,
+    )
+    return (
+        CodeBlock(
+            label=label,
+            code=safe_code,
+            parameters=[],
+            prompt="",
+            output_parameter=output_parameter,
+        ),
+        [code_block_yaml],
+        [],
+    )
+
+
 async def _generate_navigation_task(
     workflow_id: str,
     workflow_permanent_id: str,
@@ -1765,6 +2077,8 @@ async def _generate_navigation_task(
     original_url: str | None = None,
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
+    complete_criterion: str | None = None,
+    complete_criterion_is_untrusted: bool = False,
 ) -> tuple[NavigationBlock, list[BLOCK_YAML_TYPES], list[PARAMETER_YAML_TYPES]]:
     LOG.info("Generating navigation task", navigation_goal=navigation_goal, original_url=original_url)
     label = f"navigation_{generate_random_string()}"
@@ -1774,7 +2088,9 @@ async def _generate_navigation_task(
         navigation_goal=navigation_goal,
         totp_verification_url=totp_verification_url,
         totp_identifier=totp_identifier,
-        complete_verification=False,
+        complete_criterion=complete_criterion,
+        complete_criterion_is_untrusted=complete_criterion_is_untrusted,
+        complete_verification=bool(complete_criterion),
     )
     output_parameter = await app.WORKFLOW_SERVICE.create_output_parameter_for_block(
         workflow_id=workflow_id,
@@ -1788,7 +2104,9 @@ async def _generate_navigation_task(
             totp_verification_url=totp_verification_url,
             totp_identifier=totp_identifier,
             output_parameter=output_parameter,
-            complete_verification=False,
+            complete_criterion=complete_criterion,
+            complete_criterion_is_untrusted=complete_criterion_is_untrusted,
+            complete_verification=bool(complete_criterion),
         ),
         [navigation_block_yaml],
         [],
@@ -1823,7 +2141,14 @@ async def _generate_goto_url_task(
     )
 
 
-async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> list[WorkflowRunTimeline]:
+async def get_thought_timelines(
+    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
+) -> list[WorkflowRunTimeline]:
+    from skyvern.forge.sdk.workflow.service import (  # noqa: PLC0415
+        truncate_oversized_response_text,
+        truncate_oversized_response_value,
+    )
+
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
         organization_id=organization_id,
@@ -1832,6 +2157,23 @@ async def get_thought_timelines(*, task_v2_id: str, organization_id: str) -> lis
             ThoughtType.user_goal_check,
         ],
     )
+    if cap_output_values:
+        # A thought's generated text and structured output ride this response beside
+        # block outputs and are rendered directly by the run-detail UI.
+        thoughts = [
+            thought.model_copy(
+                update={
+                    "output": truncate_oversized_response_value(
+                        thought.output, thought_id=thought.observer_thought_id, field="output"
+                    ),
+                    **{
+                        field: truncate_oversized_response_text(getattr(thought, field))
+                        for field in ("user_input", "observation", "thought", "answer")
+                    },
+                }
+            )
+            for thought in thoughts
+        ]
     return [
         WorkflowRunTimeline(
             type=WorkflowRunTimelineType.thought,
@@ -1988,19 +2330,61 @@ async def mark_task_v2_as_timed_out(
     workflow_run_id: str | None = None,
     organization_id: str | None = None,
     failure_reason: str | None = None,
+    fallback_workflow_run: WorkflowRun | None = None,
+    workflow_repair_webhook_wait_seconds: float | None = None,
 ) -> TaskV2:
     task_v2 = await _update_task_v2_status(
         task_v2_id,
         organization_id=organization_id,
         status=TaskV2Status.timed_out,
     )
-    if workflow_run_id:
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
-    # Add task timed out tag to trace
+    async def repair_workflow_run() -> None:
+        nonlocal fallback_workflow_run
+        if workflow_run_id:
+            if fallback_workflow_run is None:
+                # Current callers with a linked run already supply this row. Keep
+                # the lookup for future direct callers so a failed status CAS still
+                # has a safe fallback if the follow-up refresh also fails.
+                fallback_workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                    workflow_run_id,
+                    organization_id=organization_id,
+                )
+            await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(
+                workflow_run_id,
+                failure_reason,
+                fallback_workflow_run=fallback_workflow_run,
+            )
+
+    repair_task = asyncio.create_task(repair_workflow_run())
+    await asyncio.wait({repair_task}, timeout=workflow_repair_webhook_wait_seconds)
+
     otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
+    webhook_error: Exception | None = None
+    if task_v2.webhook_failure_reason == TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL:
+        LOG.info(
+            "Skipping previously delivered task v2 timeout webhook",
+            task_v2_id=task_v2.observer_cruise_id,
+        )
+    else:
+        try:
+            await send_task_v2_webhook(task_v2, success_marker=TASK_V2_TIMEOUT_WEBHOOK_DELIVERED_SENTINEL)
+        except Exception as exc:
+            webhook_error = exc
 
-    await send_task_v2_webhook(task_v2)
+    workflow_timeout_error: Exception | None = None
+    try:
+        await repair_task
+    except Exception as exc:
+        workflow_timeout_error = exc
+
+    if workflow_timeout_error is not None:
+        if webhook_error is not None:
+            raise workflow_timeout_error from webhook_error
+        raise workflow_timeout_error
+    if webhook_error is not None:
+        raise webhook_error
+
     return task_v2
 
 
@@ -2027,7 +2411,7 @@ def _get_extracted_data_from_block_result(
 
     Args:
         block_result: The result from block execution
-        task_type: Type of task ("extract", "navigate", or "loop")
+        task_type: Type of task ("extract", "navigate", "loop", or "compute")
         task_v2_id: Optional ID for logging
         workflow_run_id: Optional ID for logging
 
@@ -2083,6 +2467,13 @@ def _get_extracted_data_from_block_result(
                             inner_loop_output_overall.append(output_value["extracted_information"])
                 loop_output_overall.append(inner_loop_output_overall)
             return loop_output_overall if loop_output_overall else None
+    elif task_type == "compute":
+        if (
+            isinstance(block_result.output_parameter_value, dict)
+            and "output" in block_result.output_parameter_value
+            and block_result.output_parameter_value["output"] is not None
+        ):
+            return block_result.output_parameter_value["output"]
     return None
 
 
@@ -2151,56 +2542,68 @@ async def _get_navigate_complete_output(
 
 
 async def _persist_completion_tab_screenshots(browser_state: BrowserState, thought: Thought) -> int:
-    """Capture one screenshot per open tab at completion, persisting each as a SCREENSHOT_LLM artifact.
+    """Persist one SCREENSHOT_LLM per open tab at task_v2 completion (see capture_open_tab_screenshots).
 
-    Best-effort: runs after the goal is already achieved, so nothing here may raise into the
-    completion path and flip a successful run to failed.
+    Skips single-tab runs: the lone active tab is already captured by the completion check.
     """
-    captured = 0
-    try:
-        # max_pages=0 enumerates without list_valid_pages' close-oldest behavior, so we never
-        # close the very tabs we are trying to prove remain open.
-        pages = await browser_state.list_valid_pages(max_pages=0)
-        # A lone tab is already captured by the completion check; only multi-tab runs need this.
-        if len(pages) <= 1:
-            return 0
 
-        per_tab_timeout = settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000
-        # Overall budget so a handful of still-loading tabs can't stall the post-success path.
-        async with asyncio.timeout(settings.COMPLETION_TAB_SCREENSHOTS_TOTAL_TIMEOUT_SECONDS):
-            for page in pages[: settings.MAX_COMPLETION_TAB_SCREENSHOTS_PER_TASK_V2]:
-                screenshots: list[bytes] = []
-                try:
-                    # Bound each tab: a slow tab's bring_to_front / load-wait must not stall completion.
-                    async with asyncio.timeout(per_tab_timeout):
-                        try:
-                            # Front each tab so Chromium paints lazily-rendered background content.
-                            await page.bring_to_front()
-                        except Exception:
-                            LOG.debug("Failed to bring tab to front before completion screenshot", exc_info=True)
-                        screenshots = await SkyvernFrame.take_split_screenshots(page=page, scroll=False)
-                except Exception:
-                    LOG.warning("Failed to capture completion screenshot for an open tab", exc_info=True)
-                    continue
-                for screenshot in screenshots:
-                    try:
-                        await app.ARTIFACT_MANAGER.create_thought_artifact(
-                            thought=thought,
-                            artifact_type=ArtifactType.SCREENSHOT_LLM,
-                            data=screenshot,
-                        )
-                        captured += 1
-                    except Exception:
-                        LOG.warning("Failed to persist completion tab screenshot artifact", exc_info=True)
-    except Exception:
-        LOG.warning("Aborted capturing completion tab screenshots", captured=captured, exc_info=True)
+    async def _persist(frame: bytes) -> None:
+        await app.ARTIFACT_MANAGER.create_thought_artifact(
+            thought=thought,
+            artifact_type=ArtifactType.SCREENSHOT_LLM,
+            data=frame,
+        )
 
+    captured = await capture_open_tab_screenshots(browser_state, persist=_persist, skip_single_tab=True)
     LOG.info(
         "Captured end-state per-tab screenshots at task_v2 completion",
         captured=captured,
         observer_thought_id=thought.observer_thought_id,
     )
     return captured
+
+
+def _parse_task_v2_summary_response(resp: Any) -> tuple[str | None, Any]:
+    """Extract (description, output) from a task_v2_summary reply, tolerating envelope
+    non-compliance.
+
+    The summary prompt requires a {"description", "output"} envelope, but when the user
+    goal defines its own output contract the model sometimes follows that contract
+    instead, emitting the deliverable at the top level of the reply. In that case the
+    reply itself IS the output; dropping it loses the run's extracted_information
+    (SKY-14004). The recovered payload keeps every data key — including a user-schema
+    "description" — so a goal-defined contract survives verbatim; only null envelope
+    slots are dropped.
+
+    The LLM handler runs with force_dict=True, so non-dict replies cannot reach this
+    parser in production; they are handled defensively.
+    """
+    if not isinstance(resp, dict):
+        return None, None
+    description = resp.get("description")
+    if not isinstance(description, str):
+        description = None
+    output = resp.get("output")
+    if output is None:
+        # Data beyond a compliant envelope: any key besides "output", except a
+        # "description" holding the envelope's string (or null) slot. A non-str,
+        # non-null "description" is user data, not the envelope.
+        has_payload = any(
+            key != "description" or (value is not None and not isinstance(value, str))
+            for key, value in resp.items()
+            if key != "output"
+        )
+        if has_payload:
+            output = {
+                key: value
+                for key, value in resp.items()
+                if key != "output" and not (key == "description" and value is None)
+            }
+            LOG.info(
+                "Recovered task_v2 summary output from non-envelope response",
+                recovered_keys=sorted(output.keys()),
+            )
+    return description, output
 
 
 async def _generate_task_v2_deliverable(
@@ -2220,7 +2623,6 @@ async def _generate_task_v2_deliverable(
         thought_type=ThoughtType.user_goal_check,
         thought_scenario=ThoughtScenario.summarization,
     )
-    # summarize the task v2 and format the output
     task_v2_summary_prompt = prompt_engine.load_prompt(
         "task_v2_summary",
         user_goal=task_v2.prompt,
@@ -2238,8 +2640,7 @@ async def _generate_task_v2_deliverable(
     )
     LOG.info("Task v2 summary response", task_v2_summary_resp=task_v2_summary_resp, is_partial=is_partial)
 
-    summary_description = task_v2_summary_resp.get("description")
-    summarized_output = task_v2_summary_resp.get("output")
+    summary_description, summarized_output = _parse_task_v2_summary_response(task_v2_summary_resp)
     await app.DATABASE.observer.update_thought(
         thought_id=thought.observer_thought_id,
         organization_id=task_v2.organization_id,
@@ -2298,15 +2699,18 @@ async def _summarize_task_v2(
     )
 
 
-async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
+async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = False) -> TaskRunResponse:
     """Build TaskRunResponse object for webhook backward compatibility."""
+    from skyvern.forge.sdk.workflow.service import truncate_oversized_response_value  # noqa: PLC0415
     from skyvern.services import workflow_service  # noqa: PLC0415
 
     workflow_run_resp = None
     if task_v2.workflow_run_id:
         try:
             workflow_run_resp = await workflow_service.get_workflow_run_response(
-                task_v2.workflow_run_id, organization_id=task_v2.organization_id
+                task_v2.workflow_run_id,
+                organization_id=task_v2.organization_id,
+                cap_output_values=cap_output_values,
             )
         except Exception:
             LOG.warning(
@@ -2323,7 +2727,11 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         run_id=task_v2.observer_cruise_id,
         run_type=RunType.task_v2,
         status=task_v2.status,
-        output=task_v2.output,
+        output=(
+            truncate_oversized_response_value(task_v2.output, task_v2_id=task_v2.observer_cruise_id)
+            if cap_output_values
+            else task_v2.output
+        ),
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
         queued_at=task_v2.queued_at,
         started_at=task_v2.started_at,
@@ -2351,7 +2759,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
     )
 
 
-async def send_task_v2_webhook(task_v2: TaskV2) -> None:
+async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> None:
     if not task_v2.webhook_callback_url:
         return
     # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
@@ -2386,14 +2794,36 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             payload_length=len(payload),
             header_keys=sorted(headers.keys()),
         )
-        resp = await deliver_webhook_with_retries(
-            url=task_v2.webhook_callback_url,
-            payload=payload,
-            headers=headers,
-            timeout_seconds=30.0,
-            organization_id=task_v2.organization_id,
-            run_id=task_v2.observer_cruise_id,
-        )
+        try:
+            resp = await deliver_webhook_with_retries(
+                url=task_v2.webhook_callback_url,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=30.0,
+                organization_id=task_v2.organization_id,
+                run_id=task_v2.observer_cruise_id,
+            )
+        except Exception as delivery_error:
+            LOG.warning(
+                "Task v2 webhook delivery failed after attempting delivery",
+                task_v2_id=task_v2.observer_cruise_id,
+                organization_id=task_v2.organization_id,
+                error=describe_delivery_error(delivery_error),
+                exc_info=True,
+            )
+            try:
+                await app.DATABASE.observer.update_task_v2(
+                    task_v2_id=task_v2.observer_cruise_id,
+                    organization_id=task_v2.organization_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {describe_delivery_error(delivery_error)}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record task v2 webhook delivery error",
+                    task_v2_id=task_v2.observer_cruise_id,
+                    exc_info=True,
+                )
+            raise
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Task v2 webhook sent successfully",
@@ -2404,13 +2834,12 @@ async def send_task_v2_webhook(task_v2: TaskV2) -> None:
             await app.DATABASE.observer.update_task_v2(
                 task_v2_id=task_v2.observer_cruise_id,
                 organization_id=task_v2.organization_id,
-                webhook_failure_reason="",
+                webhook_failure_reason=success_marker,
             )
         else:
             LOG.info(
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
-                resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )

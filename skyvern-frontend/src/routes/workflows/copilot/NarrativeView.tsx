@@ -16,18 +16,53 @@ import {
   TurnSummary,
   computeTurnSummary,
   condenseActivityEntries,
-  effectiveMode,
   formatElapsed,
+  humanizeJudgeText,
   isBlockOk,
+  isInterimOutcome,
   latestBlocksByLabel,
+  notConfirmedOutcome,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
 import { useShimmerText } from "../workflowRun/useShimmerText";
+import { useThemeAsDarkOrLight } from "../../../components/useThemeAsDarkOrLight";
 
 // Row flashes green/red for 600ms once revealed — must match the tailwind
 // copilot-row-flash-* animation duration.
 const FLASH_WINDOW_MS = 600;
+const OUTCOME_REASON_PREVIEW_LIMIT = 140;
+
+function normalizeOutcomeReason(
+  reason: string | null | undefined,
+): string | null {
+  const trimmed = reason?.trim();
+  if (!trimmed) return null;
+  const humanized = humanizeJudgeText(trimmed);
+  return humanized.length > 0 ? humanized : null;
+}
+
+function normalizeOutcomeReasonSearchText(
+  text: string | null | undefined,
+): string {
+  const normalized = normalizeOutcomeReason(text);
+  if (!normalized) return "";
+  return normalized
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,!?;:]+$/g, "")
+    .trim();
+}
+
+function truncateOutcomeReason(reason: string): string {
+  if (reason.length <= OUTCOME_REASON_PREVIEW_LIMIT) return reason;
+  const slice = reason.slice(0, OUTCOME_REASON_PREVIEW_LIMIT - 3).trimEnd();
+  return `${slice}...`;
+}
+
+function notConfirmedDisplayReason(turn: TurnNarrativeState): string | null {
+  return normalizeOutcomeReason(notConfirmedOutcome(turn)?.displayReason);
+}
 
 interface BlockPalette {
   fg: string;
@@ -306,21 +341,36 @@ interface FBlockRunProps {
   turnEnded: boolean;
   onSelect?: (label: string) => void;
   uxV1?: boolean;
+  outcomeReasonFallback?: string | null;
 }
 
-function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
+function FBlockRun({
+  block,
+  turnEnded,
+  onSelect,
+  uxV1,
+  outcomeReasonFallback,
+}: FBlockRunProps) {
   const displayLabel = uxV1 ? humanizeBlockLabel(block.label) : block.label;
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
   const isCompleted = block.state === "completed";
   const isEvaluating = isCompleted && block.outcome === "evaluating";
+  const isInterimNotDemonstrated =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    isInterimOutcome(block.outcomeRole);
   // A row stuck in `evaluating` at turn end (dropped stream) renders the
   // neutral "ran" treatment — never the live verifying beat, never green.
   const isVerifying = isEvaluating && !turnEnded;
-  const isRanNeutral = isEvaluating && turnEnded;
-  const isOutcomeNotShown = isCompleted && block.outcome === "not_demonstrated";
+  const isRanNeutral = (isEvaluating && turnEnded) || isInterimNotDemonstrated;
+  const isOutcomeNotShown =
+    isCompleted &&
+    block.outcome === "not_demonstrated" &&
+    !isInterimNotDemonstrated;
   const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
+  const isStopped = block.state === "stopped";
   const isDraft = block.state === "drafted";
 
   const accentBorder = isRunning
@@ -385,7 +435,10 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail || (hasActions && !turnEnded);
   const open = userOpen === null ? defaultOpen : userOpen;
-  const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
+  // A stop stays inspectable but not self-opening: the user knows why it
+  // stopped, so it should not demand attention the way a failure does.
+  const toggleable =
+    isOk || isOutcomeNotShown || isVerifying || isRanNeutral || isStopped;
   useTick(isRunning);
   useTick(hasActions && (replayingAction || elapsedReveal < totalMs), 150);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
@@ -400,9 +453,14 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
           ? `ran${elapsed ? ` · ${elapsed}` : ""}`
           : isFail
             ? "halted"
-            : isDraft
-              ? "drafted"
-              : "queued";
+            : isStopped
+              ? `stopped${elapsed ? ` · ${elapsed}` : ""}`
+              : isDraft
+                ? "drafted"
+                : "queued";
+  const collapsedOutcomeReason = isOutcomeNotShown
+    ? normalizeOutcomeReason(block.outcomeReason ?? outcomeReasonFallback)
+    : null;
 
   return (
     <div className="flex flex-col">
@@ -431,6 +489,8 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
             "…"
           ) : isFail ? (
             "✕"
+          ) : isStopped ? (
+            "■"
           ) : isRunning ? (
             <Spinner />
           ) : (
@@ -467,7 +527,10 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
           {!open && isOutcomeNotShown ? (
             <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/80">
               Outcome not confirmed — the run finished without showing the goal
-              was met.
+              was met
+              {collapsedOutcomeReason
+                ? `: ${truncateOutcomeReason(collapsedOutcomeReason)}`
+                : "."}
             </div>
           ) : null}
         </div>
@@ -534,7 +597,7 @@ function FBlockRun({ block, turnEnded, onSelect, uxV1 }: FBlockRunProps) {
                 !
               </span>
               <div className="text-[12px] leading-[1.5] text-amber-700 dark:text-amber-200/90">
-                {block.outcomeReason ??
+                {normalizeOutcomeReason(block.outcomeReason) ??
                   "The step ran, but the run did not demonstrate the goal was met."}
               </div>
             </div>
@@ -653,6 +716,8 @@ function phaseGlyph(status: PhaseStatus): ReactNode {
       return "✓";
     case "fail":
       return "✕";
+    case "stopped":
+      return "■";
     case "active":
       return <Spinner />;
     default:
@@ -668,6 +733,8 @@ function phasePuckClasses(status: PhaseStatus): string {
       return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
     case "active":
       return "border-blue-400/60 bg-blue-500/15 text-blue-700 dark:text-blue-300";
+    case "stopped":
+      return "border-slate-400/60 bg-slate-elevation4 text-muted-foreground";
     default:
       return "border-slate-500/60 bg-slate-elevation3 text-slate-600";
   }
@@ -707,18 +774,10 @@ function phaseStatusWord(status: PhaseStatus): string {
 }
 
 // While Draft is active its stream is necessarily empty (the LLM is writing
-// code, no frames arrive) — one shimmered placeholder row fills that gap,
-// naming the redraft iteration once a prior verify failed.
-function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
+// code, no frames arrive), so one shimmered placeholder row fills that gap.
+function DraftPlaceholderNote() {
   const shimmerRef = useShimmerText<HTMLSpanElement>(true);
-  const priorFailedVerdict =
-    turn.lastRunOutcome?.verdict === "not_demonstrated" ||
-    turn.lastRunOutcome?.verdict === "not_evaluated";
-  const text = priorFailedVerdict
-    ? `Draft v${turn.authoringCount + 1} — revising after failed verify: ${
-        turn.lastRunOutcome?.displayReason ?? "outcome not confirmed"
-      }`
-    : "Writing the workflow code…";
+  const text = "Writing the workflow code…";
   return (
     <FSubRow glyph="▸" glyphClass="text-muted-foreground">
       <span
@@ -729,6 +788,57 @@ function DraftPlaceholderNote({ turn }: { turn: TurnNarrativeState }) {
         {text}
       </span>
     </FSubRow>
+  );
+}
+
+export const COPILOT_ACK_LINES = [
+  "Reading your request…",
+  "Getting oriented…",
+  "Sketching a plan…",
+  "Lining up the steps…",
+  "Thinking it through…",
+] as const;
+
+export const ACK_ROTATE_INTERVAL_MS = 3000;
+
+// Fills the send→first-frame gap with a rotating shimmer so the build never starts on dead air.
+// The first real narrative replaces it immediately; it never persists to history.
+export function InstantAckPlaceholder() {
+  // Random start so quick repeated sends (a gap near the rotation cadence)
+  // don't always open on the same line.
+  const [index, setIndex] = useState(() =>
+    Math.floor(Math.random() * COPILOT_ACK_LINES.length),
+  );
+  useEffect(() => {
+    const id = setInterval(
+      () => setIndex((i) => (i + 1) % COPILOT_ACK_LINES.length),
+      ACK_ROTATE_INTERVAL_MS,
+    );
+    return () => clearInterval(id);
+  }, []);
+  // Shimmer paints the text with a white gradient, which vanishes on the
+  // near-white light surface — restrict it to dark, where the base
+  // text-muted-foreground stays readable on its own.
+  const isDark = useThemeAsDarkOrLight() === "dark";
+  const shimmerRef = useShimmerText<HTMLSpanElement>(isDark);
+  const line = COPILOT_ACK_LINES[index];
+  return (
+    <div className="flex items-center gap-3 px-1 py-1" role="status">
+      <span className="sr-only">Copilot is working on your request…</span>
+      <span
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15"
+        aria-hidden="true"
+      >
+        <Spinner />
+      </span>
+      <span
+        ref={shimmerRef}
+        aria-hidden="true"
+        className="text-[12.5px] font-medium text-muted-foreground"
+      >
+        {line}
+      </span>
+    </div>
   );
 }
 
@@ -745,6 +855,7 @@ function FPhaseChecklist({
   onBlockSelect,
   uxV1,
 }: FPhaseChecklistProps) {
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const rows = useMemo(() => derivePhases(turn), [turn]);
   const condensedBlocks = useMemo(
     () =>
@@ -867,7 +978,7 @@ function FPhaseChecklist({
                         </span>
                       </FSubRow>
                     ))}
-                    {isActive ? <DraftPlaceholderNote turn={turn} /> : null}
+                    {isActive ? <DraftPlaceholderNote /> : null}
                   </>
                 ) : row.id === "test" ? (
                   <>
@@ -881,6 +992,7 @@ function FPhaseChecklist({
                         turnEnded={turnEnded}
                         onSelect={onBlockSelect}
                         uxV1={uxV1}
+                        outcomeReasonFallback={collapsedOutcomeReason}
                       />
                     ))}
                   </>
@@ -902,6 +1014,9 @@ function accentBg(accent: TurnSummary["accent"]): string {
   if (accent === "fail") {
     return "border-rose-400/60 bg-rose-500/15 text-rose-700 dark:text-rose-300";
   }
+  if (accent === "warn") {
+    return "border-amber-400/60 bg-amber-500/15 text-amber-700 dark:text-amber-300";
+  }
   if (accent === "qa") {
     return "border-sky-400/60 bg-sky-500/15 text-sky-700 dark:text-sky-300";
   }
@@ -911,18 +1026,15 @@ function accentBg(accent: TurnSummary["accent"]): string {
 interface TurnHeadProps {
   summary: TurnSummary;
   expanded: boolean;
-  onClick: () => void;
+  onClick?: () => void;
   subtitle?: ReactNode;
 }
 
 function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-expanded={expanded}
-      className="flex w-full items-start gap-3 px-3.5 py-3 text-left"
-    >
+  const expandable = Boolean(onClick);
+  const headClass = "flex w-full items-start gap-3 px-3.5 py-3 text-left";
+  const body = (
+    <>
       <span
         className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
           summary.accent,
@@ -944,14 +1056,31 @@ function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
         </div>
         {subtitle}
       </div>
-      <span
-        className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
-          expanded ? "rotate-90" : ""
-        }`}
-        aria-hidden="true"
-      >
-        ›
-      </span>
+      {expandable ? (
+        <span
+          className={`mt-1 shrink-0 text-[14px] text-muted-foreground transition-transform dark:text-slate-500 ${
+            expanded ? "rotate-90" : ""
+          }`}
+          aria-hidden="true"
+        >
+          ›
+        </span>
+      ) : null}
+    </>
+  );
+
+  if (!expandable) {
+    return <div className={headClass}>{body}</div>;
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={expanded}
+      className={headClass}
+    >
+      {body}
     </button>
   );
 }
@@ -971,22 +1100,51 @@ function RollupCard({
   onBlockSelect,
   uxV1,
 }: RollupCardProps) {
-  const closing =
-    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+  // The backend appends the judge's verdict to the closing message, so it needs the
+  // same display-layer rewrite the outcome reason gets.
+  const closing = humanizeJudgeText(
+    turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+  );
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
+  const truncatedOutcomeReason = collapsedOutcomeReason
+    ? truncateOutcomeReason(collapsedOutcomeReason)
+    : null;
+  const normalizedClosing = normalizeOutcomeReasonSearchText(closing);
+  // Normalizing the truncated preview (its trailing "..." strips as punctuation)
+  // makes the containment check a prefix match, so closings carrying either the
+  // full reason or a truncated form of it both suppress the appended segment.
+  const normalizedOutcomeReason = normalizeOutcomeReasonSearchText(
+    truncatedOutcomeReason,
+  );
+  const shouldAppendOutcomeReason =
+    normalizedOutcomeReason.length > 0 &&
+    !normalizedClosing.includes(normalizedOutcomeReason);
+  const outcomeReasonSubtitle = shouldAppendOutcomeReason
+    ? `Outcome not confirmed: ${truncatedOutcomeReason!}`
+    : "";
+  const subtitle = [closing, outcomeReasonSubtitle].filter(Boolean).join(" · ");
   const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const completed = rollupBlocks.filter((b) => isBlockOk(b));
   const failed = rollupBlocks.filter((b) => b.state === "failed");
+  const stopped = rollupBlocks.filter((b) => b.state === "stopped");
   const showCommit = !summary.isQA && completed.length > 0;
   const showChecklist = Boolean(uxV1) && showPhaseChecklist(turn);
+  // Expand only earns a chevron when DetailView adds content beyond the head's
+  // message — a pure ask (no scouting) re-renders the same text, so no chevron.
+  const hasExpandableDetail =
+    showChecklist ||
+    turn.blocks.length > 0 ||
+    (turn.designStarted && (turn.draft?.blockCount ?? 0) > 0) ||
+    turn.designActivity.some((e) => e.kind === "narration");
 
   return (
     <div className="overflow-hidden rounded-xl border border-border/60 bg-slate-elevation2">
       <TurnHead
         summary={summary}
         expanded={false}
-        onClick={onExpand}
+        onClick={hasExpandableDetail ? onExpand : undefined}
         subtitle={
-          closing ? (
+          subtitle ? (
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
                 summary.isFail && !summary.isStoppedWithDraft
@@ -994,7 +1152,7 @@ function RollupCard({
                   : "text-muted-foreground"
               }`}
             >
-              {closing}
+              {subtitle}
             </div>
           ) : null
         }
@@ -1083,6 +1241,39 @@ function RollupCard({
           </ul>
         </div>
       ) : null}
+
+      {stopped.length > 0 ? (
+        <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
+          <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-muted-foreground">
+            Stopped
+          </div>
+          <ul className="m-0 flex list-none flex-col gap-1 p-0">
+            {stopped.map((b) => (
+              <li
+                key={b.label}
+                className="flex items-baseline gap-1.5 text-[12px] leading-[1.5] text-tertiary-foreground"
+              >
+                <span
+                  className="w-3.5 shrink-0 text-center text-[11px] font-bold text-muted-foreground"
+                  aria-hidden="true"
+                >
+                  ■
+                </span>
+                <span
+                  className={
+                    uxV1
+                      ? "text-[11px] text-muted-foreground"
+                      : "font-mono text-[11px] text-muted-foreground"
+                  }
+                  title={uxV1 ? b.label : undefined}
+                >
+                  {uxV1 ? humanizeBlockLabel(b.label) : b.label}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1092,6 +1283,7 @@ interface DetailViewProps {
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 function DetailView({
@@ -1099,7 +1291,9 @@ function DetailView({
   onCollapse,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: DetailViewProps) {
+  const collapsedOutcomeReason = notConfirmedDisplayReason(turn);
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -1162,23 +1356,23 @@ function DetailView({
               turnEnded={turn.terminal !== null}
               onSelect={onBlockSelect}
               uxV1={uxV1}
+              outcomeReasonFallback={collapsedOutcomeReason}
             />
           ))}
         </div>
       ) : null}
 
-      {!hasBlocks &&
-      !designStarted &&
-      !turn.terminal &&
-      !["docs_answer", "refuse", "clarify"].includes(effectiveMode(turn)) ? (
+      {!hasBlocks && !designStarted && !turn.terminal && !workingRowActive ? (
         <div className="pl-9 text-[12px] italic text-muted-foreground dark:text-slate-500">
-          Waiting for the first block to start…
+          Working…
         </div>
       ) : null}
 
       {turn.terminal && (turn.narrativeSummary || turn.terminalMessage) ? (
         <div className="whitespace-pre-wrap pl-9 pr-8 text-[13px] leading-[1.55] text-foreground dark:text-slate-200">
-          {turn.narrativeSummary?.trim() || turn.terminalMessage?.trim()}
+          {humanizeJudgeText(
+            turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "",
+          )}
         </div>
       ) : null}
     </div>
@@ -1189,12 +1383,14 @@ interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
   uxV1?: boolean;
+  workingRowActive?: boolean;
 }
 
 export function NarrativeView({
   turn,
   onBlockSelect,
   uxV1,
+  workingRowActive,
 }: NarrativeViewProps) {
   const summary = useMemo(
     () => computeTurnSummary(turn, { uxV1 }),
@@ -1223,6 +1419,7 @@ export function NarrativeView({
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
       uxV1={uxV1}
+      workingRowActive={workingRowActive}
     />
   );
 }

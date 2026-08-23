@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,7 +20,12 @@ def parse_workflow_yaml(workflow_yaml: str) -> Any:
 
 
 def url_origin(url: str) -> str | None:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+    except ValueError:
+        # A bracket `urlparse` cannot read as an IPv6 literal raises. Redaction runs this over
+        # arbitrary text, where declining collapses the span to `[URL]` and raising loses the scrub.
+        return None
     if not parsed.netloc or not parsed.hostname:
         return None
     host = parsed.hostname.lower()
@@ -34,6 +39,11 @@ def url_origin(url: str) -> str | None:
     # Keep scheme in the origin. http:// and https:// are different security
     # contexts, so crossing between them is treated as scope broadening.
     return f"{parsed.scheme.lower()}://{netloc}"
+
+
+def saved_credential_ids(candidates: Iterable[str]) -> set[str]:
+    # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
+    return {candidate for candidate in candidates if isinstance(candidate, str) and candidate.startswith("cred_")}
 
 
 def credential_params(parameters: Any) -> dict[str, str]:
@@ -89,42 +99,47 @@ def credential_param_ids(parameters: Any) -> dict[str, set[str]]:
     return out
 
 
-def workflow_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+def workflow_blocks(parsed: dict[str, Any], selected_labels: set[str] | None = None) -> list[dict[str, Any]]:
+    """With `selected_labels`, collect only blocks whose label is in the set plus their
+    descendants — a selected `for_loop` drags its `loop_blocks` in, since loop children are
+    not themselves named in an executing label set."""
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return []
 
     collected: list[dict[str, Any]] = []
 
-    def visit_branch(branch: dict[str, Any]) -> None:
+    def visit_branch(branch: dict[str, Any], inherited: bool) -> None:
         for key in _NESTED_BLOCK_LIST_KEYS:
-            visit(branch.get(key))
+            visit(branch.get(key), inherited)
         for branch_key in _BRANCH_LIST_KEYS:
             branches = branch.get(branch_key)
             if not isinstance(branches, list):
                 continue
             for nested_branch in branches:
                 if isinstance(nested_branch, dict):
-                    visit_branch(nested_branch)
+                    visit_branch(nested_branch, inherited)
 
-    def visit(blocks: Any) -> None:
+    def visit(blocks: Any, inherited: bool) -> None:
         if not isinstance(blocks, list):
             return
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            collected.append(block)
+            selected = inherited or selected_labels is None or block.get("label") in selected_labels
+            if selected:
+                collected.append(block)
             for key in _NESTED_BLOCK_LIST_KEYS:
-                visit(block.get(key))
+                visit(block.get(key), selected)
             for branch_key in _BRANCH_LIST_KEYS:
                 branches = block.get(branch_key)
                 if not isinstance(branches, list):
                     continue
                 for branch in branches:
                     if isinstance(branch, dict):
-                        visit_branch(branch)
+                        visit_branch(branch, selected)
 
-    visit(workflow_definition.get("blocks"))
+    visit(workflow_definition.get("blocks"), False)
     return collected
 
 

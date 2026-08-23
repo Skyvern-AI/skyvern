@@ -218,7 +218,11 @@ Send text to the LLM for processing without browser interaction. Useful for summ
 
 ### File Parser
 
-Parse PDFs, CSVs, Excel files, and images to extract structured data.
+Parse PDFs, CSVs, Excel files, images, DOCX files, and ZIP archives.
+
+ZIP inputs are unzipped, and the block outputs the extracted file list as `file_name`, `file_path`, and `file_size`. Data Schema is ignored for ZIP inputs; loop over the file list and pass each `file_path` to another File Parser block to parse individual files.
+
+Very large files can exceed the parser's time budget and fail the block. When a File Parser sits inside a loop, set **On block failure** (Advanced Settings) to *Skip to next iteration* so files that cannot be parsed are skipped and the rest of the list still runs.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -312,6 +316,29 @@ Execute custom Python code. Input parameters are available as global variables. 
 |-------|------|-------------|
 | **Code** | code editor | Python code to execute |
 | **Input Parameters** | select | Parameters available as globals in the code |
+
+Password credential input parameters expose plaintext fields such as
+`login_credential.username` and `login_credential.password`. These values are
+readable by Python code inside the runner; they are not opaque handles. Use them
+only where needed, such as passing them directly to browser operations.
+
+For one-time codes, use `await login_credential.otp()`, the supported pattern
+across both execution paths. Do not rely on `.totp` or the top-level `otp(...)`
+helper, whose behavior differs between paths. If no OTP source is configured,
+`login_credential.otp()` fails with a clear one-time-code-unavailable error.
+
+```python
+await page.fill("#username", login_credential.username)
+await page.fill("#password", login_credential.password)
+await page.fill("#otp", await login_credential.otp())
+```
+
+The sandbox does not reject code that prints, returns, or transforms credential
+values. Before string values in a successful block output or a surfaced failure
+reason are persisted, Skyvern masks exact registered-secret matches; registered
+secrets of at least five characters are also masked inside larger strings. Derived
+or transformed values may no longer match. Do not expose credentials through output
+or errors. Opaque credential containment is tracked separately in SKY-11771.
 
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />

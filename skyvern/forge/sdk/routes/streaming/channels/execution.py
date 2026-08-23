@@ -12,6 +12,7 @@ Channel data:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import typing as t
 from contextlib import asynccontextmanager
@@ -23,7 +24,8 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_SCREENSHOT_BYTES
-from skyvern.forge.sdk.routes.streaming.registries import get_vnc_channel
+from skyvern.forge.sdk.streaming.registries import get_vnc_channel
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
@@ -95,7 +97,7 @@ class ExecutionChannel(CdpChannel):
         if not self.page:
             raise RuntimeError(f"{self.class_name} navigate: not connected to a page.")
 
-        normalized = self._normalize_url(url)
+        normalized = await asyncio.to_thread(validate_fetch_url, self._normalize_url(url))
 
         await self.page.goto(
             normalized,
@@ -218,6 +220,8 @@ class ExecutionChannel(CdpChannel):
 
     @staticmethod
     def _normalize_url(url: str) -> str:
+        """Settle the scheme only. This says nothing about the destination — callers must pass the
+        result through ``validate_fetch_url`` before navigating."""
         candidate = url.strip()
         if not candidate:
             raise ValueError("URL must not be empty")
@@ -295,7 +299,7 @@ async def execution_for_message_channel(
     # Imports kept local to avoid a circular import (this module is imported by message.py,
     # and the persistent sessions manager pulls in app/cloud bootstrapping).
     from skyvern.forge import app
-    from skyvern.forge.sdk.routes.streaming.screencast import wait_for_browser_state
+    from skyvern.forge.sdk.routes.streaming.screencast import release_browser_state, wait_for_browser_state
 
     if message_channel.browser_session is None:
         raise RuntimeError("execution_for_message_channel: no browser session on message channel")
@@ -317,11 +321,14 @@ async def execution_for_message_channel(
     if browser_state is None:
         raise RuntimeError(f"execution_for_message_channel: browser state timeout for {browser_session_id}")
 
-    page = await browser_state.get_working_page()
-    if page is None:
-        raise RuntimeError(f"execution_for_message_channel: no working page for {browser_session_id}")
+    try:
+        page = await browser_state.get_working_page()
+        if page is None:
+            raise RuntimeError(f"execution_for_message_channel: no working page for {browser_session_id}")
 
-    yield LocalExecutionChannel(page=page)
+        yield LocalExecutionChannel(page=page)
+    finally:
+        await release_browser_state(browser_state, "browser_session", browser_session_id)
 
 
 @asynccontextmanager

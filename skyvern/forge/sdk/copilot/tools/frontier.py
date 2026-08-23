@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections import Counter
@@ -19,19 +18,27 @@ from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
-from skyvern.forge.sdk.copilot.build_phase import (
-    BuildPhase,
-)
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    _blocks_by_label,
     _canonical_block_config,
+    block_shape_hashes_by_label,
+)
+from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
+    definition_payload,
+    frontier_dump_root,
+    trust_snapshot,
+    write_packet,
 )
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
+    FrontierStartProvenance,
     resolve_browser_state_for_context,
 )
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -43,6 +50,7 @@ from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
     _block_type_name,
+    _fallback_page_info,
     _valid_runtime_anchor_url,
     _workflow_definition_block_labels,
     _workflow_yaml_blocks_by_label,
@@ -51,7 +59,12 @@ from ._shared import (
 LOG = structlog.get_logger()
 
 
+FrontierPlan = tuple[list[str], dict[str, Any], str | None, FrontierStartProvenance]
+
 _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
+
+# Bounds the walk into nested blocks; workflows nest a few levels, not hundreds.
+_MAX_BLOCK_NESTING_DEPTH = 10
 
 _JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
 _OUTPUT_REF_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})_output\s*(?=[\.|}}])")
@@ -81,18 +94,6 @@ _TEMPLATE_BUILTIN_ROOTS = (
 # Keep this to grammatical glue only. Workflow/action words are intentionally
 # not filtered; the two-token stale threshold is the conservative guardrail.
 _BLOCK_METADATA_STOPWORDS = frozenset({"and", "for", "the", "with"})
-
-
-def _blocks_by_label(workflow_definition: object | None) -> dict[str, object]:
-    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
-    by_label: dict[str, object] = {}
-    if not blocks:
-        return by_label
-    for block in blocks:
-        label = getattr(block, "label", None)
-        if isinstance(label, str):
-            by_label[label] = block
-    return by_label
 
 
 # Minimum length to apply the trailing-``s`` plural strip; below this we
@@ -327,22 +328,94 @@ def _clear_runtime_anchor_evidence(copilot_ctx: Any) -> None:
 def _reset_all_verified_trust(copilot_ctx: Any) -> None:
     evidence = copilot_ctx.workflow_verification_evidence
     copilot_ctx.verified_prefix_labels = []
+    copilot_ctx.composition_verified_labels = []
     copilot_ctx.verified_block_outputs = {}
+    copilot_ctx.verified_prefix_block_end_urls = {}
+    copilot_ctx.verified_prefix_block_end_session_id = None
+    copilot_ctx.verified_prefix_terminal_label = None
     copilot_ctx.last_full_workflow_test_ok = False
     evidence.block_verified = []
     evidence.full_workflow_verified = False
     _clear_runtime_anchor_evidence(copilot_ctx)
 
 
-def _workflow_parameters_changed(prior_definition: object | None, new_definition: object | None) -> bool:
+def _key_needles(keys: set[str]) -> set[str]:
+    # json.dumps escapes non-ASCII, so a key like "contraseña" appears in the
+    # serialized config only in its \uXXXX form.
+    return keys | {json.dumps(key)[1:-1] for key in keys}
+
+
+def _keys_named_by_blocks(keys: set[str], labels: set[str], definition: object | None) -> bool:
+    if not keys or not labels:
+        return False
+    needles = _key_needles(keys)
+    for serialized in _serialized_frontier_block_configs(list(labels), definition):
+        if any(needle in serialized for needle in needles):
+            return True
+    return False
+
+
+def _keys_named_by_definition(keys: set[str], definition: object | None) -> bool:
+    """Whether anything outside the blocks names a key: a definition-level template
+    such as ``workflow_system_prompt``, or another parameter's key-valued field
+    (``url_parameter_key``, ``totp_secret_key``, ...).
+
+    Unscoped by label — a workflow-level template is inherited by every block,
+    trusted ones included. ``blocks`` are excluded (covered per-label above) and so
+    is each changed key's own declaration, which is not a reference to itself.
+    """
+    if not keys or definition is None:
+        return False
+    dump = getattr(definition, "model_dump", None)
+    if not callable(dump):
+        return False
+    cfg = dump(mode="json", exclude={"blocks"})
+    parameters = cfg.get("parameters")
+    if isinstance(parameters, list):
+        cfg["parameters"] = [
+            param for param in parameters if not (isinstance(param, dict) and param.get("key") in keys)
+        ]
+    serialized = json.dumps(cfg, default=str, separators=(",", ":"))
+    return any(needle in serialized for needle in _key_needles(keys))
+
+
+def _labels_through_trusted(definition: object | None, trusted_labels: set[str]) -> set[str]:
+    """Trusted labels plus every label preceding them in the definition's chain order."""
+    labels = _workflow_definition_block_labels(definition)
+    last_trusted = max((index for index, label in enumerate(labels) if label in trusted_labels), default=-1)
+    return set(labels[: last_trusted + 1]) | trusted_labels
+
+
+def _workflow_parameters_changed(
+    prior_definition: object | None,
+    new_definition: object | None,
+    trusted_labels: set[str],
+) -> bool:
     new_by_key = {getattr(p, "key", None): p for p in (getattr(new_definition, "parameters", None) or [])}
     prior_by_key = {getattr(p, "key", None): p for p in (getattr(prior_definition, "parameters", None) or [])}
-    # Any added or removed parameter is a change: a block may reference a key by
-    # template without a config edit, so an added/removed key can alter behavior
-    # the block-diff alone won't catch. Pure reordering is ignored (keyed access).
-    if set(prior_by_key) != set(new_by_key):
+    # A block may reference a key by template without a config edit, so an added or
+    # removed key can alter behavior the block-diff alone won't catch — but only when
+    # a trusted block, or one upstream of it, names that key. Every block
+    # auto-declares a ``<label>_output`` key, so a narrower test would invalidate the
+    # whole verified prefix whenever a block is appended or deleted.
+    changed_keys = set(prior_by_key) ^ set(new_by_key)
+    if any(not isinstance(key, str) for key in changed_keys):
+        return True
+    removed = {key for key in changed_keys & set(prior_by_key) if isinstance(key, str)}
+    added = {key for key in changed_keys & set(new_by_key) if isinstance(key, str)}
+    try:
+        if _keys_named_by_blocks(removed, _labels_through_trusted(prior_definition, trusted_labels), prior_definition):
+            return True
+        if _keys_named_by_blocks(added, _labels_through_trusted(new_definition, trusted_labels), new_definition):
+            return True
+        if _keys_named_by_definition(removed, prior_definition) or _keys_named_by_definition(added, new_definition):
+            return True
+    except Exception:
+        LOG.debug("Parameter reference check failed on edit", exc_info=True)
         return True
     for key, prior_param in prior_by_key.items():
+        if key not in new_by_key:
+            continue
         try:
             if _stable_parameter_fingerprint(prior_param) != _stable_parameter_fingerprint(new_by_key[key]):
                 return True
@@ -353,6 +426,27 @@ def _workflow_parameters_changed(prior_definition: object | None, new_definition
 
 
 def _invalidate_verified_state_on_edit(
+    copilot_ctx: Any,
+    prior_definition: object | None,
+    new_definition: object | None,
+) -> None:
+    if frontier_dump_root() is None:
+        _apply_verified_state_invalidation(copilot_ctx, prior_definition, new_definition)
+        return
+    before = trust_snapshot(copilot_ctx)
+    _apply_verified_state_invalidation(copilot_ctx, prior_definition, new_definition)
+    write_packet(
+        "invalidation",
+        {
+            "prior_definition": definition_payload(prior_definition),
+            "new_definition": definition_payload(new_definition),
+            "trust_before": before,
+            "trust_after": trust_snapshot(copilot_ctx),
+        },
+    )
+
+
+def _apply_verified_state_invalidation(
     copilot_ctx: Any,
     prior_definition: object | None,
     new_definition: object | None,
@@ -370,7 +464,7 @@ def _invalidate_verified_state_on_edit(
     if trusted:
         # No reconcilable prior, or a parameter change that could alter any
         # block's behavior — fail closed rather than reuse unproven trust.
-        if prior_definition is None or _workflow_parameters_changed(prior_definition, new_definition):
+        if prior_definition is None or _workflow_parameters_changed(prior_definition, new_definition, trusted):
             _reset_all_verified_trust(copilot_ctx)
             return
         # Diff the full prior chain, not just trusted labels, so a change to an
@@ -390,8 +484,14 @@ def _invalidate_verified_state_on_edit(
         copilot_ctx.verified_prefix_labels = [
             label for label in copilot_ctx.verified_prefix_labels if label not in invalidated
         ]
+        # Composition credit is an ordered prefix, so an invalidated block ends it there: the
+        # labels after it were only composed by way of the block that just changed.
+        credited = list(copilot_ctx.composition_verified_labels or [])
+        end = next((index for index, label in enumerate(credited) if label in invalidated), len(credited))
+        copilot_ctx.composition_verified_labels = credited[:end]
         for label in invalidated:
             copilot_ctx.verified_block_outputs.pop(label, None)
+            copilot_ctx.verified_prefix_block_end_urls.pop(label, None)
         evidence.block_verified = [label for label in evidence.block_verified if label not in invalidated]
         # The recorded prefix-end URL came from a run that included a now-invalid
         # block, so it is no longer a safe runtime anchor for a re-run.
@@ -412,6 +512,122 @@ def _invalidate_verified_state_on_edit(
     if not (current_labels == prior_labels and all(label in verified for label in current_labels)):
         evidence.full_workflow_verified = False
         copilot_ctx.last_full_workflow_test_ok = False
+
+
+def _live_session_is_at_frontier_anchor(
+    ctx: AgentContext,
+    frontier_label: str,
+    new_definition: object | None,
+    runtime_page_url: str | None,
+) -> bool:
+    """True when the live session is still on the page the frontier's predecessor ended on.
+
+    The predecessor's recorded end page is where the frontier block started when it last ran, so
+    matching it is the only evidence that resuming there resumes against the same browser state.
+    """
+    if not runtime_page_url:
+        return False
+    workflow_labels = _workflow_definition_block_labels(new_definition)
+    try:
+        idx = workflow_labels.index(frontier_label)
+    except ValueError:
+        return False
+    if idx == 0:
+        return False
+    verified = set(ctx.verified_prefix_labels or [])
+    if not all(label in verified for label in workflow_labels[:idx]):
+        return False
+    predecessor = workflow_labels[idx - 1]
+    # A matching URL alone is not proof the browser is sitting before the frontier: an app that
+    # never changes its URL matches the predecessor's page from anywhere in the chain. Only the
+    # block that ran last says where the browser actually stopped — either just before the
+    # frontier, or on the frontier block itself, which a rerun repeats either way.
+    if ctx.verified_prefix_terminal_label not in {predecessor, frontier_label}:
+        return False
+    anchor_url = ctx.verified_prefix_block_end_urls.get(predecessor)
+    if not _same_runtime_page(anchor_url, runtime_page_url):
+        return False
+    # A hash-routed app puts the whole route in the fragment, which _same_runtime_page ignores;
+    # two routes of the same SPA are different pages for the purpose of resuming a block.
+    return urlparse(anchor_url or "").fragment == urlparse(runtime_page_url).fragment
+
+
+def _block_and_descendants(block: object, *, depth: int = 0) -> list[object]:
+    """A block plus the blocks nested inside it, which run as part of it."""
+    if block is None or depth > _MAX_BLOCK_NESTING_DEPTH:
+        return []
+    found = [block]
+    for attribute in ("loop_blocks", "blocks"):
+        children = getattr(block, attribute, None)
+        if isinstance(children, list):
+            for child in children:
+                found.extend(_block_and_descendants(child, depth=depth + 1))
+    return found
+
+
+def _frontier_replays_a_credential_fill(
+    requested_labels: list[str], frontier_label: str, new_definition: object | None
+) -> bool:
+    """A frontier that refills credentials is replayed into a fresh browser, not the one anchored."""
+    by_label = _blocks_by_label(new_definition)
+    try:
+        idx = requested_labels.index(frontier_label)
+    except ValueError:
+        return True
+    # A finally block runs alongside the frontier, and it is not in requested_labels to be scanned.
+    if getattr(new_definition, "finally_block_label", None):
+        return True
+    for label in requested_labels[idx:]:
+        for block in _block_and_descendants(by_label.get(label)):
+            code = getattr(block, "code", None)
+            if isinstance(code, str) and code_contains_credential_fill(code):
+                return True
+    return False
+
+
+def _name_resume_session_for_plan(
+    ctx: AgentContext,
+    plan: tuple[list[str], dict[str, Any], str],
+    frontier_label: str,
+    new_definition: object | None,
+    runtime_page_url: str | None,
+) -> bool:
+    """Name the browser holding the verified state as the one this plan must run in.
+
+    Takes the seeded plan rather than the request, because the seeder can veto the frontier and
+    hand back a full re-run — which puts the skipped blocks back and must not borrow that browser.
+    """
+    labels_to_execute, _seed, planned_frontier = plan
+    if planned_frontier != frontier_label:
+        return False
+    if not _live_session_is_at_frontier_anchor(ctx, frontier_label, new_definition, runtime_page_url):
+        return False
+    # A frontier that refills credentials is replayed into a fresh browser, so naming one here
+    # would suppress the mint it still needs.
+    if _frontier_replays_a_credential_fill(labels_to_execute, frontier_label, new_definition):
+        return False
+    ctx.frontier_resume_session_id = ctx.verified_prefix_block_end_session_id
+    return True
+
+
+async def _frontier_runtime_page_url(ctx: AgentContext) -> str | None:
+    """Live page of the browser holding the verified state, or None when it cannot be read.
+
+    A login-first replay runs in a browser the chat does not keep, so that browser — not the
+    chat's — is the one whose page can speak for where a resumed frontier would start.
+    """
+    if not ctx.verified_prefix_block_end_urls:
+        return None
+    session_id = ctx.verified_prefix_block_end_session_id
+    if not session_id:
+        return None
+    # A self-heal turn resolves its own browser whatever session is asked for, so the page read
+    # back would not be the browser named here.
+    if ctx.turn_origin is TurnOrigin.runtime_self_heal:
+        return None
+    # Only the URL is needed here, and page.title() is what stalls on a busy renderer.
+    url, _ = await _fallback_page_info(ctx, session_id_override=session_id, read_title=False)
+    return _valid_runtime_anchor_url(url)
 
 
 def _nearest_upstream_state_establisher(
@@ -440,6 +656,8 @@ def _block_can_start_browser_run(block: object) -> bool:
 def _nearest_upstream_runnable_anchor(
     workflow_labels: list[str], target_label: str, new_definition: object | None
 ) -> str | None:
+    """The workflow head is a last resort, so a return is not proof the anchor can start a browser
+    run; a caller needing that proof reads the plan's start provenance instead."""
     by_label = _blocks_by_label(new_definition)
     try:
         idx = workflow_labels.index(target_label)
@@ -618,6 +836,8 @@ _CANONICAL_WORKFLOW_SETTING_FIELDS: tuple[str, ...] = (
     "totp_verification_url",
     "totp_identifier",
     "persist_browser_session",
+    "reuse_browser_session",
+    "mask_secrets",
     "pin_saved_session_ip",
     "browser_profile_id",
     "browser_profile_key",
@@ -675,15 +895,85 @@ def _workflow_requires_canonical_persist(prior: Workflow | None, new: Workflow) 
     return prior_fingerprints != new_fingerprints
 
 
+def _plan_start_provenance(
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+    new_definition: object | None,
+) -> FrontierStartProvenance:
+    """Composition provenance of a plan, from what its start can prove about the page it opens on."""
+    if not labels_to_execute or frontier_start_label != labels_to_execute[0]:
+        return "unanchored"
+    workflow_labels = _workflow_definition_block_labels(new_definition)
+    start = labels_to_execute[0]
+    start_block = _blocks_by_label(new_definition).get(start)
+    start_establishes_state = start_block is not None and _block_can_start_browser_run(start_block)
+    if workflow_labels and start == workflow_labels[0]:
+        # Position alone proves nothing: a first block that establishes no state runs against
+        # whatever page authoring left open, which is the discontinuity this value exists to catch.
+        # A run given its own browser stamps "initial" directly and never reaches here.
+        return "initial" if start_establishes_state else "unanchored"
+    if start not in workflow_labels or labels_to_execute[-1] not in workflow_labels:
+        return "unanchored"
+    # A plan whose start is also its end replays nothing: the block runs against whatever page the
+    # browser already holds, which is the state this provenance exists to distinguish.
+    if workflow_labels.index(start) >= workflow_labels.index(labels_to_execute[-1]):
+        return "unanchored"
+    return "replayed" if start_establishes_state else "unanchored"
+
+
+def _anchored_plan(
+    plan: tuple[list[str], dict[str, Any], str | None],
+    new_definition: object | None,
+) -> FrontierPlan:
+    labels_to_execute, block_outputs_to_seed, frontier_start_label = plan
+    return (
+        labels_to_execute,
+        block_outputs_to_seed,
+        frontier_start_label,
+        _plan_start_provenance(labels_to_execute, frontier_start_label, new_definition),
+    )
+
+
 def _plan_frontier(
     ctx: AgentContext,
     requested_labels: list[str],
     old_definition: object | None,
     new_definition: object | None,
-) -> tuple[list[str], dict[str, Any], str | None]:
+    runtime_page_url: str | None = None,
+) -> FrontierPlan:
+    if frontier_dump_root() is None:
+        return _plan_frontier_uncaptured(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    before = trust_snapshot(ctx)
+    plan = _plan_frontier_uncaptured(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    labels_to_execute, _seed, frontier_start_label, start_provenance = plan
+    write_packet(
+        "frontier",
+        {
+            "requested_labels": list(requested_labels),
+            "old_definition": definition_payload(old_definition),
+            "new_definition": definition_payload(new_definition),
+            "runtime_page_url": runtime_page_url,
+            "trust_before": before,
+            "plan": {
+                "labels_to_execute": list(labels_to_execute),
+                "frontier_start_label": frontier_start_label,
+                "frontier_start_provenance": start_provenance,
+            },
+        },
+    )
+    return plan
+
+
+def _plan_frontier_uncaptured(
+    ctx: AgentContext,
+    requested_labels: list[str],
+    old_definition: object | None,
+    new_definition: object | None,
+    runtime_page_url: str | None = None,
+) -> FrontierPlan:
     """Plan the frontier execution.
 
-    Returns ``(labels_to_execute, block_outputs_to_seed, frontier_start_label)``.
+    Returns ``(labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance)``.
 
     Falls back to the full requested list on any ambiguity. When there is no
     workflow change (plain run path) the frontier is the first requested label,
@@ -691,9 +981,10 @@ def _plan_frontier(
     browser-state outputs needed to start a downstream frontier.
     """
     if not requested_labels:
-        return requested_labels, {}, None
+        return requested_labels, {}, None, "unanchored"
     if new_definition is None:
-        return requested_labels, {}, requested_labels[0]
+        # Nothing to prove a start against, so the run cannot claim a composition state.
+        return requested_labels, {}, requested_labels[0], "unanchored"
 
     verified_outputs: dict[str, Any] = dict(ctx.verified_block_outputs or {})
     verified_prefix: list[str] = list(ctx.verified_prefix_labels or [])
@@ -703,21 +994,27 @@ def _plan_frontier(
     # No old definition (cold start or parse failure) OR no diff signal → plain path.
     if old_definition is None:
         frontier = failed_frontier_label or requested_labels[0]
-        return _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition)
+        return _anchored_plan(
+            _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition),
+            new_definition,
+        )
 
     try:
         invalidated = _find_invalidated_labels(old_definition, new_definition, requested_labels)
     except Exception:
         LOG.debug("Frontier diff failed, falling back to full run", exc_info=True)
-        return requested_labels, {}, requested_labels[0]
+        return _anchored_plan((requested_labels, {}, requested_labels[0]), new_definition)
 
     earliest = _earliest_invalidated(requested_labels, invalidated)
     if earliest is None:
         if failed_frontier_label is not None:
-            return _seed_for_frontier(
-                requested_labels,
-                failed_frontier_label,
-                verified_outputs,
+            return _anchored_plan(
+                _seed_for_frontier(
+                    requested_labels,
+                    failed_frontier_label,
+                    verified_outputs,
+                    new_definition,
+                ),
                 new_definition,
             )
         # No invalidation at all — unchanged request. Continue from the
@@ -726,7 +1023,10 @@ def _plan_frontier(
         # verified frontiers.
         next_frontier = _first_unverified_requested_label(requested_labels, verified_prefix_set)
         if next_frontier is not None:
-            return _seed_for_frontier(requested_labels, next_frontier, verified_outputs, new_definition)
+            return _anchored_plan(
+                _seed_for_frontier(requested_labels, next_frontier, verified_outputs, new_definition),
+                new_definition,
+            )
 
         # If the model accidentally asks to rerun an already-verified prefix,
         # keep the browser moving forward instead of spending another tool call
@@ -735,14 +1035,20 @@ def _plan_frontier(
         next_workflow_frontier = _first_unverified_requested_label(workflow_labels, verified_prefix_set)
         if next_workflow_frontier is not None:
             frontier_idx = workflow_labels.index(next_workflow_frontier)
-            return _seed_for_frontier(
-                workflow_labels[: frontier_idx + 1],
-                next_workflow_frontier,
-                verified_outputs,
+            return _anchored_plan(
+                _seed_for_frontier(
+                    workflow_labels[: frontier_idx + 1],
+                    next_workflow_frontier,
+                    verified_outputs,
+                    new_definition,
+                ),
                 new_definition,
             )
 
-        return _seed_for_frontier(requested_labels, requested_labels[0], verified_outputs, new_definition)
+        return _anchored_plan(
+            _seed_for_frontier(requested_labels, requested_labels[0], verified_outputs, new_definition),
+            new_definition,
+        )
 
     earliest_idx = requested_labels.index(earliest)
     failed_frontier_idx = (
@@ -753,10 +1059,13 @@ def _plan_frontier(
         and failed_frontier_idx is not None
         and (failed_frontier_idx < earliest_idx or failed_frontier_label != _recorded_failed_attempted_label(ctx))
     ):
-        return _seed_for_frontier(
-            requested_labels,
-            failed_frontier_label,
-            verified_outputs,
+        return _anchored_plan(
+            _seed_for_frontier(
+                requested_labels,
+                failed_frontier_label,
+                verified_outputs,
+                new_definition,
+            ),
             new_definition,
         )
 
@@ -766,7 +1075,7 @@ def _plan_frontier(
     prefix_in_requested = [label for label in requested_labels if label != earliest]
     prefix_in_requested = prefix_in_requested[: requested_labels.index(earliest)]
     if not all(label in verified_prefix_set for label in prefix_in_requested):
-        return requested_labels, {}, requested_labels[0]
+        return _anchored_plan((requested_labels, {}, requested_labels[0]), new_definition)
 
     old_by_label = _blocks_by_label(old_definition)
     is_append_only = earliest not in old_by_label
@@ -780,23 +1089,42 @@ def _plan_frontier(
             if not all(label in verified_prefix_set for label in workflow_prefix):
                 anchor = _nearest_upstream_runnable_anchor(workflow_labels, earliest, new_definition)
                 if anchor is not None:
-                    return _seed_for_frontier(
-                        workflow_labels[workflow_labels.index(anchor) : workflow_labels.index(earliest) + 1],
-                        anchor,
-                        verified_outputs,
+                    return _anchored_plan(
+                        _seed_for_frontier(
+                            workflow_labels[workflow_labels.index(anchor) : workflow_labels.index(earliest) + 1],
+                            anchor,
+                            verified_outputs,
+                            new_definition,
+                        ),
                         new_definition,
                     )
-        return _seed_for_frontier(requested_labels, earliest, verified_outputs, new_definition)
+        # The prefix ran somewhere; an appended block has to run there too, or it acts on a page
+        # that browser never reached. Naming it is safe only on the same evidence a resume needs.
+        seeded = _seed_for_frontier(requested_labels, earliest, verified_outputs, new_definition)
+        if _name_resume_session_for_plan(ctx, seeded, earliest, new_definition, runtime_page_url):
+            return (*seeded, "resumed")
+        return _anchored_plan(seeded, new_definition)
 
-    # Edit-in-place. We lack a browser-anchor signal, so we cannot safely
-    # rerun just the edited block (the browser is at post-prefix state, not
-    # pre-edit state). Walk back to the nearest upstream state-establishing
-    # block within the requested chain. Falls back to the full requested list
-    # if no safe upstream anchor can be identified.
+    # Edit-in-place. The edited block can only be rerun alone when the live session is provably
+    # still on the page its predecessor ended on; otherwise walk back to the nearest upstream
+    # state establisher, or to the full requested list when there is no safe anchor.
+    if _live_session_is_at_frontier_anchor(ctx, earliest, new_definition, runtime_page_url):
+        seeded = _seed_for_frontier(requested_labels, earliest, verified_outputs, new_definition)
+        if _name_resume_session_for_plan(ctx, seeded, earliest, new_definition, runtime_page_url):
+            LOG.info(
+                "copilot_frontier_resumed_at_edited_block",
+                frontier_start_label=earliest,
+                requested_labels=requested_labels,
+                resume_session_id=ctx.frontier_resume_session_id,
+            )
+            return (*seeded, "resumed")
     anchor = _nearest_upstream_state_establisher(requested_labels, earliest, new_definition)
     if anchor is None:
-        return requested_labels, {}, requested_labels[0]
-    return _seed_for_frontier(requested_labels, anchor, verified_outputs, new_definition)
+        return _anchored_plan((requested_labels, {}, requested_labels[0]), new_definition)
+    return _anchored_plan(
+        _seed_for_frontier(requested_labels, anchor, verified_outputs, new_definition),
+        new_definition,
+    )
 
 
 def _first_unverified_requested_label(requested_labels: list[str], verified_prefix_set: set[str]) -> str | None:
@@ -807,17 +1135,8 @@ def _first_unverified_requested_label(requested_labels: list[str], verified_pref
 
 
 def _frontier_label_shape_hashes(labels: list[str], workflow_definition: object | None) -> dict[str, str] | None:
-    by_label = _blocks_by_label(workflow_definition)
-    hashes: dict[str, str] = {}
-    for label in labels:
-        block = by_label.get(label)
-        if block is None:
-            return None
-        shape = _canonical_block_config(block)
-        shape.pop("label", None)
-        serialized = json.dumps(shape, sort_keys=True, default=str, separators=(",", ":"))
-        hashes[label] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return hashes
+    hashes = block_shape_hashes_by_label(labels, workflow_definition)
+    return hashes if len(hashes) == len(set(labels)) else None
 
 
 def _recorded_failed_attempted_label(ctx: AgentContext) -> str | None:
@@ -904,74 +1223,6 @@ def _seed_for_frontier(
         if label in verified_outputs:
             seed.setdefault(label, verified_outputs[label])
     return labels_to_execute, seed, frontier
-
-
-_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS = 2
-_PAGE_CHANGING_FRONTIER_BLOCK_TYPES: frozenset[str] = frozenset(
-    {
-        BlockType.ACTION.value,
-        BlockType.FILE_DOWNLOAD.value,
-        BlockType.FILE_UPLOAD.value,
-        BlockType.LOGIN.value,
-        BlockType.NAVIGATION.value,
-    }
-)
-
-
-def _frontier_block_type_names(labels: list[str], workflow_definition: object | None) -> list[str]:
-    by_label = _blocks_by_label(workflow_definition)
-    type_names: list[str] = []
-    for label in labels:
-        block = by_label.get(label)
-        if block is None:
-            continue
-        type_name = _block_type_name(block)
-        if type_name:
-            type_names.append(type_name)
-    return type_names
-
-
-def _frontier_has_several_page_changing_stages(labels: list[str], workflow_definition: object | None) -> bool:
-    type_names = _frontier_block_type_names(labels, workflow_definition)
-    if len(type_names) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
-        return False
-    page_changing_count = sum(1 for type_name in type_names if type_name in _PAGE_CHANGING_FRONTIER_BLOCK_TYPES)
-    return page_changing_count >= 2 or (page_changing_count >= 1 and len(type_names) >= 4)
-
-
-def _frontier_includes_required_runtime_anchor(block_labels: list[str], labels_to_execute: list[str]) -> bool:
-    if not block_labels or len(labels_to_execute) <= len(block_labels):
-        return False
-    return labels_to_execute[-len(block_labels) :] == block_labels
-
-
-def _frontier_run_size_error(
-    copilot_ctx: object,
-    block_labels: list[str],
-    labels_to_execute: list[str],
-    workflow_definition: object | None,
-) -> str | None:
-    if len(labels_to_execute) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
-        return None
-    if _frontier_includes_required_runtime_anchor(block_labels, labels_to_execute):
-        return None
-    if getattr(copilot_ctx, "build_phase", None) not in (BuildPhase.COMPOSING, BuildPhase.TESTING):
-        return None
-    if not _frontier_has_several_page_changing_stages(labels_to_execute, workflow_definition):
-        return None
-
-    suggested = labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]
-    remaining = labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]
-    return (
-        f"{INTERNAL_VALIDATION_FAILURE_PREFIX}this browser test frontier is too long for a multi-stage "
-        "page-changing workflow. Keep the same complete workflow YAML, but shrink only the "
-        f"block_labels argument to the next 1-2 unverified labels: {suggested!r}. "
-        "If a prior run already advanced the browser, inspect that reached page "
-        '(inspect_page_for_composition(target_url="current_page")) to ground the next labels in '
-        "what is actually there rather than shrinking the frontier blind. "
-        f"Do not remove later blocks from the YAML; test them after this frontier succeeds. "
-        f"Deferred labels: {remaining!r}. Requested labels: {block_labels!r}."
-    )
 
 
 def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:

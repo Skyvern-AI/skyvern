@@ -203,6 +203,10 @@ const SETTINGS_LABELS: Array<{
     fields: ["persistBrowserSession"],
     label: "Toggled persist browser session",
   },
+  {
+    fields: ["reuseBrowserSession"],
+    label: "Toggled reuse browser session",
+  },
   { fields: ["pinSavedSessionIp"], label: "Toggled pinned session IP" },
   {
     fields: ["browserProfileId", "browserProfileKey"],
@@ -218,6 +222,7 @@ const SETTINGS_LABELS: Array<{
   { fields: ["scriptCacheKey"], label: "Changed script cache key" },
   { fields: ["aiFallback"], label: "Toggled AI fallback" },
   { fields: ["enableSelfHealing"], label: "Toggled self-healing" },
+  { fields: ["maskSecrets"], label: "Toggled secret masking" },
   {
     fields: ["runSequentially", "sequentialKey"],
     label: "Changed sequential run settings",

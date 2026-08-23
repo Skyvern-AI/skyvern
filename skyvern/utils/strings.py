@@ -10,6 +10,15 @@ RANDOM_STRING_POOL = string.ascii_letters + string.digits
 _random = random.SystemRandom()
 
 
+UNTRUSTED_WEB_PAGE_DATA_BEGIN = "BEGIN_UNTRUSTED_WEB_PAGE_DATA"
+UNTRUSTED_WEB_PAGE_DATA_END = "END_UNTRUSTED_WEB_PAGE_DATA"
+_UNTRUSTED_WEB_PAGE_DATA_SENTINELS = (
+    UNTRUSTED_WEB_PAGE_DATA_BEGIN,
+    UNTRUSTED_WEB_PAGE_DATA_END,
+)
+_NEUTRALIZED_UNTRUSTED_WEB_PAGE_DATA_SENTINEL = "UNTRUSTED_BLOCK_SENTINEL_REMOVED"
+
+
 def generate_random_string(length: int = 5) -> str:
     return "".join(_random.choices(RANDOM_STRING_POOL, k=length))
 
@@ -64,4 +73,10 @@ def escape_code_fences(text: str | None, escape_quotes: bool = False) -> str:
     text = re.sub(r"`{3,}|~{3,}", lambda m: " ".join(m.group()), text)
     if escape_quotes:
         text = text.replace('"', "'")
+    return text
+
+
+def neutralize_untrusted_web_page_data_sentinels(text: str) -> str:
+    for sentinel in _UNTRUSTED_WEB_PAGE_DATA_SENTINELS:
+        text = text.replace(sentinel, _NEUTRALIZED_UNTRUSTED_WEB_PAGE_DATA_SENTINEL)
     return text

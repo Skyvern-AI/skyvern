@@ -19,16 +19,21 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException
+from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException, SkyvernActionFailed
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
 from skyvern.library.ai_locator import AILocator
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
+from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.dom_inspection import read_locator_selected_state
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 if TYPE_CHECKING:
@@ -38,6 +43,10 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 
 _EXTRACT_FORM_FIELDS_JS: str | None = None
+
+
+class ResolvedSensitiveValue(str):
+    """String value whose resolved credential provenance must survive."""
 
 
 def _is_pointer_interception_error(exc: Exception) -> bool:
@@ -80,13 +89,17 @@ class SkyvernPage(Page):
     3. Provides an AI-based fallback for standard actions
     """
 
+    engine_selection: BrowserEngineSelection | None = None
+
     def __init__(
         self,
         page: Page,
         ai: SkyvernPageAi,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
         super().__init__(page)
         self.page = page
+        self.engine_selection = engine_selection
         self.current_label: str | None = None
         self._ai = ai
         self._working_frame: Frame | None = None
@@ -114,6 +127,16 @@ class SkyvernPage(Page):
         if frame is not None:
             return frame
         return object.__getattribute__(self, "page")
+
+    @property
+    def locator_scope(self) -> Page | Frame:
+        """Public read-only view of the current locator scope for callers outside this class."""
+        return self._locator_scope
+
+    @property
+    def working_frame(self) -> Frame | None:
+        """Public read-only view of the working iframe (None means the main frame)."""
+        return object.__getattribute__(self, "_working_frame")
 
     async def _decorate_call(
         self,
@@ -158,6 +181,7 @@ class SkyvernPage(Page):
         return decorator
 
     async def goto(self, url: str, **kwargs: Any) -> None:
+        url = await asyncio.to_thread(validate_fetch_url, url)
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         await self.page.goto(url, timeout=timeout, **kwargs)
 
@@ -168,6 +192,18 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
     ) -> str:
         return value
+
+    async def magic_link(
+        self,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> None:
+        # Raises rather than no-opping like the value helpers above: a silent return would let a
+        # script continue past a sign-in that never happened.
+        raise NotImplementedError("Magic link sign-in is not supported outside server context")
+
+    def _is_secret_reference(self, value: str) -> bool:
+        return False
 
     async def _resolve_totp_placeholder_or_raise(
         self,
@@ -222,7 +258,7 @@ class SkyvernPage(Page):
         totp_code = await self.get_actual_value(raw_value, totp_identifier, totp_url)
         # Return the specific digit
         if digit_index < len(totp_code):
-            return totp_code[digit_index]
+            return ResolvedSensitiveValue(totp_code[digit_index])
         return ""
 
     @staticmethod
@@ -270,7 +306,12 @@ class SkyvernPage(Page):
                 # Only retry on element-not-found (timeout) or navigation errors
                 # (execution context destroyed). Non-transient errors (browser
                 # crashed, page closed) are re-raised immediately.
-                is_transient = isinstance(exc, PlaywrightTimeoutError) or "execution context" in str(exc).lower()
+                is_timeout = (
+                    self.engine_selection.is_engine_timeout_error(exc)
+                    if self.engine_selection is not None
+                    else isinstance(exc, PlaywrightTimeoutError)
+                )
+                is_transient = is_timeout or "execution context" in str(exc).lower()
                 if attempt < max_retries and is_transient:
                     LOG.info(
                         "Selector not found, retrying after wait",
@@ -308,6 +349,24 @@ class SkyvernPage(Page):
 
     ######### Public Interfaces #########
 
+    async def _click_is_redundant(self, locator: Locator, desired_state: bool | None, timeout: float) -> bool:
+        """Whether a level-triggered click must be suppressed because the control the selector
+        resolved already holds ``desired_state``. An unreadable or unresolvable state falls open to
+        one ordinary click, so a control this reader can't classify is never left unclicked. The read
+        shares the click's own timeout budget — on the prep opt-out path the locator has not been
+        waited on, and Playwright's default would otherwise stall a miss far past that budget."""
+        if desired_state is None:
+            return False
+        try:
+            live_state = await read_locator_selected_state(locator, timeout=timeout)
+        except Exception:
+            LOG.debug("Failed to read live selected state, continuing the normal click", exc_info=True)
+            return False
+        if live_state != desired_state:
+            return False
+        LOG.info("Control already in the desired state, suppressing the redundant click", desired_state=desired_state)
+        return True
+
     @overload
     async def click(
         self,
@@ -316,6 +375,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
@@ -327,6 +387,7 @@ class SkyvernPage(Page):
         prompt: str,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
@@ -339,6 +400,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         recoverable_marker_id: int | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
@@ -357,6 +419,10 @@ class SkyvernPage(Page):
             mode: When ``"direct"``, perform a raw Playwright click with no AI
                 fallback or element preparation.  The action is still recorded
                 in the DB so it appears in the timeline.
+            desired_state: Level-triggered toggle intent recorded with the action. When set, a
+                selector-first click is suppressed if the control already holds that state, so a
+                replay never toggles an already-satisfied control back off. Ignored by
+                ``mode="direct"``.
             **kwargs: All Playwright click parameters (timeout, force, modifiers, etc.)
 
         Returns:
@@ -413,10 +479,12 @@ class SkyvernPage(Page):
                     else:
                         locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
                         await self._prepare_element(locator, timeout=timeout)
+                    if await self._click_is_redundant(locator, desired_state, timeout):
+                        return selector
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
-                    if is_post_dispatch_click_timeout(e):
+                    if is_post_dispatch_click_timeout(e, self.engine_selection):
                         LOG.info(
                             "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
                             selector=selector,
@@ -424,7 +492,11 @@ class SkyvernPage(Page):
                         return selector
                     should_retry_after_escape = (
                         not _skip_element_prep
-                        or not isinstance(e, PlaywrightTimeoutError)
+                        or not (
+                            self.engine_selection.is_engine_timeout_error(e)
+                            if self.engine_selection is not None
+                            else isinstance(e, PlaywrightTimeoutError)
+                        )
                         or _is_pointer_interception_error(e)
                     )
                     # The click may have failed because an autocomplete dropdown
@@ -435,13 +507,24 @@ class SkyvernPage(Page):
                             await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
                             locator = self._locator_scope.locator(selector).first
+                            # The primary click may have dispatched and reached the desired state
+                            # before raising, in which case retrying would toggle it back off.
+                            if await self._click_is_redundant(locator, desired_state, timeout):
+                                return selector
                             await locator.click(timeout=timeout, **kwargs)
                             LOG.info(
                                 "CSS selector click succeeded after dismissing overlay",
                                 selector=selector,
                             )
                             return selector
-                        except Exception:
+                        except Exception as retry_error:
+                            if is_post_dispatch_click_timeout(retry_error, self.engine_selection):
+                                LOG.info(
+                                    "CSS selector click dispatched after dismissing overlay; "
+                                    "navigation-wait timed out — skipping fallback",
+                                    selector=selector,
+                                )
+                                return selector
                             pass  # retry failed too — fall through to AI
                     LOG.info(
                         "CSS selector click failed, falling back to AI",
@@ -479,8 +562,9 @@ class SkyvernPage(Page):
                 )
 
         if selector:
-            locator = self._locator_scope.locator(selector)
-            await locator.click(timeout=timeout, **kwargs)
+            locator = self._locator_scope.locator(selector).first
+            if not await self._click_is_redundant(locator, desired_state, timeout):
+                await locator.click(timeout=timeout, **kwargs)
 
         return selector
 
@@ -517,6 +601,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -532,6 +617,7 @@ class SkyvernPage(Page):
         totp_identifier: str | None = None,
         totp_url: str | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str: ...
 
@@ -548,6 +634,7 @@ class SkyvernPage(Page):
         totp_url: str | None = None,
         recoverable_marker_id: int | None = None,
         _skip_element_prep: bool = False,
+        _direct_fill_release_guard: Callable[[str | None], None] | None = None,
         **kwargs: Any,
     ) -> str:
         """Fill an input field using a CSS selector, AI-powered prompt matching, or both.
@@ -565,6 +652,8 @@ class SkyvernPage(Page):
             mode: When ``"direct"``, perform a raw Playwright fill with no AI
                 fallback or element preparation.  The action is still recorded
                 in the DB so it appears in the timeline.
+            _direct_fill_release_guard: Internal synchronous guard invoked with the
+                resolved element frame URL immediately before a direct fill.
             totp_identifier: TOTP identifier for time-based one-time password fields.
             totp_url: URL to fetch TOTP codes from for authentication.
 
@@ -604,11 +693,25 @@ class SkyvernPage(Page):
             )
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
-            await locator.fill(value, timeout=timeout, **kwargs)
-            # locator.fill already emits `input`; only the change/blur a JS gate may also need are missing.
+            element = None
+            if _direct_fill_release_guard is not None:
+                element = await locator.element_handle(timeout=timeout)
+                if element is None:
+                    raise RuntimeError("Direct fill could not resolve an element before the release check.")
+                owner_frame = await element.owner_frame()
+                _direct_fill_release_guard(owner_frame.url if owner_frame is not None else None)
+                # A document-bound handle cannot re-resolve onto a page/frame that navigates after
+                # the guard. It detaches and fails instead of releasing the value on the new origin.
+                await element.fill(value, timeout=timeout, **kwargs)
+            else:
+                await locator.fill(value, timeout=timeout, **kwargs)
+            # Direct fill already emits `input`; only the change/blur a JS gate may also need are missing.
             for event_name in ("change", "blur"):
                 try:
-                    await locator.dispatch_event(event_name, timeout=timeout)
+                    if element is not None:
+                        await element.dispatch_event(event_name)
+                    else:
+                        await locator.dispatch_event(event_name, timeout=timeout)
                 except Exception:
                     LOG.debug("direct fill: dispatch_event failed", dispatched_event=event_name, exc_info=True)
             return value
@@ -775,6 +878,12 @@ class SkyvernPage(Page):
         if context and context.ai_mode_override:
             ai = context.ai_mode_override
 
+        original_value = value or ""
+        value_is_sensitive = isinstance(original_value, ResolvedSensitiveValue)
+        try:
+            value_is_sensitive = value_is_sensitive or self._is_secret_reference(original_value)
+        except Exception:
+            pass
         resolved_totp_value: str | None = None
         if value is not None and is_unresolved_totp_value(value):
             resolved_totp_value = await self._resolve_totp_placeholder_or_raise(
@@ -782,6 +891,7 @@ class SkyvernPage(Page):
                 totp_identifier=kwargs.get("totp_identifier"),
                 totp_url=kwargs.get("totp_url"),
             )
+            value_is_sensitive = True
 
         timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
         data = kwargs.pop("data", None)
@@ -795,6 +905,7 @@ class SkyvernPage(Page):
                 intention=prompt,
                 data=data,
                 timeout=timeout,
+                value_is_sensitive=value_is_sensitive,
             )
 
         # --- Selector-based autocomplete flow ---
@@ -807,6 +918,7 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    value_is_sensitive=value_is_sensitive,
                 )
             raise ValueError("Selector is required but was not provided")
 
@@ -822,6 +934,7 @@ class SkyvernPage(Page):
                 raise
             except Exception:
                 pass  # use original value
+        value_is_sensitive = value_is_sensitive or actual_value != original_value
         if is_unresolved_totp_value(actual_value):
             raise NoTOTPSecretFound()
 
@@ -835,10 +948,11 @@ class SkyvernPage(Page):
             )
             return result
         except Exception as e:
+            redaction_value = actual_value if value_is_sensitive else None
             LOG.info(
                 "fill_autocomplete selector path failed, trying AI fallback",
-                selector=selector,
-                error=str(e),
+                selector=redact_sensitive_value(selector, redaction_value),
+                error=redact_sensitive_value(str(e), redaction_value),
             )
             if prompt:
                 return await self._ai.ai_input_text(
@@ -847,8 +961,10 @@ class SkyvernPage(Page):
                     intention=prompt,
                     data=data,
                     timeout=timeout,
+                    value_is_sensitive=value_is_sensitive,
                 )
-            raise
+            error_to_raise = SkyvernActionFailed(redact_sensitive_value(str(e), redaction_value))
+        raise error_to_raise
 
     # Common selectors for autocomplete dropdown options, tried in order.
     _AUTOCOMPLETE_OPTION_SELECTORS = [
@@ -894,8 +1010,6 @@ class SkyvernPage(Page):
             # commit, then verify the value stuck.
             LOG.info(
                 "fill_autocomplete: no dropdown options found, trying Enter to commit",
-                selector=selector,
-                value=value,
             )
             await locator.press("Enter", timeout=timeout)
             await asyncio.sleep(0.5)
@@ -905,8 +1019,6 @@ class SkyvernPage(Page):
             if current_value.strip():
                 LOG.info(
                     "fill_autocomplete: value committed via Enter",
-                    selector=selector,
-                    value=current_value,
                 )
                 return current_value
 
@@ -914,8 +1026,6 @@ class SkyvernPage(Page):
             # Re-type and try clicking the first available option after a longer wait.
             LOG.info(
                 "fill_autocomplete: value cleared after Enter, retrying with longer wait",
-                selector=selector,
-                value=value,
             )
             await locator.clear(timeout=timeout)
             await handler_utils.input_sequentially(locator, value, timeout=timeout)
@@ -925,8 +1035,6 @@ class SkyvernPage(Page):
                 # Last resort: just fill the raw value and hope it sticks
                 LOG.warning(
                     "fill_autocomplete: no dropdown after retry, filling raw value",
-                    selector=selector,
-                    value=value,
                 )
                 await locator.fill(value, timeout=timeout)
                 return value
@@ -937,8 +1045,6 @@ class SkyvernPage(Page):
             await best_match.click(timeout=timeout)
             LOG.info(
                 "fill_autocomplete: clicked matching dropdown option",
-                selector=selector,
-                value=value,
             )
         else:
             # No close text match — click the first option as best guess
@@ -946,8 +1052,6 @@ class SkyvernPage(Page):
             await first.click(timeout=timeout)
             LOG.info(
                 "fill_autocomplete: no close text match, clicked first option",
-                selector=selector,
-                value=value,
             )
 
         # Wait for the selection to register in the UI
@@ -1039,15 +1143,19 @@ class SkyvernPage(Page):
 
         # For single-digit TOTP values (from multi-field TOTP inputs), force fallback mode
         # so that we use the exact digit value instead of having AI generate a new one
-        if value and len(value) == 1 and value.isdigit() and ai == "proactive":
+        if isinstance(value, ResolvedSensitiveValue) and ai == "proactive":
             ai = "fallback"
 
         # format the text with the actual value of the parameter if it's a secret when running a workflow
         if ai == "fallback":
             error_to_raise = None
+            value_is_sensitive = False
             original_selector = selector  # preserve for fallback episode recording
             if selector:
                 try:
+                    value_is_sensitive = isinstance(
+                        original_value, ResolvedSensitiveValue
+                    ) or self._is_secret_reference(original_value)
                     if resolved_totp_value is not None:
                         value = resolved_totp_value
                     else:
@@ -1056,6 +1164,7 @@ class SkyvernPage(Page):
                             totp_identifier=totp_identifier,
                             totp_url=totp_url,
                         )
+                    value_is_sensitive = value_is_sensitive or value != original_value
                     if is_unresolved_totp_value(value):
                         raise NoTOTPSecretFound()
                     # Retry selector lookup to handle page transitions (redirects,
@@ -1080,12 +1189,14 @@ class SkyvernPage(Page):
                 except NoTOTPSecretFound:
                     raise
                 except Exception as e:
+                    redaction_value = value if value_is_sensitive else None
+                    redacted_error = redact_sensitive_value(str(e), redaction_value)
                     LOG.warning(
                         "CSS selector fill failed, falling back to AI",
-                        selector=selector,
-                        error=str(e),
+                        selector=redact_sensitive_value(selector, redaction_value),
+                        error=redacted_error,
                     )
-                    error_to_raise = e
+                    error_to_raise = SkyvernActionFailed(redacted_error)
                     selector = None
 
             if intention:
@@ -1100,6 +1211,7 @@ class SkyvernPage(Page):
                     failed_selector=original_selector or "",
                     block_label=self.current_label,
                     recoverable_marker_id=recoverable_marker_id,
+                    value_is_sensitive=value_is_sensitive,
                 )
             if error_to_raise:
                 raise error_to_raise
@@ -1373,6 +1485,17 @@ class SkyvernPage(Page):
     async def complete(self, prompt: str | None = None) -> None:
         """Stub for complete. Override in subclasses for specific behavior."""
 
+    # Intentionally not @action_wrap-wrapped: this is internal evidence capture, not a
+    # user-facing recordable action like click/fill/complete.
+    async def capture_action_screenshot(self) -> None:
+        """Persist a screenshot of the current page as a timeline-visible run artifact.
+
+        On-demand evidence capture for a specific moment (e.g. a confirmed submission).
+        Stub; the cached-script page overrides this to persist a SCREENSHOT_ACTION for
+        the current block.
+        """
+        return
+
     @action_wrap(ActionType.DOWNLOAD_FILE)
     async def download_file(
         self,
@@ -1640,7 +1763,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-field-mapper",
                 organization_id=org_id,
@@ -2053,7 +2176,7 @@ class SkyvernPage(Page):
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="form-validate-mapping",
                 organization_id=org_id,
@@ -2328,7 +2451,10 @@ class SkyvernPage(Page):
             try:
                 from skyvern.webeye.utils.page import SkyvernFrame
 
-                skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+                skyvern_frame = await SkyvernFrame.create_instance(
+                    frame=self.page,
+                    engine_selection=self.engine_selection,
+                )
                 await skyvern_frame.wait_for_page_ready(
                     network_idle_timeout_ms=3000,
                     loading_indicator_timeout_ms=5000,
@@ -2684,7 +2810,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="select-from-group",
                 organization_id=org_id,
@@ -2936,7 +3062,7 @@ class SkyvernPage(Page):
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
             if skyvern_ctx:
                 skyvern_ctx.script_llm_call_count += 1
-            json_response = await app.SECONDARY_LLM_API_HANDLER(
+            json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt,
                 prompt_name="batch-form-fill-plan",
                 organization_id=org_id,
@@ -3347,7 +3473,7 @@ class SkyvernPage(Page):
             skyvern_ctx = skyvern_context.current()
             org_id = skyvern_ctx.organization_id if skyvern_ctx else None
 
-            result = await app.SECONDARY_LLM_API_HANDLER(
+            result = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
                 prompt=prompt_text,
                 prompt_name="quality-audit",
                 organization_id=org_id,

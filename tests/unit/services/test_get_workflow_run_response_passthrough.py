@@ -5,9 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.exceptions import BlockedHost
+from skyvern.forge.sdk.routes.agent_protocol import _workflow_run_request_from_workflow_request
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
-from skyvern.schemas.runs import RunStatus, ScriptRunResponse
-from skyvern.services.workflow_service import get_workflow_run_response
+from skyvern.schemas.runs import RunStatus, ScriptRunResponse, WorkflowRunRequest
+from skyvern.services.workflow_service import get_workflow_run_response, workflow_request_body_from_existing_run
 
 
 @pytest.mark.asyncio
@@ -74,3 +76,160 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.step_count == 4
     assert resp.run_request is not None
     assert resp.run_request.browser_session_id == "pbs_123"
+
+
+def _fresh_run(*, start_fresh: bool, session_id: str | None) -> WorkflowRun:
+    now = datetime.now(timezone.utc)
+    return WorkflowRun(
+        workflow_run_id="wr_f",
+        workflow_id="w_f",
+        workflow_permanent_id="wpid_f",
+        organization_id="o_f",
+        status=WorkflowRunStatus.failed,
+        browser_session_id=session_id,
+        start_fresh_browser=start_fresh,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def test_retry_omits_session_id_for_fresh_run() -> None:
+    # A fresh run created under FORCE_BROWSER_SESSION carries a generated PBS; the retry must omit it,
+    # or the start_fresh + browser_session_id validator rejects the reconstruction.
+    body = workflow_request_body_from_existing_run(_fresh_run(start_fresh=True, session_id="pbs_forced"))
+    assert body.start_fresh_browser is True
+    assert body.browser_session_id is None
+
+
+def test_retry_keeps_session_id_when_not_fresh() -> None:
+    body = workflow_request_body_from_existing_run(_fresh_run(start_fresh=False, session_id="pbs_keep"))
+    assert body.browser_session_id == "pbs_keep"
+
+
+def test_persisted_private_browser_address_is_allowed_only_for_reconstruction() -> None:
+    workflow_run = _fresh_run(start_fresh=False, session_id=None)
+    workflow_run.browser_address = "ws://10.0.0.5:9222"
+
+    body = workflow_request_body_from_existing_run(workflow_run)
+    reconstructed = _workflow_run_request_from_workflow_request(
+        workflow_id=workflow_run.workflow_permanent_id,
+        title=None,
+        workflow_request=body,
+    )
+
+    assert body.browser_address == "ws://10.0.0.5:9222"
+    assert reconstructed.browser_address == "ws://10.0.0.5:9222"
+    with pytest.raises(BlockedHost):
+        WorkflowRunRequest(workflow_id="wpid_f", browser_address="ws://10.0.0.5:9222")
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_response_reconstructs_private_browser_address() -> None:
+    workflow_run = _fresh_run(start_fresh=False, session_id=None)
+    workflow_run.browser_address = "ws://10.0.0.5:9222"
+    status_resp = MagicMock(
+        outputs={},
+        downloaded_files=None,
+        recording_url=None,
+        recording_archived=False,
+        screenshot_urls=None,
+        failure_reason=None,
+        workflow_title="Test",
+        parameters={},
+        errors=None,
+        total_steps=1,
+    )
+
+    with (
+        patch(
+            "skyvern.services.workflow_service.app.DATABASE.workflow_runs.get_workflow_run",
+            new_callable=AsyncMock,
+            return_value=workflow_run,
+        ),
+        patch(
+            "skyvern.services.workflow_service.app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id",
+            new_callable=AsyncMock,
+            return_value=status_resp,
+        ),
+    ):
+        response = await get_workflow_run_response("wr_f", organization_id="o_f")
+
+    assert response is not None
+    assert response.run_request is not None
+    assert response.run_request.browser_address == "ws://10.0.0.5:9222"
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_response_echoes_fresh_and_drops_session() -> None:
+    # A fresh run's run_request echoes start_fresh_browser and drops the session/profile so it stays
+    # valid under the mutually-exclusive validators (a FORCE_BROWSER_SESSION run has a generated PBS).
+    now = datetime.now(timezone.utc)
+    workflow_run = WorkflowRun(
+        workflow_run_id="wr_f",
+        workflow_id="w_f",
+        workflow_permanent_id="wpid_f",
+        organization_id="o_f",
+        status=WorkflowRunStatus.completed,
+        browser_session_id="pbs_forced",
+        start_fresh_browser=True,
+        created_at=now,
+        modified_at=now,
+    )
+    status_resp = MagicMock(
+        outputs={},
+        downloaded_files=None,
+        recording_url=None,
+        screenshot_urls=None,
+        failure_reason=None,
+        workflow_title="T",
+        parameters={},
+        errors=None,
+        total_steps=1,
+    )
+    with (
+        patch(
+            "skyvern.services.workflow_service.app.DATABASE.workflow_runs.get_workflow_run",
+            new_callable=AsyncMock,
+            return_value=workflow_run,
+        ),
+        patch(
+            "skyvern.services.workflow_service.app.WORKFLOW_SERVICE.build_workflow_run_status_response_by_workflow_id",
+            new_callable=AsyncMock,
+            return_value=status_resp,
+        ),
+    ):
+        resp = await get_workflow_run_response("wr_f", organization_id="o_f")
+
+    assert resp is not None
+    assert resp.run_request is not None
+    assert resp.run_request.start_fresh_browser is True
+    assert resp.run_request.browser_session_id is None
+    # The top-level field still surfaces the actual session the run used.
+    assert resp.browser_session_id == "pbs_forced"
+
+
+@pytest.mark.parametrize("value", ["__untagged__", "__other__"])
+def test_retry_drops_legacy_reserved_metadata_instead_of_failing(value: str) -> None:
+    # Runs tagged before the reserved-value rule still have to be retryable: the replay
+    # reloads their stored tags, so raising here would strand them permanently.
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": value, "team": "growth"},
+    )
+    assert body.run_metadata == {"team": "growth"}
+
+
+def test_retry_run_metadata_is_none_when_every_entry_was_reserved() -> None:
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": "__other__"},
+    )
+    assert body.run_metadata is None
+
+
+def test_retry_keeps_metadata_that_merely_contains_a_reserved_substring() -> None:
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": "prod__other__eu"},
+    )
+    assert body.run_metadata == {"cost_center": "prod__other__eu"}

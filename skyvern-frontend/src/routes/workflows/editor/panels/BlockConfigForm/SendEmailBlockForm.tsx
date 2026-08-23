@@ -26,11 +26,41 @@ function SendEmailBlockFormBody({
   blockId: string;
   node: SendEmailNode;
 }) {
-  const { recipients, subject, body, fileAttachments } = node.data;
+  const {
+    recipients,
+    subject,
+    body,
+    fileAttachments,
+    sender,
+    customSmtpHost,
+    customSmtpPort,
+    customSmtpUsername,
+    customSmtpPassword,
+  } = node.data;
 
   const value = useMemo(
-    () => ({ recipients, subject, body, fileAttachments }),
-    [recipients, subject, body, fileAttachments],
+    () => ({
+      recipients,
+      subject,
+      body,
+      fileAttachments,
+      sender,
+      customSmtpHost,
+      customSmtpPort,
+      customSmtpUsername,
+      customSmtpPassword,
+    }),
+    [
+      recipients,
+      subject,
+      body,
+      fileAttachments,
+      sender,
+      customSmtpHost,
+      customSmtpPort,
+      customSmtpUsername,
+      customSmtpPassword,
+    ],
   );
   const { commit } = useDebouncedSidebarSave({
     blockId,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -74,18 +75,47 @@ def streaming_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def fake_storage(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     save_mock = AsyncMock()
-    fake_app = SimpleNamespace(STORAGE=SimpleNamespace(save_streaming_file=save_mock))
+    fake_app = SimpleNamespace(
+        STORAGE=SimpleNamespace(save_streaming_file=save_mock),
+        AGENT_FUNCTION=SimpleNamespace(should_publish_streaming_frame=AsyncMock(return_value=True)),
+    )
     monkeypatch.setattr(publisher_module, "app", fake_app)
     return save_mock
 
 
 async def _drive_publish_once(pub: CDPFramePublisher) -> None:
     """Call the internal one-frame routine without starting the long-running loop."""
-    await pub._publish_one_frame()
+    owner_key = (pub._organization_id, pub._stream_key)
+    with publisher_module._ARTIFACT_OWNERS_LOCK:
+        publisher_module._ARTIFACT_OWNERS[owner_key] = pub._artifact_owner
+    try:
+        await pub._publish_one_frame()
+    finally:
+        with publisher_module._ARTIFACT_OWNERS_LOCK:
+            if publisher_module._ARTIFACT_OWNERS.get(owner_key) is pub._artifact_owner:
+                publisher_module._ARTIFACT_OWNERS.pop(owner_key)
 
 
-def _stream_path(temp_dir: Path) -> Path:
-    return temp_dir / ORG_ID / STREAM_KEY
+def _stream_path(temp_dir: Path, stream_key: str = STREAM_KEY) -> Path:
+    return temp_dir / ORG_ID / stream_key
+
+
+def _sentinel_path(temp_dir: Path, stream_key: str = STREAM_KEY) -> Path:
+    return temp_dir / ORG_ID / f"{stream_key}.remote"
+
+
+def _write_test_frame_atomically(temp_dir: Path, stream_key: str, data: bytes) -> bool:
+    organization_id = temp_dir.name
+    owner = object()
+    owner_key = (organization_id, stream_key)
+    with publisher_module._ARTIFACT_OWNERS_LOCK:
+        publisher_module._ARTIFACT_OWNERS[owner_key] = owner
+    try:
+        return _write_frame_atomically(temp_dir, stream_key, data, organization_id, owner)
+    finally:
+        with publisher_module._ARTIFACT_OWNERS_LOCK:
+            if publisher_module._ARTIFACT_OWNERS.get(owner_key) is owner:
+                publisher_module._ARTIFACT_OWNERS.pop(owner_key)
 
 
 def test_stream_key_helpers() -> None:
@@ -576,7 +606,7 @@ def test_write_frame_atomically_writes_bytes_via_tempfile(tmp_path: Path) -> Non
     """The sync helper used by ``_write_frame`` writes via tempfile+replace and
     leaves no ``.tmp`` siblings behind on success."""
     target_dir = tmp_path / "o_org_x"
-    _write_frame_atomically(target_dir, "wr_x.png", b"payload-bytes")
+    assert _write_test_frame_atomically(target_dir, "wr_x.png", b"payload-bytes")
 
     assert (target_dir / "wr_x.png").read_bytes() == b"payload-bytes"
     # No leftover temp files in the org dir.
@@ -597,9 +627,245 @@ def test_write_frame_atomically_cleans_tempfile_on_replace_failure(
     monkeypatch.setattr(publisher_module.os, "replace", _boom)
 
     with pytest.raises(OSError, match="replace failed"):
-        _write_frame_atomically(target_dir, "wr_x.png", b"payload-bytes")
+        _write_test_frame_atomically(target_dir, "wr_x.png", b"payload-bytes")
 
     # Target was never written, and the temp file was cleaned up.
     assert not (target_dir / "wr_x.png").exists()
     leftovers = [p for p in target_dir.iterdir() if p.name.startswith(".") and p.suffix == ".tmp"]
     assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_gate_closed_skips_capture_and_upload(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(return_value=False)
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    gate.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+    page.context.new_cdp_session.assert_not_awaited()
+    fake_storage.assert_not_awaited()
+    assert not _stream_path(streaming_temp_dir).exists()
+
+
+@pytest.mark.asyncio
+async def test_gate_open_publishes_normally(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(return_value=True)
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    gate.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+    fake_storage.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+
+
+@pytest.mark.asyncio
+async def test_gate_error_fails_open_and_publishes(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    gate = AsyncMock(side_effect=RuntimeError("gate backend down"))
+    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
+
+    await _drive_publish_once(pub)
+
+    fake_storage.assert_awaited_once_with(ORG_ID, STREAM_KEY)
+
+
+@pytest.mark.asyncio
+async def test_gated_skip_does_not_advance_dedupe_digest(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    session = _make_cdp_session([b"framebytes"])
+    page = _make_page_with_session(session)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(page),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    # First save is gated at the storage chokepoint (False), second is a real upload.
+    fake_storage.side_effect = [False, None]
+
+    await _drive_publish_once(pub)
+    assert pub._last_published_digest is None
+
+    await _drive_publish_once(pub)
+    assert pub._last_published_digest is not None
+    assert fake_storage.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_removes_only_current_run_artifacts(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    stream_key = "wr_1.png"
+    other_stream_key = "wr_10.png"
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=stream_key,
+        organization_id=ORG_ID,
+    )
+    other_pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=other_stream_key,
+        organization_id=ORG_ID,
+    )
+
+    await pub.start()
+    await other_pub.start()
+    await pub._write_frame(b"stopped-run-frame")
+    await other_pub._write_frame(b"active-run-frame")
+
+    await pub.stop()
+
+    assert not _stream_path(streaming_temp_dir, stream_key).exists()
+    assert not _sentinel_path(streaming_temp_dir, stream_key).exists()
+    assert _stream_path(streaming_temp_dir, other_stream_key).read_bytes() == b"active-run-frame"
+    assert _sentinel_path(streaming_temp_dir, other_stream_key).exists()
+
+    await other_pub.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_publisher_stop_preserves_replacement_artifacts(
+    streaming_temp_dir: Path, fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale_write_started = threading.Event()
+    release_stale_write = threading.Event()
+    real_write = _write_frame_atomically
+
+    def _block_stale_write(temp_dir: Path, stream_key: str, data: bytes, organization_id: str, owner: object) -> bool:
+        if data == b"stale-frame":
+            stale_write_started.set()
+            release_stale_write.wait(timeout=5)
+        return real_write(temp_dir, stream_key, data, organization_id, owner)
+
+    monkeypatch.setattr(publisher_module, "_write_frame_atomically", _block_stale_write)
+    stale_session = _make_cdp_session([b"stale-frame"])
+    stale_pub = CDPFramePublisher(
+        browser_state=_make_browser_state(_make_page_with_session(stale_session)),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    replacement_pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+
+    await stale_pub.start()
+    assert await asyncio.to_thread(stale_write_started.wait, 2)
+    await replacement_pub.start()
+    await replacement_pub._write_frame(b"replacement-frame")
+
+    stale_stop = asyncio.create_task(stale_pub.stop())
+    release_stale_write.set()
+    await stale_stop
+
+    assert _stream_path(streaming_temp_dir).read_bytes() == b"replacement-frame"
+    assert _sentinel_path(streaming_temp_dir).exists()
+
+    await replacement_pub.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_frame_write_finishes_before_cleanup(
+    streaming_temp_dir: Path, fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_started = threading.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
+    real_write = _write_frame_atomically
+
+    def _blocked_write(temp_dir: Path, stream_key: str, data: bytes, organization_id: str, owner: object) -> bool:
+        write_started.set()
+        release_write.wait(timeout=5)
+        committed = real_write(temp_dir, stream_key, data, organization_id, owner)
+        write_finished.set()
+        return committed
+
+    monkeypatch.setattr(publisher_module, "_write_frame_atomically", _blocked_write)
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+    await pub.start()
+    write_task = asyncio.create_task(pub._write_frame(b"late-frame"))
+    assert await asyncio.to_thread(write_started.wait, 2)
+
+    write_task.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not write_task.done()
+    finally:
+        release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await write_task
+    assert write_finished.is_set()
+
+    await pub.stop()
+    assert not _stream_path(streaming_temp_dir).exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_ignores_already_missing_artifact(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+
+    await pub.start()
+    await pub._write_frame(b"frame")
+    _stream_path(streaming_temp_dir).unlink()
+
+    await pub.stop()
+
+    assert pub._task is None
+    assert not _sentinel_path(streaming_temp_dir).exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_continues_after_artifact_cleanup_error(
+    streaming_temp_dir: Path, fake_storage: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pub = CDPFramePublisher(
+        browser_state=_make_browser_state(None, connected=False),
+        stream_key=STREAM_KEY,
+        organization_id=ORG_ID,
+    )
+
+    await pub.start()
+    await pub._write_frame(b"frame")
+    frame_path = _stream_path(streaming_temp_dir)
+    sentinel_path = _sentinel_path(streaming_temp_dir)
+    attempted_paths: list[Path] = []
+
+    def _raise_for_artifacts(path: Path, *args: object, **kwargs: object) -> None:
+        attempted_paths.append(path)
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(Path, "unlink", _raise_for_artifacts)
+
+    await pub.stop()
+
+    assert pub._task is None
+    assert frame_path.exists()
+    assert sentinel_path.exists()
+    assert attempted_paths == [frame_path, sentinel_path]

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -11,6 +12,7 @@ import {
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import {
   resolveBrowserPaneView,
+  resolveLiveSurface,
   type BrowserPaneView,
 } from "./browserPaneView";
 import { useRunVisuals, type RunVisuals } from "./useRunVisuals";
@@ -36,7 +38,7 @@ type BrowserPaneViewState = {
  * the pane body and its header chrome (queries dedupe via react-query).
  */
 export function useBrowserPaneView(): BrowserPaneViewState {
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const [searchParams] = useSearchParams();
   const { runId, explicit } = useStudioInspectedRun();
   const visuals = useRunVisuals(runId);
@@ -87,12 +89,12 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     failed: visuals.failed,
   });
 
-  // Recording pins the live surface to the debug browser (the recorder drives
-  // it), even if an inspected run happens to be streaming elsewhere.
-  const liveSurface: "debug" | "run" =
-    !isRecording && visuals.running && !runInDebugSession && runId != null
-      ? "run"
-      : "debug";
+  const liveSurface = resolveLiveSurface({
+    recording: isRecording,
+    running: visuals.running,
+    runInDebugSession,
+    hasRunId: runId != null,
+  });
 
   return {
     view,

@@ -42,7 +42,12 @@ class ClickAction(SdkActionBase):
     selector: str | None = Field(default="", description="CSS selector for the element")
     intention: str = Field(default="", description="The intention or goal of the click")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
-    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+    # Keep runtime defaults configurable while documenting a stable API default.
+    timeout: float = Field(
+        default_factory=lambda: settings.BROWSER_ACTION_TIMEOUT_MS,
+        description="Timeout in milliseconds",
+        json_schema_extra={"default": 10000},
+    )
 
     def get_navigation_goal(self) -> str | None:
         return self.intention
@@ -61,7 +66,11 @@ class InputTextAction(SdkActionBase):
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
     totp_identifier: str | None = Field(None, description="TOTP identifier for input_text actions")
     totp_url: str | None = Field(None, description="TOTP URL for input_text actions")
-    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+    timeout: float = Field(
+        default_factory=lambda: settings.BROWSER_ACTION_TIMEOUT_MS,
+        description="Timeout in milliseconds",
+        json_schema_extra={"default": 10000},
+    )
 
     def __repr__(self) -> str:
         payload = redact_input_text_payload_for_log(self.model_dump(), value_key="value")
@@ -86,7 +95,11 @@ class SelectOptionAction(SdkActionBase):
     value: str | None = Field(default="", description="Value to select")
     intention: str = Field(default="", description="The intention or goal of the selection")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
-    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+    timeout: float = Field(
+        default_factory=lambda: settings.BROWSER_ACTION_TIMEOUT_MS,
+        description="Timeout in milliseconds",
+        json_schema_extra={"default": 10000},
+    )
 
     def get_navigation_goal(self) -> str | None:
         return self.intention
@@ -103,7 +116,11 @@ class UploadFileAction(SdkActionBase):
     file_url: str | None = Field(default="", description="File URL for upload")
     intention: str = Field(default="", description="The intention or goal of the upload")
     data: str | dict[str, Any] | None = Field(None, description="Additional context data")
-    timeout: float = Field(default=settings.BROWSER_ACTION_TIMEOUT_MS, description="Timeout in milliseconds")
+    timeout: float = Field(
+        default_factory=lambda: settings.BROWSER_ACTION_TIMEOUT_MS,
+        description="Timeout in milliseconds",
+        json_schema_extra={"default": 10000},
+    )
 
     def get_navigation_goal(self) -> str | None:
         return self.intention

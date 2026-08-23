@@ -4,6 +4,7 @@ from pydantic import BaseModel, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.services.email import gmail, outlook
 from skyvern.services.email.types import EmailMessage
 
@@ -64,7 +65,7 @@ async def match_email(*, criteria: str, email: EmailMessage, organization_id: st
         snippet=email.snippet,
         body=body[:_BODY_LIMIT],
     )
-    resp = await app.SECONDARY_LLM_API_HANDLER(
+    resp = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
         prompt=prompt,
         prompt_name="match-email",
         organization_id=organization_id,

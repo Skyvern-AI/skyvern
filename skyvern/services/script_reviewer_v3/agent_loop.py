@@ -30,10 +30,9 @@ import json
 import time
 from typing import Any, Awaitable, Callable
 
-import litellm
 import structlog
 
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop,
     detect_tool_loop,
@@ -41,6 +40,7 @@ from skyvern.forge.sdk.copilot.loop_detection import (
 )
 from skyvern.services.script_reviewer_v3.budget import Budget, InvocationHandle
 from skyvern.services.script_reviewer_v3.decision import Decision
+from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
 from skyvern.services.script_reviewer_v3.skills import SkillResult
 from skyvern.services.script_reviewer_v3.skills.base import SkillRegistry
 
@@ -130,10 +130,11 @@ def _extract_usage(response: Any) -> tuple[int, int, float]:
     the v3 router workaround sometimes
     returns responses without ``_hidden_params['response_cost']`` populated
     (raw_response=True path bypasses litellm.completion_cost). When that
-    happens we fall back to ``litellm.completion_cost(completion_response=response)``
-    just like the main Skyvern handler does (see
-    ``skyvern/forge/sdk/api/llm/api_handler_factory.py:1110``). Final fallback
-    is 0 — never raises.
+    happens we fall back to the main Skyvern handler's own cost helper, which applies the
+    provider-side corrections litellm omits. That fallback is rarely taken — litellm populates
+    ``response_cost`` on ordinary completions — so this narrows a disagreement rather than
+    removing it; the preference for ``response_cost`` is tracked separately.
+    Final fallback is 0 — never raises.
     """
     try:
         usage = getattr(response, "usage", None) or response.get("usage", {})  # type: ignore[union-attr]
@@ -149,13 +150,9 @@ def _extract_usage(response: Any) -> tuple[int, int, float]:
         cost_usd = float(hidden.get("response_cost", 0.0) or 0.0)
     except Exception:
         cost_usd = 0.0
-    # Fallback: when response_cost is 0/missing, ask litellm to compute it
-    # from the model+usage. This is the same call the main Skyvern LLM
-    # handler uses, so cost numbers stay comparable across v2 and v3.
     if cost_usd == 0.0:
         try:
-            computed = litellm.completion_cost(completion_response=response)
-            cost_usd = float(computed or 0.0)
+            cost_usd = float(LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0)
         except Exception:
             cost_usd = 0.0
     return input_tokens, output_tokens, cost_usd
@@ -226,6 +223,9 @@ async def run_agent_loop(
     timeline: list[dict[str, Any]] = []
     terminal_names = registry.terminal_names(agent_kind)
     tools = registry.tool_schemas(agent_kind)
+    sensitive_value = getattr(context, "value", None) if getattr(context, "value_is_sensitive", False) else None
+    if not isinstance(sensitive_value, str):
+        sensitive_value = None
 
     # Anti-oscillation trackers, ported from Copilot's loop_detection module.
     # ``consecutive_tool_tracker`` catches A-A-A streaks (same skill 3 times
@@ -250,7 +250,7 @@ async def run_agent_loop(
     # system message. So we own the system message ourselves at messages[0].
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": redact_sensitive_value(user_prompt, sensitive_value)},
     ]
 
     timeline.append(
@@ -424,7 +424,7 @@ async def run_agent_loop(
                             "cycle": budget.cycles_used,
                             "tool_call_id": tc_id,
                             "tool_name": tool_name,
-                            "args_preview": {k: _truncate_for_log(v) for k, v in args.items()},
+                            "args_preview": {k: _redact_for_timeline(v, sensitive_value) for k, v in args.items()},
                             "status": result.status,
                             "latency_ms": round(skill_latency_ms, 2),
                         }
@@ -448,12 +448,14 @@ async def run_agent_loop(
 
                 # Feed result back to the LLM as a tool message so the next
                 # cycle's LLM call sees it.
+                tool_content = result.to_tool_content()
+                tool_content = redact_sensitive_value(tool_content, sensitive_value)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc_id,
                         "name": tool_name,
-                        "content": result.to_tool_content(),
+                        "content": tool_content,
                     }
                 )
 
@@ -576,6 +578,18 @@ def _truncate_for_log(value: Any, max_chars: int = 200) -> Any:
     """Cap long string args before adding to timeline. Defends timeline JSON size."""
     if isinstance(value, str) and len(value) > max_chars:
         return value[:max_chars] + f"... <truncated {len(value) - max_chars} chars>"
+    return value
+
+
+def _redact_for_timeline(value: Any, sensitive_value: str | None) -> Any:
+    if isinstance(value, str):
+        return _truncate_for_log(redact_sensitive_value(value, sensitive_value))
+    if isinstance(value, dict):
+        return {key: _redact_for_timeline(item, sensitive_value) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_timeline(item, sensitive_value) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_for_timeline(item, sensitive_value) for item in value)
     return value
 
 

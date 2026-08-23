@@ -16,9 +16,11 @@ import zstandard as zstd
 from freezegun import freeze_time
 
 from skyvern.config import settings
+from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge.sdk.api.aws import S3StorageClass, S3Uri
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
+from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.id import generate_artifact_id
 from skyvern.forge.sdk.models import Step
@@ -1224,3 +1226,231 @@ class TestS3StorageZIPArchivePure:
     test_build_uri_task_archive_has_zip_extension = (
         TestS3StorageZIPArchiveRetrieve.test_build_uri_task_archive_has_zip_extension
     )
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_exists_propagates_non_not_found_errors() -> None:
+    # Regression: a confirmed not-found returns False, but transient/authz errors must PROPAGATE (not
+    # swallow to False) so _managed_browser_profile_has_content's fail-safe treats a flaky read as
+    # existing content instead of reseeding a run to fresh and overwriting its saved archive.
+    from botocore.exceptions import ClientError
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client._is_not_found_error = lambda e: e.response["Error"]["Code"] in {"404", "NoSuchKey", "NotFound"}
+
+    storage.async_client.get_object_info = AsyncMock(side_effect=ClientError({"Error": {"Code": "404"}}, "HeadObject"))
+    assert await storage.browser_profile_exists("o", "bp") is False
+
+    storage.async_client.get_object_info = AsyncMock(
+        side_effect=ClientError({"Error": {"Code": "InternalError"}}, "HeadObject")
+    )
+    with pytest.raises(ClientError):
+        await storage.browser_profile_exists("o", "bp")
+
+
+@pytest.mark.asyncio
+async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: the archive used to be closed only AFTER unzipping, so anything smaller than the io
+    # buffer (~8KB) — a cookie-only first bank — was still unflushed and ZipFile hit an empty file.
+    zip_bytes = _build_zip({".skyvern_banked_cookies.json": b'[{"name":"session"}]'})
+    assert len(zip_bytes) < 1024
+
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
+    profile_dir = await storage.retrieve_browser_profile("o", "bp")
+
+    assert profile_dir is not None
+    assert (Path(profile_dir) / ".skyvern_banked_cookies.json").read_bytes() == b'[{"name":"session"}]'
+    # The extraction directory must be the ONLY thing left in TEMP_PATH — the downloaded archive is
+    # written there under a suffixless temp name, so a leak would show up as a second entry.
+    assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
+
+
+@pytest.mark.asyncio
+async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
+    # hard_delete must PROPAGATE an S3 failure (raise_on_error=True) so the reap can't falsely report a
+    # cookie-bearing archive erased and silently orphan it; a soft delete stays best-effort.
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+
+    storage.async_client.delete_file = AsyncMock(side_effect=RuntimeError("s3 down"))
+    with pytest.raises(RuntimeError):
+        await storage.delete_browser_profile("o", "bp", hard_delete=True)
+    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is True
+
+    storage.async_client.delete_file = AsyncMock()
+    await storage.delete_browser_profile("o", "bp", hard_delete=False)
+    assert storage.async_client.delete_file.await_args.kwargs["raise_on_error"] is False
+
+
+def _share_artifact(artifact_type: ArtifactType, uri: str) -> Artifact:
+    return Artifact(
+        artifact_id=generate_artifact_id(),
+        artifact_type=artifact_type,
+        uri=uri,
+        organization_id=TEST_ORGANIZATION_ID,
+        created_at=datetime.utcnow(),
+        modified_at=datetime.utcnow(),
+    )
+
+
+@pytest.mark.asyncio
+class TestS3ShareLinkSensitiveCap:
+    """Sensitive artifact types get capped presigned-URL TTLs (SKY-12527)."""
+
+    async def test_screenshot_share_link_uses_capped_expiry(self, s3_storage: S3Storage) -> None:
+        s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/shot"])
+        artifact = _share_artifact(ArtifactType.SCREENSHOT_ACTION, f"s3://{TEST_BUCKET}/shot.png")
+        assert await s3_storage.get_share_link(artifact) == "https://s3/shot"
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with(
+            [artifact.uri], expires_in=SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS
+        )
+
+    async def test_download_share_link_keeps_default_expiry(self, s3_storage: S3Storage) -> None:
+        s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/file"])
+        artifact = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+        assert await s3_storage.get_share_link(artifact) == "https://s3/file"
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with([artifact.uri])
+
+    async def test_mixed_batch_preserves_order_and_routes_by_type(self, s3_storage: S3Storage) -> None:
+        download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+        screenshot = _share_artifact(ArtifactType.SCREENSHOT_FINAL, f"s3://{TEST_BUCKET}/shot.png")
+        recording = _share_artifact(ArtifactType.RECORDING, f"s3://{TEST_BUCKET}/rec.webm")
+
+        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str]:
+            suffix = "capped" if expires_in is not None else "default"
+            return [f"{uri}?{suffix}" for uri in uris]
+
+        s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)
+        urls = await s3_storage.get_share_links([download, screenshot, recording])
+        assert urls == [
+            f"{download.uri}?default",
+            f"{screenshot.uri}?capped",
+            f"{recording.uri}?capped",
+        ]
+
+    async def test_failed_sensitive_presign_fails_the_batch(self, s3_storage: S3Storage) -> None:
+        screenshot = _share_artifact(ArtifactType.SCREENSHOT_LLM, f"s3://{TEST_BUCKET}/shot.png")
+        download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
+
+        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str] | None:
+            return None if expires_in is not None else [f"{uri}?ok" for uri in uris]
+
+        s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)
+        assert await s3_storage.get_share_links([screenshot, download]) is None
+
+
+@pytest.mark.asyncio
+class TestS3SaveDownloadedFiles:
+    def _seed_run_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_dir = tmp_path / "downloads" / "wr_partial"
+        run_dir.mkdir(parents=True)
+        (run_dir / "a.pdf").write_bytes(b"first")
+        (run_dir / "b.pdf").write_bytes(b"second")
+        monkeypatch.setattr("skyvern.forge.sdk.api.files.settings.DOWNLOAD_PATH", str(tmp_path / "downloads"))
+
+    async def test_partial_upload_failure_raises_after_saving_the_rest(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        uploaded: list[str] = []
+
+        async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+            if uri.endswith("/a.pdf"):
+                raise RuntimeError("transient 503")
+            uploaded.append(uri)
+
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", _upload)
+        create_download_artifact = AsyncMock()
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=create_download_artifact)),
+        )
+
+        with pytest.raises(DownloadSaveIncompleteError) as raised:
+            await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert raised.value.skipped_files == ["a.pdf"]
+        assert [uri.rsplit("/", 1)[-1] for uri in uploaded] == ["b.pdf"]
+        assert create_download_artifact.await_count == 1
+        assert create_download_artifact.await_args.kwargs["filename"] == "b.pdf"
+
+    async def test_artifact_row_failure_counts_as_skipped(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", AsyncMock())
+
+        async def _create_row(*, filename: str, **kwargs: object) -> None:
+            if filename == "a.pdf":
+                raise RuntimeError("db down")
+
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_create_row))
+            ),
+        )
+
+        with pytest.raises(DownloadSaveIncompleteError) as raised:
+            await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert raised.value.skipped_files == ["a.pdf"]
+
+    async def test_repeat_save_only_uploads_new_and_changed_files(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A run's second cleanup must cost only its new files, not the whole download dir (SKY-14752)."""
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        run_dir = tmp_path / "downloads" / "wr_partial"
+        uploaded: list[str] = []
+        rows: dict[str, Artifact] = {}
+
+        async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+            uploaded.append(uri.rsplit("/", 1)[-1])
+
+        async def _create_row(*, uri: str, checksum: str | None = None, **kwargs: object) -> str:
+            artifact = (rows.get(uri) or _share_artifact(ArtifactType.DOWNLOAD, uri)).model_copy(
+                update={"checksum": checksum}
+            )
+            rows[uri] = artifact
+            return artifact.artifact_id
+
+        async def _list_rows(**kwargs: object) -> list[Artifact]:
+            return list(rows.values())
+
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", _upload)
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=_create_row),
+                DATABASE=SimpleNamespace(artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows)),
+            ),
+        )
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+        assert sorted(uploaded) == ["a.pdf", "b.pdf"]
+
+        uploaded.clear()
+        (run_dir / "b.pdf").write_bytes(b"second, edited")
+        (run_dir / "c.pdf").write_bytes(b"third")
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert sorted(uploaded) == ["b.pdf", "c.pdf"]
+        assert len(rows) == 3

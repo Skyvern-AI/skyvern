@@ -1,0 +1,186 @@
+{
+  "payload": {
+    "turnId": "turn-replay",
+    "turnIndex": 0,
+    "designStarted": true,
+    "designEnded": true,
+    "draft": {
+      "blockCount": 1,
+      "blockLabels": [
+        "log_in"
+      ],
+      "summary": null
+    },
+    "blocks": [
+      {
+        "label": "log_in",
+        "blockType": "task",
+        "state": "completed",
+        "lastSeenIteration": 1,
+        "activity": [],
+        "startedAt": null,
+        "endedAt": "2026-08-20T23:13:50.173506+00:00",
+        "workflowRunBlockId": "wrb_replay"
+      }
+    ],
+    "terminal": "response",
+    "terminalMessage": "done",
+    "narrativeSummary": "done",
+    "priorBlockCount": null,
+    "designActivity": [
+      {
+        "kind": "tool_call",
+        "text": "Updating workflow\u2026",
+        "iteration": 0,
+        "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
+        "id": "tc-c1",
+        "timestamp": "2026-08-20T23:13:50.173271+00:00"
+      },
+      {
+        "kind": "tool_result",
+        "text": "Workflow updated (2 blocks)",
+        "iteration": 0,
+        "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
+        "success": true,
+        "id": "tr-c1",
+        "timestamp": "2026-08-20T23:13:50.173320+00:00"
+      },
+      {
+        "kind": "tool_call",
+        "text": "Editing block \"Log In\"\u2026",
+        "iteration": 1,
+        "toolName": "edit_block",
+        "displayLabel": "Editing block \"Log In\"",
+        "id": "tc-c2",
+        "timestamp": "2026-08-20T23:13:50.173387+00:00"
+      },
+      {
+        "kind": "narration",
+        "text": "Refining the workflow's code",
+        "iteration": 1,
+        "id": "n-1-2026-08-20T23:13:50.173435+00:00",
+        "timestamp": "2026-08-20T23:13:50.173435+00:00"
+      },
+      {
+        "kind": "tool_call",
+        "text": "Testing workflow\u2026",
+        "iteration": 2,
+        "toolName": "update_and_run_blocks",
+        "displayLabel": "Testing workflow",
+        "id": "tc-c3",
+        "timestamp": "2026-08-20T23:13:50.173449+00:00"
+      },
+      {
+        "kind": "tool_result",
+        "text": "Updated the workflow and ran it",
+        "iteration": 2,
+        "toolName": "update_and_run_blocks",
+        "displayLabel": "Testing workflow",
+        "success": true,
+        "id": "tr-c3",
+        "timestamp": "2026-08-20T23:13:50.173462+00:00"
+      },
+      {
+        "kind": "tool_result",
+        "text": "Updated the workflow and ran it",
+        "iteration": 1,
+        "toolName": "update_and_run_blocks",
+        "displayLabel": "Testing workflow",
+        "success": true,
+        "id": "tr-c4",
+        "timestamp": "2026-08-20T23:13:50.173482+00:00"
+      }
+    ],
+    "startedAt": null,
+    "endedAt": "2026-08-20T23:13:50.173521+00:00"
+  },
+  "updates": [
+    {
+      "type": "design_start",
+      "timestamp": "2026-08-20T23:13:50.173245Z"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "update_workflow",
+      "display_label": "Updating workflow",
+      "tool_input": {},
+      "iteration": 0,
+      "tool_call_id": "c1",
+      "timestamp": "2026-08-20T23:13:50.173271Z"
+    },
+    {
+      "type": "tool_result",
+      "tool_name": "update_workflow",
+      "display_label": "Updating workflow",
+      "success": true,
+      "summary": "Workflow updated (2 blocks)",
+      "iteration": 0,
+      "tool_call_id": "c1",
+      "detail": null,
+      "workflow_run_id": null,
+      "timestamp": "2026-08-20T23:13:50.173320Z"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "edit_block",
+      "display_label": "Editing block \"Log In\"",
+      "tool_input": {
+        "label": "log_in"
+      },
+      "iteration": 1,
+      "tool_call_id": "c2",
+      "timestamp": "2026-08-20T23:13:50.173387Z"
+    },
+    {
+      "type": "narration",
+      "narration": "Refining the workflow's code",
+      "iteration": 1,
+      "timestamp": "2026-08-20T23:13:50.173435Z"
+    },
+    {
+      "type": "tool_call",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "tool_input": {},
+      "iteration": 2,
+      "tool_call_id": "c3",
+      "timestamp": "2026-08-20T23:13:50.173449Z"
+    },
+    {
+      "type": "tool_result",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "success": true,
+      "summary": "Updated the workflow and ran it",
+      "iteration": 2,
+      "tool_call_id": "c3",
+      "detail": null,
+      "workflow_run_id": null,
+      "timestamp": "2026-08-20T23:13:50.173462Z"
+    },
+    {
+      "type": "tool_result",
+      "tool_name": "update_and_run_blocks",
+      "display_label": "Testing workflow",
+      "success": true,
+      "summary": "Updated the workflow and ran it",
+      "iteration": 1,
+      "tool_call_id": "c4",
+      "detail": null,
+      "workflow_run_id": null,
+      "timestamp": "2026-08-20T23:13:50.173482Z"
+    },
+    {
+      "type": "block_progress",
+      "workflow_run_block_id": "wrb_replay",
+      "workflow_run_id": "wr_replay",
+      "block_label": "log_in",
+      "block_type": "task",
+      "status": "completed",
+      "iteration": 1,
+      "timestamp": "2026-08-20T23:13:50.173506Z"
+    }
+  ]
+}

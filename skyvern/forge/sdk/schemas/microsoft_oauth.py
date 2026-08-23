@@ -8,6 +8,7 @@ class MicrosoftOAuthCredentialBase(BaseModel):
     id: str
     organization_id: str
     credential_name: str
+    email_address: str | None = None
     state: str
     scopes_requested: list[str] = Field(default_factory=list)
     scopes_granted: list[str] = Field(default_factory=list)

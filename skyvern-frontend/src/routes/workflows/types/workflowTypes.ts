@@ -402,6 +402,7 @@ export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
   parameters: Array<WorkflowParameter>;
+  error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
 };
@@ -454,6 +455,10 @@ export type SendEmailBlock = WorkflowBlockBase & {
   smtp_port?: AWSSecretParameter;
   smtp_username?: AWSSecretParameter;
   smtp_password?: AWSSecretParameter;
+  custom_smtp_host?: string | null;
+  custom_smtp_port?: number | null;
+  custom_smtp_username?: string | null;
+  custom_smtp_password?: string | null;
   sender: string;
   recipients: Array<string>;
   subject: string;
@@ -726,6 +731,7 @@ export type WorkflowApiResponse = {
   extra_http_headers: Record<string, string> | null;
   cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
+  reuse_browser_session: boolean;
   pin_saved_session_ip: boolean;
   browser_profile_id?: string | null;
   browser_profile_key?: string | null;
@@ -744,6 +750,7 @@ export type WorkflowApiResponse = {
   enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
   code_version: number | null;
+  mask_secrets: boolean;
   run_sequentially: boolean | null;
   sequential_key: string | null;
   folder_id: string | null;
@@ -757,6 +764,7 @@ export type WorkflowSettings = {
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
+  reuseBrowserSession: boolean;
   pinSavedSessionIp: boolean;
   browserProfileId: string | null;
   browserProfileKey: string | null;
@@ -770,6 +778,7 @@ export type WorkflowSettings = {
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
   enableSelfHealing: boolean | null;
+  maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;
   finallyBlockLabel: string | null;

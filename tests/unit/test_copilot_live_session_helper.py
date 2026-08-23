@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+
+_UNSET_UPSTREAM = "<unset>"
 
 
 class _FakeBrowser:
@@ -32,8 +37,30 @@ def _request(browser_session_id: str | None = None, wpid: str = "wpid-1") -> Wor
     )
 
 
-def _running_session(browser_address: str = "wss://example/cdp") -> SimpleNamespace:
-    return SimpleNamespace(status="running", browser_address=browser_address)
+def _session(
+    *,
+    status: str = "running",
+    browser_address: str | None = "wss://example/cdp",
+    upstream_cdp_url: str | None = _UNSET_UPSTREAM,
+) -> PersistentBrowserSession:
+    """The real model rather than a stand-in: whether a session is usable is decided by its
+    upstream endpoint, which the session worker writes together with the address."""
+    now = datetime.now(timezone.utc)
+    return PersistentBrowserSession(
+        persistent_browser_session_id="pbs_test",
+        organization_id="org-1",
+        status=status,
+        browser_address=browser_address,
+        upstream_cdp_url=("ws://10.0.0.7:9223/devtools/browser/b-1" if browser_address else None)
+        if upstream_cdp_url is _UNSET_UPSTREAM
+        else upstream_cdp_url,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _running_session(browser_address: str = "wss://example/cdp") -> PersistentBrowserSession:
+    return _session(browser_address=browser_address)
 
 
 @pytest.mark.asyncio
@@ -128,7 +155,7 @@ async def test_status_in_final_state_falls_back(monkeypatch: pytest.MonkeyPatch)
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(
             get_session=AsyncMock(
-                return_value=SimpleNamespace(status="completed", browser_address="wss://example/cdp"),
+                return_value=_session(status="completed"),
             ),
             can_probe_registered_browser_state=lambda: False,
         ),
@@ -158,7 +185,7 @@ async def test_browser_address_unset_falls_back(monkeypatch: pytest.MonkeyPatch)
         "PERSISTENT_SESSIONS_MANAGER",
         SimpleNamespace(
             get_session=AsyncMock(
-                return_value=SimpleNamespace(status="running", browser_address=None),
+                return_value=_session(browser_address=None),
             ),
             can_probe_registered_browser_state=lambda: False,
         ),
@@ -187,7 +214,7 @@ async def test_default_manager_registered_browser_state_allows_missing_browser_a
     )
     get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=_FakeBrowserContext()))
     manager = SimpleNamespace(
-        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_session=AsyncMock(return_value=_session(browser_address=None)),
         get_browser_state=get_browser_state,
         can_probe_registered_browser_state=lambda: True,
     )
@@ -217,7 +244,7 @@ async def test_default_manager_unattachable_registered_browser_state_falls_back(
     )
     get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=None))
     manager = SimpleNamespace(
-        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_session=AsyncMock(return_value=_session(browser_address=None)),
         get_browser_state=get_browser_state,
         can_probe_registered_browser_state=lambda: True,
     )
@@ -262,6 +289,8 @@ async def test_owned_and_running_returns_id(monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.mark.asyncio
 async def test_db_exception_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ownership fails closed, unlike liveness: an org/workflow binding that could not be confirmed
+    is never reused, while a liveness lookup that could not complete keeps the session."""
     monkeypatch.setattr(
         app.DATABASE,
         "debug",
@@ -320,3 +349,71 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
     assert result is None
     assert ctx.browser_session_id == "pbs_fresh"
     create_session_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_liveness_lookup_failure_keeps_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ownership is established, so a liveness lookup that could not complete is not evidence
+    the browser is gone. Returning None here is what discarded a healthy session under pool
+    exhaustion, before ensure_browser_session ever got to classify it."""
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=SQLATimeoutError("QueuePool limit of size 20 overflow 20 reached")),
+    )
+
+    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+
+    assert result == "pbs_live"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_health_signal_keeps_the_session_at_the_first_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered-state check feeds this gate's liveness decision. Collapsing an unavailable
+    connectivity signal to "not usable" discards an owned, running session before the probe runs."""
+
+    class _RaisingBrowser:
+        def is_connected(self) -> bool:
+            raise ConnectionError("cdp endpoint unreachable")
+
+    class _RaisingContext:
+        def __init__(self) -> None:
+            self.browser = _RaisingBrowser()
+            self._impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(return_value=_session(status="running", browser_address=None)),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "can_probe_registered_browser_state",
+        lambda: True,
+    )
+    state = SimpleNamespace(browser_context=_RaisingContext())
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=state))
+
+    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+
+    assert result == "pbs_live"

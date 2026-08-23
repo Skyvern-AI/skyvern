@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import status
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
@@ -20,11 +20,11 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
-from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.schemas.runs import ProxyLocationInput, _validate_browser_address
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.token_counter import count_tokens
-from skyvern.utils.url_validators import validate_url
+from skyvern.utils.url_validators import WebhookUrl, validate_url
 
 
 class TaskBase(BaseModel):
@@ -147,12 +147,18 @@ class TaskBase(BaseModel):
 
 
 class TaskRequest(TaskBase):
+    task_type: Literal[TaskType.general, TaskType.validation, TaskType.action] | None = Field(
+        default=TaskType.general,
+        description="The type of the task",
+        examples=[TaskType.general, TaskType.validation, TaskType.action],
+    )
+
     url: str = Field(
         ...,
         description="Starting URL for the task.",
         examples=["https://www.geico.com"],
     )
-    webhook_callback_url: str | None = Field(
+    webhook_callback_url: WebhookUrl | None = Field(
         default=None,
         description="The URL to call when the task is completed.",
         examples=["https://my-webhook.com"],
@@ -190,9 +196,14 @@ class TaskRequest(TaskBase):
             )
         return goal
 
-    @field_validator("webhook_callback_url", "totp_verification_url")
+    @field_validator("browser_address")
     @classmethod
-    def validate_optional_urls(cls, url: str | None) -> str | None:
+    def validate_browser_address(cls, browser_address: str | None) -> str | None:
+        return _validate_browser_address(browser_address)
+
+    @field_validator("totp_verification_url")
+    @classmethod
+    def validate_totp_verification_url(cls, url: str | None) -> str | None:
         if not url:
             return url
 
@@ -336,11 +347,7 @@ class Task(TaskBase):
 
     @property
     def llm_key(self) -> str | None:
-        """
-        If the `Task` has a `model` defined, then return the mapped llm_key for it.
-
-        Otherwise return `None`.
-        """
+        """Resolve the task's explicit model mapping, if any."""
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:

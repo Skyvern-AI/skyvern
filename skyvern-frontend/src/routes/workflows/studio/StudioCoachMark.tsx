@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
+import { useStudioRunRouteMatch } from "@/routes/workflows/useStudioRunRouteMatch";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 
 import { liveSearch } from "./liveSearch";
@@ -15,14 +16,36 @@ export function StudioCoachMark() {
   const coachMarkSeen = useStudioFirstRunStore((s) => s.coachMarkSeen);
   const markCoachMarkSeen = useStudioFirstRunStore((s) => s.markCoachMarkSeen);
   const location = useLocation();
+  const runRouteMatch = useStudioRunRouteMatch();
   const [deepLinked] = useState(() => {
     const params = new URLSearchParams(liveSearch(location.search));
     return Boolean(
-      params.get("wr") || params.get("active") || params.get("bl"),
+      params.get("wr") ||
+      params.get("active") ||
+      params.get("bl") ||
+      runRouteMatch,
     );
   });
 
-  if (coachMarkSeen || deepLinked) {
+  const visible = !coachMarkSeen && !deepLinked;
+
+  // Esc dismisses, as it does for the panes. Gated on `visible` so a deep-linked
+  // visit — where the mark is suppressed, not seen — doesn't silently consume
+  // the one-time callout for a user who never saw it.
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        markCoachMarkSeen();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [visible, markCoachMarkSeen]);
+
+  if (!visible) {
     return null;
   }
 

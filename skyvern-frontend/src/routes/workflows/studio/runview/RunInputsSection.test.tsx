@@ -118,7 +118,7 @@ describe("RunInputsSection", () => {
       screen.queryByText("https://example.test/invoice.pdf"),
     ).not.toBeNull();
     // Nested value renders the collapsible searchable tree (JsonExplorer).
-    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Search JSON" })).not.toBeNull();
   });
 
   test("labels every prompt inset, including single-field blocks", () => {
@@ -185,6 +185,31 @@ describe("RunInputsSection", () => {
     expect(screen.getByText(promptText).className).not.toContain(
       "line-clamp-6",
     );
+  });
+
+  test("renders Other inputs meta rows as copyable label/value pairs, including TOTP", () => {
+    render(
+      <RunInputsSection
+        {...emptyProps}
+        meta={[
+          { label: "TOTP URL", value: "https://example.test/totp" },
+          { label: "TOTP identifier", value: "totp-identifier-1" },
+        ]}
+      />,
+    );
+
+    expect(screen.queryByText("Other inputs")).not.toBeNull();
+    // Run inputs / Block prompts sections stay absent when only meta is present.
+    expect(screen.queryByText("Run inputs")).toBeNull();
+    expect(screen.queryByText("Block prompts")).toBeNull();
+    expect(screen.queryByText("TOTP URL")).not.toBeNull();
+    expect(screen.queryByText("https://example.test/totp")).not.toBeNull();
+    expect(screen.queryByText("TOTP identifier")).not.toBeNull();
+    expect(screen.queryByText("totp-identifier-1")).not.toBeNull();
+    // Every meta row exposes a copy button wired to its value.
+    expect(
+      screen.getAllByRole("button", { name: "Copy to clipboard" }),
+    ).toHaveLength(2);
   });
 
   test("renders the whole prompt as one wrapped block, not per-line rows", () => {

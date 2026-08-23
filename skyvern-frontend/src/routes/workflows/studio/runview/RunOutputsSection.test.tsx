@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("@/components/SummarizeOutput", () => ({
@@ -150,7 +150,28 @@ describe("RunOutputsSection run outputs", () => {
     // per-block output field.
     expect(screen.queryByText("extracted_information")).toBeNull();
     // The nested block output renders the collapsible searchable tree.
-    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+    expect(
+      screen.getAllByRole("button", { name: "Search JSON" }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  test("renders code-only outputs with no extracted information, files, or errors", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{
+          get_stars_output: { star_count: 22600, evidence_text: "22.6k stars" },
+          extracted_information: [],
+        }}
+      />,
+    );
+
+    // The early return must not swallow a code-only run's returned values.
+    expect(screen.getByText("Run outputs")).not.toBeNull();
+    expect(screen.getAllByText("get_stars_output").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByRole("button", { name: "Search JSON" }).length,
+    ).toBeGreaterThan(0);
   });
 });
 
@@ -177,5 +198,32 @@ describe("RunOutputsSection task 2.0 and webhook surfaces", () => {
   test("renders nothing without any output signal", () => {
     const { container } = render(<RunOutputsSection {...baseProps} />);
     expect(container.firstChild).toBeNull();
+  });
+});
+
+describe("RunOutputsSection output search", () => {
+  test("each block's explorer searches itself, behind its own toggle", () => {
+    render(
+      <RunOutputsSection
+        {...baseProps}
+        outputs={{
+          block_a_output: { invoice_total: 120 },
+          block_b_output: { shipping_carrier: "ups" },
+        }}
+      />,
+    );
+    // No field is open until asked for, so n blocks do not stack n inputs.
+    expect(screen.queryByPlaceholderText("Search JSON")).toBeNull();
+    const toggles = screen.getAllByRole("button", { name: "Search JSON" });
+    expect(toggles).toHaveLength(2);
+
+    fireEvent.click(toggles[1]!);
+    fireEvent.change(screen.getByPlaceholderText("Search JSON"), {
+      target: { value: "120" },
+    });
+
+    // Scoped: block_b empties on a value only block_a holds; block_a is untouched.
+    expect(screen.queryAllByText(/^shipping_carrier/)).toHaveLength(0);
+    expect(screen.getAllByText(/^invoice_total/).length).toBeGreaterThan(0);
   });
 });

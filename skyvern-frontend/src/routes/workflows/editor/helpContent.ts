@@ -107,9 +107,9 @@ export const helpTooltips = {
   google_sheets_read: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:
-      "Paste a Google Sheets URL, or click the table icon to pick from your connected account. Jinja templates work too.",
+      "Paste a Google Sheets URL or pick from your connected account. Click the </> button to pass in a custom value instead — for example {{ target_spreadsheet_url }}.",
     sheetName:
-      "Pick a tab via the layers icon once a spreadsheet is selected, or type the name directly.",
+      "Pick a tab once a spreadsheet is selected, or type the name directly. Click the </> button to pass in a custom value like sheet_{{ current_index }}.",
     range: "A1 notation range to read (optional, defaults to all data)",
     credentialId: "The credential ID for Google OAuth authentication",
     hasHeaderRow:
@@ -130,11 +130,11 @@ export const helpTooltips = {
   google_sheets_write: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:
-      "The full URL of the Google Sheet to write to. Use the picker to browse your connected account.",
+      "The Google Sheet to write to. Pick from your connected account, or click the </> button to pass in a custom value instead — for example {{ target_spreadsheet_url }}.",
     credentialId:
       "The Google account used to authenticate with the spreadsheet.",
     sheetName:
-      "The sheet tab to write to. Use the picker to list tabs or create a new one.",
+      "The sheet tab to write to. Pick a tab or create a new one. Click the </> button to pass in a custom value like sheet_{{ current_index }}.",
     writeMode:
       "Append adds new rows below existing data. Update Range overwrites the exact cells in the range you specify.",
     range:
@@ -202,7 +202,7 @@ export const helpTooltips = {
     fileUrl:
       "Since we're in beta this section isn't fully customizable yet, contact us if you'd like to integrate it into your workflow.",
     fileType:
-      "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are unzipped: without a data schema the block outputs the list of extracted files; with a schema it parses the files inside and extracts against the schema.",
+      "The format of the file to parse. Auto-detected from the URL extension when possible. ZIP archives are always unzipped, and the block outputs the extracted files as file_name, file_path, and file_size. Data Schema is ignored for ZIPs. To parse contained files, loop over the output and pass each file_path to another File Parser block.",
   },
   wait: {
     ...baseHelpTooltipContent,

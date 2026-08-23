@@ -49,6 +49,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
   persistBrowserSession: false,
+  reuseBrowserSession: false,
   pinSavedSessionIp: false,
   browserProfileId: null,
   browserProfileKey: null,
@@ -62,6 +63,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   scriptCacheKey: null,
   aiFallback: true,
   enableSelfHealing: false,
+  maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
@@ -95,6 +97,7 @@ function makeCodeBlock(
     output_parameter: makeOutputParameter(label),
     code: `# ${label}`,
     parameters: [],
+    error_code_mapping: null,
   };
 }
 

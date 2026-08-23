@@ -180,6 +180,7 @@ def test_collects_gated_model_on_split_pdf_block() -> None:
         ("claude-opus-4-7", "Anthropic Claude 4.7 Opus"),
         ("claude-opus-4-8", "Anthropic Claude 4.8 Opus"),
         ("claude-fable-5", "Anthropic Claude Fable 5"),
+        ("claude-opus-5", "Anthropic Claude Opus 5"),
     ],
 )
 def test_collects_enterprise_model_alias_features(model_name: str, feature_name: str) -> None:
@@ -203,13 +204,19 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(monkeypa
         workflow_run_id="wr_1",
         workflow_id=workflow.workflow_id,
         workflow_permanent_id=workflow.workflow_permanent_id,
+        browser_session_id=None,
         browser_profile_id=None,
         browser_address=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=WorkflowRunStatus.created,
     )
     failed_workflow_run = SimpleNamespace(
         workflow_run_id="wr_1",
         workflow_permanent_id=workflow.workflow_permanent_id,
+        browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=WorkflowRunStatus.failed,
     )
     organization = SimpleNamespace(organization_id="org")

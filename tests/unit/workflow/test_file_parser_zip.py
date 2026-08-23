@@ -2,13 +2,12 @@
 Tests for FileParserBlock ZIP support (SKY-11711).
 
 Covers ZIP detection, validation, safe extraction (junk filtering, zip-bomb caps,
-traversal), per-file content parsing for AI extraction, and local-path file_url
-handling (applies to all file types).
+traversal), unzip-only execution, and local-path file_url handling (applies to
+all file types).
 """
 
 from __future__ import annotations
 
-import json
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -283,87 +282,6 @@ class TestExtractZipFile:
 
 
 @pytest.mark.asyncio
-class TestParseZipContents:
-    @staticmethod
-    def _file_info(path: Path, root: Path) -> dict[str, Any]:
-        return {
-            "file_name": str(path.relative_to(root)),
-            "file_path": str(path),
-            "file_size": path.stat().st_size,
-        }
-
-    async def test_parses_supported_files_and_skips_unparseable(self, tmp_path: Path) -> None:
-        csv_path = tmp_path / "data.csv"
-        csv_path.write_text("name,age\nAlice,30")
-        docx_path = tmp_path / "doc.docx"
-        _create_docx_bytes("Report body", docx_path)
-        nested_zip = _create_zip(tmp_path / "inner.zip", {"x.txt": b"nested"})
-        binary_path = tmp_path / "blob.bin"
-        binary_path.write_bytes(b"\x00\x01\x02\x03")
-
-        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
-        entries = await block._parse_zip_contents(
-            [
-                self._file_info(csv_path, tmp_path),
-                self._file_info(docx_path, tmp_path),
-                self._file_info(nested_zip, tmp_path),
-                self._file_info(binary_path, tmp_path),
-            ]
-        )
-
-        assert entries == [
-            {"file_name": "data.csv", "content": [{"name": "Alice", "age": "30"}]},
-            {"file_name": "doc.docx", "content": "Report body"},
-        ]
-
-    async def test_pdf_files_parsed_via_pdf_parser(self, tmp_path: Path) -> None:
-        pdf_path = tmp_path / "report.pdf"
-        pdf_path.write_bytes(b"%PDF-1.5 fake")
-
-        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(FileParserBlock, "_parse_pdf_file", AsyncMock(return_value="pdf text content"))
-            entries = await block._parse_zip_contents([self._file_info(pdf_path, tmp_path)])
-
-        assert entries == [{"file_name": "report.pdf", "content": "pdf text content"}]
-
-    async def test_truncates_at_file_boundary_on_token_limit(self, tmp_path: Path) -> None:
-        first = tmp_path / "a.csv"
-        first.write_text("h\n1")
-        second = tmp_path / "b.csv"
-        second.write_text("h\n2")
-
-        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
-            entries = await block._parse_zip_contents(
-                [self._file_info(first, tmp_path), self._file_info(second, tmp_path)]
-            )
-
-        assert [entry["file_name"] for entry in entries] == ["a.csv"]
-
-    async def test_no_parseable_files_raises(self, tmp_path: Path) -> None:
-        binary_path = tmp_path / "blob.bin"
-        binary_path.write_bytes(b"\x00\x01\x02\x03")
-
-        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
-        with pytest.raises(InvalidFileType, match="no parseable files"):
-            await block._parse_zip_contents([self._file_info(binary_path, tmp_path)])
-
-    async def test_first_file_over_budget_raises(self, tmp_path: Path) -> None:
-        csv_path = tmp_path / "data.csv"
-        csv_path.write_text("h\n1")
-
-        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 100)
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
-            with pytest.raises(InvalidFileType, match="alone exceeds the maximum extraction input size"):
-                await block._parse_zip_contents([self._file_info(csv_path, tmp_path)])
-
-
-@pytest.mark.asyncio
 class TestExecuteWithZipAndLocalPaths:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, tmp_path: Path) -> AsyncMock:
@@ -420,7 +338,7 @@ class TestExecuteWithZipAndLocalPaths:
         assert result.output_parameter_value == [{"name": "Alice", "age": "30"}]
         download_mock.assert_not_awaited()
 
-    async def test_execute_zip_with_schema_runs_combined_ai_extraction(self, tmp_path: Path) -> None:
+    async def test_execute_zip_with_schema_outputs_file_list_without_llm(self, tmp_path: Path) -> None:
         zip_path = _create_zip(tmp_path / "archive.zip", {"data.csv": b"name,age\nAlice,30"})
         block = _make_file_parser_block("https://example.com/archive.zip")
         block.json_schema = {"type": "object"}
@@ -428,21 +346,144 @@ class TestExecuteWithZipAndLocalPaths:
         with pytest.MonkeyPatch.context() as mp:
             record_output = self._patch_execute_dependencies(mp, tmp_path)
             mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
+            handler = AsyncMock()
             mp.setattr(
                 "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
-                lambda *a, **kw: AsyncMock(return_value={"answer": 42}),
+                lambda *a, **kw: handler,
             )
-            mock_load = MagicMock(return_value="prompt")
-            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
 
             result = await block.execute("wr_test", "wrb_test", organization_id="org-1")
 
         assert result.success is True
-        assert result.output_parameter_value == {"answer": 42}
-        _, kwargs = mock_load.call_args
-        content_entries = json.loads(kwargs["extracted_text_content"])
-        assert content_entries == [{"file_name": "data.csv", "content": [{"name": "Alice", "age": "30"}]}]
+        assert result.output_parameter_value == [
+            {
+                "file_name": "data.csv",
+                "file_path": str(tmp_path / "downloads" / "wr_test" / "unzipped" / "archive_wrb_test" / "data.csv"),
+                "file_size": len(b"name,age\nAlice,30"),
+            }
+        ]
+        handler.assert_not_awaited()
         record_output.assert_awaited_once()
+        assert record_output.await_args.args[2] == result.output_parameter_value
+
+    async def test_execute_explicit_zip_with_schema_outputs_file_list_without_llm(self, tmp_path: Path) -> None:
+        zip_path = _create_zip(tmp_path / "explicit.zip", {"nested/data.csv": b"name,age\nAlice,30"})
+        block = _make_file_parser_block("https://example.com/explicit.zip", FileType.ZIP)
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            record_output = self._patch_execute_dependencies(mp, tmp_path)
+            mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
+            handler = AsyncMock()
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: handler,
+            )
+
+            result = await block.execute("wr_test", "wrb_explicit", organization_id="org-1")
+
+        assert result.success is True
+        assert result.output_parameter_value == [
+            {
+                "file_name": "nested/data.csv",
+                "file_path": str(
+                    tmp_path / "downloads" / "wr_test" / "unzipped" / "explicit_wrb_explicit" / "nested" / "data.csv"
+                ),
+                "file_size": len(b"name,age\nAlice,30"),
+            }
+        ]
+        handler.assert_not_awaited()
+        record_output.assert_awaited_once()
+        assert record_output.await_args.args[2] == result.output_parameter_value
+
+    async def test_execute_auto_detected_zip_with_schema_outputs_file_list_without_llm(self, tmp_path: Path) -> None:
+        zip_path = _create_zip(tmp_path / "download", {"report.pdf": b"not parsed"})
+        block = _make_file_parser_block("https://example.com/download?id=123")
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            record_output = self._patch_execute_dependencies(mp, tmp_path)
+            mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
+            handler = AsyncMock()
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: handler,
+            )
+
+            result = await block.execute("wr_test", "wrb_auto", organization_id="org-1")
+
+        assert result.success is True
+        assert result.output_parameter_value == [
+            {
+                "file_name": "report.pdf",
+                "file_path": str(tmp_path / "downloads" / "wr_test" / "unzipped" / "download_wrb_auto" / "report.pdf"),
+                "file_size": len(b"not parsed"),
+            }
+        ]
+        handler.assert_not_awaited()
+        record_output.assert_awaited_once()
+        assert record_output.await_args.args[2] == result.output_parameter_value
+
+    async def test_execute_run_local_zip_with_schema_outputs_file_list_without_llm(self, tmp_path: Path) -> None:
+        run_dir = tmp_path / "downloads" / "wr_test"
+        run_dir.mkdir(parents=True)
+        zip_path = _create_zip(run_dir / "local.zip", {"report.pdf": b"not parsed"})
+        block = _make_file_parser_block(str(zip_path))
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            record_output = self._patch_execute_dependencies(mp, tmp_path)
+            download_mock = AsyncMock(side_effect=AssertionError("download_file must not be called"))
+            mp.setattr("skyvern.forge.sdk.api.files.download_file", download_mock)
+            handler = AsyncMock()
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: handler,
+            )
+
+            result = await block.execute("wr_test", "wrb_local", organization_id="org-1")
+
+        assert result.success is True
+        assert result.output_parameter_value == [
+            {
+                "file_name": "report.pdf",
+                "file_path": str(tmp_path / "downloads" / "wr_test" / "unzipped" / "local_wrb_local" / "report.pdf"),
+                "file_size": len(b"not parsed"),
+            }
+        ]
+        download_mock.assert_not_awaited()
+        handler.assert_not_awaited()
+        record_output.assert_awaited_once()
+        assert record_output.await_args.args[2] == result.output_parameter_value
+
+    @pytest.mark.parametrize(
+        "zip_files",
+        [{}, {"__MACOSX/._report.pdf": b"junk", ".DS_Store": b"junk"}],
+        ids=["empty", "junk-only"],
+    )
+    async def test_execute_empty_or_junk_only_zip_with_schema_outputs_empty_list(
+        self, tmp_path: Path, zip_files: dict[str, bytes]
+    ) -> None:
+        zip_path = _create_zip(tmp_path / "archive.zip", zip_files)
+        block = _make_file_parser_block("https://example.com/archive.zip")
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            record_output = self._patch_execute_dependencies(mp, tmp_path)
+            mp.setattr("skyvern.forge.sdk.api.files.download_file", AsyncMock(return_value=str(zip_path)))
+            handler = AsyncMock()
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: handler,
+            )
+
+            result = await block.execute("wr_test", "wrb_test", organization_id="org-1")
+
+        assert result.success is True
+        assert result.output_parameter_value == []
+        handler.assert_not_awaited()
+        record_output.assert_awaited_once()
+        assert record_output.await_args.args[2] == result.output_parameter_value
 
     async def test_execute_local_path_outside_download_dir_fails(self, tmp_path: Path) -> None:
         outside_path = tmp_path / "elsewhere" / "data.csv"

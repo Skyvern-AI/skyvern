@@ -12,6 +12,8 @@ Reply in JSON format with the following keys:
     "output": json, // Structured data related to the user goal if any.{% if extracted_information_schema %} Use the data schema for the output field.{% endif %}
 }
 
+IMPORTANT: Reply with exactly this two-key envelope. If the user goal defines its own output format or JSON schema, put that entire JSON inside the "output" key — never at the top level of your reply.
+
 User goal:
 ```
 {{ user_goal }}

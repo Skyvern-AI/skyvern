@@ -4,8 +4,10 @@ import {
   applyNarrativeEvent,
   EMPTY_NARRATIVE,
   hydrateNarrativeFromPayload,
+  parseCredentialAutoBound,
   parseCredentialPause,
   parseCredentialPrompt,
+  parseGoogleConnectionNotices,
 } from "./narrativeState";
 import type {
   WorkflowCopilotStreamErrorUpdate,
@@ -70,13 +72,39 @@ describe("parseCredentialPause", () => {
   });
 });
 
+describe("parseCredentialAutoBound", () => {
+  it("accepts a well-formed auto-bind signal", () => {
+    expect(
+      parseCredentialAutoBound({ credentialId: "cred_x", name: "Work login" }),
+    ).toEqual({ credentialId: "cred_x", name: "Work login" });
+  });
+
+  it("rejects malformed shapes so the receipt can't crash", () => {
+    expect(parseCredentialAutoBound(null)).toBeNull();
+    expect(parseCredentialAutoBound({})).toBeNull();
+    expect(parseCredentialAutoBound({ credentialId: "cred_x" })).toBeNull();
+    expect(parseCredentialAutoBound({ name: "Work" })).toBeNull();
+    expect(
+      parseCredentialAutoBound({ credentialId: "", name: "Work" }),
+    ).toBeNull();
+    expect(
+      parseCredentialAutoBound({ credentialId: "cred_x", name: "" }),
+    ).toBeNull();
+    expect(
+      parseCredentialAutoBound({ credentialId: 3, name: "Work" }),
+    ).toBeNull();
+  });
+});
+
 describe("hydrateNarrativeFromPayload — credential signals", () => {
-  it("defaults both signals to null when absent", () => {
+  it("defaults every credential signal to null when absent", () => {
     expect(EMPTY_NARRATIVE.credentialPrompt).toBeNull();
     expect(EMPTY_NARRATIVE.credentialPause).toBeNull();
+    expect(EMPTY_NARRATIVE.credentialAutoBound).toBeNull();
     const hydrated = hydrateNarrativeFromPayload(basePayload());
     expect(hydrated?.credentialPrompt).toBeNull();
     expect(hydrated?.credentialPause).toBeNull();
+    expect(hydrated?.credentialAutoBound).toBeNull();
   });
 
   it("hydrates credentialPrompt from the narrative payload", () => {
@@ -99,6 +127,18 @@ describe("hydrateNarrativeFromPayload — credential signals", () => {
     expect(hydrated?.credentialPause).toEqual({
       outcome: "connected",
       credentialId: "cred-9",
+    });
+  });
+
+  it("hydrates a credentialAutoBound receipt from the narrative payload", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      basePayload({
+        credentialAutoBound: { credentialId: "cred_work", name: "Work login" },
+      }),
+    );
+    expect(hydrated?.credentialAutoBound).toEqual({
+      credentialId: "cred_work",
+      name: "Work login",
     });
   });
 
@@ -136,5 +176,49 @@ describe("hydrateNarrativeFromPayload — credential signals", () => {
     const next = applyNarrativeEvent(live, error);
     expect(next.credentialPrompt).toBeNull();
     expect(next.credentialPause).toBeNull();
+  });
+});
+
+describe("Google connection notice hydration", () => {
+  it("keeps valid notices, deduplicates ids, and survives reload hydration", () => {
+    const raw = [
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "Work Sheets",
+        condition: "unusable",
+      },
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "duplicate",
+        condition: "missing",
+      },
+      { provider: "microsoft", connectionId: "m1", condition: "missing" },
+    ];
+
+    expect(parseGoogleConnectionNotices(raw)).toEqual([
+      {
+        provider: "google",
+        connectionId: "goac_error",
+        displayName: "Work Sheets",
+        condition: "unusable",
+      },
+    ]);
+    expect(
+      hydrateNarrativeFromPayload(basePayload({ googleConnectionNotices: raw }))
+        ?.googleConnectionNotices,
+    ).toEqual(parseGoogleConnectionNotices(raw));
+  });
+
+  it("defaults absent and malformed notice payloads to an empty list", () => {
+    expect(EMPTY_NARRATIVE.googleConnectionNotices).toEqual([]);
+    expect(parseGoogleConnectionNotices(null)).toEqual([]);
+    expect(parseGoogleConnectionNotices({})).toEqual([]);
+    expect(
+      parseGoogleConnectionNotices([
+        { provider: "google", connectionId: "", condition: "unusable" },
+      ]),
+    ).toEqual([]);
   });
 });

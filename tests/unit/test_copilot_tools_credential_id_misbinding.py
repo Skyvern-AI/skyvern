@@ -8,7 +8,6 @@ import pytest
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
-    _credential_id_misbinding_error_message,
     _credential_id_misbinding_findings,
     _list_credentials,
     _update_workflow,
@@ -24,11 +23,16 @@ def test_credential_id_in_navigation_goal_is_flagged() -> None:
         """
         title: Sign in
         workflow_definition:
-          parameters: []
+          parameters:
+          - key: login_credentials
+            parameter_type: workflow
+            workflow_parameter_type: credential_id
+            default_value: cred_527971855302737592
           blocks:
           - block_type: login
             label: login_to_portal
             url: https://authenticationtest.com/loginUserAndPassword/
+            parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
         """
     )
@@ -355,41 +359,6 @@ def test_malformed_or_empty_yaml_is_inert() -> None:
     assert _credential_id_misbinding_findings(":: broken yaml ::") == []
 
 
-def test_error_message_names_block_label_field_and_credential_id() -> None:
-    findings = [
-        {
-            "location": "login_to_portal",
-            "field": "navigation_goal",
-            "credential_id": "cred_527971855302737592",
-        }
-    ]
-
-    message = _credential_id_misbinding_error_message(findings)
-
-    assert "cred_527971855302737592" in message
-    assert "navigation_goal" in message
-    assert "login_to_portal" in message
-    assert "credential parameter" in message.lower()
-
-
-def test_error_message_steers_delete_not_relocate() -> None:
-    """The message must tell the agent to delete the ID from prose fields, not
-    relocate it — a relocate-only reading drives multi-iteration reject loops
-    when the agent keeps moving the ID between criterion/goal fields."""
-    findings = [
-        {"location": "login_to_portal", "field": "complete_criterion", "credential_id": "cred_111"},
-        {"location": "login_to_portal", "field": "terminate_criterion", "credential_id": "cred_111"},
-    ]
-
-    message = _credential_id_misbinding_error_message(findings)
-    lowered = message.lower()
-
-    assert "delete" in lowered
-    assert "complete_criterion" in message
-    assert "terminate_criterion" in message
-    assert "parameter_keys" in message
-
-
 def _ctx() -> MagicMock:
     ctx = MagicMock(spec=AgentContext)
     ctx.workflow_yaml = ""
@@ -399,40 +368,82 @@ def _ctx() -> MagicMock:
     ctx.workflow_permanent_id = "wpid_test"
     ctx.organization_id = "o_test"
     ctx.allow_untested_workflow_draft = False
-    ctx.request_policy = None
+    ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.code_artifact_metadata = {}
+    ctx.code_authoring_guardrail_reject_count = 0
+    ctx.blocker_signal = None
+    ctx.turn_halt = None
+    ctx.build_test_outcomes = []
+    ctx.latest_recorded_build_test_outcome = None
     return ctx
 
 
 @pytest.mark.asyncio
-async def test_update_workflow_rejects_credential_id_in_navigation_goal() -> None:
+async def test_update_workflow_persists_credential_id_misbinding_without_authoring_a_finding() -> None:
     submitted = _yaml(
         """
         title: Sign in
         workflow_definition:
-          parameters: []
+          parameters:
+          - key: login_credentials
+            parameter_type: workflow
+            workflow_parameter_type: credential_id
+            default_value: cred_527971855302737592
           blocks:
           - block_type: login
             label: login_to_portal
             url: https://authenticationtest.com/loginUserAndPassword/
+            parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
         """
     )
+
+    ctx = _ctx()
+    ctx.request_policy.discovered_credentials = [
+        _ListedCredential(
+            "cred_527971855302737592",
+            "Authentication Test",
+            "https://authenticationtest.com/loginUserAndPassword/",
+        )
+    ]
 
     with (
         patch(
             "skyvern.forge.sdk.copilot.tools.workflow_update._credential_reference_validation_error",
             new=AsyncMock(return_value=None),
         ),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
+            new=AsyncMock(
+                return_value=MagicMock(
+                    title="Sign in",
+                    description=None,
+                    workflow_definition=MagicMock(),
+                    proxy_location=None,
+                    webhook_callback_url=None,
+                    persist_browser_session=False,
+                    browser_profile_id=None,
+                    model=None,
+                    max_screenshot_scrolls=None,
+                    extra_http_headers=None,
+                    run_with=None,
+                    ai_fallback=None,
+                    cache_key=None,
+                    run_sequentially=None,
+                    sequential_key=None,
+                ),
+            ),
+        ),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
-        result = await _update_workflow({"workflow_yaml": submitted}, _ctx())
+        mock_app.DATABASE = MagicMock()
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
-    assert result["ok"] is False
-    assert "cred_527971855302737592" in result["error"]
-    assert "navigation_goal" in result["error"]
-    assert "login_to_portal" in result["error"]
-    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_not_called()
+    assert result["ok"] is True, result
+    assert "findings" not in result["data"]
+    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -482,10 +493,6 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
                 ),
             ),
         ),
-        patch(
-            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
-            new=AsyncMock(return_value="copilot"),
-        ),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
         patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
@@ -495,27 +502,6 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
 
     error_text = str(result.get("error", ""))
     assert "credential ID appeared" not in error_text, error_text
-
-
-def test_error_message_groups_multiple_findings() -> None:
-    findings = [
-        {
-            "location": "login_to_portal",
-            "field": "navigation_goal",
-            "credential_id": "cred_111",
-        },
-        {
-            "location": "login_to_portal",
-            "field": "complete_criterion",
-            "credential_id": "cred_111",
-        },
-    ]
-
-    message = _credential_id_misbinding_error_message(findings)
-
-    assert "navigation_goal" in message
-    assert "complete_criterion" in message
-    assert message.count("cred_111") >= 1
 
 
 class _ListedCredential:

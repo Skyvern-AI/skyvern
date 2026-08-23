@@ -172,6 +172,48 @@ class TestParseApiResponse:
         result = parse_api_response(response)
         assert result == {"message": 'He said "hello" to me'}
 
+    def test_parse_api_response_reasoning_object_followed_by_action_array(self) -> None:
+        """A reasoning object and the actions array emitted as two top-level JSON
+        values must reassemble into one response instead of dropping the actions."""
+        response = self._create_mock_response(
+            '{"page_info": "The downloaded invoice is displayed.", '
+            '"thoughts": "The extracted category and account number match the criterion.", '
+            '"account_number": "1234567890"}\n'
+            '[{"reasoning": "The complete criterion has been met.", '
+            '"confidence_float": 1.0, "action_type": "COMPLETE"}]'
+        )
+        result = parse_api_response(response)
+        assert result["page_info"] == "The downloaded invoice is displayed."
+        assert result["account_number"] == "1234567890"
+        assert result["actions"] == [
+            {
+                "reasoning": "The complete criterion has been met.",
+                "confidence_float": 1.0,
+                "action_type": "COMPLETE",
+            }
+        ]
+
+    def test_parse_api_response_bare_action_array(self) -> None:
+        """A bare top-level actions array must be wrapped under the actions key
+        for actions-consuming prompts."""
+        response = self._create_mock_response(
+            '[{"reasoning": "Fill the name field.", "action_type": "INPUT_TEXT", "id": "a1", "text": "John"}, '
+            '{"reasoning": "Submit the form.", "action_type": "CLICK", "id": "a2"}]'
+        )
+        result = parse_api_response(response, prompt_name="extract-actions")
+        assert [a["action_type"] for a in result["actions"]] == ["INPUT_TEXT", "CLICK"]
+
+    def test_parse_api_response_bare_action_array_not_wrapped_for_single_object_prompt(self) -> None:
+        """A single-object prompt (e.g. custom-select) split into action dicts must
+        keep first-dict behavior so the handler can read the top-level fields."""
+        response = self._create_mock_response(
+            '[{"reasoning": "Match found.", "action_type": "CLICK", "id": "a1", "value": "California"}, '
+            '{"action_type": "CLICK", "id": "a1"}]'
+        )
+        result = parse_api_response(response, prompt_name="custom-select")
+        assert result["value"] == "California"
+        assert result["id"] == "a1"
+
 
 def test_fixing_json_with_unescaped_quotes() -> None:
     json_string_with_unescaped_quotes = """

@@ -15,12 +15,15 @@ from pydantic import ValidationError
 from skyvern.exceptions import require_server_extra_modules
 
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
-
 from fastapi import FastAPI, Response, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -32,14 +35,14 @@ from skyvern.cors import credentialed_cors_allow_origin_regex, credentialed_cors
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_request_exception
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
-from skyvern.forge.sdk.routes import internal_auth
+from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
@@ -123,6 +126,17 @@ def format_validation_errors(exc: ValidationError) -> str:
         if error_messages
         else "A validation error occurred. Please check your input and try again."
     )
+
+
+def sanitize_request_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    return [
+        {
+            "loc": error["loc"],
+            "msg": error["msg"],
+            "type": error["type"],
+        }
+        for error in exc.errors()
+    ]
 
 
 class ExecutionDatePlugin(Plugin):
@@ -215,6 +229,18 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
+def _upgrade_sqlite_organization_slug(connection: Connection) -> None:
+    """Add the organization slug column and index to an existing local SQLite database."""
+    inspector = inspect(connection)
+    if "organizations" not in inspector.get_table_names():
+        return
+    if "slug" not in {column["name"] for column in inspector.get_columns("organizations")}:
+        connection.execute(text("ALTER TABLE organizations ADD COLUMN slug VARCHAR"))
+    connection.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL")
+    )
+
+
 async def _bootstrap_sqlite() -> None:
     """Auto-bootstrap SQLite on first server start.
 
@@ -227,6 +253,7 @@ async def _bootstrap_sqlite() -> None:
     db = forge_app.DATABASE
     async with db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_upgrade_sqlite_organization_slug)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.
@@ -418,6 +445,9 @@ def create_api_app() -> FastAPI:
         fastapi_app.include_router(internal_auth.router, prefix="/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
         fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_llms.router, prefix="/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
+        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
@@ -450,6 +480,20 @@ def create_api_app() -> FastAPI:
             content={"detail": detail},
         )
 
+    @fastapi_app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
+        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
+        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
+        path = request.url.path.rstrip("/")
+        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
+        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+            return await request_validation_exception_handler(request, exc)
+
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": sanitize_request_validation_errors(exc)},
+        )
+
     @fastapi_app.exception_handler(ClientDisconnect)
     async def handle_client_disconnect(request: Request, exc: ClientDisconnect) -> Response:
         # Client closed the connection mid-request (e.g. while a route reads the body).
@@ -463,11 +507,13 @@ def create_api_app() -> FastAPI:
         # Base-Exception handlers run inside Starlette's ServerErrorMiddleware, which sits
         # outside SecurityHeadersMiddleware, so stamp the framing headers here too.
         # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
             headers=SECURITY_HEADERS,
         )
+        log_raw_request_exception(response.status_code)
+        return response
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -483,12 +529,12 @@ def create_api_app() -> FastAPI:
         finally:
             skyvern_context.reset()
 
-    @fastapi_app.middleware("http")
-    async def raw_request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        return await log_raw_request_middleware(request, call_next)
-
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Register after extensions so it stays outside cloud BaseHTTPMiddleware
+    # layers, whose child tasks do not propagate request ContextVars upstream.
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
 
     # Added last so it is outermost: stamps every response, including CORS
     # preflights short-circuited by the cloud middleware registered above.

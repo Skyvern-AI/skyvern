@@ -25,6 +25,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   useEdgesState,
   useNodesState,
@@ -39,15 +40,18 @@ import {
   isWorkflowYamlDirty,
 } from "@/store/WorkflowYamlEditorStore";
 import { getClient } from "@/api/AxiosClient";
+import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse, ProxyLocation } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
+import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
+import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
-import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import {
   StreamModeBadge,
   StreamStatusPanel,
@@ -90,7 +94,8 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
-import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
 import { RecordingPanel } from "@/routes/workflows/editor/recording/RecordingPanel";
 import { useApplyRecordedBlocks } from "@/routes/workflows/editor/recording/useApplyRecordedBlocks";
@@ -112,7 +117,11 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -197,6 +206,7 @@ import { useWorkflowYamlEditorLifecycle } from "./hooks/useWorkflowYamlEditorLif
 import {
   preservedFinallyBlockLabel,
   workflowVersionFromSaveData,
+  yamlCommitInputs,
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
@@ -358,7 +368,8 @@ function Workspace({
   embedded = false,
   workflow,
 }: Props) {
-  const { blockLabel, workflowPermanentId } = useParams();
+  const { blockLabel } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const studioPaneWidths = useStudioShellStore((s) => s.paneWidths);
@@ -374,7 +385,6 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
-    copilotFixOrigin?: unknown;
   } | null;
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
@@ -389,7 +399,6 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
-  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     clearStoredInitialCopilotMessage();
@@ -524,7 +533,6 @@ function Workspace({
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
-  const { browserStreamingMode } = useBrowserStreamingMode();
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -570,13 +578,9 @@ function Workspace({
   // restores the pre-YAML dirty state instead of leaving it stuck true.
   const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
+  const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
-  const isCdpStreamingMode =
-    browserStreamingMode === "cdp" && !recordingStore.isRecording;
-  // Record Browser exfiltration requires VNC even when the org default is CDP streaming.
-  const preferVncStream =
-    browserStreamingMode !== "cdp" || recordingStore.isRecording;
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -726,11 +730,13 @@ function Workspace({
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
+    enabled: isGeneratingCode,
     workflowPermanentId,
     pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "pending",
@@ -760,14 +766,71 @@ function Workspace({
     isRateLimited,
     keepAliveBrowserSession: true,
   });
+  const debugSessionPaymentRequired = isPaymentRequiredError(debugSessionError);
+  const debugSessionErrorPanel = (
+    <StreamStatusPanel
+      diagnostic={
+        debugSessionPaymentRequired
+          ? {
+              title: "Out of credits",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "More credits are required to start a browser session.",
+              hint: "Upgrade your plan in Billing, then return here to start the browser session.",
+            }
+          : {
+              title: "Could not start browser session",
+              detail:
+                getAxiosErrorDetail(debugSessionError) ??
+                "The backend rejected the browser session request.",
+              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
+            }
+      }
+    >
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => {
+          if (debugSessionPaymentRequired) {
+            navigate("/billing");
+          } else {
+            void refetchDebugSession();
+          }
+        }}
+      >
+        {debugSessionPaymentRequired ? "Go to Billing" : "Retry"}
+      </Button>
+    </StreamStatusPanel>
+  );
+  const { data: viewerState } = useActiveRunSessionQuery({
+    workflowPermanentId,
+    enabled:
+      shouldFetchDebugSession && Boolean(workflowPermanentId) && !isRateLimited,
+    isTurnActive: isCopilotTurnActive,
+  });
 
   const activeDebugSession = debugSession ?? null;
+
+  const { streamTransport } = useStreamTransport(
+    activeDebugSession?.browser_session_id,
+  );
+  const isCdpStreamingMode =
+    streamTransport === "cdp" && !recordingStore.isRecording;
+  // Record Browser exfiltration requires VNC even when the transport is CDP streaming.
+  const preferVncStream =
+    streamTransport !== "cdp" || recordingStore.isRecording;
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
-  const liveBrowserSessionId = activeDebugSession?.browser_session_id ?? null;
+  const { debugBrowserSessionId, displayBrowserSessionId } =
+    resolveWorkspaceBrowserSessionBindings(
+      activeDebugSession?.browser_session_id ?? null,
+      viewerState?.active_run_session_id ?? null,
+    );
+  const activeRunSessionIdRef = useRef<string | null>(null);
+  activeRunSessionIdRef.current = viewerState?.active_run_session_id ?? null;
   const showVncBrowserPanel =
     preferVncStream &&
     shouldFetchDebugSession &&
@@ -781,11 +844,11 @@ function Workspace({
   // guard keeps the null -> first-id transition from clearing a recording that
   // started before the session resolved.
   useEffect(() => {
-    if (embedded || !liveBrowserSessionId) {
+    if (embedded || !debugBrowserSessionId) {
       return;
     }
     return () => useRecordingStore.getState().reset();
-  }, [embedded, liveBrowserSessionId]);
+  }, [embedded, debugBrowserSessionId]);
   // Embedded: the shell owns the stream, so bind the copilot once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
   const copilotRequiresLiveBrowser =
@@ -795,28 +858,28 @@ function Workspace({
   // from the previous session cannot leak into the next render.
   const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
     displayReady: Boolean(
-      readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+      readyBrowserSessionId && readyBrowserSessionId === debugBrowserSessionId,
     ),
-    hasBackendSession: Boolean(liveBrowserSessionId),
+    hasBackendSession: Boolean(debugBrowserSessionId),
     headlessTurnDrainEnabled: headlessTurnDrainEnabled || embedded,
   });
   const debugSessionExpiryWarningKeyRef = useRef<string | null>(null);
 
   const { data: liveBrowserSession, dataUpdatedAt: liveBrowserSessionNowMs } =
     useQuery<BrowserSessionData>({
-      queryKey: ["browserSession", liveBrowserSessionId],
+      queryKey: ["browserSession", debugBrowserSessionId],
       queryFn: async () => {
-        if (!liveBrowserSessionId) {
+        if (!debugBrowserSessionId) {
           throw new Error("Cannot fetch browser session without an ID");
         }
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<BrowserSessionData>(
-          `/browser_sessions/${liveBrowserSessionId}`,
+          `/browser_sessions/${debugBrowserSessionId}`,
         );
         return response.data;
       },
       enabled:
-        Boolean(liveBrowserSessionId) &&
+        Boolean(debugBrowserSessionId) &&
         shouldFetchDebugSession &&
         !isRateLimited,
       refetchInterval: DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
@@ -825,6 +888,9 @@ function Workspace({
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
+      if (activeRunSessionIdRef.current !== null) {
+        return;
+      }
       setReadyBrowserSessionId(ready ? sessionId : null);
     },
     [],
@@ -1354,7 +1420,7 @@ function Workspace({
     });
     setIsRecording(true, {
       workflowPermanentId: workflowPermanentId ?? null,
-      browserSessionId: liveBrowserSessionId,
+      browserSessionId: debugBrowserSessionId,
     });
   }, [
     getNodes,
@@ -1362,7 +1428,7 @@ function Workspace({
     setWorkflowPanelState,
     setIsRecording,
     workflowPermanentId,
-    liveBrowserSessionId,
+    debugBrowserSessionId,
   ]);
   useEffect(() => {
     if (!embedded) {
@@ -1578,12 +1644,17 @@ function Workspace({
 
   const applyWorkflowUpdate = (
     workflowData: WorkflowVersion,
-    options?: { persisted?: boolean; userDriven?: boolean },
+    options?: {
+      persisted?: boolean;
+      userDriven?: boolean;
+      midTurnDraft?: boolean;
+    },
   ) => {
     const settings: WorkflowSettings = {
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
+      reuseBrowserSession: workflowData.reuse_browser_session ?? false,
       pinSavedSessionIp: workflowData.pin_saved_session_ip ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
       browserProfileKey: workflowData.browser_profile_key ?? null,
@@ -1601,6 +1672,7 @@ function Workspace({
       scriptCacheKey: workflowData.cache_key ?? null,
       aiFallback: workflowData.ai_fallback ?? true,
       enableSelfHealing: workflowData.enable_self_healing ?? false,
+      maskSecrets: workflowData.mask_secrets ?? false,
       runSequentially: workflowData.run_sequentially ?? false,
       sequentialKey: workflowData.sequential_key ?? null,
       finallyBlockLabel:
@@ -1628,9 +1700,16 @@ function Workspace({
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
     // Sync title so snap-back on Reject reverts the editor's title bar
-    // alongside the canvas blocks.
+    // alongside the canvas blocks. A mid-turn draft is not authoritative: it must
+    // not clobber a rename made while the turn was running, and a draft still
+    // carrying the placeholder must not mark the title as generated.
     if (typeof workflowData.title === "string") {
-      useWorkflowTitleStore.getState().setTitle(workflowData.title);
+      const titleStore = useWorkflowTitleStore.getState();
+      if (options?.midTurnDraft) {
+        titleStore.setTitleFromCopilotIfDefault(workflowData.title);
+      } else {
+        titleStore.syncTitleFromWorkflow(workflowData.title);
+      }
     }
 
     if (options?.persisted) {
@@ -1679,13 +1758,15 @@ function Workspace({
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
-  // Expose Code-mode entry to the studio's Editor pane header via the store.
-  // A stable wrapper over a ref keeps the registration from churning while
-  // still calling the latest closure.
+  // Expose Code-mode entry via the store so header chrome outside this
+  // closure (studio's Editor pane header, the legacy overflow menu's "View
+  // schema" item) can enter Code mode without owning serialization. A stable
+  // wrapper over a ref keeps the registration from churning while still
+  // calling the latest closure.
   const enterYamlModeRef = useRef(enterYamlMode);
   enterYamlModeRef.current = enterYamlMode;
   useEffect(() => {
-    if (!embedded || isGlobalWorkflow) {
+    if (isGlobalWorkflow) {
       return;
     }
     const store = useWorkflowYamlEditorStore.getState();
@@ -1743,12 +1824,16 @@ function Workspace({
       );
       return false;
     }
+    const { definition: draftDefinition, definitionYaml } = yamlCommitInputs(
+      parsed,
+      yamlStore.draft,
+    );
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post<WorkflowYAMLConversionResponse>(
         "/workflow/copilot/convert-yaml-to-blocks",
         {
-          workflow_definition_yaml: yamlStore.draft,
+          workflow_definition_yaml: definitionYaml,
           workflow_id: saveData.workflow.workflow_id,
         },
       );
@@ -1825,7 +1910,7 @@ function Workspace({
         try {
           await saveWorkflow.mutateAsync({
             blocks: upgradedBlocks,
-            parameters: parsed?.parameters ?? [],
+            parameters: draftDefinition?.parameters ?? [],
             workflowDefinitionVersion: upgradedVersion,
             settings: { ...saveData.settings, finallyBlockLabel },
           });
@@ -1896,6 +1981,7 @@ function Workspace({
         selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
+      reuseBrowserSession: selectedVersion.reuse_browser_session ?? false,
       pinSavedSessionIp: selectedVersion.pin_saved_session_ip ?? false,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
       browserProfileKey: selectedVersion.browser_profile_key ?? null,
@@ -1913,6 +1999,7 @@ function Workspace({
       scriptCacheKey: selectedVersion.cache_key,
       aiFallback: selectedVersion.ai_fallback ?? true,
       enableSelfHealing: selectedVersion.enable_self_healing ?? false,
+      maskSecrets: selectedVersion.mask_secrets ?? false,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
       finallyBlockLabel:
@@ -2473,7 +2560,7 @@ function Workspace({
                   panels that each fire their own commit. */}
               {!embedded && recordingStore.isRecording && (
                 <div className="absolute inset-0 z-20 h-full px-6 pb-4 pt-[8.5rem]">
-                  <RecordingPanel browserSessionId={liveBrowserSessionId} />
+                  <RecordingPanel browserSessionId={debugBrowserSessionId} />
                 </div>
               )}
             </div>
@@ -2510,29 +2597,13 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Live browser: mode comes from BROWSER_STREAMING_MODE / runtime config */}
+                {/* Live browser: mode comes from the session's stream transport, falling back to runtime config */}
                 {showVncBrowserPanel && (
                   <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
                     <div key={reloadKey} className="w-full flex-1">
-                      {!liveBrowserSessionId ? (
+                      {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2544,13 +2615,13 @@ function Workspace({
                         )
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserStream
-                          key={liveBrowserSessionId}
+                          key={displayBrowserSessionId}
                           exfiltrate={
                             recordingStore.isRecording &&
                             !recordingStore.finishRequested
                           }
                           interactive={true}
-                          browserSessionId={liveBrowserSessionId}
+                          browserSessionId={displayBrowserSessionId}
                           showControlButtons={true}
                           // The recording panel overlays the canvas whenever a
                           // recording is live here, so the REC pill is redundant.
@@ -2612,25 +2683,9 @@ function Workspace({
                       key={reloadKey}
                       className="flex w-full flex-1 items-center justify-center"
                     >
-                      {!liveBrowserSessionId ? (
+                      {!displayBrowserSessionId ? (
                         isDebugSessionError ? (
-                          <StreamStatusPanel
-                            diagnostic={{
-                              title: "Could not start browser session",
-                              detail:
-                                getAxiosErrorDetail(debugSessionError) ??
-                                "The backend rejected the browser session request.",
-                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
-                            }}
-                          >
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void refetchDebugSession()}
-                            >
-                              Retry
-                            </Button>
-                          </StreamStatusPanel>
+                          debugSessionErrorPanel
                         ) : (
                           <StreamStatusPanel
                             diagnostic={{
@@ -2642,9 +2697,14 @@ function Workspace({
                         )
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
-                          browserSessionId={liveBrowserSessionId}
+                          browserSessionId={displayBrowserSessionId}
                           interactive={true}
                           showControlButtons={true}
+                          // The CDP transport streams the page viewport only, so
+                          // unlike the VNC panel there is no browser address bar
+                          // to type into and a session resting on about:blank has
+                          // no way out (SKY-13705).
+                          enableUrlInput={true}
                           onReadyChange={handleLiveBrowserReadyChange}
                         />
                       ) : (
@@ -2814,13 +2874,13 @@ function Workspace({
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
         liveBrowserSessionId={
-          copilotLiveBrowserReady ? liveBrowserSessionId : null
+          copilotLiveBrowserReady ? debugBrowserSessionId : null
         }
+        onTurnActivityChange={setIsCopilotTurnActive}
         workflowRunId={copilotRunId({ embedded, studioRunId })}
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
-        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
@@ -2921,6 +2981,7 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              reuse_browser_session: saveData.settings.reuseBrowserSession,
               pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
               browser_profile_id: saveData.settings.browserProfileId,
               browser_profile_key: saveData.settings.browserProfileKey,
@@ -2939,6 +3000,7 @@ function Workspace({
               ai_fallback: saveData.settings.aiFallback,
               enable_self_healing: saveData.settings.enableSelfHealing ?? false,
               adaptive_caching: false,
+              mask_secrets: saveData.settings.maskSecrets,
               code_version:
                 saveData.settings.runWith === "code"
                   ? (saveData.settings.codeVersion ?? 2)
@@ -3052,7 +3114,7 @@ function Workspace({
           }
         }}
       />
-      <DeleteConfirmationDialog
+      <ConfirmDialog
         open={deleteBlockDialogState.open}
         onOpenChange={(open) => {
           if (!open) {
@@ -3064,9 +3126,9 @@ function Workspace({
             });
           }
         }}
-        title="Delete Block"
-        description={`Are you sure you want to delete "${deleteBlockDialogState.nodeLabel}"?`}
-        affectedBlocks={affectedBlocksForDelete}
+        title={`Delete block "${deleteBlockDialogState.nodeLabel}"?`}
+        description="This block will be deleted from the agent."
+        reversible
         onConfirm={() => {
           if (deleteConfirmCallbackRef.current) {
             deleteConfirmCallbackRef.current();
@@ -3078,7 +3140,9 @@ function Workspace({
             nodeLabel: null,
           });
         }}
-      />
+      >
+        <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
+      </ConfirmDialog>
 
       {/* Studio: the cache key/value panel escapes the Editor pane via the
           shell-level portal, so the Overview pane's Code view can open it (and

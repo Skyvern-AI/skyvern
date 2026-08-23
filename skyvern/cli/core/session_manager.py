@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import secrets
 import time
 import weakref
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator
 
+import httpx
 import structlog
 
 from skyvern.config import settings
+from skyvern.exceptions import get_user_facing_exception_message
+from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
+from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
+from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
-from .result import BrowserContext, ErrorCode, make_error
+from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
 LOG = structlog.get_logger(__name__)
@@ -27,8 +33,26 @@ _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s 
 if TYPE_CHECKING:
     from playwright.async_api import Frame, Page
 
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+
+
+@dataclass
+class ObserveV2State:
+    page_key: tuple[int, int | None, str, str | None] | None = None
+    document_id: str | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+    refs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    next_ref: int = 0
+    host_budgets: dict[str, int] = field(default_factory=dict)
+
+    def reset_refs(self) -> None:
+        """Clear per-document refs while preserving monotonic ref IDs and host budgets."""
+        self.page_key = None
+        self.document_id = None
+        self.params = {}
+        self.refs = {}
 
 
 @dataclass
@@ -36,6 +60,7 @@ class SessionState:
     browser: SkyvernBrowser | None = None
     context: BrowserContext | None = None
     api_key_hash: str | None = None
+    organization_id: str | None = None
     console_messages: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     network_requests: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     dialog_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
@@ -66,6 +91,9 @@ class SessionState:
     _working_frame: Frame | None = None
     _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
     _observed_refs_generation: int = 0
+    # Local fallback when no cloud/CDP/extension browser-session identity is available.
+    _observe_v2_state: ObserveV2State = field(default_factory=ObserveV2State)
+    _codeblock_redactor: Callable[[Any], Any] | None = field(default=None, repr=False)
 
     def get_response_body(self, request_id: int) -> str | None:
         """Public accessor for cached response bodies (keyed by request_id)."""
@@ -73,13 +101,18 @@ class SessionState:
 
 
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
+_current_organization_id: ContextVar[str | None] = ContextVar("mcp_session_organization_id", default=None)
 _global_session: SessionState | None = None
+_organization_sessions: dict[str, SessionState] = {}
 _stateless_http_mode = False
+_stdio_local_file_access_enabled = False
 
-# Process-wide registry for copilot browser sessions. Keyed by browser_session_id.
+# Process-wide registry for copilot browser sessions. Keys always carry the
+# owning organization so authenticated HTTP requests cannot address another
+# tenant's entry even when the browser session ID is known.
 # This bypasses ContextVar propagation issues when FastMCP runs tool handlers
 # in a separate task whose context snapshot predates scoped_session().
-_copilot_sessions: dict[str, SessionState] = {}
+_copilot_sessions: dict[tuple[str, str], SessionState] = {}
 # Ref snapshots and their invalidation generations, FIFO-capped like _body_store.
 # Capacity eviction can drop a live session's refs early; that fails safe (unknown
 # ref → the caller re-observes), which is why the tool contract doesn't mention it.
@@ -87,8 +120,9 @@ _copilot_sessions: dict[str, SessionState] = {}
 # touch, so an evicted entry re-materializes with a NEVER-seen token — a stale
 # observe holding an old token can't collide with it (no ABA reset to a default).
 _SESSION_REF_STORE_MAX = 64
-_session_ref_maps: dict[tuple[str, str, str | None], dict[str, Any]] = {}
-_session_ref_generations: dict[tuple[str, str, str | None], int] = {}
+_session_ref_maps: dict[tuple[str | None, str, str, str | None], dict[str, Any]] = {}
+_session_ref_generations: dict[tuple[str | None, str, str, str | None], int] = {}
+_observe_v2_states: dict[tuple[str | None, str, str, str | None], ObserveV2State] = {}
 _session_ref_generation_counter = itertools.count(1)
 # Identity tokens instead of id(): a GC'd page's id() can be reused by a new
 # page, making a stale snapshot look valid. Tokens are never reissued.
@@ -118,7 +152,7 @@ def page_ref_key(page: SkyvernBrowserPage) -> tuple[int, int | None, str, str | 
     )
 
 
-def _generation_for(key: tuple[str, str, str | None]) -> int:
+def _generation_for(key: tuple[str | None, str, str, str | None]) -> int:
     generation = _session_ref_generations.get(key)
     if generation is None:
         generation = next(_session_ref_generation_counter)
@@ -128,24 +162,57 @@ def _generation_for(key: tuple[str, str, str | None]) -> int:
     return generation
 
 
+def _advance_generation_for(key: tuple[str | None, str, str, str | None]) -> int:
+    generation = next(_session_ref_generation_counter)
+    # Pop-then-reinsert: an advance is activity, so it must LRU-touch the key -
+    # FIFO eviction would drop the longest-lived (often busiest) session and a
+    # freshly minted generation would break its in-flight reservation.
+    _session_ref_generations.pop(key, None)
+    _session_ref_generations[key] = generation
+    while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
+        _session_ref_generations.pop(next(iter(_session_ref_generations)))
+    return generation
+
+
 def _session_ref_key(
     state: SessionState,
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
-) -> tuple[str, str, str | None] | None:
+) -> tuple[str | None, str, str, str | None] | None:
     context = state.context
     resolved_session_id = session_id or (context.session_id if context else None)
     resolved_cdp_url = cdp_url or (context.cdp_url if context else None)
     # Prefer the hash stored at resolve_browser time — recomputing runs a
     # deliberately slow PBKDF2 per call, and this sits on the per-ref hot path.
     api_key_hash = state.api_key_hash or _api_key_hash(get_active_api_key())
+    organization_id = _current_organization_id.get() or state.organization_id
 
     if resolved_session_id:
-        return ("cloud_session", resolved_session_id, api_key_hash)
+        return (organization_id, "cloud_session", resolved_session_id, api_key_hash)
+    if context is not None and context.mode == "extension":
+        return (organization_id, "extension", "own-browser", api_key_hash)
     if resolved_cdp_url:
-        return ("cdp", resolved_cdp_url, api_key_hash)
+        return (organization_id, "cdp", resolved_cdp_url, api_key_hash)
     return None
+
+
+def get_observe_v2_state(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> ObserveV2State:
+    """Return observe-v2 state keyed exactly like the legacy per-browser ref map."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        observe_state = _observe_v2_states.pop(key, None)
+        if observe_state is None:
+            observe_state = ObserveV2State()
+        _observe_v2_states[key] = observe_state
+        while len(_observe_v2_states) > _SESSION_REF_STORE_MAX:
+            _observe_v2_states.pop(next(iter(_observe_v2_states)))
+        return observe_state
+    return state._observe_v2_state
 
 
 def session_ref_generation(
@@ -161,6 +228,38 @@ def session_ref_generation(
     return state._observed_refs_generation
 
 
+def begin_session_ref_publication(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> int:
+    """Reserve a unique generation for one in-flight ref publication."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        return _advance_generation_for(key)
+    state._observed_refs_generation = next(_session_ref_generation_counter)
+    return state._observed_refs_generation
+
+
+def invalidate_session_ref_map(
+    *,
+    session_id: str | None = None,
+    cdp_url: str | None = None,
+) -> int:
+    """Invalidate published refs while retaining v2 budgets and monotonic ref IDs."""
+    state = get_current_session()
+    if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        _session_ref_maps.pop(key, None)
+        observe_state = _observe_v2_states.get(key)
+        if observe_state is not None:
+            observe_state.reset_refs()
+        return _advance_generation_for(key)
+    state._observed_refs = {}
+    state._observe_v2_state.reset_refs()
+    state._observed_refs_generation = next(_session_ref_generation_counter)
+    return state._observed_refs_generation
+
+
 def replace_session_ref_map(
     ref_map: dict[str, dict[str, Any]],
     *,
@@ -168,12 +267,19 @@ def replace_session_ref_map(
     cdp_url: str | None = None,
     generation: int | None = None,
     page_key: tuple[int, int | None, str, str | None] | None = None,
+    advance_on_commit: bool = True,
 ) -> bool:
     """Replace the session's ref snapshot (never merge). Returns False if discarded.
 
-    When ``generation`` is given, the snapshot is discarded if the registry was
-    cleared after that generation was captured — the observe raced a navigation
-    or context switch and describes a replaced document.
+    A supplied generation is a publication reservation. The snapshot is discarded
+    if a newer operation has reserved or invalidated the registry; an accepted
+    commit advances the generation so work captured before the commit cannot
+    mutate the published snapshot afterward.
+
+    Legacy (pre-v2) publications pass ``advance_on_commit=False``: their generation
+    is a plain read, so the CAS refuses snapshots that raced an invalidation
+    (navigation/clear) while overlapping publications keep last-completer-wins -
+    exactly the pre-reservation contract.
     """
     state = get_current_session()
     snapshot: dict[str, Any] = {"page_key": page_key, "refs": dict(ref_map)}
@@ -183,10 +289,14 @@ def replace_session_ref_map(
         _session_ref_maps[key] = snapshot
         while len(_session_ref_maps) > _SESSION_REF_STORE_MAX:
             _session_ref_maps.pop(next(iter(_session_ref_maps)))
+        if advance_on_commit:
+            _advance_generation_for(key)
     else:
         if generation is not None and generation != state._observed_refs_generation:
             return False
         state._observed_refs = snapshot
+        if advance_on_commit:
+            state._observed_refs_generation = next(_session_ref_generation_counter)
     return True
 
 
@@ -220,36 +330,67 @@ def clear_session_ref_map(
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
-) -> None:
+    generation: int | None = None,
+) -> bool:
+    """Clear refs, unless a newer publication reservation superseded this caller."""
     state = get_current_session()
     if key := _session_ref_key(state, session_id=session_id, cdp_url=cdp_url):
+        if generation is not None and generation != _generation_for(key):
+            return False
         _session_ref_maps.pop(key, None)
-        _session_ref_generations[key] = next(_session_ref_generation_counter)
-        while len(_session_ref_generations) > _SESSION_REF_STORE_MAX:
-            _session_ref_generations.pop(next(iter(_session_ref_generations)))
+        observe_state = _observe_v2_states.pop(key, None)
+        if observe_state is None:
+            observe_state = ObserveV2State()
+        else:
+            observe_state.reset_refs()
+        _observe_v2_states[key] = observe_state
+        while len(_observe_v2_states) > _SESSION_REF_STORE_MAX:
+            _observe_v2_states.pop(next(iter(_observe_v2_states)))
+        _advance_generation_for(key)
     else:
+        if generation is not None and generation != session_ref_generation(
+            session_id=session_id,
+            cdp_url=cdp_url,
+        ):
+            return False
         state._observed_refs = {}
+        state._observe_v2_state.reset_refs()
         state._observed_refs_generation = next(_session_ref_generation_counter)
+    return True
 
 
-def register_copilot_session(session_id: str, state: SessionState) -> None:
+def register_copilot_session(session_id: str, state: SessionState, *, organization_id: str) -> None:
     """Register a pre-configured browser session for cross-task lookup.
 
     The registry is process-local and in-memory: entries do not survive a
     process restart and are not shared across uvicorn workers. Callers that
     need cross-process continuity must reconnect via the cloud session API.
     """
-    _copilot_sessions[session_id] = state
+    if not organization_id:
+        raise ValueError("organization_id is required for a copilot browser session")
+    if state.organization_id not in {None, organization_id}:
+        raise ValueError("session state belongs to a different organization")
+    if is_self_heal_session_id(session_id):
+        os.environ.pop("DEBUGP", None)
+        redactor = current_codeblock_log_redactor()
+        if redactor is not None:
+            state._codeblock_redactor = redactor
+    state.organization_id = organization_id
+    _copilot_sessions[(organization_id, session_id)] = state
 
 
-def unregister_copilot_session(session_id: str) -> None:
+def unregister_copilot_session(session_id: str, *, organization_id: str) -> None:
     """Remove a copilot browser session from the process-local registry."""
-    _copilot_sessions.pop(session_id, None)
+    _copilot_sessions.pop((organization_id, session_id), None)
 
 
 def active_copilot_session_ids() -> set[str]:
     """Browser-session IDs currently bound to an active copilot turn."""
-    return set(_copilot_sessions)
+    return {session_id for _, session_id in _copilot_sessions}
+
+
+def _registered_copilot_session(session_id: str, *, organization_id: str) -> SessionState | None:
+    return _copilot_sessions.get((organization_id, session_id))
 
 
 def _explicit_cloud_session_can_access_localhost() -> bool:
@@ -259,7 +400,17 @@ def _explicit_cloud_session_can_access_localhost() -> bool:
 def get_current_session() -> SessionState:
     global _global_session
 
+    organization_id = _current_organization_id.get()
     state = _current_session.get()
+
+    if organization_id is not None and not _stateless_http_mode:
+        state = _organization_sessions.get(organization_id)
+        if state is None:
+            state = SessionState(organization_id=organization_id)
+            _organization_sessions[organization_id] = state
+        _current_session.set(state)
+        return state
+
     if state is not None:
         return state
 
@@ -279,9 +430,28 @@ def get_current_session() -> SessionState:
 
 def set_current_session(state: SessionState) -> None:
     global _global_session
-    if not _stateless_http_mode:
+
+    organization_id = _current_organization_id.get()
+    if organization_id is not None and not _stateless_http_mode:
+        state.organization_id = organization_id
+        _organization_sessions[organization_id] = state
+    elif not _stateless_http_mode:
         _global_session = state
     _current_session.set(state)
+
+
+@contextmanager
+def request_session_scope(organization_id: str) -> Iterator[None]:
+    if not organization_id:
+        raise ValueError("organization_id is required for an authenticated MCP request")
+
+    organization_token = _current_organization_id.set(organization_id)
+    session_token = _current_session.set(None)
+    try:
+        yield
+    finally:
+        _current_session.reset(session_token)
+        _current_organization_id.reset(organization_token)
 
 
 @asynccontextmanager
@@ -305,6 +475,15 @@ def set_stateless_http_mode(enabled: bool) -> None:
 
 def is_stateless_http_mode() -> bool:
     return _stateless_http_mode
+
+
+def set_stdio_local_file_access_enabled(enabled: bool) -> None:
+    global _stdio_local_file_access_enabled
+    _stdio_local_file_access_enabled = enabled
+
+
+def is_stdio_local_file_access_enabled() -> bool:
+    return _stdio_local_file_access_enabled
 
 
 def _api_key_hash(api_key: str | None) -> str | None:
@@ -341,6 +520,7 @@ def _matches_current(
     *,
     session_id: str | None = None,
     cdp_url: str | None = None,
+    extension_runtime: BrowserExtensionRuntime | None = None,
     local: bool = False,
 ) -> bool:
     if current.browser is None or current.context is None:
@@ -350,6 +530,8 @@ def _matches_current(
 
     if session_id:
         return current.context.mode == "cloud_session" and current.context.session_id == session_id
+    if extension_runtime is not None:
+        return current.context.mode == "extension"
     if cdp_url:
         return current.context.mode == "cdp" and current.context.cdp_url == cdp_url
     if local:
@@ -357,6 +539,15 @@ def _matches_current(
     return False
 
 
+def _extension_browser_is_connected(browser: SkyvernBrowser) -> bool:
+    try:
+        playwright_browser = browser.browser
+        return playwright_browser is not None and playwright_browser.is_connected()
+    except Exception:
+        return False
+
+
+@count_browser_attach
 async def resolve_browser(
     session_id: str | None = None,
     cdp_url: str | None = None,
@@ -364,6 +555,8 @@ async def resolve_browser(
     create_session: bool = False,
     timeout: int | None = None,
     headless: bool = False,
+    *,
+    extension_runtime: BrowserExtensionRuntime | None = None,
 ) -> tuple[SkyvernBrowser, BrowserContext]:
     """Resolve browser from parameters or current session.
 
@@ -371,27 +564,68 @@ async def resolve_browser(
     Cleanup is done via explicit skyvern_browser_session_close() call. For scripts that need
     guaranteed cleanup, use the browser_session() context manager instead.
     """
+    # _session_ref_key must prefer session_id so raw cdp_url callers share refs with this normalized context.
+    if cdp_url and cdp_url.startswith("pbs_") and not session_id:
+        session_id, cdp_url = cdp_url, None
+
     skyvern = get_skyvern()
     current = get_current_session()
 
-    if _stateless_http_mode and not (session_id or cdp_url or local or create_session):
+    if _stateless_http_mode and not (session_id or cdp_url or extension_runtime or local or create_session):
         raise BrowserNotAvailableError()
 
-    if _matches_current(current, session_id=session_id, cdp_url=cdp_url, local=local):
+    if _matches_current(
+        current,
+        session_id=session_id,
+        cdp_url=cdp_url,
+        extension_runtime=extension_runtime,
+        local=local,
+    ):
         if current.browser is None or current.context is None:
             raise RuntimeError("Expected active browser and context for matching session")
-        return current.browser, current.context
+        if extension_runtime is None or _extension_browser_is_connected(current.browser):
+            return current.browser, current.context
+        try:
+            await _close_session_state(current, close_via_active_client=False)
+        except Exception:
+            pass
+        finally:
+            set_current_session(SessionState())
+        current = get_current_session()
+
+    # Cloud sessions created by the MCP session tool intentionally do not open a
+    # second CDP connection. Connect lazily when a browser tool is used; this
+    # leaves the initial page available to the backend persistent-session manager
+    # for code-only workflow runs.
+    if (
+        current.browser is None
+        and current.context is not None
+        and current.context.mode == "cloud_session"
+        and current.context.session_id
+        and session_id is None
+        and cdp_url is None
+        and not local
+        and _hashes_equal(current.api_key_hash, _api_key_hash(get_active_api_key()))
+    ):
+        connected_browser = await skyvern.connect_to_cloud_browser_session(current.context.session_id)
+        current.browser = connected_browser
+        return connected_browser, current.context
 
     active_api_key_hash = _api_key_hash(get_active_api_key())
 
     # Check copilot session registry (cross-task fallback when ContextVar
     # does not propagate through FastMCP in-process transport).
-    registered = _copilot_sessions.get(session_id) if session_id else None
+    organization_id = _current_organization_id.get()
+    registered = (
+        _registered_copilot_session(session_id, organization_id=organization_id)
+        if session_id and organization_id
+        else None
+    )
     if registered is not None and registered.browser is not None and registered.context is not None:
         if _hashes_equal(registered.api_key_hash, active_api_key_hash) or not has_api_key_override():
             # FastMCP in-process tool tasks may miss the parent ContextVar.
             # Explicit request overrides still win; otherwise use the temporary Copilot registry.
-            _current_session.set(registered)
+            set_current_session(registered)
             return registered.browser, registered.context
 
     browser: SkyvernBrowser | None = None
@@ -403,6 +637,12 @@ async def resolve_browser(
                 session_id=session_id,
                 can_access_localhost=_explicit_cloud_session_can_access_localhost(),
             )
+            set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+            return browser, ctx
+
+        if extension_runtime is not None:
+            browser = await skyvern.connect_to_browser_extension(extension_runtime)
+            ctx = BrowserContext(mode="extension", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
@@ -427,28 +667,71 @@ async def resolve_browser(
             )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
-    except Exception:
+    except Exception as exc:
         if browser is not None:
             try:
                 await browser.close()
             except Exception:
                 pass
         set_current_session(SessionState())
-        raise
+        wrapped = _wrap_browser_connection_failure(exc)
+        if wrapped is None:
+            # Not a recognized connect/CDP failure -- e.g. an explicit PermissionError from a
+            # cross-organization ownership check. Callers scope-check on the real exception
+            # class, so reclassifying it here would turn a 403-shaped denial into a generic
+            # "retry" story.
+            raise
+        raise wrapped from exc
 
     if current.browser is not None and current.context is not None:
-        return current.browser, current.context
+        if current.context.mode != "extension" or _extension_browser_is_connected(current.browser):
+            return current.browser, current.context
+        # The extension-mode CDP link died (extension reload, broker restart, session
+        # churn). Heal through the live runtime instead of handing back a dead browser
+        # or dead-ending targetless tools on NO_ACTIVE_BROWSER.
+        healed = await _reconnect_extension_session(current, active_api_key_hash)
+        if healed is not None:
+            return healed
 
     raise BrowserNotAvailableError()
 
 
-async def close_current_session() -> None:
-    """Close the active browser session (if any) and clear local session state."""
+async def _reconnect_extension_session(
+    current: SessionState,
+    active_api_key_hash: str | None,
+) -> tuple[SkyvernBrowser, BrowserContext] | None:
+    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+    runtime = BrowserExtensionRuntime.instance()
+    if runtime is None:
+        return None
+    try:
+        await _close_session_state(current, close_via_active_client=False)
+    except Exception:
+        pass
+    finally:
+        set_current_session(SessionState())
+    skyvern = get_skyvern()
+    try:
+        browser = await skyvern.connect_to_browser_extension(runtime)
+    except Exception:
+        LOG.warning("browser_extension_session_reconnect_failed", exc_info=True)
+        return None
+    ctx = BrowserContext(mode="extension", can_access_localhost=True)
+    set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
+    return browser, ctx
+
+
+async def _close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
     from .session_ops import do_session_close
 
-    current = get_current_session()
     try:
-        if current.context and current.context.mode == "cloud_session" and current.context.session_id:
+        if (
+            close_via_active_client
+            and current.context
+            and current.context.mode == "cloud_session"
+            and current.context.session_id
+        ):
             try:
                 skyvern = get_skyvern()
                 await do_session_close(skyvern, current.context.session_id)
@@ -473,8 +756,51 @@ async def close_current_session() -> None:
         clear_session_ref_map()
         if current.context and current.context.session_id:
             delete_session_trajectories(current.context.session_id)
-            unregister_copilot_session(current.context.session_id)
+            organization_id = _current_organization_id.get() or current.organization_id
+            if organization_id is not None:
+                unregister_copilot_session(current.context.session_id, organization_id=organization_id)
+
+
+async def close_current_session() -> None:
+    """Close the active browser session (if any) and clear local session state."""
+    current = get_current_session()
+    try:
+        await _close_session_state(current, close_via_active_client=True)
+    finally:
         set_current_session(SessionState())
+
+
+async def close_all_sessions() -> None:
+    errors: list[tuple[str | None, BaseException]] = []
+    for organization_id in list(_organization_sessions):
+        try:
+            with request_session_scope(organization_id):
+                current = get_current_session()
+                try:
+                    # Preserve the session ID so browser.close() uses the browser's owning client for remote cleanup.
+                    await _close_session_state(current, close_via_active_client=False)
+                finally:
+                    set_current_session(SessionState())
+        except BaseException as exc:
+            errors.append((organization_id, exc))
+
+    _organization_sessions.clear()
+    try:
+        await close_current_session()
+    except BaseException as exc:
+        errors.append((None, exc))
+    finally:
+        _current_session.set(None)
+        _current_organization_id.set(None)
+
+    if errors:
+        for failed_organization_id, cleanup_error in errors[1:]:
+            LOG.warning(
+                "Additional session cleanup failed",
+                organization_id=failed_organization_id,
+                exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+            )
+        raise errors[0][1]
 
 
 async def get_page(
@@ -489,22 +815,30 @@ async def get_page(
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     state = get_current_session()
 
-    # Use explicitly set active page if still valid
-    if state._active_page is not None and not state._active_page.is_closed():
-        try:
-            context_pages = browser._browser_context.pages
-            if state._active_page in context_pages:
-                page = await browser.get_page_for(state._active_page)
-            else:
+    try:
+        # Use explicitly set active page if still valid
+        if state._active_page is not None and not state._active_page.is_closed():
+            try:
+                context_pages = browser._browser_context.pages
+                if state._active_page in context_pages:
+                    page = await browser.get_page_for(state._active_page)
+                else:
+                    state._active_page = None
+                    page = await browser.get_working_page()
+            except Exception:
                 state._active_page = None
                 page = await browser.get_working_page()
-        except Exception:
-            state._active_page = None
+        else:
+            if state._active_page is not None:
+                state._active_page = None
             page = await browser.get_working_page()
-    else:
-        if state._active_page is not None:
-            state._active_page = None
-        page = await browser.get_working_page()
+    except Exception as exc:
+        # The connect above can succeed and the target still die before this command
+        # reaches it -- same failure family as resolve_browser's connect attempt.
+        wrapped = _wrap_browser_connection_failure(exc)
+        if wrapped is None:
+            raise
+        raise wrapped from exc
 
     # Register inspection hooks on all pages in the context.
     # Import here to avoid circular imports.
@@ -534,12 +868,22 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
         return
 
     def _on_new_page(page: Page) -> None:
-        event = {
-            "tab_id": str(id(page)),
-            "url": page.url,
-            "timestamp": time.time(),
-            "page": page,
-        }
+        from skyvern.cli.mcp_tools.inspection import _redact_inspection_value
+
+        try:
+            event_data = _redact_inspection_value(
+                state,
+                {
+                    "tab_id": str(id(page)),
+                    "url": page.url,
+                    "timestamp": time.time(),
+                },
+            )
+        except BaseException:
+            return
+        if type(event_data) is not dict:
+            return
+        event = {**event_data, "page": page}
         state._page_events.append(event)
         state._page_event_signal.set()
 
@@ -554,18 +898,21 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
                 page_id = id(page)
                 state._hooked_page_ids.discard(page_id)
                 state._hooked_handlers_map.pop(page_id, None)
-            except Exception:
-                LOG.debug("Failed to clean up closed page state", exc_info=True)
+            except BaseException:
+                pass
 
-        page.on("close", _on_close)
+        try:
+            page.on("close", _on_close)
+        except BaseException:
+            pass
 
         # Register inspection hooks eagerly so early popup events are captured
         try:
             from skyvern.cli.mcp_tools.inspection import _register_hooks_on_page
 
             _register_hooks_on_page(state, page)
-        except Exception:
-            LOG.debug("Failed to register inspection hooks on new page", exc_info=True)
+        except BaseException:
+            pass
 
     try:
         browser._browser_context.on("page", _on_new_page)
@@ -616,7 +963,94 @@ class BrowserNotAvailableError(Exception):
     """Raised when no browser session is available."""
 
 
-def no_browser_error() -> dict[str, Any]:
+class BrowserSessionConnectionError(BrowserNotAvailableError):
+    """A browser/session was resolvable but connecting to it (or its page) failed.
+
+    Subclasses BrowserNotAvailableError so every existing MCP tool's
+    ``except BrowserNotAvailableError`` clause already handles it without modification.
+    ``raw_detail`` keeps the original driver/CDP text -- which can carry an internal
+    hostname or a raw proxy response body -- available to server-side classifiers
+    without exposing it in ``str(self)``.
+
+    ``session_gone`` is true only once we are sure the session itself is gone (not
+    just this particular connect attempt), via two independent signals OR'd together:
+    an engine-neutral "target already closed" message taxonomy, and the session
+    router's own expiry close code paired with its reason text (the code alone is
+    reused by an unrelated subsystem for a different meaning, and the taxonomy alone
+    is not guaranteed to match every message shape that close can take).
+    """
+
+    def __init__(self, raw_detail: str) -> None:
+        self.raw_detail = raw_detail
+        lowered = raw_detail.lower()
+        self.session_gone = is_target_closed_message(raw_detail) or (
+            "code=4408" in lowered and "reason=session expired" in lowered
+        )
+        super().__init__("Browser session connection failed")
+
+
+_BROWSER_CONNECT_MESSAGE_MARKERS = (
+    "connect_over_cdp",
+    "websocket error",
+    "websocket was closed",
+    "ws connecting",
+    "ws unexpected response",
+    "ws error",
+)
+
+
+def _looks_like_browser_connection_failure(exc: Exception) -> bool:
+    """Recognize a failure that belongs to the connect/resolve-a-page boundary.
+
+    Deliberately narrow: resolve_browser()'s try block and get_page()'s page-resolution
+    step can also surface an exception that exists precisely so a CALLER can key off its
+    real type -- e.g. a cross-organization PermissionError. Only convert what is
+    unambiguously a browser/CDP/session-router failure; anything else re-raises unchanged.
+    """
+    if isinstance(exc, httpx.TransportError):
+        # A network-level failure talking to our own API while fetching session
+        # metadata; str(exc) is often empty for this class (e.g. httpx.ReadError).
+        return True
+    message = str(exc).lower()
+    if not message.strip():
+        # A typed authorization denial always carries a message; a message-less
+        # exception at this exact boundary has nothing else to go on and nothing to
+        # leak either way, so treat it as a connection failure rather than let an
+        # uninformative, uncaught ToolError reach the client.
+        return True
+    return (
+        is_target_closed_message(message)
+        or is_context_lost_message(message)
+        or any(marker in message for marker in _BROWSER_CONNECT_MESSAGE_MARKERS)
+    )
+
+
+def _wrap_browser_connection_failure(exc: Exception) -> BrowserSessionConnectionError | None:
+    if not _looks_like_browser_connection_failure(exc):
+        return None
+    LOG.warning("Browser session connection failed", exc_info=True)
+    # str(exc) can be empty (e.g. httpx.ReadError, asyncio TimeoutError) -- fall back to the
+    # original exception's type name so raw_detail is never blank.
+    return BrowserSessionConnectionError(str(exc) or type(exc).__name__)
+
+
+def no_browser_error(exc: BrowserNotAvailableError | None = None) -> dict[str, Any]:
+    if isinstance(exc, BrowserSessionConnectionError):
+        if exc.session_gone:
+            return make_error(
+                ErrorCode.SESSION_EXPIRED,
+                "Browser session expired or closed.",
+                "Create a new browser session and retry this operation.",
+            )
+        return make_error(
+            ErrorCode.SDK_ERROR,
+            # get_user_facing_exception_message already strips CDP/session-router hostnames,
+            # raw proxy response bodies, and driver call logs for anything connect_over_cdp-
+            # shaped; anything else degrades to a generic "Unexpected error: <text>", also safe.
+            get_user_facing_exception_message(Exception(exc.raw_detail)),
+            "This is often transient. Retry with the same session_id/cdp_url; "
+            "if it keeps failing, create a new browser session.",
+        )
     return make_error(
         ErrorCode.NO_ACTIVE_BROWSER,
         "No browser session available",

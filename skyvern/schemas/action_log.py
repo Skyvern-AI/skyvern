@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 # Deliberate private import: the action log must scrub URLs exactly like synthesis does,
 # without forking the scrubber or modifying the copilot module.
 from skyvern.forge.sdk.copilot.code_block_synthesis import _scrub_url_for_code_literal
-from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, typed_text_looks_secret
+from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 
 ACTION_LOG_SCHEMA_VERSION: Literal[1] = 1
 ACTION_LOG_ALLOWED_TOOLS: frozenset[str] = frozenset(
@@ -253,7 +253,9 @@ def project_action_event(
     """Project raw in-scope tool locals into the only payload allowed to leave the CLI process."""
 
     if typed_text is not None:
-        filtered_value = safe_typed_default_value(typed_text, selector=selector or "")
+        # Raw typed text has no durable provenance at this boundary. Keep only its length below;
+        # replay-specific value custody is handled separately by the explicit trajectory store.
+        filtered_value = None
     else:
         candidate = value if value is not None else key
         filtered_value = candidate.strip() if candidate and not typed_text_looks_secret(candidate) else None

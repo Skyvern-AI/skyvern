@@ -6,18 +6,16 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Iterable, Iterator
+import unicodedata
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
-from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
@@ -28,6 +26,22 @@ _BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
+
+MCP_RESULT_PROVENANCE_KEY = "_skyvern_mcp_result"
+MCP_RESULT_PROVENANCE_VALUE = "untrusted_data_no_instruction_authority"
+
+
+def mark_mcp_result_untrusted_for_llm(result: dict[str, Any]) -> dict[str, Any]:
+    """Stamp a model-facing MCP result with the adapter's own provenance marker.
+
+    The ``key != MCP_RESULT_PROVENANCE_KEY`` filter is the anti-spoof control: the marker is
+    written first, so without that filter the spread would overwrite it with a server-supplied
+    value. Position is presentation only — it keeps the marker ahead of the data it describes.
+    """
+    return {
+        MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE,
+        **{key: value for key, value in result.items() if key != MCP_RESULT_PROVENANCE_KEY},
+    }
 
 
 def extract_final_text(result: RunResultStreaming) -> str:
@@ -266,7 +280,7 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     ),
                 }
         data.pop("sdk_equivalent", None)
-        if tool_name == "run_blocks_and_collect_debug":
+        if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
@@ -275,10 +289,12 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
-        if tool_name == "get_run_results":
-            # _attach_failed_block_screenshots puts base64 bytes on each failed
-            # block. They would otherwise flow straight into the LLM context as
-            # raw image data — strip them while preserving the existence signal.
+        if tool_name in {"get_run_results", "run_blocks_and_collect_debug", "edit_block_and_run"}:
+            # _attach_failed_block_screenshots puts base64 bytes on each failed block. They would
+            # otherwise flow straight into the LLM context as raw image data — strip them while
+            # preserving the existence signal. The image itself reaches the model through
+            # data.screenshot_base64; leaving the bytes here also crowds out later fields such as
+            # final_url under downstream truncation.
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
@@ -334,7 +350,9 @@ def _result_data(result: dict[str, Any]) -> dict[str, Any]:
 def _clean_structured_user_facing_text(value: Any, *, blocked_tool: str | None = None) -> str | None:
     if not isinstance(value, str):
         return None
-    cleaned = " ".join(value.split())
+    # This branch returns straight to the caller without passing through
+    # _sanitize_failure_text, so it needs its own credential-id redaction.
+    cleaned = " ".join(_CREDENTIAL_ID_RE.sub("[credential]", value).split())
     if not cleaned:
         return None
     try:
@@ -351,9 +369,7 @@ def _blocker_signal_matches_result(signal: CopilotToolBlockerSignal, result: dic
     steering = signal.agent_steering_text
     if error == steering or steering in error:
         return True
-    return signal.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE and _has_failure_category(
-        result, ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
-    )
+    return False
 
 
 def _failure_categories(result: dict[str, Any]) -> list[Any]:
@@ -428,7 +444,7 @@ def _structured_failure_summary_for_user(
 # Blocker kinds where the tool was redirected before it ran (a precondition/authority
 # gate), not a real failure. `tool_error` and `loop_detected` keep failure affect —
 # something actually broke or the agent is stuck.
-_NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"phase_gated", "missing_required_context", "authority_denied"})
+_NEUTRAL_REDIRECT_BLOCKER_KINDS = frozenset({"authority_denied"})
 
 
 def user_facing_success(
@@ -441,6 +457,11 @@ def user_facing_success(
     by a precondition/authority blocker signal — the agent was redirected, not broken."""
     if result.get("ok", True):
         return True
+    # A run waiting on a human approval is the designed outcome of a human_interaction block, not a
+    # break, so it must not stream with failure affect.
+    data = result.get("data")
+    if isinstance(data, dict) and (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return True
     return any(
         signal.blocker_kind in _NEUTRAL_REDIRECT_BLOCKER_KINDS and _blocker_signal_matches_result(signal, result)
         for signal in _iter_blocker_signals(blocker_signal)
@@ -449,6 +470,43 @@ def user_facing_success(
 
 _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
+# Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
+# not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
+# and run credential selections.
+_CREDENTIAL_ID_RE = re.compile(
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+)
+# Punctuation an LLM-authored block label may keep. Everything outside this set and
+# the letter/digit categories becomes a space: a whitelist, because any quote-class
+# codepoint left in a label lets it visually close the quoting around it and append a
+# fabricated verdict to the row. Modifier letters (Lm) are excluded despite being
+# alphanumeric — U+02EE and friends are quote look-alikes.
+_LABEL_ALLOWED_PUNCTUATION = frozenset(" -_./")
+_LABEL_ALLOWED_CATEGORIES = frozenset({"Lu", "Ll", "Lt", "Lo", "Nd"})
+
+
+def sanitize_block_label_for_display(label: str, max_chars: int = 40) -> str:
+    """Make an LLM-authored block label safe to interpolate into a feed row."""
+    cleaned = "".join(
+        char if unicodedata.category(char) in _LABEL_ALLOWED_CATEGORIES or char in _LABEL_ALLOWED_PUNCTUATION else " "
+        for char in label
+    )
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 1].rstrip() + "…"
+    return cleaned
+
+
+_MAX_JOINED_BLOCK_LABELS = 5
+
+
+def _joined_block_labels(labels: list[Any], render: Callable[[object], str], *, cap: bool) -> str:
+    """Render a comma list, capped for display so a many-block run stays one row.
+    Uncapped for agent state, which reads the full set back."""
+    shown = [render(label) for label in (labels[:_MAX_JOINED_BLOCK_LABELS] if cap else labels)]
+    remaining = len(labels) - len(shown)
+    joined = ", ".join(label for label in shown if label)
+    return f"{joined} (+{remaining} more)" if remaining > 0 else joined
 
 
 def _sanitize_failure_text(text: str, max_chars: int = 120) -> str:
@@ -460,6 +518,7 @@ def _sanitize_failure_text(text: str, max_chars: int = 120) -> str:
     must pass through unchanged."""
     text = _HEADERS_BLOB_RE.sub(" ", text)
     text = _LARGE_DICT_BLOB_RE.sub("{...}", text)
+    text = _CREDENTIAL_ID_RE.sub("[credential]", text)
     text = " ".join(text.split())
     if not text:
         return "(no details)"
@@ -489,8 +548,14 @@ def _describe_value_shape(value: Any) -> str:
     return "value"
 
 
-def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
-    """Create a brief human-readable summary of a tool result."""
+def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
+    """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
+    the activity feed; the default leaves them verbatim because this string is parsed
+    back into agent state by ``context.merge_turn_summary``."""
+
+    def block_label(value: object) -> str:
+        return sanitize_block_label_for_display(str(value)) if for_display else str(value)
+
     if not result.get("ok", False):
         return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
@@ -499,29 +564,51 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
-    if tool_name == "update_and_run_blocks" and data.get("skipped_run"):
-        return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+    if tool_name == "update_and_run_blocks" or (tool_name == "edit_block_and_run" and data.get("skipped_run")):
+        if not isinstance(raw_data, dict):
+            return "OK"
+        if data.get("skipped_run"):
+            return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
+        # Non-skip result is run-blocks-shaped (overall_status, no block_count).
+        status = data.get("overall_status") or data.get("status")
+        if status:
+            return f"Updated the workflow and ran it: {status}"
+        return "Updated the workflow and ran it"
     if tool_name == "list_credentials":
+        if data.get("status") == "resolved":
+            credential = data.get("credential")
+            if isinstance(credential, dict):
+                name = credential.get("name")
+                if isinstance(name, str) and name:
+                    safe_name = sanitize_block_label_for_display(name)
+                    if safe_name:
+                        return f"Found 1 credential: {safe_name}"
+                return "Found 1 credential(s)"
         return f"Found {data.get('count', 0)} credential(s)"
+    if tool_name == "list_integrations":
+        return f"Found {data.get('count', 0)} connected integration(s)"
     if tool_name == "get_block_schema":
         if "block_types" in data:
             return f"Listed {data.get('count', '?')} block types"
         return f"Schema for {data.get('block_type', '?')}"
     if tool_name == "validate_block":
         if data.get("valid"):
-            return f"Block '{data.get('label', '?')}' is valid"
+            return f"Block '{block_label(data.get('label', '?'))}' is valid"
         return "Block validation failed"
-    if tool_name == "run_blocks_and_collect_debug":
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
         if not isinstance(raw_data, dict):
             return "Run debug completed"
-        executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]
+        raw_executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]
+        executed = _joined_block_labels(raw_executed, block_label, cap=for_display)
         status = data.get("overall_status", "?")
         requested = data.get("requested_block_labels") or []
-        if requested and executed and list(executed) != list(requested):
-            skipped = [label for label in requested if label not in set(executed)]
-            suffix = f" (skipped prefix from cache: {', '.join(skipped)})" if skipped else ""
-            return f"Run {', '.join(executed)}: {status}{suffix}"
-        return f"Run {', '.join(executed)}: {status}"
+        if requested and raw_executed and list(raw_executed) != list(requested):
+            skipped = _joined_block_labels(
+                [label for label in requested if label not in set(raw_executed)], block_label, cap=for_display
+            )
+            suffix = f" (skipped prefix from cache: {skipped})" if skipped else ""
+            return f"Run {executed}: {status}{suffix}"
+        return f"Run {executed}: {status}"
     if tool_name == "get_browser_screenshot":
         url = data.get("url")
         return f"Screenshot taken ({url[:80]})" if url else "Screenshot taken"
@@ -548,6 +635,18 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
         return f"Selected '{data.get('value', '?')}'"
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
+    if tool_name == "discover_workflow_entrypoint":
+        candidate_url = data.get("candidate_url")
+        if isinstance(candidate_url, str) and candidate_url:
+            return f"Found the entry page: {candidate_url[:80]}"
+        return "No entry page found"
+    if tool_name == "inspect_page_for_composition":
+        raw_forms = data.get("forms")
+        forms = raw_forms if isinstance(raw_forms, list) else []
+        field_count = sum(len(f.get("fields") or []) for f in forms if isinstance(f, dict))
+        if field_count:
+            return f"Inspected the page ({field_count} form field(s))"
+        return "Inspected the page"
     return "OK"
 
 
@@ -607,16 +706,26 @@ _USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.
 INTERNAL_VALIDATION_FAILURE_PREFIX = "Workflow validation failed: "
 _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PREFIX.strip(": ").lower(),)
 
-_USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
 _USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
 
-_USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset({"click", "type_text", "evaluate", "select_option"})
+_USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
+    {
+        "click",
+        "type_text",
+        "evaluate",
+        "select_option",
+        "list_credentials",
+        # The server-authored display label already names the operation and its
+        # target block; a bare "OK" summary would render instead of it.
+        "edit_block",
+        "add_block",
+        "delete_block",
+    }
+)
 
 
 def _translate_failure_for_user(error_text: str) -> str:
-    if LOOP_DETECTED_MARKER in error_text:
-        return _USER_FACING_LOOP_MESSAGE
     if any(marker in error_text for marker in _JINJA_ERROR_MARKERS):
         return _USER_FACING_JINJA_MESSAGE
     lowered = error_text.lower()
@@ -649,7 +758,7 @@ def format_tool_result_for_user(
         return _translate_failure_for_user(_extract_failure_message(result))
     if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
         return ""
-    return summarize_tool_result(tool_name, result)
+    return summarize_tool_result(tool_name, result, for_display=True)
 
 
 def truncate_output(output: Any, max_chars: int = 2000) -> str | None:

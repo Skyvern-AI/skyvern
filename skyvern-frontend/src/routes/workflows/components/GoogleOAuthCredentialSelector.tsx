@@ -23,16 +23,19 @@ type Props = {
   value: string;
   onChange: (value: string) => void;
   requiredScopes: readonly string[];
+  optional?: boolean;
 };
 
 const ADVANCED_OPTION = "__advanced__";
 const SETTINGS_OPTION = "__settings__";
+const NONE_OPTION = "__none__";
 
 function GoogleOAuthCredentialSelector({
   nodeId,
   value,
   onChange,
   requiredScopes,
+  optional = false,
 }: Readonly<Props>) {
   const {
     credentials: allCredentials,
@@ -56,8 +59,17 @@ function GoogleOAuthCredentialSelector({
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
+  // The saved id may point at a connection that still exists but is expired
+  // ("needs reconnect"). Re-auth-in-place keeps the same id, so the block keeps
+  // working once the account is reconnected — no need to repoint.
+  const savedCredentialNeedsReconnect =
+    !!value &&
+    !isKnownCredential &&
+    allCredentials.some(
+      (c) => c.id === value && !isGoogleOAuthCredentialActive(c),
+    );
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
-  const needsAutoFill = !value;
+  const needsAutoFill = !optional && !value;
 
   useEffect(() => {
     if (
@@ -73,6 +85,10 @@ function GoogleOAuthCredentialSelector({
   }, [isLoading, isFetching, hasCredentials, needsAutoFill, firstValidId]);
 
   const handlePickerValueChange = (selected: string) => {
+    if (selected === NONE_OPTION) {
+      onChange("");
+      return;
+    }
     if (selected === ADVANCED_OPTION) {
       setShowAdvanced(true);
       return;
@@ -120,7 +136,20 @@ function GoogleOAuthCredentialSelector({
         </>
       ) : (
         <>
-          {value && hasCredentials && !isKnownCredential ? (
+          {savedCredentialNeedsReconnect ? (
+            <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
+              Saved Google account needs to be reconnected. Reconnect it on the{" "}
+              <a
+                href="/integrations"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Integrations
+              </a>{" "}
+              page to keep this block working.
+            </p>
+          ) : value && hasCredentials && !isKnownCredential ? (
             <p className="rounded-md border border-amber-300 bg-amber-100 px-2 py-1 text-[0.7rem] text-amber-700 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-200">
               Saved Google account is no longer connected. Pick another below.
             </p>
@@ -131,6 +160,10 @@ function GoogleOAuthCredentialSelector({
               <SelectValue placeholder="Select a Google account" />
             </SelectTrigger>
             <SelectContent>
+              {optional ? (
+                <SelectItem value={NONE_OPTION}>No Google account</SelectItem>
+              ) : null}
+
               {credentials.map((cred) => (
                 <CustomSelectItem key={cred.id} value={cred.id}>
                   <div className="space-y-0.5">

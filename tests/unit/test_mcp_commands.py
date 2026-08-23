@@ -92,7 +92,7 @@ def test_apply_profile_to_target_updates_local_entry_and_creates_backup(tmp_path
         "mcpServers": {
             "Skyvern": {
                 "command": "/opt/homebrew/bin/python3.11",
-                "args": ["-m", "skyvern", "run", "mcp"],
+                "args": ["-m", "skyvern", "run", "mcp", "--scope", "operate"],
                 "env": {
                     "SKYVERN_BASE_URL": "http://localhost:8000",
                     "SKYVERN_API_KEY": "old-key",
@@ -120,7 +120,7 @@ def test_apply_profile_to_target_updates_local_entry_and_creates_backup(tmp_path
     written = json.loads(config_path.read_text(encoding="utf-8"))
     written_entry = written["mcpServers"]["Skyvern"]
     assert written_entry["command"] == "/opt/homebrew/bin/python3.11"
-    assert written_entry["args"] == ["-m", "skyvern", "run", "mcp"]
+    assert written_entry["args"] == ["-m", "skyvern", "run", "mcp", "--scope", "operate"]
     assert written_entry["env"]["SKYVERN_API_KEY"] == "new-key-1234567890"
     assert written_entry["env"]["SKYVERN_BASE_URL"] == "https://api.skyvern.com"
     assert written_entry["env"]["OTHER"] == "keep-me"
@@ -728,6 +728,7 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: codex_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-hermes.yaml")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._opencode_config_path", lambda: tmp_path / "missing-hermes.json")
 
     discovered, missing = _discover_switch_targets()
 
@@ -760,6 +761,7 @@ def test_discover_switch_targets_reports_openclaw_invalid_nested_structure(
     monkeypatch.setattr("skyvern.cli.mcp_commands._codex_config_path", lambda: tmp_path / "missing-f.toml")
     monkeypatch.setattr("skyvern.cli.mcp_commands._openclaw_config_path", lambda: openclaw_config)
     monkeypatch.setattr("skyvern.cli.mcp_commands._hermes_config_path", lambda: tmp_path / "missing-g.yaml")
+    monkeypatch.setattr("skyvern.cli.mcp_commands._opencode_config_path", lambda: tmp_path / "missing-g.json")
 
     discovered, _missing = _discover_switch_targets()
 

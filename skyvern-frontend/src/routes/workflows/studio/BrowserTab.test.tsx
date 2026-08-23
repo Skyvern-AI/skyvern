@@ -51,6 +51,7 @@ vi.mock("../hooks/useWorkflowRunsQuery", () => ({
 }));
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useBrowserStreamingMode: () => ({ browserStreamingMode: "vnc" }),
+  useStreamTransport: () => ({ streamTransport: "vnc" }),
 }));
 vi.mock("posthog-js/react", () => ({
   usePostHog: () => ({ capture: vi.fn() }),
@@ -486,6 +487,23 @@ describe("BrowserTab pills and selection sync", () => {
     ]) {
       expect((screen.getByLabelText(name) as HTMLButtonElement).disabled).toBe(
         false,
+      );
+    }
+  });
+
+  it("styles only Turn off browser as destructive, not its siblings", () => {
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(STUDIO_PATH);
+
+    expect(screen.getByLabelText("Turn off browser").className).toContain(
+      "text-destructive",
+    );
+    for (const name of [
+      "Reconnect browser stream",
+      "Open browser in new tab",
+    ]) {
+      expect(screen.getByLabelText(name).className).not.toContain(
+        "text-destructive",
       );
     }
   });

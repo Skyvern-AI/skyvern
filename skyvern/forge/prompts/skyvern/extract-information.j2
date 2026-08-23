@@ -33,6 +33,11 @@ Clickable elements:
 
 Text extracted from the webpage: {{ extracted_text | untrusted }}
 {% endif %}
+{% if virtualized_grid_rows %}
+
+The elements above contain only a partial window of a server-paginated data grid; the following is the complete authoritative row set:
+{{ virtualized_grid_rows | untrusted }}
+{% endif %}
 ```
 END_UNTRUSTED_WEB_PAGE_DATA
 

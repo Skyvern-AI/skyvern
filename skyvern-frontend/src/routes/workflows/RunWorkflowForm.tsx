@@ -6,7 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 
@@ -58,6 +58,13 @@ import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { parseHeaderJson } from "@/util/secretHeaders";
+import {
+  getRecoveryGuidanceRetryContext,
+  isRecoveryGuidanceTelemetryContext,
+  RecoveryGuidanceTelemetry,
+  type RecoveryGuidanceRetryNavigation,
+  type RecoveryGuidanceTelemetryContext,
+} from "@/util/onboarding/recoveryGuidanceTelemetry";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -71,6 +78,13 @@ import {
 } from "./types/workflowTypes";
 import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
+import { BrowserProfileControl } from "./components/BrowserProfileControl";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { RotatingCredentialField } from "./components/RotatingCredentialField";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
@@ -81,6 +95,7 @@ import {
 import {
   getLoginCredentialInputs,
   getRotatingCredentialIds,
+  isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
 import { visitWorkflowBlocks } from "./workflowBlockUtils";
@@ -136,6 +151,7 @@ type Props = {
   initialSettings: {
     proxyLocation: ProxyLocation;
     webhookCallbackUrl: string;
+    reuseBrowserSession: boolean;
     cdpAddress: string | null;
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
@@ -212,7 +228,9 @@ type RunWorkflowRequestBody = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url?: string | null;
   browser_session_id: string | null;
+  reuse_browser_session: boolean | null;
   browser_profile_id?: string | null;
+  start_fresh_browser?: boolean;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
   cdp_connect_headers?: Record<string, string> | null;
@@ -221,15 +239,35 @@ type RunWorkflowRequestBody = {
   ai_fallback?: boolean;
 };
 
-function getRunWorkflowRequestBody(
+// Start-fresh and a picked override are mutually exclusive, but a per-input
+// agent's seeded override is inert (submit nulls it), so it must not count —
+// otherwise a per-input rerun leaves Start-fresh permanently disabled.
+// eslint-disable-next-line react-refresh/only-export-components
+export function isOverrideProfilePicked(
+  browserProfileId: string | null | undefined,
+  browserProfileKey?: string | null,
+  browserMemoryEnabled?: boolean,
+): boolean {
+  if (browserMemoryEnabled && browserProfileKey?.trim()) {
+    return false;
+  }
+  return Boolean((browserProfileId ?? "").toString().trim());
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function getRunWorkflowRequestBody(
   values: RunWorkflowFormType,
   workflowParameters: Array<WorkflowParameter>,
+  browserProfileKey?: string | null,
+  browserMemoryEnabled?: boolean,
 ): RunWorkflowRequestBody {
   const {
     webhookCallbackUrl,
     proxyLocation,
     browserSessionId,
+    reuseBrowserSession,
     browserProfileId,
+    startFreshBrowser,
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
@@ -247,16 +285,33 @@ function getRunWorkflowRequestBody(
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
   const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
+  // A live session is the browser for the run and the backend rejects fresh +
+  // session together, so an attached session wins and suppresses the fresh flag.
+  const startFresh = Boolean(startFreshBrowser) && !bsi;
+  // A per-input agent resolves its profile from browser_profile_key server-side;
+  // a run-level override ranks above that key and bypasses it, so drop it too.
+  // Browser-memory only — flag-off keeps the legacy payload byte-identical.
+  const perInputAgent =
+    Boolean(browserMemoryEnabled) && Boolean(browserProfileKey?.trim());
 
   const body: RunWorkflowRequestBody = {
     data,
     proxy_location: proxyLocation,
     browser_session_id: bsi,
-    browser_profile_id: bpi,
+    reuse_browser_session: reuseBrowserSession,
+    // Backend ranks an explicit profile override above start_fresh_browser, so a
+    // fresh run must drop the (possibly settings-derived) override to take effect.
+    browser_profile_id: startFresh || perInputAgent ? null : bpi,
     browser_address: cdpAddress,
     run_with: runWith,
     ai_fallback: aiFallback ?? true,
   };
+
+  // start_fresh_browser is a browser-memory-only field; flag-off must not add it
+  // to the request, keeping the legacy wire shape byte-identical.
+  if (browserMemoryEnabled) {
+    body.start_fresh_browser = startFresh;
+  }
 
   if (maxScreenshotScrolls) {
     body.max_screenshot_scrolls = maxScreenshotScrolls;
@@ -402,11 +457,13 @@ function FallbackCredentialList({
   );
 }
 
-type RunWorkflowFormType = Record<string, unknown> & {
+export type RunWorkflowFormType = Record<string, unknown> & {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   browserSessionId: string | null;
+  reuseBrowserSession: boolean | null;
   browserProfileId: string | null;
+  startFreshBrowser?: boolean;
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
@@ -414,6 +471,42 @@ type RunWorkflowFormType = Record<string, unknown> & {
   runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
+
+function recordRecoveryGuidanceRetryCreated(
+  context: RecoveryGuidanceTelemetryContext | null,
+  retryRunId: unknown,
+): RecoveryGuidanceRetryNavigation | null {
+  if (
+    !isRecoveryGuidanceTelemetryContext(context) ||
+    typeof retryRunId !== "string" ||
+    retryRunId.trim().length === 0
+  ) {
+    return null;
+  }
+  RecoveryGuidanceTelemetry.retryCreated(context, retryRunId);
+  return { ...context, retryRunId };
+}
+
+type RunWorkflowSuccessCallbacks = Readonly<{
+  onStarted: () => void;
+  onNavigate: (
+    workflowRunId: unknown,
+    recoveryGuidanceRetry: RecoveryGuidanceRetryNavigation | null,
+  ) => void;
+}>;
+
+function handleRunWorkflowSuccess(
+  workflowRunId: unknown,
+  recoveryGuidanceRetryContext: RecoveryGuidanceTelemetryContext | null,
+  { onStarted, onNavigate }: RunWorkflowSuccessCallbacks,
+): void {
+  const recoveryGuidanceRetry = recordRecoveryGuidanceRetryCreated(
+    recoveryGuidanceRetryContext,
+    workflowRunId,
+  );
+  onStarted();
+  onNavigate(workflowRunId, recoveryGuidanceRetry);
+}
 
 function RunWorkflowForm({
   workflowParameters,
@@ -423,9 +516,13 @@ function RunWorkflowForm({
   const { workflowPermanentId } = useParams();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
+  const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const apiCredential = useApiCredential();
+  const recoveryGuidanceRetryContext = getRecoveryGuidanceRetryContext(
+    location.state,
+  );
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
   const loginCredentialInputs = useMemo(
     () => getLoginCredentialInputs({ workflow, workflowParameters }),
@@ -466,6 +563,7 @@ function RunWorkflowForm({
   const credentialFallbackRetryEnabled =
     useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
   const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  const browserMemoryEnabled = useFeatureFlag("browser_memory_v1");
   const onboardingLoading = onboarding != null && onboarding.isLoading;
   // Gate on the rollout arm so a 0% rollout / rollback restores the
   // pre-onboarding login-block alert instead of the credential prompt.
@@ -489,7 +587,9 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      reuseBrowserSession: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
+      startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -504,6 +604,16 @@ function RunWorkflowForm({
   });
 
   const formErrors = form.formState.errors;
+  // start_fresh and a picked profile override are contradictory (the backend
+  // rejects the pair), so keep them mutually exclusive in the form.
+  const overrideProfilePicked = isOverrideProfilePicked(
+    form.watch("browserProfileId"),
+    workflow?.browser_profile_key,
+    browserMemoryEnabled,
+  );
+  const explicitBrowserSessionPicked = Boolean(
+    form.watch("browserSessionId")?.trim(),
+  );
   const hasBlockingParameterError = workflowParameters.some(
     (param) =>
       blockingParameterTypes.has(param.workflow_parameter_type) &&
@@ -513,37 +623,51 @@ function RunWorkflowForm({
   const runWorkflowMutation = useMutation({
     mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
-      const body = getRunWorkflowRequestBody(values, workflowParameters);
+      const body = getRunWorkflowRequestBody(
+        values,
+        workflowParameters,
+        workflow?.browser_profile_key,
+        browserMemoryEnabled,
+      );
       return client.post<
         RunWorkflowRequestBody,
         { data: { workflow_run_id: string } }
       >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
-      toast({
-        variant: "success",
-        title: "Agent run started",
-        description: "The agent run has been started successfully",
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["workflowRuns"],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["runs"],
-      });
-      if (studioEnabled) {
-        // A full-run start lands on the bare ?wr= deep link; the learned run
-        // layout (or factory copilot,browser,overview) restores via the fallback.
-        navigate(
-          `/agents/${workflowPermanentId}/studio?wr=${response.data.workflow_run_id}`,
-        );
-      } else {
-        navigate(
-          env.useNewRunsUrl
-            ? `/runs/${response.data.workflow_run_id}`
-            : `/agents/${workflowPermanentId}/${response.data.workflow_run_id}/overview`,
-        );
-      }
+      handleRunWorkflowSuccess(
+        response.data?.workflow_run_id,
+        recoveryGuidanceRetryContext,
+        {
+          onStarted: () => {
+            toast({
+              variant: "success",
+              title: "Agent run started",
+              description: "The agent run has been started successfully",
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["workflowRuns"],
+            });
+            queryClient.invalidateQueries({
+              queryKey: ["runs"],
+            });
+          },
+          onNavigate: (workflowRunId, recoveryGuidanceRetry) => {
+            const runPath = studioEnabled
+              ? `/runs/${workflowRunId}`
+              : env.useNewRunsUrl
+                ? `/runs/${workflowRunId}`
+                : `/agents/${workflowPermanentId}/${workflowRunId}/overview`;
+            if (recoveryGuidanceRetry) {
+              navigate(runPath, {
+                state: { recoveryGuidanceRetry },
+              });
+            } else {
+              navigate(runPath);
+            }
+          },
+        },
+      );
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -609,7 +733,9 @@ function RunWorkflowForm({
       webhookCallbackUrl: initialSettings.webhookCallbackUrl,
       proxyLocation: initialSettings.proxyLocation ?? ProxyLocation.Residential,
       browserSessionId: null,
+      reuseBrowserSession: null,
       browserProfileId: initialSettings.browserProfileId ?? null,
+      startFreshBrowser: false,
       cdpAddress: initialSettings.cdpAddress,
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
@@ -647,7 +773,9 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      reuseBrowserSession,
       browserProfileId,
+      startFreshBrowser,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpConnectHeaders,
@@ -666,7 +794,9 @@ function RunWorkflowForm({
       webhookCallbackUrl,
       proxyLocation,
       browserSessionId,
+      reuseBrowserSession,
       browserProfileId,
+      startFreshBrowser,
       maxScreenshotScrolls,
       extraHttpHeaders,
       cdpConnectHeaders,
@@ -681,7 +811,9 @@ function RunWorkflowForm({
       "webhookCallbackUrl",
       "proxyLocation",
       "browserSessionId",
+      "reuseBrowserSession",
       "browserProfileId",
+      "startFreshBrowser",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
       "cdpConnectHeaders",
@@ -736,6 +868,8 @@ function RunWorkflowForm({
                 const body = getRunWorkflowRequestBody(
                   values,
                   workflowParameters,
+                  workflow?.browser_profile_key,
+                  browserMemoryEnabled,
                 );
                 const transformedBody = transformToWorkflowRunRequest(
                   body,
@@ -849,6 +983,9 @@ function RunWorkflowForm({
                           value === undefined ||
                           value === ""
                         ) {
+                          if (isAtWillCredentialParameter(parameter)) {
+                            return;
+                          }
                           return "Warning: you left this field empty";
                         }
                       },
@@ -1020,6 +1157,12 @@ function RunWorkflowForm({
                         ) {
                           return "This field is required";
                         }
+                        return;
+                      }
+
+                      // An at-will credential (credential_id, no default) may be left
+                      // empty: the run proceeds without a credential.
+                      if (isAtWillCredentialParameter(parameter)) {
                         return;
                       }
 
@@ -1356,6 +1499,67 @@ function RunWorkflowForm({
                   />
                   <FormField
                     control={form.control}
+                    name="reuseBrowserSession"
+                    render={({ field }) => (
+                      <FormItem>
+                        <div className="flex gap-16">
+                          <FormLabel>
+                            <div className="w-72">
+                              <div className="flex items-center gap-2 text-lg">
+                                Reuse browser session
+                              </div>
+                              <h2 className="text-sm text-muted-foreground">
+                                Override whether this run continues in the
+                                workflow&apos;s live browser.
+                              </h2>
+                            </div>
+                          </FormLabel>
+                          <div className="w-full space-y-2">
+                            <FormControl>
+                              <Select
+                                value={
+                                  field.value == null
+                                    ? "workflow-default"
+                                    : field.value
+                                      ? "on"
+                                      : "off"
+                                }
+                                onValueChange={(value) =>
+                                  field.onChange(
+                                    value === "workflow-default"
+                                      ? null
+                                      : value === "on",
+                                  )
+                                }
+                                disabled={explicitBrowserSessionPicked}
+                              >
+                                <SelectTrigger
+                                  className="w-64"
+                                  aria-label="Reuse browser session override"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="workflow-default">
+                                    Workflow default (currently{" "}
+                                    {initialSettings.reuseBrowserSession
+                                      ? "on"
+                                      : "off"}
+                                    )
+                                  </SelectItem>
+                                  <SelectItem value="on">On</SelectItem>
+                                  <SelectItem value="off">Off</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </FormControl>
+                            <FormMessage />
+                          </div>
+                        </div>
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
                     name="browserProfileId"
                     render={({ field }) => {
                       return (
@@ -1374,10 +1578,42 @@ function RunWorkflowForm({
                             </FormLabel>
                             <div className="w-full space-y-2">
                               <FormControl>
-                                <BrowserProfileSelector
-                                  value={field.value}
-                                  onChange={field.onChange}
-                                />
+                                {browserMemoryEnabled ? (
+                                  workflow?.browser_profile_key ? (
+                                    // F8: a per-input agent has no single profile to
+                                    // override — show the state read-only, not a picker.
+                                    <div className="rounded-md border border-input px-3 py-2 text-sm text-muted-foreground">
+                                      This agent keeps one profile per input
+                                      value — a one-run override doesn’t apply
+                                      here.
+                                    </div>
+                                  ) : (
+                                    <BrowserProfileControl
+                                      mode="dropdown"
+                                      profileId={field.value}
+                                      onProfileChange={(id) => {
+                                        field.onChange(id);
+                                        // Picking an override and starting fresh are
+                                        // mutually exclusive; a real pick clears fresh.
+                                        if (id) {
+                                          form.setValue(
+                                            "startFreshBrowser",
+                                            false,
+                                          );
+                                        }
+                                      }}
+                                      codeValue=""
+                                      onCodeChange={() => {}}
+                                      codeMode="none"
+                                      restingCaption="Resolved from agent settings"
+                                    />
+                                  )
+                                ) : (
+                                  <BrowserProfileSelector
+                                    value={field.value}
+                                    onChange={field.onChange}
+                                  />
+                                )}
                               </FormControl>
                               <FormMessage />
                             </div>
@@ -1386,6 +1622,46 @@ function RunWorkflowForm({
                       );
                     }}
                   />
+                  {browserMemoryEnabled && (
+                    <FormField
+                      control={form.control}
+                      name="startFreshBrowser"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormControl>
+                            {overrideProfilePicked ? (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <label className="flex w-fit cursor-not-allowed items-center gap-2 text-sm opacity-50">
+                                    <Checkbox checked={false} disabled />
+                                    Start fresh for this run
+                                  </label>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  This run starts from the picked profile —
+                                  clear it to start fresh.
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
+                                <Checkbox
+                                  checked={Boolean(field.value)}
+                                  onCheckedChange={(v) =>
+                                    field.onChange(v === true)
+                                  }
+                                />
+                                Start fresh for this run
+                              </label>
+                            )}
+                          </FormControl>
+                          <p className="ml-6 text-xs text-muted-foreground">
+                            Ignores saved profiles this run — nothing is read or
+                            written.
+                          </p>
+                        </FormItem>
+                      )}
+                    />
+                  )}
                   <FormField
                     key="cdpAddress"
                     control={form.control}
@@ -1546,4 +1822,10 @@ function RunWorkflowForm({
   );
 }
 
-export { RunWorkflowForm };
+/* eslint-disable react-refresh/only-export-components */
+export {
+  handleRunWorkflowSuccess,
+  recordRecoveryGuidanceRetryCreated,
+  RunWorkflowForm,
+};
+/* eslint-enable react-refresh/only-export-components */

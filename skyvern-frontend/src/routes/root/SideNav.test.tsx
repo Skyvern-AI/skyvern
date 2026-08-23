@@ -191,6 +191,23 @@ describe("SideNav", () => {
     expect(screen.getByRole("button", { name: /Integrations/i })).toBeTruthy();
   });
 
+  it("includes the Magic Links credentials child", () => {
+    window.localStorage.setItem(
+      "skyvern-sidebar-open-groups",
+      JSON.stringify({ "/credentials": true }),
+    );
+
+    render(
+      <MemoryRouter>
+        <SideNav />
+      </MemoryRouter>,
+    );
+
+    expect(
+      screen.getByRole("link", { name: "Magic Links" }).getAttribute("href"),
+    ).toBe("/credentials?tab=magicLinks");
+  });
+
   it("preserves a stored recipes state on short screens", () => {
     window.localStorage.setItem(
       "skyvern-sidebar-open-groups",

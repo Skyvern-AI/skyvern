@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -17,7 +18,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { type ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 
 import { Status } from "@/api/types";
 import type {
@@ -144,19 +145,49 @@ function renderTimeline(
   activeItem: WorkflowRunOverviewActiveElement,
   options: {
     enableSearch?: boolean;
+    elapsed?: string;
+    elapsedTitle?: string;
+    hideBorder?: boolean;
+    hideHeader?: boolean;
     onBlockItemSelected?: (block: WorkflowRunBlock) => void;
   } = {},
 ) {
   return render(
     <WorkflowRunTimeline
       activeItem={activeItem}
+      hideBorder={options.hideBorder}
+      hideHeader={options.hideHeader}
       enableSearch={options.enableSearch}
+      elapsed={options.elapsed}
+      elapsedTitle={options.elapsedTitle}
       onLiveStreamSelected={noop}
       onActionItemSelected={noop}
       onBlockItemSelected={options.onBlockItemSelected ?? noop}
       onThoughtItemSelected={noop}
       onIterationSelected={noop}
     />,
+  );
+}
+
+// The production loop in both consumers: a selection callback feeds the next
+// activeItem, and the newly active row reveals + scrolls itself.
+function StatefulTimeline({
+  enableSearch = false,
+}: {
+  enableSearch?: boolean;
+}) {
+  const [activeItem, setActiveItem] =
+    useState<WorkflowRunOverviewActiveElement>(null);
+  return (
+    <WorkflowRunTimeline
+      activeItem={activeItem}
+      enableSearch={enableSearch}
+      onLiveStreamSelected={() => setActiveItem("stream")}
+      onActionItemSelected={(item) => setActiveItem(item.action)}
+      onBlockItemSelected={(block) => setActiveItem(block)}
+      onThoughtItemSelected={(thought) => setActiveItem(thought)}
+      onIterationSelected={noop}
+    />
   );
 }
 
@@ -172,6 +203,10 @@ function expectDomOrder(labels: Array<string>) {
 }
 
 afterEach(() => {
+  // Restore before the setup file's afterEach awaits a real macrotask; a
+  // failed assertion mid-test would otherwise leave fake timers installed
+  // and hang that hook.
+  vi.useRealTimers();
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
@@ -454,6 +489,140 @@ describe("WorkflowRunTimeline", () => {
   });
 });
 
+describe("timeline header elapsed", () => {
+  function seed(totalSteps = 0, actions: WorkflowRunBlock["actions"] = null) {
+    mocks.workflowRun = {
+      status: Status.Completed,
+      total_steps: totalSteps,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({ workflow_run_block_id: "wrb_a", label: "A", actions }),
+      ),
+    ];
+  }
+
+  it("shows the elapsed duration with the timestamp breakdown on its tooltip", () => {
+    seed();
+
+    renderTimeline(null, {
+      elapsed: "18m 55s",
+      elapsedTitle: "Created Jun 30\nStarted Jul 1",
+    });
+
+    const el = screen.getByTitle(/Created/);
+    expect(el.textContent).toContain("18m 55s");
+  });
+
+  it("renders no duration when elapsed is omitted (legacy parity)", () => {
+    seed();
+
+    renderTimeline(null);
+
+    expect(screen.queryByText(/\d+m \d+s/)).toBeNull();
+  });
+
+  // The header reports executed timeline blocks, not task steps.
+  it("omits the steps chip when the run reports no steps", () => {
+    seed();
+
+    renderTimeline(null);
+
+    const { container } = renderTimeline(null);
+
+    expect(container.textContent).not.toContain("steps");
+  });
+
+  it("shows the executed block count instead of a steps chip", () => {
+    seed(3, [{ action_id: "act_1" }] as unknown as WorkflowRunBlock["actions"]);
+
+    const { container } = renderTimeline(null);
+
+    expect(container.textContent).toContain("1 block");
+    expect(container.textContent).toContain("1 action");
+    expect(container.textContent).not.toContain("steps");
+    // No configured blocks means no completed/configured ratio to explain, so
+    // the metric stays plain text rather than an empty focus stop.
+    const blockMetric = Array.from(container.querySelectorAll("span")).find(
+      (el) => el.textContent === "1 block",
+    );
+    expect(blockMetric?.getAttribute("tabindex")).toBeNull();
+  });
+});
+
+// The studio pane already paints this exact surface, so the card would draw a
+// box inside its own fill; the legacy run view sits in a sidebar column on the
+// page background, where the border is the only thing separating it. The two
+// callers must stay divergent — collapsing them regresses one page or the other.
+describe("timeline surface", () => {
+  const CARD_CLASSES = ["border", "border-border", "bg-slate-elevation1"];
+
+  function seed() {
+    mocks.workflowRun = {
+      status: Status.Completed,
+      total_steps: 0,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({ workflow_run_block_id: "wrb_a", label: "A" }),
+      ),
+    ];
+  }
+
+  function timelineRoot(container: HTMLElement) {
+    return container.firstElementChild as HTMLElement;
+  }
+
+  it("drops the card border and fill when hideBorder is set (studio)", () => {
+    seed();
+    const { container } = renderTimeline(null, { hideBorder: true });
+    const root = timelineRoot(container);
+    for (const cls of CARD_CLASSES) {
+      expect(root.classList.contains(cls)).toBe(false);
+    }
+  });
+
+  it("renders only the list when hideHeader is set — the studio strip owns title, counts and search", () => {
+    seed();
+    const { container } = renderTimeline(null, {
+      hideHeader: true,
+      enableSearch: true,
+      elapsed: "1m 2s",
+    });
+    const scope = within(container);
+    expect(scope.queryByText("Timeline")).toBeNull();
+    expect(
+      scope.queryByText(
+        (_, node) =>
+          node?.tagName === "SPAN" &&
+          /^\d+ blocks?$/.test(node.textContent ?? ""),
+      ),
+    ).toBeNull();
+    expect(scope.queryByText(/credits$/)).toBeNull();
+    expect(scope.queryByText("1m 2s")).toBeNull();
+    expect(scope.queryByRole("button", { name: "Search blocks" })).toBeNull();
+  });
+
+  it("keeps the card border and fill when hideBorder is omitted (legacy parity)", () => {
+    seed();
+    const { container } = renderTimeline(null);
+    const root = timelineRoot(container);
+    for (const cls of CARD_CLASSES) {
+      expect(root.classList.contains(cls)).toBe(true);
+    }
+  });
+});
+
 describe("timeline block search", () => {
   function seed(blocks: Array<WorkflowRunBlock>) {
     mocks.workflowRun = {
@@ -522,8 +691,8 @@ describe("timeline block search", () => {
     expect(screen.getByText("No blocks found.")).toBeTruthy();
   });
 
-  it("selecting a result selects the block and scrolls it into view", () => {
-    const onBlockItemSelected = vi.fn();
+  it("selecting a result makes the block active, which scrolls its row into view", () => {
+    vi.useFakeTimers();
     const login = buildBlock({
       workflow_run_block_id: "wrb_a",
       label: "Login",
@@ -536,35 +705,55 @@ describe("timeline block search", () => {
     });
     seed([login, extract]);
 
-    renderTimeline(null, { enableSearch: true, onBlockItemSelected });
+    render(<StatefulTimeline enableSearch />);
     fireEvent.click(screen.getByRole("button", { name: "Search blocks" }));
     fireEvent.change(screen.getByPlaceholderText("Search blocks…"), {
       target: { value: "extract" },
     });
     fireEvent.click(screen.getByRole("option"));
 
-    expect(onBlockItemSelected).toHaveBeenCalledWith(extract);
-    expect(scrollIntoViewMock).toHaveBeenCalledWith({
-      behavior: "smooth",
-      block: "start",
-    });
     // The popover closes after a jump.
     expect(screen.queryByPlaceholderText("Search blocks…")).toBeNull();
+    // cmdk scrolls its own options too ({block:"nearest"}, no behavior); only
+    // the row scroll passes a behavior, so filter rather than count raw calls.
+    const rowScrollIndexes = () =>
+      scrollIntoViewMock.mock.calls.flatMap((call, index) =>
+        (call[0] as ScrollIntoViewOptions | undefined)?.behavior !== undefined
+          ? [index]
+          : [],
+      );
+    // The scroll waits out the reveal animation before firing.
+    expect(rowScrollIndexes()).toHaveLength(0);
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "nearest",
+    });
+    const scrolled = scrollIntoViewMock.mock.contexts[
+      rowScrollIndexes()[0]!
+    ] as HTMLElement;
+    expect(scrolled.textContent).toContain("Extract rows");
   });
 
   it("honors prefers-reduced-motion for the jump", () => {
+    vi.useFakeTimers();
     window.matchMedia = vi.fn().mockReturnValue({
       matches: true,
     }) as unknown as typeof window.matchMedia;
     seed([buildBlock({ workflow_run_block_id: "wrb_a", label: "Login" })]);
 
-    renderTimeline(null, { enableSearch: true });
+    render(<StatefulTimeline enableSearch />);
     fireEvent.click(screen.getByRole("button", { name: "Search blocks" }));
     fireEvent.click(screen.getByRole("option"));
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
 
     expect(scrollIntoViewMock).toHaveBeenCalledWith({
       behavior: "auto",
-      block: "start",
+      block: "nearest",
     });
   });
 
@@ -651,5 +840,101 @@ describe("timeline block search", () => {
     expect(options.some((o) => o.textContent?.includes("inner_step"))).toBe(
       false,
     );
+  });
+});
+
+// The selection can land on a nested row from outside the timeline — the editor
+// canvas pin, a deep link — so the reveal + scroll must not depend on the row
+// being clickable (a collapsed ancestor unmounts it entirely).
+describe("timeline selection reveal", () => {
+  const child1 = buildBlock({
+    workflow_run_block_id: "wrb_child_1",
+    block_type: "navigation",
+    label: "census_hold",
+    parent_workflow_run_block_id: "wrb_container",
+    created_at: "2026-01-01T00:00:10Z",
+  });
+  const child2 = buildBlock({
+    workflow_run_block_id: "wrb_child_2",
+    block_type: "navigation",
+    label: "submit_form",
+    parent_workflow_run_block_id: "wrb_container",
+    created_at: "2026-01-01T00:00:20Z",
+  });
+
+  function seed() {
+    mocks.workflowRun = {
+      status: Status.Completed,
+      total_steps: 0,
+      credits_used: 0,
+      cached_credits_used: 0,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_container",
+          block_type: "task_v2",
+          label: "container",
+          created_at: "2026-01-01T00:00:00Z",
+        }),
+        [buildBlockItem(child1), buildBlockItem(child2)],
+      ),
+    ];
+  }
+
+  it("reveals and scrolls a nested row when the selection lands on it from outside", () => {
+    vi.useFakeTimers();
+    seed();
+
+    const { rerender } = renderTimeline(null);
+    // The container starts collapsed; the nested row is not mounted at all.
+    expect(screen.queryByText("census_hold")).toBeNull();
+
+    rerender(
+      <WorkflowRunTimeline
+        activeItem={child1}
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />,
+    );
+
+    expect(screen.getByText("census_hold")).toBeTruthy();
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    const scrolled = scrollIntoViewMock.mock.contexts[0] as HTMLElement;
+    expect(scrolled.textContent).toContain("census_hold");
+  });
+
+  it("a new selection into a container reopens it after a manual collapse", () => {
+    vi.useFakeTimers();
+    seed();
+
+    const view = renderTimeline(child1);
+    expect(screen.getByText("census_hold")).toBeTruthy();
+
+    // The user hides the container; their choice holds for the CURRENT selection.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByText("census_hold")).toBeNull();
+
+    // A different nested selection outranks the old collapse.
+    view.rerender(
+      <WorkflowRunTimeline
+        activeItem={child2}
+        onLiveStreamSelected={noop}
+        onActionItemSelected={noop}
+        onBlockItemSelected={noop}
+        onThoughtItemSelected={noop}
+        onIterationSelected={noop}
+      />,
+    );
+
+    expect(screen.getByText("submit_form")).toBeTruthy();
   });
 });

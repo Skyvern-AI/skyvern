@@ -4,7 +4,7 @@ values are not carriers, and a category without one is untrusted."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Any
 
@@ -20,6 +20,17 @@ class ChallengeEvidenceSource(StrEnum):
     KEYWORD_ONLY = "keyword_only"
 
 
+class ChallengeKind(StrEnum):
+    """Closed set the vision classifier picks from; ``challenge_state.kind`` stays free-form."""
+
+    CAPTCHA = "captcha"
+    HUMAN_VERIFICATION = "human_verification"
+    DEVICE_APPROVAL = "device_approval"
+    ACCESS_DENIED = "access_denied"
+    OTHER = "other"
+
+
+CHALLENGE_KIND_KEY = "challenge_kind"
 CHALLENGE_EVIDENCE_SOURCE_KEY = "evidence_source"
 CARRIER_CHALLENGE_EVIDENCE_SOURCES: frozenset[ChallengeEvidenceSource] = frozenset(
     {
@@ -103,11 +114,13 @@ ANTI_BOT_ARTIFACT_MARKER_VALUES: frozenset[str] = frozenset(
 _MAX_ARTIFACT_FLAG_DEPTH = 5
 
 
-def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+def interactive_challenge_controls(
+    challenge_controls: Sequence[object] | None,
+) -> list[Mapping[str, Any]]:
     return [
         control
         for control in challenge_controls or []
-        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
+        if isinstance(control, Mapping) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
     ]
 
 
@@ -124,6 +137,25 @@ def challenge_evidence_source_from_entry(entry: Mapping[str, Any]) -> ChallengeE
         return ChallengeEvidenceSource(raw.strip().lower())
     except ValueError:
         return None
+
+
+def normalized_challenge_kind(value: object) -> ChallengeKind | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return ChallengeKind(value.strip().lower())
+    except ValueError:
+        return None
+
+
+def typed_challenge_kind(evidence: Mapping[str, Any] | None) -> ChallengeKind | None:
+    """The closed-enum kind stamped on ``challenge_state``, or ``None`` when unclassified."""
+    if not isinstance(evidence, Mapping):
+        return None
+    challenge_state = evidence.get("challenge_state")
+    if not isinstance(challenge_state, Mapping):
+        return None
+    return normalized_challenge_kind(challenge_state.get(CHALLENGE_KIND_KEY))
 
 
 def is_carrier_backed_category_entry(entry: object) -> bool:
@@ -183,13 +215,46 @@ def composition_challenge_carrier(evidence: Mapping[str, Any] | None) -> Challen
     if stamped in CARRIER_CHALLENGE_EVIDENCE_SOURCES:
         return stamped
     # gates_submit_controls is only ever derived from rendered controls or a
-    # vision confirmation, so it carries the same weight as either.
+    # structurally corroborated vision confirmation, so it carries the same weight as either.
     if (
         challenge_state.get("requires_human_verification") is True
         or challenge_state.get("gates_submit_controls") is True
     ):
         return ChallengeEvidenceSource.CHALLENGE_STATE
     return None
+
+
+def _challenge_signalled(evidence: Mapping[str, Any] | None) -> bool:
+    if not isinstance(evidence, Mapping):
+        return False
+    challenge_state = evidence.get("challenge_state")
+    return isinstance(challenge_state, Mapping) and challenge_state.get("detected") is True
+
+
+def challenge_signal_regressed(
+    previous: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+) -> bool:
+    """True when ``candidate`` drops a challenge signal ``previous`` already carried.
+
+    Looking again for a carrier must never erase the signal that justified looking:
+    a signalled packet is the only trigger for the visual fallback, so replacing one
+    with an unsignalled packet removes the last detection channel on this path."""
+    return _challenge_signalled(previous) and not _challenge_signalled(candidate)
+
+
+def challenge_evidence_unsettled(evidence: Mapping[str, Any] | None) -> bool:
+    """True when a challenge was signalled but no carrier has rendered yet, so one
+    more capture may witness it. A widget that renders asynchronously is absent from
+    a capture taken at first paint, and a page holding a form is otherwise treated as
+    fully captured. This decides only whether to look again — never whether a
+    challenge exists, which stays with ``composition_challenge_carrier``."""
+    if not isinstance(evidence, Mapping):
+        return False
+    challenge_state = evidence.get("challenge_state")
+    if not isinstance(challenge_state, Mapping) or challenge_state.get("detected") is not True:
+        return False
+    return composition_challenge_carrier(evidence) is None
 
 
 def vision_challenge_carrier(visual_summary: Mapping[str, Any] | None) -> bool:

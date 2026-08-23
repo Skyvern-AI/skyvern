@@ -43,7 +43,9 @@ export const STATUS_PILL_TONE: Record<RunStatusKind, string> = {
   neutral: "bg-slate-500/15 text-tertiary-foreground",
 };
 
-export function getRunDurationLabel(run: DebugSessionRun): string | null {
+export function getRunDurationLabel(
+  run: Pick<DebugSessionRun, "created_at" | "started_at" | "finished_at">,
+): string | null {
   const begin = run.started_at
     ? toDate(run.started_at, null)
     : run.created_at
@@ -57,7 +59,7 @@ export function getRunDurationLabel(run: DebugSessionRun): string | null {
 }
 
 export function getRunAgoLabel(
-  run: DebugSessionRun,
+  run: Pick<DebugSessionRun, "created_at">,
   now: number,
 ): string | null {
   const dt = run.created_at ? toDate(run.created_at, null) : null;
@@ -65,7 +67,9 @@ export function getRunAgoLabel(
   return formatMs(now - dt.getTime()).ago;
 }
 
-export function getRunAbsoluteTime(run: DebugSessionRun): string | null {
+export function getRunAbsoluteTime(
+  run: Pick<DebugSessionRun, "created_at">,
+): string | null {
   const dt = run.created_at ? toDate(run.created_at, null) : null;
   return dt ? dt.toLocaleString() : null;
 }

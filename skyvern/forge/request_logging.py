@@ -4,22 +4,32 @@ import json
 import re
 import time
 import typing
+from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import partial
 
 import structlog
 from starlette.concurrency import iterate_in_threadpool
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from skyvern.config import settings
+from skyvern.forge.log_redaction import (
+    REDACTED,
+    SENSITIVE_HEADERS,
+    redact_sensitive_fields,
+    strip_artifact_url_query,
+)
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from typing import Awaitable, Callable
 
     from starlette.requests import Request
+    from starlette.types import Message, Receive, Scope, Send
 
 LOG = structlog.get_logger()
 
-_SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key"}
 _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/credentials",
     "POST /v1/credentials",
@@ -33,50 +43,66 @@ _SENSITIVE_ENDPOINTS = {
     "POST /v1/google/oauth/callback",
     "POST /api/v1/google/oauth/callback",
 }
+_SENSITIVE_ENDPOINT_PATTERNS = (re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+# 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;
+# there is nothing to act on, so they stay out of the warn tier.
+_ROUTINE_CLIENT_ERROR_STATUSES = frozenset({404, 405})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
-_REDACTED = "****"
 _LOGGABLE_CONTENT_TYPES = {"text/", "application/json"}
 _STREAMING_CONTENT_TYPE = "text/event-stream"
-# Matches a signed artifact-content URL (absolute or path-relative) anywhere in a
-# string and captures everything up to — but excluding — its query, so re.sub can
-# drop the capability params (expiry/kid/sig) while leaving surrounding text and
-# non-artifact URLs untouched. Query runs to the next whitespace/quote/angle bracket.
-_ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(
-    r"((?:[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s\"'<>]+)?/v1/artifacts/[^/\s\"'<>]+/content/?)\?[^\s\"'<>]*"
-)
 _ACTION_LOG_ENDPOINT_RE = re.compile(r"^/v1/browser_sessions/[^/]+/action_logs/?$")
+_raw_request_exception_logger: ContextVar[typing.Callable[[int], None] | None] = ContextVar(
+    "raw_request_exception_logger", default=None
+)
+_raw_request_stream_success_logger: ContextVar[typing.Callable[[int, str], None] | None] = ContextVar(
+    "raw_request_stream_success_logger", default=None
+)
 
-# Exact field names that are always redacted.  Use a set for O(1) lookup
-# instead of regex substring matching to avoid false positives like
-# credential_id, author, page_token, etc.
-_SENSITIVE_FIELDS: set[str] = {
-    "password",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
-    "api-key",
-    "credential",
-    "access_key",
-    "private_key",
-    "auth",
-    "authorization",
-    "secret_key",
-    "totp",
-    "otp",
-    "one_time_code",
-    "one_time_password",
-    "mfa_code",
-}
+
+@dataclass
+class _RequestIdentity:
+    organization_id: str | None = None
+    organization_name: str | None = None
+
+
+_request_identity: ContextVar[_RequestIdentity | None] = ContextVar("raw_request_identity", default=None)
+
+
+def set_request_organization(organization_id: str | None, organization_name: str | None = None) -> None:
+    """Attribute the in-flight ``api.raw_request`` record to the authenticated organization.
+
+    Auth resolves in a child task of this middleware, and a ContextVar rebound there never
+    reaches the middleware that emits the record. Mutating the holder bound before
+    ``call_next`` does, because the child inherits the same object.
+    """
+    identity = _request_identity.get()
+    if identity is None:
+        return
+    if organization_id:
+        identity.organization_id = organization_id
+    if organization_name:
+        identity.organization_name = organization_name
+
+
+def _organization_log_fields() -> dict[str, str]:
+    identity = _request_identity.get()
+    if identity is None:
+        return {}
+    fields: dict[str, str] = {}
+    if identity.organization_id:
+        fields["organization_id"] = identity.organization_id
+    if identity.organization_name:
+        fields["organization_name"] = identity.organization_name
+    return fields
 
 
 def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in headers.items():
-        if key.lower() in _SENSITIVE_HEADERS:
+        if key.lower() in SENSITIVE_HEADERS:
             continue
         sanitized[key] = value
     return sanitized
@@ -92,14 +118,17 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
 
 
 def _is_sensitive_endpoint(request: Request) -> bool:
-    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS or (
-        request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None
+    endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
+    return (
+        endpoint in _SENSITIVE_ENDPOINTS
+        or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
+        or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
     if _is_sensitive_endpoint(request):
-        return _REDACTED
+        return REDACTED
     if not body:
         return ""
     if content_type and not (content_type.startswith("text/") or content_type.startswith("application/json")):
@@ -114,42 +143,11 @@ def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> s
     return text
 
 
-def _is_sensitive_key(key: str) -> bool:
-    return key.lower() in _SENSITIVE_FIELDS
-
-
-def _strip_artifact_url_query(value: str) -> str:
-    return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
-
-
-def redact_sensitive_fields(obj: typing.Any, _depth: int = 0) -> typing.Any:
-    """Redact sensitive fields and strip capability queries from artifact URLs.
-
-    Field names use exact-match (case-insensitive) rather than substring/regex
-    to avoid false positives on fields like ``credential_id``, ``author``, or
-    ``page_token`` which contain sensitive substrings but are not secrets.
-    """
-    if isinstance(obj, str):
-        return _strip_artifact_url_query(obj)
-    if _depth > 20:
-        # Stop recursing but still redact sensitive keys at this level
-        if isinstance(obj, dict):
-            return {k: _REDACTED if _is_sensitive_key(k) else v for k, v in obj.items()}
-        return obj
-    if isinstance(obj, dict):
-        return {
-            k: _REDACTED if _is_sensitive_key(k) else redact_sensitive_fields(v, _depth + 1) for k, v in obj.items()
-        }
-    if isinstance(obj, list):
-        return [redact_sensitive_fields(item, _depth + 1) for item in obj]
-    return obj
-
-
 def _redact_loggable_body(text: str) -> str:
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return _strip_artifact_url_query(text)
+        return strip_artifact_url_query(text)
     redacted = redact_sensitive_fields(parsed)
     return json.dumps(redacted) if redacted != parsed else text
 
@@ -162,7 +160,7 @@ def _is_loggable_content_type(content_type: str | None) -> bool:
 
 def _sanitize_response_body(request: Request, body_str: str | None, content_type: str | None) -> str:
     if _is_sensitive_endpoint(request):
-        return _REDACTED
+        return REDACTED
     if body_str is None:
         return _BINARY_PLACEHOLDER
     if not body_str:
@@ -196,11 +194,85 @@ async def _get_response_body_str(response: Response) -> str | None:
         return None
 
 
+def _log_unhandled_request(
+    status_code: int,
+    *,
+    method: str,
+    path: str,
+    client_ip: str | None,
+    body: str,
+    headers: dict[str, str],
+    start_time: float,
+) -> None:
+    """Emit the raw-request row after the server error handler selects a response."""
+    try:
+        LOG.error(
+            "api.raw_request",
+            method=method,
+            path=path,
+            status_code=status_code,
+            client_ip=client_ip,
+            body=body,
+            headers=headers,
+            exc_info=True,
+            duration_seconds=time.monotonic() - start_time,
+            **_organization_log_fields(),
+        )
+    except Exception:
+        pass
+
+
+def _log_request(
+    status_code: int,
+    response_body: str,
+    *,
+    method: str,
+    path: str,
+    client_ip: str | None,
+    body: str,
+    headers: dict[str, str],
+    start_time: float,
+) -> None:
+    if status_code >= 500:
+        log_method = LOG.error
+    elif status_code >= 400 and status_code not in _ROUTINE_CLIENT_ERROR_STATUSES:
+        log_method = LOG.warning
+    else:
+        log_method = LOG.info
+
+    try:
+        log_method(
+            "api.raw_request",
+            method=method,
+            path=path,
+            status_code=status_code,
+            client_ip=client_ip,
+            body=body,
+            headers=headers,
+            response_body=response_body,
+            # backwards-compat: keep error_body for existing Datadog queries
+            error_body=response_body if status_code >= 400 else None,
+            duration_seconds=time.monotonic() - start_time,
+            **_organization_log_fields(),
+        )
+    except Exception:
+        pass
+
+
+def log_raw_request_exception(status_code: int) -> None:
+    """Log an unhandled request once its outer error handler has chosen the status."""
+    logger = _raw_request_exception_logger.get()
+    _raw_request_exception_logger.set(None)
+    if logger is not None:
+        logger(status_code)
+
+
 async def log_raw_request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     if not settings.LOG_RAW_API_REQUESTS:
         return await call_next(request)
 
     start_time = time.monotonic()
+    _request_identity.set(_RequestIdentity())
     try:
         body_bytes = await request.body()
     except ClientDisconnect:
@@ -222,60 +294,94 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
     sanitized_headers = _sanitize_headers(request_headers)
     client_ip = _client_ip_from_headers(request_headers)
     body_text = _sanitize_body(request, body_bytes, request.headers.get("content-type"))
+    request_logger = partial(
+        _log_unhandled_request,
+        method=http_method,
+        path=url_path,
+        client_ip=client_ip,
+        body=body_text,
+        headers=sanitized_headers,
+        start_time=start_time,
+    )
+    _raw_request_exception_logger.set(request_logger)
 
-    try:
-        response = await call_next(request)
+    response = await call_next(request)
+    resp_content_type = response.headers.get("content-type", "")
+    is_streaming_response = _STREAMING_CONTENT_TYPE in resp_content_type
 
-        # Skip successful reads before buffering the response body: they are
-        # the bulk of request volume (health checks, status polling) and the
-        # 4xx/5xx and mutating paths below retain all audit/debugging value.
-        # Sensitive endpoints (credential/TOTP reads) always keep their
-        # redacted audit line.
-        if (
-            response.status_code < 400
-            and http_method in _READ_METHODS
-            and not settings.LOG_RAW_API_REQUESTS_SUCCESSFUL_READS
-            and not _is_sensitive_endpoint(request)
-        ):
-            return response
-
-        if response.status_code >= 500:
-            log_method = LOG.error
-        elif response.status_code >= 400:
-            log_method = LOG.warning
-        else:
-            log_method = LOG.info
-
-        resp_content_type = response.headers.get("content-type", "")
-        if _STREAMING_CONTENT_TYPE in resp_content_type:
-            response_body = "<streaming>"
-        else:
-            raw_response_body = await _get_response_body_str(response)
-            response_body = _sanitize_response_body(request, raw_response_body, resp_content_type)
-
-        log_method(
-            "api.raw_request",
-            method=http_method,
-            path=url_path,
-            status_code=response.status_code,
-            client_ip=client_ip,
-            body=body_text,
-            headers=sanitized_headers,
-            response_body=response_body,
-            # backwards-compat: keep error_body for existing Datadog queries
-            error_body=response_body if response.status_code >= 400 else None,
-            duration_seconds=time.monotonic() - start_time,
+    # Skip successful reads before buffering the response body; 4xx/5xx and
+    # mutating paths keep logging, and sensitive endpoints always keep
+    # their redacted audit line.
+    log_success = not (
+        response.status_code < 400
+        and http_method in _READ_METHODS
+        and not settings.LOG_RAW_API_REQUESTS_SUCCESSFUL_READS
+        and not _is_sensitive_endpoint(request)
+    )
+    if is_streaming_response:
+        _raw_request_stream_success_logger.set(
+            partial(
+                _log_request,
+                method=http_method,
+                path=url_path,
+                client_ip=client_ip,
+                body=body_text,
+                headers=sanitized_headers,
+                start_time=start_time,
+            )
+            if log_success
+            else None
         )
         return response
-    except Exception:
-        LOG.error(
-            "api.raw_request",
-            method=http_method,
-            path=url_path,
-            client_ip=client_ip,
-            body=body_text,
-            headers=sanitized_headers,
-            exc_info=True,
-            duration_seconds=time.monotonic() - start_time,
-        )
-        raise
+
+    if not log_success:
+        _raw_request_exception_logger.set(None)
+        return response
+
+    raw_response_body = await _get_response_body_str(response)
+    _log_request(
+        response.status_code,
+        _sanitize_response_body(request, raw_response_body, resp_content_type),
+        method=http_method,
+        path=url_path,
+        client_ip=client_ip,
+        body=body_text,
+        headers=sanitized_headers,
+        start_time=start_time,
+    )
+    _raw_request_exception_logger.set(None)
+    return response
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        return await log_raw_request_middleware(request, call_next)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await super().__call__(scope, receive, send)
+            return
+
+        # BaseHTTPMiddleware raises a started stream's error only after dispatch returns.
+        # Keep the client-visible status here so that error is still countable.
+        response_status: int | None = None
+
+        async def send_with_response_status(message: Message) -> None:
+            nonlocal response_status
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+            await send(message)
+
+        try:
+            await super().__call__(scope, receive, send_with_response_status)
+        except Exception:
+            if response_status is not None:
+                log_raw_request_exception(response_status)
+            raise
+        else:
+            stream_success_logger = _raw_request_stream_success_logger.get()
+            if response_status is not None and stream_success_logger is not None:
+                stream_success_logger(response_status, "<streaming>")
+            _raw_request_exception_logger.set(None)
+        finally:
+            _raw_request_stream_success_logger.set(None)

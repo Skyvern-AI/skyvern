@@ -6,6 +6,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, ValidationError
 
+from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.schemas.organizations import OrganizationUpdate
 
 from ._common import ErrorCode, Timer, make_error, make_result, raw_http_get, raw_http_put
@@ -92,7 +93,7 @@ async def skyvern_org_update(
 
     try:
         validated = OrganizationUpdate.model_validate(updates).model_dump(exclude_unset=True)
-    except ValidationError as e:
+    except (SkyvernHTTPException, ValidationError) as e:
         return make_result(
             "skyvern_org_update",
             ok=False,

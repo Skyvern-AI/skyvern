@@ -30,3 +30,27 @@ describe("runtime config helpers", () => {
     expect(normalizeBrowserStreamingMode(undefined)).toBe("vnc");
   });
 });
+
+describe("resolveStreamTransport", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("prefers the session's transport over the global mode", async () => {
+    const { resolveStreamTransport } = await loadRuntimeConfigHelpers();
+
+    expect(resolveStreamTransport("vnc", "cdp")).toBe("cdp");
+    expect(resolveStreamTransport("cdp", "vnc")).toBe("vnc");
+  });
+
+  it("falls back to the global mode when the session gives none or garbage", async () => {
+    const { resolveStreamTransport } = await loadRuntimeConfigHelpers();
+
+    expect(resolveStreamTransport("vnc", null)).toBe("vnc");
+    expect(resolveStreamTransport("vnc", undefined)).toBe("vnc");
+    expect(resolveStreamTransport("cdp", "")).toBe("cdp");
+    expect(resolveStreamTransport("vnc", "webrtc")).toBe("vnc");
+    expect(resolveStreamTransport("cdp", "webrtc")).toBe("cdp");
+  });
+});

@@ -170,6 +170,11 @@ class BaseExperimentationProvider(ABC):
         self.variant_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
         self.payload_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
         self.tri_state_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
+        # Kept apart from tri_state_map: a lenient resolution caches a swallowed evaluation error
+        # as None, and serving that to a strict caller would silently break its no-swallow contract.
+        self.strict_tri_state_map: TTLCache = TTLCache(
+            maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL
+        )
 
     @abstractmethod
     async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
@@ -177,6 +182,22 @@ class BaseExperimentationProvider(ABC):
 
     async def _prepare_feature_flag_resolution(self, feature_name: str, *, cached: bool) -> None:
         return None
+
+    def invalidate_resolution_caches(self) -> int:
+        """Drop all cached resolutions; returns how many entries were dropped."""
+        dropped = (
+            len(self.result_map)
+            + len(self.tri_state_map)
+            + len(self.strict_tri_state_map)
+            + len(self.variant_map)
+            + len(self.payload_map)
+        )
+        self.result_map.clear()
+        self.tri_state_map.clear()
+        self.strict_tri_state_map.clear()
+        self.variant_map.clear()
+        self.payload_map.clear()
+        return dropped
 
     async def is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
         await self._prepare_feature_flag_resolution(feature_name, cached=False)
@@ -195,6 +216,9 @@ class BaseExperimentationProvider(ABC):
         await self._prepare_feature_flag_resolution(feature_name, cached=True)
         return await self._is_feature_enabled(feature_name, distinct_id, properties)
 
+    # The prepare hook is the only suspension point in the cached resolvers:
+    # nothing may await between cache consult and store, or a concurrent data
+    # refresh could interleave and hits would lose generation consistency.
     async def is_feature_enabled_cached(
         self, feature_name: str, distinct_id: str, properties: dict | None = None
     ) -> bool:
@@ -202,12 +226,15 @@ class BaseExperimentationProvider(ABC):
         if should_bypass_feature_flag_cache(feature_name):
             await self._prepare_feature_flag_resolution(feature_name, cached=False)
             feature_flag_value = await self._is_feature_enabled(feature_name, distinct_id, properties)
-        elif cache_key in self.result_map:
-            feature_flag_value = self.result_map[cache_key]
         else:
+            # Freshness first: a provider that reloads flag data here may
+            # invalidate the maps, so a hit below is generation-consistent.
             await self._prepare_feature_flag_resolution(feature_name, cached=True)
-            feature_flag_value = await self._is_feature_enabled(feature_name, distinct_id, properties)
-            self.result_map[cache_key] = feature_flag_value
+            if cache_key in self.result_map:
+                feature_flag_value = self.result_map[cache_key]
+            else:
+                feature_flag_value = await self._is_feature_enabled(feature_name, distinct_id, properties)
+                self.result_map[cache_key] = feature_flag_value
         record_feature_flag_resolution(
             feature_name=feature_name,
             resolution_kind="enabled",
@@ -225,6 +252,33 @@ class BaseExperimentationProvider(ABC):
         """
         return await self._is_feature_enabled(feature_name, distinct_id, properties)
 
+    async def _resolve_feature_flag_strict(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        return await self._resolve_feature_flag(feature_name, distinct_id, properties)
+
+    async def resolve_feature_flag_strict(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        """Resolve a tri-state flag without allowing providers to swallow evaluation errors."""
+        cache_key = _make_cache_key(feature_name, distinct_id, properties)
+        if should_bypass_feature_flag_cache(feature_name):
+            await self._prepare_feature_flag_resolution(feature_name, cached=False)
+            resolved = await self._resolve_feature_flag_strict(feature_name, distinct_id, properties)
+        else:
+            await self._prepare_feature_flag_resolution(feature_name, cached=True)
+            if cache_key in self.strict_tri_state_map:
+                resolved = self.strict_tri_state_map[cache_key]
+            else:
+                resolved = await self._resolve_feature_flag_strict(feature_name, distinct_id, properties)
+                self.strict_tri_state_map[cache_key] = resolved
+        record_feature_flag_resolution(
+            feature_name=feature_name,
+            resolution_kind="enabled",
+            resolved_value=resolved,
+        )
+        return resolved
+
     async def resolve_feature_flag_cached(
         self, feature_name: str, distinct_id: str, properties: dict | None = None
     ) -> bool | None:
@@ -232,12 +286,13 @@ class BaseExperimentationProvider(ABC):
         if should_bypass_feature_flag_cache(feature_name):
             await self._prepare_feature_flag_resolution(feature_name, cached=False)
             resolved = await self._resolve_feature_flag(feature_name, distinct_id, properties)
-        elif cache_key in self.tri_state_map:
-            resolved = self.tri_state_map[cache_key]
         else:
             await self._prepare_feature_flag_resolution(feature_name, cached=True)
-            resolved = await self._resolve_feature_flag(feature_name, distinct_id, properties)
-            self.tri_state_map[cache_key] = resolved
+            if cache_key in self.tri_state_map:
+                resolved = self.tri_state_map[cache_key]
+            else:
+                resolved = await self._resolve_feature_flag(feature_name, distinct_id, properties)
+                self.tri_state_map[cache_key] = resolved
         record_feature_flag_resolution(
             feature_name=feature_name,
             resolution_kind="enabled",
@@ -275,10 +330,10 @@ class BaseExperimentationProvider(ABC):
 
     async def get_value_cached(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> str | None:
         cache_key = _make_cache_key(feature_name, distinct_id, properties)
+        await self._prepare_feature_flag_resolution(feature_name, cached=True)
         if cache_key in self.variant_map:
             variant = self.variant_map[cache_key]
         else:
-            await self._prepare_feature_flag_resolution(feature_name, cached=True)
             variant = await self._get_value(feature_name, distinct_id, properties)
             self.variant_map[cache_key] = variant
         record_feature_flag_resolution(
@@ -290,10 +345,10 @@ class BaseExperimentationProvider(ABC):
 
     async def get_payload_cached(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> Any:
         cache_key = _make_cache_key(feature_name, distinct_id, properties)
+        await self._prepare_feature_flag_resolution(feature_name, cached=True)
         if cache_key in self.payload_map:
             payload = self.payload_map[cache_key]
         else:
-            await self._prepare_feature_flag_resolution(feature_name, cached=True)
             payload = await self._get_payload(feature_name, distinct_id, properties)
             self.payload_map[cache_key] = payload
         record_feature_flag_resolution(

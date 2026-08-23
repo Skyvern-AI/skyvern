@@ -20,6 +20,7 @@ import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
+from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,
@@ -30,7 +31,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-from ._common import ErrorCode, Timer, make_error, make_result
+from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
@@ -119,7 +120,11 @@ def _serialize_run(run: Any) -> dict[str, Any]:
     }
     for field in (
         "run_type",
+        "workflow_id",
+        "workflow_permanent_id",
+        "workflow_title",
         "step_count",
+        "total_steps",
         "failure_reason",
         "recording_url",
         "app_url",
@@ -300,15 +305,20 @@ def _summarize_output_value(output_value: Any) -> tuple[dict[str, Any], dict[str
 
 
 def _summarize_artifacts(run: Any, output_stats: dict[str, Any]) -> dict[str, Any]:
-    downloaded_files = _jsonable(_get_value(run, "downloaded_files")) or []
-    screenshot_urls = _jsonable(_get_value(run, "screenshot_urls")) or []
+    missing = object()
+    downloaded_files_value = _get_value(run, "downloaded_files", missing)
+    screenshot_urls_value = _get_value(run, "screenshot_urls", missing)
+    downloaded_files = [] if downloaded_files_value is missing else (_jsonable(downloaded_files_value) or [])
+    screenshot_urls = [] if screenshot_urls_value is missing else (_jsonable(screenshot_urls_value) or [])
 
     summary: dict[str, Any] = {
         "recording_available": bool(_get_value(run, "recording_url")),
-        "workflow_screenshot_count": len(screenshot_urls),
-        "downloaded_file_count": len(downloaded_files),
         "artifact_id_count": output_stats["artifact_id_count"],
     }
+    if screenshot_urls_value is not missing:
+        summary["workflow_screenshot_count"] = len(screenshot_urls)
+    if downloaded_files_value is not missing:
+        summary["downloaded_file_count"] = len(downloaded_files)
 
     filenames = [
         filename
@@ -343,6 +353,10 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         "artifact_summary": _summarize_artifacts(run, output_stats),
         "output_summary": output_summary,
     }
+
+    parent_run_id = _get_value(run, "parent_workflow_run_id")
+    if parent_run_id:
+        summary["parent_run_id"] = parent_run_id
 
     failure_reason = _get_value(run, "failure_reason")
     if failure_reason:
@@ -484,7 +498,7 @@ def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str)
             ErrorCode.INVALID_INPUT,
             f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
             "In code-only mode, use a `code` block for durable browser/page work instead of "
-            "task/navigation/extraction/etc.",
+            "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
         ),
     )
 
@@ -507,6 +521,8 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "totp_verification_url",
     "totp_identifier",
     "persist_browser_session",
+    "reuse_browser_session",
+    "mask_secrets",
     "pin_saved_session_ip",
     "browser_profile_id",
     "browser_profile_key",
@@ -664,26 +680,88 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
     return _dump_definition_dict(raw, parsed_format) if changed else definition
 
 
-def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults (code_version=2, run_with=agent) when not explicitly set.
+def _collect_code_block_labels(blocks: Any) -> frozenset[str]:
+    if not isinstance(blocks, list):
+        return frozenset()
+    return frozenset(
+        block["label"]
+        for block in _iter_blocks_flat(blocks)
+        if block.get("block_type") == "code" and isinstance(block.get("label"), str)
+    )
 
-    Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
+
+def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_labels: frozenset[str]) -> str:
+    """Default `prompt` to "" on new code blocks, matching the editor's new-block default.
+
+    A non-null prompt is what makes the frontend render the code-first (new) code block
+    experience; the empty string is runtime-neutral (all backend prompt checks are truthiness
+    based). Blocks whose label is in `existing_code_labels`, or that carry an explicit prompt
+    value (including null), are left untouched so existing legacy blocks are never migrated.
     """
-    if fmt == "yaml":
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    workflow_definition = raw.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    if not isinstance(blocks, list):
         return definition
 
-    try:
-        raw = json.loads(definition)
-    except (json.JSONDecodeError, TypeError):
-        return definition  # let _parse_definition handle the error
-
     changed = False
-    for key, value in _CODE_V2_DEFAULTS.items():
-        if key not in raw:
-            raw[key] = value
+    for block in _iter_blocks_flat(blocks):
+        if (
+            block.get("block_type") == "code"
+            and "prompt" not in block
+            and block.get("label") not in existing_code_labels
+        ):
+            block["prompt"] = ""
             changed = True
 
-    return json.dumps(raw) if changed else definition
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
+def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
+    """Fill `steps` from `code` on code-first blocks (non-null prompt) that carry none, using the
+    copilot's own deterministic derivation. Legacy blocks (null/absent prompt) and explicit steps
+    (even an empty outline) are left untouched, so this composes with the prompt-default injection's
+    migration guarantees; `steps: null` is the workflow-get shape for "no steps yet" and derives."""
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+    workflow_definition = raw.get("workflow_definition")
+    blocks = workflow_definition.get("blocks") if isinstance(workflow_definition, dict) else None
+    if not isinstance(blocks, list):
+        return definition
+
+    changed = False
+    for block in _iter_blocks_flat(blocks):
+        if block.get("block_type") != "code" or block.get("prompt") is None or block.get("steps") is not None:
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        derived = derive_code_block_steps(code, block.get("prompt"))
+        if derived:
+            block["steps"] = derived
+            changed = True
+
+    return _dump_definition_dict(raw, parsed_format) if changed else definition
+
+
+async def _inject_workflow_update_code_block_prompt_defaults(
+    definition: str,
+    fmt: str,
+    fetch_existing: Callable[[], Awaitable[dict[str, Any]]],
+) -> str:
+    """Apply the new-code-block prompt default on update, only for labels new to the workflow."""
+
+    raw, parsed_format = _load_definition_dict(definition, fmt)
+    if raw is None or parsed_format is None:
+        return definition
+
+    existing = await fetch_existing()
+    existing_definition = existing.get("workflow_definition")
+    existing_blocks = existing_definition.get("blocks") if isinstance(existing_definition, dict) else None
+    return _inject_code_block_prompt_defaults(definition, fmt, _collect_code_block_labels(existing_blocks))
 
 
 async def _inject_workflow_update_proxy_default(
@@ -1551,9 +1629,20 @@ async def skyvern_workflow_run_list(
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
     search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
+    include_child_runs: Annotated[
+        bool,
+        Field(
+            description=(
+                "Include child runs — runs of this workflow started from inside another workflow run. "
+                "False by default, so only top-level runs are listed."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """List runs for a specific workflow. Use this when you have a workflow permanent ID
-    and need to browse its run history with pagination and optional filters."""
+    and need to browse its run history with pagination and optional filters.
+    Child runs — runs started by another workflow — are excluded by default, so the count here can be
+    far lower than the workflow's total run history; pass include_child_runs=true to list them too."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_run_list"):
         return err
 
@@ -1567,6 +1656,7 @@ async def skyvern_workflow_run_list(
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
+                include_child_runs=include_child_runs,
             )
             timer.mark("sdk")
         except NotFoundError:
@@ -1600,9 +1690,14 @@ async def skyvern_workflow_run_list(
             "page_size": page_size,
             "count": len(runs),
             "has_more": has_more,
+            "include_child_runs": include_child_runs,
             "sdk_equivalent": (
-                f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
-                f"page={page}, page_size={page_size})"
+                f"# No SDK argument yet — GET /v1/workflows/{workflow_id}/runs?include_child_runs=true"
+                if include_child_runs
+                else (
+                    f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
+                    f"page={page}, page_size={page_size})"
+                )
             ),
         },
         timing_ms=timer.timing_ms,
@@ -1616,12 +1711,9 @@ async def skyvern_workflow_create(
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
@@ -1635,10 +1727,14 @@ async def skyvern_workflow_create(
     skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
+    Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
-    Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
-    injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
+    When omitted, run_with defaults to "agent" and code_version defaults to 2 for both JSON and YAML
+    definitions.
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
+    Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
+    editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
+    code block editor experience, and their `steps` outline is derived from the code when omitted.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
@@ -1663,11 +1759,12 @@ async def skyvern_workflow_create(
 
     # Default MCP-created workflows to the same editor defaults while preserving
     # any explicit user-supplied values.
-    definition = _inject_code_v2_defaults(definition, format)
+    definition = _inject_code_block_prompt_defaults(definition, format, existing_code_labels=frozenset())
+    definition = _inject_code_block_derived_steps(definition, format)
     definition = _inject_missing_top_level_defaults(
         definition,
         format,
-        {"proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
+        {**_CODE_V2_DEFAULTS, "proxy_location": _DEFAULT_MCP_PROXY_LOCATION},
     )
 
     json_def, yaml_def, parse_err = _parse_definition(definition, format)
@@ -1725,12 +1822,9 @@ async def skyvern_workflow_update(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
     code_only: Annotated[
-        bool,
-        Field(
-            description="When true, structurally reject non-code browser/page block types before persisting "
-            "(code-only mode)"
-        ),
-    ] = False,
+        bool | None,
+        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
+    ] = None,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow.
@@ -1743,6 +1837,10 @@ async def skyvern_workflow_update(
     `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
     `skyvern workflow update --id <wpid> --definition @wf.json`.
     This command replaces the whole workflow definition.
+
+    Give each code block NEW to the workflow a `prompt` (its plain-language goal, shown as the
+    block's Goal); omitted prompts on new blocks default to "" and their `steps` outline is derived
+    from the code. Existing code blocks are never migrated to those defaults.
 
     Preserve `workflow_definition.workflow_system_prompt` when updating — omitting it clears it; see
     skyvern_workflow_get for the safe get → edit → update flow and format caveats."""
@@ -1776,6 +1874,8 @@ async def skyvern_workflow_update(
     try:
         definition = await _inject_workflow_update_proxy_default(definition, format, fetch_existing)
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
+        definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
+        definition = _inject_code_block_derived_steps(definition, format)
         if code_only:
             existing = await fetch_existing()
             existing_wf_def = existing.get("workflow_definition")
@@ -1994,6 +2094,10 @@ async def skyvern_workflow_run(
             description="Execution mode override (e.g., 'code' for cached script execution). Null inherits from workflow setting."
         ),
     ] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Return compact run output or the full response, subject to the final size caps."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
     Starts a NEW run and requires a workflow_id (wpid_...), NOT a workflow_run_id. To re-run an existing
@@ -2083,6 +2187,7 @@ async def skyvern_workflow_run(
 
     LOG.info("workflow_run_started", workflow_id=workflow_id, run_id=run.run_id, wait=wait)
     data = _serialize_run(run)
+    data.setdefault("workflow_id", workflow_id)
     params_str = f", parameters={parsed_params}" if parsed_params else ""
     wait_str = f", wait_for_completion=True, timeout={timeout_seconds}" if wait else ""
     data["sdk_equivalent"] = f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{wait_str})"
@@ -2141,15 +2246,54 @@ async def skyvern_workflow_status(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check the run ID and your API key"),
             )
 
-    data = _serialize_run_full(run) if verbosity == "full" else _serialize_run_summary(run)
+    def _payload_for(selected_verbosity: str) -> dict[str, Any]:
+        payload = _serialize_run_full(run) if selected_verbosity == "full" else _serialize_run_summary(run)
+        if run_id.startswith("wr_"):
+            payload["sdk_equivalent"] = (
+                f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={selected_verbosity!r})"
+            )
+        else:
+            verbosity_arg = "" if selected_verbosity == "summary" else f", verbosity={selected_verbosity!r}"
+            payload["sdk_equivalent"] = (
+                f"await skyvern.get_run({run_id!r})  # or skyvern_workflow_status(run_id={run_id!r}{verbosity_arg})"
+            )
+        return payload
+
+    result = make_result("skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms)
+    if _response_size(result) <= MCP_MAX_RESPONSE_CHARS:
+        return result
+
+    # The generic size cap preserves only top-level `ok`/`error`/`*_id`, and this result
+    # nests the run under `data` — so it would strip run_id and status and leave a polling
+    # caller nothing to act on. Degrade to the compact payload instead; the full output is
+    # still retrievable over the HTTP API, which is not capped.
+    oversized_warning = (
+        f"Full output exceeded the {MCP_MAX_RESPONSE_CHARS}-char MCP response limit; "
+        f"returning a reduced payload. Fetch the full run over the HTTP API at /v1/runs/{run_id}."
+    )
+    summary_result = make_result(
+        "skyvern_workflow_status",
+        data=_payload_for("summary"),
+        timing_ms=timer.timing_ms,
+        warnings=[oversized_warning],
+    )
+    if _response_size(summary_result) <= MCP_MAX_RESPONSE_CHARS:
+        return summary_result
+
+    # The summary is itself unbounded — it copies fields like failure_reason verbatim. Fall
+    # back to the identifiers a poller needs so it never lands in the stripped envelope.
+    summary_data = _payload_for("summary")
+    minimal: dict[str, Any] = {"run_id": run_id, "status": summary_data.get("status")}
     if run_id.startswith("wr_"):
-        data["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={verbosity!r})"
+        minimal["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity='summary')"
     else:
-        verbosity_arg = "" if verbosity == "summary" else f", verbosity={verbosity!r}"
-        data["sdk_equivalent"] = (
-            f"await skyvern.get_run({run_id!r})  # or skyvern_workflow_status(run_id={run_id!r}{verbosity_arg})"
-        )
-    return make_result("skyvern_workflow_status", data=data, timing_ms=timer.timing_ms)
+        minimal["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
+    return make_result(
+        "skyvern_workflow_status",
+        data=minimal,
+        timing_ms=timer.timing_ms,
+        warnings=[oversized_warning],
+    )
 
 
 async def skyvern_workflow_cancel(

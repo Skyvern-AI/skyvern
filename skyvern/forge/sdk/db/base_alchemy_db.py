@@ -7,7 +7,7 @@ from typing import Any, AsyncContextManager, AsyncIterator, Callable
 
 import structlog
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
 LOG = structlog.get_logger()
 
@@ -89,6 +89,23 @@ class _SessionFactory:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sessionmaker, name)
+
+    def current(self) -> AsyncSession | None:
+        entry = self._session_ctx.get()
+        current_task = asyncio.current_task()
+        if entry is None or current_task is None or entry.task is not current_task:
+            return None
+        return entry.session
+
+    @asynccontextmanager
+    async def bind_connection(self, connection: AsyncConnection) -> AsyncIterator[AsyncSession]:
+        session = self._sessionmaker(bind=connection, join_transaction_mode="rollback_only")
+        token = self._session_ctx.set(_SessionEntry(session=session, task=asyncio.current_task()))
+        try:
+            yield session
+        finally:
+            self._session_ctx.reset(token)
+            await session.close()
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[AsyncSession]:

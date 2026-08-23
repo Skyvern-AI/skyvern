@@ -115,6 +115,24 @@ describe("isRequired", () => {
     });
     expect(isRequired(p)).toBe(false);
   });
+
+  test("returns false for a credential_id parameter without a default (at-will)", () => {
+    const p = makeWorkflowParam({
+      key: "k",
+      workflow_parameter_type: "credential_id",
+      default_value: null,
+    });
+    expect(isRequired(p)).toBe(false);
+  });
+
+  test("returns true for a non-credential parameter without a default", () => {
+    const p = makeWorkflowParam({
+      key: "k",
+      workflow_parameter_type: "integer",
+      default_value: null,
+    });
+    expect(isRequired(p)).toBe(true);
+  });
 });
 
 describe("isMissingRequiredValue", () => {

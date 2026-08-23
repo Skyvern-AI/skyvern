@@ -2,6 +2,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   ExternalLinkIcon,
+  MagnifyingGlassIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -11,6 +12,9 @@ import {
   getReadableActionType,
   type ActionsApiResponse,
 } from "@/api/types";
+import { isRecorderCallText } from "@/routes/workflows/workflowBlockUtils";
+import { CopyButton } from "@/components/CopyButton";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/util/utils";
@@ -19,12 +23,14 @@ import {
   shouldShowExtractedInformation,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
+import { jsonClipboardText } from "./formatValue";
 import { BlockDetailFailure } from "./shared";
 
 type InspectorField = {
   label: string;
   value: unknown;
-  kind?: "json" | "text";
+  // "mono": an identifier or enum token, set like every other id in the pane.
+  kind?: "json" | "text" | "mono";
 };
 
 type JsonExplorerProps = {
@@ -113,8 +119,15 @@ function FieldValue({ field }: { field: InspectorField }) {
   if (field.kind === "json" || typeof field.value === "object") {
     return <JsonExplorer value={field.value} rootLabel={field.label} />;
   }
+  if (field.kind === "mono") {
+    return (
+      <code className="break-all font-mono text-xs text-foreground">
+        {String(field.value)}
+      </code>
+    );
+  }
   return (
-    <div className="whitespace-pre-wrap break-words rounded bg-slate-elevation1 px-2.5 py-2 text-xs text-tertiary-foreground">
+    <div className="whitespace-pre-wrap break-words text-sm text-foreground">
       {String(field.value)}
     </div>
   );
@@ -135,9 +148,9 @@ function FieldList({
     );
   }
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       {fields.map((field) => (
-        <div key={field.label} className="space-y-1.5">
+        <div key={field.label} className="space-y-1">
           <div className="text-[11px] font-medium text-muted-foreground dark:text-slate-500">
             {field.label}
           </div>
@@ -233,10 +246,19 @@ function JsonNode({
 
   const isOpen = hasSearch || expanded.has(path);
   const childCount = children.length;
+  const copyButton = (
+    // The path keeps accessible names unique when the same key repeats at
+    // different depths (e.g. two "id" fields).
+    <CopyButton
+      value={() => jsonClipboardText(value)}
+      ariaLabel={`Copy ${path === "$" ? label : path.slice(2)}`}
+      className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/jsonnode:opacity-100 [&_svg]:size-3"
+    />
+  );
 
   if (!isExpandable) {
     return (
-      <div className="flex min-w-0 items-start gap-1 py-0.5 text-xs">
+      <div className="group/jsonnode flex min-w-0 items-start gap-1 py-0.5 text-xs">
         <span className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="shrink-0 text-muted-foreground dark:text-slate-500">
           <HighlightedText text={label} search={search} />
@@ -244,31 +266,35 @@ function JsonNode({
         <span className="min-w-0 break-words font-mono text-tertiary-foreground">
           <HighlightedText text={primitivePreview(value)} search={search} />
         </span>
+        {copyButton}
       </div>
     );
   }
 
   return (
     <div className="min-w-0 text-xs">
-      <button
-        type="button"
-        onClick={() => onToggle(path)}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-muted/60 focus-visible:ring-1 focus-visible:ring-foreground/40"
-      >
-        {isOpen ? (
-          <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
-        ) : (
-          <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
-        )}
-        <span className="shrink-0 text-muted-foreground">
-          <HighlightedText text={label} search={search} />
-        </span>
-        {!isOpen && (
-          <span className="min-w-0 truncate font-mono text-tertiary-foreground">
-            {expandablePreview(value, childCount)}
+      <div className="group/jsonnode flex min-w-0 items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onToggle(path)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded py-0.5 text-left outline-none hover:bg-muted/60 focus-visible:ring-1 focus-visible:ring-foreground/40"
+        >
+          {isOpen ? (
+            <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          ) : (
+            <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground dark:text-slate-500" />
+          )}
+          <span className="shrink-0 text-muted-foreground">
+            <HighlightedText text={label} search={search} />
           </span>
-        )}
-      </button>
+          {!isOpen && (
+            <span className="min-w-0 truncate font-mono text-tertiary-foreground">
+              {expandablePreview(value, childCount)}
+            </span>
+          )}
+        </button>
+        {copyButton}
+      </div>
       {isOpen && (
         <div className="ml-4 border-l border-border pl-3">
           {children.map(([childKey, childValue]) => (
@@ -290,6 +316,9 @@ function JsonNode({
 
 function JsonExplorer({ value, rootLabel = "value" }: JsonExplorerProps) {
   const [search, setSearch] = useState("");
+  // The field is behind a corner toggle, like the code block's find: a view
+  // with n explorers would otherwise stack n search inputs.
+  const [searchOpen, setSearchOpen] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(["$"]));
   const normalizedSearch = search.trim().toLowerCase();
   const rootIsExpandable = Array.isArray(value) || isRecord(value);
@@ -307,13 +336,31 @@ function JsonExplorer({ value, rootLabel = "value" }: JsonExplorerProps) {
   }
 
   return (
-    <div className="space-y-2 rounded bg-slate-elevation1 p-2">
+    <div className="relative space-y-2 rounded bg-slate-elevation1 p-2">
       {rootIsExpandable && (
+        <Button
+          size="icon"
+          variant="ghost"
+          aria-label="Search JSON"
+          aria-pressed={searchOpen}
+          className="absolute right-2 top-2 z-10 h-7 w-7 bg-slate-elevation3/80 text-muted-foreground backdrop-blur hover:bg-slate-elevation4 hover:text-foreground"
+          onClick={() => {
+            setSearchOpen((open) => !open);
+            if (searchOpen) {
+              setSearch("");
+            }
+          }}
+        >
+          <MagnifyingGlassIcon />
+        </Button>
+      )}
+      {rootIsExpandable && searchOpen && (
         <Input
+          autoFocus
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search JSON"
-          className="h-7 border-border bg-slate-elevation2 text-xs"
+          className="h-7 border-border bg-slate-elevation2 pr-9 text-xs"
         />
       )}
       <div className="max-h-80 overflow-auto rounded bg-slate-elevation2 p-2">
@@ -360,13 +407,12 @@ function getInputFields(
   pushField(fields, "Complete criterion", block.complete_criterion);
   pushField(fields, "Terminate criterion", block.terminate_criterion);
   pushField(fields, "Loop values", block.loop_values, "json");
-  pushField(fields, "Current value", block.current_value);
   pushField(fields, "Instructions", block.instructions);
   pushField(fields, "Subject", block.subject);
   pushField(fields, "Recipients", block.recipients, "json");
   pushField(fields, "Body", block.body);
   pushField(fields, "Wait seconds", block.wait_sec);
-  pushField(fields, "HTTP method", block.method);
+  pushField(fields, "HTTP method", block.method, "mono");
   pushField(fields, "Headers", block.headers, "json");
   pushField(fields, "Request body", block.request_body, "json");
   pushField(fields, "Continue on failure", block.continue_on_failure);
@@ -379,11 +425,8 @@ function getOutputValue(block: WorkflowRunBlock): unknown {
 
 function getSummaryFields(block: WorkflowRunBlock): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
-  pushField(fields, "Task ID", block.task_id);
-  pushField(fields, "Engine", block.engine);
-  pushField(fields, "Executed branch", block.executed_branch_expression);
-  pushField(fields, "Executed branch result", block.executed_branch_result);
-  pushField(fields, "Executed next block", block.executed_branch_next_block);
+  pushField(fields, "Task ID", block.task_id, "mono");
+  pushField(fields, "Engine", block.engine, "mono");
   return fields;
 }
 
@@ -400,7 +443,7 @@ function getActionSummaryFields(
 ): Array<InspectorField> {
   const fields: Array<InspectorField> = [];
   pushField(fields, "Type", getReadableActionType(action.action_type));
-  pushField(fields, "Status", action.status);
+  pushField(fields, "Status", action.status, "mono");
   pushField(
     fields,
     "Confidence",
@@ -410,6 +453,11 @@ function getActionSummaryFields(
   );
   pushField(fields, "Reasoning", action.reasoning);
   pushField(fields, "Intention", action.intention);
+  // The row demotes this to a hover title, which keyboard and screen-reader users never get;
+  // this panel is the reachable home for it.
+  if (isRecorderCallText(action.description)) {
+    pushField(fields, "Recorded call", action.description);
+  }
   return fields;
 }
 
@@ -555,8 +603,10 @@ function BlockInspector({
   const diagnosticsStepIndex = action
     ? getActionStepIndex(block.actions, action)
     : null;
+  // The selected tab is a solid fill: elevation4-on-elevation2 read as
+  // unselected and this strip drew ~1.7k dead re-clicks a month.
   const triggerClassName =
-    "rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-white/5 dark:hover:text-slate-200 data-[state=active]:bg-slate-elevation4 data-[state=active]:text-foreground data-[state=active]:shadow-sm";
+    "rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-white/5 dark:hover:text-slate-200 data-[state=active]:bg-foreground data-[state=active]:text-background";
 
   useEffect(() => {
     setActiveTab(defaultTab);
@@ -569,7 +619,7 @@ function BlockInspector({
         onValueChange={setActiveTab}
         className="space-y-3"
       >
-        <TabsList className="h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5 ring-1 ring-inset ring-border/60">
+        <TabsList className="h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5">
           <TabsTrigger className={triggerClassName} value="summary">
             Summary
           </TabsTrigger>

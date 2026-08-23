@@ -64,6 +64,18 @@ class TestNoPrefixConfigured:
         assert result == "hi"
         page.evaluate.assert_awaited_once_with("(x) => x", "hi")
 
+    @pytest.mark.asyncio
+    async def test_force_cdp_uses_runtime_evaluate_with_empty_prefix(self) -> None:
+        page, _ = _mock_page()
+        page.context.new_cdp_session.return_value.send = AsyncMock(return_value={"result": {"value": 42}})
+
+        result = await evaluate_in_main_world(page, "() => 42", force_cdp=True)
+
+        assert result == 42
+        page.evaluate.assert_not_awaited()
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params["expression"] == "\n(() => 42)()"
+
 
 class TestPrefixConfiguredNoArg:
     @pytest.mark.asyncio
@@ -85,6 +97,15 @@ class TestPrefixConfiguredNoArg:
         assert params["returnByValue"] is True
         assert params["awaitPromise"] is True
         page.context.new_cdp_session.return_value.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_cdp_preserves_configured_prefix(self) -> None:
+        page, _ = _mock_page(prefix="// MARKER")
+
+        await evaluate_in_main_world(page, "() => 7", force_cdp=True)
+
+        params = page.context.new_cdp_session.return_value.send.await_args.args[1]
+        assert params["expression"].startswith("// MARKER\n")
 
     @pytest.mark.asyncio
     async def test_statement_form_passes_through_unchanged_to_runtime_evaluate(self) -> None:

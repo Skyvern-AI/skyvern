@@ -9,23 +9,16 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
-from skyvern.forge.sdk.copilot.completion_verification import (
-    CompletionVerificationResult,
-    only_structural_requested_output_abstentions,
-)
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
-    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
-    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     RepairRootCauseIdentity,
     compute_repair_root_cause_signature,
 )
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
-from skyvern.forge.sdk.copilot.schema_incompatibility import SCHEMA_INCOMPATIBILITY_FAILURE_TYPE
-from skyvern.forge.sdk.copilot.terminal_predicates import outcome_fully_verified
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
@@ -37,7 +30,7 @@ _MAX_ITEMS = 20
 _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
 _CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
-_REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE", "OUTCOME_UNVERIFIED"}
+_REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE"}
 _TERMINAL_ANTI_BOT_TERMS = ("captcha", "challenge", "verification", "anti-bot", "anti bot", "turnstile")
 _AUTHORING_REPAIR_SIGNATURE_VERSION = "authoring_repair_context:v1"
 _AUTHORING_REPAIR_CATEGORY = "CODE_AUTHORING_REPAIR"
@@ -54,10 +47,7 @@ class DiagnosisFailureType(StrEnum):
     TERMINAL_CHALLENGE_BLOCKER = "terminal_challenge_blocker"
     MISSING_CREDENTIAL_OR_INIT = "missing_credential_or_init"
     REPAIRABLE_BLOCK_FAILURE = "repairable_block_failure"
-    ACTIVE_RUN_TERMINAL_EVIDENCE = "active_run_terminal_evidence"
     UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
-    SCHEMA_INCOMPATIBILITY = "schema_incompatibility"
-    DELIVERED_UNVERIFIED = "delivered_unverified"
     UNKNOWN = "unknown"
 
 
@@ -71,7 +61,6 @@ class RepairNextAction(StrEnum):
 
 class DiagnosisInput(StrictModel):
     user_goal: str = ""
-    turn_intent: dict[str, Any] = Field(default_factory=dict)
     source_tool: str
     workflow_updated: bool = False
     workflow_run_id: str | None = None
@@ -82,7 +71,6 @@ class DiagnosisInput(StrictModel):
     failed_block_labels: list[str] = Field(default_factory=list)
     failure_categories: list[str] = Field(default_factory=list)
     browser_page_state: dict[str, Any] = Field(default_factory=dict)
-    prior_repair_attempts: dict[str, int] = Field(default_factory=dict)
 
 
 class DiagnosisResult(StrictModel):
@@ -109,18 +97,11 @@ class VerificationResult(StrictModel):
     remaining_blocker: str | None = None
 
 
-class RepairLoopState(StrictModel):
-    streak_token: str | None = None
-    consecutive_identical_repair_count: int = 0
-    ceiling_reached: bool = False
-
-
 class DiagnosisRepairContract(StrictModel):
     diagnosis_input: DiagnosisInput
     diagnosis_result: DiagnosisResult
     repair_decision: RepairDecision
     verification_result: VerificationResult
-    repair_loop_state: RepairLoopState = Field(default_factory=RepairLoopState)
 
     def to_trace_data(self) -> dict[str, Any]:
         identity = self.diagnosis_result.root_cause_identity
@@ -143,9 +124,6 @@ class DiagnosisRepairContract(StrictModel):
             "missing_context": list(self.diagnosis_result.missing_context),
             "user_goal_satisfied": self.verification_result.user_goal_satisfied,
             "completion_contract_satisfied": self.verification_result.completion_contract_satisfied,
-            "consecutive_identical_repair_count": self.repair_loop_state.consecutive_identical_repair_count,
-            "ceiling_reached": self.repair_loop_state.ceiling_reached,
-            "streak_token": self.repair_loop_state.streak_token,
         }
 
 
@@ -177,21 +155,15 @@ def build_diagnosis_repair_contract(
         blocks=[block for block in blocks if isinstance(block, dict)],
         detected_challenge=bool(getattr(ctx, "last_test_anti_bot", None)),
     )
-    outcome_verified = outcome_fully_verified(ctx)
-    completion_verification = getattr(ctx, "completion_verification_result", None)
-    completion_verification_failed = _completion_verification_failed(completion_verification)
-    delivered_unverified = bool(
-        run_ok
-        and getattr(ctx, "delivered_unverified_terminal", False) is True
-        and workflow_run_id
-        and workflow_run_id == getattr(ctx, "delivered_unverified_workflow_run_id", None)
-    )
+    # Interactive authoring runs are classified from their run result. Completion
+    # verification is retained only for unattended self-heal and cannot rewrite
+    # the diagnosis or repair decision for this tool boundary.
+    completion_verification = None
+    completion_verification_failed = False
     failure_type = _failure_type(
         run_ok,
         suspicious,
-        outcome_verified,
         completion_verification_failed,
-        delivered_unverified,
         failed_blocks,
         categories,
         terminal_challenge_categories,
@@ -237,7 +209,7 @@ def build_diagnosis_repair_contract(
     )
     decision_summary = {
         RepairNextAction.NO_CHANGE: "No repair needed.",
-        RepairNextAction.ASK: "Ask the user for the missing authority or context before changing the workflow.",
+        RepairNextAction.ASK: "Ask the user for the missing context before changing the workflow.",
         RepairNextAction.STOP: "Stop retrying the current failure and report the blocker.",
         RepairNextAction.ESCALATE: "Escalate because the current evidence is insufficient for an autonomous repair.",
     }.get(next_action, _safe_text(f"Repair the workflow based on: {summary}", _SUMMARY_MAX))
@@ -247,18 +219,6 @@ def build_diagnosis_repair_contract(
         decision_summary = (
             "Stop retrying because structured evidence shows the workflow path is blocked by a site challenge."
         )
-    elif failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
-        decision_summary = (
-            "Stop the current retry loop: the active run reached the requested browser state, "
-            "but the reusable workflow is not verified end-to-end."
-        )
-    elif failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
-        decision_summary = (
-            "Stop re-authoring: the edited extraction schema declares fields that map to no output the "
-            "workflow produces, so the mismatch is not repairable without user input."
-        )
-    elif failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
-        decision_summary = "No repair selected; the latest run returned requested output but it was not verified."
     if (
         next_action == RepairNextAction.NO_CHANGE
         and user_goal_satisfied is True
@@ -267,9 +227,7 @@ def build_diagnosis_repair_contract(
         completion_check = "Current run already satisfies the goal."
     else:
         completion_check = {
-            RepairNextAction.NO_CHANGE: "No repair selected; completion is delivered but not independently verified."
-            if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED
-            else "No repair selected; completion remains unverified.",
+            RepairNextAction.NO_CHANGE: "No repair selected; completion remains unverified.",
             RepairNextAction.ASK: "Resume diagnosis after the user supplies the missing context.",
             RepairNextAction.STOP: "Do not rerun unchanged; user-visible blocker must be resolved first.",
         }.get(
@@ -278,19 +236,9 @@ def build_diagnosis_repair_contract(
             if target_blocks
             else "Run the repaired workflow path and confirm the requested goal is satisfied.",
         )
-    required_authority: list[str] = []
-    if next_action == RepairNextAction.ASK:
-        required_authority = ["may_answer_without_mutation"]
-    elif next_action == RepairNextAction.REPAIR:
-        authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
-        required_authority = ["may_update_workflow"] + (
-            ["may_run_blocks"] if getattr(authority, "may_run_blocks", True) else []
-        )
-
     return DiagnosisRepairContract(
         diagnosis_input=DiagnosisInput(
             user_goal=_safe_text(_ctx_user_goal(ctx)),
-            turn_intent=_turn_intent_summary(ctx),
             source_tool=source_tool,
             workflow_updated=workflow_updated,
             workflow_run_id=workflow_run_id,
@@ -301,7 +249,6 @@ def build_diagnosis_repair_contract(
             failed_block_labels=failed_blocks,
             failure_categories=categories,
             browser_page_state=_browser_page_state(data),
-            prior_repair_attempts=_prior_repair_attempts(ctx),
         ),
         diagnosis_result=DiagnosisResult(
             suspected_failure_type=failure_type,
@@ -319,7 +266,7 @@ def build_diagnosis_repair_contract(
             next_action=next_action,
             target_blocks=target_blocks,
             proposed_change_summary=decision_summary,
-            required_authority=required_authority,
+            required_authority=[],
             completion_check=completion_check,
         ),
         verification_result=VerificationResult(
@@ -381,14 +328,13 @@ def _repair_context_root_cause_identity(
         payload["runtime_failure_class"] = runtime_failure_class
         payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
         payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
-        payload["current_url_present"] = repair_context.current_url_present
-        payload["current_title_present"] = repair_context.current_title_present
         payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
         payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
         payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
+        payload["page_obstruction_summaries"] = _safe_identity_list(repair_context.page_obstruction_summaries)
     elif reason_code == "runtime_missing_output_dependency":
         payload["missing_output_key"] = _safe_text(repair_context.missing_output_key, 120)
         payload["available_output_keys"] = _safe_identity_list(repair_context.available_output_keys)
@@ -420,22 +366,8 @@ def _str_list(value: Any) -> list[str]:
 
 
 def _ctx_user_goal(ctx: Any) -> str:
-    intent = getattr(ctx, "turn_intent", None)
-    goal = getattr(intent, "user_goal", None)
-    if isinstance(goal, str) and goal.strip():
-        return goal
     user_message = getattr(ctx, "user_message", None)
     return user_message if isinstance(user_message, str) else ""
-
-
-def _turn_intent_summary(ctx: Any) -> dict[str, Any]:
-    to_trace_data = getattr(getattr(ctx, "turn_intent", None), "to_trace_data", None)
-    if not callable(to_trace_data):
-        return {}
-    try:
-        return dict(to_trace_data())
-    except Exception:
-        return {}
 
 
 def _failure_categories(raw: list[Any]) -> list[str]:
@@ -486,9 +418,7 @@ def _failure_summary(result: dict[str, Any], data: dict[str, Any], blocks: list[
 def _failure_type(
     run_ok: bool,
     suspicious: bool,
-    outcome_verified: bool,
     completion_verification_failed: bool,
-    delivered_unverified: bool,
     failed_blocks: list[str],
     categories: list[str],
     terminal_challenge_categories: list[str],
@@ -496,6 +426,10 @@ def _failure_type(
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
 ) -> DiagnosisFailureType:
+    # A paused run is waiting on a person, not failing: classifying it as a failure would tell the
+    # model to repair a workflow whose only problem is that nobody has approved it yet.
+    if (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return DiagnosisFailureType.NO_FAILURE
     skip_reason = _safe_str(data.get("skip_reason"))
     if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
@@ -518,13 +452,6 @@ def _failure_type(
     ):
         return DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
     if (
-        ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY in categories
-        or data.get("active_run_terminal_evidence_detected") is True
-    ):
-        if outcome_verified and _active_run_terminal_evidence_reason_code(data):
-            return DiagnosisFailureType.NO_FAILURE
-        return DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
-    if (
         category_set & _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES
         or "organization not found" in error_text
         or "workflow not found" in error_text
@@ -533,16 +460,10 @@ def _failure_type(
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     if _safe_str(data.get("failure_type")) == "missing_credential_or_init":
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    if _safe_str(data.get("failure_type")) == SCHEMA_INCOMPATIBILITY_FAILURE_TYPE:
-        return DiagnosisFailureType.SCHEMA_INCOMPATIBILITY
     if repair_context is not None:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
-    if outcome_verified:
-        return DiagnosisFailureType.NO_FAILURE
     if failed_blocks:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
-    if delivered_unverified:
-        return DiagnosisFailureType.DELIVERED_UNVERIFIED
     if category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
     if completion_verification_failed:
@@ -554,25 +475,17 @@ def _failure_type(
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
 
 
-def _active_run_terminal_evidence_reason_code(data: dict[str, Any]) -> bool:
-    return _safe_str(data.get("active_run_terminal_evidence_reason_code")) == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
-
-
 def _next_action(
     failure_type: DiagnosisFailureType,
     ctx: CopilotContext,
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
 ) -> RepairNextAction:
-    if failure_type in {DiagnosisFailureType.NO_FAILURE, DiagnosisFailureType.DELIVERED_UNVERIFIED}:
+    if failure_type == DiagnosisFailureType.NO_FAILURE:
         return RepairNextAction.NO_CHANGE
     if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
         return RepairNextAction.STOP
-    if failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE:
-        return RepairNextAction.STOP
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
-        return RepairNextAction.STOP
-    if failure_type == DiagnosisFailureType.SCHEMA_INCOMPATIBILITY:
         return RepairNextAction.STOP
     if ctx.last_test_non_retriable_nav_error:
         return RepairNextAction.STOP
@@ -582,18 +495,12 @@ def _next_action(
         DiagnosisFailureType.SUSPICIOUS_SUCCESS,
     }:
         return RepairNextAction.STOP
-    # The judge confirmed every criterion; no repair path should overwrite an already-verified terminal proposal.
-    if outcome_fully_verified(ctx):
-        return RepairNextAction.NO_CHANGE
     if repair_context is not None:
         return RepairNextAction.REPAIR
     if (
         data.get("skip_reason") == "workflow_credential_inputs_unbound"
         or failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     ):
-        return RepairNextAction.ASK
-    authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
-    if getattr(authority, "requires_user_input", False) or getattr(authority, "may_update_workflow", True) is False:
         return RepairNextAction.ASK
     if failure_type in {
         DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
@@ -658,41 +565,16 @@ def _verification_satisfaction(
 ) -> tuple[bool | None, bool | None]:
     if failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER:
         return False, False
-    if failure_type == DiagnosisFailureType.DELIVERED_UNVERIFIED:
-        return True, False
-    if isinstance(data, dict) and data.get("active_run_terminal_evidence_detected") is True:
-        trace = data.get("active_run_terminal_completion_verification")
-        fully_satisfied = isinstance(trace, dict) and trace.get("fully_satisfied") is True
-        return fully_satisfied, fully_satisfied
     if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return False, False
-    if outcome_fully_verified(ctx):
-        return True, True
-    if (
-        failure_type == DiagnosisFailureType.NO_FAILURE
-        and completion_verification is not None
-        and completion_verification.is_fully_satisfied()
-    ):
-        return True, True
-    if completion_verification is not None and not completion_verification.is_fully_satisfied():
+    if failure_type in {
+        DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
+        DiagnosisFailureType.FAILED_RUN,
+        DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR,
+    }:
         return False, False
     user_goal_satisfied = (not suspicious) if run_ok else None if run_status is None else False
-    # When the verification judge was required (a non-null result), its verdict
-    # is authoritative: an unmet or unavailable verdict cannot claim the outcome.
-    # With no result (no criteria, judge skipped) fall back to run trust.
-    if completion_verification is not None:
-        completion_contract_satisfied: bool | None = completion_verification.is_fully_satisfied()
-    else:
-        completion_contract_satisfied = user_goal_satisfied
-    return user_goal_satisfied, completion_contract_satisfied
-
-
-def _completion_verification_failed(completion_verification: CompletionVerificationResult | None) -> bool:
-    if completion_verification is None or completion_verification.is_fully_satisfied():
-        return False
-    if completion_verification.status != "evaluated" or not completion_verification.criterion_ids:
-        return True
-    return not only_structural_requested_output_abstentions(completion_verification)
+    return user_goal_satisfied, user_goal_satisfied
 
 
 def _missing_context(result: dict[str, Any], data: dict[str, Any], failure_type: DiagnosisFailureType) -> list[str]:
@@ -716,14 +598,3 @@ def _browser_page_state(data: dict[str, Any]) -> dict[str, Any]:
         "has_current_url": bool(raw_url),
         "has_page_title": bool(_safe_str(data.get("page_title"))),
     }
-
-
-def _prior_repair_attempts(ctx: Any) -> dict[str, int]:
-    keys = (
-        "repeated_failure_streak_count",
-        "failed_test_nudge_count",
-        "probable_site_block_streak_count",
-        "per_tool_budget_nudge_count",
-        "repeated_action_fingerprint_streak_count",
-    )
-    return {key: int(getattr(ctx, key, 0) or 0) for key in keys}

@@ -1,6 +1,8 @@
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { statusIsFinalized } from "@/routes/tasks/types";
+import { SELECTED_BLOCK_SEARCH_PARAM } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
 import { RunView } from "./runview/RunView";
@@ -16,7 +18,7 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 export function RunTab() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { workflowPermanentId } = useParams();
+  const workflowPermanentId = useWorkflowPermanentId();
   const { openPane } = useStudioPanes();
   const { runId, pending } = useStudioInspectedRun();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
@@ -25,7 +27,7 @@ export function RunTab() {
   // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-  // ?bl= marks a block-scoped run; "Retry as-is" would rerun the whole workflow,
+  // ?bl= marks a block-scoped run; "Retry" would rerun the whole workflow,
   // so suppress that CTA for block runs (the block is rerun from the editor).
   const isBlockRun = searchParams.has("bl");
   const retryRun = () => {
@@ -49,13 +51,16 @@ export function RunTab() {
       onFix={
         workflowDeleted
           ? undefined
-          : (seedMessage) => {
+          : (seedMessage, failingLabel) => {
               // One replace-navigation opens the Copilot pane and seeds the message
               // via location.state (Workspace reads it as the copilot's
               // initialMessage), so the pane write can't race a separate
               // state-only navigation.
               openPane("copilot", {
-                state: { copilotMessage: seedMessage, copilotFixOrigin: true },
+                state: { copilotMessage: seedMessage },
+                extraSearchParams: {
+                  [SELECTED_BLOCK_SEARCH_PARAM]: failingLabel ?? null,
+                },
               });
             }
       }
