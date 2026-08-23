@@ -1978,6 +1978,10 @@ class GoogleOAuthCredentialModel(Base):
             unique=True,
             postgresql_where=text("consent_nonce IS NOT NULL"),
         ),
+        CheckConstraint(
+            "state IN ('pending_consent', 'active', 'revoked', 'error')",
+            name="ck_google_oauth_credentials_state",
+        ),
     )
 
     id = Column(String, primary_key=True, default=generate_google_oauth_credential_id)

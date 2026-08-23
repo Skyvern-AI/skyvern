@@ -27,6 +27,13 @@ TAG_KEY_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # `,` separates terms in the `?tags=` filter encoding, so it may not appear
 # inside a value. `:` is allowed: the parser splits on the first `:` only.
 _TAG_VALUE_FORBIDDEN_CHARS = (",",)
+# Bucket markers the analytics group-by aggregation emits in place of a real value:
+# a tag whose value equals one of these is absorbed into that bucket, so the group's
+# number is silently wrong. Compared case-sensitively downstream, so the reservation
+# is exact-match too — `__UNTAGGED__` and `built__other__thing` collide with nothing.
+RESERVED_TAG_VALUE_UNTAGGED = "__untagged__"
+RESERVED_TAG_VALUE_OTHER = "__other__"
+RESERVED_TAG_VALUES = frozenset({RESERVED_TAG_VALUE_UNTAGGED, RESERVED_TAG_VALUE_OTHER})
 
 
 def normalize_run_with(v: str | None) -> str:
@@ -91,7 +98,11 @@ def normalize_run_metadata(v: dict[str, str] | None) -> dict[str, str] | None:
     )
     if not normalized:
         return None
-    return {key: value for key, value in normalized.items() if not is_reserved_tag_key(key)} or None
+    user_written = {key: value for key, value in normalized.items() if not is_reserved_tag_key(key)}
+    # These become run tags, so they reach the same analytics rollup as the tag endpoints.
+    for value in user_written.values():
+        assert_tag_value_not_reserved(value)
+    return user_written or None
 
 
 def is_reserved_tag_key(key: str) -> bool:
@@ -166,6 +177,23 @@ def normalize_tag_value(value: object) -> str:
         if forbidden in trimmed:
             raise ValueError(f"tag values must not contain '{forbidden}'")
     return trimmed
+
+
+def assert_tag_value_not_reserved(value: str) -> None:
+    """Reject the analytics bucket markers. Layered onto the surfaces that bring a value
+    into existence (set, register, rename-to) rather than into ``normalize_tag_value``, so
+    a pre-existing colliding row stays addressable for delete and rename-away."""
+    if value in RESERVED_TAG_VALUES:
+        raise ValueError(f"tag values must not be exactly '{value}' (reserved as an analytics bucket marker)")
+
+
+def drop_reserved_tag_values(v: dict[str, str] | None) -> dict[str, str] | None:
+    """Strip entries carrying a reserved value, for replay paths that reload a stored run's
+    tags. Those rows may predate the reservation, and raising there would turn stored data
+    into a failed retry instead of rejecting a new write."""
+    if not v:
+        return None
+    return {key: value for key, value in v.items() if value.strip() not in RESERVED_TAG_VALUES} or None
 
 
 def normalize_optional_tag_value(value: object) -> str | None:

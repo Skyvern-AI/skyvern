@@ -1223,6 +1223,7 @@ class ForgeAgent:
             taskv3_runaway_backstops,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS
+        from skyvern.forge.taskv3.tools import pending_marker
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -1511,6 +1512,16 @@ class ForgeAgent:
             )
             return await peek.evaluate(probe_js)
 
+        # Whether the control the run CLICKED is still in flight. Scoped to that one control on
+        # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
+        # widget or a stale modal the app left in the DOM. Narrow for the same reason -- every
+        # widening is a way to hold a run that succeeded.
+        async def _pending_marker(selector: str) -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+            return await pending_marker(peek, selector)
+
         resolve_typed_text = None
         if task_block is not None:
             # Local import: handler.py transitively imports this module (agent registration), so a
@@ -1542,6 +1553,11 @@ class ForgeAgent:
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                # Unfenced across both populations, unlike the settle probe above: that fence exists
+                # to keep a RENDERING wait off the bare arm, and this asks a different question. The
+                # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
+                # whose reason does not apply looks like).
+                pending_marker=_pending_marker,
                 # The 2026-08-18 scoping decision kept the completed-side settle probe off the
                 # bare-task arm. Fenced by its own deferral budget so it does not also disable
                 # the failure-evidence gate that shares the sampler (SKY-14598).

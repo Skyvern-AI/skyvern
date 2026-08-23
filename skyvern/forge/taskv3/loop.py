@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
@@ -147,11 +148,13 @@ NO_TOOL_CALL_NUDGE = (
     "finish(status, reason, extracted_output) if the goal is complete. Emit a tool call now."
 )
 
-# Perception-stall policy: N consecutive byte-identical snapshots from the same perception
-# (compactable) tool mean the page has stopped changing in response to actions — a page gated by
-# something the run cannot perceive or operate otherwise burns the whole budget on identical
-# re-observes. Only compactable tools count: action tools legitimately return the same string
-# every call ("waited"), so they can never witness "the page is unchanged".
+# Perception-stall policy: N consecutive byte-identical snapshots from the same (compactable) tool
+# AND from the same probe (that tool with the same arguments) mean the page has stopped changing in
+# response to actions, and a page gated by something the run cannot perceive or operate otherwise
+# burns the whole budget on identical re-observes. The per-probe term is what keeps two different
+# probes returning the same string from reading as one frozen page. Only compactable tools count:
+# action tools legitimately return the same string every call ("waited"), so they can never witness
+# "the page is unchanged".
 PERCEPTION_STALL_NUDGE_AFTER = 6
 PERCEPTION_STALL_TERMINATE_AFTER = 15
 
@@ -171,6 +174,111 @@ ACTION_LOOP_TERMINATE_AFTER = 6
 
 # Facetable sibling of PERCEPTION_STALL_REASON_PREFIX; same dashboard contract.
 ACTION_LOOP_REASON_PREFIX = "action_loop:"
+
+# Emitted, never acted on, when the oscillation rule WOULD have terminated. The step engine's
+# tripwires (skyvern/forge/sdk/fail_fast/shadow.py) earn the right to act by publishing this event
+# first and deriving a decision precision from it; a rule that ADDS terminations gets the same
+# treatment rather than being trusted because it looks right.
+PERCEPTION_STALL_SHADOW_EVENT = "taskv3 loop perception stall would fire"
+
+# Emitted once per run, where the argument-blind per-tool counter first reached the terminator and
+# the per-probe term did not. It marks a verdict withheld, not a run spared: most such runs end on
+# another guard, so read it joined to the final status.
+PERCEPTION_STALL_SUPPRESSED_EVENT = "taskv3 loop perception stall suppressed_main_fire"
+
+# How many recent states a probe remembers. This length IS the longest oscillation period that can
+# be recognised, so it is a detection limit and not a memory tuning knob.
+PERCEPTION_RING = 8
+
+
+@dataclass
+class _ProbeStreak:
+    history: deque[str]
+    # Consecutive snapshots identical to the previous one; a match means two reads, so it opens at 2.
+    identical: int = 0
+    # Consecutive snapshots matching ANY state still in the ring (a superset of ``identical``).
+    revisits: int = 0
+
+
+@dataclass
+class _Snapshot:
+    """Streak readings after one snapshot; the verdict reads ``live``, the warning ``tool_identical``."""
+
+    # Per-tool consecutive-identical count, argument-blind: the counter this guard shipped with.
+    tool_identical: int
+    probe_identical: int
+    probe_revisits: int
+    # A repeated probe returned different content: in-loop evidence that the page changed.
+    progressed: bool
+
+    @property
+    def live(self) -> int:
+        return min(self.tool_identical, self.probe_identical)
+
+
+class _PerceptionLedger:
+    """No-progress streaks of perception snapshots, kept per tool AND per probe (tool, canonical args).
+
+    The loop acts only where BOTH agree: the tool has returned the same string N times running and
+    the same probe has too. The per-probe term is what stops distinct probes that happen to return
+    the same string (a form full of not-yet-chosen dropdowns) from reading as one frozen page; the
+    per-tool term is what keeps firing a subset of what the argument-blind counter fired, so a
+    frozen page interleaved with a live sibling probe — which content alone cannot tell from a live
+    page whose static region is re-read — is never terminated where it was not before.
+
+    Streaks are scoped to the probe that produced them. Progress in one probe says nothing about
+    another: a sibling that ticks every read (a clock, a log tail) must not keep a frozen page
+    alive to the budget cap, which is exactly what clearing on any probe's progress would do.
+
+    Counts per RESULT, not per round: the thresholds are denominated in snapshots, and a turn that
+    batches five identical probes has taken five of them.
+
+    ``revisits`` additionally treats a return to any state still in the ring as no progress, which
+    is what catches a control toggling open and shut. That is NEW firing, so it is only reported.
+    """
+
+    def __init__(self) -> None:
+        self._probes: dict[tuple[str, str], _ProbeStreak] = {}
+        self._tools: dict[str, tuple[str, int]] = {}
+        self.shadow_reported = False
+        self.suppressed_reported = False
+
+    def record(self, key: tuple[str, str], content_digest: str) -> _Snapshot:
+        tool_name = key[0]
+        prev = self._tools.get(tool_name)
+        tool_identical = prev[1] + 1 if prev is not None and prev[0] == content_digest else 1
+        self._tools[tool_name] = (content_digest, tool_identical)
+
+        probe = self._probes.get(key)
+        if probe is None:
+            self._probes[key] = _ProbeStreak(deque([content_digest], maxlen=PERCEPTION_RING))
+            return _Snapshot(tool_identical, 0, 0, False)
+        progressed = content_digest != probe.history[-1]
+        if progressed:
+            probe.identical = 0
+        else:
+            probe.identical = probe.identical + 1 if probe.identical else 2
+        if content_digest in probe.history:
+            probe.revisits = probe.revisits + 1 if probe.revisits else 2
+        else:
+            probe.revisits = 0
+        probe.history.append(content_digest)
+        return _Snapshot(tool_identical, probe.identical, probe.revisits, progressed)
+
+    def next_snapshot_can_trip(self, threshold: int) -> bool:
+        """Whether ONE more read of some probe, returning what it last returned, reaches ``threshold``
+        live. This is the trip's exact precondition, not an estimate of it: the next read continues
+        the tool counter only if that content is also the tool's last content, so a probe that went
+        dormant while its tool moved on to other content cannot be the one that trips."""
+        for (tool_name, _), probe in self._probes.items():
+            tool_last_content, tool_identical = self._tools[tool_name]
+            if probe.history[-1] != tool_last_content:
+                continue
+            next_probe_identical = probe.identical + 1 if probe.identical else 2
+            if min(tool_identical + 1, next_probe_identical) >= threshold:
+                return True
+        return False
+
 
 # Failure-evidence gate: a finish(failed) issued shortly after a submit-class action or a
 # solve_captcha attempt is held for ONE evidence turn, because submissions and captcha protocols
@@ -226,12 +334,77 @@ class ActivityRecency:
     tokens_remaining: int | None = None
     last_turn_tokens: int = 0
     last_trigger_turn: int | None = None
-    # True while any perception tool's identical-snapshot streak is one short of the stall
-    # terminator: a deferral-forced observe must never be the snapshot that trips it.
+    # True while one more read of some probe, returning what it last returned, would trip the stall
+    # terminator: a deferral-forced observe must never be the snapshot that trips it. KNOWN LIMIT: a
+    # run that reaches the edge and then stops reading that tool altogether leaves this true for the
+    # rest of the run, disabling the deferral (same as the argument-blind counter it shipped with).
     perception_stall_imminent: bool = False
 
     def armed(self, window: int = FAILURE_EVIDENCE_WINDOW_TURNS) -> bool:
         return self.last_trigger_turn is not None and (self.turn - self.last_trigger_turn) <= window
+
+
+def _names_submit_control(tool_name: str, args: dict[str, Any], ok: bool) -> str | None:
+    """The selector of a control a successful action acted on directly, or None.
+
+    Only `click`. An Enter press and a type-that-pressed-Enter submit through a control they do not
+    name, and a captcha dispatch names none at all, so for all three "is that control still in
+    flight" has no subject — and the selector they do carry is a text field, whose value is the
+    model's own typed text."""
+    if not ok or tool_name != "click":
+        return None
+    selector = args.get("selector")
+    return selector if isinstance(selector, str) and selector else None
+
+
+def _has_hold_headroom(activity: ActivityRecency | None, deadline_at: float | None) -> bool:
+    """Whether a deferral has the budget to buy the re-verification turn it asks for.
+
+    Without it the run ends budget_exhausted, which is unmapped and lands on failed -- turning an
+    honest hold into the false failure it exists to avoid. Every axis the failure-evidence gate
+    reserves, for the same reason: a token exhaustion and a stall streak one short of its terminator
+    each convert the deferral into a verdict the gate did not choose."""
+    if activity is not None:
+        if activity.turns_remaining is not None and activity.turns_remaining < FAILURE_EVIDENCE_MIN_TURNS:
+            return False
+        if (
+            activity.tool_calls_remaining is not None
+            and activity.tool_calls_remaining < FAILURE_EVIDENCE_MIN_TOOL_CALLS
+        ):
+            return False
+        if activity.tokens_remaining is not None and activity.tokens_remaining < FAILURE_EVIDENCE_MIN_TURNS * max(
+            activity.last_turn_tokens, 1
+        ):
+            return False
+        if activity.perception_stall_imminent:
+            return False
+    if deadline_at is not None and deadline_at - time.monotonic() < FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS:
+        return False
+    return True
+
+
+@dataclass
+class SubmitWatch:
+    """The control a click last acted on, and whether a completed verdict has already been held once
+    against it.
+
+    Deliberately NOT part of `ActivityRecency`. That record arms failure evidence, where a broad
+    trigger (any click, any captcha dispatch) and a decaying turn window are both correct. Neither is
+    correct here: a captcha dispatch carries no selector and would erase the control, and a turn
+    window expires while the run is doing the waiting this gate asked for. There is no window — the
+    probe is the arbiter, because a control that resolves and still reads as in flight IS the
+    question, where elapsed turns are only a proxy for it."""
+
+    selector: str | None = None
+    deferred: bool = False
+
+    def record(self, selector: str) -> None:
+        self.selector = selector
+        self.deferred = False
+
+    def clear(self) -> None:
+        self.selector = None
+        self.deferred = False
 
 
 def _unblocker_options(available_tools: set[str]) -> list[str]:
@@ -274,6 +447,33 @@ def _action_nudge_text(repeats: list[tuple[str, dict[str, Any], int]], available
     )
 
 
+_TOOL_CALL_RECORD_FIELDS = frozenset(
+    {
+        "tool",
+        "tool_status",
+        "duration_seconds",
+        "result_chars",
+        "selector_present",
+        "billable",
+        "turn",
+        "batch_size",
+        "batch_index",
+    }
+)
+
+
+def _observe_summary_fields(result: ToolResult) -> dict[str, int]:
+    """Counts only: the summary is built by the tool, but an indexed field is re-checked here."""
+    summary = (result.data or {}).get("summary")
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        key: value
+        for key, value in summary.items()
+        if key not in _TOOL_CALL_RECORD_FIELDS and isinstance(value, int) and not isinstance(value, bool)
+    }
+
+
 def _append_skipped_tool_results(
     messages: list[dict[str, Any]], remaining: list[tuple[str, str, dict[str, Any]]], reason: str
 ) -> None:
@@ -294,6 +494,8 @@ def make_finish_tool(
     activity: ActivityRecency | None = None,
     max_failure_deferrals: int = 1,
     failure_settle_max_seconds: float = FAILURE_EVIDENCE_SETTLE_MAX_SECONDS,
+    pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
+    submit_watch: SubmitWatch | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -308,7 +510,16 @@ def make_finish_tool(
     completed-side cap, not per verdict attempt) — a quiescence wait
     bounded by `failure_settle_max_seconds`, then a deferral asking the model to re-observe —
     because async submissions and captcha protocols otherwise produce false-negative verdicts.
-    terminated is never gated on either side."""
+    terminated is never gated on either side.
+
+    `pending_marker` reports the text the page still shows the control in `submit_watch` as in
+    flight with, or None. A settled page is not a submitted one -- a submit frozen mid-flight is
+    maximally stable, so the settle probe is satisfied by exactly the state it should refuse. A
+    completed verdict is held ONCE against that marker, with the re-observe it asks for budgeted; if
+    the model insists a second time its verdict stands, so a run that declares completion on a
+    still-pending control remains possible after this gate. Deliberately a POSITIVE observation -- a
+    probe that fails reports nothing, and nothing is not evidence of pending, so it accepts rather
+    than holding a run on probe flakiness."""
     deferrals = 0
     failure_deferrals = 0
 
@@ -357,6 +568,33 @@ def make_finish_tool(
             return ToolResult.error(
                 f"invalid finish status: {status!r}; call finish again with status=completed|failed|terminated"
             )
+        if (
+            status == "completed"
+            and pending_marker is not None
+            and submit_watch is not None
+            and submit_watch.selector
+            and not submit_watch.deferred
+            # Holding costs a turn, the tool calls of the re-observe it asks for, and deadline
+            # seconds. Without the headroom to spend them the run ends budget_exhausted, which is
+            # unmapped and lands on failed -- turning an honest hold into a false failure.
+            and _has_hold_headroom(activity, deadline_at)
+        ):
+            try:
+                marker = await pending_marker(submit_watch.selector)
+            except Exception:
+                # Warning, not debug: the only way here is a broken probe, and a silently disabled
+                # gate reads exactly like a page that was never pending.
+                LOG.warning("taskv3 pending-marker probe failed; not treating it as pending", exc_info=True)
+                marker = None
+            if marker:
+                submit_watch.deferred = True
+                LOG.info("taskv3 completed verdict held: submission still in flight", marker=marker)
+                return ToolResult.error(
+                    f"the page still shows a submission in flight: {marker}. That is not a "
+                    "settled failure OR a confirmation -- wait for it to resolve and re-observe. "
+                    "Finish with status=completed only once the page shows the submission "
+                    "landed; if it never resolves, say so with status=terminated."
+                )
         if status == "completed" and page_fingerprint is not None and deferrals < max_settle_deferrals:
             try:
                 settled = await _settled()
@@ -511,6 +749,7 @@ async def run_agent_tool_loop(
     action_nudge_after: int | None = ACTION_LOOP_NUDGE_AFTER,
     action_terminate_after: int | None = ACTION_LOOP_TERMINATE_AFTER,
     activity: ActivityRecency | None = None,
+    submit_watch: SubmitWatch | None = None,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     openai_tools = [tool.to_openai_tool() for tool in tools]
@@ -525,17 +764,7 @@ async def run_agent_tool_loop(
     # Indices into `messages` of successful perception results, recorded as they are appended so
     # compaction can keep only the newest of each without inferring "real snapshot" from content size.
     snapshot_indices: set[int] = set()
-    # Per perception tool: (last successful content, consecutive identical count). One previous
-    # content is held per tool, so memory stays bounded by the tool set.
-    stall_counts: dict[str, tuple[str, int]] = {}
-    # Evidence memory for the action-loop guard, keyed by (tool name, canonical args): a digest of
-    # each probe's last successful content. A REPEATED probe returning different content is the
-    # in-loop evidence that the page changed; a first-time probe has no baseline and proves
-    # nothing, which is what keeps varied-selector probing from laundering repetition into
-    # progress. Digests, not contents, so a probe-heavy run's memory stays small. Deliberately
-    # separate from stall_counts: the stall policy is shipped and dashboarded, and this memory
-    # must never alter its firing behavior.
-    probe_baselines: dict[tuple[str, str], str] = {}
+    perception = _PerceptionLedger()
     # The action-loop counter: (repeat count, first turn of the streak) per billable action
     # identity, cleared whenever evidence of page change arrives. action_warned holds the streaks
     # whose warning was actually DELIVERED — termination is gated on it, so the model always gets
@@ -717,6 +946,10 @@ async def run_agent_tool_loop(
                     result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}")
             tool_duration_seconds = time.monotonic() - tool_started_at
             tool_seconds += tool_duration_seconds
+            # Observe's summary counters are the only trace a perception change leaves on this
+            # record; its content is deliberately never logged. Gated on the tool, not the payload,
+            # so every other tool's record keeps exactly today's fields.
+            observe_summary = _observe_summary_fields(result) if tool_name == "observe" else {}
             # The only per-tool-call timing the engine has: tool execution is the majority of a v3
             # run's wall-clock and otherwise emits nothing at all. Names, sizes and booleans only —
             # argument values and result content carry end-user data and must not be logged.
@@ -735,6 +968,7 @@ async def run_agent_tool_loop(
                 turn=turns,
                 batch_size=len(tool_calls),
                 batch_index=idx,
+                **observe_summary,
             )
 
             if spec is not None and spec.compactable and result.status == "ok":
@@ -752,34 +986,49 @@ async def run_agent_tool_loop(
                 _clear_action_state()
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(result.content.encode()).hexdigest()
-                baseline = probe_baselines.get(action_key)
-                if baseline is not None and baseline != content_digest:
+                snap = perception.record(action_key, content_digest)
+                if snap.progressed:
                     # This probe saw the page change since it last looked — fresh evidence of
                     # progress, so repeat counts for actions taken against the old state are stale.
+                    # A first-time probe has no baseline and proves nothing, which is what keeps
+                    # varied-selector probing from laundering repetition into progress.
                     _clear_action_state()
-                probe_baselines[action_key] = content_digest
-                prev = stall_counts.get(tool_name)
-                identical_count = prev[1] + 1 if prev is not None and prev[0] == result.content else 1
-                stall_counts[tool_name] = (result.content, identical_count)
                 if activity is not None and stall_terminate_after is not None:
-                    activity.perception_stall_imminent = any(
-                        count >= stall_terminate_after - 1 for _, count in stall_counts.values()
-                    )
-                if stall_terminate_after is not None and identical_count >= stall_terminate_after:
-                    LOG.info(
-                        "taskv3 loop perception stalled", tool=tool_name, identical_count=identical_count, turn=turns
-                    )
+                    activity.perception_stall_imminent = perception.next_snapshot_can_trip(stall_terminate_after)
+                if stall_terminate_after is not None and snap.live >= stall_terminate_after:
+                    LOG.info("taskv3 loop perception stalled", tool=tool_name, identical_count=snap.live, turn=turns)
                     outcome = LoopOutcome(
                         "terminated",
-                        f"{PERCEPTION_STALL_REASON_PREFIX} {identical_count} consecutive byte-identical "
-                        f"{tool_name} snapshots — the page stopped changing in response to actions, so the goal "
-                        "cannot progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
+                        f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive byte-identical snapshots from "
+                        f"one {tool_name} probe — the page stopped changing in response to actions, so the goal cannot "
+                        "progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
                         "cross-origin frame)",
                     )
                     _append_skipped_tool_results(messages, tool_calls[idx + 1 :], "perception stalled")
                     break
-                if stall_nudge_after is not None and identical_count == stall_nudge_after:
-                    stall_nudges_due.append((tool_name, identical_count))
+                if (
+                    stall_terminate_after is not None
+                    and snap.tool_identical == stall_terminate_after
+                    and not perception.suppressed_reported
+                ):
+                    perception.suppressed_reported = True
+                    LOG.info(
+                        PERCEPTION_STALL_SUPPRESSED_EVENT,
+                        tool=tool_name,
+                        identical_count=snap.tool_identical,
+                        turn=turns,
+                    )
+                if (
+                    stall_terminate_after is not None
+                    and snap.probe_revisits >= stall_terminate_after
+                    and not perception.shadow_reported
+                ):
+                    perception.shadow_reported = True
+                    LOG.info(PERCEPTION_STALL_SHADOW_EVENT, snapshots=snap.probe_revisits, tool=tool_name, turn=turns)
+                if stall_nudge_after is not None and snap.tool_identical == stall_nudge_after:
+                    # Warn off the per-tool counter, not ``live``: it moves by one per read, so it
+                    # crosses the threshold exactly once per streak and before any live verdict.
+                    stall_nudges_due.append((tool_name, snap.tool_identical))
             if spec is not None and spec.billable:
                 # Errored dispatches count too: a failed attempt consumed a step (see the action-step
                 # accounting above) and a repeat-failing action is the same no-progress pathology.
@@ -812,6 +1061,10 @@ async def run_agent_tool_loop(
                     and action_key not in action_warned
                 ):
                     action_nudges_due.append((tool_name, args, repeat_count))
+            if submit_watch is not None and tool_name == "navigate" and result.status == "ok":
+                # Outside the billable/recordable branch on purpose: navigate is neither, so a clear
+                # placed in there never runs. The run left the page; the control it clicked went too.
+                submit_watch.clear()
             if spec is not None and (spec.billable or spec.recordable):
                 # Dispatched page actions enter the round with their outcome: a failed billable round
                 # still consumed budget and must persist (else later blocks undercount the run
@@ -821,6 +1074,10 @@ async def run_agent_tool_loop(
                     billable_actions.append(tool_name)
                 if activity is not None and _arms_failure_evidence(tool_name, args, result.status == "ok"):
                     activity.last_trigger_turn = turns
+                if submit_watch is not None:
+                    submit_selector = _names_submit_control(tool_name, args, result.status == "ok")
+                    if submit_selector is not None:
+                        submit_watch.record(submit_selector)
 
             if spec is not None and spec.terminal and result.status == "ok":
                 data = result.data or {}

@@ -150,6 +150,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
+    selected_block_label: str | None = Field(
+        None,
+        description=(
+            "Label of the block currently selected on the studio canvas, if any. An ambient fact for "
+            "resolving references like 'this block' — never a directive to act on that block."
+        ),
+    )
     supports_credential_pause: bool = Field(
         False,
         description=(

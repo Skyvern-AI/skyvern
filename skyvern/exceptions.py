@@ -933,6 +933,14 @@ class EmptyScrapePage(SkyvernException):
         super().__init__("Failed to scrape the page, returned an NONE result")
 
 
+class ElementTreeBuildFailed(SkyvernException):
+    def __init__(self, *, returned: str) -> None:
+        # Says what reached Python, not what the page produced: on the main-world lane a
+        # RemoteObject with no `value` key also arrives as None from a build that succeeded.
+        self.returned = returned
+        super().__init__(f"Element tree build returned {returned}, not [elements, element_tree]")
+
+
 class ScrapingFailed(SkyvernException):
     def __init__(self, *, reason: str | None = None) -> None:
         self.reason = reason
@@ -1193,6 +1201,13 @@ class InvalidElementForTextInput(SkyvernException):
         if is_date_related:
             message += _INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT
         super().__init__(message)
+
+
+class FailedToClearInputField(SkyvernException):
+    def __init__(self, element_id: str, tag_name: str):
+        super().__init__(
+            f"Failed to clear the existing value of the {tag_name} element with id={element_id} before typing."
+        )
 
 
 class ElementIsNotLabel(SkyvernException):
