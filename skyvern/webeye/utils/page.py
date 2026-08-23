@@ -399,6 +399,32 @@ class ScreenshotMode(StrEnum):
     DETAILED = "detailed"
 
 
+async def _restore_invalid_viewport_before_screenshot(page: Page) -> None:
+    viewport = page.viewport_size
+    if not isinstance(viewport, dict):
+        return
+
+    width = viewport.get("width")
+    height = viewport.get("height")
+    if not (isinstance(width, int) and isinstance(height, int)) or (width > 0 and height > 0):
+        return
+
+    settings = SettingsManager.get_settings()
+    restored_viewport = {
+        "width": width if width > 0 else settings.BROWSER_WIDTH,
+        "height": height if height > 0 else settings.BROWSER_HEIGHT,
+    }
+    if restored_viewport["width"] <= 0 or restored_viewport["height"] <= 0:
+        return
+
+    LOG.warning(
+        "Restoring invalid page viewport before screenshot",
+        viewport=viewport,
+        restored_viewport=restored_viewport,
+    )
+    await page.set_viewport_size(restored_viewport)
+
+
 async def _page_screenshot_helper(
     page: Page,
     file_path: str | None = None,
@@ -406,6 +432,7 @@ async def _page_screenshot_helper(
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
+    await _restore_invalid_viewport_before_screenshot(page)
     if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
         try:
             await SkyvernFrame.hide_cursor_overlay(page)
