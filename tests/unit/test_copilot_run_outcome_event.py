@@ -292,7 +292,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["not_demonstrated"]
     final = frames[-1]
-    assert final.reason_code == "terminal_challenge_blocker"
+    assert final.reason_code == "blocker_reported"
     assert final.workflow_run_id == "wr_test"
     assert final.workflow_run_block_ids == ["wrb_open_registry_search", "wrb_search_registry_person"]
     assert final.block_labels == ["open_registry_search", "search_registry_person"]
@@ -308,7 +308,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
     assert ctx.last_run_outcome_block_labels == final.block_labels
 
 
-def test_challenge_failure_records_terminal_blocker_outcome() -> None:
+def test_challenge_failure_records_observation_without_halting_agent() -> None:
     result = _challenge_failure_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -316,24 +316,19 @@ def test_challenge_failure_records_terminal_blocker_outcome() -> None:
 
     assert outcome == RecordedRunOutcome(
         verdict="not_demonstrated",
-        reason_code="terminal_challenge_blocker",
-        display_reason=run_outcome_display_reason(
-            "Run output reported a blocker: Human verification challenge blocked the search."
-        ),
+        reason_code="blocker_reported",
+        display_reason=run_outcome_display_reason("Human verification challenge blocked the search."),
         workflow_run_id="wr_challenge",
     )
     assert ctx.last_run_outcome == outcome
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_anti_bot is not None
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
-    assert ctx.blocker_signal.extra["run_outcome_reason_code"] == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.extra["evidence_source"] == "structured_blocker"
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
 
 
-def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
+def test_challenge_failure_sanitizes_model_observation_reason() -> None:
     result = _challenge_failure_result()
     raw_reason = (
         "Human verification challenge blocked https://user:secret@example.com/path?token=abc "
@@ -343,10 +338,11 @@ def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
     result["data"]["blocks"][0]["failure_reason"] = raw_reason
     ctx = _ctx(result["data"]["blocks"])
 
-    _record_run_blocks_result(ctx, result, completion_verification=None)
+    outcome = _record_run_blocks_result(ctx, result, completion_verification=None)
 
-    assert ctx.turn_halt is not None
-    evidence_reason = ctx.turn_halt.extra["evidence_reason"]
+    assert ctx.turn_halt is None
+    assert outcome is not None
+    evidence_reason = outcome.display_reason or ""
     assert re.search(r"https://example\.com", evidence_reason) is not None
     assert "[REDACTED_SECRET]" in evidence_reason
     assert "user:secret" not in evidence_reason

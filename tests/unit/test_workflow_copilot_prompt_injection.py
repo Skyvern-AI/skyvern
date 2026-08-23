@@ -64,29 +64,11 @@ class TestSystemTemplateSecurity:
 
 
 class TestAgentTemplateCorrectionRules:
-    def test_agent_template_requires_label_and_title_refresh_on_corrections(self) -> None:
+    def test_agent_template_protects_existing_blocks_across_additive_edits(self) -> None:
         rendered = render_agent_prompt()
 
-        assert "Rename affected block labels and block titles" in rendered
-        assert "Labels become output keys" in rendered
-        assert "Jinja block reference" in rendered
-
-    def test_agent_template_extends_commit_early_to_additive_edits(self) -> None:
-        rendered = render_agent_prompt()
-
-        assert "existing workflow draft needs a well-scoped additive edit" in rendered
-        assert "clear condition plus action target" in rendered
-        assert "update_and_run_blocks" in rendered
-        assert "prose-only block outline" in rendered
-
-    def test_agent_template_prefers_prompt_criteria_for_extraction_conditionals(self) -> None:
-        rendered = render_agent_prompt()
-
-        assert "conditional branches that depend on prior extraction output" in rendered
-        assert "criteria_type: prompt" in rendered
-        assert "Do NOT write pure Jinja" in rendered
-        assert "inspect_table.output.extracted_information.has_match" in rendered
-        assert "safe snapshot of prior extraction results" in rendered
+        assert "Blocks already in the workflow stay as-is unless the user asks you to change them" in rendered
+        assert "If you think one should change, ask before changing it" in rendered
 
 
 class TestUserTemplateCodeFencing:
@@ -277,8 +259,10 @@ class TestAgentTemplateSecurity:
 class TestAgentTemplateCredentialHandlingRule:
     def test_agent_template_keeps_raw_credential_deferral(self) -> None:
         rendered = render_agent_prompt()
-        assert "CREDENTIAL HANDLING - CRITICAL:" in rendered
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in rendered
+        assert "If a message contains a raw secret written inline" in rendered
+        assert "do not echo it, do not type or submit it into a page" in rendered
+        assert "do not use the browser or run anything with it" in rendered
+        assert "persist only a redacted draft that uses a saved credential parameter" in rendered
 
     def test_agent_template_does_not_reintroduce_sample_value_refusal_rule(self) -> None:
         rendered = render_agent_prompt()

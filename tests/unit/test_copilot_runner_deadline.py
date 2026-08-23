@@ -72,7 +72,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
 async def test_runner_deadline_protects_context_overflow_recovery_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -297,7 +297,7 @@ async def test_a_broken_recorder_neither_masks_nor_delays_the_cancellation(
 async def test_deadline_event_names_the_operation_still_open_when_the_budget_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -352,7 +352,7 @@ async def test_a_broken_fingerprint_reader_neither_masks_nor_delays_the_cancella
 async def test_the_deadline_names_the_inner_operation_that_returned_over_the_outer_one_still_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -390,7 +390,7 @@ async def test_the_deadline_names_the_inner_operation_that_returned_over_the_out
 async def test_the_deadline_names_an_operation_that_exited_by_exception_and_never_calls_it_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()

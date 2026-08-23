@@ -62,6 +62,7 @@ def _ctx(
     ctx.latest_diagnosis_repair_contract = None
     ctx.test_after_update_done = last_test_ok is not None
     ctx.last_update_block_count = None
+    ctx.request_policy.selected_connected_account_id = None
     return ctx
 
 

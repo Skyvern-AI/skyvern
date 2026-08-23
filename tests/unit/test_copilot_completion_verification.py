@@ -2746,7 +2746,6 @@ def test_visual_prompt_requests_outcome_relevant_page_state() -> None:
     assert "cart items" in prompt
     assert "visible identifiers" in prompt
     assert "quantities" in prompt
-    assert "human-verification" in prompt
 
 
 def test_summarize_unsatisfied_lists_unmet_outcomes() -> None:

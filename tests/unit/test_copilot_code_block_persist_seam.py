@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
+from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 
 
 def _yaml(body: str) -> str:
@@ -311,11 +312,13 @@ async def _empty_credentials() -> list[SimpleNamespace]:
 
 
 @pytest.mark.asyncio
-async def test_google_notice_capture_waits_for_a_relevant_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_google_notice_capture_records_every_sheets_binding_including_resolvable_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _stub_successful_update(monkeypatch)
     ctx = _ctx()
     ctx.google_connection_turn_start_bindings = ()
-    current_bindings = iter(((), (("write_sheet", "goac_error"),)))
+    current_bindings = iter(((), (("write_sheet", "goac_active"),), (("write_sheet", "goac_active"),)))
     captures: list[dict[str, object]] = []
 
     monkeypatch.setenv("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS", "/tmp/google-notice-capture")
@@ -326,7 +329,14 @@ async def test_google_notice_capture_waits_for_a_relevant_binding(monkeypatch: p
     )
 
     async def _visible_credentials(_organization_id: str) -> list[SimpleNamespace]:
-        return [SimpleNamespace(id="goac_error", state="error", credential_name="Needs reconnect")]
+        return [
+            SimpleNamespace(
+                id="goac_active",
+                state="active",
+                credential_name="Sheets account",
+                scopes_granted=[GOOGLE_SHEETS_DATA_SCOPE],
+            )
+        ]
 
     monkeypatch.setattr(
         workflow_update_module.google_oauth_service,
@@ -346,16 +356,17 @@ async def test_google_notice_capture_waits_for_a_relevant_binding(monkeypatch: p
     )
     assert first["ok"] is True
     assert captures == []
-    assert ctx.google_connection_notice_capture_written is False
 
-    second = await _update_workflow(
-        {"workflow_yaml": _code_yaml('return {"step": 2}')},
-        ctx,
-        allow_missing_credentials=True,
-    )
-    assert second["ok"] is True
-    assert len(captures) == 1
-    assert ctx.google_connection_notice_capture_written is True
+    for step in (2, 3):
+        accepted = await _update_workflow(
+            {"workflow_yaml": _code_yaml(f'return {{"step": {step}}}')},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert accepted["ok"] is True
+
+    assert [capture["observed_notices"] for capture in captures] == [[], []]
+    assert [capture["turn_id"] for capture in captures] == [ctx.turn_id, ctx.turn_id]
 
 
 @pytest.mark.asyncio

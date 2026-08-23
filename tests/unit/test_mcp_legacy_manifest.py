@@ -140,7 +140,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
 # Resolved memberships for the three pre-existing scopes must remain byte-for-byte stable.
 LEGACY_SCOPE_MEMBERSHIP_DIGESTS: dict[MCPScope, tuple[int, str]] = {
     "browser": (54, "8c05058f36d5d4472e11f384ed68cabbae0478b3e16d2f7da6c2d07dda21703a"),
-    "build": (60, "9e00f4ef315bddba70665bfc3fa84ff97c56d37551d136b7624d9ba4d4526675"),
+    "build": (61, "3d5e09451edd441de5c79f489539a8b0f97679e0e342972c7541757eb4de14a4"),
     "operate": (29, "d5181b03b06212403ce381a6f95a916d12e303987949acd46b8f813f38e413f0"),
 }
 

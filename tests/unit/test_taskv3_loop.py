@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import random
 import time
@@ -20,6 +21,8 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.taskv3.loop import (
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
@@ -3060,3 +3063,263 @@ async def test_disabling_the_stall_guard_silences_its_measurement_streams_too() 
     assert outcome.status == "completed"
     events = {PERCEPTION_STALL_SHADOW_EVENT, PERCEPTION_STALL_SUPPRESSED_EVENT}
     assert not [entry for entry in logs if entry.get("event") in events]
+
+
+@pytest.mark.asyncio
+async def test_model_hidden_secret_values_are_scrubbed_from_the_tool_message_the_model_sees() -> None:
+    """A model-hidden value (a magic sign-in link URL and its bare token) must never reach the
+    LLM's view of a tool result — including a tool_error raised by a handler — while a
+    registered-but-not-hidden secret (a TOTP code) still passes through untouched."""
+    hidden_url = "https://example.test/magic?token=synthetictoken0123"
+    hidden_token = "synthetictoken0123"
+    visible_code = "123456"
+
+    async def clean_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("nothing sensitive here")
+
+    async def linky_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"now at {hidden_url} code {visible_code}")
+
+    async def boom_handler(_args: dict[str, Any]) -> ToolResult:
+        raise ValueError(f"failed at {hidden_url}")
+
+    tools = [
+        ToolSpec(name="clean", description="c", parameters={"type": "object", "properties": {}}, handler=clean_handler),
+        ToolSpec(name="linky", description="l", parameters={"type": "object", "properties": {}}, handler=linky_handler),
+        ToolSpec(name="boom", description="b", parameters={"type": "object", "properties": {}}, handler=boom_handler),
+        make_finish_tool(),
+    ]
+    script = [
+        [("clean", {}), ("linky", {}), ("boom", {})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+
+    ctx = SkyvernContext(task_id="tsk_hidden_link")
+    ctx.register_secret_value(hidden_url, hide_from_model=True)
+    ctx.register_secret_value(hidden_token, hide_from_model=True)
+    ctx.register_secret_value(visible_code)
+    skyvern_context.set(ctx)
+    try:
+        outcome, caller = await _run(script, tools)
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    tool_messages = {m["name"]: m["content"] for m in caller.message_history if m.get("role") == "tool"}
+    assert tool_messages["clean"] == "nothing sensitive here"
+    assert tool_messages["linky"] == f"now at [withheld: sign-in link] code {visible_code}"
+    assert tool_messages["boom"] == "tool_error: ValueError: failed at [withheld: sign-in link]"
+
+    assert ctx.runtime_secret_values == {hidden_url, hidden_token, visible_code}
+    assert ctx.model_hidden_values == {hidden_url, hidden_token}
+
+
+@pytest.mark.asyncio
+async def test_on_pre_action_fires_before_dispatch_only_for_submit_shaped_actions() -> None:
+    # The pre-action hook fires BEFORE the handler runs (after it the page may be the confirmation
+    # page) and only for the loop's own submit-shaped predicate: any click, an Enter press, a type
+    # that presses Enter. Perception, a plain type, a non-Enter key and solve_captcha never fire it.
+    events: list[str] = []
+
+    async def _pre(tool_name: str, args: dict[str, Any]) -> None:
+        events.append(f"pre:{tool_name}")
+
+    def _tool(name: str) -> ToolSpec:
+        async def handler(args: dict[str, Any]) -> ToolResult:
+            events.append(f"run:{name}")
+            return ToolResult.ok("ok")
+
+        spec = ToolSpec(name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler)
+        spec.billable = name != "observe"
+        return spec
+
+    tools = [_tool(n) for n in ("observe", "click", "type", "press_key", "solve_captcha")]
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("observe", {})],
+        [("type", {"selector": "#a", "text": "x"}), ("type", {"selector": "#b", "text": "y", "press_enter": True})],
+        [("press_key", {"key": "Tab"}), ("press_key", {"key": "Enter"})],
+        [("solve_captcha", {}), ("click", {"selector": "#submit"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, tools + [make_finish_tool()], on_pre_action=_pre)
+    assert outcome.status == "completed"
+    assert events == [
+        "run:observe",
+        "run:type",
+        "pre:type",
+        "run:type",
+        "run:press_key",
+        "pre:press_key",
+        "run:press_key",
+        "run:solve_captcha",
+        "pre:click",
+        "run:click",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_pre_action_failure_does_not_abort_the_action() -> None:
+    async def _boom(tool_name: str, args: dict[str, Any]) -> None:
+        raise RuntimeError("capture boom")
+
+    clk: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", clk)
+    click.billable = True
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, _ = await _run(script, [click, make_finish_tool()], on_pre_action=_boom)
+    assert outcome.status == "completed"
+    assert len(clk) == 1
+
+
+_SALT = "a" * 32
+_SECRET_TEXT = "Boston-Zip-02134-sentinel"
+
+
+def _record_dump(logs: list[dict[str, Any]]) -> str:
+    return json.dumps(logs, default=str, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_record_carries_a_stable_action_key_hash_and_never_the_value() -> None:
+    # Same (tool, canonical args) → same hash within a run; a changed arg → a different hash. This is
+    # what lets a Datadog query tell "the guard's key repeated N times" from "the text varied".
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_recording_tool("type", calls), make_finish_tool()]
+    script = [
+        [("type", {"selector": "#city", "text": _SECRET_TEXT})],
+        [("type", {"text": _SECRET_TEXT, "selector": "#city"})],  # key order differs, key identical
+        [("type", {"selector": "#city", "text": _SECRET_TEXT + "x"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await _run(script, tools, telemetry_salt=_SALT)
+    records = [entry for entry in logs if entry["event"] == "taskv3 tool call finished"]
+    hashes = [entry["action_key_hash"] for entry in records]
+    assert len(hashes) == 4 and all(len(h) == 16 for h in hashes)
+    assert hashes[0] == hashes[1] != hashes[2]
+    canonical = json.dumps({"selector": "#city", "text": _SECRET_TEXT}, sort_keys=True)
+    expected = hashlib.sha256(f"{_SALT}\x1ftype\x1f{canonical}".encode()).hexdigest()[:16]
+    assert hashes[0] == expected
+    dump = _record_dump(logs)
+    assert _SECRET_TEXT not in dump and "#city" not in dump and _SALT not in dump
+
+
+@pytest.mark.asyncio
+async def test_observe_summary_cannot_shadow_the_attribution_fields() -> None:
+    # A summary key named like a fixed field would otherwise raise at the log call on every observe.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("snap", data={"summary": {"probe_first_time": 7, "snapshot_digest": 1, "text_dropped": 2}})
+
+    tools = [ToolSpec(name="observe", description="o", parameters={}, handler=handler, compactable=True)]
+    script = [[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [*tools, make_finish_tool()], telemetry_salt=_SALT)
+    assert outcome.status == "completed"
+    record = [e for e in logs if e["event"] == "taskv3 tool call finished" and e["tool"] == "observe"][0]
+    assert record["probe_first_time"] is True and len(record["snapshot_digest"]) == 16
+    assert record["text_dropped"] == 2
+
+
+@pytest.mark.asyncio
+async def test_action_repeated_verdict_carries_the_key_hash_it_counted() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    click = _recording_tool("click", calls)
+    click.billable = True
+    script = [[("click", {"selector": "#go"})] for _ in range(6)]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script, [click, make_finish_tool()], action_nudge_after=2, action_terminate_after=3, telemetry_salt=_SALT
+        )
+    assert outcome.status == "terminated"
+    repeated = [e for e in logs if e["event"] == "taskv3 loop action repeated"][0]
+    finished = [e for e in logs if e["event"] == "taskv3 tool call finished"][0]
+    assert repeated["action_key_hash"] == finished["action_key_hash"]
+
+
+@pytest.mark.asyncio
+async def test_action_key_hash_differs_across_runs_without_an_injected_salt() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    script = [[("type", {"selector": "#city", "text": "x"})], [("finish", {"status": "completed", "reason": "ok"})]]
+    seen = []
+    for _ in range(2):
+        with capture_logs() as logs:
+            await _run(script, [_recording_tool("type", calls), make_finish_tool()])
+        seen.append([e["action_key_hash"] for e in logs if e["event"] == "taskv3 tool call finished"][0])
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.asyncio
+async def test_perception_records_carry_snapshot_digest_and_first_time_flag() -> None:
+    contents = ["page-A " + _SECRET_TEXT, "page-A " + _SECRET_TEXT, "page-B " + _SECRET_TEXT]
+    tools = [_perception_tool("observe", contents), _recording_tool("click", []), make_finish_tool()]
+    script = [
+        [("observe", {"selector": "#a"})],
+        [("click", {"selector": "#btn"})],
+        [("observe", {"selector": "#a"})],
+        [("observe", {"selector": "#b"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await _run(script, tools, telemetry_salt=_SALT)
+    records = [entry for entry in logs if entry["event"] == "taskv3 tool call finished"]
+    observes = [r for r in records if r["tool"] == "observe"]
+    assert [r["probe_first_time"] for r in observes] == [True, False, True]
+    digests = [r["snapshot_digest"] for r in observes]
+    assert digests[0] == digests[1] != digests[2] and all(len(d) == 16 for d in digests)
+    content_sha = hashlib.sha256(contents[0].encode()).hexdigest()
+    assert digests[0] == hashlib.sha256(f"{_SALT}\x1f{content_sha}".encode()).hexdigest()[:16]
+    # Action tools never enter the ledger, so they carry neither field — today's record shape holds.
+    click = [r for r in records if r["tool"] == "click"][0]
+    assert "snapshot_digest" not in click and "probe_first_time" not in click
+    dump = _record_dump(logs)
+    assert _SECRET_TEXT not in dump and _SALT not in dump
+
+
+@pytest.mark.asyncio
+async def test_stall_firing_lines_carry_the_compared_digest_and_key_hash() -> None:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("frozen " + _SECRET_TEXT)
+
+    probe = ToolSpec(name="get_html", description="g", parameters={}, handler=handler, compactable=True)
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("get_html", {"selector": "#x"})] for _ in range(6)]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [probe, make_finish_tool()], stall_terminate_after=4, telemetry_salt=_SALT)
+    assert outcome.status == "terminated"
+    stalled = [e for e in logs if e["event"] == "taskv3 loop perception stalled"][0]
+    finished = [e for e in logs if e["event"] == "taskv3 tool call finished"][0]
+    assert stalled["snapshot_digest"] == finished["snapshot_digest"]
+    assert stalled["action_key_hash"] == finished["action_key_hash"]
+    assert _SECRET_TEXT not in _record_dump(logs) and _SALT not in _record_dump(logs)
+
+
+@pytest.mark.asyncio
+async def test_shadow_and_suppressed_lines_carry_the_hash_fields() -> None:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("changed" if args.get("selector") == "#break" else "Select One")
+
+    probe = ToolSpec(name="get_html", description="g", parameters={}, handler=handler, compactable=True)
+    selectors = [f"#dd-{i}" for i in range(4)]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("get_html", {"selector": s})] for s in selectors]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        await _run(
+            script, [probe, make_finish_tool()], stall_terminate_after=4, stall_nudge_after=2, telemetry_salt=_SALT
+        )
+    suppressed = [e for e in logs if e["event"] == PERCEPTION_STALL_SUPPRESSED_EVENT][0]
+    assert len(suppressed["snapshot_digest"]) == 16 and len(suppressed["action_key_hash"]) == 16
+
+    contents = ["state-A", "state-B"] * 10
+    script = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    with capture_logs() as logs:
+        await _run(
+            script,
+            [_perception_tool("observe", contents), make_finish_tool()],
+            stall_terminate_after=4,
+            telemetry_salt=_SALT,
+        )
+    shadow = [e for e in logs if e["event"] == PERCEPTION_STALL_SHADOW_EVENT][0]
+    assert len(shadow["snapshot_digest"]) == 16 and len(shadow["action_key_hash"]) == 16
