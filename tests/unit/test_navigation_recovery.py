@@ -105,6 +105,23 @@ class TestEvaluateWithNavigationRecovery:
             )
 
     @pytest.mark.asyncio
+    async def test_navigation_recovery_cannot_outlive_the_original_evaluate_deadline(self) -> None:
+        """Recovery shares evaluate's deadline rather than minting four fresh attempts."""
+        frame = AsyncMock()
+        frame.evaluate = AsyncMock(side_effect=[_context_destroyed_error(), None, 42])
+
+        async def settles_after_the_evaluate_budget(*_args: object, **_kwargs: object) -> None:
+            await asyncio.sleep(0.1)
+
+        frame.wait_for_load_state = settles_after_the_evaluate_budget
+
+        with pytest.raises(SkyvernPageAnalysisTimeout, match="Skyvern timed out trying to analyze the page"):
+            await SkyvernFrame.evaluate(frame=frame, expression="() => 42", timeout_ms=50)
+
+        # No re-injection or retry may start after the original evaluate budget has elapsed.
+        assert frame.evaluate.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_recovers_after_one_context_destroyed(self) -> None:
         """First eval fails, re-inject + retry succeeds."""
         frame = AsyncMock()

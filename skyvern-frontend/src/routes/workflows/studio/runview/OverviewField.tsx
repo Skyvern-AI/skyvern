@@ -9,7 +9,7 @@ export function OverviewField({
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      <span className="text-[11px] font-medium text-muted-foreground">
         {label}
       </span>
       <div className="break-words text-sm text-foreground">{children}</div>

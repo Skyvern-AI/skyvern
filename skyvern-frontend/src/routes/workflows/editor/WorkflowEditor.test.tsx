@@ -173,7 +173,8 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
       isLoading: false,
     });
 
-    renderStudioAt("/agents/wpid_live/studio?wr=wr_1");
+    // Editor open alongside the run: the authoring cluster (Save) is up too.
+    renderStudioAt("/agents/wpid_live/studio?wr=wr_1&panes=editor,overview");
 
     expect(screen.getByTestId("editor-tab-body")).toBeTruthy();
     expect(screen.queryByText(/Agent deleted on/)).toBeNull();
@@ -181,8 +182,32 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
       screen.queryByText("Source agent deleted — this run is view-only."),
     ).toBeNull();
     expect(screen.getByLabelText("Save workflow")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^Run$/ })).toBeTruthy();
     expect(
       (screen.getByRole("button", { name: "Copilot" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  test("a bare run link (watch-and-review) keeps Run but not the authoring cluster", () => {
+    workflowQueryMock.mockReturnValue({
+      data: liveWorkflow,
+      isLoading: false,
+      isError: false,
+    });
+    runQueryMock.mockReturnValue({
+      data: makeRun(liveWorkflow),
+      isLoading: false,
+    });
+
+    renderStudioAt("/agents/wpid_live/studio?wr=wr_1");
+
+    expect(screen.getByRole("button", { name: /^Run$/ })).toBeTruthy();
+    expect(screen.queryByLabelText("Save workflow")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Inputs" })).toBeNull();
+    // Not the deleted-agent degradation: Editor is still openable.
+    expect(
+      (screen.getByRole("button", { name: "Editor" }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
   });

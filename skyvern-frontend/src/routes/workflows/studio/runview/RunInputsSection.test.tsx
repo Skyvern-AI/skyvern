@@ -118,7 +118,7 @@ describe("RunInputsSection", () => {
       screen.queryByText("https://example.test/invoice.pdf"),
     ).not.toBeNull();
     // Nested value renders the collapsible searchable tree (JsonExplorer).
-    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Search JSON" })).not.toBeNull();
   });
 
   test("labels every prompt inset, including single-field blocks", () => {

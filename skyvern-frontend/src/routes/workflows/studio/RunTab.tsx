@@ -2,6 +2,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { statusIsFinalized } from "@/routes/tasks/types";
+import { SELECTED_BLOCK_SEARCH_PARAM } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRerunNavigationState } from "../utils";
 import { RunView } from "./runview/RunView";
@@ -50,13 +51,16 @@ export function RunTab() {
       onFix={
         workflowDeleted
           ? undefined
-          : (seedMessage) => {
+          : (seedMessage, failingLabel) => {
               // One replace-navigation opens the Copilot pane and seeds the message
               // via location.state (Workspace reads it as the copilot's
               // initialMessage), so the pane write can't race a separate
               // state-only navigation.
               openPane("copilot", {
                 state: { copilotMessage: seedMessage },
+                extraSearchParams: {
+                  [SELECTED_BLOCK_SEARCH_PARAM]: failingLabel ?? null,
+                },
               });
             }
       }

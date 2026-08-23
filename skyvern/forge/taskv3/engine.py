@@ -33,6 +33,7 @@ from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
     LoopOutcome,
+    SubmitWatch,
     ToolSpec,
     make_finish_tool,
     run_agent_tool_loop,
@@ -172,6 +173,7 @@ async def run_task_v3_agent_loop(
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
+    pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -199,9 +201,12 @@ async def run_task_v3_agent_loop(
     # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
+    submit_watch = SubmitWatch()
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         max_settle_deferrals=max_settle_deferrals,
+        pending_marker=None if page_free else pending_marker,
+        submit_watch=None if page_free else submit_watch,
         should_cancel=should_cancel,
         deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
         activity=activity,
@@ -226,6 +231,7 @@ async def run_task_v3_agent_loop(
         retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
         max_call_retries=DEFAULT_MAX_CALL_RETRIES,
         activity=activity,
+        submit_watch=None if page_free else submit_watch,
     )
     LOG.info(
         "taskv3 engine loop finished",

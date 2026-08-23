@@ -1,6 +1,7 @@
 import { CheckIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { Link } from "react-router-dom";
 
+import { TriggerType } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { cn, handleInfiniteScroll } from "@/util/utils";
@@ -8,12 +9,20 @@ import { cn, handleInfiniteScroll } from "@/util/utils";
 import {
   getRunAbsoluteTime,
   getRunAgoLabel,
+  getRunDurationLabel,
 } from "../debugger/recentActivity/runActivity";
 import { useInfiniteWorkflowRunsQuery } from "../hooks/useInfiniteWorkflowRunsQuery";
 import { useSwitchStudioRun } from "./runSwitchNavigation";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 
 const PAGE_SIZE = 20;
+// Manual is the common case and reads as noise on every row; the rest answer
+// "why did this run happen?" with something the user did not do by hand.
+const TRIGGER_LABEL: Partial<Record<TriggerType, string>> = {
+  [TriggerType.Scheduled]: "Scheduled",
+  [TriggerType.Api]: "API",
+  [TriggerType.Mcp]: "MCP",
+};
 // While the popover is open, poll past the app-wide 5-minute staleTime so an
 // in-flight run's badge and runs started elsewhere surface without a refocus.
 const REFRESH_INTERVAL_MS = 10_000;
@@ -95,6 +104,10 @@ export function PastRunsList({
               const isCurrent = run.workflow_run_id === inspectedRunId;
               const ago = getRunAgoLabel(run, now);
               const absolute = getRunAbsoluteTime(run);
+              const duration = getRunDurationLabel(run);
+              const trigger = run.trigger_type
+                ? TRIGGER_LABEL[run.trigger_type]
+                : undefined;
               return (
                 <li key={run.workflow_run_id}>
                   <button
@@ -111,7 +124,7 @@ export function PastRunsList({
                     }}
                     aria-current={isCurrent ? "true" : undefined}
                     className={cn(
-                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
+                      "flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
                       "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
                       isCurrent
                         ? "bg-accent dark:bg-white/10"
@@ -122,17 +135,28 @@ export function PastRunsList({
                       status={run.status}
                       className="shrink-0 md:w-auto"
                     />
-                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                      {run.workflow_run_id}
-                    </span>
-                    {ago ? (
-                      <span
-                        title={absolute ?? undefined}
-                        className="shrink-0 text-[10px] tabular-nums text-muted-foreground"
-                      >
-                        {ago}
+                    <span className="flex min-w-0 flex-1 flex-col">
+                      {/* Runs in this list all belong to one workflow, so the
+                          title never varies — when it ran is what tells them
+                          apart. */}
+                      <span className="flex items-baseline gap-2">
+                        <span
+                          title={absolute ?? undefined}
+                          className="min-w-0 flex-1 truncate text-xs font-medium text-foreground"
+                        >
+                          {ago ?? absolute ?? "—"}
+                        </span>
+                        {duration ? (
+                          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                            {duration}
+                          </span>
+                        ) : null}
                       </span>
-                    ) : null}
+                      <span className="truncate text-[10px] leading-tight text-muted-foreground/80">
+                        <span className="font-mono">{run.workflow_run_id}</span>
+                        {trigger ? ` · ${trigger}` : null}
+                      </span>
+                    </span>
                     {isCurrent ? (
                       <CheckIcon className="size-4 shrink-0 text-foreground" />
                     ) : null}

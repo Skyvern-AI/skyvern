@@ -206,3 +206,30 @@ async def test_get_workflow_run_response_echoes_fresh_and_drops_session() -> Non
     assert resp.run_request.browser_session_id is None
     # The top-level field still surfaces the actual session the run used.
     assert resp.browser_session_id == "pbs_forced"
+
+
+@pytest.mark.parametrize("value", ["__untagged__", "__other__"])
+def test_retry_drops_legacy_reserved_metadata_instead_of_failing(value: str) -> None:
+    # Runs tagged before the reserved-value rule still have to be retryable: the replay
+    # reloads their stored tags, so raising here would strand them permanently.
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": value, "team": "growth"},
+    )
+    assert body.run_metadata == {"team": "growth"}
+
+
+def test_retry_run_metadata_is_none_when_every_entry_was_reserved() -> None:
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": "__other__"},
+    )
+    assert body.run_metadata is None
+
+
+def test_retry_keeps_metadata_that_merely_contains_a_reserved_substring() -> None:
+    body = workflow_request_body_from_existing_run(
+        _fresh_run(start_fresh=False, session_id=None),
+        run_metadata={"cost_center": "prod__other__eu"},
+    )
+    assert body.run_metadata == {"cost_center": "prod__other__eu"}

@@ -266,10 +266,8 @@ describe("WorkflowRunBlockDetail router", () => {
 
     expect(screen.getByText("output")).toBeDefined();
     expect(screen.getAllByText("status_code").length).toBeGreaterThanOrEqual(1);
-    expect(
-      screen.getAllByPlaceholderText("Search JSON").length,
-    ).toBeGreaterThanOrEqual(1);
-
+    // The field sits behind the explorer's corner toggle.
+    fireEvent.click(screen.getAllByRole("button", { name: "Search JSON" })[0]!);
     fireEvent.change(screen.getAllByPlaceholderText("Search JSON")[0]!, {
       target: { value: "low_value" },
     });
@@ -506,14 +504,18 @@ describe("WorkflowRunBlockDetail router", () => {
     expect(screen.getByText("{{ x == 1 }}")).toBeDefined();
   });
 
-  it("renders the loop detail (iterable values) for a for_loop block with values", () => {
+  it("renders a for_loop block with no body below the tabs — the iterable lives in Inputs", () => {
     const block = buildBlock({
       block_type: "for_loop",
       loop_values: [{ name: "alpha" }, { name: "beta" }],
     });
     render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
-    // Header section enumerates the iterable count
-    expect(screen.getByText(/iterable values \(2\)/i)).toBeDefined();
+    expect(screen.queryByText(/iterable values/i)).toBeNull();
+    expect(screen.queryByText(/Current iteration/)).toBeNull();
+    // Radix tabs activate on mousedown.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Inputs" }));
+    expect(screen.getAllByText(/Loop values/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Current value/)).toBeNull();
   });
 
   it("renders the http_request detail (URL) for an http_request block", () => {
@@ -563,8 +565,8 @@ describe("WorkflowRunBlockDetail router", () => {
     // Should render the running extraction's detail header
     expect(screen.getByText("Extraction")).toBeDefined();
     expect(screen.getByText("extract_posts")).toBeDefined();
-    // StatusBadge renders the raw status token ("running"), capitalized via CSS.
-    expect(screen.getByText("running")).toBeDefined();
+    // The header's status glyph carries the raw status token as its name.
+    expect(screen.getByRole("img", { name: "running" })).toBeDefined();
   });
 
   it("does not show a redundant Selected action section when a child action is selected", () => {

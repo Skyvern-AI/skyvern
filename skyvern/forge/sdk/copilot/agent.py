@@ -4260,6 +4260,7 @@ async def _run_copilot_turn_impl(
         block_authoring_policy=copilot_config.block_authoring_policy,
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
+        selected_block_label=getattr(chat_request, "selected_block_label", None),
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
         executed_block_fingerprints={
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
@@ -4466,6 +4467,16 @@ async def _run_copilot_turn_impl(
             "Preserve every other block's code, goal, steps, and configuration exactly as-is.\n\n"
             f"{safe_global_llm_context}"
         )
+    elif ctx.selected_block_label:
+        # An ambient fact, not a directive: the model decides whether the message refers to this
+        # block. Skipped under target_block_label, whose turn is already pinned to one block.
+        safe_selected_block_label = re.sub(r"\s+", " ", ctx.selected_block_label).replace('"', "").strip()[:200]
+        if safe_selected_block_label:
+            scoped_global_llm_context = (
+                f"{scoped_global_llm_context}\n\nCANVAS SELECTION FACT:\n"
+                f'The user currently has the block labeled "{safe_selected_block_label}" selected on the '
+                "studio canvas. If their message refers to a block without naming one, it is likely this one."
+            ).strip()
 
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,

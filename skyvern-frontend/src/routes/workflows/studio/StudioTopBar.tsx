@@ -52,6 +52,7 @@ import { runOutcomeFromStatus } from "./runProjections";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { StudioPaneToggles } from "./StudioPaneToggles";
+import { isAuthoringLayout } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
@@ -408,24 +409,43 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   if (stopOnly) {
     return null;
   }
+  // The label alone doesn't say what a re-run carries; the tooltip does.
   return (
-    <Button
-      size="default"
-      className="h-8 border border-transparent px-3"
-      disabled={isRecording}
-      onClick={startFullRun}
+    <ControlTooltip
+      content={
+        rerunEligible
+          ? "Re-run with this run's inputs (opens the run form pre-filled)"
+          : "Run workflow"
+      }
+      blocked={isRecording}
     >
-      <PlayIcon className="mr-2 size-4" />
-      {rerunEligible ? "Re-run" : "Run"}
-    </Button>
+      <Button
+        size="default"
+        className="h-8 border border-transparent px-3"
+        disabled={isRecording}
+        onClick={startFullRun}
+      >
+        <PlayIcon className="mr-2 size-4" />
+        {rerunEligible ? "Re-run" : "Run"}
+      </Button>
+    </ControlTooltip>
   );
 }
 
 export function StudioTopBar() {
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const workflowDeletedAt = useStudioWorkflowDeletedAt();
-  const { setOpenPanes } = useStudioPanes();
+  const { panes, setOpenPanes } = useStudioPanes();
   const toggleHistoryPanel = useToggleHistoryPanel();
+  const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
+  const hasChanges = useWorkflowHasChangesStore((s) => s.hasChanges);
+  // Watching a run and authoring one are different jobs sharing this bar. The
+  // workflow-mutating controls only earn their place while an authoring pane is
+  // open — otherwise the bar's "Inputs" (workflow parameters) sits next to the
+  // Run pane's own "Inputs" (this run's values), same word, different thing.
+  const authoring = isAuthoringLayout(panes);
+  // Unsaved work always keeps Save reachable, whichever panes are open.
+  const showSave = authoring || contentDirty || hasChanges;
   // Version comparison renders in the editor canvas: collapse to an
   // editor-only layout on entry (an explicit override, like the full-run
   // reset). Exiting doesn't restore the previous set — reopen as needed.
@@ -456,22 +476,32 @@ export function StudioTopBar() {
         </div>
       ) : (
         <div data-tour="editor-actions" className="flex items-center gap-2">
-          <div className="flex items-center gap-1">
-            <SaveButton />
-            <PanelToggle
-              content="schedules"
-              label="Schedule"
-              icon={<CalendarIcon className="size-4" />}
-            />
-            <EditorOverflowMenu
-              triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              onVersionHistory={openVersionHistory}
-              embedded
-            />
-          </div>
-          <div className="h-6 w-px bg-border" aria-hidden />
+          {showSave ? (
+            <>
+              <div className="flex items-center gap-1">
+                <SaveButton />
+                {authoring ? (
+                  <>
+                    <PanelToggle
+                      content="schedules"
+                      label="Schedule"
+                      icon={<CalendarIcon className="size-4" />}
+                    />
+                    <EditorOverflowMenu
+                      triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onVersionHistory={openVersionHistory}
+                      embedded
+                    />
+                  </>
+                ) : null}
+              </div>
+              <div className="h-6 w-px bg-border" aria-hidden />
+            </>
+          ) : null}
           <div className="flex items-center gap-2">
-            <PanelToggle content="parameters" label="Inputs" />
+            {authoring ? (
+              <PanelToggle content="parameters" label="Inputs" />
+            ) : null}
             <RunStopButton />
           </div>
         </div>

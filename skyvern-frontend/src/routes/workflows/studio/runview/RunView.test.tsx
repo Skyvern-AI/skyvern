@@ -8,7 +8,13 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useSearchParams,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ReactNode } from "react";
 
@@ -246,10 +252,28 @@ function LocationSpy() {
   return <div data-testid="location-search">{location.search}</div>;
 }
 
+// Stands in for the editor canvas: selecting a block there mirrors the label
+// into ?selected-block= (useSelectedBlockUrlSync).
+function SelectBlockOnCanvas({ label }: { label: string }) {
+  const [params, setParams] = useSearchParams();
+  return (
+    <button
+      onClick={() => {
+        const next = new URLSearchParams(params);
+        next.set("selected-block", label);
+        setParams(next, { replace: true });
+      }}
+    >
+      canvas: select {label}
+    </button>
+  );
+}
+
 function renderRunView(
   props: Partial<Parameters<typeof RunView>[0]> = {},
   initialEntry = "/",
   compact = false,
+  extra?: ReactNode,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -279,6 +303,7 @@ function renderRunView(
           )}
         </TooltipProvider>
         <LocationSpy />
+        {extra}
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -336,15 +361,26 @@ describe("RunView view toggles", () => {
     const { container } = renderRunView();
     const scope = within(container);
 
-    // status · duration — the run id lives in the top bar's "View Run" tab,
-    // and the counts live in the timeline's own header row, so the strip
-    // carries no id chip and no stat boxes.
+    // status · duration · counts · search on one line — the run id lives in
+    // the top bar's "View Run" tab, so the strip carries no id chip, and the
+    // timeline below renders no title row of its own.
     expect(scope.queryByText("wr_1")).toBeNull();
     expect(
       scope.getAllByText("completed", { exact: false }).length,
     ).toBeGreaterThan(0);
     expect(scope.queryByText("Steps")).toBeNull();
     expect(scope.queryByText("Credits")).toBeNull();
+    // The only "Timeline" left is the pane header's view pill; the list no
+    // longer paints a title row of its own.
+    expect(
+      scope.getAllByText("Timeline").every((node) => node.closest("button")),
+    ).toBe(true);
+    const strip = scope.getByRole("button", { name: "Search blocks" })
+      .parentElement?.parentElement;
+    expect(strip).not.toBeNull();
+    expect(within(strip as HTMLElement).getByText("credits")).toBeTruthy();
+    expect(within(strip as HTMLElement).getByText("5")).toBeTruthy();
+    expect(within(strip as HTMLElement).getByText("block")).toBeTruthy();
   });
 
   test("Inputs view shows the run's input metadata, including TOTP diagnostics", () => {
@@ -581,6 +617,92 @@ describe("RunView cold-open selection", () => {
   });
 });
 
+describe("RunView canvas selection sync", () => {
+  function seedTwoBlockRun() {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_login",
+          label: "login",
+          actions: [buildAction({ action_id: "act_login" })],
+        }),
+      ),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_checkout",
+          label: "checkout",
+          actions: [buildAction({ action_id: "act_checkout" })],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+  }
+
+  test("selecting a block on the canvas moves ?active= onto that block", () => {
+    // ?active= is what the Browser pane follows (useRunVisuals), so this is the
+    // whole canvas → run → screenshot chain, not just the store write.
+    seedTwoBlockRun();
+    const { getByTestId, getByRole } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=editor,overview",
+      false,
+      <SelectBlockOnCanvas label="login" />,
+    );
+    // Cold open auto-pins the last item, in the OTHER block.
+    expect(getByTestId("location-search").textContent).not.toContain(
+      "active=wrb_login",
+    );
+
+    fireEvent.click(getByRole("button", { name: /canvas: select login/ }));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_login");
+    expect(getByTestId("location-search").textContent).toContain(
+      "active=wrb_login",
+    );
+  });
+
+  test("leaves the run selection alone while the editor pane is closed", () => {
+    seedTwoBlockRun();
+    const { getByTestId, getByRole } = renderRunView(
+      {},
+      "/?wr=wr_1&panes=overview",
+      false,
+      <SelectBlockOnCanvas label="login" />,
+    );
+
+    fireEvent.click(getByRole("button", { name: /canvas: select login/ }));
+
+    expect(getByTestId("location-search").textContent).not.toContain(
+      "active=wrb_login",
+    );
+  });
+
+  test("authoring a block writes no run reference while the Run pane is closed", () => {
+    // The edit layout: no run in the URL, Run pane closed, RunView still mounted.
+    // Writing ?active= here would make the search run-class and open the run
+    // surfaces, so one click on the canvas dropped the user into the last run.
+    seedTwoBlockRun();
+    const { getByTestId, getByRole } = renderRunView(
+      {},
+      "/?panes=editor,browser",
+      false,
+      <SelectBlockOnCanvas label="login" />,
+    );
+
+    fireEvent.click(getByRole("button", { name: /canvas: select login/ }));
+
+    const search = getByTestId("location-search").textContent ?? "";
+    expect(search).not.toContain("active=");
+    expect(search).not.toContain("wr=");
+  });
+});
+
 describe("RunView live-watch terminal transition", () => {
   function seedWatchedRun(status: Status) {
     mocks.timeline = [
@@ -670,6 +792,30 @@ describe("RunView failure banner", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Retry" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  test("Fix passes the failing block's label alongside the seed message", () => {
+    seedCompletedRun({
+      status: Status.Failed,
+      failure_reason: "Login page rejected the credentials",
+    });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_checkout",
+          label: "checkout",
+          status: Status.Failed,
+        }),
+      ),
+    ];
+    const onFix = vi.fn();
+    const { container } = renderRunView({ onFix, onRetry: vi.fn() });
+
+    fireEvent.click(
+      within(container).getByRole("button", { name: "Fix with Copilot" }),
+    );
+
+    expect(onFix.mock.calls[0]?.[1]).toBe("checkout");
   });
 
   test("splits the banner into a headline and de-emphasized detail", () => {
@@ -853,7 +999,9 @@ describe("RunView live affordances", () => {
     const { container, getByTestId } = renderRunView();
     const scope = within(container);
 
-    fireEvent.click(scope.getByRole("button", { name: "Live" }));
+    fireEvent.click(
+      scope.getByRole("button", { name: "Watch live in the Browser pane" }),
+    );
 
     // Unpins to the live edge and pins the Browser pane's view intent to live.
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
@@ -861,13 +1009,16 @@ describe("RunView live affordances", () => {
     expect(getByTestId("location-search").textContent).toContain("browser");
   });
 
-  test("a queued run shows the queued chip instead of the Live chip", () => {
+  test("a queued run shows only the queued status pill — no Live chip, no banner", () => {
     seedCompletedRun({ status: Status.Queued });
     const { container } = renderRunView();
     const scope = within(container);
 
-    expect(scope.queryByText(/Run queued/)).not.toBeNull();
-    expect(scope.queryByRole("button", { name: "Live" })).toBeNull();
+    expect(scope.getAllByText("queued", { exact: false }).length).toBe(1);
+    expect(scope.queryByText(/Run queued/)).toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Watch live in the Browser pane" }),
+    ).toBeNull();
   });
 
   test("a queued run reports no elapsed time in the strip or the timeline", () => {
@@ -897,21 +1048,27 @@ describe("RunView iteration selection", () => {
     const { container } = renderRunView({}, "/?active=wrb_loop");
     const scope = within(container);
 
-    // Baseline: loop overview (all iterable values), not a single iteration.
-    expect(scope.queryByText(/Iterable values/)).not.toBeNull();
+    // The detail header's meta line is the one place the selected iteration
+    // and its value render. Baseline: the loop's own current iteration.
+    const headerMeta = () =>
+      container.querySelector('[data-slot="block-detail-header-meta"]')
+        ?.textContent ?? "";
+    expect(headerMeta()).toContain("Iteration 1");
+    expect(scope.getByText("alpha")).not.toBeNull();
 
-    // Drill into iteration 2.
+    // Drill into iteration 2 (the timeline row).
     fireEvent.click(scope.getByText("Iteration 2"));
-    expect(scope.queryByText("Iteration 2 value")).not.toBeNull();
-    expect(scope.queryByText(/Iterable values/)).toBeNull();
+    expect(headerMeta()).toContain("Iteration 2");
+    expect(scope.getByText("beta")).not.toBeNull();
+    expect(scope.queryByText("alpha")).toBeNull();
     // The iteration scope is shared with the Browser pane via the store.
     expect(useRunViewStore.getState().activeIteration).toBe(1);
 
     // Click the loop block row (descriptor text is timeline-only). The detail
-    // must fall back to the loop overview instead of staying on iteration 2.
+    // must fall back to the loop's own iteration instead of staying on 2.
     fireEvent.click(scope.getByText(/Loop over 2 values/));
-    expect(scope.queryByText(/Iterable values/)).not.toBeNull();
-    expect(scope.queryByText("Iteration 2 value")).toBeNull();
+    expect(headerMeta()).toContain("Iteration 1");
+    expect(scope.getByText("alpha")).not.toBeNull();
     expect(useRunViewStore.getState().activeIteration).toBeNull();
   }, 20_000);
 });
@@ -963,6 +1120,39 @@ describe("RunView timeline → editor jump", () => {
     expect(focusBlock).toHaveBeenCalledWith("node-jump");
   });
 
+  test("clicking an action row jumps the editor to the action's block and keeps the action pinned", () => {
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_jump",
+          label: "jump-target-block",
+          actions: [buildAction({ action_id: "act_jump" })],
+        }),
+      ),
+    ];
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status: Status.Completed,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    const focusBlock = registerHandle();
+
+    // ?active= on the block expands it so its action rows render.
+    const { container } = renderRunView(
+      {},
+      "/?wr=wr_1&active=wrb_jump&panes=editor,overview",
+    );
+    // The row's name is its index glued to the sr-only action type.
+    fireEvent.click(
+      within(container).getByRole("button", { name: /^#1\s*Click$/ }),
+    );
+
+    expect(focusBlock).toHaveBeenCalledWith("node-jump");
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("act_jump");
+  });
+
   test("clicking a timeline block does not jump when the editor pane is closed", () => {
     seedRunWithBlock("jump-target-block");
     const focusBlock = registerHandle();
@@ -1005,8 +1195,10 @@ describe("RunView output signals", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
 
-    expect(scope.getByText("Run errors")).not.toBeNull();
-    expect(scope.getAllByText("E_INVOICE_MISSING").length).toBeGreaterThan(0);
+    expect(scope.getByText("Errors")).not.toBeNull();
+    // A field, not an alert: no title prose, and each code renders once.
+    expect(scope.queryByText("Run errors")).toBeNull();
+    expect(scope.getAllByText("E_INVOICE_MISSING")).toHaveLength(1);
     expect(scope.getByText("E_PAYMENT_BLOCKED")).not.toBeNull();
     expect(
       scope.getByText("The expected invoice was not available."),
@@ -1062,7 +1254,7 @@ describe("RunView output signals", () => {
     const scope = within(container);
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
-    expect(scope.queryByText("Run errors")).toBeNull();
+    expect(scope.queryByText("Errors")).toBeNull();
   });
 
   test("shows the Outputs empty state when run signals are absent", () => {
@@ -1073,7 +1265,7 @@ describe("RunView output signals", () => {
 
     fireEvent.click(scope.getByRole("button", { name: "Outputs" }));
     expect(scope.getByText("No outputs for this run")).not.toBeNull();
-    expect(scope.queryByText("Run errors")).toBeNull();
+    expect(scope.queryByText("Errors")).toBeNull();
     expect(scope.queryByText("Downloaded files")).toBeNull();
   });
 });

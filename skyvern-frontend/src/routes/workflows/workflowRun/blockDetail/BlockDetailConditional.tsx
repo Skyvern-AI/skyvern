@@ -1,10 +1,12 @@
+import { cn } from "@/util/utils";
+
 import {
+  type BranchEvaluation,
   hasEvaluations,
   type WorkflowRunBlock,
 } from "../../types/workflowRunTypes";
 import { JsonExplorer } from "./BlockInspector";
-import { CodeBlock, Section } from "./shared";
-import { cn } from "@/util/utils";
+import { Section } from "./shared";
 
 type Props = {
   block: WorkflowRunBlock;
@@ -20,15 +22,135 @@ function tryParseJson(value: string): unknown | null {
   }
 }
 
-function RenderedExpression({ value }: { value: string }) {
-  const parsedJson = tryParseJson(value);
-  if (parsedJson !== null) {
-    return <JsonExplorer value={parsedJson} rootLabel="rendered" />;
+/**
+ * One branch as a keyword-led rule line: `if` / `else if` / `else` in a muted
+ * gutter carries the order, the condition follows in regular type (mono only
+ * for a template expression), and the outcome sits at the end — `false` for a
+ * condition that did not hold, the destination for the branch that ran. The
+ * branch that ran is the one emphasized row; no glyph, no tint.
+ */
+function BranchRow({
+  keyword,
+  taken,
+  condition,
+  template,
+  mono = false,
+  outcome,
+  children,
+}: {
+  keyword: string;
+  taken: boolean;
+  condition: string;
+  template?: string | null;
+  mono?: boolean;
+  outcome?:
+    | { kind: "next"; label: string }
+    | { kind: "result"; value: boolean };
+  children?: React.ReactNode;
+}) {
+  return (
+    <li className="space-y-1.5 py-1.5">
+      <div
+        className={cn(
+          "flex items-start gap-3 text-xs",
+          taken ? "text-foreground" : "text-muted-foreground",
+        )}
+      >
+        <span className="w-10 shrink-0 font-mono text-muted-foreground/70">
+          {keyword}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className={cn("break-words", mono && "font-mono")}>
+            {condition}
+          </span>
+          {template ? (
+            <code className="ml-2 break-all font-mono text-muted-foreground/60">
+              {template}
+            </code>
+          ) : null}
+        </span>
+        {outcome?.kind === "next" ? (
+          <span
+            role="img"
+            aria-label="taken"
+            className="shrink-0 whitespace-nowrap text-muted-foreground"
+          >
+            →{" "}
+            <span className="font-medium text-foreground">{outcome.label}</span>
+          </span>
+        ) : outcome?.kind === "result" ? (
+          <span className="shrink-0 font-mono text-muted-foreground/70">
+            {outcome.value ? "true" : "false"}
+          </span>
+        ) : null}
+      </div>
+      {children ? <div className="pl-[3.25rem]">{children}</div> : null}
+    </li>
+  );
+}
+
+function keywordFor(index: number, isDefault: boolean): string {
+  if (isDefault) return "else";
+  return index === 0 ? "if" : "else if";
+}
+
+function EvaluationRow({
+  evaluation,
+  index,
+}: {
+  evaluation: BranchEvaluation;
+  index: number;
+}) {
+  const keyword = keywordFor(index, evaluation.is_default);
+  const outcome = evaluation.is_matched
+    ? evaluation.next_block_label
+      ? ({ kind: "next", label: evaluation.next_block_label } as const)
+      : undefined
+    : evaluation.result === null
+      ? undefined
+      : ({ kind: "result", value: evaluation.result } as const);
+  if (evaluation.is_default) {
+    return (
+      <BranchRow
+        keyword={keyword}
+        taken={evaluation.is_matched}
+        condition="Default branch"
+        outcome={outcome}
+      />
+    );
+  }
+  const mono = evaluation.criteria_type === "jinja2_template";
+  const original = evaluation.original_expression ?? "";
+  const rendered =
+    evaluation.rendered_expression &&
+    evaluation.rendered_expression !== evaluation.original_expression
+      ? evaluation.rendered_expression
+      : null;
+  const renderedJson = rendered ? tryParseJson(rendered) : null;
+  // A JSON-shaped rendered value is too wide for the line; it gets the
+  // explorer underneath and the template keeps the line.
+  if (renderedJson !== null) {
+    return (
+      <BranchRow
+        keyword={keyword}
+        taken={evaluation.is_matched}
+        condition={original}
+        mono={mono}
+        outcome={outcome}
+      >
+        <JsonExplorer value={renderedJson} rootLabel="rendered" />
+      </BranchRow>
+    );
   }
   return (
-    <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-foreground dark:text-slate-200">
-      {value}
-    </code>
+    <BranchRow
+      keyword={keyword}
+      taken={evaluation.is_matched}
+      condition={rendered ?? original}
+      template={rendered ? original : null}
+      mono={mono}
+      outcome={outcome}
+    />
   );
 }
 
@@ -46,110 +168,51 @@ function BlockDetailConditional({ block }: Props) {
     <div className="space-y-4 px-3 py-3 empty:hidden">
       {hasExecutedBranch && evaluations && evaluations.length > 0 ? (
         <Section title="Branches">
-          <div className="space-y-2">
+          <ul className="divide-y divide-border/50">
             {evaluations.map((evaluation, index) => (
-              <div
+              <EvaluationRow
                 key={evaluation.branch_id || index}
-                className={cn(
-                  "space-y-1.5 rounded border px-2.5 py-2 text-xs",
-                  evaluation.is_matched
-                    ? "border-success/50 bg-success/10"
-                    : "border-border bg-slate-elevation3 dark:border-slate-600",
-                )}
-              >
-                {evaluation.is_default ? (
-                  <div className="text-tertiary-foreground">
-                    <span className="font-medium">Default branch</span>
-                    {evaluation.is_matched && (
-                      <span className="ml-2 text-success">✓ Matched</span>
-                    )}
-                  </div>
-                ) : (
-                  <div className="space-y-1.5">
-                    <div className="text-muted-foreground">
-                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground dark:text-slate-500">
-                        Expression
-                      </span>
-                      <div className="mt-0.5">
-                        <code className="break-all rounded bg-slate-elevation1 px-1.5 py-0.5 font-mono text-foreground dark:text-slate-200">
-                          {evaluation.original_expression}
-                        </code>
-                      </div>
-                    </div>
-                    {evaluation.rendered_expression &&
-                      evaluation.rendered_expression !==
-                        evaluation.original_expression && (
-                        <div className="text-muted-foreground">
-                          <span className="text-[10px] uppercase tracking-wide text-muted-foreground dark:text-slate-500">
-                            Rendered
-                          </span>
-                          <div className="mt-0.5">
-                            <RenderedExpression
-                              value={evaluation.rendered_expression}
-                            />
-                          </div>
-                        </div>
-                      )}
-                    <div className="flex items-center gap-2">
-                      <span className="text-muted-foreground dark:text-slate-500">
-                        Result:
-                      </span>
-                      <span
-                        className={cn(
-                          "font-medium",
-                          evaluation.result
-                            ? "text-success"
-                            : "text-red-700 dark:text-red-400",
-                        )}
-                      >
-                        {evaluation.result ? "True" : "False"}
-                      </span>
-                      {evaluation.is_matched && (
-                        <span className="text-success">✓ Matched</span>
-                      )}
-                    </div>
-                  </div>
-                )}
-                {evaluation.is_matched && evaluation.next_block_label && (
-                  <div className="border-t border-border pt-1.5 text-muted-foreground dark:border-slate-600">
-                    → Next:{" "}
-                    <span className="font-medium text-foreground dark:text-slate-200">
-                      {evaluation.next_block_label}
-                    </span>
-                  </div>
-                )}
-              </div>
+                evaluation={evaluation}
+                index={index}
+              />
             ))}
-          </div>
+          </ul>
         </Section>
       ) : hasExecutedBranch ? (
         <Section title="Evaluation">
           {block.executed_branch_expression ? (
-            <div className="space-y-1.5 text-sm text-tertiary-foreground">
-              <div>
-                <span className="text-muted-foreground dark:text-slate-500">
-                  Expression:{" "}
-                </span>
-                <CodeBlock className="mt-1">
-                  {block.executed_branch_expression}
-                </CodeBlock>
-              </div>
-              <div>
-                <span className="text-muted-foreground dark:text-slate-500">
-                  Result:{" "}
-                </span>
-                <span
-                  className={cn(
-                    "font-medium",
-                    block.executed_branch_result
-                      ? "text-success"
-                      : "text-red-700 dark:text-red-400",
-                  )}
-                >
-                  {block.executed_branch_result ? "True" : "False"}
-                </span>
-              </div>
-            </div>
+            <ul className="divide-y divide-border/50">
+              <BranchRow
+                keyword="if"
+                taken={Boolean(block.executed_branch_result)}
+                condition={block.executed_branch_expression}
+                outcome={
+                  block.executed_branch_result
+                    ? block.executed_branch_next_block
+                      ? {
+                          kind: "next",
+                          label: block.executed_branch_next_block,
+                        }
+                      : undefined
+                    : { kind: "result", value: false }
+                }
+              />
+              {!block.executed_branch_result ? (
+                <BranchRow
+                  keyword="else"
+                  taken
+                  condition="Default branch"
+                  outcome={
+                    block.executed_branch_next_block
+                      ? {
+                          kind: "next",
+                          label: block.executed_branch_next_block,
+                        }
+                      : undefined
+                  }
+                />
+              ) : null}
+            </ul>
           ) : (
             <div className="text-sm text-muted-foreground">
               No conditions matched — executed default branch.

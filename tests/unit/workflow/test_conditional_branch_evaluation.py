@@ -1,24 +1,31 @@
 """Tests for prompt-based conditional branch evaluation behavior."""
 
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.config import settings
 from skyvern.exceptions import BranchEvaluationContextTooLargeError, ConditionalBranchEvaluationError
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     BranchEvaluationContext,
     ConditionalBlock,
+    ExtractionBlock,
+    JinjaBranchCriteria,
     PromptBranchCriteria,
     _build_branch_evaluation_schema,
     _coerce_condition_index,
     _make_empty_params_explicit,
+    _neutralize_jinja_delimiters,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
-from skyvern.schemas.workflows import BlockResult
+from skyvern.schemas.workflows import BlockResult, BlockStatus
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON = (
     "Workflow branch evaluation context is too large to process safely. "
@@ -204,7 +211,15 @@ async def test_mixed_prompt_conditions_keep_browser_session() -> None:
 
 @pytest.mark.asyncio
 async def test_oversized_branch_context_trips_before_extraction_and_returns_stable_failure() -> None:
-    block = _conditional_block()
+    # No default branch: with one defined, evaluation failures now route to it (SKY-14080)
+    # instead of surfacing this stable failure.
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("conditional_output"),
+        branch_conditions=[
+            BranchCondition(criteria=PromptBranchCriteria(expression="fallback"), next_block_label="next"),
+        ],
+    )
     oversized_context_value = "oversized-context-value " * 200_000
 
     with (
@@ -1094,3 +1109,385 @@ def test_coerce_condition_index_handles_loose_types() -> None:
     assert _coerce_condition_index("two") is None
     assert _coerce_condition_index("") is None
     assert _coerce_condition_index(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for stored-Jinja injection into branch-eval prompts + default-branch
+# fallback on evaluation failure (SKY-14080)
+# ---------------------------------------------------------------------------
+
+_ALL_JINJA_DELIMITERS = ("{{", "}}", "{%", "%}", "{#", "#}")
+# JSON structure itself produces adjacent `}}` when nested objects close together; without an
+# opening delimiter that text is inert in Jinja, so only openers must never appear in full text.
+_JINJA_OPENING_DELIMITERS = ("{{", "{%", "{#")
+
+
+def _iter_strings(value):  # noqa: ANN001, ANN202
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_strings(key)
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
+
+
+@pytest.mark.asyncio
+async def test_stored_jinja_in_prior_output_does_not_break_branch_evaluation(monkeypatch) -> None:
+    """Regression: a prior block's stored output containing a literal ``{{current_value.x}}``
+    used to be embedded verbatim in the branch-eval goal and re-rendered by the synthetic
+    ExtractionBlock, raising UndefinedError/MissingJinjaVariables under strict templating."""
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", "strict")
+    fake_ctx = FakeWorkflowRunContext(
+        values={
+            "prior_conditional_output": {
+                "criteria_expression": "{{ current_value.account_number }} == '123'",
+                "original_expression": "{{ current_value.account_number }} == '123'",
+                "branch_taken": "path_a",
+            },
+        },
+    )
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(criteria=PromptBranchCriteria(expression="the account is active"), next_block_label="a"),
+            BranchCondition(criteria=PromptBranchCriteria(expression="the account is closed"), next_block_label="b"),
+            BranchCondition(is_default=True, next_block_label="fallback"),
+        ],
+    )
+    branches = [c for c in block.branch_conditions if not c.is_default]
+    evaluation_context = BranchEvaluationContext(
+        workflow_run_context=fake_ctx,
+        block_label="cond",
+        template_renderer=lambda expr: expr,
+    )
+
+    captured: dict = {}
+
+    async def _execute_after_real_format(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        # Run the real second-render step the production ExtractionBlock.execute performs; the
+        # bug fired here as an UndefinedError on the embedded `{{current_value...}}` text.
+        self.format_potential_template_parameters(workflow_run_context=fake_ctx)
+        captured["goal"] = self.data_extraction_goal
+        return _extraction_result(
+            self.output_parameter,
+            [
+                {"condition_index": 1, "reasoning": "ok", "result": False},
+                {"condition_index": 2, "reasoning": "ok", "result": True},
+            ],
+        )
+
+    with patch.object(ExtractionBlock, "execute", _execute_after_real_format):
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]
+    goal = captured["goal"]
+    # The stored expression text survives for the LLM but neutralized, with no live Jinja opener.
+    assert "{ { current_value.account_number } }" in goal
+    for delimiter in _JINJA_OPENING_DELIMITERS:
+        assert delimiter not in goal
+
+
+def test_prerendered_extraction_goal_skips_second_jinja_render(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", "strict")
+    goal = "Evaluate: {{ current_value.account_number }} == '123'"
+    block = ExtractionBlock(label="eval", data_extraction_goal=goal, output_parameter=_output_parameter("out"))
+    block.mark_data_extraction_goal_prerendered()
+
+    block.format_potential_template_parameters(workflow_run_context=FakeWorkflowRunContext(values={}))
+
+    assert block.data_extraction_goal == goal
+
+
+def test_unmarked_extraction_goal_still_renders(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", "strict")
+    block = ExtractionBlock(
+        label="eval",
+        data_extraction_goal="Evaluate: {{ foo }}",
+        output_parameter=_output_parameter("out"),
+    )
+
+    block.format_potential_template_parameters(workflow_run_context=FakeWorkflowRunContext(values={"foo": "bar"}))
+    assert block.data_extraction_goal == "Evaluate: bar"
+
+    unresolvable = ExtractionBlock(
+        label="eval",
+        data_extraction_goal="Evaluate: {{ current_value.account_number }}",
+        output_parameter=_output_parameter("out"),
+    )
+    with pytest.raises(MissingJinjaVariables):
+        unresolvable.format_potential_template_parameters(workflow_run_context=FakeWorkflowRunContext(values={}))
+
+
+def test_llm_safe_context_snapshot_neutralizes_jinja_delimiters() -> None:
+    fake_ctx = FakeWorkflowRunContext(
+        values={
+            "prior_output": {
+                "criteria_expression": "{{ current_value.x }} == 1",
+                "nested": ["{% if x %}", {"deep": "{# comment #}"}],
+            },
+            "extracted_output": {"extracted_information": {"note": "{{ injected }}"}},
+            "plain": "no jinja here",
+            "count": 7,
+        },
+    )
+    snapshot = BranchEvaluationContext(
+        workflow_run_context=fake_ctx, block_label="cond"
+    ).build_llm_safe_context_snapshot()
+
+    for embedded_string in _iter_strings(snapshot):
+        for delimiter in _ALL_JINJA_DELIMITERS:
+            assert delimiter not in embedded_string
+    serialized = json.dumps(snapshot, default=str)
+    for delimiter in _JINJA_OPENING_DELIMITERS:
+        assert delimiter not in serialized
+    # Values stay readable for the LLM and non-strings pass through untouched.
+    assert "current_value.x" in serialized
+    assert snapshot["plain"] == "no jinja here"
+    assert snapshot["count"] == 7
+
+
+def test_neutralize_jinja_delimiters_cannot_reform_delimiters_from_brace_runs() -> None:
+    neutralized = _neutralize_jinja_delimiters({"k": ["{{{x}}}", "{{{{y}}}}", "a{%b%}c", "{#c#}"]})
+    for embedded_string in _iter_strings(neutralized):
+        for delimiter in _ALL_JINJA_DELIMITERS:
+            assert delimiter not in embedded_string
+
+
+def test_neutralize_jinja_delimiters_keeps_keys_that_would_collide() -> None:
+    """Neutralization is not injective, so it is applied to values only: rewriting these two
+    distinct keys would map both to ``{ {a} }`` and silently drop one of the values."""
+    neutralized = _neutralize_jinja_delimiters({"{{a}}": "{{ x }}", "{ {a} }": "{{ y }}"})
+
+    assert len(neutralized) == 2
+    assert neutralized["{{a}}"] == "{ { x } }"
+    assert neutralized["{ {a} }"] == "{ { y } }"
+
+
+@pytest.mark.asyncio
+async def test_branch_evaluation_failure_with_default_branch_falls_back() -> None:
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+            ),
+            BranchCondition(is_default=True, next_block_label="fallback_block"),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, "LLM exploded")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+
+    kwargs = mock_build_result.await_args.kwargs
+    assert kwargs["success"] is True
+    assert kwargs["failure_reason"] is None
+    assert kwargs["status"] == BlockStatus.completed
+    assert kwargs["executed_branch_next_block"] == "fallback_block"
+
+    metadata = kwargs["output_parameter_value"]
+    assert metadata["branch_taken"] == "fallback_block"
+    assert metadata["next_block_label"] == "fallback_block"
+    assert "LLM exploded" in metadata["evaluation_error"]
+    default_eval = next(entry for entry in metadata["evaluations"] if entry["is_default"])
+    assert default_eval["is_matched"] is True
+    failed_eval = next(entry for entry in metadata["evaluations"] if not entry["is_default"])
+    assert "LLM exploded" in failed_eval["error"]
+
+
+@pytest.mark.asyncio
+async def test_branch_evaluation_failure_without_default_branch_still_fails() -> None:
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+            ),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, "LLM exploded")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+
+    kwargs = mock_build_result.await_args.kwargs
+    assert kwargs["success"] is False
+    assert kwargs["status"] == BlockStatus.failed
+    assert "LLM exploded" in kwargs["failure_reason"]
+    metadata = kwargs["output_parameter_value"]
+    assert metadata["branch_taken"] is None
+    assert metadata["next_block_label"] is None
+    assert "evaluation_error" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_no_branch_matched_without_failure_still_takes_default_branch() -> None:
+    """Guard the pre-existing no-match path through the restructured fallback: a clean False
+    evaluation (no error) must take the default branch without recording an evaluation_error."""
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+            ),
+            BranchCondition(is_default=True, next_block_label="fallback_block"),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_extraction_result(
+                block.output_parameter,
+                [{"condition_index": 1, "reasoning": "not premium", "result": False}],
+            )
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+
+    kwargs = mock_build_result.await_args.kwargs
+    assert kwargs["success"] is True
+    assert kwargs["failure_reason"] is None
+    metadata = kwargs["output_parameter_value"]
+    assert metadata["branch_taken"] == "fallback_block"
+    assert "evaluation_error" not in metadata
+    default_eval = next(entry for entry in metadata["evaluations"] if entry["is_default"])
+    assert default_eval["is_matched"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_branch_does_not_hide_a_later_matching_branch() -> None:
+    """A branch that cannot be evaluated must not short-circuit the loop into the default: the
+    remaining branches are still evaluated, and a later match wins over the default."""
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+            ),
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ 1 == 1 }}"), next_block_label="jinja_match"),
+            BranchCondition(is_default=True, next_block_label="fallback_block"),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, "LLM exploded")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+
+    kwargs = mock_build_result.await_args.kwargs
+    assert kwargs["success"] is True
+    assert kwargs["failure_reason"] is None
+    assert kwargs["status"] == BlockStatus.completed
+    assert kwargs["executed_branch_next_block"] == "jinja_match"
+
+    metadata = kwargs["output_parameter_value"]
+    assert metadata["branch_taken"] == "jinja_match"
+    assert metadata["branch_index"] == 1
+    # The unevaluable branch stays visible even though routing succeeded.
+    assert "LLM exploded" in metadata["evaluation_error"]
+    assert "LLM exploded" in metadata["evaluations"][0]["error"]
+    assert [entry["next_block_label"] for entry in metadata["evaluations"] if entry["is_matched"]] == ["jinja_match"]
+
+
+@pytest.mark.asyncio
+async def test_failed_branch_does_not_reorder_later_matching_branches() -> None:
+    """Among branches that do evaluate, author order still decides: an earlier failure must not
+    let a lower-priority branch jump ahead of the first branch that actually matched."""
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="user selected premium plan"), next_block_label="premium"
+            ),
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ 1 == 1 }}"), next_block_label="first_true"),
+            BranchCondition(criteria=JinjaBranchCriteria(expression="{{ 2 == 2 }}"), next_block_label="second_true"),
+            BranchCondition(is_default=True, next_block_label="fallback_block"),
+        ],
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=None),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(
+            return_value=_failed_extraction_result(block.output_parameter, "LLM exploded")
+        )
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+
+    kwargs = mock_build_result.await_args.kwargs
+    metadata = kwargs["output_parameter_value"]
+    assert metadata["branch_taken"] == "first_true"
+    assert metadata["branch_index"] == 1
+    # The third branch is never reached, so it must not appear as evaluated or matched.
+    assert [entry["next_block_label"] for entry in metadata["evaluations"]] == ["premium", "first_true"]

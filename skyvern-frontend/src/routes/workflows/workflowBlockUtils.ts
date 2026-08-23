@@ -27,19 +27,52 @@ export function findWorkflowBlockByLabel(
   return found;
 }
 
+// Pre-order in reading order: the next_block_label chain, a conditional's
+// branches before its merge block, a loop's body right after the loop. The
+// editor serializes conditional-branch children after the top-level chain, so
+// plain array order would list the merge block ahead of the branches.
 export function visitWorkflowBlocks(
   blocks: Array<WorkflowBlock>,
   visit: (block: WorkflowBlock) => void | false,
-) {
-  for (const block of blocks) {
+): boolean {
+  const byLabel = new Map(blocks.map((block) => [block.label, block]));
+  const visited = new Set<string>();
+
+  const walk = (
+    label: string | null | undefined,
+    stop: string | null,
+  ): boolean => {
+    const block = label ? byLabel.get(label) : undefined;
+    if (!block || label === stop || visited.has(block.label)) {
+      return true;
+    }
+    visited.add(block.label);
     if (visit(block) === false) {
       return false;
     }
-
-    if (isNestedLoopWorkflowBlock(block) && block.loop_blocks.length > 0) {
-      if (visitWorkflowBlocks(block.loop_blocks, visit) === false) {
-        return false;
+    if (
+      isNestedLoopWorkflowBlock(block) &&
+      block.loop_blocks.length > 0 &&
+      !visitWorkflowBlocks(block.loop_blocks, visit)
+    ) {
+      return false;
+    }
+    if (block.block_type === "conditional") {
+      const merge = block.next_block_label ?? stop;
+      for (const branch of block.branch_conditions) {
+        if (!walk(branch.next_block_label, merge)) {
+          return false;
+        }
       }
+    }
+    return walk(block.next_block_label, stop);
+  };
+
+  // Array order seeds the walk: the head of the chain first, then whatever a
+  // chain never reached (v1 fall-through, orphans) so nothing is skipped.
+  for (const block of blocks) {
+    if (!walk(block.label, null)) {
+      return false;
     }
   }
 

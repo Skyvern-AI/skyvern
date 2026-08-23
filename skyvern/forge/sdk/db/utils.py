@@ -67,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from skyvern.schemas.proxy_pinning import redact_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -138,6 +139,19 @@ def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:
         return None
 
 
+def _safe_error(exc: Exception) -> object:
+    """A parse failure described without its input. Pydantic puts the offending value in the
+    message - for a missing field that is the whole object - so the rendered text of a
+    ValidationError carries whatever the caller stored."""
+    if isinstance(exc, pydantic.ValidationError):
+        # msg is input-derived too - a custom validator embeds the offending value in its text -
+        # so only the fixed error type and the field location are safe to emit.
+        return [(err["type"], err["loc"]) for err in exc.errors(include_input=False, include_url=False)]
+    if isinstance(exc, json.JSONDecodeError):
+        return f"{type(exc).__name__}: {exc.msg} at {exc.pos}"
+    return type(exc).__name__
+
+
 def deserialize_proxy_location(
     value: str | None,
     *,
@@ -167,25 +181,33 @@ def deserialize_proxy_location(
 
             # Custom proxy URL dict: {"url": "http://..."} for self-hosted deployments.
             if "url" in data and "country" not in data:
-                LOG.info("Deserialized proxy_location as custom proxy URL dict", db_value=value)
+                LOG.info("Deserialized proxy_location as custom proxy URL dict")
                 return data
 
             # Handle malformed subdivision (e.g., boolean instead of string)
             subdivision = data.get("subdivision")
             if subdivision is not None and not isinstance(subdivision, str):
-                LOG.warning("Malformed subdivision in proxy_location", db_value=value, subdivision=subdivision)
+                LOG.warning(
+                    "Malformed subdivision in proxy_location",
+                    db_value=redact_proxy_location(value),
+                    subdivision=redact_proxy_location(subdivision),
+                )
                 data["subdivision"] = None
             result = GeoTarget.model_validate(data)
             LOG.info(
                 "Deserialized proxy_location as GeoTarget",
-                db_value=value,
-                result=str(result),
+                db_value=redact_proxy_location(value),
+                result=redact_proxy_location(result),
             )
             return result
         except (json.JSONDecodeError, ValueError) as e:
             if raise_on_invalid_geo_target:
                 raise
-            LOG.warning("Failed to parse proxy_location as GeoTarget", db_value=value, error=str(e))
+            LOG.warning(
+                "Failed to parse proxy_location as GeoTarget",
+                db_value=redact_proxy_location(value),
+                error=_safe_error(e),
+            )
 
     # Try as ProxyLocation enum
     try:
@@ -193,7 +215,7 @@ def deserialize_proxy_location(
         return result
     except ValueError:
         # If all else fails, return as-is (shouldn't happen with valid data)
-        LOG.warning("Failed to deserialize proxy_location", db_value=value)
+        LOG.warning("Failed to deserialize proxy_location", db_value=redact_proxy_location(value))
         return None
 
 
@@ -219,8 +241,8 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
     LOG.debug(
         "Serializing proxy_location for DB",
         input_type=type(proxy_location).__name__,
-        input_value=str(proxy_location),
-        serialized_value=result,
+        input_value=redact_proxy_location(proxy_location),
+        serialized_value=redact_proxy_location(result),
     )
     return result
 

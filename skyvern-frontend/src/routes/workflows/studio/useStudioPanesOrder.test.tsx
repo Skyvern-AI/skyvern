@@ -271,3 +271,96 @@ describe("useStudioPanes under the short run URL", () => {
     expect(screen.getByTestId("panes").textContent).toBe("copilot");
   });
 });
+
+function OpenWithParamsProbe() {
+  const { panes, openPane } = useStudioPanes();
+  const location = useLocation();
+  return (
+    <div>
+      <output data-testid="search">{location.search}</output>
+      <output data-testid="panes">{panes.join(",")}</output>
+      <button
+        onClick={() =>
+          openPane("copilot", {
+            extraSearchParams: { "selected-block": "checkout" },
+          })
+        }
+      >
+        open-with-params
+      </button>
+      <button
+        onClick={() =>
+          openPane("copilot", {
+            extraSearchParams: { "selected-block": null },
+          })
+        }
+      >
+        open-clearing-params
+      </button>
+      <button
+        onClick={() =>
+          openPane("browser", {
+            extraSearchParams: { "selected-block": "checkout" },
+          })
+        }
+      >
+        open-browser-with-params
+      </button>
+    </div>
+  );
+}
+
+describe("useStudioPanes extraSearchParams", () => {
+  test("openPane carries extraSearchParams in the same navigation", () => {
+    render(
+      <MemoryRouter initialEntries={["/studio?panes=editor"]}>
+        <OpenWithParamsProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("open-with-params"));
+    // Copilot's open state is runtime-only by design, so the pane change shows
+    // up in the pane list while the extra param lands in the one navigation.
+    expect(screen.getByTestId("search").textContent).toContain(
+      "selected-block=checkout",
+    );
+    expect(screen.getByTestId("panes").textContent).toContain("copilot");
+  });
+
+  test("a pane write that changes the URL pane list carries them too", () => {
+    render(
+      <MemoryRouter initialEntries={["/studio?panes=editor"]}>
+        <OpenWithParamsProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("open-browser-with-params"));
+    const search = screen.getByTestId("search").textContent ?? "";
+    expect(search).toContain("panes=editor,browser");
+    expect(search).toContain("selected-block=checkout");
+  });
+
+  test("a null value clears a stale param instead of writing it", () => {
+    render(
+      <MemoryRouter
+        initialEntries={["/studio?panes=editor&selected-block=stale"]}
+      >
+        <OpenWithParamsProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("open-clearing-params"));
+    expect(screen.getByTestId("search").textContent).not.toContain(
+      "selected-block",
+    );
+  });
+
+  test("openPane carries extraSearchParams even when the pane is already open", () => {
+    render(
+      <MemoryRouter initialEntries={["/studio?panes=editor,copilot"]}>
+        <OpenWithParamsProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByText("open-with-params"));
+    expect(screen.getByTestId("search").textContent).toContain(
+      "selected-block=checkout",
+    );
+  });
+});

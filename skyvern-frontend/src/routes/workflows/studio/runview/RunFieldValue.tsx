@@ -54,17 +54,17 @@ export function ClampedProse({ text }: { text: string }) {
       <div className="group relative w-full">
         <CopyButton
           value={text}
-          className="absolute right-1.5 top-1.5 z-10 h-6 w-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+          className="absolute right-0 top-0 z-10 h-6 w-6 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
         />
-        {/* elevation2 (the run-view pane is elevation1) so the field reads as
-            raised. Padding sits on this wrapper, not the clamped child, because
-            line-clamp clips at the padding box and would otherwise leak a sliver
-            of the next line below the ellipsis. */}
-        <div className="rounded bg-slate-elevation2 px-2.5 py-2 pr-9">
+        {/* One surface: the value sits flush under its label, no raised box.
+            The right padding reserves the copy button's slot; it sits on this
+            wrapper, not the clamped child, because line-clamp clips at the
+            padding box and would otherwise leak a sliver of the next line. */}
+        <div className="pr-9">
           <div
             id={contentId}
             ref={boxRef}
-            className={`whitespace-pre-wrap break-words text-xs text-tertiary-foreground ${expanded ? "" : "line-clamp-6"}`}
+            className={`whitespace-pre-wrap break-words text-sm text-foreground ${expanded ? "" : "line-clamp-6"}`}
           >
             {text}
           </div>

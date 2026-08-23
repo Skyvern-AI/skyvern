@@ -19,6 +19,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { DotFilledIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
@@ -47,8 +48,11 @@ import {
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
 import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
+  buildBlockOrderIndex,
   classifyUnexecutedDefinedBlocks,
+  collectTimelineSearchTargets,
   flattenTimelineChronologically,
+  type TimelineSearchTarget,
   type UnexecutedDefinedBlock,
 } from "./workflowTimelineUtils";
 
@@ -59,9 +63,17 @@ type Props = {
   workflowRunId?: string;
   // Studio owns live-status in its own header; let it hide this duplicate badge.
   hideLiveBadge?: boolean;
+  // In the studio the pane already paints this exact surface, so the card would
+  // be a box drawn inside its own fill. Legacy sits in a sidebar column on the
+  // page background, where the border does separate — so it keeps it.
+  hideBorder?: boolean;
   // Opt-in label search + jump-to-block; off by default so the legacy run
   // view renders no search UI and stays unchanged.
   enableSearch?: boolean;
+  // Studio composes its own header (RunSummaryStrip: status, duration, counts,
+  // search) above this list, so neither the label row nor the counts row
+  // renders. Legacy keeps both — they are that page's only timeline title bar.
+  hideHeader?: boolean;
   // Studio surfaces the run's elapsed time here, next to the counts, with the
   // created/queued/started/finished breakdown on its hover tooltip. Legacy
   // passes neither and renders no duration.
@@ -76,72 +88,6 @@ type Props = {
     iterationIndex: number,
   ) => void;
 };
-
-function buildBlockOrderIndex(
-  items: Array<WorkflowRunTimelineItem>,
-): ReadonlyMap<string, number> {
-  const blocks: Array<{
-    id: string;
-    createdAt: number;
-    sequence: number;
-  }> = [];
-
-  function walk(timelineItems: Array<WorkflowRunTimelineItem>) {
-    for (const item of timelineItems) {
-      if (isBlockItem(item)) {
-        const createdAt = new Date(item.created_at).getTime();
-        blocks.push({
-          id: item.block.workflow_run_block_id,
-          createdAt: Number.isNaN(createdAt)
-            ? Number.MAX_SAFE_INTEGER
-            : createdAt,
-          sequence: blocks.length,
-        });
-      }
-      if (item.children.length > 0) {
-        walk(item.children);
-      }
-    }
-  }
-
-  walk(items);
-  blocks.sort(
-    (left, right) =>
-      left.createdAt - right.createdAt || left.sequence - right.sequence,
-  );
-
-  return new Map(blocks.map((block, index) => [block.id, index + 1]));
-}
-
-type TimelineSearchTarget = {
-  block: WorkflowRunBlock;
-  label: string;
-  order: number | null;
-};
-
-// Top-level rows only: flattenTimelineChronologically hoists conditional
-// branches here, but loop/task_v2 children stay nested with no row to scroll to.
-function collectTimelineSearchTargets(
-  items: Array<WorkflowRunTimelineItem>,
-  blockOrder: ReadonlyMap<string, number>,
-): Array<TimelineSearchTarget> {
-  const targets: Array<TimelineSearchTarget> = [];
-  for (const item of items) {
-    if (!isBlockItem(item)) {
-      continue;
-    }
-    const label = item.block.label;
-    if (!label || label.trim() === "") {
-      continue;
-    }
-    targets.push({
-      block: item.block,
-      label,
-      order: blockOrder.get(item.block.workflow_run_block_id) ?? null,
-    });
-  }
-  return targets;
-}
 
 function filterTimelineSearchTargets(
   targets: Array<TimelineSearchTarget>,
@@ -179,7 +125,9 @@ function TimelineBlockSearch({
         <button
           type="button"
           aria-label="Search blocks"
-          className="ml-auto inline-flex shrink-0 cursor-pointer items-center rounded p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200"
+          // Mirrors studio/constants PANE_HEADER_ICON_BUTTON_CLASS; this shared
+          // module can't import from studio/.
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         >
           <MagnifyingGlassIcon className="size-3.5" />
         </button>
@@ -231,12 +179,90 @@ function TimelineBlockSearch({
   );
 }
 
+/**
+ * The run's executed-block, credit, and action counts. Rendered by this
+ * component's legacy header row and by the studio's RunSummaryStrip, so the
+ * two surfaces never drift.
+ */
+function TimelineRunCounts({
+  workflowRun,
+  timeline,
+}: {
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow;
+  timeline: Array<WorkflowRunTimelineItem>;
+}) {
+  const numberOfActions = countActionsInTimeline(timeline);
+  const numberOfBlocks = timeline.filter(isBlockItem).length;
+  const totalBlocks =
+    workflowRun.workflow?.workflow_definition?.blocks?.length ?? 0;
+  const completedBlocks = countCompletedTopLevelBlocks(timeline);
+  return (
+    <>
+      {totalBlocks > 0 ? (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="cursor-default whitespace-nowrap text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-500"
+                tabIndex={0}
+              >
+                <span className="tabular-nums text-foreground dark:text-slate-300">
+                  {numberOfBlocks}
+                </span>{" "}
+                {numberOfBlocks === 1 ? "block" : "blocks"}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-left">
+              {completedBlocks}/{totalBlocks} blocks
+              <span className="block">
+                Top-level blocks completed out of the total defined for this
+                workflow
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      ) : (
+        // No configured blocks → no ratio to explain; plain text, not an
+        // empty focus stop.
+        <span className="whitespace-nowrap text-muted-foreground dark:text-slate-500">
+          <span className="tabular-nums text-foreground dark:text-slate-300">
+            {numberOfBlocks}
+          </span>{" "}
+          {numberOfBlocks === 1 ? "block" : "blocks"}
+        </span>
+      )}
+      <span
+        className="whitespace-nowrap text-muted-foreground dark:text-slate-500"
+        title="Credits consumed by this run (live + cached)"
+      >
+        <span className="tabular-nums text-foreground dark:text-slate-300">
+          {(
+            (workflowRun.credits_used ?? 0) +
+            (workflowRun.cached_credits_used ?? 0)
+          ).toLocaleString()}
+        </span>{" "}
+        credits
+      </span>
+      {numberOfActions > 0 ? (
+        <span className="whitespace-nowrap text-muted-foreground dark:text-slate-500">
+          <span className="tabular-nums text-foreground dark:text-slate-300">
+            {numberOfActions}
+          </span>{" "}
+          {numberOfActions === 1 ? "action" : "actions"}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 function WorkflowRunTimeline({
   activeItem,
   activeIteration = null,
   workflowRunId,
   hideLiveBadge = false,
+  hideBorder = false,
   enableSearch = false,
+  hideHeader = false,
   elapsed,
   elapsedTitle,
   onLiveStreamSelected,
@@ -265,27 +291,11 @@ function WorkflowRunTimeline({
         : [],
     [enableSearch, displayTimeline, blockOrder],
   );
-  const blockElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
-  const registerBlockElement = (id: string, el: HTMLDivElement | null) => {
-    if (el) {
-      blockElementsRef.current.set(id, el);
-    } else {
-      blockElementsRef.current.delete(id);
-    }
-  };
+  // Selecting is the whole jump: the row that becomes active scrolls itself
+  // into view (WorkflowRunTimelineBlockItem), which reaches nested rows a
+  // top-level element registry here never could.
   const jumpToBlock = (target: TimelineSearchTarget) => {
     onBlockItemSelected(target.block);
-    const el = blockElementsRef.current.get(target.block.workflow_run_block_id);
-    if (!el) {
-      return;
-    }
-    const reduceMotion =
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    el.scrollIntoView({
-      behavior: reduceMotion ? "auto" : "smooth",
-      block: "start",
-    });
   };
   const codeStepsByLabel = useMemo(
     () =>
@@ -397,89 +407,65 @@ function WorkflowRunTimeline({
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
-  const numberOfActions = countActionsInTimeline(workflowRunTimeline);
-  const numberOfBlocks = workflowRunTimeline.filter(isBlockItem).length;
-  const totalBlocks = definedBlocks.length;
-  const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
-  const blockCountLabel = `· ${numberOfBlocks} ${
-    numberOfBlocks === 1 ? "block" : "blocks"
-  }`;
-
   return (
-    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-border bg-slate-elevation1">
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs">
-        <span className="font-medium text-foreground dark:text-slate-200">
-          Timeline
-        </span>
-        {elapsed ? (
-          <span
-            className="text-muted-foreground dark:text-slate-500"
-            title={elapsedTitle || undefined}
-          >
-            · {elapsed}
-          </span>
-        ) : null}
-        {totalBlocks > 0 ? (
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span
-                  className="cursor-default text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-slate-500"
-                  tabIndex={0}
-                >
-                  {blockCountLabel}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-left">
-                {completedBlocks}/{totalBlocks} blocks
-                <span className="block">
-                  Top-level blocks completed out of the total defined for this
-                  workflow
-                </span>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        ) : (
-          <span className="text-muted-foreground dark:text-slate-500">
-            {blockCountLabel}
-          </span>
-        )}
-        {numberOfActions > 0 && (
-          <span className="text-muted-foreground dark:text-slate-500">
-            · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
-          </span>
-        )}
-        <span
-          className="text-muted-foreground dark:text-slate-500"
-          title="Credits consumed by this run (live + cached)"
-        >
-          ·{" "}
-          {(
-            (workflowRun.credits_used ?? 0) +
-            (workflowRun.cached_credits_used ?? 0)
-          ).toLocaleString()}{" "}
-          credits
-        </span>
-        {workflowRunIsNotFinalized && !hideLiveBadge && (
-          <button
-            type="button"
-            onClick={onLiveStreamSelected}
-            aria-pressed={activeItem === "stream"}
-            aria-label="Jump to the live stream of the running workflow"
-            className={cn(
-              "ml-auto inline-flex shrink-0 cursor-pointer items-center gap-1 rounded bg-destructive/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-destructive ring-1 ring-transparent transition-all hover:bg-destructive/25",
-              activeItem === "stream" &&
-                "bg-destructive/25 ring-destructive/40",
+    <div
+      className={cn(
+        "flex h-full min-w-0 flex-col overflow-hidden",
+        !hideBorder && "rounded-md border border-border bg-slate-elevation1",
+      )}
+    >
+      {hideHeader ? null : (
+        <>
+          <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 text-xs">
+            <span className="shrink-0 font-medium text-foreground dark:text-slate-200">
+              Timeline
+            </span>
+            <div className="min-w-0 flex-1" />
+            {workflowRunIsNotFinalized && !hideLiveBadge && (
+              <button
+                type="button"
+                onClick={onLiveStreamSelected}
+                aria-pressed={activeItem === "stream"}
+                aria-label="Jump to the live stream of the running workflow"
+                className={cn(
+                  "ml-auto inline-flex shrink-0 cursor-pointer items-center gap-1 rounded bg-destructive/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-destructive ring-1 ring-transparent transition-all hover:bg-destructive/25",
+                  activeItem === "stream" &&
+                    "bg-destructive/25 ring-destructive/40",
+                )}
+              >
+                <DotFilledIcon className="size-3 animate-pulse" />
+                <span>Live</span>
+              </button>
             )}
-          >
-            <DotFilledIcon className="size-3 animate-pulse" />
-            <span>Live</span>
-          </button>
-        )}
-        {enableSearch && (
-          <TimelineBlockSearch targets={searchTargets} onJump={jumpToBlock} />
-        )}
-      </div>
+            {enableSearch && (
+              <TimelineBlockSearch
+                targets={searchTargets}
+                onJump={jumpToBlock}
+              />
+            )}
+          </div>
+          {/* The run's counts sit on their own full-width row rather than in the
+          header, so they are free to reflow to a second line. Crammed into the
+          fixed-height header they broke *inside* each value in a narrow pane —
+          "· 0/2 / blocks" — and the last one still clipped off the edge. */}
+          <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1.5 text-xs">
+            {elapsed ? (
+              <span
+                className="whitespace-nowrap text-muted-foreground dark:text-slate-500"
+                title={elapsedTitle || undefined}
+              >
+                <span className="tabular-nums text-foreground dark:text-slate-300">
+                  {elapsed}
+                </span>
+              </span>
+            ) : null}
+            <TimelineRunCounts
+              workflowRun={workflowRun}
+              timeline={workflowRunTimeline}
+            />
+          </div>
+        </>
+      )}
       <ScrollArea className="min-h-0 flex-1">
         <ScrollAreaViewport className="h-full max-h-full [&>div]:!block [&>div]:!overflow-x-hidden">
           <div className="p-2">
@@ -506,15 +492,6 @@ function WorkflowRunTimeline({
                 return (
                   <div
                     key={timelineItem.block.workflow_run_block_id}
-                    ref={
-                      enableSearch
-                        ? (el) =>
-                            registerBlockElement(
-                              timelineItem.block.workflow_run_block_id,
-                              el,
-                            )
-                        : undefined
-                    }
                     className={cn({
                       "duration-300 animate-in fade-in slide-in-from-top-3":
                         isNew,
@@ -578,4 +555,4 @@ function WorkflowRunTimeline({
   );
 }
 
-export { WorkflowRunTimeline };
+export { TimelineBlockSearch, TimelineRunCounts, WorkflowRunTimeline };

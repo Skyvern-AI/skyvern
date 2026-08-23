@@ -10,7 +10,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from skyvern.schemas.tags import TagApplyRequest, TagKeyUpdate
+from skyvern.schemas.tags import (
+    TagApplyRequest,
+    TagKeyUpdate,
+    TagValueCreate,
+    TagValueDelete,
+    TagValueRename,
+    TagValueUpdate,
+)
 
 
 def test_standalone_label_parses_with_null_key() -> None:
@@ -136,3 +143,55 @@ def test_tag_key_update_rejects_non_string_description() -> None:
 def test_tag_key_update_accepts_none() -> None:
     parsed = TagKeyUpdate.model_validate({"description": None})
     assert parsed.description is None
+
+
+# `__untagged__` and `__other__` are the buckets the group-by aggregation folds into.
+# A real tag value equal to one is absorbed into that bucket, so the group's number is
+# wrong and nothing fails — the reservation is what keeps that from happening.
+
+RESERVED = ("__untagged__", "__other__")
+# Values that merely resemble a reserved literal, indexed by character class: case,
+# affix, substring, separator. Every downstream comparison is exact and case-sensitive,
+# so none of these collide.
+NOT_RESERVED = (
+    "__UNTAGGED__",
+    "__Other__",
+    "untagged",
+    "other",
+    "__untagged",
+    "untagged__",
+    "_untagged_",
+    "prod__other__eu",
+    "__ other __",
+)
+
+
+@pytest.mark.parametrize("value", RESERVED)
+def test_reserved_value_rejected_on_every_creating_surface(value: str) -> None:
+    with pytest.raises(ValidationError):  # standalone label, workflow + run tags
+        TagApplyRequest.model_validate({"tags": [{"value": value}]})
+    with pytest.raises(ValidationError):  # grouped label
+        TagApplyRequest.model_validate({"tags": [{"key": "env", "value": value}]})
+    with pytest.raises(ValidationError):  # padded — the trim runs before the check
+        TagApplyRequest.model_validate({"tags": [{"value": f"  {value}  "}]})
+    with pytest.raises(ValidationError):  # registry pre-registration
+        TagValueCreate.model_validate({"key": "env", "value": value})
+    with pytest.raises(ValidationError):  # rename onto a reserved value
+        TagValueRename.model_validate({"value": "prod", "new_value": value})
+
+
+@pytest.mark.parametrize("value", NOT_RESERVED)
+def test_near_miss_values_still_accepted(value: str) -> None:
+    assert TagApplyRequest.model_validate({"tags": [{"value": value}]}).tags[0].value == value.strip()
+    assert TagValueCreate.model_validate({"key": "env", "value": value}).value == value.strip()
+
+
+@pytest.mark.parametrize("value", RESERVED)
+def test_reserved_value_stays_addressable_for_removal(value: str) -> None:
+    """Rows written before the reservation can't be retro-validated, so the surfaces that
+    identify an existing value must keep accepting it — otherwise a colliding row is
+    permanently unremovable."""
+    assert TagApplyRequest.model_validate({"tags_to_delete": [{"value": value}]}).tags_to_delete[0].value == value
+    assert TagValueDelete.model_validate({"value": value}).value == value
+    assert TagValueUpdate.model_validate({"value": value, "color": "red"}).value == value
+    assert TagValueRename.model_validate({"value": value, "new_value": "prod"}).value == value

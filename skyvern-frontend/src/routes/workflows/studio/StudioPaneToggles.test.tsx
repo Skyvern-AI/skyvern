@@ -494,6 +494,27 @@ describe("StudioPaneToggles keyboard navigation", () => {
     ).toEqual([0, -1, -1]);
   });
 
+  // The assertion above only reads three named toggles, so it stayed green
+  // while the copy control sat in the rail as a second, permanently-tabbable
+  // stop. These count what is actually reachable, in the state that has the
+  // most controls.
+  test("every control in the rail is reachable by arrow keys, not by Tab", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_current");
+    const rail = screen.getByRole("navigation", { name: "Studio panes" });
+    const tabbable = Array.from(
+      rail.querySelectorAll<HTMLElement>("button, a[href], [tabindex]"),
+    ).filter((el) => el.tabIndex >= 0);
+    expect(tabbable).toHaveLength(1);
+  });
+
+  test("the rail nests no interactive control inside another", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_current");
+    const rail = screen.getByRole("navigation", { name: "Studio panes" });
+    expect(
+      rail.querySelector("button button, button [tabindex], button [role]"),
+    ).toBeNull();
+  });
+
   test("ArrowRight moves across all four tabs and wraps", () => {
     renderAt();
     tab(/^Copilot/).focus();
@@ -516,6 +537,8 @@ describe("StudioPaneToggles keyboard navigation", () => {
     fireEvent.keyDown(tab("View Run: wr_current"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab("Past Runs"));
     fireEvent.keyDown(tab("Past Runs"), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tab("Copy run link"));
+    fireEvent.keyDown(tab("Copy run link"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 

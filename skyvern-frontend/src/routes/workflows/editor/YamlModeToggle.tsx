@@ -12,7 +12,7 @@ const segmentClass = (active: boolean) =>
     "flex h-7 items-center gap-1 rounded-md px-2 text-xs transition-colors",
     "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
     active
-      ? "bg-accent text-foreground"
+      ? "bg-foreground text-background"
       : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
   );
 

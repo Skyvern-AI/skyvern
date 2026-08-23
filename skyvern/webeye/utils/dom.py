@@ -58,7 +58,12 @@ def is_incompatible_text_input_error(exc: BaseException) -> bool:
     # from fill()/clear() when the resolved node can't accept text (button, link, span,
     # dialog/container, iframe). The static tag_name can disagree with the live node after
     # a re-render, so callers relying on the tag alone still reach these APIs.
-    return "is not an" in str(exc).lower()
+    #
+    # It raises `Input of type "{type}" cannot be filled` for the other shape: the tag IS an
+    # input, so a tag-only check like supports_text_input() lets it through, but the type
+    # (checkbox, radio, file...) is not fillable. Both mean the live node cannot accept text.
+    message = str(exc).lower()
+    return "is not an" in message or "cannot be filled" in message
 
 
 def is_element_detached_error(exc: BaseException) -> bool:

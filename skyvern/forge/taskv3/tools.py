@@ -356,6 +356,74 @@ _SELECTOR_EXISTS_JS = (
 # control the page renders at zero size. Nothing rendered means a collapsed section, a closed modal or
 # an inactive step. Kept as one fragment because three page.evaluate payloads cannot be kept in sync by
 # hand, and the whole point is that perception and action agree on what counts as a styled proxy.
+# The text the page still shows one control as in flight with, or null. Applied to an element handle
+# the caller resolved, never to a selector -- resolution belongs to Playwright's engine, which is what
+# the action tools act through.
+PENDING_MARKER_JS = (
+    "(el) => { let ctl = el;"
+    " try { ctl = Element.prototype.closest.call(el,"
+    "   'button,input[type=submit],input[type=button],input[type=image],[role=button]') || el }"
+    " catch(e) {}"
+    # A selector can name a wrapper (a <form>, or a clickable <div> the page put the handler on)
+    # rather than the control. Descend when the element is not itself a control and holds exactly
+    # one: a card holds several, or none.
+    " if (ctl === el && el.tagName !== 'BUTTON' && el.tagName !== 'INPUT') {"
+    "   let inners = []; try { inners = el.querySelectorAll("
+    "     'button,input[type=submit],input[type=button],input[type=image],[role=button]') } catch(e) {}"
+    "   if (inners.length === 1) ctl = inners[0]; }"
+    " const isButtonInput = ctl.tagName === 'INPUT'"
+    "   && /^(submit|button|image)$/i.test(ctl.getAttribute('type') || '');"
+    # .value on a text input is the model's own typed text, not a label the page rendered.
+    # The control's OWN label, not its whole subtree: innerText spans every descendant and `closest`
+    # can climb to a card-sized [role=button], so a status row ("Processing - Order 4821 - $32.10")
+    # would read as an in-flight submit. The subtree is a fallback only for a real <button>/<input>
+    # simple enough to be one (a spinner plus a label) -- [role=button] is a claim the page makes,
+    # and it is what cards are built from.
+    " let own = '';"
+    " for (const n of ctl.childNodes) { if (n.nodeType === 3) own += n.nodeValue; }"
+    " const isElementControl = ctl.tagName === 'BUTTON' || ctl.tagName === 'INPUT';"
+    " let inner = '';"
+    " try { inner = isElementControl ? (ctl.innerText || '') : '' } catch(e) {}"
+    " const t = String(own.trim() || inner || (isButtonInput ? ctl.value : '') || '').trim().slice(0, 60);"
+    " if (!/^(submitting|processing|sending|uploading)\\b/i.test(t)) return null;"
+    " const r = ctl.getBoundingClientRect();"
+    " if (r.width < 8 || r.height < 8) return null;"
+    " let cs; try { cs = getComputedStyle(ctl) } catch(e) { return null }"
+    " if (cs.clip && cs.clip !== 'auto') return null;"
+    " if (cs.clipPath && cs.clipPath !== 'none') return null;"
+    " let shown;"
+    " try { shown = ctl.checkVisibility({opacityProperty: true, visibilityProperty: true,"
+    "   contentVisibilityAuto: true}) }"
+    " catch(e) { shown = !(cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05) }"
+    " if (!shown) return null;"
+    " return ctl.getAttribute('aria-busy') === 'true' ? t + ' (aria-busy)' : t; }"
+)
+
+
+async def pending_marker(page: Any, selector: str) -> str | None:
+    """The text the page still shows `selector`'s control as in flight with, or None.
+
+    Resolution goes through Playwright's engine — the one the action tools act through — so the probe
+    judges the element the run acted on. A second, hand-rolled resolver would be a second source of
+    truth: shadow-piercing CSS, host-anchored selectors straddling a shadow boundary, and the
+    text=/xpath forms all resolve here and none of them resolve through an in-page querySelector walk.
+    Fails open: an unresolvable control reports nothing, and nothing is not evidence of pending."""
+    try:
+        handle = await page.query_selector(selector)
+    except Exception:
+        LOG.warning("taskv3 pending-marker probe could not resolve the control", selector=selector, exc_info=True)
+        return None
+    if handle is None:
+        # Not an error: the control being gone is the ordinary shape of a submission that landed.
+        return None
+    try:
+        marker: str | None = await handle.evaluate(PENDING_MARKER_JS)
+    except Exception:
+        LOG.warning("taskv3 pending-marker probe failed on the control", selector=selector, exc_info=True)
+        return None
+    return marker
+
+
 _VISIBLE_PROXY_JS = r"""(el) => {
   let named = el.labels && el.labels[0];
   if (!named) {
@@ -1144,6 +1212,12 @@ _OBSERVE_JS = (
   // component watching that root re-render, destroying the marker before the model can click it --
   // and unlike the pre-snapshot the marker cannot move off-DOM, because the marker IS the handle we
   // hand out. Each fresh observe would mint another and the click would fail again, forever.
+  // Of the markers this call hands out, those it wrote versus those it found already on the page:
+  // the split is what says whether markers churn between observes, which the stall terminator's
+  // digest comparison depends on. Both count the handing out, and an entry the post-walk check
+  // strips is uncounted again.
+  let markersWritten = 0;
+  let markersReused = 0;
   const mintOn = (el) => {
     let m = el.getAttribute('data-tv3');
     // A marker already on the element is page-controlled text like any other attribute: it is
@@ -1155,13 +1229,13 @@ _OBSERVE_JS = (
     // syntactically-broken data-tv3 value that a remembered selector could resolve to the wrong node.
     if (m) {
       checkInconclusive = false;
-      if (resolvesTo(attr('data-tv3', m), el)) return attr('data-tv3', m);
+      if (resolvesTo(attr('data-tv3', m), el)) { markersReused++; return attr('data-tv3', m); }
       // Reuse only when THIS check could not be taken AND the gather positively saw this marker
       // exactly once. Gating on the page-global let one unreadable root anywhere hand out a marker
       // resolvesTo had proven is a duplicate; gating on inconclusiveness alone still did, because a
       // throwing DOCUMENT root means the duplicate is never counted at all. Both times two payload
       // lines carried one selector and the click landed on whichever the executor matched first.
-      if (checkInconclusive && gatheredCounts.get(m) === 1) return attr('data-tv3', m);
+      if (checkInconclusive && gatheredCounts.get(m) === 1) { markersReused++; return attr('data-tv3', m); }
     }
     // Minting below is NOT verified when a root is unreadable: takenMarkers could not include that
     // root's markers, so a decoy planted in there can collide with a fresh candidate. Dropping
@@ -1209,6 +1283,7 @@ _OBSERVE_JS = (
       return null;
     }
     takenMarkers.add(m);
+    markersWritten++;
     return attr('data-tv3', m);
   };
   // Every scope the executor searches under a host: the host's own light subtree, the root it owns,
@@ -1284,6 +1359,7 @@ _OBSERVE_JS = (
   // design system produces; a name or testid reused across instances is not, and neither is the rest.
   // Records named by a marker we wrote, re-checked after the walk: a later element can mutate an
   // earlier one, and an element's own attributeChangedCallback can move our marker onto a peer.
+  // Registered before the record is built, so a throw between the two still reaches that check.
   const mintedOn = [];
   let unnamedAnonymous = 0;
   let unnamedDuplicated = 0;
@@ -1303,6 +1379,7 @@ _OBSERVE_JS = (
    const el = els[idx].el;
    const host = els[idx].host;
    let mintedValue = null;
+   let minted = null;
    // A form exposes its named controls as its own properties, so <input name="tagName"> makes
    // el.tagName that input. Every read below can therefore be a clobbered non-function, and the
    // loop is inside page.evaluate: one throw costs the whole element list, not one element.
@@ -1345,9 +1422,12 @@ _OBSERVE_JS = (
           continue;
         }
       } else {
+        const writtenBefore = markersWritten;
         selector = mintOn(el);
         if (!selector) { dropped++; continue; }
         mintedValue = el.getAttribute('data-tv3');
+        minted = { rec: null, el: el, m: mintedValue, fresh: markersWritten > writtenBefore };
+        mintedOn.push(minted);
       }
     }
     let label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim();
@@ -1421,7 +1501,7 @@ _OBSERVE_JS = (
     }
     const pressed = el.getAttribute('aria-pressed');
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
-    if (mintedValue !== null) mintedOn.push({ rec: rec, el: el, m: mintedValue });
+    if (minted !== null) minted.rec = rec;
     if (hidden) hiddenListed++;
     out.push(rec);
     if (++i > 250) {
@@ -1448,9 +1528,11 @@ _OBSERVE_JS = (
   for (const rem of mintedOn) {
     let still = null;
     try { still = rem.el.getAttribute('data-tv3'); } catch (e) { still = null; }
-    if (still !== rem.m) {
-      const at = out.indexOf(rem.rec);
+    // A record never built (the element threw mid-walk) was never handed out either.
+    if (rem.rec === null || still !== rem.m) {
+      const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) { out.splice(at, 1); dropped++; }
+      if (rem.fresh) markersWritten--; else markersReused--;
     }
   }
   // Page-text digest: outcome states (submission confirmations, rejection banners, validation
@@ -1507,8 +1589,19 @@ _OBSERVE_JS = (
     // cannot reach it -- the blindness already lifted for controls, on the channel that carries
     // refusal messages. Walked like the ARIA and heading channels above, so this asks the page no
     // new question, only the same one of more roots.
-    const formMsgs = [];
-    const otherMsgs = [];
+    // A bucket past its cap has to give something up, and a plain prefix gives up the end -- which
+    // is where a page renders the outcome of a submission, after the fields it is about. The last
+    // 50 are kept alongside the first 200 rather than instead of part of them, so nothing a 200
+    // prefix read is given up, and the loss moves into the middle of the walk. The loop below reads
+    // up to 250 for the same reason: one full bucket must fit. The other bucket's tail is reached
+    // only when the first bucket is small, which is the same priority the concat order states.
+    const formMsgs = { head: [], tail: [] };
+    const otherMsgs = { head: [], tail: [] };
+    const hold = (bucket, item) => {
+      if (bucket.head.length < 200) { bucket.head.push(item); return; }
+      bucket.tail.push(item);
+      if (bucket.tail.length > 50) bucket.tail.shift();
+    };
     for (const root of allRoots) {
       // nodeType 11 first: Document has no `host`, so `root.host` would hit the HTML named-property
       // getter and <form name="host"> would supply one.
@@ -1519,18 +1612,25 @@ _OBSERVE_JS = (
       // is not defended here.
       let cands;
       try { cands = root.querySelectorAll(msgSel); } catch (e) { continue; }
-      for (const el of cands) {
-        // Being inside a form is what separates a validation message from page chrome, and it is
-        // a structural fact rather than a guess about which roots tend to hold content. Ranking
-        // component blocks above light-DOM ones instead would bury a page's own banner under the
-        // cookie-consent and chat widgets that also ship as components.
-        const bucket = (el.closest('form') || inFormRoots.has(root)) ? formMsgs : otherMsgs;
-        // Bounded per bucket at the same 200 the loop below stops at, so a page of components cannot
-        // make the gather itself the expensive part.
-        if (bucket.length < 200) bucket.push({ el: el, host: host });
-      }
+      // The iteration is inside the try because a root can hand back a non-iterable instead of
+      // throwing, which is the same attack one line later.
+      try {
+        for (const el of cands) {
+          // Per element, because reading `closest` off one is a page-controlled call: a form
+          // exposes its named controls over its own methods, so <input name="closest"> turns it
+          // into a throw. Uncaught it reaches the digest-wide catch, and an emptied digest is
+          // indistinguishable from a page that rendered no messages at all.
+          try {
+            // Being inside a form is what separates a validation message from page chrome, and it is
+            // a structural fact rather than a guess about which roots tend to hold content. Ranking
+            // component blocks above light-DOM ones instead would bury a page's own banner under the
+            // cookie-consent and chat widgets that also ship as components.
+            hold((el.closest('form') || inFormRoots.has(root)) ? formMsgs : otherMsgs, { el: el, host: host });
+          } catch (e) { continue; }
+        }
+      } catch (e) { continue; }
     }
-    const orderedCands = formMsgs.concat(otherMsgs);
+    const orderedCands = formMsgs.head.concat(formMsgs.tail, otherMsgs.head, otherMsgs.tail);
     // A per-field state wrapper (`field--has-error`, `field--no-error`) matches this selector and its
     // text is just the control's own name, so it spends the channel's budget on what the element list
     // already carries -- enough of them and the page's real message never fits. Read off the records
@@ -1549,28 +1649,48 @@ _OBSERVE_JS = (
       const cs = getComputedStyle(el);
       return cs.visibility !== 'hidden' && cs.opacity !== '0';
     };
+    // The suppression above compares byte for byte, so a wrapper that renders its control's label
+    // beside a required-field marker does not match it and spends the budget on a name the element
+    // list already carries. Comparing with the decoration stripped is only safe as an ORDERING:
+    // dropping on it would also swallow a real message that is nothing but a listed label and
+    // punctuation ("Payment declined!" beside a "Payment declined" button), and a dropped banner
+    // reads exactly like a page that never rendered one. So a near-match is offered to the budget
+    // after every message the page did not build out of a label, and what the budget then does with
+    // it -- take it, fold it into an entry that already holds it, or count it as dropped -- is what
+    // it would have done at its place in the walk.
+    const decoration = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
+    const deferred = [];
+    const takeCand = (cand, mayDefer) => {
+      const el = cand.el;
+      if (!visibleText(el)) return;
+      // A component's message block is `<div class="alert"><slot></slot></div>`: the words are
+      // slotted from the host's light DOM, so the block's own innerText is empty and the host
+      // carries them. Same fallback the heading channel below uses, and the field count comes
+      // from whichever node supplied the text.
+      let t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      let src = el;
+      if (!t && cand.host) {
+        t = (cand.host.innerText || '').replace(/\s+/g, ' ').trim();
+        src = cand.host;
+      }
+      if (!t) return;
+      // Compared at the width labels are stored at, so a truncated one still matches.
+      if (listedLabels.has(t.slice(0, 140))) return;
+      if (mayDefer && listedLabels.has(t.replace(decoration, '').slice(0, 140))) { deferred.push(cand); return; }
+      if (t.length <= 300 || (t.length <= 900 && src.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
+    };
     for (const cand of orderedCands) {
-      if (textFull || textTotal - blockStart >= 600 || ++messageCandidates > 200) break;
+      if (textFull || textTotal - blockStart >= 600 || ++messageCandidates > 250) break;
       // This selector set is broad, so one poisoned element degrades to "skip it", not to an
       // emptied digest (the outer catch is for the narrow ARIA channel).
-      try {
-        const el = cand.el;
-        if (!visibleText(el)) continue;
-        // A component's message block is `<div class="alert"><slot></slot></div>`: the words are
-        // slotted from the host's light DOM, so the block's own innerText is empty and the host
-        // carries them. Same fallback the heading channel below uses, and the field count comes
-        // from whichever node supplied the text.
-        let t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-        let src = el;
-        if (!t && cand.host) {
-          t = (cand.host.innerText || '').replace(/\s+/g, ' ').trim();
-          src = cand.host;
-        }
-        if (!t) continue;
-        // Compared at the width labels are stored at, so a truncated one still matches.
-        if (listedLabels.has(t.slice(0, 140))) continue;
-        if (t.length <= 300 || (t.length <= 900 && src.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
-      } catch (e) { continue; }
+      try { takeCand(cand, true); } catch (e) { continue; }
+    }
+    // Already counted against the candidate cap on the pass that deferred them, so this pass is
+    // bounded by that same cap. Each is offered to pushText like any other entry, with no budget
+    // short-circuit, so the dedupe, the length gate and the drop count apply exactly as they would
+    // have at its place in the walk.
+    for (const cand of deferred) {
+      try { takeCand(cand, false); } catch (e) { continue; }
     }
     // role=heading alongside h1-h3: a component's heading is a custom element, so its tag name
     // carries no signal and only the ARIA role does.
@@ -1600,7 +1720,7 @@ _OBSERVE_JS = (
   // elements, so hidden tracking pixels stay out. Isolated like the digest above.
   // `failed` and `unread` are this channel's own bookkeeping, not a question put to the page: on the
   // section that reports gates, "found none" and "could not look" must not render as one sentence.
-  const iframeInfo = { total: 0, entries: [], failed: false, unread: 0 };
+  const iframeInfo = { total: 0, inComponents: 0, entries: [], failed: false, unread: 0 };
   try {
     const sig = /captcha|turnstile|challenges\.cloudflare|arkoselabs|funcaptcha|datadome|perimeterx|verify you are human|security challenge/i;
     // A design system packages the widget inside its own shadow root, where a document query cannot
@@ -1629,6 +1749,7 @@ _OBSERVE_JS = (
             // Counted once every throwable read has succeeded: incrementing earlier put a frame in
             // `total` and in `unread` at once, so the two summed past the page's real count.
             iframeInfo.total++;
+            if (root !== document) iframeInfo.inComponents++;
             if (iframeInfo.entries.length < 8) {
               iframeInfo.entries.push({ host: u.host.slice(0, 80), title: ttl, captcha: isCaptcha });
             } else if (isCaptcha) {
@@ -1641,9 +1762,9 @@ _OBSERVE_JS = (
         }
       } catch (e) { iframeInfo.unread++; continue; }
     }
-  } catch (e) { iframeInfo.total = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
+  } catch (e) { iframeInfo.total = 0; iframeInfo.inComponents = 0; iframeInfo.entries.length = 0; iframeInfo.unread = 0; iframeInfo.failed = true; }
 
-  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, elements: out });
+  return JSON.stringify({ url: location.href, title: document.title, text: texts, textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, dropped: dropped, truncated: truncated, truncatedInComponents: truncatedInComponents, unnamedAnonymous: unnamedAnonymous, unnamedDuplicated: unnamedDuplicated, unnamedUnverifiable: unnamedUnverifiable, unnamedUnsafe: unnamedUnsafe, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, markersMinted: markersWritten, markersReused: markersReused, elements: out });
 }
 """
 )
@@ -1907,7 +2028,19 @@ def build_browser_tools(
             elif e.get("role"):
                 kind += "/" + _digest_token(e["role"], 40)
             lines.append(f"[{e['selector']}] {kind} {e.get('label', '')!r}{extra}")
-        return ToolResult.ok("\n".join(lines), data={"count": len(elements)})
+        # Counts only, for the per-call log record: every perception change that alters only what
+        # this function renders is otherwise invisible to production telemetry.
+        summary = {
+            "text_dropped": text_dropped,
+            "hidden_listed": hidden_kept,
+            "iframes_in_component_roots": iframe_info.get("inComponents") or 0,
+            "undiscovered_roots": data.get("undiscoveredRoots") or 0,
+            "omitted_unnameable": omitted_in_components,
+            "invalid_fields": sum(1 for e in elements if e.get("invalid")),
+            "markers_minted": data.get("markersMinted") or 0,
+            "markers_reused": data.get("markersReused") or 0,
+        }
+        return ToolResult.ok("\n".join(lines), data={"count": len(elements), "summary": summary})
 
     async def get_html(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()

@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 
 import { CopyButton } from "@/components/CopyButton";
+import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 
 import type { WorkflowParameter } from "../../types/workflowTypes";
@@ -34,7 +35,7 @@ export function RunInputsSection({
   }
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex flex-col gap-5">
       {parameters.length > 0 ? (
         <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-muted-foreground">
@@ -57,11 +58,11 @@ export function RunInputsSection({
         </div>
       ) : null}
       {blockPrompts.length > 0 ? (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-muted-foreground">
             Block prompts
           </span>
-          <div className="flex flex-col gap-[18px]">
+          <div className="flex flex-col gap-4">
             {blockPrompts.map((block, index) => {
               const typeLabel = workflowBlockTitle[block.blockType];
               return (
@@ -70,10 +71,14 @@ export function RunInputsSection({
                   // pair with the flattened index to keep keys stable.
                   key={`${block.blockLabel}-${index}`}
                 >
-                  <div className="mb-2.5 text-sm font-medium text-foreground">
-                    {block.blockLabel}
+                  <div className="mb-3 flex items-center gap-2 text-sm font-medium text-foreground">
+                    <WorkflowBlockIcon
+                      workflowBlockType={block.blockType}
+                      className="size-4 shrink-0 text-tertiary-foreground"
+                    />
+                    <span className="min-w-0 truncate">{block.blockLabel}</span>
                     {typeLabel ? (
-                      <span className="ml-2 font-normal text-muted-foreground">
+                      <span className="shrink-0 font-normal text-muted-foreground">
                         {typeLabel}
                       </span>
                     ) : null}
@@ -81,7 +86,7 @@ export function RunInputsSection({
                   <div className="flex flex-col gap-3">
                     {block.fields.map((field) => (
                       <div key={field.fieldLabel} className="flex flex-col">
-                        <span className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                        <span className="mb-1 text-[11px] font-medium text-muted-foreground">
                           {field.fieldLabel}
                         </span>
                         <ClampedProse text={field.prompt} />
@@ -95,17 +100,17 @@ export function RunInputsSection({
         </div>
       ) : null}
       {meta.length > 0 ? (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-muted-foreground">
             Other inputs
           </span>
-          <div className="overflow-hidden rounded-lg border border-border bg-slate-elevation2">
+          <div className="divide-y divide-border/50">
             {meta.map((entry) => (
               <div
                 key={entry.label}
-                className="group flex items-start gap-3 border-t border-border px-3 py-[9px] first:border-t-0"
+                className="group flex items-start gap-3 py-1.5"
               >
-                <span className="w-32 shrink-0 pt-px text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="w-32 shrink-0 pt-px text-[11px] font-medium text-muted-foreground">
                   {entry.label}
                 </span>
                 <span className={metaValueClassName}>
