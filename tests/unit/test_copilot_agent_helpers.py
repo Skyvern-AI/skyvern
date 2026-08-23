@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1779,10 +1779,16 @@ class TestEditBlockAndRun:
             ),
         )
 
-        assert json.loads(result) == {
-            "ok": False,
-            "error": "block_labels must include the edited block 'repair_me' so this call tests the persisted repair.",
-        }
+        parsed = json.loads(result)
+        assert parsed["ok"] is False
+        assert parsed["error"] == (
+            "block_labels must include the edited block 'repair_me' so this call tests the persisted repair."
+        )
+        assert parsed["data"]["build_test_packet"]["run"] == {}
+        assert any(
+            "no workflow run was recorded" in notice
+            for notice in parsed["data"]["build_test_packet"]["omission_notices"]
+        )
 
     @pytest.mark.asyncio
     async def test_one_call_persists_the_scoped_edit_then_returns_run_debug_evidence(self, monkeypatch) -> None:
@@ -1877,6 +1883,7 @@ workflow_definition:
         async def fake_update_workflow(payload, ctx, *, allow_missing_credentials=False):
             captured["persisted_yaml"] = payload["workflow_yaml"]
             captured["allow_missing_credentials"] = allow_missing_credentials
+            ctx.last_workflow_yaml = payload["workflow_yaml"]
             ctx.last_update_block_count = 1
             return {"ok": True, "data": {"block_count": 1}}
 
@@ -1911,16 +1918,269 @@ workflow_definition:
 
         parsed = json.loads(result)
         assert parsed["ok"] is True
-        assert parsed["data"] == {
+        assert {key: value for key, value in parsed["data"].items() if key != "build_test_packet"} == {
             "block_count": 1,
             "workflow_updated": True,
             "skipped_run": True,
             "skip_reason": "workflow_credential_inputs_unbound",
         }
+        packet = parsed["data"]["build_test_packet"]
+        assert packet["canonical_workflow_yaml"] == workflow_yaml.replace("credential.username", "credential.password")
+        assert packet["canonical_workflow_source"] == "accepted_write_readback"
+        assert packet["run"] == {}
+        assert any("no workflow run was recorded" in notice for notice in packet["omission_notices"])
         assert captured["allow_missing_credentials"] is True
         assert "credential.password" in str(captured["persisted_yaml"])
         assert ctx.last_run_skipped_unbound_credentials is True
         run_blocks.assert_not_awaited()
+
+
+class TestSharedBuildTestPacket:
+    _SAVED_WORKFLOW = """title: Test workflow
+workflow_definition:
+  blocks:
+    - block_type: code
+      label: read_total
+      code: |
+        return {"total": await page.inner_text("#final")}
+"""
+    _PRIOR_WORKFLOW = _SAVED_WORKFLOW.replace('"#final"', '"#old"')
+    _FAILED_RUN: ClassVar[dict[str, Any]] = {
+        "ok": False,
+        "error": "The total was not available.",
+        "data": {
+            "workflow_run_id": "wr_packet_1",
+            "overall_status": "failed",
+            "requested_block_labels": ["read_total"],
+            "executed_block_labels": ["read_total"],
+            "blocks": [
+                {
+                    "label": "read_total",
+                    "block_type": "CODE",
+                    "status": "failed",
+                    "failure_reason": "The total was not available.",
+                    "extracted_data": {"downloaded_file_artifact_ids": ["artifact_1"]},
+                }
+            ],
+            "current_url": "https://example.test/results",
+            "page_title": "Results",
+            "action_trace_summary": ["NULL_ACTION failed response=missing total code_line=3"],
+            "registered_output_parameter_values": [
+                {
+                    "workflow_run_id": "wr_packet_1",
+                    "output_parameter_id": "output_1",
+                    "output_parameter_key": "total",
+                    "block_label": "read_total",
+                    "block_type": "CODE",
+                    "value": None,
+                }
+            ],
+            "screenshot_base64": "frame-bytes",
+            "authoring_repair_context": {
+                "block_label": "read_total",
+                "reason_code": "runtime_block_failure",
+                "runtime_failure_reason": "The total was not available.",
+                "failed_block_status": "failed",
+                "workflow_run_id": "wr_packet_1",
+                "current_origin": "https://example.test",
+                "current_url": "https://example.test/results",
+                "current_title": "Results",
+                "page_evidence_source": "inspect_page_for_composition",
+                "observed_after_workflow_run": True,
+                "page_form_summaries": [],
+                "page_result_summaries": ["result container #summary; text=Total unavailable"],
+                "page_action_summaries": ["button #refresh; text=Refresh"],
+                "page_challenge_summaries": [],
+                "page_obstruction_summaries": [],
+            },
+        },
+    }
+
+    @pytest.mark.asyncio
+    async def test_same_saved_workflow_and_failed_run_share_one_packet_across_three_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_update_workflow(payload, ctx, **_kwargs):
+            assert payload["workflow_yaml"] == self._SAVED_WORKFLOW
+            ctx.workflow_yaml = self._SAVED_WORKFLOW
+            ctx.last_workflow_yaml = self._SAVED_WORKFLOW
+            ctx.last_workflow = SimpleNamespace(workflow_definition={"blocks": []})
+            return {"ok": True, "data": {"block_count": 1}, "_workflow": ctx.last_workflow}
+
+        async def fake_run_blocks(_params, _ctx, **_kwargs):
+            return json.loads(json.dumps(self._FAILED_RUN))
+
+        async def fake_verify(ctx, _result, _handler_start):
+            ctx.last_unverified_block_labels = ["read_total"]
+            ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="run_blocks_and_collect_debug",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_packet_1",
+            )
+
+        def fake_record_update(ctx, result, _prior_definition=None):
+            if result.get("ok"):
+                ctx.last_workflow_yaml = ctx.workflow_yaml
+                ctx.last_workflow = result.get("_workflow") or ctx.last_workflow
+                ctx.last_update_block_count = 1
+
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value={"blocks": []}))
+        monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_record_workflow_update_result", fake_record_update)
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", fake_verify)
+        monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_clear_pending_browser_interaction_observation", lambda *args: None)
+
+        def context(workflow_yaml: str) -> CopilotContext:
+            return _ctx(
+                workflow_yaml=workflow_yaml,
+                last_workflow_yaml=workflow_yaml,
+                request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+            )
+
+        update_then_run_ctx = context(self._PRIOR_WORKFLOW)
+        combined_ctx = context(self._PRIOR_WORKFLOW)
+        edit_ctx = context(self._PRIOR_WORKFLOW)
+        with capture_logs() as logs:
+            await tools_module.update_workflow_tool.on_invoke_tool(
+                SimpleNamespace(context=update_then_run_ctx, tool_name="update_workflow"),
+                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW}),
+            )
+            update_then_run = await tools_module.run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=update_then_run_ctx, tool_name="run_blocks_and_collect_debug"),
+                json.dumps({"block_labels": ["read_total"], "parameters": {}}),
+            )
+            combined = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+                SimpleNamespace(context=combined_ctx, tool_name="update_and_run_blocks"),
+                json.dumps({"workflow_yaml": self._SAVED_WORKFLOW, "block_labels": ["read_total"], "parameters": {}}),
+            )
+            edited = await tools_module.edit_block_and_run_tool.on_invoke_tool(
+                SimpleNamespace(context=edit_ctx, tool_name="edit_block_and_run"),
+                json.dumps(
+                    {
+                        "label": "read_total",
+                        "expected_code": '"#old"',
+                        "replacement_code": '"#final"',
+                        "block_labels": ["read_total"],
+                        "parameters": {},
+                    }
+                ),
+            )
+
+        packets = [json.loads(result)["data"]["build_test_packet"] for result in (update_then_run, combined, edited)]
+        assert packets[0] == packets[1] == packets[2]
+        packet = packets[0]
+        assert packet["workflow_permanent_id"] == "wfp-1"
+        assert packet["canonical_workflow_yaml"] == self._SAVED_WORKFLOW
+        assert packet["attempted_block_labels"] == ["read_total"]
+        assert packet["executed_block_labels"] == ["read_total"]
+        assert packet["run"] == {"workflow_run_id": "wr_packet_1", "status": "failed"}
+        assert packet["failure"]["block_label"] == "read_total"
+        assert packet["failure"]["action_trace"] == ["NULL_ACTION failed response=missing total code_line=3"]
+        assert packet["failure"]["page_state"]["result_summaries"] == [
+            "result container #summary; text=Total unavailable"
+        ]
+        assert packet["registered_outputs"][0]["output_parameter_key"] == "total"
+        assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
+        assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
+        assert packet["unfinished_items"] == [{"kind": "unverified_block", "label": "read_total"}]
+        assert sum(log.get("event") == "copilot diagnosis repair contract shadow" for log in logs) == 3
+
+    def test_packet_falls_back_to_turn_start_persistence_readback_not_submitted_yaml(self) -> None:
+        ctx = _ctx(
+            workflow_yaml="title: submitted but rejected",
+            persisted_workflow_yaml="title: persisted canonical workflow",
+            last_workflow_yaml=None,
+        )
+        result: dict[str, Any] = {"ok": False, "error": "workflow validation failed"}
+
+        run_execution_module.finalize_build_test_result(
+            ctx,
+            source_tool="update_workflow",
+            result=result,
+        )
+        packet = result["data"]["build_test_packet"]
+
+        assert packet["canonical_workflow_yaml"] == "title: persisted canonical workflow"
+        assert packet["canonical_workflow_source"] == "turn_start_persisted_readback"
+        assert "submitted but rejected" not in str(packet)
+
+    def test_packet_omits_evidence_that_is_not_bound_to_the_current_run(self) -> None:
+        ctx = _ctx(
+            persisted_workflow_yaml="title: persisted canonical workflow",
+            last_unverified_block_labels=["stale_block"],
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="run_blocks_and_collect_debug",
+                verdict="repairable_failure",
+                reason_code="runtime_block_failure",
+                workflow_run_id="wr_old",
+            ),
+        )
+        result: dict[str, Any] = {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_new",
+                "overall_status": "failed",
+                "current_url": "https://example.test/current",
+                "blocks": [{"label": "read_total", "status": "failed"}],
+                "registered_output_parameter_values": [
+                    {"workflow_run_id": "wr_old", "output_parameter_key": "total", "value": "stale"}
+                ],
+                "authoring_repair_context": {
+                    "workflow_run_id": "wr_old",
+                    "page_result_summaries": ["stale page result"],
+                },
+            },
+        }
+
+        run_execution_module.finalize_build_test_result(
+            ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
+        packet = result["data"]["build_test_packet"]
+
+        assert packet["registered_outputs"] == []
+        assert packet["unfinished_items"] == []
+        assert packet["failure"]["page_state"]["current_url"] == "https://example.test/current"
+        assert packet["failure"]["page_state"]["result_summaries"] == []
+        assert any("another or unknown run" in notice for notice in packet["omission_notices"])
+
+    def test_packet_omits_failed_block_screenshot_without_a_recorded_run(self) -> None:
+        ctx = _ctx(persisted_workflow_yaml="title: persisted canonical workflow")
+        result: dict[str, Any] = {
+            "ok": False,
+            "data": {
+                "overall_status": "failed",
+                "blocks": [
+                    {
+                        "label": "read_total",
+                        "status": "failed",
+                        "screenshot_b64": "unbound-screenshot-bytes",
+                    }
+                ],
+            },
+        }
+
+        run_execution_module.finalize_build_test_result(
+            ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
+        packet = result["data"]["build_test_packet"]
+
+        assert packet["run"] == {"status": "failed"}
+        assert packet["screenshot"] == {"present": False}
+        assert any("screenshot omitted" in notice for notice in packet["omission_notices"])
 
 
 class TestTranslateToAgentResultGating:

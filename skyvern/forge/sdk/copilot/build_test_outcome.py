@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import structlog
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     carrier_backed_anti_bot_categories,
@@ -67,6 +67,8 @@ BuildTestOutcomeReasonCode = Literal[
 _TERMINAL_CHALLENGE_REASON_CODES: frozenset[BuildTestOutcomeReasonCode] = frozenset({"terminal_challenge_blocker"})
 PostRunPagePathKind = Literal["login", "challenge", "incomplete_navigation", "non_page_outcome"]
 PostRunPagePathTargetKind = Literal["form_submit", "navigation", "clickable", "challenge"]
+BuildTestPacketWorkflowSource = Literal["accepted_write_readback", "turn_start_persisted_readback", "unavailable"]
+BuildTestPacketUnfinishedKind = Literal["unverified_block", "missing_requested_output"]
 
 _STRUCTURAL_KEY_VERSION = "recorded_build_test_outcome:v1"
 _AUTHORED_STRUCTURE_VERSION = "recorded_build_test_outcome_authored_structure:v1"
@@ -103,6 +105,92 @@ class PostRunPagePathFailure(BaseModel):
     @property
     def is_page_path(self) -> bool:
         return self.kind != "non_page_outcome" and bool(self.continuation_targets)
+
+
+class BuildTestPacketRun(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str | None = None
+    status: str | None = None
+
+
+class BuildTestPacketPageState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    current_origin: str | None = None
+    current_url: str | None = None
+    title: str | None = None
+    evidence_source: str | None = None
+    observed_after_workflow_run: bool = False
+    form_summaries: list[str] = Field(default_factory=list)
+    result_summaries: list[str] = Field(default_factory=list)
+    action_summaries: list[str] = Field(default_factory=list)
+    challenge_summaries: list[str] = Field(default_factory=list)
+    obstruction_summaries: list[str] = Field(default_factory=list)
+
+
+class BuildTestPacketFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    block_label: str | None = None
+    block_status: str | None = None
+    reason: str | None = None
+    action_trace: list[str] = Field(default_factory=list)
+    page_state: BuildTestPacketPageState | None = None
+
+
+class BuildTestPacketRegisteredOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workflow_run_id: str | None = None
+    output_parameter_id: str | None = None
+    output_parameter_key: str | None = None
+    block_label: str | None = None
+    block_type: str | None = None
+    value: JsonValue = None
+    value_complete: bool = True
+
+
+class BuildTestPacketDownload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    artifact_id: str
+    file_name: str | None = None
+
+
+class BuildTestPacketScreenshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    present: bool
+    provenance: str | None = None
+
+
+class BuildTestPacketUnfinishedItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: BuildTestPacketUnfinishedKind
+    label: str | None = None
+    output_path: str | None = None
+    reason_code: str | None = None
+
+
+class BuildTestEvidencePacket(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    contract_version: Literal["build_test_evidence_packet_v1"] = "build_test_evidence_packet_v1"
+    workflow_permanent_id: str | None = None
+    canonical_workflow_yaml: str | None = None
+    canonical_workflow_source: BuildTestPacketWorkflowSource
+    canonical_workflow_yaml_complete: bool = True
+    attempted_block_labels: list[str] = Field(default_factory=list)
+    executed_block_labels: list[str] = Field(default_factory=list)
+    run: BuildTestPacketRun
+    failure: BuildTestPacketFailure | None = None
+    registered_outputs: list[BuildTestPacketRegisteredOutput] = Field(default_factory=list)
+    downloads: list[BuildTestPacketDownload] = Field(default_factory=list)
+    screenshot: BuildTestPacketScreenshot
+    unfinished_items: list[BuildTestPacketUnfinishedItem] = Field(default_factory=list)
+    omission_notices: list[str] = Field(default_factory=list)
 
 
 class RecordedBuildTestOutcome(BaseModel):

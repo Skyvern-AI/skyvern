@@ -341,6 +341,52 @@ class TestModelInputCapture:
         assert len(sorted(tmp_path.glob("call-*.json"))) == 2
 
 
+def test_build_test_packet_survives_recent_tool_output_head_compaction() -> None:
+    from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+    from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+    packet = {
+        "contract_version": "build_test_evidence_packet_v1",
+        "workflow_permanent_id": "wfp_compaction",
+        "canonical_workflow_yaml": "title: accepted workflow",
+        "canonical_workflow_source": "accepted_write_readback",
+        "canonical_workflow_yaml_complete": True,
+        "attempted_block_labels": ["read_total"],
+        "executed_block_labels": ["read_total"],
+        "run": {"workflow_run_id": "wr_compaction", "status": "failed"},
+        "failure": {"block_label": "read_total", "block_status": "failed", "reason": "missing total"},
+        "registered_outputs": [],
+        "downloads": [],
+        "screenshot": {"present": True, "provenance": "data.screenshot_base64"},
+        "unfinished_items": [{"kind": "unverified_block", "label": "read_total"}],
+        "omission_notices": [],
+    }
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {
+            "ok": False,
+            "data": {
+                "legacy_blob": "x" * 60_000,
+                "screenshot_base64": "raw-frame-bytes",
+                "build_test_packet": packet,
+            },
+        },
+    )
+    output = json.dumps(sanitized)
+    filtered = copilot_call_model_input_filter(
+        _mk_input_data([{"type": "function_call_output", "call_id": "run-1", "output": output}])
+    )
+    compacted_output = filtered.input[0]["output"]
+    projected_packet = json.dumps(sanitized["data"]["build_test_packet"])
+
+    assert len(output) > 50_000
+    assert projected_packet in compacted_output
+    assert compacted_output.index("build_test_packet") < compacted_output.index("legacy_blob")
+    assert "wfp_compaction" in compacted_output
+    assert "wr_compaction" in compacted_output
+    assert "raw-frame-bytes" not in compacted_output
+
+
 def test_model_input_pipeline_has_no_generated_offer_special_case() -> None:
     from skyvern.forge.sdk.copilot import enforcement
 
