@@ -1807,7 +1807,7 @@ async def test_observe_digest_reads_a_component_banner_whose_text_is_slotted() -
 _REJECTION_BANNER = "We could not process your application. The reference number does not match our records."
 
 
-def _wrapper_form_html(n_fields: int, *, decorated: bool) -> str:
+def _wrapper_form_html(n_fields: int, *, decorated: bool, marker_text: str = " *") -> str:
     """N per-field state wrappers with a rejection banner LAST inside the form.
 
     Walk order is the channel's order, so a banner placed last is the worst case for a
@@ -1815,7 +1815,7 @@ def _wrapper_form_html(n_fields: int, *, decorated: bool) -> str:
     marker in a sibling node, which is what makes a wrapper's text differ from the listed
     label by a character the label suppression compares byte for byte.
     """
-    marker = '<span class="req"> *</span>' if decorated else ""
+    marker = f'<span class="req">{marker_text}</span>' if decorated else ""
     rows = "".join(
         f'<div class="field--has-error"><label for="f{i}">Question number {i} about your '
         f'background</label>{marker}<input id="f{i}" name="f{i}"></div>'
@@ -1834,6 +1834,92 @@ async def test_observe_digest_surfaces_a_rejection_banner_behind_decorated_field
     # label suppression does not match, so every wrapper spends the message channel's budget on
     # text the element list already carries and the page's real refusal never fits.
     async with _content_page(_wrapper_form_html(120, decorated=True)) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n_fields", [40, 120, 200])
+async def test_observe_digest_surfaces_a_rejection_banner_behind_word_marked_field_wrappers(n_fields: int) -> None:
+    # A "(required)" word marker is at least as common as an asterisk, and it is letters, so
+    # stripping edge punctuation leaves "<label> (required" and the wrapper is read as a message
+    # at its place in the walk. Enough of them and the refusal placed last never fits.
+    async with _content_page(_wrapper_form_html(n_fields, decorated=True, marker_text=" (required)")) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_still_reads_a_word_marked_wrapper_the_budget_has_room_for() -> None:
+    # The word marker is recognised for ORDERING only: offered last, a wrapper on a page with room
+    # is still read, as its text may be the page's one message. Dropping it would fail closed.
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        '<div class="field--has-error"><label for="d1">Upload your identity document</label>'
+        '<span class="req"> (required)</span><input id="d1" type="file"></div>'
+        '<div class="field--has-error"><label for="e1">Email</label><input id="e1"></div>'
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("identity document (required)" in t for t in texts), texts
+    assert data.get("textDropped", 0) == 0, data.get("textDropped")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inside, after",
+    [
+        (
+            '<input type="hidden" name="returnUrl" value="/account">',
+            '<button class="btn" type="button">Sign in</button>',
+        ),
+        ('<input type="submit" name="btnLogin" value="Sign in">', ""),
+    ],
+)
+async def test_observe_digest_keeps_a_refusal_that_is_a_button_caption_plus_a_marker_word(
+    inside: str, after: str
+) -> None:
+    # Listed labels carry button captions, so "Sign in required" reads as the "Sign in" button plus
+    # a marker word, and the banner holds a control -- a hidden one the list never carries, or the
+    # captioned submit itself. Neither makes it a wrapper; deferred, it would not fit behind
+    # fillers that spend the 600-char budget to the byte, and a refusal base surfaced would be dropped.
+    fillers = "".join(f'<div class="error">Field {i:02d} is invalid.</div>' for i in range(30))
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        f'<div class="alert alert-danger">Sign in required{inside}</div>'
+        f"{fillers}{after}"
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("Sign in required" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_text", [" *", " (required)"])
+async def test_observe_digest_surfaces_a_refusal_rendered_above_the_form_behind_its_wrappers(marker_text: str) -> None:
+    # A near-match is read after EVERY other message, in-form or not, never merely after its own
+    # bucket: a page-level refusal toast sits outside the form, and draining the form's wrappers
+    # before it is read would spend the budget on label echoes and drop it.
+    wrappers = "".join(
+        f'<div class="field--has-error"><label for="f{i}">Question number {i} about your '
+        f'background</label><span class="req">{marker_text}</span><input id="f{i}"></div>'
+        for i in range(40)
+    )
+    html_doc = (
+        f'<!doctype html><html><body><form id="application">{wrappers}</form>'
+        f'<div class="alert alert-danger">{_REJECTION_BANNER}</div></body></html>'
+    )
+    async with _content_page(html_doc) as page:
         data = await _observe_data(page)
     texts = data.get("text") or []
     assert any("reference number does not match" in t for t in texts), texts
