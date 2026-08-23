@@ -3453,8 +3453,8 @@ async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
 
     async def _read(
         _ctx_arg: CopilotContext, *, run_session_id: str, current_url: str
-    ) -> tuple[dict[str, Any], str, None]:
-        return packet, run_session_id, None
+    ) -> tuple[dict[str, Any], str, None, None]:
+        return packet, run_session_id, None, None
 
     monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", _read)
 

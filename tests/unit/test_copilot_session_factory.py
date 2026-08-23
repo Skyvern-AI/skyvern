@@ -10,7 +10,11 @@ from typing import Any
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotEntry,
+    ScreenshotProvenance,
+)
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     make_copilot_call_model_input_filter,
@@ -27,8 +31,23 @@ def _image_parts(item: Any) -> list[Any]:
 
 def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
-        pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+        pending_screenshots=[
+            ScreenshotEntry(
+                b64="dGVzdA==",
+                mime="image/jpeg",
+                capture_id="sha256:frame-123",
+                provenance=ScreenshotProvenance(
+                    source_tool="inspect_page_for_composition",
+                    captured_url="https://example.com/results",
+                    observation_step=2,
+                    browser_session_id="pbs_123",
+                    workflow_run_id="wr_123",
+                    action_relation=ScreenshotActionRelation.SAME_PAGE_OBSERVATION,
+                ),
+            )
+        ],
         supports_vision=supports_vision,
+        pending_frame_lease=None,
     )
 
 
@@ -171,6 +190,44 @@ class TestSessionInputCallback:
         new_items = [{"role": "user", "content": "hello"}]
         assert copilot_session_input_callback([], new_items) == new_items
 
+    def test_materialized_paired_frame_is_placeholdered_after_tool_output(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import SCREENSHOT_PLACEHOLDER
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        goal = {"role": "user", "content": "build a workflow"}
+        paired = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "[copilot:screenshot] [copilot:paired-observation] Frame provenance",
+                },
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,dGVzdA=="},
+            ],
+        }
+        output = {"type": "function_call_output", "call_id": "click-1", "output": '{"ok":true}'}
+
+        combined = copilot_session_input_callback([goal, paired, output], [])
+
+        assert combined[1] == {"role": "user", "content": SCREENSHOT_PLACEHOLDER}
+
+    def test_unmarked_generic_frame_keeps_existing_retention_behavior(self) -> None:
+        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+
+        goal = {"role": "user", "content": "build a workflow"}
+        generic = {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "[copilot:screenshot] generic tool frame"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,dGVzdA=="},
+            ],
+        }
+        output = {"type": "function_call_output", "call_id": "read-1", "output": '{"ok":true}'}
+
+        combined = copilot_session_input_callback([goal, generic, output], [])
+
+        assert combined[1] == generic
+
     def test_preserves_original_goal_and_applies_compaction_to_middle(self) -> None:
         """First-turn shape (one real user, several tool iterations): the
         goal at index 0 is preserved; older function_call_output items get
@@ -303,6 +360,32 @@ class TestStagedScreenshotBinding:
         assert [len(_image_parts(item)) for item in result.input] == [0, 1]
         assert any(log["event"] == "Injecting screenshot user message" for log in logs)
 
+    def test_linked_structural_result_precedes_the_frame_and_its_provenance(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        items = [
+            {"role": "user", "content": "inspect this page"},
+            {
+                "type": "function_call_output",
+                "call_id": "inspect-1",
+                "output": json.dumps(
+                    {
+                        "ok": True,
+                        "current_url": "https://example.com/results",
+                        "observation_step": 2,
+                        "data": {"source_tool": "inspect_page_for_composition"},
+                    }
+                ),
+            },
+        ]
+
+        result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
+
+        assert result.input[-2] == items[-1]
+        assert len(_image_parts(result.input[-1])) == 1
+        provenance_text = result.input[-1]["content"][0]["text"]
+        assert "source_tool=inspect_page_for_composition" in provenance_text
+        assert "observation_step=2" in provenance_text
+
     def test_a_second_pass_over_the_same_context_still_carries_the_frame(self) -> None:
         ctx = _ctx_with_staged_frame()
         items = [{"role": "user", "content": "clear the modal on this page"}]
@@ -313,6 +396,63 @@ class TestStagedScreenshotBinding:
         assert len(_image_parts(first.input[-1])) == 1
         assert len(_image_parts(second.input[-1])) == 1
         assert len(ctx.pending_screenshots) == 1
+
+    def test_paired_frame_is_not_redelivered_after_model_input_advances(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        initial = [{"role": "user", "content": "clear the modal on this page"}]
+
+        first = copilot_call_model_input_filter(_mk_input_data(initial, context=ctx))
+        advanced = [
+            *initial,
+            {"type": "function_call", "call_id": "click-1", "name": "click", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "click-1", "output": '{"ok":true}'},
+        ]
+        second = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
+
+        assert len(_image_parts(first.input[-1])) == 1
+        assert not any(_image_parts(item) for item in second.input)
+        assert ctx.pending_screenshots == []
+        assert ctx.pending_frame_lease is None
+
+    def test_new_paired_capture_gets_a_fresh_lease_after_invalidation(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        initial = [{"role": "user", "content": "clear the modal on this page"}]
+        copilot_call_model_input_filter(_mk_input_data(initial, context=ctx))
+        copilot_call_model_input_filter(
+            _mk_input_data([*initial, {"role": "assistant", "content": "acted"}], context=ctx)
+        )
+        ctx.pending_screenshots = _ctx_with_staged_frame().pending_screenshots
+
+        delivered = copilot_call_model_input_filter(
+            _mk_input_data([*initial, {"role": "assistant", "content": "acted"}], context=ctx)
+        )
+
+        assert len(_image_parts(delivered.input[-1])) == 1
+        assert ctx.pending_frame_lease.capture_id == "sha256:frame-123"
+
+    def test_same_pixels_from_a_new_capture_event_get_a_fresh_lease(self) -> None:
+        ctx = _ctx_with_staged_frame()
+        initial = [{"role": "user", "content": "inspect this page"}]
+        copilot_call_model_input_filter(_mk_input_data(initial, context=ctx))
+        first_event_id = ctx.pending_frame_lease.capture_event_id
+
+        recaptured = _ctx_with_staged_frame().pending_screenshots[0]
+        assert recaptured.capture_id == ctx.pending_screenshots[0].capture_id
+        assert recaptured.capture_event_id != first_event_id
+        ctx.pending_screenshots = [recaptured]
+        advanced = [*initial, {"role": "assistant", "content": "the page was inspected again"}]
+
+        delivered = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
+
+        assert len(_image_parts(delivered.input[-1])) == 1
+        assert ctx.pending_frame_lease.capture_event_id == recaptured.capture_event_id
+
+    def test_paired_message_has_machine_readable_marker(self) -> None:
+        ctx = _ctx_with_staged_frame()
+
+        result = copilot_call_model_input_filter(_mk_input_data([{"role": "user", "content": "inspect"}], context=ctx))
+
+        assert result.input[-1]["content"][0]["text"].startswith("[copilot:screenshot] [copilot:paired-observation] ")
 
     def test_a_non_vision_fallback_model_gets_no_image(self) -> None:
         # The frame was staged while the primary was still vision-capable; a retriable failure
