@@ -1215,6 +1215,7 @@ _OBSERVE_JS = (
     }
   }
   const out = [];
+  const labelOfControl = new Map();
   // Monotonic across observe() calls (persisted on window), and never reassigned on an element that
   // already has one, so a data-tv3 marker always denotes the same element. Resetting the counter per
   // call let a selector remembered from an earlier observe silently resolve to a different node.
@@ -1652,6 +1653,10 @@ _OBSERVE_JS = (
     if (pressed === 'true' || pressed === 'false') rec.pressed = pressed === 'true';
     if (minted !== null) minted.rec = rec;
     if (hidden) hiddenListed++;
+    // A submit or button input is named by its caption, and a caption is what a refusal beside it
+    // repeats; a field's own control is the only thing a wrapper holds.
+    const captioned = rec.tag === 'input' && /^(?:submit|button|reset|image)$/.test(rec.type || '');
+    if ((rec.tag === 'input' && !captioned) || rec.tag === 'select' || rec.tag === 'textarea') labelOfControl.set(el, rec.label.replace(/\s+/g, ' ').trim());
     out.push(rec);
     if (++i > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
@@ -1680,7 +1685,7 @@ _OBSERVE_JS = (
     // A record never built (the element threw mid-walk) was never handed out either.
     if (rem.rec === null || still !== rem.m) {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
-      if (at !== -1) { out.splice(at, 1); dropped++; }
+      if (at !== -1) { out.splice(at, 1); labelOfControl.delete(rem.el); dropped++; }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
   }
@@ -1779,7 +1784,6 @@ _OBSERVE_JS = (
         }
       } catch (e) { continue; }
     }
-    const orderedCands = formMsgs.head.concat(formMsgs.tail, otherMsgs.head, otherMsgs.tail);
     // A per-field state wrapper (`field--has-error`, `field--no-error`) matches this selector and its
     // text is just the control's own name, so it spends the channel's budget on what the element list
     // already carries -- enough of them and the page's real message never fits. Read off the records
@@ -1808,6 +1812,25 @@ _OBSERVE_JS = (
     // it -- take it, fold it into an entry that already holds it, or count it as dropped -- is what
     // it would have done at its place in the walk.
     const decoration = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
+    // A word marker ("(required)", "optional") is letters, so stripping edge punctuation leaves
+    // it in place and the wrapper still reads as a message. Listed labels include button captions,
+    // so "Sign in required" beside a "Sign in" button would read as a wrapper too: the marker is
+    // decoration only at an edge, and only on a block that holds the very control the rest names.
+    const wordMarker = /^(?:required|optional)(?:[^\p{L}\p{N}]+|$)|(?:^|[^\p{L}\p{N}]+)(?:required|optional)$/giu;
+    const nearLabel = (t, src) => {
+      const trimmed = t.replace(decoration, '');
+      if (listedLabels.has(trimmed.slice(0, 140))) return true;
+      const unmarked = trimmed.replace(wordMarker, '').replace(decoration, '');
+      if (!unmarked || unmarked === trimmed) return false;
+      const key = unmarked.slice(0, 140);
+      // A host can shadow querySelectorAll; a block that cannot be asked is not known to be a wrapper.
+      try {
+        for (const c of src.querySelectorAll('input,select,textarea')) {
+          if (labelOfControl.get(c) === key) return true;
+        }
+      } catch (e) { return false; }
+      return false;
+    };
     const deferred = [];
     const takeCand = (cand, mayDefer) => {
       const el = cand.el;
@@ -1825,10 +1848,10 @@ _OBSERVE_JS = (
       if (!t) return;
       // Compared at the width labels are stored at, so a truncated one still matches.
       if (listedLabels.has(t.slice(0, 140))) return;
-      if (mayDefer && listedLabels.has(t.replace(decoration, '').slice(0, 140))) { deferred.push(cand); return; }
+      if (mayDefer && nearLabel(t, src)) { deferred.push(cand); return; }
       if (t.length <= 300 || (t.length <= 900 && src.querySelectorAll('input,select,textarea').length < 2)) pushText(t, blockLimit);
     };
-    for (const cand of orderedCands) {
+    for (const cand of formMsgs.head.concat(formMsgs.tail, otherMsgs.head, otherMsgs.tail)) {
       if (textFull || textTotal - blockStart >= 600 || ++messageCandidates > 250) break;
       // This selector set is broad, so one poisoned element degrades to "skip it", not to an
       // emptied digest (the outer catch is for the narrow ARIA channel).
