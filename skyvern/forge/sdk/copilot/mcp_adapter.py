@@ -52,7 +52,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
     retire_browser_session_id,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    enqueue_screenshot_from_result,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.utils.contained_effects import contained_effect
@@ -1177,7 +1181,27 @@ class SkyvernOverlayMCPServer(MCPServer):
 
         copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
-        enqueue_screenshot_from_result(copilot_ctx, copilot_result)
+        screenshot_data = copilot_result.get("data")
+        screenshot_data = screenshot_data if isinstance(screenshot_data, dict) else {}
+        captured_url = screenshot_data.get("url") or screenshot_data.get("current_url")
+        observation_step = copilot_result.get("observation_step")
+        if observation_step is None:
+            observation_step = screenshot_data.get("observation_step")
+        workflow_run_id = copilot_result.get("workflow_run_id") or screenshot_data.get("workflow_run_id")
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            copilot_result,
+            provenance=ScreenshotProvenance(
+                source_tool=tool_name,
+                captured_url=captured_url if isinstance(captured_url, str) and captured_url else None,
+                observation_step=observation_step
+                if isinstance(observation_step, int) and not isinstance(observation_step, bool)
+                else None,
+                browser_session_id=call_browser_session_id,
+                workflow_run_id=workflow_run_id if isinstance(workflow_run_id, str) and workflow_run_id else None,
+                action_relation=ScreenshotActionRelation.TOOL_RESULT,
+            ),
+        )
         return _copilot_to_call_tool_result(copilot_result)
 
     async def call_internal_tool(
@@ -1214,6 +1238,9 @@ class SkyvernOverlayMCPServer(MCPServer):
         phases = _PhaseClock()
         copilot_name = self._reverse_alias.get(mcp_tool_name, mcp_tool_name)
         ctx = self._context_provider()
+        requested_session_id = mcp_args.get("session_id")
+        if not isinstance(requested_session_id, str) or not requested_session_id:
+            requested_session_id = None
         observed_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0)
         if not self._client:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "not_connected")
@@ -1238,8 +1265,10 @@ class SkyvernOverlayMCPServer(MCPServer):
         if continuity_result is not None:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
             return _scrub_tool_result(ctx, continuity_result)
-        merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
-        call_browser_session_id = ctx.browser_session_id
+        # An explicit session is a dispatch lease chosen before session preparation awaits. Do not
+        # relabel that call with mutable ambient context if another concurrent tool replaces it.
+        call_browser_session_id = requested_session_id or ctx.browser_session_id
+        merged_args = {**mcp_args, "session_id": call_browser_session_id}
         try:
             phases.enter("context_enter")
             async with mcp_browser_context(ctx):

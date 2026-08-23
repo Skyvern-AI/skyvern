@@ -31,7 +31,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
-from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    enqueue_screenshot_from_result,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import (
@@ -807,7 +811,11 @@ async def run_blocks_tool(
             source_tool="run_blocks_and_collect_debug",
             result=result,
         )
-        enqueue_screenshot_from_result(copilot_ctx, result)
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            result,
+            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+        )
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     return json.dumps(sanitized)
@@ -1067,9 +1075,39 @@ async def _run_updated_workflow_blocks(
             result=run_result,
             workflow_updated=True,
         )
-        enqueue_screenshot_from_result(copilot_ctx, run_result)
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            run_result,
+            provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
+        )
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     return json.dumps(sanitized)
+
+
+def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: str) -> ScreenshotProvenance:
+    """Bind a run-result frame to the facts carried by the run payload.
+
+    Run execution returns its identity fields under ``data``. Some older call
+    sites and error paths still expose them at the top level, so retain that as
+    a factual fallback rather than stamping the frame as unidentified.
+    """
+    data = result.get("data")
+    facts = data if isinstance(data, dict) else {}
+
+    def _string_fact(key: str) -> str | None:
+        value = facts.get(key)
+        if not isinstance(value, str) or not value:
+            value = result.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return ScreenshotProvenance(
+        source_tool=source_tool,
+        captured_url=_string_fact("current_url"),
+        observation_step=None,
+        browser_session_id=_string_fact("browser_session_id"),
+        workflow_run_id=_string_fact("workflow_run_id"),
+        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+    )
 
 
 @function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)

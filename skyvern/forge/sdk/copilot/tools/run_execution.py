@@ -102,6 +102,11 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     repair_page_evidence_is_admissible,
     same_run_typed_challenge_kind,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    enqueue_screenshot,
+)
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
@@ -1500,11 +1505,11 @@ async def _capture_and_store_post_run_page(
 ) -> None:
     """A failed or hollow capture neutralizes stale evidence to None only when it would not cleanly match
     this run_id, so the matcher's destructive clear cannot fire on the pending failure-string context."""
-    evidence, observed_session_id, _ = await _read_run_session_page_evidence(
+    evidence, observed_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
     if evidence is not None and repair_page_evidence_is_admissible(evidence):
-        store_post_run_page_evidence(
+        _, preserved_stored_evidence = store_post_run_page_evidence(
             ctx,
             evidence,
             run_id=run_id,
@@ -1512,6 +1517,24 @@ async def _capture_and_store_post_run_page(
             source_browser_session_id=observed_session_id,
             run_browser_session_id=run_session_id,
         )
+        if captured_frame is not None and not preserved_stored_evidence:
+            enqueue_screenshot(
+                ctx,
+                captured_frame.b64,
+                provenance=ScreenshotProvenance(
+                    source_tool="post_run_page_capture",
+                    captured_url=captured_frame.captured_url,
+                    observation_step=None,
+                    browser_session_id=captured_frame.browser_session_id,
+                    workflow_run_id=run_id,
+                    action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+                    dispatch_url=captured_frame.dispatch_url,
+                    dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
+                    producer_browser_session_id=captured_frame.producer_browser_session_id,
+                    session_binding=captured_frame.session_binding,
+                ),
+                captured_at=captured_frame.captured_at,
+            )
         return
     if not post_run_inspection_cleanly_matches(ctx.composition_page_evidence, run_id):
         ctx.composition_page_evidence = None
@@ -1590,7 +1613,7 @@ async def _capture_dispatched_terminal_page_evidence(
     if _pre_run_baseline_is_provenance_valid(ctx.composition_page_evidence):
         _pin_pre_run_page_reference(ctx, run_id)
     source = "cdp_run_session"
-    evidence, source_session_id, _ = await _read_run_session_page_evidence(
+    evidence, source_session_id, _, captured_frame = await _read_run_session_page_evidence(
         ctx, run_session_id=run_session_id, current_url=current_url
     )
     # A capture that landed on a substituted session can still look usable (a blank replacement page
@@ -1602,6 +1625,7 @@ async def _capture_dispatched_terminal_page_evidence(
         or not _dispatched_terminal_page_evidence_is_usable(evidence)
     ):
         source = "worker_artifact"
+        captured_frame = None
         source_session_id = run_session_id
         evidence = await _fetch_dispatched_terminal_page_evidence(
             run_id=run_id, organization_id=organization_id, current_url=current_url
@@ -1616,6 +1640,24 @@ async def _capture_dispatched_terminal_page_evidence(
         source_browser_session_id=source_session_id,
         run_browser_session_id=run_session_id,
     )
+    if captured_frame is not None and not preserved_stored_evidence:
+        enqueue_screenshot(
+            ctx,
+            captured_frame.b64,
+            provenance=ScreenshotProvenance(
+                source_tool="dispatched_terminal_page_capture",
+                captured_url=captured_frame.captured_url,
+                observation_step=None,
+                browser_session_id=captured_frame.browser_session_id,
+                workflow_run_id=run_id,
+                action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+                dispatch_url=captured_frame.dispatch_url,
+                dispatch_browser_session_id=captured_frame.dispatch_browser_session_id,
+                producer_browser_session_id=captured_frame.producer_browser_session_id,
+                session_binding=captured_frame.session_binding,
+            ),
+            captured_at=captured_frame.captured_at,
+        )
     LOG.info(
         "copilot_dispatched_terminal_page_evidence_captured",
         workflow_run_id=run_id,

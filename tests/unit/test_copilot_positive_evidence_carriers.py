@@ -632,8 +632,8 @@ async def test_dispatched_producer_prefers_worker_artifact_over_a_substituted_se
 
     async def fake_read(
         inner_ctx: object, *, run_session_id: str, current_url: str
-    ) -> tuple[dict[str, object], str, None]:
-        return {"observed_empty_page": True, "current_url": current_url}, "pbs_replacement", None
+    ) -> tuple[dict[str, object], str, None, None]:
+        return {"observed_empty_page": True, "current_url": current_url}, "pbs_replacement", None, None
 
     monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
 

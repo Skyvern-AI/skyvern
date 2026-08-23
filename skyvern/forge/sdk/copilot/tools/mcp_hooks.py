@@ -562,14 +562,22 @@ async def _navigate_post_hook(
             result_url=result["url"],
         )
         await _bind_login_credential_for_observed_url(ctx, result["url"], result)
-        staged = await _capture_post_interaction_screenshot(ctx)
+        staged = await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=result["url"],
+        )
         attached = " A screenshot is attached." if staged else ""
         result["next_step"] = (
             f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
             "page's structure or selectors before responding."
         )
     else:
-        await _capture_post_interaction_screenshot(ctx)
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=source_url,
+        )
     return result
 
 
@@ -633,6 +641,8 @@ async def _click_post_hook(
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
     page_evidence: dict[str, Any] | None = None
+    captured_url: str | None = None
+    observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
@@ -706,6 +716,7 @@ async def _click_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        captured_url = url or None
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
             # A download this click produced is proof the affordance works, so it outranks the
             # href-shape prediction — and is the only source that sees a command-URL download.
@@ -723,7 +734,12 @@ async def _click_post_hook(
     # The round-trip is skipped only when the evidence positively names the obstruction a frame
     # would have shown; evidence that merely parsed is not a substitute for looking at the page.
     if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
-        await _capture_post_interaction_screenshot(ctx)
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="click",
+            captured_url=captured_url or source_url,
+            observation_step=observation_step,
+        )
     return result
 
 

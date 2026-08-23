@@ -183,6 +183,9 @@ async def test_unrendered_challenge_keeps_structured_packet_when_relooks_run_out
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
+    async def visual_identity(ctx: object, evidence: dict) -> tuple[dict, None]:
+        return evidence, None
+
     # Body-only read: the anti-bot token lives in <title>, so it is absent here by construction.
     get_html = AsyncMock(return_value=(_BOUNDED_HTML, None, False, False))
     monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", fake_structured)
@@ -190,7 +193,9 @@ async def test_unrendered_challenge_keeps_structured_packet_when_relooks_run_out
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
     )
-    monkeypatch.setattr(tools.composition_capture, "_augment_composition_evidence_with_visual_fallback", identity)
+    monkeypatch.setattr(
+        tools.composition_capture, "_augment_composition_evidence_with_visual_fallback", visual_identity
+    )
     settle_sleep = AsyncMock()
     monkeypatch.setattr(tools.composition_capture, "asyncio", _AsyncioSleepProxy(settle_sleep))
 
@@ -267,13 +272,18 @@ async def test_signalled_packet_survives_extractor_blinking_mid_loop(monkeypatch
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
+    async def visual_identity(ctx: object, evidence: dict) -> tuple[dict, None]:
+        return evidence, None
+
     get_html = AsyncMock(return_value=(_BOUNDED_HTML, None, False, False))
     monkeypatch.setattr(tools.composition_capture, "_composition_get_structured_evidence_result", fake_structured)
     monkeypatch.setattr(tools.composition_capture, "_composition_get_html", get_html)
     monkeypatch.setattr(
         tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
     )
-    monkeypatch.setattr(tools.composition_capture, "_augment_composition_evidence_with_visual_fallback", identity)
+    monkeypatch.setattr(
+        tools.composition_capture, "_augment_composition_evidence_with_visual_fallback", visual_identity
+    )
     monkeypatch.setattr(tools.composition_capture, "asyncio", _AsyncioSleepProxy(AsyncMock()))
 
     evidence, html_error = await tools._capture_composition_evidence(

@@ -3955,11 +3955,13 @@ async def test_navigation_failure_uses_structured_evidence_when_bounded() -> Non
     server = _RecordingCompositionServer(structured_json=json.dumps(_structured_form_payload()))
     ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
 
-    evidence = await tools_module._composition_evidence_after_navigation_failure(
+    capture = await tools_module._composition_evidence_after_navigation_failure(
         ctx, inspected_url="https://example.com/lookup", navigation_error="boom"
     )
 
-    assert evidence is not None
+    assert capture is not None
+    evidence, frame = capture
+    assert frame is None
     assert evidence["forms"]
     assert server.calls.count("skyvern_get_html") == 0
     assert any("navigation_error_before_html_capture" in warning for warning in evidence["inspection_warnings"])
@@ -3972,8 +3974,8 @@ async def test_navigation_failure_uses_visual_fallback_after_structured_failure_
     server = _RecordingCompositionServer(structured_json=None, html=_HTML_FORM_PAGE)
     ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
 
-    async def attach_visual(_ctx: Any, evidence: dict[str, Any]) -> dict[str, Any]:
-        return {**evidence, "screenshot_used": True, "visual_evidence_summary": "A login form is visible."}
+    async def attach_visual(_ctx: Any, evidence: dict[str, Any]) -> tuple[dict[str, Any], None]:
+        return {**evidence, "screenshot_used": True, "visual_evidence_summary": "A login form is visible."}, None
 
     monkeypatch.setattr(
         tools_module.composition_capture,
@@ -3981,13 +3983,15 @@ async def test_navigation_failure_uses_visual_fallback_after_structured_failure_
         attach_visual,
     )
 
-    evidence = await tools_module._composition_evidence_after_navigation_failure(
+    capture = await tools_module._composition_evidence_after_navigation_failure(
         ctx,
         inspected_url="https://example.com/login",
         navigation_error="https://example.com/callback?token=raw-secret",
     )
 
-    assert evidence is not None
+    assert capture is not None
+    evidence, frame = capture
+    assert frame is None
     assert evidence["screenshot_used"] is True
     assert evidence["visual_evidence_summary"] == "A login form is visible."
     assert "raw-secret" not in json.dumps(evidence)

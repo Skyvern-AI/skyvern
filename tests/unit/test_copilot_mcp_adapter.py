@@ -197,6 +197,50 @@ def _server_whose_call_takes_time(
     )
 
 
+@pytest.mark.asyncio
+async def test_internal_call_preserves_explicit_session_across_session_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_snapshot")
+    server = _make_server(
+        ctx,
+        {"ok": True},
+        SchemaOverlay(requires_browser=True),
+        alias_map=get_skyvern_mcp_alias_map(),
+    )
+    dispatched: list[dict[str, Any]] = []
+
+    class _CapturingClient:
+        async def call_tool(self, name: str, args: dict[str, Any], raise_on_error: bool = False) -> Any:
+            dispatched.append(dict(args))
+            return SimpleNamespace(
+                structured_content={"ok": True},
+                is_error=False,
+                content=[],
+            )
+
+    async def _replace_ambient_session(_ctx: AgentContext, **_kwargs: Any) -> tuple[None, None]:
+        _ctx.browser_session_id = "pbs_replacement"
+        return None, None
+
+    @asynccontextmanager
+    async def _scope(_ctx: AgentContext) -> AsyncIterator[None]:
+        yield
+
+    server._client = _CapturingClient()
+    monkeypatch.setattr(mcp_adapter, "_prepare_browser_session_for_dispatch", _replace_ambient_session)
+    monkeypatch.setattr(mcp_adapter, "mcp_browser_context", _scope)
+
+    result = await server.call_internal_tool(
+        "skyvern_evaluate",
+        {"expression": "scan()", "session_id": "pbs_snapshot"},
+    )
+
+    assert result["ok"] is True
+    assert dispatched == [{"expression": "scan()", "session_id": "pbs_snapshot"}]
+    assert ctx.browser_session_id == "pbs_replacement"
+
+
 @pytest.mark.usefixtures("_stub_browser_session")
 class TestMCPToolTiming:
     @pytest.mark.asyncio

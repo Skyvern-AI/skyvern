@@ -405,7 +405,7 @@ class TestMCPFailedStepLoopDetection:
         monkeypatch.setattr(
             mcp_adapter,
             "enqueue_screenshot_from_result",
-            lambda _ctx, result: screenshots.append(dict(result)),
+            lambda _ctx, result, **_kwargs: screenshots.append(dict(result)),
         )
 
         initial_scouted_interactions = [{"tool_name": "click", "selector": "#existing"}]

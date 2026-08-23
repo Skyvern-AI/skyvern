@@ -16,7 +16,10 @@ from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     COPILOT_SCREENSHOT_MAX_HEIGHT,
     COPILOT_SCREENSHOT_MAX_WIDTH,
+    ScreenshotActionRelation,
     ScreenshotEntry,
+    ScreenshotProvenance,
+    enqueue_screenshot,
     stage_screenshot_from_artifact,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
@@ -48,6 +51,15 @@ def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> Non
         DATABASE = mock_db
 
     monkeypatch.setattr(run_execution_module, "app", _AppStub())
+
+
+def _screenshot_entry(b64: str) -> ScreenshotEntry:
+    return ScreenshotEntry(
+        b64=b64,
+        mime="image/jpeg",
+        capture_id="sha256:test-frame",
+        provenance=ScreenshotProvenance.unknown(source_tool="test_capture"),
+    )
 
 
 class TestIsValidPngBase64:
@@ -93,11 +105,35 @@ class TestEnqueueScreenshot:
         ctx = MagicMock()
         ctx.supports_vision = True
         ctx.pending_screenshots = []
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}})
+        provenance = ScreenshotProvenance(
+            source_tool="get_browser_screenshot",
+            captured_url="https://example.com/current",
+            observation_step=3,
+            browser_session_id="pbs_123",
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.TOOL_RESULT,
+        )
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}},
+            provenance=provenance,
+        )
         assert len(ctx.pending_screenshots) == 1
         entry = ctx.pending_screenshots[0]
         assert isinstance(entry, ScreenshotEntry)
         assert entry.mime == "image/jpeg"
+        assert entry.capture_id.startswith("sha256:")
+        assert entry.provenance == provenance
+
+    def test_older_capture_cannot_replace_newer_pending_frame(self) -> None:
+        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[])
+        provenance = ScreenshotProvenance.unknown(source_tool="inspect_page_for_composition")
+
+        assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=20.0) is True
+        newest = ctx.pending_screenshots[0]
+        assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=10.0) is False
+
+        assert ctx.pending_screenshots == [newest]
 
     def test_skips_when_no_vision(self) -> None:
         from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
@@ -105,7 +141,11 @@ class TestEnqueueScreenshot:
         ctx = MagicMock()
         ctx.supports_vision = False
         ctx.pending_screenshots = []
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}})
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}},
+            provenance=ScreenshotProvenance.unknown(source_tool="get_browser_screenshot"),
+        )
         assert len(ctx.pending_screenshots) == 0
 
     def test_skips_invalid_image(self) -> None:
@@ -114,7 +154,11 @@ class TestEnqueueScreenshot:
         ctx = MagicMock()
         ctx.supports_vision = True
         ctx.pending_screenshots = []
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": "not-valid"}})
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": "not-valid"}},
+            provenance=ScreenshotProvenance.unknown(source_tool="get_browser_screenshot"),
+        )
         assert len(ctx.pending_screenshots) == 0
 
     def test_skips_corrupt_header_valid_image(self) -> None:
@@ -126,7 +170,11 @@ class TestEnqueueScreenshot:
         ctx.supports_vision = True
         ctx.pending_screenshots = []
         truncated_png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"broken-image-data").decode()
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": truncated_png + "A" * 100}})
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": truncated_png + "A" * 100}},
+            provenance=ScreenshotProvenance.unknown(source_tool="get_browser_screenshot"),
+        )
         assert len(ctx.pending_screenshots) == 0
 
     def test_second_enqueue_replaces_first_pending_entry(self) -> None:
@@ -137,13 +185,47 @@ class TestEnqueueScreenshot:
         ctx.supports_vision = True
         ctx.pending_screenshots = []
 
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}})
+        provenance = ScreenshotProvenance.unknown(source_tool="get_browser_screenshot")
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}},
+            provenance=provenance,
+        )
         first_entry = ctx.pending_screenshots[0]
 
-        enqueue_screenshot_from_result(ctx, {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}})
+        enqueue_screenshot_from_result(
+            ctx,
+            {"ok": True, "data": {"screenshot_base64": self.VALID_PNG_B64}},
+            provenance=provenance,
+        )
 
         assert len(ctx.pending_screenshots) == 1
         assert ctx.pending_screenshots[0] is not first_entry
+
+
+def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
+    from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
+
+    provenance = _run_result_screenshot_provenance(
+        {
+            "ok": False,
+            "data": {
+                "current_url": "https://example.com/after-run",
+                "browser_session_id": "pbs_nested",
+                "workflow_run_id": "wr_123",
+            },
+        },
+        source_tool="update_and_run_blocks",
+    )
+
+    assert provenance == ScreenshotProvenance(
+        source_tool="update_and_run_blocks",
+        captured_url="https://example.com/after-run",
+        observation_step=None,
+        browser_session_id="pbs_nested",
+        workflow_run_id="wr_123",
+        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+    )
 
 
 class TestStageScreenshotFromArtifact:
@@ -158,11 +240,15 @@ class TestStageScreenshotFromArtifact:
     def _ctx() -> SimpleNamespace:
         return SimpleNamespace(supports_vision=True, pending_screenshots=[])
 
+    @staticmethod
+    def _provenance() -> ScreenshotProvenance:
+        return ScreenshotProvenance.unknown(source_tool="click")
+
     def test_stages_the_artifact_the_path_names(self, tmp_path: Path) -> None:
         ctx = self._ctx()
         result = {"ok": True, "data": {"path": self._png(tmp_path / "frame.png", (400, 300))}}
 
-        assert stage_screenshot_from_artifact(ctx, result) is True
+        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
         assert len(ctx.pending_screenshots) == 1
         assert ctx.pending_screenshots[0].mime == "image/jpeg"
 
@@ -170,7 +256,7 @@ class TestStageScreenshotFromArtifact:
         ctx = self._ctx()
         result = {"ok": True, "data": {"path": self._png(tmp_path / "big.png", (2400, 1800))}}
 
-        assert stage_screenshot_from_artifact(ctx, result) is True
+        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
         width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
         assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
         assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
@@ -186,17 +272,31 @@ class TestStageScreenshotFromArtifact:
     def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
         ctx = self._ctx()
 
-        assert stage_screenshot_from_artifact(ctx, {"ok": True, "data": data}) is False
+        assert (
+            stage_screenshot_from_artifact(
+                ctx,
+                {"ok": True, "data": data},
+                provenance=self._provenance(),
+            )
+            is False
+        )
         assert ctx.pending_screenshots == []
 
     def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
         """A queue-length check would call this staged: the earlier frame is still pending."""
-        stale = ScreenshotEntry(b64="stale", mime="image/jpeg")
+        stale = _screenshot_entry("stale")
         ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[stale])
         corrupt = tmp_path / "corrupt.png"
         corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
 
-        assert stage_screenshot_from_artifact(ctx, {"ok": True, "data": {"path": str(corrupt)}}) is False
+        assert (
+            stage_screenshot_from_artifact(
+                ctx,
+                {"ok": True, "data": {"path": str(corrupt)}},
+                provenance=self._provenance(),
+            )
+            is False
+        )
         assert ctx.pending_screenshots == [stale]
 
 
@@ -204,8 +304,8 @@ class TestCapturePostInteractionScreenshot:
     @staticmethod
     def _server(result: dict[str, Any]) -> SimpleNamespace:
         async def call_internal_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            assert arguments == {}, "the copilot capture path must not request an inline frame"
-            return result
+            assert arguments == {"session_id": "pbs_123"}, "capture must dispatch to the snapshotted session"
+            return {**result, "browser_context": {"session_id": "pbs_123"}}
 
         return SimpleNamespace(call_internal_tool=call_internal_tool)
 
@@ -215,6 +315,7 @@ class TestCapturePostInteractionScreenshot:
             "supports_vision": True,
             "pending_screenshots": [],
             "discovery_mcp_server": self._server(result),
+            "browser_session_id": "pbs_123",
         }
         base.update(overrides)
         return SimpleNamespace(**base)
@@ -225,8 +326,50 @@ class TestCapturePostInteractionScreenshot:
         Image.new("RGB", (300, 200), (0, 0, 0)).save(frame, format="PNG")
         ctx = self._ctx({"ok": True, "data": {"path": str(frame)}})
 
-        assert await _capture_post_interaction_screenshot(ctx) is True
+        assert (
+            await _capture_post_interaction_screenshot(
+                ctx,
+                source_tool="click",
+                captured_url="https://example.com/results",
+                observation_step=2,
+            )
+            is True
+        )
         assert len(ctx.pending_screenshots) == 1
+        provenance = ctx.pending_screenshots[0].provenance
+        assert provenance.observation_step == 2
+        assert provenance.captured_url is None
+        assert provenance.dispatch_url == "https://example.com/results"
+        assert provenance.dispatch_browser_session_id == "pbs_123"
+        assert provenance.producer_browser_session_id == "pbs_123"
+        assert provenance.session_binding.value == "agree"
+
+    @pytest.mark.asyncio
+    async def test_context_mutation_during_capture_does_not_relabel_dispatch(self, tmp_path: Path) -> None:
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (300, 200), (0, 0, 0)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame)}})
+
+        async def call_internal_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            assert arguments == {"session_id": "pbs_123"}
+            ctx.browser_session_id = "pbs_replacement"
+            return {
+                "ok": True,
+                "browser_context": {"session_id": "pbs_producer"},
+                "data": {"path": str(frame)},
+            }
+
+        ctx.discovery_mcp_server = SimpleNamespace(call_internal_tool=call_internal_tool)
+        assert await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="click",
+            captured_url="https://example.com/results",
+        )
+        provenance = ctx.pending_screenshots[0].provenance
+        assert provenance.dispatch_browser_session_id == "pbs_123"
+        assert provenance.producer_browser_session_id == "pbs_producer"
+        assert provenance.browser_session_id == "pbs_producer"
+        assert provenance.session_binding.value == "disagree"
 
     @pytest.mark.parametrize(
         "overrides",
@@ -242,14 +385,28 @@ class TestCapturePostInteractionScreenshot:
         Image.new("RGB", (300, 200), (0, 0, 0)).save(frame, format="PNG")
         ctx = self._ctx({"ok": True, "data": {"path": str(frame)}}, **overrides)
 
-        assert await _capture_post_interaction_screenshot(ctx) is False
+        assert (
+            await _capture_post_interaction_screenshot(
+                ctx,
+                source_tool="click",
+                captured_url="https://example.com/results",
+            )
+            is False
+        )
         assert ctx.pending_screenshots == []
 
     @pytest.mark.asyncio
     async def test_failed_tool_call_stages_nothing(self) -> None:
         ctx = self._ctx({"ok": False, "error": "no page"})
 
-        assert await _capture_post_interaction_screenshot(ctx) is False
+        assert (
+            await _capture_post_interaction_screenshot(
+                ctx,
+                source_tool="click",
+                captured_url=None,
+            )
+            is False
+        )
         assert ctx.pending_screenshots == []
 
 
@@ -265,7 +422,19 @@ class TestConsumePendingScreenshots:
         from skyvern.forge.sdk.copilot.enforcement import SCREENSHOT_SENTINEL, _consume_pending_screenshots
         from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 
-        entry = ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")
+        entry = ScreenshotEntry(
+            b64="dGVzdA==",
+            mime="image/jpeg",
+            capture_id="sha256:frame-123",
+            provenance=ScreenshotProvenance(
+                source_tool="inspect_page_for_composition",
+                captured_url="https://example.com/results",
+                observation_step=4,
+                browser_session_id="pbs_123",
+                workflow_run_id="wr_123",
+                action_relation=ScreenshotActionRelation.SAME_PAGE_OBSERVATION,
+            ),
+        )
         ctx = MagicMock()
         ctx.pending_screenshots = [entry]
         msg = _consume_pending_screenshots(ctx)
@@ -275,6 +444,13 @@ class TestConsumePendingScreenshots:
         assert len(content) == 2
         assert content[0]["type"] == "input_text"
         assert content[0]["text"].startswith(SCREENSHOT_SENTINEL)
+        assert "capture_id=sha256:frame-123" in content[0]["text"]
+        assert "captured_url=https://example.com/results" in content[0]["text"]
+        assert "observation_step=4" in content[0]["text"]
+        assert "browser_session_id=pbs_123" in content[0]["text"]
+        assert "workflow_run_id=wr_123" in content[0]["text"]
+        assert "action_relation=same_page_observation" in content[0]["text"]
+        assert "may predate later actions" not in content[0]["text"]
         assert content[1]["type"] == "input_image"
         assert "image/jpeg" in content[1]["image_url"]
         assert content[1]["detail"] == "high"
@@ -283,10 +459,9 @@ class TestConsumePendingScreenshots:
 
     def test_handles_multiple_screenshots(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
-        from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 
-        entry1 = ScreenshotEntry(b64="abc=", mime="image/jpeg")
-        entry2 = ScreenshotEntry(b64="def=", mime="image/jpeg")
+        entry1 = _screenshot_entry("abc=")
+        entry2 = _screenshot_entry("def=")
         ctx = MagicMock()
         ctx.pending_screenshots = [entry1, entry2]
         msg = _consume_pending_screenshots(ctx)
@@ -305,7 +480,7 @@ class TestConsumePendingScreenshots:
 class TestNudgeDrainAndFilterExclusivity:
     def test_nudge_delivery_binds_the_frame_and_the_next_filter_pass_adds_nothing(self) -> None:
         ctx = SimpleNamespace(
-            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            pending_screenshots=[_screenshot_entry("dGVzdA==")],
             supports_vision=True,
         )
 
@@ -324,7 +499,7 @@ class TestNudgeDrainAndFilterExclusivity:
         # The vision check lives in the shared builder so every delivery path inherits it;
         # the drain still empties the queue.
         ctx = SimpleNamespace(
-            pending_screenshots=[ScreenshotEntry(b64="dGVzdA==", mime="image/jpeg")],
+            pending_screenshots=[_screenshot_entry("dGVzdA==")],
             supports_vision=False,
         )
 
@@ -1080,7 +1255,18 @@ class TestRunScreenshotResolution:
         ctx = MagicMock()
         ctx.supports_vision = True
         ctx.pending_screenshots = []
-        enqueue_screenshot_from_result(ctx, result)
+        enqueue_screenshot_from_result(
+            ctx,
+            result,
+            provenance=ScreenshotProvenance(
+                source_tool="run_blocks_and_collect_debug",
+                captured_url="https://example.com/failure",
+                observation_step=None,
+                browser_session_id="pbs_123",
+                workflow_run_id="wr_123",
+                action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+            ),
+        )
 
         assert len(ctx.pending_screenshots) == 1
 

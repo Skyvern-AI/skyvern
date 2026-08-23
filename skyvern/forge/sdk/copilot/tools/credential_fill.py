@@ -976,7 +976,12 @@ async def _fill_credential_field_impl_serial(
         form_submits = await _capture_enclosing_form_submits(copilot_ctx, selector)
         if form_submits:
             data["form_submit_controls"] = form_submits
-    await _capture_post_interaction_screenshot(copilot_ctx)
+    await _capture_post_interaction_screenshot(
+        copilot_ctx,
+        source_tool=observed_tool,
+        captured_url=observed_url,
+        observation_step=observation_step,
+    )
     LOG.info(
         "copilot fill_credential_field filled a saved credential field",
         selector=selector,
