@@ -894,6 +894,80 @@ async def _observe_data(page: Any) -> dict[str, Any]:
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_observe_result_carries_count_only_summary_for_the_call_record() -> None:
+    # The loop logs these as fields on the per-call record, so each must be a real count off the
+    # page: an invalid field, a hidden proxy, a frame inside a component root, an anonymous control
+    # that needed a minted marker, one inside a component that cannot be given one, and a message
+    # past the digest's budget.
+    # Distinct per message: the digest's containment dedupe would fold a shared prefix, not drop it.
+    noise = "".join(f'<div class="alert">Message {i} {"x" * 200}{i}</div>' for i in range(40))
+    html = (
+        "<!doctype html><html><body>"
+        '<form><input id="email" aria-invalid="true"><input id="ok">'
+        '<label for="agree" style="display:inline-block;width:200px;height:24px">I agree</label>'
+        '<input id="agree" type="checkbox" style="position:absolute;width:0;height:0;opacity:0">'
+        '<div id="host"></div><button>Go</button></form>'
+        f"{noise}"
+        "<script>"
+        "const r = document.getElementById('host').attachShadow({mode:'open'});"
+        'r.innerHTML = \'<button>Inner</button><iframe src="https://frames.example/x" style="width:200px;height:100px"></iframe>\';'
+        "</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        first = await _tool(tools, "observe").handler({})
+        second = await _tool(tools, "observe").handler({})
+
+    assert first.status == "ok" and first.data is not None
+    summary = first.data["summary"]
+    assert set(summary) == {
+        "text_dropped",
+        "hidden_listed",
+        "iframes_in_component_roots",
+        "undiscovered_roots",
+        "omitted_unnameable",
+        "invalid_fields",
+        "markers_minted",
+        "markers_reused",
+    }
+    assert all(type(v) is int for v in summary.values())
+    assert summary["invalid_fields"] == 1
+    assert summary["hidden_listed"] == 1
+    assert summary["iframes_in_component_roots"] == 1
+    assert summary["text_dropped"] > 0
+    assert summary["omitted_unnameable"] == 1
+    assert summary["markers_minted"] == 1 and summary["markers_reused"] == 0
+    # The second pass finds the markers the first one wrote, so minted and reused trade places.
+    assert second.data is not None
+    assert second.data["summary"]["markers_reused"] == 1 and second.data["summary"]["markers_minted"] == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_uncounts_a_marker_whose_element_threw_before_it_was_listed() -> None:
+    # The marker is written and then the element refuses a read the record needs, so it is dropped
+    # unlisted. Nothing was handed out, on this pass or the next one that finds the marker again.
+    html = (
+        '<!doctype html><html><body><button id="keep">Keep</button><button>Poison</button>'
+        "<script>"
+        "const p = document.querySelectorAll('button')[1];"
+        "Object.defineProperty(p, 'innerText', { get() { throw new Error('no'); } });"
+        "</script></body></html>"
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        first = await _tool(tools, "observe").handler({})
+        second = await _tool(tools, "observe").handler({})
+
+    for result in (first, second):
+        assert result.data is not None
+        assert "data-tv3" not in result.content
+        assert result.data["summary"]["markers_minted"] == 0
+        assert result.data["summary"]["markers_reused"] == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_digest_surfaces_status_alert_and_heading_text() -> None:
     # After an async submit many sites replace the form with a static outcome banner (role=status /
     # role=alert). observe lists only interactive elements, so without a text digest the outcome is
@@ -1523,6 +1597,245 @@ async def test_observe_digest_reads_a_component_banner_whose_text_is_slotted() -
     async with _content_page(html) as page:
         data = await _observe_data(page)
         assert any("card was declined" in t for t in (data.get("text") or []))
+
+
+_REJECTION_BANNER = "We could not process your application. The reference number does not match our records."
+
+
+def _wrapper_form_html(n_fields: int, *, decorated: bool) -> str:
+    """N per-field state wrappers with a rejection banner LAST inside the form.
+
+    Walk order is the channel's order, so a banner placed last is the worst case for a
+    budget the wrappers ahead of it have already spent. `decorated` puts the required-field
+    marker in a sibling node, which is what makes a wrapper's text differ from the listed
+    label by a character the label suppression compares byte for byte.
+    """
+    marker = '<span class="req"> *</span>' if decorated else ""
+    rows = "".join(
+        f'<div class="field--has-error"><label for="f{i}">Question number {i} about your '
+        f'background</label>{marker}<input id="f{i}" name="f{i}"></div>'
+        for i in range(n_fields)
+    )
+    return (
+        f'<!doctype html><html><body><form id="application">{rows}'
+        f'<div class="alert alert-danger">{_REJECTION_BANNER}</div></form></body></html>'
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_a_rejection_banner_behind_decorated_field_wrappers() -> None:
+    # A required-field marker in a sibling node makes a wrapper's text "<label> *", which the
+    # label suppression does not match, so every wrapper spends the message channel's budget on
+    # text the element list already carries and the page's real refusal never fits.
+    async with _content_page(_wrapper_form_html(120, decorated=True)) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_a_rejection_banner_past_the_gather_cap() -> None:
+    # Suppression cannot reach this one: undecorated wrappers are recognised in the processing
+    # loop, which never runs for a banner the per-bucket gather cap already refused to hold.
+    # The banner is candidate 201 in walk order here, one past that cap.
+    async with _content_page(_wrapper_form_html(200, decorated=False)) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_a_banner_a_flood_of_wrappers_surrounds() -> None:
+    # The banner is candidate 121 of 421 here, held by the gather and reached only once the
+    # wrappers ahead of it give up the budget.
+    def rows(prefix: str, count: int) -> str:
+        return "".join(
+            f'<div class="field--has-error"><label for="{prefix}{i}">Question {i} about your '
+            f'background</label><span class="req"> *</span><input id="{prefix}{i}"></div>'
+            for i in range(count)
+        )
+
+    html_doc = (
+        '<!doctype html><html><body><form id="application">'
+        f'{rows("f", 120)}<div class="alert alert-danger">{_REJECTION_BANNER}</div>'
+        f"{rows('g', 300)}</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_keeps_every_candidate_a_plain_prefix_cap_held() -> None:
+    # Keeping a bucket's tail must come on top of its first 200, not out of them: the banner is
+    # candidate 161 of 221 here, inside the old prefix and outside a 150-and-last-50 reservoir.
+    def rows(prefix: str, count: int) -> str:
+        return "".join(
+            f'<div class="field--has-error"><label for="{prefix}{i}">Question {i} about your '
+            f'background</label><input id="{prefix}{i}"></div>'
+            for i in range(count)
+        )
+
+    html_doc = (
+        '<!doctype html><html><body><form id="application">'
+        f'{rows("f", 160)}<div class="alert alert-danger">{_REJECTION_BANNER}</div>'
+        f"{rows('g', 60)}</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_still_surfaces_a_banner_that_wraps_a_control() -> None:
+    # Whether a block wraps a control of its own says nothing about whether it is that control's
+    # state wrapper: a banner carries a CSRF token, an acknowledgement box, a retry field. Ranking
+    # on that instead would sink this one behind 40 field-level complaints and out of the budget,
+    # which is the miss this channel exists to prevent, not a smaller version of it.
+    rows = "".join(
+        f'<div class="field--has-error"><label for="f{i}">Question number {i} about your '
+        f'background</label><span class="req"> *</span><input id="f{i}">'
+        f'<span class="error-text">Answer {i} is not valid for this application</span></div>'
+        for i in range(40)
+    )
+    html_doc = (
+        '<!doctype html><html><body><form id="application">'
+        f'<div class="alert alert-danger">{_REJECTION_BANNER}'
+        '<input type="hidden" name="csrf"></div>'
+        f"{rows}</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_still_reads_a_decorated_wrapper_the_budget_has_room_for() -> None:
+    # Ordering a near-match last has to leave it readable, or it is a drop wearing a different
+    # name. On a page with room to spare the wrapper's own text is all there is to report, and
+    # today's digest carries it.
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        + "".join(
+            f'<div class="field--has-error"><label for="f{i}">Question number {i}</label>'
+            f'<span class="req"> *</span><input id="f{i}"></div>'
+            for i in range(3)
+        )
+        + "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any(t.startswith("Question number 0") for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_survives_a_form_that_shadows_its_own_dom_methods() -> None:
+    # A form serves its named controls in place of its own methods, so <input name="closest">
+    # turns a routine call on it into a throw. Uncaught it reaches the digest-wide catch, and an
+    # emptied digest with nothing dropped reads exactly like a page that rendered no messages.
+    html_doc = (
+        "<!doctype html><html><body>"
+        '<div role="alert">Your application was rejected</div>'
+        '<form class="has-error"><input name="closest"><input name="querySelector">'
+        '<input id="e1"></form></body></html>'
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("application was rejected" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_keeps_a_forms_own_error_when_that_form_poisons_a_read() -> None:
+    # The element that refuses the read pays for it alone. Here the form itself throws on the call
+    # that buckets it, and the page's real refusal is a block inside that same form.
+    html_doc = (
+        "<!doctype html><html><body>"
+        '<form class="has-error"><input name="closest">'
+        f'<div class="page-error">{_REJECTION_BANNER}</div></form></body></html>'
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("reference number does not match" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_surfaces_a_message_that_begins_with_a_field_label() -> None:
+    # Relaxing the label comparison to a prefix match would suppress this, which fails closed --
+    # strictly worse than the miss it would fix, because a dropped banner and a page with no banner
+    # read the same to the model. The ticket names this trap; the test keeps it shut.
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        '<div class="field--has-error"><label for="e1">Email</label><input id="e1"></div>'
+        '<div class="error-message">Email is already registered to another account.</div>'
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert any("already registered to another account" in t for t in texts), texts
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_discloses_a_deferred_message_the_budget_could_not_take() -> None:
+    # A message that is nothing but a listed label and punctuation reads as a near-match and is
+    # offered last; when the other messages have spent the block budget it does not fit. That is
+    # the ordering's one cost, and it must be disclosed as a drop, not vanish.
+    # Thirty 20-char messages spend the 600-char block budget to the byte, so a pass that stops at
+    # a full budget without counting what it left is the implementation this catches.
+    fillers = "".join(f'<div class="error">Field {i:02d} is invalid.</div>' for i in range(30))
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        '<div class="alert">Payment declined!</div>'
+        f"{fillers}"
+        '<button class="btn" type="button">Payment declined</button>'
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert sum(len(t) for t in texts) <= 600
+    assert not any("Payment declined!" in t for t in texts), texts
+    assert data.get("textDropped", 0) == 1, data.get("textDropped")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_digest_does_not_count_a_deferred_message_the_digest_already_holds() -> None:
+    # A deferred near-match whose words already sit inside an accepted entry is in the digest, so a
+    # full budget must not report it as a drop: that count reaches the model as messages it did not
+    # see. Twenty-six 20-char entries plus one of 80 spend the 600-char budget to the byte.
+    fillers = "".join(f'<div class="error">Field {i:02d} is invalid.</div>' for i in range(26))
+    holder = "Error in Field 03! Please fix it and retry, that same value was refused by us OK"
+    assert len(holder) == 80
+    html_doc = (
+        "<!doctype html><html><body><form>"
+        '<div class="alert">Field 03!</div>'
+        f'{fillers}<div class="error">{holder}</div>'
+        '<button class="btn" type="button">Field 03</button>'
+        "</form></body></html>"
+    )
+    async with _content_page(html_doc) as page:
+        data = await _observe_data(page)
+    texts = data.get("text") or []
+    assert sum(len(t) for t in texts) == 600, texts
+    assert any(holder in t for t in texts), texts
+    assert data.get("textDropped", 0) == 0, data.get("textDropped")
 
 
 @_skip_no_browser
@@ -3264,6 +3577,8 @@ async def test_dom_multiselect_option_commits_by_child_checkbox_property() -> No
 async def test_dom_self_mutating_row_text_is_not_commit_evidence() -> None:
     # A row whose text updates on its own (countdown, live price) changes the state fingerprint
     # without any commit; a no-op click on it must error loud, not read as "its state changed".
+    # The row's text is made to differ on EVERY read rather than on a wall-clock timer: a timer
+    # races the 150 ms two-read hold and decided this test by coincidence, not by the behaviour.
     async with _menu_page() as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         click = _tool(tools, "click")
@@ -3271,12 +3586,17 @@ async def test_dom_self_mutating_row_text_is_not_commit_evidence() -> None:
         assert "opened a menu of 7 options" in r1.content
         await page.evaluate(
             "() => { window.__noCommit = 1; const row = document.querySelector('[data-tv3-menu=\"1\"]');"
-            " let n = 0; setInterval(() => { row.textContent = 'Trending ' + n++; }, 80); }"
+            " window.__reads = 0; Object.defineProperty(row, 'innerText', { configurable: true,"
+            " get() { return 'Trending ' + window.__reads++; } }); }"
         )
         r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
         assert r2.status == "error"
         assert "did not commit" in r2.content
         assert await page.evaluate("() => window.__commits") == 0
+        # The getter is only visible to a fingerprint that reads the row's own innerText. Were it to
+        # read textContent instead, the text would never change and this test would pass vacuously.
+        reads = await page.evaluate("() => window.__reads")
+        assert reads >= 4, reads
 
 
 @_skip_no_browser
@@ -4664,6 +4984,11 @@ async def test_every_selector_the_payload_prints_denotes_exactly_one_element() -
             assert await page.locator(sel).count() == 1, (
                 f"{sel!r} denotes {await page.locator(sel).count()}:\n{r.content}"
             )
+        # A marker the page moved is not one this call handed out: the count reports selectors the
+        # model can act on, not attribute writes that happened.
+        assert r.data is not None
+        printed = {sel for sel in re.findall(r"^\[(.*?)\] ", r.content, re.M) if "data-tv3" in sel}
+        assert r.data["summary"]["markers_minted"] == len(printed)
 
 
 @_skip_no_browser
@@ -6705,3 +7030,167 @@ async def test_a_menu_opened_by_a_hash_href_trigger_is_still_reported() -> None:
         assert r.status == "ok", r.content
         assert "opened a menu of 3 options" in r.content, r.content
         assert "Alpha Corp" in r.content, r.content
+
+
+async def _pending_marker_of(page: Any, selector: str) -> str | None:
+    """The engine's own probe, not a re-implementation of it: resolution and judgement both have to
+    be under test, because resolving beside the action tools instead of through them is the defect."""
+    from skyvern.forge.taskv3.tools import pending_marker  # noqa: PLC0415
+
+    return await pending_marker(page, selector)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_reads_a_frozen_submit_control() -> None:
+    # The word has to OPEN the label: a control offering to "Resend submitting instructions" is idle
+    # markup, and downgrading a run on it turns a landed submission into a terminate.
+    async with _live_page(
+        """<button id="frozen">Submitting…</button>
+        <button id="busy" aria-busy="true">Processing your application</button>
+        <button id="idle">Resend submitting instructions</button>
+        <button id="done">Submitted</button>"""
+    ) as page:
+        assert await _pending_marker_of(page, "#frozen") == "Submitting…"
+        assert await _pending_marker_of(page, "#busy") == "Processing your application (aria-busy)"
+        assert await _pending_marker_of(page, "#idle") is None
+        assert await _pending_marker_of(page, "#done") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_never_reads_a_text_inputs_typed_value() -> None:
+    # `.value` on a text field is the model's own typed text coming back as if the page had rendered
+    # it — a search box the run typed a job title into would report itself as forever in flight. Only
+    # a button-shaped input has a value that is a label.
+    async with _live_page(
+        """<input id="search" value="Processing Engineer" style="width:220px;height:26px">
+        <input id="submit" type="submit" value="Submitting…" style="width:220px;height:26px">"""
+    ) as page:
+        assert await _pending_marker_of(page, "#search") is None
+        assert await _pending_marker_of(page, "#submit") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_ignores_scroll_position() -> None:
+    # Where the control sits relative to the viewport says nothing about whether it is in flight, and
+    # the model routinely scrolls to a confirmation banner before finishing — which would scroll the
+    # frozen submit off screen and silently disarm the gate.
+    async with _live_page(
+        """<button id="submit" style="width:200px;height:30px">Submitting…</button>
+        <div style="height:4000px"></div>
+        <div id="foot">end of page</div>"""
+    ) as page:
+        assert await _pending_marker_of(page, "#submit") == "Submitting…"
+        await page.evaluate("() => window.scrollTo(0, 3500)")
+        above_viewport = await page.eval_on_selector("#submit", "el => el.getBoundingClientRect().bottom < 0")
+        assert above_viewport is True
+        assert await _pending_marker_of(page, "#submit") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_honours_inherited_invisibility() -> None:
+    # The control's own computed style is clean; it is the ancestor that hides it. A hidden overlay
+    # left in the DOM is not something the page is showing the user, so reading it as pending
+    # terminates runs whose submission actually landed.
+    async with _live_page(
+        """<div style="opacity:0"><button id="faded">Submitting…</button></div>
+        <div style="visibility:hidden"><button id="gone">Submitting…</button></div>
+        <button id="live">Submitting…</button>"""
+    ) as page:
+        assert await _pending_marker_of(page, "#faded") is None
+        assert await _pending_marker_of(page, "#gone") is None
+        assert await _pending_marker_of(page, "#live") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_survives_a_clobbered_closest() -> None:
+    # A named form control is exposed as a property of its form, so `<input name="closest">` shadows
+    # `form.closest`. The probe must still answer instead of throwing its way into silence.
+    async with _live_page(
+        """<form id="f"><input name="closest">
+        <button id="b" style="width:160px;height:32px">Submitting…</button></form>"""
+    ) as page:
+        # Answering at all is the assertion: an uncaught throw in the climb returns None, which
+        # reads exactly like a page with nothing pending. A wrapper holding exactly one control is
+        # judged by that control, so naming the form and naming the button agree.
+        assert await _pending_marker_of(page, "#f") == "Submitting…"
+        assert await _pending_marker_of(page, "#b") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_reaches_selector_forms_a_querySelector_walk_cannot() -> None:
+    # The selectors the action tools act through include host-anchored CSS whose halves straddle an
+    # open shadow boundary and Playwright's text= form. Resolving in page script cannot reach either,
+    # so the probe would silently answer "nothing pending" about the control it was asked to judge.
+    async with _live_page(
+        """<div id="host"></div>
+        <script>
+          document.getElementById('host').attachShadow({mode: 'open'}).innerHTML =
+            '<button id="ctrl">Submitting…</button>';
+        </script>"""
+    ) as page:
+        in_page = await page.evaluate("() => document.querySelector('#host #ctrl') !== null")
+        assert in_page is False  # the counterfactual: page-script resolution cannot cross the boundary
+        assert await _pending_marker_of(page, "#host #ctrl") == "Submitting…"
+        assert await _pending_marker_of(page, "text=Submitting…") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_ignores_a_card_whose_first_row_reads_processing() -> None:
+    # `closest` climbs to any ancestor `[role=button]`, and a card is what `[role=button]` is
+    # routinely built from — so reading the whole subtree turns a status row on a list item into a
+    # submission the run could never confirm. Only the control's own label is a claim it makes.
+    async with _live_page(
+        """<div id="card" role="button" style="width:320px;height:60px">
+          <span>Processing</span><span> · Order 4821</span><span> · $32.10</span>
+        </div>
+        <div id="row" role="button" style="width:320px;height:60px">
+          <a id="detail" href="#" style="display:block">Processing</a><span> · Order 4822</span>
+        </div>"""
+    ) as page:
+        assert await _pending_marker_of(page, "#card") is None
+        assert await _pending_marker_of(page, "#detail") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_still_reads_an_ordinary_spinner_button() -> None:
+    # The shape the gate exists for, in the markup every framework actually ships it as: an inline
+    # `<svg>` carrying two shape children plus a label span. Any descendant-count ceiling on the
+    # subtree fallback silently excludes that — Tailwind, Heroicons, Bootstrap and MUI spinners are
+    # all 3+ descendants — leaving `own` as whitespace and the frozen button reading as idle. A
+    # childless placeholder `<svg>` is not this shape and proves nothing about it.
+    async with _live_page(
+        """<button id="spinner" style="width:160px;height:32px">
+          <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" stroke-width="4" fill="none"></circle>
+            <path d="M4 12a8 8 0 018-8" stroke-width="4" fill="none"></path>
+          </svg><span>Submitting…</span>
+        </button>
+        <button id="wrapped" style="width:160px;height:32px"><span>Submitting…</span></button>
+        <div id="own" role="button" style="width:160px;height:32px">Submitting…</div>"""
+    ) as page:
+        assert await page.eval_on_selector("#spinner", "el => el.querySelectorAll('*').length") >= 3
+        assert await _pending_marker_of(page, "#spinner") == "Submitting…"
+        assert await _pending_marker_of(page, "#wrapped") == "Submitting…"
+        assert await _pending_marker_of(page, "#own") == "Submitting…"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_pending_marker_warns_only_when_the_probe_could_not_run() -> None:
+    # A control that no longer resolves is the ordinary shape of a submission that landed. Warning
+    # on it buries the case that is genuinely a broken gate: a probe that never got to look.
+    async with _live_page("""<button id="submit" style="width:160px;height:32px">Submitting…</button>""") as page:
+        with capture_logs() as absent_logs:
+            assert await _pending_marker_of(page, "#no-such-control") is None
+        with capture_logs() as unresolvable_logs:
+            assert await _pending_marker_of(page, "#a[") is None
+    assert [log for log in absent_logs if log.get("log_level") == "warning"] == [], absent_logs
+    assert [log for log in unresolvable_logs if log.get("log_level") == "warning"], unresolvable_logs
