@@ -5,9 +5,6 @@ import { Workspace } from "@/routes/workflows/editor/Workspace";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 
-// PiP shelved for now — no good placement (copilot left, settings right, Pylon corner).
-// import { BrowserPiP } from "./BrowserPiP";
-
 export type StudioWorkspaceProps = Omit<
   ComponentProps<typeof Workspace>,
   "showBrowser" | "embedded"
@@ -29,7 +26,6 @@ export function EditorTab(props: StudioWorkspaceProps) {
   return (
     <div className="relative h-full w-full">
       <Workspace {...props} showBrowser={false} embedded />
-      {/* <BrowserPiP /> */}
       {applyingRecording ? (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-background/70 backdrop-blur-sm">
           <div className="flex items-center gap-3 rounded-lg border bg-slate-elevation2 px-4 py-3 shadow-lg">

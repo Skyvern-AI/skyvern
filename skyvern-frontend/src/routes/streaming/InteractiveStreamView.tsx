@@ -334,7 +334,15 @@ function InteractiveStreamView({
     const controlOverlays = (
       <>
         {showControlButtons && !userIsControlling && inputReady && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center">
+          // The overlay covers the whole picture, so a click anywhere on it is
+          // someone trying to use the page: take control instead of eating the
+          // click (this layer alone drew ~470 dead clicks from a fifth of studio
+          // users). The button stays the keyboard/screen-reader path.
+          <div
+            data-testid="take-control-overlay"
+            className="absolute inset-0 z-10 flex cursor-pointer items-center justify-center"
+            onClick={() => setUserIsControlling(true)}
+          >
             <Button
               size="sm"
               className="border"

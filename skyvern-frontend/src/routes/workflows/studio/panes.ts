@@ -64,17 +64,22 @@ export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "overview",
 ];
 
-// Panes that mutate the workflow (Copilot builds, Editor saves) are blocked
-// while the shell shows a run of a deleted agent; run viewing stays.
-export const DELETED_WORKFLOW_BLOCKED_PANES: readonly StudioPaneId[] = [
+// Panes that mutate the workflow (Copilot builds, Editor saves), as opposed to
+// the ones that only watch a run. The top bar keys its authoring controls off
+// this, and it is also what a deleted agent blocks.
+export const WORKFLOW_AUTHORING_PANES: readonly StudioPaneId[] = [
   "copilot",
   "editor",
 ];
 
+export function isAuthoringLayout(panes: readonly StudioPaneId[]): boolean {
+  return panes.some((id) => WORKFLOW_AUTHORING_PANES.includes(id));
+}
+
 export function panesWithoutDeletedBlocked(
   panes: readonly StudioPaneId[],
 ): StudioPaneId[] {
-  return panes.filter((id) => !DELETED_WORKFLOW_BLOCKED_PANES.includes(id));
+  return panes.filter((id) => !WORKFLOW_AUTHORING_PANES.includes(id));
 }
 
 // Copilot / Editor / Overview share one narrow floor; the browser viewport

@@ -903,6 +903,12 @@ function NodeHeader({
     isCanvasLocked,
   });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
+  const playInert =
+    workflowRunIsRunningOrQueued ||
+    !workflowPermanentId ||
+    debugSession === undefined ||
+    isRecording;
+
   const collapseToggleButton =
     isCollapsible &&
     (mode === "build" ||
@@ -1052,45 +1058,76 @@ function NodeHeader({
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
-              <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
-                {cancelBlock.isPending ? (
-                  <ReloadIcon className="size-6 animate-spin" />
-                ) : (
-                  <StopIcon
-                    className="size-6"
-                    onClick={() => {
-                      handleOnCancel();
-                    }}
-                  />
-                )}
-              </button>
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Stop this block"
+                      disabled={cancelBlock.isPending}
+                      onClick={() => {
+                        handleOnCancel();
+                      }}
+                      className="nodrag nopan rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50"
+                    >
+                      {cancelBlock.isPending ? (
+                        <ReloadIcon className="size-6 animate-spin" />
+                      ) : (
+                        <StopIcon className="size-6" aria-hidden />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>Stop this block</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </div>
           )}
           {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
             isDebuggable && (
-              <button
-                disabled={workflowRunIsRunningOrQueued}
-                className={cn("rounded p-1 disabled:opacity-50", {
-                  "hover:bg-muted": workflowRunIsRunningOrQueued,
-                })}
-              >
-                {runBlock.isPending ? (
-                  <ReloadIcon className="size-6 animate-spin" />
-                ) : (
-                  <PlayIcon
-                    className={cn("size-6", {
-                      "pointer-events-none fill-gray-500 text-muted-foreground dark:text-gray-500":
-                        workflowRunIsRunningOrQueued ||
-                        !workflowPermanentId ||
-                        debugSession === undefined ||
-                        isRecording,
-                    })}
-                    onClick={() => {
-                      void handleOnPlay();
-                    }}
-                  />
-                )}
-              </button>
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Run this block"
+                      // Must match the click guard below: any inert state the
+                      // attribute misses is a control that still takes focus
+                      // and announces as enabled while doing nothing. isPending
+                      // adds the in-flight case, where the spinner branch used
+                      // to carry no handler and a second click would re-enter.
+                      disabled={playInert || runBlock.isPending}
+                      onClick={() => {
+                        // Same inert set the icon used to express with
+                        // pointer-events-none; the click now lands on the
+                        // button (its padding was a dead zone before).
+                        if (playInert) {
+                          return;
+                        }
+                        void handleOnPlay();
+                      }}
+                      className={cn(
+                        "nodrag nopan rounded p-1 disabled:opacity-50",
+                        {
+                          "hover:bg-muted": workflowRunIsRunningOrQueued,
+                        },
+                      )}
+                    >
+                      {runBlock.isPending ? (
+                        <ReloadIcon className="size-6 animate-spin" />
+                      ) : (
+                        <PlayIcon
+                          aria-hidden
+                          className={cn("size-6", {
+                            "fill-gray-500 text-muted-foreground dark:text-gray-500":
+                              playInert,
+                          })}
+                        />
+                      )}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>Run this block</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             )}
           {collapseToggleButton}
           {disabled ? null : (

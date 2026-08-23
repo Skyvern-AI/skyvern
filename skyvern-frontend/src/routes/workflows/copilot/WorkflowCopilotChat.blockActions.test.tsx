@@ -162,6 +162,9 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
 }));
 
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
@@ -568,5 +571,90 @@ describe("WorkflowCopilotChat — studio run focus", () => {
     streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
     await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
     expect(switchStudioRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowCopilotChat — build follow", () => {
+  const focusBlock = vi.fn();
+
+  beforeEach(() => {
+    focusBlock.mockClear();
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () => [
+        { nodeId: "node_login", label: "login", blockType: "task" },
+      ],
+      focusBlock,
+    });
+    window.history.pushState(null, "", "/?panes=copilot,editor");
+  });
+
+  afterEach(() => {
+    useWorkflowBlockSearchStore.getState().registerHandle(null);
+    window.history.pushState(null, "", "/");
+  });
+
+  it("focuses the canvas on the block a progress frame names", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).toHaveBeenCalledWith("node_login");
+  });
+
+  it("follows a block only once per label", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "completed" }),
+    );
+
+    expect(focusBlock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops following after the user presses outside the copilot pane", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    fireEvent.pointerDown(document.body);
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+
+  it("does not follow when the editor pane is closed", async () => {
+    window.history.pushState(null, "", "/?panes=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+
+  it("never fights the recording overlay", async () => {
+    useRecordingStore.setState({ isRecording: true });
+    try {
+      await renderChat(makeDockedProps());
+      await submit("build it");
+
+      streamCalls[0]!.onMessage(
+        blockProgressFrame({ block_label: "login", status: "running" }),
+      );
+
+      expect(focusBlock).not.toHaveBeenCalled();
+    } finally {
+      useRecordingStore.setState({ isRecording: false });
+    }
   });
 });

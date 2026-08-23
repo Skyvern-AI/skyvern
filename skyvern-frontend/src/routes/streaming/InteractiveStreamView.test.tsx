@@ -218,6 +218,28 @@ describe("InteractiveStreamView URL bar", () => {
   });
 });
 
+describe("InteractiveStreamView take-control overlay", () => {
+  it("takes control on a click anywhere on the read-only picture, not just the button", () => {
+    const props = baseProps();
+    render(<InteractiveStreamView {...props} />);
+
+    fireEvent.click(screen.getByTestId("take-control-overlay"));
+
+    expect(props.setUserIsControlling).toHaveBeenCalledWith(true);
+    // The picture's own mouse handlers stay untouched by the overlay click.
+    expect(props.handlers.handleMouseDown).not.toHaveBeenCalled();
+  });
+
+  it("has no overlay to swallow clicks once the user is controlling", () => {
+    render(<InteractiveStreamView {...baseProps()} userIsControlling />);
+
+    expect(screen.queryByTestId("take-control-overlay")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /stop controlling/ }),
+    ).toBeTruthy();
+  });
+});
+
 describe("InteractiveStreamView browser chrome", () => {
   it("renders no nav controls for callers that don't wire history navigation", () => {
     render(<InteractiveStreamView {...baseProps()} onNavigate={vi.fn()} />);

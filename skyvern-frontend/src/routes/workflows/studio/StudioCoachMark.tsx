@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
@@ -27,7 +27,25 @@ export function StudioCoachMark() {
     );
   });
 
-  if (coachMarkSeen || deepLinked) {
+  const visible = !coachMarkSeen && !deepLinked;
+
+  // Esc dismisses, as it does for the panes. Gated on `visible` so a deep-linked
+  // visit — where the mark is suppressed, not seen — doesn't silently consume
+  // the one-time callout for a user who never saw it.
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        markCoachMarkSeen();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [visible, markCoachMarkSeen]);
+
+  if (!visible) {
     return null;
   }
 

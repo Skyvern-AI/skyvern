@@ -36,7 +36,6 @@ import {
   PANE_HEADER_ICON_BUTTON_DESTRUCTIVE_CLASS,
 } from "./constants";
 import { ControlTooltip } from "./ControlTooltip";
-import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useStudioPaneCompact } from "./StudioShellContext";
 import { ViewToggle } from "./ViewToggle";
@@ -57,7 +56,6 @@ export function BrowserPaneViewPills() {
       {compact || !import.meta.env.DEV ? null : (
         <StreamModeBadge mode={browserStreamingMode} className="shrink-0" />
       )}
-      <PaneHeaderDivider />
       <div
         role="group"
         aria-label="Browser view"
@@ -78,7 +76,7 @@ export function BrowserPaneViewPills() {
               type="button"
               disabled
               aria-label={RECORDING_ARCHIVED_LABEL}
-              className="pointer-events-none inline-flex items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium text-muted-foreground opacity-60"
+              className="pointer-events-none inline-flex h-7 items-center gap-1.5 rounded px-1.5 py-1 text-xs font-medium text-muted-foreground opacity-60"
             >
               <PlayIcon className="h-3 w-3" />
               {compact ? null : "Recording archived"}
@@ -176,7 +174,7 @@ export function BrowserPaneActions() {
                 variant="ghost"
                 size="sm"
                 className={cn(
-                  "h-7 shrink-0 gap-1.5 px-2",
+                  "h-7 shrink-0 gap-1.5 px-1.5",
                   manualCapturePaused ? "text-amber-500" : "text-red-500",
                 )}
                 aria-label="Stop recording"

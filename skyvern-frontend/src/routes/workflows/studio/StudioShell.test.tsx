@@ -3,8 +3,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { copyText } from "@/util/copyText";
+import { type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { type StudioPaneId } from "./panes";
+import { paneAccessibleName } from "./paneMeta";
 import { StudioPane } from "./StudioShell";
 
 vi.mock("@/util/copyText", () => ({ copyText: vi.fn() }));
@@ -21,9 +24,11 @@ describe("StudioPane header", () => {
   const renderPane = ({
     id = "copilot",
     runId,
+    headerActions,
   }: {
-    id?: "copilot" | "overview";
+    id?: StudioPaneId;
     runId?: string;
+    headerActions?: ReactNode;
   } = {}) => {
     const reorder = {
       draggingId: null,
@@ -43,6 +48,7 @@ describe("StudioPane header", () => {
           flex={undefined}
           reorder={reorder}
           onClose={vi.fn()}
+          headerActions={headerActions}
         >
           <div>content</div>
         </StudioPane>
@@ -50,8 +56,9 @@ describe("StudioPane header", () => {
     );
     return {
       reorder,
+      pane: screen.getByRole("region", { name: paneAccessibleName(id) }),
       header: screen.getByRole("group", {
-        name: `${id === "overview" ? "Run" : "Copilot"} pane header`,
+        name: `${paneAccessibleName(id)} pane header`,
       }),
     };
   };
@@ -137,5 +144,31 @@ describe("StudioPane header", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
 
     expect(mockedCopyText).toHaveBeenCalledWith(runId);
+  });
+
+  test("groups pane utilities separately from close", () => {
+    const { header } = renderPane({
+      id: "browser",
+      headerActions: (
+        <>
+          <button type="button">Reconnect</button>
+          <button type="button">Open in new tab</button>
+        </>
+      ),
+    });
+
+    const actions = header.querySelector("[data-pane-header-actions]");
+    expect(actions).not.toBeNull();
+    if (!actions) {
+      throw new Error("pane action cluster was not rendered");
+    }
+    expect(
+      actions.contains(screen.getByRole("button", { name: "Reconnect" })),
+    ).toBe(true);
+    expect(
+      actions.contains(screen.getByRole("button", { name: "Open in new tab" })),
+    ).toBe(true);
+    const close = screen.getByRole("button", { name: "Close Browser pane" });
+    expect(actions.contains(close)).toBe(false);
   });
 });

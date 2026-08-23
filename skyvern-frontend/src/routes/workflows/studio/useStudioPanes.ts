@@ -15,6 +15,7 @@ import {
   resolveOpenPanes,
   searchWithPanes,
   searchWithRunReference,
+  toReadableSearch,
   togglePane as togglePaneIn,
   withCopilotSelection,
   withPaneClosed,
@@ -31,7 +32,31 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   // layout class (edit/run). System writes leave this unset so they never
   // overwrite a user's last-chosen arrangement.
   learn?: boolean;
+  // Extra query params written in the SAME navigation as the pane change, so a
+  // caller can open a pane and set e.g. ?selected-block= without racing a
+  // second URL write (the Fix flow depends on this atomicity). A null value
+  // clears the param, so a caller with nothing to say cannot leave a stale one
+  // standing.
+  extraSearchParams?: Record<string, string | null>;
 };
+
+function withExtraParams(
+  search: string,
+  extra: Record<string, string | null> | undefined,
+): string {
+  if (!extra || Object.keys(extra).length === 0) {
+    return search;
+  }
+  const params = new URLSearchParams(search);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value === null) {
+      params.delete(key);
+    } else {
+      params.set(key, value);
+    }
+  }
+  return toReadableSearch(params);
+}
 
 type PaneWriteKind = "normal" | "copilot-only" | "exact" | "reorder";
 
@@ -236,11 +261,15 @@ export function useStudioPanes() {
         });
       }
       if (!nonCopilotChanged && writeKind !== "normal") {
-        if (options !== undefined && "state" in options) {
+        if (
+          options !== undefined &&
+          ("state" in options ||
+            Object.keys(options.extraSearchParams ?? {}).length > 0)
+        ) {
           navigate(
             {
               pathname: location.pathname,
-              search,
+              search: withExtraParams(search, options.extraSearchParams),
               hash: location.hash,
             },
             { replace: true, state: options.state },
@@ -259,7 +288,10 @@ export function useStudioPanes() {
       navigate(
         {
           pathname: location.pathname,
-          search: searchWithPanes(search, urlNext),
+          search: withExtraParams(
+            searchWithPanes(search, urlNext),
+            options?.extraSearchParams,
+          ),
           hash: location.hash,
         },
         {

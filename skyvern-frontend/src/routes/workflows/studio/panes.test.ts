@@ -2,13 +2,14 @@ import { describe, expect, test } from "vitest";
 
 import {
   DEFAULT_STUDIO_PANES,
-  DELETED_WORKFLOW_BLOCKED_PANES,
   RUN_APPEND_PANES,
   STUDIO_STAGE_GAP_PX,
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
+  WORKFLOW_AUTHORING_PANES,
   copilotContextForSearch,
   fitPanesToWidth,
+  isAuthoringLayout,
   layoutClassForSearch,
   panesFitWidth,
   panesFromDeepLink,
@@ -491,7 +492,21 @@ describe("panesWithoutDeletedBlocked", () => {
   });
 
   test("blocks exactly the copilot and editor panes", () => {
-    expect(DELETED_WORKFLOW_BLOCKED_PANES).toEqual(["copilot", "editor"]);
+    expect(WORKFLOW_AUTHORING_PANES).toEqual(["copilot", "editor"]);
+  });
+});
+
+describe("isAuthoringLayout", () => {
+  test("watch-and-review (the cold run-link layout) is not authoring", () => {
+    // The top bar hides its workflow-parameter "Inputs" here so it can't sit
+    // next to the Run pane's own "Inputs" view.
+    expect(isAuthoringLayout(RUN_APPEND_PANES)).toBe(false);
+    expect(isAuthoringLayout([])).toBe(false);
+  });
+
+  test("any open editor or copilot pane makes the layout authoring", () => {
+    expect(isAuthoringLayout(DEFAULT_STUDIO_PANES)).toBe(true);
+    expect(isAuthoringLayout(["browser", "overview", "copilot"])).toBe(true);
   });
 });
 

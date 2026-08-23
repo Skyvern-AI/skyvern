@@ -1342,7 +1342,21 @@ function BrowserStream({
         ref={setCanvasContainerRef}
       >
         {isReady && isVisible && (
-          <div className="overlay z-10 flex items-center justify-center overflow-hidden">
+          // Same as InteractiveStreamView: while the take-control button is
+          // offered, a click anywhere on the picture takes control instead of
+          // being swallowed by this layer.
+          <div
+            data-testid="browser-stream-overlay"
+            className={cn(
+              "overlay z-10 flex items-center justify-center overflow-hidden",
+              { "can-take-control": showControlButtons && !userIsControlling },
+            )}
+            onClick={
+              showControlButtons && !userIsControlling
+                ? () => setUserIsControlling(true)
+                : undefined
+            }
+          >
             {showControlButtons && (
               <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
                 <Button

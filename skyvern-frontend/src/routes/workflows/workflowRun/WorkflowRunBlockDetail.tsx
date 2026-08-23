@@ -2,6 +2,7 @@ import type { ActionsApiResponse } from "@/api/types";
 import { useMemo } from "react";
 import { FileIcon } from "@radix-ui/react-icons";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
+import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
@@ -27,7 +28,6 @@ import { BlockDetailConditional } from "./blockDetail/BlockDetailConditional";
 import { BlockDetailGeneric } from "./blockDetail/BlockDetailGeneric";
 import { BlockDetailHttpRequest } from "./blockDetail/BlockDetailHttpRequest";
 import { BlockDetailHumanInteraction } from "./blockDetail/BlockDetailHumanInteraction";
-import { BlockDetailLoop } from "./blockDetail/BlockDetailLoop";
 import { BlockDetailTask } from "./blockDetail/BlockDetailTask";
 import { BlockDetailThought } from "./blockDetail/BlockDetailThought";
 import { BlockDetailWorkflowTrigger } from "./blockDetail/BlockDetailWorkflowTrigger";
@@ -48,10 +48,6 @@ type Props = {
   workflowRunId?: string;
   onThoughtSelect?: (thought: ObserverThought) => void;
 };
-
-function isLoopBlock(block: WorkflowRunBlock): boolean {
-  return block.block_type === "for_loop" || block.block_type === "while_loop";
-}
 
 function BlockDownloadedFiles({
   block,
@@ -115,7 +111,6 @@ function renderBodyForBlock(
   block: WorkflowRunBlock,
   activeItem: WorkflowRunOverviewActiveElement,
   onThoughtSelect: Props["onThoughtSelect"],
-  activeIteration: number | null,
   timeline: Array<WorkflowRunTimelineItem>,
 ) {
   const thoughts = findThoughtsForBlock(timeline, block);
@@ -138,9 +133,6 @@ function renderBodyForBlock(
       );
     case "conditional":
       return <BlockDetailConditional block={block} />;
-    case "for_loop":
-    case "while_loop":
-      return <BlockDetailLoop block={block} iterationIndex={activeIteration} />;
     case "http_request":
       return <BlockDetailHttpRequest block={block} />;
     case "workflow_trigger":
@@ -166,6 +158,9 @@ function WorkflowRunBlockDetail({
   // loop the iteration was set for — ignore it to avoid stale labels.
   const effectiveIteration =
     activeItem === null || activeItem === "stream" ? null : activeIteration;
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
+    workflowRunId ? { workflowRunId } : undefined,
+  );
 
   // Cold-start: timeline data hasn't arrived yet. Check data === undefined
   // rather than isLoading because the timeline query is gated on the
@@ -200,13 +195,7 @@ function WorkflowRunBlockDetail({
       findRunningBlock(timeline) ?? findLastExecutedBlock(timeline);
     if (target) {
       resolvedBlock = target;
-      body = renderBodyForBlock(
-        target,
-        activeItem,
-        onThoughtSelect,
-        effectiveIteration,
-        timeline,
-      );
+      body = renderBodyForBlock(target, activeItem, onThoughtSelect, timeline);
     } else {
       body = <EmptyState />;
     }
@@ -222,7 +211,6 @@ function WorkflowRunBlockDetail({
         parentBlock,
         activeItem,
         onThoughtSelect,
-        effectiveIteration,
         timeline,
       );
     } else {
@@ -238,7 +226,6 @@ function WorkflowRunBlockDetail({
       activeItem,
       activeItem,
       onThoughtSelect,
-      effectiveIteration,
       timeline,
     );
   } else {
@@ -254,8 +241,10 @@ function WorkflowRunBlockDetail({
           <>
             <BlockDetailHeader
               block={resolvedBlock}
-              iterationOverride={
-                isLoopBlock(resolvedBlock) ? effectiveIteration : null
+              iterationOverride={effectiveIteration}
+              runFinalized={
+                Boolean(workflowRun) &&
+                statusIsFinalized({ status: workflowRun!.status })
               }
             />
           </>

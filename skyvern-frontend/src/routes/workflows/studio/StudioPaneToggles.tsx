@@ -1,13 +1,13 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
-import { CheckIcon, ChevronDownIcon, CopyIcon } from "@radix-ui/react-icons";
+import { ChevronDownIcon } from "@radix-ui/react-icons";
 
 import { Status } from "@/api/types";
+import { CopyButton } from "@/components/CopyButton";
 import {
   iconForStatus,
   variantForStatus,
   type StatusVariant,
 } from "@/components/statusVisuals";
-import { copyText } from "@/util/copyText";
 import {
   Popover,
   PopoverContent,
@@ -26,8 +26,8 @@ import { PastRunsList } from "./PastRunsList";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
 import {
-  DELETED_WORKFLOW_BLOCKED_PANES,
   STUDIO_PANE_IDS,
+  WORKFLOW_AUTHORING_PANES,
   type StudioPaneId,
 } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
@@ -96,17 +96,6 @@ export function StudioPaneToggles() {
   const { runId, runStatus } = useStudioRunSignals();
   const labelsCollapsed = useLabelsCollapsed();
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
-  const [runLinkCopied, setRunLinkCopied] = useState(false);
-
-  // Copies the run's shareable link — not just the raw id.
-  const copyRunLink = async () => {
-    if (!runId || runLinkCopied) {
-      return;
-    }
-    await copyText(`${window.location.origin}/runs/${runId}`);
-    setRunLinkCopied(true);
-    setTimeout(() => setRunLinkCopied(false), 1500);
-  };
 
   // Picking a run in the selector opens/retargets the run pane. The row's own
   // handler pushes ?wr= first; openPane then merges against the live URL, so
@@ -124,11 +113,13 @@ export function StudioPaneToggles() {
   };
 
   const paneBlockedByDeletion = (id: StudioPaneId) =>
-    workflowDeleted && DELETED_WORKFLOW_BLOCKED_PANES.includes(id);
+    workflowDeleted && WORKFLOW_AUTHORING_PANES.includes(id);
 
-  type StudioControlId = StudioPaneId | "past-runs";
+  type StudioControlId = StudioPaneId | "past-runs" | "copy-run-link";
+  // Visual order, which is also the arrow-key order: run toggle, selector
+  // chevron, copy link.
   const controlIds: StudioControlId[] = STUDIO_PANE_IDS.flatMap((id) =>
-    id === "overview" && runId ? [id, "past-runs"] : [id],
+    id === "overview" && runId ? [id, "past-runs", "copy-run-link"] : [id],
   );
 
   // Roving tabindex (WAI-ARIA toolbar): the cluster is one tab stop; arrow
@@ -137,7 +128,10 @@ export function StudioPaneToggles() {
     STUDIO_PANE_IDS[0]!,
   );
   const enabledIds = controlIds.filter(
-    (id) => id === "past-runs" || !paneBlockedByDeletion(id),
+    (id) =>
+      id === "past-runs" ||
+      id === "copy-run-link" ||
+      !paneBlockedByDeletion(id),
   );
   const tabStopId = enabledIds.includes(focusedId) ? focusedId : enabledIds[0];
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -237,48 +231,9 @@ export function StudioPaneToggles() {
               tabIndex={id === tabStopId ? 0 : -1}
               onFocus={() => setFocusedId(id)}
               onClick={runId ? () => onToggle(id) : undefined}
-              className={cn(
-                buttonClassName,
-                "group",
-                runId && "rounded-r-none pr-2",
-              )}
+              className={cn(buttonClassName, runId && "rounded-r-none pr-2")}
             >
               {iconAndDot}
-              {runId ? (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  aria-label="Copy run link"
-                  title="Copy run link"
-                  onPointerDown={(event) => event.stopPropagation()}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    event.preventDefault();
-                    void copyRunLink();
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.stopPropagation();
-                      event.preventDefault();
-                      void copyRunLink();
-                    }
-                  }}
-                  className={cn(
-                    "-ml-1.5 hidden w-0 overflow-hidden rounded p-0 opacity-0 transition-all xl:inline-flex",
-                    "text-muted-foreground hover:text-foreground",
-                    "group-focus-within:ml-0 group-focus-within:w-4 group-focus-within:p-0.5 group-focus-within:opacity-100 group-hover:ml-0 group-hover:w-4 group-hover:p-0.5 group-hover:opacity-100",
-                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                    runLinkCopied &&
-                      "ml-0 w-4 p-0.5 text-foreground opacity-100",
-                  )}
-                >
-                  {runLinkCopied ? (
-                    <CheckIcon className="size-3" aria-hidden />
-                  ) : (
-                    <CopyIcon className="size-3" aria-hidden />
-                  )}
-                </span>
-              ) : null}
             </button>
           );
           const selectorTrigger = runId ? (
@@ -316,7 +271,7 @@ export function StudioPaneToggles() {
               open={runsSelectorOpen}
               onOpenChange={setRunsSelectorOpen}
             >
-              <span className="inline-flex items-center">
+              <span className="group/runctl inline-flex items-center">
                 {runId ? (
                   labelsCollapsed || showRunStatusDot ? (
                     <Tooltip>
@@ -340,6 +295,28 @@ export function StudioPaneToggles() {
                 ) : (
                   selectorTrigger
                 )}
+                {/* Sibling, not a child of the toggle: a button may not
+                    contain interactive content, and nesting it also made it a
+                    tab stop the roving tabindex above could not control.
+                    Copies the canonical /runs/:runId link, not the raw id. */}
+                {runId ? (
+                  <span
+                    className={cn(
+                      "inline-flex w-0 overflow-hidden opacity-0 transition-all",
+                      "group-hover/runctl:ml-0.5 group-hover/runctl:w-7 group-hover/runctl:opacity-100",
+                      "group-focus-within/runctl:ml-0.5 group-focus-within/runctl:w-7 group-focus-within/runctl:opacity-100",
+                    )}
+                  >
+                    <CopyButton
+                      value={() => `${window.location.origin}/runs/${runId}`}
+                      ariaLabel="Copy run link"
+                      id={studioTabId("copy-run-link")}
+                      tabIndex={"copy-run-link" === tabStopId ? 0 : -1}
+                      onFocus={() => setFocusedId("copy-run-link")}
+                      className="h-7 w-7 shrink-0 p-0 text-muted-foreground hover:text-foreground"
+                    />
+                  </span>
+                ) : null}
               </span>
               <PopoverContent
                 align={runId ? "end" : "start"}

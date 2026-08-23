@@ -34,26 +34,41 @@ function makeRun(
   } as WorkflowRunStatusApiResponseWithWorkflow;
 }
 
-function renderStrip(run: WorkflowRunStatusApiResponseWithWorkflow) {
+function renderStrip(
+  run: WorkflowRunStatusApiResponseWithWorkflow,
+  liveElapsed: string | null = null,
+) {
   return render(
     // The studio shell provides this in production (StudioShell root).
     <TooltipProvider delayDuration={0}>
-      <RunSummaryStrip workflowRun={run} />
+      <RunSummaryStrip
+        workflowRun={run}
+        timeline={undefined}
+        liveElapsed={liveElapsed}
+      />
     </TooltipProvider>,
   );
 }
 
+// The numeral is its own emphasized span inside the focusable chip, so match
+// the chip (the tab stop) by its full text.
+const durationChip = (text: string) =>
+  screen.getByText(
+    (_, node) =>
+      node?.getAttribute("tabindex") === "0" && node.textContent === text,
+  );
+
 describe("RunSummaryStrip duration", () => {
   test("shows a single elapsed chip for a finalized run", () => {
     renderStrip(makeRun());
-    expect(screen.getByText("Ran for 5m 0s")).toBeTruthy();
+    expect(durationChip("Ran for 5m 0s")).toBeTruthy();
     expect(screen.queryByText(/^Started /)).toBeNull();
     expect(screen.queryByText(/^Finished /)).toBeNull();
   });
 
   test("hovering/focusing the chip breaks down all four run times", async () => {
     renderStrip(makeRun());
-    fireEvent.focus(screen.getByText("Ran for 5m 0s"));
+    fireEvent.focus(durationChip("Ran for 5m 0s"));
     const tooltip = await screen.findByRole("tooltip");
     const breakdown = within(tooltip);
     expect(breakdown.getByText(/Created /)).toBeTruthy();
@@ -65,6 +80,13 @@ describe("RunSummaryStrip duration", () => {
   test("shows started without an elapsed chip while the run is not finalized", () => {
     renderStrip(makeRun({ status: Status.Running }));
     expect(screen.getByText(/^Started /)).toBeTruthy();
+    expect(screen.queryByText(/^Ran for /)).toBeNull();
+  });
+
+  test("a live run shows the ticking elapsed in the chip's place instead of the start date", () => {
+    renderStrip(makeRun({ status: Status.Running }), "2m 14s");
+    expect(durationChip("2m 14s")).toBeTruthy();
+    expect(screen.queryByText(/^Started /)).toBeNull();
     expect(screen.queryByText(/^Ran for /)).toBeNull();
   });
 
