@@ -2357,6 +2357,9 @@ class _ClickFakePage:
         is_option: bool = False,
         opt_text: str = "",
         opt_state: str = "",
+        opt_sel: str = "|||",
+        opt_kids: int = 0,
+        opt_h: int = 26,
         after_states: list[dict[str, Any]] | None = None,
         found_menu: dict[str, Any] | None = None,
         probe_raises: bool = False,
@@ -2370,6 +2373,9 @@ class _ClickFakePage:
         self._is_option = is_option
         self._opt_text = opt_text
         self._opt_state = opt_state
+        self._opt_sel = opt_sel
+        self._opt_kids = opt_kids
+        self._opt_h = opt_h
         self._after_states = after_states or [{"stillOpen": 0, "optState": ""}]
         self._after_i = 0
         self._found_menu = found_menu
@@ -2388,6 +2394,11 @@ class _ClickFakePage:
                 "isOption": self._is_option,
                 "optText": self._opt_text,
                 "optState": self._opt_state,
+                # The precheck carries the commit baselines; omitting them here left `_grew` unable
+                # to fire anywhere in the mocked suite, so the branch it gates went unexercised.
+                "optSel": self._opt_sel,
+                "optKids": self._opt_kids,
+                "optH": self._opt_h,
             }
         if "stillOpen" in js:
             state = self._after_states[min(self._after_i, len(self._after_states) - 1)]
@@ -2596,15 +2607,144 @@ async def test_click_multiselect_option_state_change_is_commit() -> None:
         is_option=True,
         opt_text="In stock",
         opt_state="aria-checked=false",
+        opt_sel="false|||",
         after_states=[
-            {"stillOpen": 7, "optState": "aria-checked=false"},  # post-hover baseline
-            {"stillOpen": 7, "optState": "aria-checked=true"},  # post-click: marked
+            # The row is marked but does not grow, which is what makes this the "it was picked"
+            # path: no expansion competes with the commit reading, so no child-menu probe runs.
+            {"stillOpen": 7, "optState": "aria-checked=false", "optSel": "false|||", "optKids": 0, "optH": 26},
+            {"stillOpen": 7, "optState": "aria-checked=true", "optSel": "true|||", "optKids": 0, "optH": 26},
         ],
     )
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="2"]'})
     assert r.status == "ok"
     assert "Selected option 'In stock'" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_that_is_marked_and_also_grows_reports_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A branch row can mark itself AND expand. Reporting only the mark hides that more picks are
+    # needed; reporting only the child menu hides a mark the page really made. Say both — and drop
+    # the "menu stayed open" clause, because the child note has just renumbered the markers.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Referral",
+        opt_state="s0",
+        opt_sel="false|||",
+        opt_kids=0,
+        opt_h=26,
+        after_states=[
+            {"stillOpen": 4, "optState": "s0", "optSel": "false|||", "optKids": 0, "optH": 26},
+            {"stillOpen": 4, "optState": "s1", "optSel": "true|||", "optKids": 1, "optH": 78},
+        ],
+        found_menu={"count": 2, "options": [{"n": 1, "text": "Current employee"}, {"n": 2, "text": "Former"}]},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="1"]'})
+    assert r.status == "ok"
+    assert "Selected option 'Referral' — its state changed." in r.content
+    assert "the menu stayed open" not in r.content
+    assert "opened a menu of 2 options" in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_that_grows_without_being_marked_reports_only_its_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same shape, no selection attribute: the growth is all there is, so calling it a selection
+    # would be the false report this exists to prevent. A row that grew only in HEIGHT counts —
+    # a wrapper replaced by an expanded one keeps its child count.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Referral",
+        opt_state="s0",
+        opt_sel="|||",
+        opt_kids=1,
+        opt_h=26,
+        after_states=[
+            {"stillOpen": 4, "optState": "s0", "optSel": "|||", "optKids": 1, "optH": 26},
+            {"stillOpen": 4, "optState": "s1", "optSel": "|||", "optKids": 1, "optH": 78},
+        ],
+        found_menu={"count": 2, "options": [{"n": 1, "text": "Current employee"}, {"n": 2, "text": "Former"}]},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="1"]'})
+    assert r.status == "ok"
+    assert "opened a menu of 2 options" in r.content
+    assert "Selected option" not in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_whose_row_grew_on_HOVER_is_not_read_as_expanding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Playwright hovers before it clicks, and list rows routinely reveal an edit/remove pair on
+    # hover. That growth is the hover's, not the click's — measured from a pre-hover baseline it
+    # would turn an ordinary commit into "this opened a menu", naming hover chrome as options.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    grown = {"stillOpen": 4, "optState": "s1", "optSel": "true|||", "optKids": 2, "optH": 60}
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="In stock",
+        opt_state="s0",
+        opt_sel="false|||",
+        opt_kids=0,
+        opt_h=26,
+        after_states=[
+            {"stillOpen": 4, "optState": "s0", "optSel": "false|||", "optKids": 2, "optH": 60},
+            grown,
+            grown,
+        ],
+        found_menu={"count": 2, "options": [{"n": 1, "text": "Edit"}, {"n": 2, "text": "Remove"}]},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="2"]'})
+    assert r.status == "ok"
+    assert "Selected option 'In stock'" in r.content
+    assert "opened a menu of" not in r.content
+
+
+@pytest.mark.asyncio
+async def test_click_option_expanding_by_animation_is_judged_on_the_settled_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An expansion driven by a CSS transition has barely started when the first post-click read
+    # lands, so judging on that read reports a plain commit and never looks for the child rows.
+    # The hold check already pays for a newer read; the verdict is taken from that one.
+    import asyncio as _a
+
+    monkeypatch.setattr(_a, "sleep", _instant_sleep)
+    page = _ClickFakePage(
+        menu_open=True,
+        is_option=True,
+        opt_text="Referral",
+        opt_state="s0",
+        opt_sel="|||",
+        opt_kids=1,
+        opt_h=26,
+        after_states=[
+            {"stillOpen": 4, "optState": "s0", "optSel": "|||", "optKids": 1, "optH": 26},
+            {"stillOpen": 4, "optState": "s1", "optSel": "|||", "optKids": 1, "optH": 26},
+            {"stillOpen": 4, "optState": "s1", "optSel": "|||", "optKids": 1, "optH": 78},
+        ],
+        found_menu={"count": 2, "options": [{"n": 1, "text": "Current employee"}, {"n": 2, "text": "Former"}]},
+    )
+    tools = build_browser_tools(_fixed_page_provider(page))
+    r = await _tool(tools, "click").handler({"selector": '[data-tv3-menu="1"]'})
+    assert r.status == "ok"
+    assert "opened a menu of 2 options" in r.content
+    assert "Selected option" not in r.content
 
 
 @pytest.mark.asyncio
@@ -2643,6 +2783,277 @@ async def test_click_trigger_reclick_reports_menu_closed_no_selection() -> None:
     assert r.status == "ok"
     assert "CLOSED the open menu" in r.content
     assert "no option was selected" in r.content
+
+
+# A dropdown whose rows are a RADIOGROUP: role="radio" per row, no cursor:pointer, no
+# option/menuitem role anywhere -- the accessible single-select pattern, and a shape the menu finder
+# used to walk straight past. Categories (rows with children) expand in place; leaves commit.
+_ROLE_MENU_FIXTURE_HTML = """
+<!doctype html><html><body style="margin:0">
+  <div id="trigger" tabindex="0"
+       style="position:absolute;top:40px;left:40px;width:320px;height:28px;border:1px solid #888">
+    Choose one</div>
+  <script>
+    window.__commits = 0;
+    const TREE = {'Referral': ['Current employee', 'Former employee'], 'Job board': null,
+                  'Search engine': null, 'Event': ['Career fair', 'Conference']};
+    const ROW = 'min-height:26px;padding:2px 6px;';   // deliberately no cursor:pointer
+    let _n = 0;
+    function leaf(txt, host) {
+      const el = document.createElement('div');
+      el.id = 'row-' + (++_n);
+      el.setAttribute('role', window.__rowRole || 'radio');
+      el.setAttribute('aria-checked', 'false');
+      el.setAttribute('style', ROW + 'padding-left:18px;');
+      // A real listbox row is often a native control in a label, not a bare div -- and a branch row
+      // that expands one of these into itself is the only way the row acquires an <input>.
+      if (window.__nativeKids) {
+        const lab = document.createElement('label');
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        lab.appendChild(box);
+        lab.appendChild(document.createTextNode(' ' + txt));
+        el.appendChild(lab);
+      } else {
+        el.textContent = txt;
+      }
+      el.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (window.__noCommit) return;
+        // Commits by flipping its own aria-checked and leaving the list open, the way a
+        // multi-select does -- so the commit reading is exercised, not the menu-closed shortcut.
+        el.setAttribute('aria-checked', 'true');
+        document.getElementById('trigger').textContent = txt;
+        window.__commits++;
+        if (!window.__revealOnPick) return;
+        const extra = document.createElement('div');
+        for (const t of ['Add-on A', 'Add-on B']) {
+          const x = document.createElement('div');
+          x.id = 'row-' + (++_n);
+          x.setAttribute('role', window.__rowRole || 'radio');
+          x.setAttribute('aria-checked', 'false');
+          x.setAttribute('style', ROW + 'padding-left:30px;');
+          x.textContent = t;
+          extra.appendChild(x);
+        }
+        el.parentNode.insertBefore(extra, el.nextSibling);
+      });
+      host.appendChild(el);
+    }
+    document.getElementById('trigger').addEventListener('click', () => {
+      const ex = document.getElementById('list');
+      if (ex) { ex.remove(); return; }
+      _n = 0;
+      const list = document.createElement('div');
+      list.id = 'list';
+      list.setAttribute('style', 'position:absolute;top:74px;left:40px;width:320px;background:#fff;'
+                               + 'border:1px solid #ccc');
+      for (const name of Object.keys(TREE)) {
+        const kids = TREE[name];
+        if (!kids) { leaf(name, list); continue; }
+        const row = document.createElement('div');
+        row.id = 'row-' + (++_n);
+        row.setAttribute('role', window.__rowRole || 'radio');
+        row.setAttribute('aria-checked', 'false');
+        row.setAttribute('style', ROW);
+        row.textContent = name;
+        // Some listboxes mark the hovered row aria-selected; Playwright hovers before it clicks.
+        if (window.__ariaOnHover) {
+          row.addEventListener('mouseenter', () => { row.setAttribute('aria-selected', 'true'); });
+        }
+        row.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (row.querySelector('div')) return;
+          // A tree-shaped listbox marks the branch you opened as the current one AND expands it.
+          if (window.__ariaOnPick) row.setAttribute('aria-selected', 'true');
+          const sub = document.createElement('div');
+          for (const k of kids) leaf(k, sub);
+          row.appendChild(sub);
+        });
+        list.appendChild(row);
+      }
+      document.body.appendChild(list);
+    });
+  </script>
+</body></html>
+"""
+
+
+@contextlib.asynccontextmanager
+async def _role_menu_page(row_role: str = "radio", *, native_kids: bool = False) -> AsyncIterator[Any]:
+    from playwright.async_api import async_playwright  # noqa: PLC0415
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context(viewport={"width": 1024, "height": 900})
+            page = await context.new_page()
+            await page.set_content(_ROLE_MENU_FIXTURE_HTML)
+            await page.evaluate("(r) => { window.__rowRole = r; }", row_role)
+            await page.evaluate("(n) => { window.__nativeKids = n; }", native_kids)
+            yield page
+        finally:
+            await browser.close()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_role", ["radio", "checkbox", "button", "switch"])
+async def test_dom_a_dropdown_of_widget_role_rows_is_reported_as_a_menu(row_role: str) -> None:
+    # observe already treats these four as controls (_WIDGET_ROLES); the menu finder used to honour
+    # only option/menuitem, so these lists opened silently and nothing was ever tagged.
+    async with _role_menu_page(row_role) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#trigger"})
+        assert r.status == "ok"
+        assert "opened a menu of 4 options" in r.content
+        assert '[data-tv3-menu="2"]' in r.content and "Job board" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_radiogroup_option_that_does_not_commit_errors_loud() -> None:
+    # THE discriminating negative. Unrecognised rows are never tagged, so the whole commit path in
+    # _click_reaction is gated off and the click returns a bare ok while the field stays empty --
+    # the exact "every click returns ok" this must never do again.
+    async with _role_menu_page() as page:
+        await page.evaluate("() => { window.__noCommit = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#trigger"})
+        # Addressed by the row's own selector, not by a data-tv3-menu tag, so this asks the same
+        # question of a build that never tags it: what does clicking a dead option row report?
+        r = await click.handler({"selector": "#row-2"})
+        assert await page.evaluate("() => window.__commits") == 0
+        assert await page.eval_on_selector("#trigger", "e => e.textContent.trim()") == "Choose one"
+        assert r.status == "error"
+        assert "did not commit" in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_radiogroup_category_reports_its_children_and_the_leaf_commits() -> None:
+    # The hierarchical case end to end: a category commits nothing, so its child rows are reported
+    # (never a false "selected"), and the leaf then commits in one more click.
+    async with _role_menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r2 = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r2.status == "ok"
+        assert "opened a menu of 2 options" in r2.content
+        assert "Current employee" in r2.content and "Former employee" in r2.content
+        assert await page.evaluate("() => window.__commits") == 0
+        r3 = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert r3.status == "ok"
+        # The full sentence, not its prefix: "the menu closed" shares that prefix and would let this
+        # pass without ever reaching the reading under test.
+        assert "Selected option 'Former employee' — its state changed (the menu stayed open)." in r3.content
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_real_commit_survives_the_click_also_revealing_more_rows() -> None:
+    # A row can commit AND reveal dependent options in one click. The selection attribute settles
+    # it, so the commit must still be reported -- reading the new rows as "this only expanded"
+    # would swallow a selection that really happened.
+    async with _role_menu_page() as page:
+        await page.evaluate("() => { window.__revealOnPick = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r = await click.handler({"selector": '[data-tv3-menu="2"]'})
+        assert r.status == "ok"
+        assert "Selected option 'Job board' — its state changed (the menu stayed open)." in r.content
+        assert "opened a menu of" not in r.content
+        assert await page.evaluate("() => window.__commits") == 1
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_hover_marking_a_row_selected_is_not_read_as_the_click_committing() -> None:
+    # Playwright hovers before it clicks, so a row the widget marks aria-selected on hover would
+    # otherwise hand the commit check a selection that the click did not make -- and a parent that
+    # only expanded would report a commit instead of its child rows.
+    async with _role_menu_page() as page:
+        await page.evaluate("() => { window.__ariaOnHover = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r.status == "ok"
+        assert "opened a menu of 2 options" in r.content
+        assert "its state changed" not in r.content
+        assert await page.evaluate("() => window.__commits") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_category_that_marks_itself_selected_reports_the_mark_AND_its_children() -> None:
+    # A tree-shaped listbox marks the branch it opened as current. Both readings are true, so both
+    # are reported: calling it only a selection hides that more picks are needed, and calling it
+    # only a submenu hides a mark the page really did make.
+    async with _role_menu_page() as page:
+        await page.evaluate("() => { window.__ariaOnPick = 1; }")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r.status == "ok"
+        assert "Selected option 'Referral' — its state changed." in r.content
+        # Not "the menu stayed open": the child note below has just renumbered the markers, so the
+        # menu the model was holding is exactly what did not stay.
+        assert "the menu stayed open" not in r.content
+        assert "opened a menu of 2 options" in r.content
+        assert "Current employee" in r.content
+        assert await page.evaluate("() => window.__commits") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_branch_row_that_reveals_native_checkboxes_is_not_called_a_selection() -> None:
+    # Expanding a branch row moves native <input>s INTO it, and a selection read that counted them
+    # would call that growth a pick. Nothing here is checked and nothing commits, so the child rows
+    # are the whole answer.
+    async with _role_menu_page(native_kids=True) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r.status == "ok"
+        assert "opened a menu of 2 options" in r.content
+        assert "its state changed" not in r.content
+        assert await page.evaluate("() => window.__commits") == 0
+        assert await page.evaluate("() => document.querySelectorAll('#row-1 input:checked').length") == 0
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_menu_note_for_a_clicked_row_does_not_name_the_selector_it_just_invalidated() -> None:
+    # The note renumbers every data-tv3-menu, so naming the row's own selector as the way to close
+    # the menu contradicts the sentence right after it, which declares that selector stale.
+    async with _role_menu_page() as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+        assert "opened a menu of 4 options" in (await click.handler({"selector": "#trigger"})).content
+        r = await click.handler({"selector": '[data-tv3-menu="1"]'})
+        assert r.status == "ok"
+        assert "opened a menu of 2 options" in r.content
+        assert "the row you just clicked" in r.content
+        assert 'clicking [data-tv3-menu="1"] again' not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_tab_strip_is_still_not_a_menu() -> None:
+    # The exclusion half: role=tab is navigational (_FIND_SUGGESTION_JS refuses it too), so widening
+    # to the widget roles must NOT start calling a vertical tab strip a menu of options.
+    async with _role_menu_page("tab") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#trigger"})
+        assert r.status == "ok"
+        assert "opened a menu of" not in r.content
 
 
 @pytest.mark.asyncio
