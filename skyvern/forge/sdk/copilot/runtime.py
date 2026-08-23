@@ -29,7 +29,7 @@ from skyvern.cli.core.session_manager import (
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
@@ -325,6 +325,7 @@ class AgentContext:
     browser_session_continuity_disposition: str | None = None
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
+    pending_frame_lease: PendingFrameLease | None = None
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     unrecoverable_tool_error_streak_count: int = 0
     unrecoverable_tool_error_signature: str | None = None

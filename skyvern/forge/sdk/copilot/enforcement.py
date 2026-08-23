@@ -82,7 +82,7 @@ from skyvern.forge.sdk.copilot.result_evidence import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -117,6 +117,7 @@ TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # constant so tests can shrink it instead of paying a full second per deadline.
 MIN_DEADLINE_REMAINING_SECONDS = 1.0
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
+PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
@@ -450,13 +451,42 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
+    provenance_lines: list[str] = []
+    for entry in screenshots:
+        provenance = entry.provenance
+        fields = {
+            "capture_id": entry.capture_id,
+            "source_tool": provenance.source_tool,
+            "captured_url": provenance.captured_url or "unavailable",
+            "dispatch_url": provenance.dispatch_url or "unavailable",
+            "observation_step": provenance.observation_step
+            if provenance.observation_step is not None
+            else "unavailable",
+            "browser_session_id": provenance.browser_session_id or "unavailable",
+            "dispatch_browser_session_id": provenance.dispatch_browser_session_id or "unavailable",
+            "producer_browser_session_id": provenance.producer_browser_session_id or "unavailable",
+            "session_binding": provenance.session_binding.value,
+            "workflow_run_id": provenance.workflow_run_id or "unavailable",
+            "action_relation": provenance.action_relation.value,
+        }
+        rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
+        relation = (
+            "This frame was captured during the named page observation."
+            if provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+            else "This frame records the named source at its stated action relation."
+        )
+        provenance_lines.append(
+            f"Frame provenance: {rendered}. {relation} Its provenance does not claim freshness after later actions."
+        )
+    paired_marker = (
+        PAIRED_OBSERVATION_MARKER
+        if screenshots[0].provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+        else ""
+    )
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": (
-                SCREENSHOT_SENTINEL + "Here is the most recent screenshot captured this turn. "
-                "It shows the page as of that capture and may predate later actions."
-            ),
+            "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
     for entry in screenshots:
@@ -476,6 +506,8 @@ def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
     pending = getattr(ctx, "pending_screenshots", None)
     if isinstance(pending, list):
         pending.clear()
+    if hasattr(ctx, "pending_frame_lease"):
+        ctx.pending_frame_lease = None
     return message
 
 
@@ -534,6 +566,22 @@ def is_screenshot_message(item: Any) -> bool:
         if isinstance(text, str) and text.startswith(SCREENSHOT_SENTINEL):
             return True
     return False
+
+
+def is_paired_observation_message(item: Any) -> bool:
+    """Return True only for explicitly marked observation-bound frames."""
+    if _item_field(item, "role") != "user":
+        return False
+    prefix = SCREENSHOT_SENTINEL + PAIRED_OBSERVATION_MARKER
+    content = _item_field(item, "content")
+    if isinstance(content, str):
+        return content.startswith(prefix)
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(_item_field(block, "text"), str) and _item_field(block, "text").startswith(prefix)
+        for block in content
+    )
 
 
 def _is_nudge_message(item: Any) -> bool:
