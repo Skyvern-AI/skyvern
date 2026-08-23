@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     finalize_runtime_authoring_repair_context_from_page_observation,
     post_run_inspection_cleanly_matches,
@@ -47,6 +48,7 @@ from ._shared import (
     _CURRENT_PAGE_INSPECTION_TARGETS,
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
     _append_flow_evidence,
+    _call_internal_browser_tool,
     _composition_evidence_page_url,
     _composition_get_html,
     _composition_get_structured_evidence_result,
@@ -132,13 +134,17 @@ async def _composition_get_screenshot(ctx: CopilotContext, *, dispatch_session_i
     if server is None:
         return {"ok": False, "error": "discovery MCP server not attached to context"}
     try:
-        return await asyncio.wait_for(
-            server.call_internal_tool(
+        result, outcome = await asyncio.wait_for(
+            _call_internal_browser_tool(
+                server,
                 "skyvern_screenshot",
                 {"inline": True, **({"session_id": dispatch_session_id} if dispatch_session_id else {})},
             ),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
+        if outcome is not None and outcome.payload_omitted:
+            return {"ok": False, "error": "skyvern_screenshot payload was omitted at the MCP boundary"}
+        return result
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"skyvern_screenshot timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
 
@@ -568,6 +574,10 @@ async def _capture_composition_evidence(
     current_url: str,
 ) -> CompositionEvidenceCapture:
     """Capture page evidence, using HTML only to enrich a valid but unsettled structured packet."""
+    capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
+    capture_session_generation = (
+        copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
+    )
     evidence: dict[str, Any] | None = None
     html_truncated = False
     used_structured = False
@@ -619,13 +629,29 @@ async def _capture_composition_evidence(
     # Structured evidence already carries computed obstruction candidates; only the get_html path augments.
     if evidence is not None and not used_structured:
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
+    frame: CapturedFrame | None = None
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence, frame = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
-        return CompositionEvidenceCapture(evidence, None, frame)
-    return CompositionEvidenceCapture(evidence, None)
+    if (
+        isinstance(copilot_ctx, AgentContext)
+        and evidence is not None
+        and (
+            copilot_ctx.browser_session_id != capture_session_id
+            or copilot_ctx.browser_session_continuity_generation != capture_session_generation
+        )
+    ):
+        evidence = _composition_add_inspection_warning(evidence, "mixed_browser_session_provenance")
+        evidence["browser_session_provenance"] = {
+            "mixed": True,
+            "start_browser_session_id": capture_session_id,
+            "end_browser_session_id": copilot_ctx.browser_session_id,
+            "start_generation": capture_session_generation,
+            "end_generation": copilot_ctx.browser_session_continuity_generation,
+        }
+    return CompositionEvidenceCapture(evidence, None, frame)
 
 
 async def _read_run_session_page_evidence(
@@ -772,6 +798,10 @@ async def _inspect_page_for_composition_impl(
         result = {"ok": False, "error": authority_error}
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
+    capture_session_id = copilot_ctx.browser_session_id if isinstance(copilot_ctx, AgentContext) else None
+    capture_session_generation = (
+        copilot_ctx.browser_session_continuity_generation if isinstance(copilot_ctx, AgentContext) else None
+    )
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     if not use_current_page:
@@ -877,6 +907,23 @@ async def _inspect_page_for_composition_impl(
                 )
                 evidence, observation_error, visual_fallback_frame = _capture_result_parts(capture)
 
+    if (
+        isinstance(copilot_ctx, AgentContext)
+        and evidence is not None
+        and (
+            copilot_ctx.browser_session_id != capture_session_id
+            or copilot_ctx.browser_session_continuity_generation != capture_session_generation
+        )
+    ):
+        evidence = _composition_add_inspection_warning(evidence, "mixed_browser_session_provenance")
+        evidence["browser_session_provenance"] = {
+            "mixed": True,
+            "start_browser_session_id": capture_session_id,
+            "end_browser_session_id": copilot_ctx.browser_session_id,
+            "start_generation": capture_session_generation,
+            "end_generation": copilot_ctx.browser_session_continuity_generation,
+        }
+
     if observation_error is not None:
         result = {
             "ok": False,
@@ -896,8 +943,12 @@ async def _inspect_page_for_composition_impl(
         return result
 
     if isinstance(run_id, str) and run_id:
+        session_provenance = evidence.get("browser_session_provenance")
+        mixed_session_provenance = isinstance(session_provenance, dict) and session_provenance.get("mixed") is True
         source_browser_session_id = (
-            observed_run_session_id if run_page_source_session_id else copilot_ctx.browser_session_id
+            None
+            if mixed_session_provenance
+            else (observed_run_session_id if run_page_source_session_id else copilot_ctx.browser_session_id)
         )
         evidence, preserved_stored_evidence = store_post_run_page_evidence(
             copilot_ctx,
