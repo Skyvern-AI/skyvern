@@ -20,7 +20,17 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     stage_screenshot_from_artifact,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    NO_PERSISTED_END_URL,
+    _attach_action_traces,
+    _attach_failed_block_screenshots,
+    _dispatched_end_url,
+    _resolve_run_screenshot_b64,
+    _summarize_action_trace,
+    _update_verification_evidence_from_run_result,
+)
 from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit.copilot_test_helpers import make_model_input_data
 
 
@@ -358,6 +368,7 @@ class TestAttachActionTraces:
         element_id: str | None,
         *,
         description: str | None = None,
+        response: str | None = None,
         output: dict[str, Any] | list | str | None = None,
     ) -> MagicMock:
         action = MagicMock()
@@ -367,6 +378,7 @@ class TestAttachActionTraces:
         action.reasoning = reasoning
         action.element_id = element_id
         action.description = description
+        action.response = response
         action.output = output
         return action
 
@@ -476,13 +488,123 @@ class TestAttachActionTraces:
         assert "output" not in trace[0]
         assert "arbitrary" not in trace[0]
         assert "description" not in trace[1]
-        assert "code_line" not in trace[1]
+        assert trace[1]["code_line"] == 17
         assert "description" not in trace[2]
         assert "code_line" not in trace[2]
         assert "description" not in trace[3]
         assert "code_line" not in trace[3]
         assert "description" not in trace[4]
         assert "code_line" not in trace[4]
+
+    @pytest.mark.asyncio
+    async def test_failed_direct_action_carries_browser_error_text_and_its_code_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "accept_notice", "status": "failed"}
+        actionability_error = (
+            "Locator.click: Timeout 5000ms exceeded.\n"
+            "Call log:\n"
+            '  - waiting for locator("#continue")\n'
+            '  - <div class="privacy-notice-veil" role="dialog">…</div> intercepts pointer events'
+        )
+        actions = [
+            self._make_action(
+                "task-1",
+                "click",
+                "failed",
+                None,
+                "continue-1",
+                response=actionability_error,
+                output={"code_line": 19},
+            )
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        entry = result["action_trace"][0]
+        assert entry["response"] != "Browser operation failed."
+        assert "privacy-notice-veil" in entry["response"]
+        assert "intercepts pointer events" in entry["response"]
+        assert entry["code_line"] == 19
+
+        summary = _summarize_action_trace(result["action_trace"])
+        assert "privacy-notice-veil" in summary[-1]
+        assert "code_line=19" in summary[-1]
+        assert "description=" not in summary[-1]
+
+    @pytest.mark.asyncio
+    async def test_browser_error_text_is_bounded_in_the_trace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "accept_notice", "status": "failed"}
+        actions = [
+            self._make_action("task-1", "click", "failed", None, None, response="y" * 4000, output={"code_line": 19})
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        assert len(result["action_trace"][0]["response"]) == 300
+
+    @pytest.mark.asyncio
+    async def test_a_non_recorder_failed_action_keeps_its_response_out_of_the_trace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """personalize_action writes the typed-in field value to response; only the recorder's own
+        rows, which carry a code_line, may surface it."""
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "fill_ssn", "status": "failed"}
+        actions = [self._make_action("task-1", "input_text", "failed", None, "ssn-field", response="123-45-6789")]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        assert "response" not in result["action_trace"][0]
+        assert "123-45-6789" not in str(result["action_trace"])
+
+    @pytest.mark.asyncio
+    async def test_repeated_identical_failures_are_neither_deduped_nor_labelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = self._make_block("task-1", "failed")
+        result: dict[str, Any] = {"label": "accept_notice", "status": "failed"}
+        repeated = '<div class="privacy-notice-veil">…</div> intercepts pointer events'
+        actions = [
+            self._make_action(
+                "task-1", "click", "failed", None, "continue-1", response=repeated, output={"code_line": 19}
+            )
+            for _ in range(3)
+        ]
+
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=actions)
+        _install_mock_database(monkeypatch, mock_db)
+
+        await _attach_action_traces([block], [result], "org-1")
+
+        trace = result["action_trace"]
+        assert len(trace) == 3
+        assert all(entry["response"] == repeated for entry in trace)
+        assert all(
+            set(entry) == {"action", "status", "reasoning", "element", "code_line", "response"} for entry in trace
+        )
+        summary = _summarize_action_trace(trace)
+        assert len(summary) == 3
+        assert len(set(summary)) == 1
 
     @pytest.mark.asyncio
     async def test_attach_action_traces_skips_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -695,6 +817,199 @@ class TestAttachFailedBlockScreenshots:
 
         assert result["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
         assert "final_url" not in result
+
+    @pytest.mark.asyncio
+    async def test_dispatched_failure_packet_carries_the_worker_persisted_frame_and_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = self._make_block(
+            workflow_run_block_id="wrb-dispatched",
+            task_id="tsk-v1-container",
+            final_url="https://example.com/step-2",
+        )
+        results: list[dict[str, Any]] = [{"label": "accept_notice", "status": "failed"}]
+
+        self._install_app(monkeypatch, run_block_artifact=MagicMock(), task_v2_artifacts=[])
+
+        await _attach_failed_block_screenshots([block], results, "org-1")
+        packet = {
+            "blocks": results,
+            "current_url": _dispatched_end_url([block]),
+            "screenshot_base64": _resolve_run_screenshot_b64(live_capture=None, results=results, run_ok=False),
+        }
+
+        assert packet["current_url"] == "https://example.com/step-2"
+        assert packet["screenshot_base64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert results[0]["final_url"] == "https://example.com/step-2"
+        assert "at_failure_evidence" not in results[0]
+
+    @pytest.mark.asyncio
+    async def test_dispatched_failure_without_persisted_evidence_states_the_absence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        block = self._make_block(workflow_run_block_id="wrb-bare", task_id="tsk-bare", final_url=None)
+        results: list[dict[str, Any]] = [{"label": "accept_notice", "status": "failed"}]
+
+        self._install_app(monkeypatch, run_block_artifact=None, task_v2_artifacts=[])
+
+        await _attach_failed_block_screenshots([block], results, "org-1")
+        end_url = _dispatched_end_url([block])
+        packet: dict[str, Any] = {
+            "blocks": results,
+            "screenshot_base64": _resolve_run_screenshot_b64(live_capture=None, results=results, run_ok=False),
+        }
+        if end_url is None:
+            packet["current_url_evidence"] = NO_PERSISTED_END_URL
+        else:
+            packet["current_url"] = end_url
+
+        assert results[0]["at_failure_evidence"] == (
+            "No at-failure screenshot or final URL was persisted for this block."
+        )
+        assert "final_url" not in results[0]
+        assert "screenshot_b64" not in results[0]
+        assert end_url is None
+        assert packet["current_url_evidence"] == NO_PERSISTED_END_URL
+        assert "current_url" not in packet
+        assert packet["screenshot_base64"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the call site, not the helper: reverting the dispatched branch to ("", "") must fail here."""
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = MagicMock()
+        block.label = "accept_notice"
+        block.block_type = SimpleNamespace(name="code")
+        block.status = "failed"
+        block.failure_reason = None
+        block.output = None
+        block.task_id = None
+        block.final_url = "https://example.com/step-2"
+        block.workflow_run_block_id = "wrb-1"
+
+        run = SimpleNamespace(
+            status="failed",
+            workflow_permanent_id="wpid-1",
+            failure_reason=None,
+        )
+
+        class _AppStub:
+            class DATABASE:
+                class workflow_runs:
+                    get_workflow_run = AsyncMock(return_value=run)
+
+                class observer:
+                    get_workflow_run_blocks = AsyncMock(return_value=[block])
+
+            class AGENT_FUNCTION:
+                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(run_execution_module, "app", _AppStub())
+        monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
+        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
+
+        ctx = SimpleNamespace(organization_id="org-1", workflow_permanent_id="wpid-1")
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        assert result["data"]["current_url"] == "https://example.com/step-2"
+        assert "current_url_evidence" not in result["data"]
+        assert result["data"].get("current_url_live_observed") is not True
+
+    def test_an_earlier_blocks_url_is_not_reported_as_where_the_run_ended(self) -> None:
+        earlier = self._make_block(
+            workflow_run_block_id="wrb-earlier",
+            task_id="tsk-earlier",
+            final_url="https://example.com/step-1",
+        )
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-terminal",
+            task_id="tsk-terminal",
+            final_url=None,
+        )
+
+        assert _dispatched_end_url([earlier, terminal]) is None
+
+    def test_a_worker_persisted_url_does_not_claim_the_live_page_was_verified(self) -> None:
+        ctx = SimpleNamespace(
+            workflow_verification_evidence=WorkflowVerificationEvidence(),
+            last_full_workflow_test_ok=False,
+            last_failure_category_top=None,
+            last_test_failure_reason=None,
+        )
+        result = {"ok": False, "data": {"current_url": "https://example.com/step-2"}}
+
+        _update_verification_evidence_from_run_result(ctx, result)  # type: ignore[arg-type]
+
+        assert ctx.workflow_verification_evidence.current_url == "https://example.com/step-2"
+        assert ctx.workflow_verification_evidence.live_page_state_verified is False
+
+    def test_a_persisted_url_clears_a_verification_left_by_an_earlier_live_read(self) -> None:
+        """The flag is only ever set True elsewhere, so it must move with the URL it describes."""
+        evidence = WorkflowVerificationEvidence()
+        evidence.live_page_state_verified = True
+        evidence.current_url = "https://example.com/scouted"
+        ctx = SimpleNamespace(
+            workflow_verification_evidence=evidence,
+            last_full_workflow_test_ok=False,
+            last_failure_category_top=None,
+            last_test_failure_reason=None,
+        )
+        result = {"ok": False, "data": {"current_url": "https://example.com/persisted"}}
+
+        _update_verification_evidence_from_run_result(ctx, result)  # type: ignore[arg-type]
+
+        assert evidence.current_url == "https://example.com/persisted"
+        assert evidence.live_page_state_verified is False
+
+    def test_a_live_observed_url_still_verifies_the_page_state(self) -> None:
+        ctx = SimpleNamespace(
+            workflow_verification_evidence=WorkflowVerificationEvidence(),
+            last_full_workflow_test_ok=False,
+            last_failure_category_top=None,
+            last_test_failure_reason=None,
+        )
+        result = {
+            "ok": False,
+            "data": {"current_url": "https://example.com/step-2", "current_url_live_observed": True},
+        }
+
+        _update_verification_evidence_from_run_result(ctx, result)  # type: ignore[arg-type]
+
+        assert ctx.workflow_verification_evidence.live_page_state_verified is True
+
+    def test_an_over_long_url_is_refused_rather_than_truncated(self) -> None:
+        """A cut URL still parses, so truncating would report an unresumable page as the end state."""
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-long",
+            task_id="tsk-long",
+            final_url="https://example.com/p?" + "x=1&" * 75000,
+        )
+
+        assert _dispatched_end_url([terminal]) is None
+
+    def test_a_runtime_token_in_the_end_url_is_screened(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-tok",
+            task_id="tsk-tok",
+            final_url="https://example.com/cb?access_token=abcdef1234567890xyz",
+        )
+
+        end_url = _dispatched_end_url([terminal])
+
+        assert end_url is not None
+        assert "abcdef1234567890xyz" not in end_url
+
+    def test_a_secret_masked_url_is_not_reported_as_a_resumable_page(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-masked",
+            task_id="tsk-masked",
+            final_url="https://example.com/callback?token=*****",
+        )
+
+        assert _dispatched_end_url([terminal]) is None
 
     @pytest.mark.asyncio
     async def test_successful_block_gets_no_evidence(self, monkeypatch: pytest.MonkeyPatch) -> None:

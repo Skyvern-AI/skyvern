@@ -15,6 +15,7 @@ from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tools
 from skyvern.forge.sdk.copilot.composition_evidence import parse_composition_structured
 from skyvern.forge.sdk.copilot.tools import _normalized_inspect_url, _same_inspect_target
+from skyvern.forge.sdk.copilot.tools._shared import _composition_get_structured_evidence_result
 from skyvern.forge.sdk.copilot.tools.scouting import _page_evidence_location_fingerprint
 
 
@@ -284,3 +285,85 @@ async def test_signalled_packet_survives_extractor_blinking_mid_loop(monkeypatch
     assert evidence["challenge_state"]["detected"] is True
     assert evidence["challenge_state"]["indicators"] == ["just a moment"]
     get_html.assert_not_awaited()
+
+
+async def _structured_evidence(server: SimpleNamespace) -> tuple[dict | None, str | None]:
+    return await _composition_get_structured_evidence_result(
+        SimpleNamespace(discovery_mcp_server=server),
+        inspected_url="https://example.com/",
+        current_url="https://example.com/",
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_rejection_returns_the_underlying_error() -> None:
+    server = SimpleNamespace(
+        call_internal_tool=AsyncMock(return_value={"ok": False, "error": "SecurityError: blocked a frame with origin"})
+    )
+
+    evidence, error = await _structured_evidence(server)
+
+    assert evidence is None
+    assert error is not None
+    assert "SecurityError: blocked a frame with origin" in error
+    assert "structured page evidence failed: evaluate returned an error" not in error
+
+
+class _HostileStr(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["error_payload", "raised_exception"])
+async def test_a_hostile_dunder_str_does_not_escape_the_evidence_error(arm: str) -> None:
+    """Both arms return the graceful (None, message); reading the value must not raise on either."""
+    server = SimpleNamespace(
+        call_internal_tool=AsyncMock(return_value={"ok": False, "error": _HostileStr()})
+        if arm == "error_payload"
+        else AsyncMock(side_effect=_HostileStr())
+    )
+
+    evidence, error = await _structured_evidence(server)
+
+    assert evidence is None
+    assert isinstance(error, str)
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_non_mapping_result_does_not_raise() -> None:
+    evidence, error = await _structured_evidence(
+        SimpleNamespace(call_internal_tool=AsyncMock(return_value="not-a-mapping"))
+    )
+
+    assert evidence is None
+    assert error == (
+        "skyvern_evaluate returned an error while capturing structured page evidence, "
+        "and the result carried no error detail"
+    )
+    assert "structured page evidence failed: evaluate returned an error" not in error
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_exception_returns_the_underlying_error() -> None:
+    evidence, error = await _structured_evidence(
+        SimpleNamespace(call_internal_tool=AsyncMock(side_effect=RuntimeError("CDP target detached")))
+    )
+
+    assert evidence is None
+    assert error is not None
+    assert "CDP target detached" in error
+
+
+@pytest.mark.asyncio
+async def test_structured_evidence_error_is_bounded_and_redacted() -> None:
+    server = SimpleNamespace(
+        call_internal_tool=AsyncMock(return_value={"ok": False, "error": "api_key=zzzz1111yyyy2222 " + "e" * 4000})
+    )
+
+    evidence, error = await _structured_evidence(server)
+
+    assert evidence is None
+    assert error is not None
+    assert "zzzz1111yyyy2222" not in error
+    assert len(error) < 400

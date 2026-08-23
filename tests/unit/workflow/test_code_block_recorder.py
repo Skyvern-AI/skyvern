@@ -32,6 +32,8 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
+    RECORDED_FAILURE_CAPTURE_MAX_CHARS,
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
     PendingAction,
     RecordingKeyboard,
     RecordingLocator,
@@ -558,11 +560,19 @@ async def test_filter_locator_chain_click_is_recorded() -> None:
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
 
 
+_ACTIONABILITY_ERROR = (
+    "Locator.click: Timeout 5000ms exceeded.\n"
+    "Call log:\n"
+    '  - waiting for locator("#submit")\n'
+    '  - <div class="privacy-notice-veil" role="dialog">…</div> intercepts pointer events'
+)
+
+
 @pytest.mark.asyncio
-async def test_failed_call_records_failed_action_and_reraises() -> None:
+async def test_failed_call_records_the_browser_error_text_and_reraises() -> None:
     class ExplodingLocator(FakeLocator):
         async def click(self, **kwargs):  # noqa: ANN003, ANN201
-            raise RuntimeError("element detached")
+            raise RuntimeError(_ACTIONABILITY_ERROR)
 
     fake = FakePage()
     fake.inner = ExplodingLocator()
@@ -572,8 +582,54 @@ async def test_failed_call_records_failed_action_and_reraises() -> None:
     recorded = page.recorded_actions()
     assert recorded[-1].action_type == ActionType.CLICK
     assert recorded[-1].status == ActionStatus.failed
-    assert "element detached" not in (recorded[-1].response or "")
-    assert recorded[-1].response == "Browser operation failed."
+    assert recorded[-1].response != "Browser operation failed."
+    assert "privacy-notice-veil" in (recorded[-1].response or "")
+    assert "intercepts pointer events" in (recorded[-1].response or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_str",
+    [
+        pytest.param(lambda self: (_ for _ in ()).throw(RuntimeError("__str__ exploded")), id="raising"),
+        pytest.param(lambda self: 42, id="non_str"),
+    ],
+)
+async def test_a_hostile_dunder_str_cannot_swallow_the_original_failure(bad_str) -> None:  # noqa: ANN001
+    """Capturing the message must not cost the fault: the original exception still propagates."""
+
+    class Hostile(Exception):
+        __str__ = bad_str
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise Hostile()
+
+    fake = FakePage()
+    fake.inner = ExplodingLocator()
+    page = RecordingPage(fake)
+    with pytest.raises(Hostile):
+        await page.locator("#x").click()
+    assert page.recorded_actions()[-1].response == "Hostile"
+
+
+@pytest.mark.asyncio
+async def test_a_huge_error_is_captured_above_the_mask_bound_but_still_capped() -> None:
+    """Unbounded capture would exceed the parameter redactor's disclosure budget, which returns a
+    replacement string instead of the payload and drops the whole row."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("x" * 70000)
+
+    fake = FakePage()
+    fake.inner = ExplodingLocator()
+    page = RecordingPage(fake)
+    with pytest.raises(RuntimeError):
+        await page.locator("#x").click()
+    captured = page.recorded_actions()[-1].response or ""
+    assert len(captured) > RECORDED_FAILURE_RESPONSE_MAX_CHARS
+    assert len(captured) == RECORDED_FAILURE_CAPTURE_MAX_CHARS
 
 
 @pytest.mark.asyncio

@@ -22,10 +22,12 @@ from skyvern.cli.core.browser_ops import (
     do_select_option,
 )
 from skyvern.cli.core.result import Artifact, BrowserContext, set_concise_responses
+from skyvern.cli.mcp_tools import _element_state
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import cdp_input as mcp_cdp_input
 from skyvern.cli.mcp_tools import mcp
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
+from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
 from tests.unit._mcp_browser_fakes import (
     make_mock_page,
     make_probe_locator,
@@ -672,6 +674,93 @@ async def test_skyvern_click_direct_failure_reports_element_state(
     assert result["error"]["hint"]
     click.assert_awaited_once()
     locator.count.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "bad_str",
+    [
+        pytest.param(lambda self: (_ for _ in ()).throw(RuntimeError("boom")), id="raising"),
+        pytest.param(lambda self: 7, id="non_str"),
+    ],
+)
+def test_a_hostile_dunder_str_cannot_raise_out_of_the_element_state_detail(bad_str) -> None:  # noqa: ANN001
+    """Reading the message must not turn a handled actionability failure into an unhandled one."""
+
+    class Hostile(Exception):
+        __str__ = bad_str
+
+    assert _element_state._redacted_exception_detail(Hostile()) == ""
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_returns_the_underlying_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = (
+        "Locator.click: Timeout 5000ms exceeded.\n"
+        'Call log:\n  - <div class="privacy-notice-veil">Accept</div> intercepts pointer events'
+    )
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(message),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    details = result["error"]["details"]
+    assert "privacy-notice-veil" in details["exception_detail"]
+    assert "intercepts pointer events" in details["exception_detail"]
+    assert details["exception_detail"] != details["exception_type"]
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_redacts_a_secret_bearing_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(
+            "Locator.click: navigating to https://example.com/callback?access_token=abcd1234efgh5678 failed"
+        ),
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    assert "abcd1234efgh5678" not in result["error"]["details"]["exception_detail"]
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_direct_failure_masks_a_parameter_straddling_the_detail_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The codeblock redactor replaces parameter values by exact match, so bounding the text before
+    # it runs would leave a cut value behind as an unmatchable fragment.
+    parameter_value = "vault-secret-" + "q" * 40
+    prefix = "Locator.click: Timeout 5000ms exceeded. Call log: navigating to "
+    message = prefix.ljust(_element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS - 30, "-") + parameter_value + " failed"
+    cut = message[: _element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS]
+    assert parameter_value[:20] in cut and parameter_value not in cut
+
+    click, _ = _direct_click_page(
+        monkeypatch,
+        count=1,
+        visible=True,
+        enabled=True,
+        click_error=mcp_browser.PlaywrightTimeoutError(message),
+    )
+
+    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]")):
+        result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
+
+    detail = result["error"]["details"]["exception_detail"]
+    assert len(detail) <= _element_state.ELEMENT_STATE_ERROR_DETAIL_MAX_CHARS
+    assert "vault-secret" not in detail
 
 
 @pytest.mark.asyncio

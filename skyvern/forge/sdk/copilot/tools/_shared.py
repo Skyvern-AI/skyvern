@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _requested_output_labels_by_path,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
     _TASK_OUTPUT_PAYLOAD_FIELDS,
@@ -60,6 +61,9 @@ _FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
 
 
 _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
+
+
+_EVIDENCE_ERROR_DETAIL_MAX_CHARS = 300
 
 
 # Block types whose output can demonstrate an end-state outcome. Until a workflow
@@ -746,6 +750,16 @@ def _requested_capture_targets(copilot_ctx: object) -> tuple[str, ...]:
     return tuple(targets)
 
 
+def _bounded_evidence_error_detail(value: object) -> str:
+    # A hostile __str__ raising here would escape the caller's except clause and turn a handled
+    # evidence-capture failure into an unhandled one.
+    try:
+        text = str(value).strip()
+    except BaseException:
+        return ""
+    return redact_raw_secrets_for_prompt(text)[:_EVIDENCE_ERROR_DETAIL_MAX_CHARS]
+
+
 async def _composition_get_structured_evidence_result(
     copilot_ctx: Any,
     *,
@@ -772,19 +786,34 @@ async def _composition_get_structured_evidence_result(
                 f"skyvern_evaluate timed out after {timeout_seconds:g}s while capturing structured page evidence",
             )
         except Exception as exc:
+            # Read the message once, through the guard: an unguarded str(exc) here would raise on a
+            # hostile __str__ before the guarded read below could contain it.
+            detail = _bounded_evidence_error_detail(exc)
             LOG.warning(
                 "copilot_composition_structured_extract_failed",
                 error_type=type(exc).__name__,
-                detail_present=bool(str(exc).strip()),
+                detail_present=bool(detail),
             )
-            return None, "skyvern_evaluate failed while capturing structured page evidence"
+            if detail:
+                return None, f"skyvern_evaluate raised while capturing structured page evidence: {detail}"
+            return None, (
+                "skyvern_evaluate raised while capturing structured page evidence, "
+                f"and {type(exc).__name__} carried no message"
+            )
     if not isinstance(result, dict) or not result.get("ok"):
         LOG.warning(
             "copilot_composition_structured_extract_rejected",
             result_is_mapping=isinstance(result, dict),
             error_present=bool(result.get("error")) if isinstance(result, dict) else False,
         )
-        return None, "structured page evidence failed: evaluate returned an error"
+        raw_error = result.get("error") if isinstance(result, dict) else None
+        detail = _bounded_evidence_error_detail(raw_error) if raw_error else ""
+        if detail:
+            return None, f"skyvern_evaluate returned an error while capturing structured page evidence: {detail}"
+        return None, (
+            "skyvern_evaluate returned an error while capturing structured page evidence, "
+            "and the result carried no error detail"
+        )
     raw = (result.get("data") or {}).get("result")
     if isinstance(raw, str):
         if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
