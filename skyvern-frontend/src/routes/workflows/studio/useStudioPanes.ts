@@ -23,6 +23,7 @@ import {
   type CopilotPaneSelection,
   type StudioPaneId,
 } from "./panes";
+import { SELECTED_BLOCK_SEARCH_PARAM } from "../editor/hooks/useSelectedBlockUrlSync";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
@@ -32,28 +33,23 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   // layout class (edit/run). System writes leave this unset so they never
   // overwrite a user's last-chosen arrangement.
   learn?: boolean;
-  // Extra query params written in the SAME navigation as the pane change, so a
-  // caller can open a pane and set e.g. ?selected-block= without racing a
-  // second URL write (the Fix flow depends on this atomicity). A null value
-  // clears the param, so a caller with nothing to say cannot leave a stale one
-  // standing.
-  extraSearchParams?: Record<string, string | null>;
+  // Written in the SAME navigation as the pane change. null clears the value;
+  // undefined leaves it untouched.
+  selectedBlockLabel?: string | null;
 };
 
-function withExtraParams(
+function withSelectedBlockLabel(
   search: string,
-  extra: Record<string, string | null> | undefined,
+  selectedBlockLabel: string | null | undefined,
 ): string {
-  if (!extra || Object.keys(extra).length === 0) {
+  if (selectedBlockLabel === undefined) {
     return search;
   }
   const params = new URLSearchParams(search);
-  for (const [key, value] of Object.entries(extra)) {
-    if (value === null) {
-      params.delete(key);
-    } else {
-      params.set(key, value);
-    }
+  if (selectedBlockLabel === null) {
+    params.delete(SELECTED_BLOCK_SEARCH_PARAM);
+  } else {
+    params.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
   }
   return toReadableSearch(params);
 }
@@ -263,13 +259,15 @@ export function useStudioPanes() {
       if (!nonCopilotChanged && writeKind !== "normal") {
         if (
           options !== undefined &&
-          ("state" in options ||
-            Object.keys(options.extraSearchParams ?? {}).length > 0)
+          ("state" in options || options.selectedBlockLabel !== undefined)
         ) {
           navigate(
             {
               pathname: location.pathname,
-              search: withExtraParams(search, options.extraSearchParams),
+              search: withSelectedBlockLabel(
+                search,
+                options.selectedBlockLabel,
+              ),
               hash: location.hash,
             },
             { replace: true, state: options.state },
@@ -288,9 +286,9 @@ export function useStudioPanes() {
       navigate(
         {
           pathname: location.pathname,
-          search: withExtraParams(
+          search: withSelectedBlockLabel(
             searchWithPanes(search, urlNext),
-            options?.extraSearchParams,
+            options?.selectedBlockLabel,
           ),
           hash: location.hash,
         },

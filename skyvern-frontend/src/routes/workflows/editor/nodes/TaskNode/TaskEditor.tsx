@@ -1,3 +1,4 @@
+import { RunEngine } from "@/api/types";
 import { useEdges, useNodes } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -42,6 +43,12 @@ function TaskEditor({ blockId }: { blockId: string }) {
 }
 
 function TaskEditorBody({ blockId }: { blockId: string }) {
+  const availableEngines = [
+    RunEngine.SkyvernV1,
+    RunEngine.SkyvernV3,
+    RunEngine.OpenaiCua,
+    RunEngine.AnthropicCua,
+  ];
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
   // Subscribe to the node via the live useNodes() store rather than a
@@ -214,6 +221,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"
+                  availableEngines={availableEngines}
                 />
               </div>
               <div className="flex items-center justify-between">

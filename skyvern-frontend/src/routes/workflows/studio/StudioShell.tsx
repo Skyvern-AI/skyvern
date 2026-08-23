@@ -225,7 +225,7 @@ export function StudioPane({
       aria-label={accessibleLabel}
       style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
-        "relative min-h-0 flex-col overflow-hidden rounded-lg bg-slate-elevation1",
+        "relative min-h-0 flex-col overflow-hidden rounded-lg border-2 border-border bg-slate-elevation1",
         open
           ? "flex duration-200 motion-safe:animate-in motion-safe:fade-in"
           : "hidden",

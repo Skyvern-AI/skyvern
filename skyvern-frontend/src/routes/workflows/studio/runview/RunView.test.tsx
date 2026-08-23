@@ -344,6 +344,97 @@ describe("RunView view toggles", () => {
     expect(scope.getByRole("button", { name: "Search blocks" })).not.toBeNull();
   });
 
+  test("filters the Studio timeline search by top-level block label", () => {
+    seedCompletedRun();
+    const login = buildBlock({
+      workflow_run_block_id: "wrb_login",
+      label: "Login",
+      created_at: "2026-01-01T00:00:00Z",
+    });
+    const extract = buildBlock({
+      workflow_run_block_id: "wrb_extract",
+      label: "Extract rows",
+      created_at: "2026-01-01T00:01:00Z",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+      label: "checkout_loop",
+      created_at: "2026-01-01T00:02:00Z",
+    });
+    const nested = buildBlock({
+      workflow_run_block_id: "wrb_nested",
+      label: "inner_step",
+      parent_workflow_run_block_id: "wrb_loop",
+      created_at: "2026-01-01T00:03:00Z",
+    });
+    mocks.timeline = [
+      buildBlockItem(login),
+      buildBlockItem(extract),
+      buildBlockItem(loop, [buildBlockItem(nested)]),
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_unlabeled",
+          label: null,
+          created_at: "2026-01-01T00:04:00Z",
+        }),
+      ),
+    ];
+
+    const { container } = renderRunView();
+    const scope = within(container);
+    fireEvent.click(scope.getByRole("button", { name: "Search blocks" }));
+
+    expect(screen.getAllByRole("option")).toHaveLength(3);
+    fireEvent.change(screen.getByPlaceholderText("Search blocks…"), {
+      target: { value: "ROWS" },
+    });
+
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(1);
+    expect(options[0]?.textContent).toContain("Extract rows");
+  });
+
+  test("selecting a Studio timeline search result pins its block", () => {
+    seedCompletedRun();
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_extract",
+          label: "Extract rows",
+        }),
+      ),
+    ];
+
+    const { container } = renderRunView();
+    const scope = within(container);
+    fireEvent.click(scope.getByRole("button", { name: "Search blocks" }));
+    fireEvent.click(screen.getByRole("option", { name: /Extract rows/ }));
+
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_extract");
+    expect(screen.queryByPlaceholderText("Search blocks…")).toBeNull();
+  });
+
+  test("keeps Escape in the Studio block search", () => {
+    seedCompletedRun();
+    mocks.timeline = [buildBlockItem(buildBlock({ label: "Login" }))];
+    const windowEscape = vi.fn();
+    window.addEventListener("keydown", windowEscape);
+    try {
+      const { container } = renderRunView();
+      const scope = within(container);
+      fireEvent.click(scope.getByRole("button", { name: "Search blocks" }));
+      fireEvent.keyDown(screen.getByPlaceholderText("Search blocks…"), {
+        key: "Escape",
+      });
+
+      expect(screen.queryByPlaceholderText("Search blocks…")).toBeNull();
+      expect(windowEscape).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", windowEscape);
+    }
+  });
+
   test("the Timeline view leads with the summary meta line", () => {
     seedCompletedRun({
       total_steps: 12,

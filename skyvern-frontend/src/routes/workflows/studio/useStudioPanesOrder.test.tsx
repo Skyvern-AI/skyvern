@@ -282,7 +282,7 @@ function OpenWithParamsProbe() {
       <button
         onClick={() =>
           openPane("copilot", {
-            extraSearchParams: { "selected-block": "checkout" },
+            selectedBlockLabel: "checkout",
           })
         }
       >
@@ -291,7 +291,7 @@ function OpenWithParamsProbe() {
       <button
         onClick={() =>
           openPane("copilot", {
-            extraSearchParams: { "selected-block": null },
+            selectedBlockLabel: null,
           })
         }
       >
@@ -300,7 +300,7 @@ function OpenWithParamsProbe() {
       <button
         onClick={() =>
           openPane("browser", {
-            extraSearchParams: { "selected-block": "checkout" },
+            selectedBlockLabel: "checkout",
           })
         }
       >
@@ -310,8 +310,8 @@ function OpenWithParamsProbe() {
   );
 }
 
-describe("useStudioPanes extraSearchParams", () => {
-  test("openPane carries extraSearchParams in the same navigation", () => {
+describe("useStudioPanes selectedBlockLabel", () => {
+  test("openPane carries selectedBlockLabel in the same navigation", () => {
     render(
       <MemoryRouter initialEntries={["/studio?panes=editor"]}>
         <OpenWithParamsProbe />
@@ -352,7 +352,7 @@ describe("useStudioPanes extraSearchParams", () => {
     );
   });
 
-  test("openPane carries extraSearchParams even when the pane is already open", () => {
+  test("openPane carries selectedBlockLabel even when the pane is already open", () => {
     render(
       <MemoryRouter initialEntries={["/studio?panes=editor,copilot"]}>
         <OpenWithParamsProbe />

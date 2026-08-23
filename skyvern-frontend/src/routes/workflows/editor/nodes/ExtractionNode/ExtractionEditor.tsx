@@ -1,3 +1,4 @@
+import { RunEngine } from "@/api/types";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -49,6 +50,12 @@ function ExtractionEditorBody({
   blockId: string;
   data: ExtractionNodeData;
 }) {
+  const availableEngines = [
+    RunEngine.SkyvernV1,
+    RunEngine.SkyvernV3,
+    RunEngine.OpenaiCua,
+    RunEngine.AnthropicCua,
+  ];
   const { editable } = data;
   const update = useUpdate<ExtractionNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
@@ -152,6 +159,7 @@ function ExtractionEditorBody({
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"
+                  availableEngines={availableEngines}
                 />
               </div>
               <div className="flex items-center justify-between">

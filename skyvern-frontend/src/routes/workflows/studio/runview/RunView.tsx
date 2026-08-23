@@ -3,6 +3,7 @@ import {
   Cross2Icon,
   ExclamationTriangleIcon,
   MagicWandIcon,
+  MagnifyingGlassIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -10,6 +11,19 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Status } from "@/api/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import {
   SELECTED_BLOCK_SEARCH_PARAM,
@@ -26,10 +40,7 @@ import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithW
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
-import {
-  TimelineBlockSearch,
-  WorkflowRunTimeline,
-} from "../../workflowRun/WorkflowRunTimeline";
+import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { CodeBlockFailureDetails } from "../../workflowRun/CodeBlockFailureDetails";
 import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
@@ -39,6 +50,7 @@ import {
   collectTimelineSearchTargets,
   findActiveItem,
   flattenTimelineChronologically,
+  type TimelineSearchTarget,
 } from "../../workflowRun/workflowTimelineUtils";
 import { getOrderedRunParameters } from "../../utils";
 import {
@@ -102,6 +114,77 @@ function useLiveClock(active: boolean) {
     const id = window.setInterval(() => setTick((tick) => tick + 1), 1000);
     return () => window.clearInterval(id);
   }, [active]);
+}
+
+function TimelineBlockSearch({
+  targets,
+  onJump,
+}: {
+  targets: Array<TimelineSearchTarget>;
+  onJump: (target: TimelineSearchTarget) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const closeAndReset = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => (next ? setOpen(true) : closeAndReset())}
+    >
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="Search blocks"
+          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        >
+          <MagnifyingGlassIcon className="size-3.5" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" sideOffset={6} className="w-64 p-0">
+        <Command
+          onKeyDown={(event) => {
+            // Keep Escape local: Studio may mount the editor canvas beside the
+            // run view, whose window Escape handler would clear its selection.
+            if (event.key === "Escape") {
+              event.stopPropagation();
+              closeAndReset();
+            }
+          }}
+        >
+          <CommandInput
+            placeholder="Search blocks…"
+            value={query}
+            onValueChange={setQuery}
+          />
+          <CommandList>
+            <CommandEmpty>No blocks found.</CommandEmpty>
+            <CommandGroup>
+              {targets.map((target) => (
+                <CommandItem
+                  key={target.block.workflow_run_block_id}
+                  value={target.label}
+                  onSelect={() => {
+                    onJump(target);
+                    closeAndReset();
+                  }}
+                >
+                  {target.order !== null ? (
+                    <span className="mr-2 shrink-0 text-muted-foreground">
+                      #{target.order}
+                    </span>
+                  ) : null}
+                  <span className="truncate">{target.label}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 /**

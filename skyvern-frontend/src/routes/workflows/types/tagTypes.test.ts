@@ -244,6 +244,34 @@ describe("tag validation", () => {
     expect(validateTagValue("*", { hasKey: true })).not.toBeNull();
   });
 
+  it("rejects the reserved analytics bucket values, grouped or not", () => {
+    for (const value of ["__untagged__", "__other__"]) {
+      for (const hasKey of [true, false]) {
+        expect(validateTagValue(value, { hasKey })).not.toBeNull();
+      }
+      expect(
+        validateTagValue(`  ${value}  `, { hasKey: false }),
+      ).not.toBeNull();
+    }
+  });
+
+  it("accepts values that only resemble a reserved one", () => {
+    // Every downstream comparison is exact and case-sensitive, so none of these
+    // collide: case variants, affix near-misses, and mere substring containment.
+    for (const value of [
+      "__UNTAGGED__",
+      "__Other__",
+      "untagged",
+      "other",
+      "__untagged",
+      "untagged__",
+      "_untagged_",
+      "prod__other__eu",
+    ]) {
+      expect(validateTagValue(value, { hasKey: false })).toBeNull();
+    }
+  });
+
   it("rejects an empty key and the reserved prefix", () => {
     for (const key of ["", "skyvern.foo"]) {
       expect(validateTagKey(key)).not.toBeNull();

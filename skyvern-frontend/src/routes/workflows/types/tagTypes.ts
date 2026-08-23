@@ -109,6 +109,11 @@ export function validateTagKey(key: string): string | null {
   return null;
 }
 
+// Values the analytics group-by aggregation reserves as bucket markers; a real label
+// equal to one is absorbed into that bucket and the group's number is silently wrong.
+// Exact-match, mirroring the backend (RESERVED_TAG_VALUES in validators.py).
+const RESERVED_TAG_VALUES = ["__untagged__", "__other__"];
+
 // Validates a label value. `hasKey` toggles two backend rules: a standalone label
 // can't contain ":", and a grouped value can't be exactly "*" (group wildcard).
 export function validateTagValue(
@@ -130,6 +135,9 @@ export function validateTagValue(
   }
   if (hasKey && trimmed === "*") {
     return 'A grouped value can\'t be exactly "*" (reserved as the group filter wildcard).';
+  }
+  if (RESERVED_TAG_VALUES.includes(trimmed)) {
+    return `A label can't be exactly "${trimmed}" (reserved by usage analytics).`;
   }
   return null;
 }
