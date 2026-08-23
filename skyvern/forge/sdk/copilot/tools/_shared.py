@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
 import structlog
@@ -49,6 +49,9 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.mcp_adapter import _BrowserCallOutcome
+
 
 _FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
     {
@@ -64,6 +67,21 @@ _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
 
 
 _EVIDENCE_ERROR_DETAIL_MAX_CHARS = 300
+
+
+async def _call_internal_browser_tool(
+    server: Any,
+    tool_name: Literal["skyvern_evaluate", "skyvern_screenshot"],
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], _BrowserCallOutcome | None]:
+    """Use typed provenance in production while retaining lightweight test adapters."""
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
+
+    if isinstance(server, SkyvernOverlayMCPServer):
+        call = await server.call_internal_browser_tool(tool_name, arguments)
+        return call.result, call.outcome
+    result = await server.call_internal_tool(tool_name, arguments)
+    return result if isinstance(result, dict) else {}, None
 
 
 # Block types whose output can demonstrate an end-state outcome. Until a workflow
@@ -773,8 +791,9 @@ async def _composition_get_structured_evidence_result(
         return None, "structured page evidence failed: discovery MCP server not attached to context"
     with copilot_span("composition_structured_extract"):
         try:
-            result = await asyncio.wait_for(
-                server.call_internal_tool(
+            result, outcome = await asyncio.wait_for(
+                _call_internal_browser_tool(
+                    server,
                     "skyvern_evaluate",
                     {"expression": composition_structured_evidence_expression(_requested_capture_targets(copilot_ctx))},
                 ),
@@ -800,13 +819,15 @@ async def _composition_get_structured_evidence_result(
                 "skyvern_evaluate raised while capturing structured page evidence, "
                 f"and {type(exc).__name__} carried no message"
             )
-    if not isinstance(result, dict) or not result.get("ok"):
+    if outcome is not None and outcome.payload_omitted:
+        return None, "structured page evidence was omitted at the MCP boundary"
+    if not result.get("ok"):
         LOG.warning(
             "copilot_composition_structured_extract_rejected",
-            result_is_mapping=isinstance(result, dict),
-            error_present=bool(result.get("error")) if isinstance(result, dict) else False,
+            result_is_mapping=True,
+            error_present=bool(result.get("error")),
         )
-        raw_error = result.get("error") if isinstance(result, dict) else None
+        raw_error = result.get("error")
         detail = _bounded_evidence_error_detail(raw_error) if raw_error else ""
         if detail:
             return None, f"skyvern_evaluate returned an error while capturing structured page evidence: {detail}"

@@ -413,6 +413,7 @@ class TestMCPFailedStepLoopDetection:
         initial_flow_evidence = [{"step": 1, "evidence": {"source_tool": "existing"}}]
         initial_pending_observation = SimpleNamespace(tool_name="click", url="https://existing")
         ctx = SimpleNamespace(
+            browser_session_continuity_generation=0,
             consecutive_tool_tracker=[],
             failed_tool_step_tracker={},
             scouted_interactions=list(initial_scouted_interactions),

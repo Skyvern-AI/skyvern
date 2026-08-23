@@ -976,12 +976,12 @@ class TestIndeterminateProbeDispatch:
         ctx = _make_ctx()
         ctx.browser_session_id = None
 
-        error, continuity = await mcp_adapter._prepare_browser_session_for_dispatch(
+        error, continuity, disposition = await mcp_adapter._prepare_browser_session_for_dispatch(
             ctx, tool_name="evaluate", call_path="model", observed_generation=0
         )
 
         assert probed == []
-        assert (error, continuity) == (None, None)
+        assert (error, continuity, disposition) == (None, None, None)
         assert ctx.browser_session_id == "bs_created"
 
     def test_the_indeterminate_path_carries_no_attempt_state(self) -> None:
