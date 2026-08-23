@@ -544,6 +544,73 @@ def extension_broker_stop() -> None:
     console.print(f"Browser-extension broker stop requested; port {port} will no longer be reserved.")
 
 
+def extension_approve_workstation() -> None:
+    """Persist workstation approval through the authenticated broker control channel."""
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+
+        async def _run() -> dict[str, Any]:
+            client = await _broker_client(port, auto_spawn=False, operator=True)
+            try:
+                return await client.grant_workstation()
+            finally:
+                await client.stop()
+
+        result = asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    if result.get("granted") is True:
+        console.print("Workstation approval: granted.")
+        console.print(f"Workstation approval source: {result.get('source', 'cli')}.")
+
+
+def extension_revoke_workstation(
+    all_scope: bool = typer.Option(False, "--all", help="Also clear live interactive approvals."),
+) -> None:
+    """Revoke workstation approval through the authenticated broker control channel.
+
+    Interactive approval is bound to a CONTINUOUSLY CONNECTED agent: it survives overlap socket
+    replacement (same proven client identity, predecessor still live and approved - required for
+    MV3/network reconnects), and dies on true disconnect. It must NEVER be restorable from a stale
+    approval_source after a disconnect cleared it.
+
+    workstation.revoke default scope clears grant-source approvals only (existing amended contract).
+    New scope "all" also clears interactive approvals and is the operator's full kill switch.
+    """
+    scope = "all" if all_scope else "grant"
+    try:
+        port = BrowserExtensionRuntime.configured_port()
+
+        async def _run() -> dict[str, Any]:
+            client = await _broker_client(port, auto_spawn=False, operator=True)
+            try:
+                return await client.revoke_workstation(scope=scope)
+            finally:
+                await client.stop()
+
+        result = asyncio.run(_run())
+    except (BrowserExtensionError, OSError) as exc:
+        console.print(str(exc))
+        raise typer.Exit(code=1) from None
+    if result.get("revoked") is True:
+        console.print("Workstation approval: revoked.")
+    else:
+        console.print("Workstation approval: not present.")
+    cleared = result.get("cleared")
+    if not isinstance(cleared, dict):
+        cleared = {}
+    console.print(f"Grant-source approvals cleared: {cleared.get('grant', 0)}.")
+    if scope == "all":
+        console.print(f"Interactive approvals cleared: {cleared.get('interactive', 0)}.")
+    else:
+        console.print("Interactive approvals were not cleared; they die on true disconnect.")
+    file_removal_error = result.get("file_removal_error")
+    if isinstance(file_removal_error, str) and file_removal_error:
+        console.print(f"Warning: {file_removal_error}. Inspect the workstation grant file manually before retrying.")
+        raise typer.Exit(code=1)
+
+
 def extension_broker_daemon(
     port: int = typer.Option(..., "--port", min=1, max=65535),
 ) -> None:
@@ -557,6 +624,8 @@ def extension_broker_daemon(
 
 
 browser_app.command("extension-broker-enable")(extension_broker_enable)
+browser_app.command("extension-approve-workstation")(extension_approve_workstation)
+browser_app.command("extension-revoke-workstation")(extension_revoke_workstation)
 browser_app.command("extension-broker-pair")(extension_broker_pair)
 browser_app.command("extension-broker-status")(extension_broker_status)
 browser_app.command("extension-broker-stop")(extension_broker_stop)

@@ -73,6 +73,13 @@ from skyvern.browser_extension.errors import (
 )
 from skyvern.browser_extension.protocol import ALLOWED_OPS, LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION
 from skyvern.browser_extension.relay import ExtensionRelayServer
+from skyvern.browser_extension.workstation_grant import (
+    WorkstationGrant,
+    load_workstation_grant,
+    remove_workstation_grant,
+    workstation_grant_path,
+    write_workstation_grant,
+)
 
 LOG = structlog.get_logger(__name__)
 READY_FD_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER_READY_FD"
@@ -86,6 +93,9 @@ EXTENSION_RESET_TIMEOUT_SECONDS = 5.0
 MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
 _LEASED_OPS = frozenset({"debugger.attach", "debugger.send", "debugger.detach", "tabs.activate", "tabs.remove"})
+_WORKSTATION_GRANT_OPS = frozenset({"workstation.grant", "workstation.revoke"})
+_APPROVAL_SOURCE_INTERACTIVE = "interactive"
+_APPROVAL_SOURCE_GRANT = "grant"
 
 
 class Relay(Protocol):
@@ -147,6 +157,7 @@ class _Credential:
     recovery_secret: str
     connection_generation: int = 0
     approved: bool = False
+    approval_source: str | None = None
     approval_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -206,6 +217,8 @@ class BrowserExtensionBrokerServer:
         self._relay_factory = relay_factory
         self._pairing_opener = pairing_opener
         self._relay: Relay | None = None
+        self._broker_auth_token: str | None = None
+        self._workstation_grant: WorkstationGrant | None = None
         self._control_server: asyncio.AbstractServer | None = None
         self._daemon_lock: OwnerFileLock | None = None
         self._credentials: dict[str, _Credential] = {}
@@ -270,6 +283,8 @@ class BrowserExtensionBrokerServer:
         self._daemon_lock = daemon_lock
         try:
             extension_secret = read_extension_secret(self.paths)
+            self._broker_auth_token = extension_secret
+            self._workstation_grant = self._load_workstation_grant()
             stale_leases = reset_lease_journal(self.paths)
             if stale_leases:
                 LOG.warning(
@@ -550,6 +565,32 @@ class BrowserExtensionBrokerServer:
                 raise error
 
             assert credential is not None
+            if not operator:
+                # Interactive approval is bound to a CONTINUOUSLY CONNECTED agent: it survives
+                # overlap socket replacement (same proven client identity, predecessor still live
+                # and approved - required for MV3/network reconnects), and dies on true disconnect.
+                # It must NEVER be restorable from a stale approval_source after a disconnect cleared it.
+                interactive_approval = (
+                    previous is not None
+                    and self._clients.get(credential.client_id) is previous
+                    and not previous.closed
+                    and not previous.ownership_released
+                    and credential.approved
+                    and credential.approval_source == _APPROVAL_SOURCE_INTERACTIVE
+                )
+                credential.approved = False
+                credential.approval_source = None
+                credential.approval_event.clear()
+                grant = self._load_workstation_grant()
+                self._workstation_grant = grant
+                if interactive_approval:
+                    credential.approved = True
+                    credential.approval_source = _APPROVAL_SOURCE_INTERACTIVE
+                    credential.approval_event.set()
+                elif grant is not None:
+                    credential.approved = True
+                    credential.approval_source = _APPROVAL_SOURCE_GRANT
+                    credential.approval_event.set()
             credential.connection_generation += 1
             connection = _ClientConnection(
                 client_id=credential.client_id,
@@ -585,23 +626,35 @@ class BrowserExtensionBrokerServer:
                     self._evict_stale_credentials_locked()
                     self._credentials[credential.client_id] = credential
                 self._clients[credential.client_id] = connection
-                if previous is not None:
-                    # Publish the successor before fencing the old socket. If the new
-                    # authentication response fails, the old client remains current and
-                    # keeps its leases instead of leaving a closed slot behind.
-                    previous.ownership_released = True
-                    await self._close_connection(previous)
+                try:
+                    if previous is not None:
+                        # Publish the successor before fencing the old socket. If the new
+                        # authentication response fails, the old client remains current and
+                        # keeps its leases instead of leaving a closed slot behind.
+                        previous.ownership_released = True
+                        await self._close_connection(previous)
+                except BaseException:
+                    # Ownership transfer failed before the post-handshake cleanup guard.
+                    self._release_client_locked(connection)
+                    await self._close_connection(connection)
+                    raise
 
-        relay = self._relay
-        if (
-            not connection.operator
-            and credential.approved
-            and relay is not None
-            and relay.connected
-            and relay.extension_protocol_version == PROTOCOL_VERSION
-            and not self._extension_reset_quarantined
-        ):
-            await self._send_client_snapshot(connection)
+        try:
+            relay = self._relay
+            if (
+                not connection.operator
+                and credential.approved
+                and relay is not None
+                and relay.connected
+                and relay.extension_protocol_version == PROTOCOL_VERSION
+                and not self._extension_reset_quarantined
+            ):
+                await self._send_client_snapshot(connection)
+        except BaseException:
+            # If a successor handshake fails after ownership transfer, release the
+            # current connection so its credential cannot remain approved-orphaned.
+            await self._connection_closed(connection)
+            raise
         return connection
 
     async def _read_requests(self, connection: _ClientConnection) -> None:
@@ -772,12 +825,21 @@ class BrowserExtensionBrokerServer:
             "pairing.begin",
             "pairing.status",
             "pairing.cancel",
+            "workstation.grant",
+            "workstation.revoke",
         }:
             raise BrowserExtensionBrokerError("OP_NOT_ALLOWED", "Operator connection cannot forward extension requests")
         relay = self._relay
         if relay is None:
             raise BrowserExtensionBrokerError("BROKER_STOPPING", "Browser-extension broker is stopping")
 
+        if op in _WORKSTATION_GRANT_OPS and not connection.operator:
+            # Same-UID CLI authority is intentional: only the operator may
+            # manage the per-user workstation grant envelope.
+            raise BrowserExtensionBrokerError(
+                "OP_NOT_ALLOWED",
+                "Only an operator connection may manage workstation approval",
+            )
         if op == "broker.status":
             tab_ids = []
             if not connection.operator and not self._extension_reset_quarantined:
@@ -801,6 +863,20 @@ class BrowserExtensionBrokerServer:
                 "tabIds": tab_ids,
                 "quarantines": [],
             }
+        if op == "workstation.grant":
+            if args:
+                raise BrowserExtensionBrokerError("INVALID_REQUEST", "Workstation grant does not accept arguments")
+            return await self._grant_workstation()
+        if op == "workstation.revoke":
+            if set(args) - {"scope"}:
+                raise BrowserExtensionBrokerError("INVALID_REQUEST", "Workstation revoke arguments are invalid")
+            scope = args.get("scope", "grant")
+            if not isinstance(scope, str) or scope not in {"grant", "all"}:
+                raise BrowserExtensionBrokerError(
+                    "INVALID_REQUEST",
+                    "Workstation revoke scope must be 'grant' or 'all'",
+                )
+            return self._revoke_workstation(scope=scope)
         if op == "extension.wait_connected":
             timeout = args.get("timeout", 45.0)
             if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 <= timeout <= 45:
@@ -953,6 +1029,89 @@ class BrowserExtensionBrokerServer:
             return {"stopping": True}
         raise BrowserExtensionBrokerError("OP_NOT_ALLOWED", "Broker operation is not available")
 
+    def _current_auth_token(self) -> str | None:
+        return self._broker_auth_token
+
+    def _load_workstation_grant(self) -> WorkstationGrant | None:
+        token = self._current_auth_token()
+        if token is None:
+            return None
+        return load_workstation_grant(workstation_grant_path(), token)
+
+    async def _grant_workstation(self) -> dict[str, Any]:
+        token = self._current_auth_token()
+        if token is None:
+            raise BrowserExtensionBrokerError(
+                "BROKER_NOT_ENABLED",
+                "Browser-extension broker authentication token is unavailable",
+            )
+        # Local-trust envelope: the broker binds to 127.0.0.1, clients already
+        # authenticate with the 0600 local token file, and the pairing click adds
+        # HUMAN CONSENT for first use. This grant persists that consent for this OS user.
+        grant = write_workstation_grant(workstation_grant_path(), token, source="cli")
+        self._workstation_grant = grant
+        for client_id in tuple(self._clients):
+            await self._approve_client(client_id, source=_APPROVAL_SOURCE_GRANT)
+        return {
+            "granted": True,
+            "source": grant.source,
+            "grantedAt": grant.granted_at,
+        }
+
+    def _revoke_workstation(self, *, scope: str = "grant") -> dict[str, Any]:
+        relay = self._relay
+        if relay is not None and self._pairing_owner is not None:
+            # Invalidate every pending confirmation before revoking live approvals.
+            self._clear_pairing(relay, cancel_nonce=True)
+        self._workstation_grant = None
+        cleared_grant = 0
+        cleared_interactive = 0
+        for connection in tuple(self._clients.values()):
+            if connection.closed:
+                continue
+            credential = self._credentials.get(connection.client_id)
+            if credential is None:
+                continue
+            if credential.approval_source == _APPROVAL_SOURCE_GRANT:
+                if credential.approved:
+                    cleared_grant += 1
+            elif scope == "all" and credential.approval_source == _APPROVAL_SOURCE_INTERACTIVE:
+                if credential.approved:
+                    cleared_interactive += 1
+            else:
+                continue
+            credential.approved = False
+            credential.approval_source = None
+            credential.approval_event.clear()
+
+        file_removal_error: str | None = None
+        try:
+            revoked = remove_workstation_grant(workstation_grant_path())
+        except BrowserExtensionBrokerError as exc:
+            revoked = False
+            file_removal_error = (
+                "Workstation grant path failed safety validation"
+                if exc.code == "UNSAFE_PATH"
+                else "Workstation grant file could not be removed"
+            )
+        except OSError:
+            revoked = False
+            file_removal_error = "Workstation grant file could not be removed"
+
+        # workstation.revoke default scope clears grant-source approvals only (existing amended contract).
+        # New scope "all" also clears interactive approvals and is the operator's full kill switch.
+        result: dict[str, Any] = {
+            "revoked": revoked,
+            "scope": scope,
+            "cleared": {
+                "grant": cleared_grant,
+                "interactive": cleared_interactive,
+            },
+        }
+        if file_removal_error is not None:
+            result["file_removal_error"] = file_removal_error
+        return result
+
     async def _pairing_begin(self, connection: _ClientConnection, relay: Relay) -> dict[str, Any]:
         if relay.connected and relay.extension_protocol_version != PROTOCOL_VERSION:
             raise BrowserExtensionBrokerError(
@@ -1038,12 +1197,19 @@ class BrowserExtensionBrokerServer:
         credential = self._credentials.get(connection.client_id)
         return credential is not None and credential.approved
 
-    async def _approve_client(self, client_id: str) -> bool:
+    async def _approve_client(self, client_id: str, *, source: str = _APPROVAL_SOURCE_INTERACTIVE) -> bool:
         credential = self._credentials.get(client_id)
         connection = self._clients.get(client_id)
         if credential is None or connection is None or connection.closed:
             return False
+        if (
+            source == _APPROVAL_SOURCE_GRANT
+            and credential.approved
+            and credential.approval_source == _APPROVAL_SOURCE_INTERACTIVE
+        ):
+            return True
         credential.approved = True
+        credential.approval_source = source
         credential.approval_event.set()
         relay = self._relay
         if (
@@ -1112,10 +1278,31 @@ class BrowserExtensionBrokerServer:
         approved = approval_nonce in self._approved_pairing_nonces
         if not approved and secrets.compare_digest(approval_nonce, self._pairing_approval_nonce or ""):
             owner = self._pairing_owner
-            approved = owner == "operator" or (owner is not None and await self._approve_client(owner))
+            approved = owner == "operator" or (
+                owner is not None and await self._approve_client(owner, source=_APPROVAL_SOURCE_INTERACTIVE)
+            )
             if approved and owner is not None:
                 if owner != "operator":
                     self._principal_pairing_begin.pop(owner, None)
+                    token = self._current_auth_token()
+                    if token is not None:
+                        try:
+                            grant = write_workstation_grant(
+                                workstation_grant_path(),
+                                token,
+                                source="pairing",
+                            )
+                        except (BrowserExtensionBrokerError, OSError) as exc:
+                            LOG.warning(
+                                "grant not persisted, next client will re-prompt",
+                                error_type=type(exc).__name__,
+                                reason=str(exc),
+                                exc_info=True,
+                            )
+                        else:
+                            self._workstation_grant = grant
+                            for client_id in tuple(self._clients):
+                                await self._approve_client(client_id, source=_APPROVAL_SOURCE_GRANT)
                 self._approved_pairing_nonces[approval_nonce] = time.monotonic() + PAIRING_TTL_SECONDS
                 self._clear_pairing(relay, cancel_nonce=False)
         if approved:
@@ -1233,7 +1420,11 @@ class BrowserExtensionBrokerServer:
             self._release_client_locked(connection)
 
     def _release_client_locked(self, connection: _ClientConnection) -> None:
-        if connection.operator or connection.ownership_released:
+        if connection.operator:
+            return
+        if connection.ownership_released:
+            # Overlap replacement transferred ownership to a live successor. A failed
+            # successor handshake clears approval in its own connection cleanup.
             return
         if self._clients.get(connection.client_id) is not connection:
             return
@@ -1241,7 +1432,10 @@ class BrowserExtensionBrokerServer:
         del self._clients[connection.client_id]
         credential = self._credentials.get(connection.client_id)
         if credential is not None:
+            # Interactive approval is bound to a CONTINUOUSLY CONNECTED agent and
+            # dies on true disconnect; clear every approval field before removal.
             credential.approved = False
+            credential.approval_source = None
             credential.approval_event.clear()
         if self._pairing_owner == connection.client_id:
             # An in-flight approval stays alive only while its owner is connected.
