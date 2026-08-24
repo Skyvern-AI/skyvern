@@ -16,7 +16,9 @@ only the post-claim row can say whether the task started.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import copy
+from datetime import UTC, datetime, timedelta, tzinfo
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,6 +27,8 @@ from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -145,3 +149,192 @@ async def test_task_v1_emission_reads_started_at_from_the_claim_not_the_entry_re
     kwargs = record_run_duration.await_args.kwargs
     assert kwargs.get("excluded_reason") is None
     assert kwargs["duration_seconds"] == pytest.approx(9 * 60, abs=5)
+
+
+FINALLY_BLOCK_SECONDS = 5 * 60
+BODY_SECONDS = 20 * 60
+
+
+class _Clock:
+    """The service reads wall clock through ``service_module.datetime``. Driving it by hand is
+    what makes the body's minutes and the finally block's minutes two distinct intervals
+    rather than two reads of the same instant."""
+
+    def __init__(self, start: datetime) -> None:
+        self.now_value = start
+
+    def advance(self, seconds: float) -> None:
+        self.now_value += timedelta(seconds=seconds)
+
+    def now(self, tz: tzinfo | None = None) -> datetime:
+        return self.now_value if tz is None else self.now_value.astimezone(tz)
+
+
+class _FakeWorkflowRunStore:
+    """The two writers ``_update_workflow_run_status`` picks between, over one mutable row: a
+    conditional claim that refuses an already-terminal row, and the unconditional overwrite.
+    A terminal write stamps ``finished_at`` at the clock's current instant, as the real row does.
+    """
+
+    def __init__(self, row: SimpleNamespace, clock: _Clock) -> None:
+        self.row = row
+        self.clock = clock
+
+    def snapshot(self) -> SimpleNamespace:
+        return copy.copy(self.row)
+
+    async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> SimpleNamespace:
+        return self.snapshot()
+
+    async def update_workflow_run_if_not_final(
+        self, workflow_run_id: str, status: WorkflowRunStatus, **_: object
+    ) -> SimpleNamespace | None:
+        if self.row.status.is_final():
+            return None
+        self.row.status = status
+        if status.is_final():
+            self.row.finished_at = self.clock.now_value
+        return self.snapshot()
+
+    async def update_workflow_run(
+        self, workflow_run_id: str, status: WorkflowRunStatus | None = None, **_: object
+    ) -> SimpleNamespace:
+        if status is not None:
+            self.row.status = status
+        return self.snapshot()
+
+
+@pytest.mark.asyncio
+async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
+    monkeypatch: pytest.MonkeyPatch,
+    record_run_duration: AsyncMock,
+) -> None:
+    """A run whose body terminalized it and whose workflow declares a finally block is written
+    back to ``running`` so the block can execute, then terminalized again. Both writes flip a
+    non-terminal row to a terminal one, so recording each one's full ``now - started_at``
+    bills the body twice (SKY-14606). The second write owes only the compute the first did
+    not measure -- and it does owe that, because the finally block is real work on the pod.
+    """
+    clock = _Clock(datetime.now(UTC))
+    started_at = clock.now_value
+    store = _FakeWorkflowRunStore(
+        SimpleNamespace(
+            workflow_run_id="wr_finally",
+            workflow_id="wf_finally",
+            workflow_permanent_id="wpid_finally",
+            organization_id="org_finally",
+            parent_workflow_run_id=None,
+            status=WorkflowRunStatus.running,
+            failure_reason=None,
+            failure_category=None,
+            created_at=started_at,
+            started_at=started_at,
+            finished_at=None,
+            run_with="agent",
+            ai_fallback=False,
+            trigger_type=None,
+            workflow_schedule_id=None,
+            browser_session_id=None,
+            browser_profile_id=None,
+            browser_address=None,
+            start_fresh_browser=None,
+            reuse_browser_session=None,
+            ignore_inherited_workflow_system_prompt=False,
+            proxy_location=None,
+            max_elapsed_time_minutes=None,
+            code_gen=False,
+        ),
+        clock,
+    )
+    workflow = SimpleNamespace(
+        workflow_id="wf_finally",
+        workflow_permanent_id="wpid_finally",
+        organization_id="org_finally",
+        title="Finally workflow",
+        persist_browser_session=False,
+        reuse_browser_session=False,
+        generate_script_on_terminal=False,
+        model=None,
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            finally_block_label="cleanup",
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+        ),
+    )
+    organization = SimpleNamespace(organization_id="org_finally")
+
+    monkeypatch.setattr(service_module, "datetime", SimpleNamespace(now=clock.now))
+    monkeypatch.setattr(
+        service_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        SimpleNamespace(
+            initialize_workflow_run_context=AsyncMock(),
+            get_workflow_run_context=lambda _workflow_run_id: SimpleNamespace(browser_session_id=None),
+        ),
+    )
+    monkeypatch.setattr(service_module.app, "DATABASE", SimpleNamespace(workflow_runs=store))
+    monkeypatch.setattr(service_module.workflow_script_service, "workflow_has_conditionals", lambda _workflow: False)
+    monkeypatch.setattr(
+        service_module.workflow_script_service,
+        "get_workflow_script",
+        AsyncMock(return_value=(None, None, False)),
+    )
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(service_module, "is_adaptive_caching", lambda _workflow, _workflow_run: False)
+    monkeypatch.setattr(service_module, "_get_workflow_run_max_elapsed_timeout_seconds", lambda _workflow_run: 10.0)
+
+    svc = WorkflowService()
+
+    async def terminalize_inside_body(**_: object) -> tuple[SimpleNamespace, set[str]]:
+        clock.advance(BODY_SECONDS)
+        await svc.mark_workflow_run_as_terminated(
+            workflow_run_id="wr_finally",
+            failure_reason="terminate criterion matched",
+        )
+        return store.snapshot(), set()
+
+    statuses_seen_by_finally_block: list[WorkflowRunStatus] = []
+
+    async def observe_finally_block(**_: object) -> None:
+        statuses_seen_by_finally_block.append(store.row.status)
+        clock.advance(FINALLY_BLOCK_SECONDS)
+        return None
+
+    monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(side_effect=lambda **_: store.snapshot()))
+    monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
+    monkeypatch.setattr(svc, "bind_browser_action_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "mark_workflow_run_as_running", AsyncMock(side_effect=lambda **_: store.snapshot()))
+    monkeypatch.setattr(svc, "get_workflow_run_parameter_tuples", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "get_workflow_output_parameters", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "_collect_inherited_workflow_system_prompt", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "auto_create_browser_session_if_needed", AsyncMock(return_value=None))
+    monkeypatch.setattr(svc, "_browser_profile_is_managed", AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, "_execute_workflow_blocks", AsyncMock(side_effect=terminalize_inside_body))
+    monkeypatch.setattr(svc, "generate_script_if_needed", AsyncMock())
+    monkeypatch.setattr(svc, "should_run_script", AsyncMock(return_value=False))
+    monkeypatch.setattr(svc, "_execute_finally_block_if_configured", AsyncMock(side_effect=observe_finally_block))
+    monkeypatch.setattr(svc, "clean_up_workflow", AsyncMock())
+
+    await svc.execute_workflow(workflow_run_id="wr_finally", api_key=None, organization=organization)
+
+    # The row really was re-opened and re-finalized. Without both flips there is nothing to
+    # double-count and the durations below would pass for the wrong reason.
+    assert statuses_seen_by_finally_block == [WorkflowRunStatus.running]
+    assert store.row.status == WorkflowRunStatus.terminated
+
+    # Two terminal writes, two samples: dropping the second would erase the finally block's
+    # own compute, which is as wrong as counting the body twice.
+    assert record_run_duration.await_count == 2
+    body_call, re_finalize_call = record_run_duration.await_args_list
+    assert [call.kwargs["status"] for call in (body_call, re_finalize_call)] == [str(WorkflowRunStatus.terminated)] * 2
+    assert body_call.kwargs["excluded_reason"] is None
+    assert body_call.kwargs["duration_seconds"] == pytest.approx(BODY_SECONDS)
+    assert re_finalize_call.kwargs["duration_seconds"] == pytest.approx(FINALLY_BLOCK_SECONDS)
+
+    # The invariant the delta form exists to hold: the samples partition the run's wall clock
+    # rather than overlapping on the body.
+    wall_clock_seconds = (clock.now_value - started_at).total_seconds()
+    assert wall_clock_seconds == pytest.approx(BODY_SECONDS + FINALLY_BLOCK_SECONDS)
+    assert sum(call.kwargs["duration_seconds"] for call in record_run_duration.await_args_list) == pytest.approx(
+        wall_clock_seconds
+    )

@@ -167,13 +167,15 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     """Terminal-transition parity with ``_update_workflow_run_status``: a
     successful conditional cancel must emit the ``Workflow run duration metrics``
     log with the same structured fields, so the metric stays comparable across
-    statuses.
+    statuses. ``recorded_seconds`` must equal the sample handed to
+    ``record_run_duration`` so a log query keyed on it reconciles with the metric.
     """
     from skyvern.forge.sdk.workflow import service as service_module
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
     fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
     updated_row = _make_updated_row(fixed_now)
+    updated_row.parent_workflow_run_id = None
 
     class FrozenDateTime(datetime):
         @classmethod
@@ -193,6 +195,8 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
         "_sync_task_run_from_workflow_run",
         AsyncMock(return_value=None),
     )
+    recorder = AsyncMock()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "record_run_duration", recorder)
 
     info_calls: list[tuple[str, dict]] = []
 
@@ -214,6 +218,8 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     assert metrics["workflow_run_status"] == WorkflowRunStatus.canceled
     assert metrics["queued_seconds"] == pytest.approx(10.0, abs=1.0)
     assert metrics["duration_seconds"] == pytest.approx(20.0, abs=1.0)
+    assert recorder.await_count == 1
+    assert metrics["recorded_seconds"] == recorder.await_args.kwargs["duration_seconds"]
 
 
 @pytest.mark.asyncio
