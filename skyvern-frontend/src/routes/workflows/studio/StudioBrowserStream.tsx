@@ -40,8 +40,8 @@ export function StudioBrowserStream() {
   }, [browserSessionId, reset]);
 
   // Recording is session-scoped: clear it when the studio's browser session ends
-  // or changes. The transport stream no longer resets on unmount (it remounts
-  // across CDP<->VNC swaps without the session ending), so this owns that.
+  // or changes. The stream component can remount while the session persists and
+  // doesn't reset recording state itself, so this owns that.
   useEffect(() => {
     return () => resetRecording();
   }, [browserSessionId, resetRecording]);
@@ -84,8 +84,9 @@ export function StudioBrowserStream() {
         enableUrlInput={true}
         isRecording={isRecording}
         // While recording, the Copilot pane hosts the live-drafts panel, whose
-        // header already shows the timer + step count — the REC pill would
-        // duplicate it. Closing that pane brings the pill back as the indicator.
+        // header already shows the timer + step count — an on-stream REC pill
+        // would duplicate it. Closing that pane brings the pill back on either
+        // transport (VNC renders it in BrowserStream, CDP in StreamPresenter).
         hideRecordingIndicator={panes.includes("copilot")}
         onUrlChange={handleUrlChange}
         onActivity={handleActivity}

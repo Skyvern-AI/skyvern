@@ -14,7 +14,13 @@ import structlog
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
-from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
+from skyvern.forge.sdk.copilot.context import (
+    COPILOT_RESPONSE_TYPES,
+    PageObstruction,
+    PageObstructionControl,
+    PageObstructionIdentity,
+    PageObstructionSelectorCandidate,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
@@ -44,6 +50,11 @@ _BUILD_TEST_UNFINISHED_MAX_ITEMS = 24
 _BUILD_TEST_ACTION_TRACE_MAX_ITEMS = 6
 _BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS = 8
 _BUILD_TEST_PAGE_SUMMARY_MAX_CHARS = 300
+_BUILD_TEST_OBSTRUCTION_MAX_ITEMS = 5
+_BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS = 6
+_BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS = 8
+_BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS = 240
+_BUILD_TEST_IDENTITY_LABEL_MAX_CHARS = 2_048
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
@@ -312,6 +323,125 @@ def _bounded_packet_strings(
     return rendered
 
 
+def _bounded_obstruction_control(
+    control: PageObstructionControl,
+    *,
+    obstruction_index: int,
+    control_index: int,
+    notices: list[str],
+) -> PageObstructionControl:
+    field_prefix = f"failure.page_state.obstructions[{obstruction_index}].visible_controls[{control_index}]"
+    candidates = control.selector_candidates[:_BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS]
+    if len(control.selector_candidates) > _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS:
+        _append_omission(
+            notices,
+            f"{field_prefix}.selector_candidates shortened: "
+            f"{len(control.selector_candidates) - _BUILD_TEST_SELECTOR_CANDIDATE_MAX_ITEMS} item(s) omitted.",
+        )
+    bounded_candidates = [
+        PageObstructionSelectorCandidate(
+            selector=_bounded_packet_string(
+                candidate.selector,
+                field_name=f"{field_prefix}.selector_candidates[].selector",
+                max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
+                notices=notices,
+            )
+            or "",
+            source=_bounded_packet_string(
+                candidate.source,
+                field_name=f"{field_prefix}.selector_candidates[].source",
+                max_chars=40,
+                notices=notices,
+            )
+            or "",
+        )
+        for candidate in candidates
+    ]
+    identity = control.identity
+    if identity is not None:
+        identity = PageObstructionIdentity(
+            tag=_bounded_packet_string(
+                identity.tag,
+                field_name=f"{field_prefix}.identity.tag",
+                max_chars=40,
+                notices=notices,
+            )
+            or "",
+            role=_bounded_packet_string(
+                identity.role,
+                field_name=f"{field_prefix}.identity.role",
+                max_chars=40,
+                notices=notices,
+            )
+            or "",
+            label_context=_bounded_packet_string(
+                identity.label_context,
+                field_name=f"{field_prefix}.identity.label_context",
+                max_chars=_BUILD_TEST_IDENTITY_LABEL_MAX_CHARS,
+                notices=notices,
+            )
+            or "",
+        )
+    values = control.model_dump(mode="json", exclude_none=True)
+    for key, value in tuple(values.items()):
+        if key in {"selector_candidates", "identity"} or not isinstance(value, str):
+            continue
+        max_chars = _BUILD_TEST_IDENTIFIER_MAX_CHARS if key == "selector" else _BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS
+        values[key] = _bounded_packet_string(
+            value,
+            field_name=f"{field_prefix}.{key}",
+            max_chars=max_chars,
+            notices=notices,
+        )
+    values["selector_candidates"] = bounded_candidates
+    values["identity"] = identity
+    return PageObstructionControl.model_validate(values)
+
+
+def _bounded_page_obstructions(obstructions: list[PageObstruction], notices: list[str]) -> list[PageObstruction]:
+    bounded_obstructions = obstructions[:_BUILD_TEST_OBSTRUCTION_MAX_ITEMS]
+    if len(obstructions) > _BUILD_TEST_OBSTRUCTION_MAX_ITEMS:
+        _append_omission(
+            notices,
+            "failure.page_state.obstructions shortened: "
+            f"{len(obstructions) - _BUILD_TEST_OBSTRUCTION_MAX_ITEMS} item(s) omitted.",
+        )
+    projected: list[PageObstruction] = []
+    for obstruction_index, obstruction in enumerate(bounded_obstructions):
+        field_prefix = f"failure.page_state.obstructions[{obstruction_index}]"
+        controls = obstruction.visible_controls[:_BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS]
+        if len(obstruction.visible_controls) > _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS:
+            _append_omission(
+                notices,
+                f"{field_prefix}.visible_controls shortened: "
+                f"{len(obstruction.visible_controls) - _BUILD_TEST_OBSTRUCTION_CONTROL_MAX_ITEMS} item(s) omitted.",
+            )
+        values = obstruction.model_dump(mode="json", exclude_none=True)
+        for key, value in tuple(values.items()):
+            if key in {"visible_controls", "underlying_page_blocked"} or not isinstance(value, str):
+                continue
+            max_chars = (
+                _BUILD_TEST_IDENTIFIER_MAX_CHARS if key == "selector" else _BUILD_TEST_OBSTRUCTION_VALUE_MAX_CHARS
+            )
+            values[key] = _bounded_packet_string(
+                value,
+                field_name=f"{field_prefix}.{key}",
+                max_chars=max_chars,
+                notices=notices,
+            )
+        values["visible_controls"] = [
+            _bounded_obstruction_control(
+                control,
+                obstruction_index=obstruction_index,
+                control_index=control_index,
+                notices=notices,
+            )
+            for control_index, control in enumerate(controls)
+        ]
+        projected.append(PageObstruction.model_validate(values))
+    return projected
+
+
 def _bounded_packet_page_state(
     page_state: BuildTestPacketPageState | None, notices: list[str]
 ) -> BuildTestPacketPageState | None:
@@ -377,6 +507,7 @@ def _bounded_packet_page_state(
             max_chars=_BUILD_TEST_PAGE_SUMMARY_MAX_CHARS,
             notices=notices,
         ),
+        "obstructions": _bounded_page_obstructions(page_state.obstructions, notices),
     }
     return page_state.model_copy(update=updates)
 
@@ -406,6 +537,7 @@ def _compact_packet_for_aggregate_limit(
     if failure is not None:
         page_state = failure.page_state
         if page_state is not None:
+            had_obstructions = bool(page_state.obstructions)
 
             def compact_summaries(values: list[str]) -> list[str]:
                 return [value[:117] + "..." if len(value) > 120 else value for value in values[:2]]
@@ -417,8 +549,14 @@ def _compact_packet_for_aggregate_limit(
                     "action_summaries": compact_summaries(page_state.action_summaries),
                     "challenge_summaries": compact_summaries(page_state.challenge_summaries),
                     "obstruction_summaries": compact_summaries(page_state.obstruction_summaries),
+                    "obstructions": [],
                 }
             )
+            if had_obstructions:
+                _append_omission(
+                    notices,
+                    "failure.page_state.obstructions omitted at the aggregate packet limit.",
+                )
         failure = failure.model_copy(
             update={
                 "action_trace": [
@@ -749,6 +887,12 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
                     else block
                     for block in blocks
                 ]
+        repair_context = data.get("authoring_repair_context")
+        if isinstance(repair_context, dict):
+            repair_context = dict(repair_context)
+            repair_context.pop("page_obstructions", None)
+            repair_context.pop("page_obstruction_omission_notices", None)
+            data["authoring_repair_context"] = repair_context
         raw_packet = data.get(BUILD_TEST_PACKET_KEY)
         if isinstance(raw_packet, dict):
             from skyvern.forge.sdk.copilot.build_test_outcome import BuildTestEvidencePacket

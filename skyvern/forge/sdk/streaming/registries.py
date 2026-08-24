@@ -8,10 +8,12 @@ the same backend api instance. This is because the two registries here are
 tied together via a `client_id` string.
 
 The tale-of-the-tape is this:
-  - frontend app requires two different channels (WS connections) to the backend api
+  - legacy VNC viewers open two paired channels (WS connections) to the backend api
     - one dedicated to streaming VNC's RFB protocol
     - the other dedicated to messaging (JSON)
-  - both of these channels are stateful and need to coordinate with one another
+  - the CDP Record Browser path opens only the Message channel here; frames and
+    user-event capture ride CDP (screencast + ExfiltrationChannel) instead of VNC
+  - stateful channels sharing a `client_id` need to coordinate with one another
 
 Additionally, this module manages:
   - CDP input channels for interactive browser control

@@ -23,7 +23,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     only_degraded_blocking,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import page_evidence_source_matches_run, workflow_target_url
-from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
+from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, PageObstruction
 from skyvern.forge.sdk.copilot.failure_tracking import selector_identities_in_text, selector_identity_from_failure
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -127,6 +127,7 @@ class BuildTestPacketPageState(BaseModel):
     action_summaries: list[str] = Field(default_factory=list)
     challenge_summaries: list[str] = Field(default_factory=list)
     obstruction_summaries: list[str] = Field(default_factory=list)
+    obstructions: list[PageObstruction] = Field(default_factory=list)
 
 
 class BuildTestPacketFailure(BaseModel):

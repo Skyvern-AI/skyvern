@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import time
 from collections import deque
@@ -150,7 +151,7 @@ NO_TOOL_CALL_NUDGE = (
     "finish(status, reason, extracted_output) if the goal is complete. Emit a tool call now."
 )
 
-# Perception-stall policy: N consecutive byte-identical snapshots from the same (compactable) tool
+# Perception-stall policy: N consecutive identical (marker-canonicalized) snapshots from the same (compactable) tool
 # AND from the same probe (that tool with the same arguments) mean the page has stopped changing in
 # response to actions, and a page gated by something the run cannot perceive or operate otherwise
 # burns the whole budget on identical re-observes. The per-probe term is what keeps two different
@@ -196,6 +197,24 @@ TELEMETRY_HASH_HEX_LEN = 16
 
 def telemetry_hash(salt: str, *parts: str) -> str:
     return hashlib.sha256("\x1f".join((salt, *parts)).encode()).hexdigest()[:TELEMETRY_HASH_HEX_LEN]
+
+
+# The value shape observe()'s enrichment mints ('t' + monotonic counter, optional '-<n>'
+# disambiguator — tools._OBSERVE_JS): identity handles, not page semantics, and a node-replacing
+# framework re-mints them on every read, so hashed raw they hide a frozen page from the stall
+# guard. Page-authored data-tv3 values (any other shape) are page content and stay significant.
+_TV3_MARKER_VALUE_RE = re.compile(r'data-tv3="t\d+(?:-\d+)?"')
+
+# get_html truncates to a fixed budget before the loop ever sees the content, so a marker the cut
+# leaves open at the tail has no closing quote for the pattern above and its churning digits would
+# be the one leak that survives canonicalization. The lookahead assumes the truncation notice itself
+# carries no quote character, and this sub must run AFTER closed markers are rewritten to the
+# quote-bearing placeholder — either broken silently brings the leak back.
+_TV3_MARKER_CUT_RE = re.compile(r'data-tv3="t\d*(?:-\d*)?(?=[^"]*\Z)')
+
+
+def _canonical_perception_content(content: str) -> str:
+    return _TV3_MARKER_CUT_RE.sub('data-tv3="*', _TV3_MARKER_VALUE_RE.sub('data-tv3="*"', content))
 
 
 # How many recent states a probe remembers. This length IS the longest oscillation period that can
@@ -436,9 +455,10 @@ def _unblocker_options(available_tools: set[str]) -> list[str]:
 def _stall_nudge_text(stalled: list[tuple[str, int]], available_tools: set[str]) -> str:
     """One warning naming every stalled perception tool and the unblockers this run actually has —
     a model that cannot see the gate won't reach for solve_captcha unless the symptom names it."""
-    symptoms = "; ".join(f"{name} has returned byte-identical output {count} times in a row" for name, count in stalled)
+    symptoms = "; ".join(f"{name} has returned identical output {count} times in a row" for name, count in stalled)
     return (
-        f"The page is not changing: {symptoms}, despite your actions. Do not keep re-observing, "
+        f"The page is not changing: {symptoms}, despite your actions (transient element-marker ids are "
+        "ignored when comparing). Do not keep re-observing, "
         "waiting, or repeating the same action. Your options: " + "; ".join(_unblocker_options(available_tools)) + "."
     )
 
@@ -994,7 +1014,7 @@ async def run_agent_tool_loop(
             attribution: dict[str, Any] = {"action_key_hash": telemetry_hash(telemetry_salt, *action_key)}
             content_digest: str | None = None
             if spec is not None and spec.compactable and result.status == "ok":
-                content_digest = hashlib.sha256(result.content.encode()).hexdigest()
+                content_digest = hashlib.sha256(_canonical_perception_content(result.content).encode()).hexdigest()
                 attribution["snapshot_digest"] = telemetry_hash(telemetry_salt, content_digest)
                 attribution["probe_first_time"] = perception.first_time(action_key)
             # The only per-tool-call timing the engine has: tool execution is the majority of a v3
@@ -1055,7 +1075,7 @@ async def run_agent_tool_loop(
                     )
                     outcome = LoopOutcome(
                         "terminated",
-                        f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive byte-identical snapshots from "
+                        f"{PERCEPTION_STALL_REASON_PREFIX} {snap.live} consecutive identical snapshots from "
                         f"one {tool_name} probe — the page stopped changing in response to actions, so the goal cannot "
                         "progress (commonly a blocker the run cannot perceive or operate, e.g. inside a "
                         "cross-origin frame)",

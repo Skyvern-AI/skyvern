@@ -38,6 +38,7 @@ from skyvern.forge.taskv3.loop import (
     ToolHandler,
     ToolResult,
     ToolSpec,
+    _canonical_perception_content,
     _PerceptionLedger,
     make_finish_tool,
     run_agent_tool_loop,
@@ -1714,7 +1715,7 @@ async def test_stall_nudge_is_delivered_once_per_streak_not_once_per_turn() -> N
     nudges = [
         message
         for message in outcome.messages
-        if message.get("role") == "user" and "byte-identical output" in str(message.get("content"))
+        if message.get("role") == "user" and "identical output" in str(message.get("content"))
     ]
     assert len(nudges) == 1
 
@@ -1723,7 +1724,7 @@ def _stall_warnings(outcome: LoopOutcome) -> list[dict[str, Any]]:
     return [
         message
         for message in outcome.messages
-        if message.get("role") == "user" and "byte-identical output" in str(message.get("content"))
+        if message.get("role") == "user" and "identical output" in str(message.get("content"))
     ]
 
 
@@ -3323,3 +3324,101 @@ async def test_shadow_and_suppressed_lines_carry_the_hash_fields() -> None:
         )
     shadow = [e for e in logs if e["event"] == PERCEPTION_STALL_SHADOW_EVENT][0]
     assert len(shadow["snapshot_digest"]) == 16 and len(shadow["action_key_hash"]) == 16
+
+
+def _replaced_node_observe(counter: int) -> str:
+    # A node-replacing framework loses data-tv3 with each rebuilt node, so observe re-mints values
+    # from the monotonic counter; every semantic byte below is frozen across calls.
+    return (
+        "url=https://site.test/form title='Form' (2 interactive elements)\n"
+        f"[[data-tv3=\"t{counter}\"]] input/text 'First name'\n"
+        f"[[data-tv3=\"t{counter + 1}-1\"]] button 'Continue' *required"
+    )
+
+
+@pytest.mark.asyncio
+async def test_marker_churn_on_a_frozen_page_still_trips_the_stall_guard_through_observe() -> None:
+    # SKY-14658 Direction B mode 2: the re-minted marker values are the only bytes that change, so
+    # byte-identity on the raw payload can never form a streak — the digest must be computed on
+    # marker-canonicalized content for the guard to do its primary job on a re-rendering page.
+    contents = [_replaced_node_observe(5 * i) for i in range(20)]
+    script = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    tools = [_perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_marker_churn_on_a_frozen_page_still_trips_the_stall_guard_through_get_html() -> None:
+    contents = [
+        f'<form><input data-tv3="t{7 * i}" name="q"><button data-tv3="t{7 * i + 3}-2">Go</button></form>'
+        for i in range(20)
+    ]
+    script = [[("get_html", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    tools = [_perception_tool("get_html", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_semantic_change_under_marker_churn_still_reads_as_progress() -> None:
+    # The canonicalization may only merge snapshots whose every semantic byte matches: when the
+    # page genuinely changes call over call (and markers churn too), the streak must keep resetting.
+    contents = [_replaced_node_observe(5 * i).replace("'Form'", f"'Form step {i}'") for i in range(20)]
+    script = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    tools = [_perception_tool("observe", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "completed"
+    assert not outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+
+
+def test_canonicalization_normalizes_only_engine_minted_marker_values() -> None:
+    # Minted values (t<counter>, optionally -<n> disambiguated) are identity handles, not page
+    # semantics: both shapes normalize, in observe rendering and raw HTML alike.
+    assert _canonical_perception_content('[[data-tv3="t12"]] input') == _canonical_perception_content(
+        '[[data-tv3="t9004"]] input'
+    )
+    assert _canonical_perception_content('<a data-tv3="t3-1">x</a>') == _canonical_perception_content(
+        '<a data-tv3="t77">x</a>'
+    )
+    # A page-authored data-tv3 value is page content like any other attribute — left alone.
+    assert _canonical_perception_content('<a data-tv3="decoy">x</a>') != _canonical_perception_content(
+        '<a data-tv3="other">x</a>'
+    )
+    # The positional menu markers are stable on a frozen page and stay significant.
+    assert _canonical_perception_content('[[data-tv3-menu="2"]] row') != _canonical_perception_content(
+        '[[data-tv3-menu="3"]] row'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_marker_cut_open_by_the_get_html_truncation_does_not_leak_churn() -> None:
+    # get_html truncates at a fixed byte budget BEFORE the loop hashes, so a marker straddling the
+    # cut has no closing quote and its churning digits were the one leak canonicalization missed.
+    frozen_prefix = "<form>" + "<input name=q>" * 10 + '<button data-tv3="t'
+    contents = [f"{frozen_prefix}{100 + i}…[truncated at 20000 chars]" for i in range(20)]
+    script = [[("get_html", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    tools = [_perception_tool("get_html", contents), make_finish_tool()]
+    outcome, _ = await _run(script, tools, max_turns=200, max_tool_calls=500)
+    assert outcome.status == "terminated"
+    assert outcome.reason.startswith(PERCEPTION_STALL_REASON_PREFIX)
+
+
+def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> None:
+    # The cut can land anywhere in the value — after the digits, mid-digits, or before them.
+    assert _canonical_perception_content(
+        '<a data-tv3="t12…[truncated at 20000 chars]'
+    ) == _canonical_perception_content('<a data-tv3="t907-3…[truncated at 20000 chars]')
+    assert _canonical_perception_content('x data-tv3="t') == _canonical_perception_content('x data-tv3="t44-')
+    # A closed marker earlier in the content does not shield the open tail fragment, and a closed
+    # tail marker is not double-rewritten.
+    assert _canonical_perception_content('<a data-tv3="t1">y</a><b data-tv3="t2') == _canonical_perception_content(
+        '<a data-tv3="t9">y</a><b data-tv3="t8'
+    )
+    assert _canonical_perception_content('tail closed data-tv3="t5"') == 'tail closed data-tv3="*"'

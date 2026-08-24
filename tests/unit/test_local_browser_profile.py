@@ -147,15 +147,18 @@ def test_background_sweep_logs_failure_instead_of_killing_its_thread(monkeypatch
         "sweep_local_browser_profiles_with_budget",
         MagicMock(side_effect=OSError("cannot spawn sweep")),
     )
-    warning = MagicMock()
-    monkeypatch.setattr(local_browser_profile.LOG, "warning", warning)
+    # Patch the module's LOG, not LOG.warning: monkeypatching an attribute on the
+    # BoundLoggerLazyProxy makes the undo re-install a bound method frozen to the
+    # current structlog config, permanently hiding this logger from capture_logs.
+    fake_log = MagicMock()
+    monkeypatch.setattr(local_browser_profile, "LOG", fake_log)
 
     thread = local_browser_profile.sweep_local_browser_profiles_once_in_background()
 
     assert thread is not None
     thread.join(timeout=5)
     assert not thread.is_alive()
-    assert warning.call_args.args[0] == "local_browser_profile_background_sweep_failed"
+    assert fake_log.warning.call_args.args[0] == "local_browser_profile_background_sweep_failed"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="managed profile sweep is POSIX-only")

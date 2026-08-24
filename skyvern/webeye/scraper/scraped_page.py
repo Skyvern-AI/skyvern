@@ -65,7 +65,7 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element is flagged as dropped, the html format is empty
     """
     tag = element["tagName"]
-    attributes: dict[str, Any] = copy.deepcopy(element.get("attributes", {}))
+    attributes: dict[str, Any] = dict(element.get("attributes", {}))
 
     interactable = element.get("interactable", False)
     if element.get("isDropped", False):

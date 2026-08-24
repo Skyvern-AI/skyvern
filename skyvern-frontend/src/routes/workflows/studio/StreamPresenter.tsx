@@ -1,6 +1,10 @@
+import { useLayoutEffect } from "react";
+
 import { BrowserStream } from "@/components/BrowserStream";
+import { RecordingPill } from "@/components/RecordingPill";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
+import { useRecordingStore } from "@/store/useRecordingStore";
 
 type StreamPresenterProps = {
   browserSessionId: string;
@@ -18,8 +22,10 @@ type StreamPresenterProps = {
 };
 
 /**
- * Transport-agnostic live browser stream: picks VNC vs CDP from runtime config,
- * honoring the recording override (recording requires VNC).
+ * Transport-agnostic live browser stream: picks VNC vs CDP from runtime config.
+ * Recording stays on the session's own transport — a CDP-transport session has
+ * no reachable VNC endpoint, so swapping to VNC for recording kills the view;
+ * exfiltration only needs the messages channel, which both transports carry.
  */
 export function StreamPresenter({
   browserSessionId,
@@ -32,25 +38,50 @@ export function StreamPresenter({
   onActivity,
 }: StreamPresenterProps) {
   const { streamTransport } = useStreamTransport(browserSessionId);
-  const useCdp = streamTransport === "cdp" && !isRecording;
+  const workflowPermanentId = useRecordingStore(
+    (state) => state.workflowPermanentId,
+  );
+  const finishRequested = useRecordingStore((state) => state.finishRequested);
+  const setRecordingTransport = useRecordingStore(
+    (state) => state.setRecordingTransport,
+  );
+
+  // Recording telemetry labels each recording with its transport; the store
+  // ignores this while a recording is live.
+  useLayoutEffect(() => {
+    if (streamTransport) {
+      setRecordingTransport(streamTransport);
+    }
+  }, [streamTransport, setRecordingTransport]);
 
   if (!streamTransport) {
     // Mounting either transport now would open a connection this session may not serve.
     return null;
   }
 
-  if (useCdp) {
+  if (streamTransport === "cdp") {
     // CDP frames must be explicitly centered; VNC handles this in its own CSS.
     return (
-      <BrowserSessionStream
-        browserSessionId={browserSessionId}
-        interactive={interactive}
-        showControlButtons={showControlButtons}
-        enableUrlInput={enableUrlInput}
-        onUrlChange={onUrlChange}
-        onActivity={onActivity}
-        centered
-      />
+      <div className="relative h-full w-full">
+        <BrowserSessionStream
+          browserSessionId={browserSessionId}
+          interactive={interactive}
+          showControlButtons={showControlButtons}
+          enableUrlInput={enableUrlInput}
+          // undefined keeps the recording message channel closed on the
+          // non-recording live view; a defined value opens it.
+          exfiltrate={isRecording ? !finishRequested : undefined}
+          workflowPermanentId={workflowPermanentId}
+          onUrlChange={onUrlChange}
+          onActivity={onActivity}
+          centered
+        />
+        {isRecording && !hideRecordingIndicator && (
+          <div className="pointer-events-none absolute left-3 top-3 z-10">
+            <RecordingPill />
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -61,9 +92,8 @@ export function StreamPresenter({
       showControlButtons={showControlButtons}
       exfiltrate={isRecording}
       hideRecordingIndicator={hideRecordingIndicator}
-      // The studio swaps CDP<->VNC when recording toggles and StrictMode remounts
-      // this component; the recording must survive those. StudioBrowserStream owns
-      // the session-level reset instead.
+      // StrictMode remounts this component; the recording must survive those.
+      // StudioBrowserStream owns the session-level reset instead.
       resetRecordingOnUnmount={false}
       onActivity={onActivity}
     />

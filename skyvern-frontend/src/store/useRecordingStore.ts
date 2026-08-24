@@ -199,8 +199,9 @@ export const nextOptimisticStepId = (): string =>
   `optimistic-${(optimisticStepSeq += 1)}`;
 
 /**
- * A frame grabbed from the live VNC canvas at the moment of a recorded click,
- * matched to draft steps by source-event timestamp (ms epoch).
+ * The last committed frame of the live browser stream, grabbed at the moment
+ * of a recorded click, matched to draft steps by source-event timestamp
+ * (ms epoch).
  */
 export interface RecordingScreenshot {
   timestampMs: number;

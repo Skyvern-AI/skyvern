@@ -9,6 +9,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunParameter
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 
 def _make_workflow_parameter(
@@ -141,3 +142,74 @@ class TestAtWillCredentialBackfill:
         )
 
         assert not context.has_value("portal_cred")
+
+
+class TestCredentialTemplateEntriesShape:
+    """`credential_template_entries` decides which credential secrets reach block templates, and a
+    password-less credential registers no password placeholder — so the password shape is now keyed
+    on `username` alone. Pin that the widened check still scopes secrets to password credentials."""
+
+    def test_password_less_credential_exposes_username_and_empty_password(self) -> None:
+        context = FakeWorkflowRunContext(
+            values={
+                "portal_cred": {
+                    "context": "credential",
+                    "username": "secret_username_id",
+                },
+            },
+            secrets={"secret_username_id": "user@example.com"},
+        )
+
+        entries = context.credential_template_entries(["portal_cred"], resolve_credential_dicts=True)
+
+        assert entries["portal_cred_real_username"] == "user@example.com"
+        assert entries["portal_cred_real_password"] == ""
+        assert entries["portal_cred"] == {"username": "user@example.com"}
+
+    def test_password_credential_still_exposes_both_secrets(self) -> None:
+        context = FakeWorkflowRunContext(
+            values={
+                "portal_cred": {
+                    "context": "credential",
+                    "username": "secret_username_id",
+                    "password": "secret_password_id",
+                },
+            },
+            secrets={"secret_username_id": "user@example.com", "secret_password_id": "hunter2"},
+        )
+
+        entries = context.credential_template_entries(["portal_cred"], resolve_credential_dicts=True)
+
+        assert entries["portal_cred_real_username"] == "user@example.com"
+        assert entries["portal_cred_real_password"] == "hunter2"
+
+    def test_credit_card_credential_registers_no_password_entries(self) -> None:
+        # Card credentials carry no `username`, so the widened check must not start emitting
+        # spurious _real_username/_real_password entries for them.
+        context = FakeWorkflowRunContext(
+            values={
+                "card_cred": {
+                    "context": "credential",
+                    "card_number": "secret_card_id",
+                    "card_cvv": "secret_cvv_id",
+                },
+            },
+            secrets={"secret_card_id": "4111111111111111", "secret_cvv_id": "123"},
+        )
+
+        entries = context.credential_template_entries(["card_cred"], resolve_credential_dicts=True)
+
+        assert entries == {}
+
+    def test_undeclared_credential_is_never_exposed(self) -> None:
+        context = FakeWorkflowRunContext(
+            values={
+                "portal_cred": {
+                    "context": "credential",
+                    "username": "secret_username_id",
+                },
+            },
+            secrets={"secret_username_id": "user@example.com"},
+        )
+
+        assert context.credential_template_entries([], resolve_credential_dicts=True) == {}

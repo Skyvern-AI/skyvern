@@ -7,17 +7,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
+from pydantic import ValidationError
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.forge_app import ForgeApp
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.routes import credentials as credentials_routes
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
+    CredentialItem,
     CredentialType,
     CredentialVaultType,
+    NonEmptyCreditCardCredential,
+    NonEmptyPasswordCredential,
+    PasswordCredential,
+)
+from skyvern.forge.sdk.schemas.credentials import TestLoginRequest as LoginTestRequest
+from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
     UpdateCredentialRequest,
 )
@@ -1372,8 +1381,6 @@ async def test_repo_update_credential_clears_proxy_session_id_with_proxy_locatio
 async def test_update_credential_route_applies_validated_browser_profile_and_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.schemas.credentials import NonEmptyPasswordCredential
-
     existing = _stored_credential()
     monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
     monkeypatch.setattr(
@@ -1386,8 +1393,6 @@ async def test_update_credential_route_applies_validated_browser_profile_and_pin
         "get_credentials_by_browser_profile_id",
         AsyncMock(return_value=[]),
     )
-    from skyvern.forge.forge_app import ForgeApp
-
     vault_service = SimpleNamespace(
         update_credential=AsyncMock(return_value=_stored_credential()),
         post_delete_credential_item=AsyncMock(),
@@ -1637,3 +1642,192 @@ async def test_oss_route_allows_disabling_sequential_credential(monkeypatch: pyt
 
     assert response.run_sequentially is False
     assert update_credential.await_args.kwargs["run_sequentially"] is False
+
+
+def test_password_credential_accepts_empty_password() -> None:
+    credential = NonEmptyPasswordCredential(username="user@example.com", password="")
+    assert credential.password == ""
+
+    request = CreateCredentialRequest.model_validate(
+        {
+            "name": "passwordless login",
+            "credential_type": "password",
+            "credential": {"username": "user@example.com", "password": ""},
+        }
+    )
+    assert isinstance(request.credential, NonEmptyPasswordCredential)
+    assert request.credential.password == ""
+
+
+def test_password_credential_omitted_password_stored_as_empty() -> None:
+    request = CreateCredentialRequest.model_validate(
+        {
+            "name": "passwordless login",
+            "credential_type": "password",
+            "credential": {"username": "user@example.com"},
+        }
+    )
+    assert isinstance(request.credential, NonEmptyPasswordCredential)
+    assert request.credential.password == ""
+
+
+def test_password_credential_still_rejects_empty_username() -> None:
+    with pytest.raises(ValidationError):
+        NonEmptyPasswordCredential(username="", password="pw")
+    with pytest.raises(ValidationError):
+        CreateCredentialRequest.model_validate(
+            {
+                "name": "bad login",
+                "credential_type": "password",
+                "credential": {"username": "", "password": ""},
+            }
+        )
+
+
+def test_credit_card_and_secret_credentials_still_reject_empty_values() -> None:
+    with pytest.raises(ValidationError):
+        NonEmptyCreditCardCredential(
+            card_number="",
+            card_cvv="123",
+            card_exp_month="12",
+            card_exp_year="2030",
+            card_brand="visa",
+            card_holder_name="Jane Doe",
+        )
+    with pytest.raises(ValidationError):
+        CreateCredentialRequest.model_validate(
+            {
+                "name": "bad secret",
+                "credential_type": "secret",
+                "credential": {"secret_value": ""},
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_credential_route_accepts_blanking_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _stored_credential()
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    vault_service = SimpleNamespace(
+        update_credential=AsyncMock(return_value=_stored_credential()),
+        post_delete_credential_item=AsyncMock(),
+    )
+    monkeypatch.setattr(ForgeApp, "CREDENTIAL_VAULT_SERVICES", {existing.vault_type: vault_service}, raising=False)
+    monkeypatch.setattr(credentials_routes, "_clear_cached_totp_code_preview", lambda **_kwargs: None)
+
+    data = CreateCredentialRequest.model_validate(
+        {
+            "name": "test",
+            "credential_type": "password",
+            "credential": {"username": "user@example.com", "password": ""},
+        }
+    )
+
+    response = await credentials_routes.update_credential(
+        background_tasks=BackgroundTasks(),
+        credential_id="cred_123",
+        data=data,
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+
+    written = vault_service.update_credential.await_args.kwargs["data"]
+    assert isinstance(written.credential, NonEmptyPasswordCredential)
+    assert written.credential.password == ""
+    assert written.credential.username == "user@example.com"
+    assert response.credential_id == "cred_123"
+
+
+class _PreservingVaultService(CredentialVaultService):
+    """Vault stub that runs the real omitted-field preservation, like every concrete vault does."""
+
+    def __init__(self, stored: PasswordCredential) -> None:
+        self.stored = stored
+        self.written: PasswordCredential | None = None
+
+    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+        raise NotImplementedError
+
+    async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
+        assert isinstance(data.credential, PasswordCredential)
+        self.written = await self._preserve_omitted_password_fields(
+            credential=credential,
+            updated_credential=data.credential,
+        )
+        return credential
+
+    async def delete_credential(self, credential: Credential) -> None:
+        raise NotImplementedError
+
+    async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
+        return CredentialItem(
+            item_id=db_credential.item_id,
+            name=db_credential.name,
+            credential_type=CredentialType.PASSWORD,
+            credential=self.stored,
+        )
+
+
+async def _update_password_credential_via_route(
+    monkeypatch: pytest.MonkeyPatch,
+    credential_payload: dict[str, object],
+) -> _PreservingVaultService:
+    existing = _stored_credential()
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    vault_service = _PreservingVaultService(
+        PasswordCredential(
+            username="user@example.com",
+            password="stored-password",
+            metadata={"tenant": "north"},
+        )
+    )
+    monkeypatch.setattr(ForgeApp, "CREDENTIAL_VAULT_SERVICES", {existing.vault_type: vault_service}, raising=False)
+    monkeypatch.setattr(credentials_routes, "_clear_cached_totp_code_preview", lambda **_kwargs: None)
+
+    await credentials_routes.update_credential(
+        background_tasks=BackgroundTasks(),
+        credential_id="cred_123",
+        data=CreateCredentialRequest.model_validate(
+            {"name": "test", "credential_type": "password", "credential": credential_payload}
+        ),
+        current_org=SimpleNamespace(organization_id="org_123"),
+    )
+    return vault_service
+
+
+@pytest.mark.asyncio
+async def test_update_credential_route_preserves_omitted_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An overwrite that only renames or re-sends the username must not destroy the stored password.
+    vault_service = await _update_password_credential_via_route(monkeypatch, {"username": "renamed@example.com"})
+
+    assert vault_service.written is not None
+    assert vault_service.written.password == "stored-password"
+    assert vault_service.written.username == "renamed@example.com"
+    assert vault_service.written.metadata == {"tenant": "north"}
+
+
+@pytest.mark.asyncio
+async def test_update_credential_route_blanks_explicitly_empty_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    vault_service = await _update_password_credential_via_route(
+        monkeypatch, {"username": "user@example.com", "password": ""}
+    )
+
+    assert vault_service.written is not None
+    assert vault_service.written.password == ""
+
+
+@pytest.mark.asyncio
+async def test_update_credential_route_overwrites_supplied_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    vault_service = await _update_password_credential_via_route(
+        monkeypatch, {"username": "user@example.com", "password": "rotated-password"}
+    )
+
+    assert vault_service.written is not None
+    assert vault_service.written.password == "rotated-password"
+
+
+def test_login_test_request_accepts_empty_password() -> None:
+    # The inline Test button must work for the password-less credentials this endpoint can now store.
+    assert LoginTestRequest(url="https://example.com/login", username="user@example.com", password="").password == ""
+    assert LoginTestRequest(url="https://example.com/login", username="user@example.com").password == ""
+    with pytest.raises(ValidationError):
+        LoginTestRequest(url="https://example.com/login", username="", password="")
