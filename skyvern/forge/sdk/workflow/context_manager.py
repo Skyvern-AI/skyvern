@@ -471,7 +471,10 @@ class WorkflowRunContext:
             value = self.values.get(key)
             if not isinstance(value, dict) or "context" not in value:
                 continue
-            has_password_shape = "username" in value and "password" in value
+            # A password-less credential registers "password" as a literal "" rather than a
+            # placeholder id, so username alone marks the password shape; the secrets lookup
+            # below misses on "" and falls back to "", which is the value it actually holds.
+            has_password_shape = "username" in value
             if not has_password_shape and "secret_value" not in value:
                 continue
             entries[f"{key}_real_username"] = self.secrets.get(value.get("username", ""), "")
@@ -840,6 +843,12 @@ class WorkflowRunContext:
             if key in ("totp_type", "totp"):
                 continue
             if not value:
+                # A password-less login stores password="". Blocks dereference `.password`
+                # directly, so the key has to exist or the namespace lookup raises instead of
+                # yielding the empty string the credential actually holds.
+                if key == "password" and isinstance(credential, PasswordCredential):
+                    self.values[parameter.key][key] = ""
+                    used_secret_field_keys.add(key)
                 continue
             for field_key, field_value in self._flatten_credential_secret_field(key, value):
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)

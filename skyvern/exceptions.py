@@ -1138,6 +1138,16 @@ class CredentialParameterNotFoundError(SkyvernException):
         )
 
 
+class CredentialVaultShapeMismatchError(SkyvernHTTPException):
+    def __init__(self, credential_id: str, stored_credential_type: str) -> None:
+        super().__init__(
+            f"Credential {credential_id} is recorded as a password credential but the vault holds a "
+            f"{stored_credential_type}. Refusing to update it, because an omitted password would "
+            "overwrite the stored secret with an empty one.",
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+
 class CredentialVaultNotConfiguredError(SkyvernException):
     def __init__(self, vault_type: str, credential_id: str) -> None:
         super().__init__(
