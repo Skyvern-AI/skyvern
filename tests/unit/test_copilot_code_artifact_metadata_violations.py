@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_block_returns_flat_string,
     _code_block_returns_uninvoked_structured_function,
     _download_descriptor_leak_finding,
+    _is_download_intent,
     _normalize_code_artifact_metadata_detailed,
 )
 
@@ -688,6 +689,44 @@ def _download_intent_metadata(label: str) -> dict:
     return metadata
 
 
+class TestDownloadIntentTerminals:
+    """Which engine will run a block is unknown when it is authored, and `click_and_claim_download`
+    is the only download terminal that registers on both, so it is the only one this gate credits.
+    A block relying on the `page.expect_download` idiom therefore loses the download exemption and
+    is held to the extraction-shape checks."""
+
+    def test_expect_download_alone_is_not_download_intent(self) -> None:
+        code = textwrap.dedent(
+            """
+            async with page.expect_download(timeout=30000) as download_event:
+                await page.click("a#statement-pdf")
+            """
+        )
+        assert _is_download_intent({}, code) is False
+
+    def test_download_claim_is_download_intent(self) -> None:
+        code = 'saved = await click_and_claim_download(page, "a#statement-pdf")\nreturn {"saved_as": saved}'
+        assert _is_download_intent({}, code) is True
+
+    def test_declared_registration_key_still_carries_download_intent(self) -> None:
+        code = "async with page.expect_download() as download_event:\n    await page.click('a#statement-pdf')"
+        assert _is_download_intent(_download_intent_metadata("dl_block"), code) is True
+
+    def test_expect_download_no_longer_exempts_a_block_from_the_extraction_validators(self) -> None:
+        code = """
+        async with page.expect_download() as dl_info:
+            await page.click("a#statement-pdf")
+        return page.inner_text("#results")
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "flat text blob" in error
+
+
 class TestDownloadDescriptorLeak:
     """A run cannot reveal this arm: the run succeeds and the path lands in workflow output.
     The registration-detection arms were deleted precisely because a run does reveal those."""
@@ -707,7 +746,9 @@ class TestDownloadDescriptorLeak:
 
 class TestDownloadShapesThatMustNotBeFlagged:
     """Negative space for the surviving descriptor-leak arm: a clean descriptor, an extraction
-    block, and a non-download block must all normalize without a violation."""
+    block, and a non-download block must all normalize without a violation. The first arm passes
+    because its artifact declares a registration key, not because the `expect_download` idiom is
+    read as a download terminal."""
 
     def test_expect_download_idiom_with_descriptor_passes(self) -> None:
         code = """
