@@ -5143,6 +5143,13 @@ class WorkflowService:
         # A finally-only failure is a cleanup outcome, not evidence that replaying the
         # workflow with another credential can help.
         finally_block_set_terminal_outcome = False
+        # When a terminal row is re-opened so its finally block can run, the write that
+        # terminalized it already recorded the run's minutes up to that instant, and carrying
+        # that instant makes the in-band re-finalization below record only what ran after it.
+        # Out-of-band writers that terminalize the row mid-block (API cancel, the
+        # heartbeat-timeout activity, the durable fail finalizer) carry no such instant and
+        # still record now - started_at.
+        run_minutes_recorded_through: datetime | None = None
 
         try:
             effective_max_elapsed_minutes = get_effective_workflow_run_max_elapsed_time_minutes(
@@ -5347,6 +5354,12 @@ class WorkflowService:
                             WorkflowRunStatus.terminated,
                             WorkflowRunStatus.timed_out,
                         ):
+                            # A terminal write stamps ``finished_at`` in the same breath as it
+                            # records run minutes, so the stamp is the instant those minutes
+                            # were measured to. A row that reached a terminal status without one
+                            # (bulk stuck-run cleanup writes status only) recorded nothing, and
+                            # the re-finalization is then the run's first and only sample.
+                            run_minutes_recorded_through = workflow_run.finished_at
                             workflow_run = await self._update_workflow_run_status(
                                 workflow_run_id=workflow_run_id,
                                 status=WorkflowRunStatus.running,
@@ -5518,6 +5531,7 @@ class WorkflowService:
                             pre_finally_status=pre_finally_status,
                             pre_finally_failure_reason=pre_finally_failure_reason,
                             pre_finally_failure_category=pre_finally_failure_category,
+                            run_minutes_recorded_through=run_minutes_recorded_through,
                         )
                     )
                 except BaseException:
@@ -9416,6 +9430,7 @@ class WorkflowService:
         failure_reason: str | None = None,
         run_with: str | None = None,
         failure_category: list[dict] | None = None,
+        run_minutes_recorded_through: datetime | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
         run's own finalizer. Returns ``None`` when the row was already terminal."""
@@ -9428,7 +9443,11 @@ class WorkflowService:
         )
         if workflow_run is None:
             return None
-        await self._after_workflow_run_status_write(workflow_run, status)
+        await self._after_workflow_run_status_write(
+            workflow_run,
+            status,
+            run_minutes_recorded_through=run_minutes_recorded_through,
+        )
         return workflow_run
 
     async def _finish_preexisting_timed_out_workflow_run(
@@ -9452,25 +9471,40 @@ class WorkflowService:
         return workflow_run
 
     async def _after_workflow_run_status_write(
-        self, workflow_run: WorkflowRun, status: WorkflowRunStatus, emit_run_minutes: bool = True
+        self,
+        workflow_run: WorkflowRun,
+        status: WorkflowRunStatus,
+        emit_run_minutes: bool = True,
+        run_minutes_recorded_through: datetime | None = None,
     ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
         if status.is_final():
             # Free extraction-cache entries for this run.
             extraction_cache.clear_workflow_run(workflow_run_id)
+            now = datetime.now(UTC)
             start_time = (
                 workflow_run.started_at.replace(tzinfo=UTC)
                 if workflow_run.started_at
                 else workflow_run.created_at.replace(tzinfo=UTC)
             )
             queued_seconds = (start_time - workflow_run.created_at.replace(tzinfo=UTC)).total_seconds()
-            duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
+            duration_seconds = (now - start_time).total_seconds()
+            # A run can reach a terminal status twice: the finally-block path terminalizes,
+            # re-opens the row to `running` so the block can execute, then terminalizes again.
+            # Both writes are real non-terminal -> terminal flips, so the second one records
+            # only the compute the first one had not measured yet.
+            recorded_seconds = (
+                duration_seconds
+                if run_minutes_recorded_through is None
+                else (now - run_minutes_recorded_through.replace(tzinfo=UTC)).total_seconds()
+            )
             LOG.info(
                 "Workflow run duration metrics",
                 workflow_run_id=workflow_run_id,
                 workflow_id=workflow_run.workflow_id,
                 queued_seconds=queued_seconds,
                 duration_seconds=duration_seconds,
+                recorded_seconds=recorded_seconds,
                 workflow_run_status=workflow_run.status,
                 organization_id=workflow_run.organization_id,
                 run_with=workflow_run.run_with,
@@ -9486,7 +9520,7 @@ class WorkflowService:
                 await app.AGENT_FUNCTION.record_run_duration(
                     run_type="workflow_run",
                     status=str(status),
-                    duration_seconds=duration_seconds,
+                    duration_seconds=recorded_seconds,
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                     excluded_reason=None if workflow_run.started_at else "never_started",
@@ -9567,6 +9601,7 @@ class WorkflowService:
         pre_finally_failure_category: list[dict] | None = None,
         is_partial_run: bool = False,
         requested_completion_contract: dict[str, Any] | None = None,
+        run_minutes_recorded_through: datetime | None = None,
     ) -> WorkflowRun:
         """
         Set final workflow run status based on pre-finally state.
@@ -9612,6 +9647,7 @@ class WorkflowService:
                 status=pre_finally_status,
                 failure_reason=pre_finally_failure_reason,
                 failure_category=pre_finally_failure_category,
+                run_minutes_recorded_through=run_minutes_recorded_through,
             )
             if updated is None:
                 return await self._current_row_after_lost_finalize(workflow_run_id, workflow_run)
@@ -9979,12 +10015,15 @@ class WorkflowService:
         )
         queued_seconds = (start_time - updated.created_at.replace(tzinfo=UTC)).total_seconds()
         duration_seconds = (datetime.now(UTC) - start_time).total_seconds()
+        # This path finalizes once and never re-opens the run, so the recorded sample is
+        # the whole duration. It is logged anyway so every emission site carries the field.
         LOG.info(
             "Workflow run duration metrics",
             workflow_run_id=workflow_run_id,
             workflow_id=updated.workflow_id,
             queued_seconds=queued_seconds,
             duration_seconds=duration_seconds,
+            recorded_seconds=duration_seconds,
             workflow_run_status=updated.status,
             organization_id=updated.organization_id,
             run_with=updated.run_with,

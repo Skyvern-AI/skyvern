@@ -51,6 +51,7 @@ def _workflow_run(
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         started_at=started_at,
         created_at=started_at,
+        finished_at=None,
         code_gen=False,
         run_with="agent",
     )
