@@ -42,6 +42,10 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     CriterionVerdict,
     gradeable_completion_criteria,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    _page_obstructions_from_visual_summary,
+    parse_composition_structured,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -2000,6 +2004,29 @@ workflow_definition:
     async def test_same_saved_workflow_and_failed_run_share_one_packet_across_three_paths(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        structured_fixture = json.loads(
+            (Path(__file__).parent / "data/click_overlay_named_dismiss.structured.json").read_text()
+        )
+        producer_packet = parse_composition_structured(
+            structured_fixture,
+            inspected_url="https://example.test/statements",
+            current_url="https://example.test/statements",
+        )
+        assert producer_packet is not None
+        dom_obstructions = producer_packet["page_obstructions"]
+        screenshot_obstruction = _page_obstructions_from_visual_summary(
+            {
+                "page_obstruction_detected": True,
+                "obstruction_kind": "floating_notice",
+                "obstruction_location": "Lower-right corner",
+                "underlying_page_blocked": False,
+                "visible_dismiss_controls": ["Dismiss notice"],
+            }
+        )[0]
+        source_obstructions = [dom_obstructions[0], screenshot_obstruction, *dom_obstructions, *dom_obstructions]
+        failed_run = json.loads(json.dumps(self._FAILED_RUN))
+        failed_run["data"]["authoring_repair_context"]["page_obstructions"] = source_obstructions
+
         async def fake_update_workflow(payload, ctx, **_kwargs):
             assert payload["workflow_yaml"] == self._SAVED_WORKFLOW
             ctx.workflow_yaml = self._SAVED_WORKFLOW
@@ -2008,7 +2035,7 @@ workflow_definition:
             return {"ok": True, "data": {"block_count": 1}, "_workflow": ctx.last_workflow}
 
         async def fake_run_blocks(_params, _ctx, **_kwargs):
-            return json.loads(json.dumps(self._FAILED_RUN))
+            return json.loads(json.dumps(failed_run))
 
         async def fake_verify(ctx, _result, _handler_start):
             ctx.last_unverified_block_labels = ["read_total"]
@@ -2088,6 +2115,46 @@ workflow_definition:
         assert packet["failure"]["page_state"]["result_summaries"] == [
             "result container #summary; text=Total unavailable"
         ]
+        carried_obstructions = packet["failure"]["page_state"]["obstructions"]
+        assert len(carried_obstructions) == 5
+        assert [
+            control["selector_candidates"]
+            for obstruction in carried_obstructions
+            for control in obstruction["visible_controls"]
+            if obstruction.get("source") != "vision_summary"
+        ] == [
+            control["selector_candidates"]
+            for obstruction in source_obstructions[:5]
+            for control in obstruction["visible_controls"]
+            if obstruction.get("source") != "vision_summary"
+        ]
+        assert [
+            control["identity"]
+            for obstruction in carried_obstructions
+            for control in obstruction["visible_controls"]
+            if "identity" in control
+        ] == [
+            control["identity"]
+            for obstruction in source_obstructions[:5]
+            for control in obstruction["visible_controls"]
+            if "identity" in control
+        ]
+        screenshot_control = carried_obstructions[1]["visible_controls"][0]
+        assert carried_obstructions[1]["source"] == "vision_summary"
+        assert carried_obstructions[1]["visual_location"] == "Lower-right corner"
+        assert carried_obstructions[1]["underlying_page_blocked"] is False
+        assert screenshot_control["text"] == "Dismiss notice"
+        assert screenshot_control["selector_candidates"] == []
+        assert "identity" not in screenshot_control
+        assert any(
+            notice
+            == f"failure.page_state.obstructions shortened: {len(source_obstructions) - len(carried_obstructions)} item(s) omitted."
+            for notice in packet["omission_notices"]
+        )
+        for result in (update_then_run, combined, edited):
+            model_data = json.loads(result)["data"]
+            assert "page_obstructions" not in model_data["authoring_repair_context"]
+            assert "page_obstruction_omission_notices" not in model_data["authoring_repair_context"]
         assert packet["registered_outputs"][0]["output_parameter_key"] == "total"
         assert packet["downloads"] == [{"artifact_id": "artifact_1"}]
         assert packet["screenshot"] == {"present": True, "provenance": "data.screenshot_base64"}
@@ -2138,6 +2205,14 @@ workflow_definition:
                 "authoring_repair_context": {
                     "workflow_run_id": "wr_old",
                     "page_result_summaries": ["stale page result"],
+                    "page_obstructions": [
+                        {
+                            "kind": "modal_overlay",
+                            "source": "dom_html",
+                            "selector": "#stale-overlay",
+                            "visible_controls": [],
+                        }
+                    ],
                 },
             },
         }
@@ -2153,6 +2228,7 @@ workflow_definition:
         assert packet["unfinished_items"] == []
         assert packet["failure"]["page_state"]["current_url"] == "https://example.test/current"
         assert packet["failure"]["page_state"]["result_summaries"] == []
+        assert packet["failure"]["page_state"]["obstructions"] == []
         assert any("another or unknown run" in notice for notice in packet["omission_notices"])
 
     def test_packet_omits_failed_block_screenshot_without_a_recorded_run(self) -> None:
