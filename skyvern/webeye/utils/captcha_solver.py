@@ -13,6 +13,7 @@ so this module stays OSS-clean: the OSS bases return False and the cloud overrid
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -47,12 +48,16 @@ _CAPTCHA_MARKER_SELECTOR = ", ".join(
         ".cf-turnstile",
         ".g-recaptcha[data-sitekey]",
         ".cf-turnstile[data-sitekey]",
+        ".h-captcha",
+        ".h-captcha[data-sitekey]",
         'iframe[src*="recaptcha" i]',
         'iframe[src*="turnstile" i]',
+        'iframe[src*="hcaptcha" i]',
         'iframe[title*="recaptcha" i]',
         'iframe[title*="challenge" i]',
     )
 )
+_HCAPTCHA_MARKER_SELECTOR = ", ".join((".h-captcha", ".h-captcha[data-sitekey]", 'iframe[src*="hcaptcha" i]'))
 _RECAPTCHA_MARKER_SELECTOR = ", ".join(
     (
         ".g-recaptcha",
@@ -67,10 +72,18 @@ _RECAPTCHA_ANCHOR_PATHS = ("/recaptcha/api2/anchor", "/recaptcha/enterprise/anch
 _RECAPTCHA_ANCHOR_ARM_TIMEOUT_SECONDS = 5
 # The extension arm polls a solver over the network; the scout caller has no enclosing bound.
 _EXTENSION_ARM_TIMEOUT_SECONDS = 12
+# hCaptcha is solved by the extension through an image challenge that takes tens of seconds, so the
+# Turnstile-sized bound would cut nearly every solve.
+_HCAPTCHA_ARM_TIMEOUT_SECONDS = 90
 # A correct solver task returns in ~25s, so this covers one with headroom while cutting the losing task
 # of the pair, which only ends at its own 180s timeout.
 _TOKEN_ARM_TIMEOUT_SECONDS = 90
 _WIDGET_RESET_TIMEOUT_SECONDS = 3
+# Sum of the bounded arms on a non-hCaptcha page (anchor 5 + reset 3 + extension 12 + token 90); the token
+# arm is clamped to what remains so a 90s hCaptcha extension arm cannot push the bounded arms past the v3
+# tool's 120s ceiling. On a page carrying both hCaptcha and reCAPTCHA markers the token arm may therefore
+# get less than a full solve needs; hCaptcha is the visible gate there.
+_LADDER_BUDGET_SECONDS = 110
 # Google's widget flips aria-checked after its own animation; a shorter wait reads as unsolved.
 _RECAPTCHA_ANCHOR_SETTLE_MS = 2_000
 _CAPTCHA_CONTINUE_SELECTOR = ", ".join(
@@ -130,6 +143,7 @@ async def solve_challenge_ladder(
     callers do not re-perceive a page nothing touched. Raises CaptchaChallengeUnsolvedError when a
     challenge was present but no arm resolved it.
     """
+    start = time.monotonic()
     checkbox = page.locator(_CAPTCHA_CHECKBOX_SELECTOR)
     checkbox_count = await _bounded_locator_count(checkbox)
     marker = page.locator(_CAPTCHA_MARKER_SELECTOR)
@@ -223,8 +237,10 @@ async def solve_challenge_ladder(
         except Exception:
             LOG.info("CAPTCHA widget reset did not run", arm="recaptcha_anchor_frame")
 
+    hcaptcha_present = await _bounded_locator_count(page.locator(_HCAPTCHA_MARKER_SELECTOR)) > 0
+    extension_timeout = _HCAPTCHA_ARM_TIMEOUT_SECONDS if hcaptcha_present else _EXTENSION_ARM_TIMEOUT_SECONDS
     try:
-        async with asyncio.timeout(_EXTENSION_ARM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(extension_timeout):
             if await app.AGENT_FUNCTION.auto_solve_captchas(page):
                 return True
     except Exception:
@@ -232,16 +248,21 @@ async def solve_challenge_ladder(
 
     recaptcha = page.locator(_RECAPTCHA_MARKER_SELECTOR)
     if await _bounded_locator_count(recaptcha) > 0:
-        try:
-            async with asyncio.timeout(_TOKEN_ARM_TIMEOUT_SECONDS):
-                if await app.AGENT_FUNCTION.solve_recaptcha_token(
-                    page,
-                    organization_id=organization_id,
-                    workflow_run_id=workflow_run_id,
-                    browser_session_id=browser_session_id,
-                ):
-                    return True
-        except Exception:
-            LOG.info("CAPTCHA token arm did not solve", arm="token")
+        remaining = _LADDER_BUDGET_SECONDS - (time.monotonic() - start)
+        token_timeout = min(_TOKEN_ARM_TIMEOUT_SECONDS, remaining)
+        if token_timeout <= 0:
+            LOG.info("CAPTCHA token arm skipped: ladder budget exhausted", arm="token")
+        else:
+            try:
+                async with asyncio.timeout(token_timeout):
+                    if await app.AGENT_FUNCTION.solve_recaptcha_token(
+                        page,
+                        organization_id=organization_id,
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    ):
+                        return True
+            except Exception:
+                LOG.info("CAPTCHA token arm did not solve", arm="token")
 
     raise CaptchaChallengeUnsolvedError("CAPTCHA could not be solved.")

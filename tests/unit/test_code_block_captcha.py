@@ -11,6 +11,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockCaptchaError
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
+from skyvern.webeye.utils.captcha_solver import CaptchaChallengeUnsolvedError, solve_challenge_ladder
 
 
 class FakeLocator:
@@ -86,6 +87,8 @@ class FakePage:
         *,
         checkbox: bool = False,
         recaptcha: bool = False,
+        hcaptcha: bool = False,
+        turnstile: bool = False,
         token_values: list[str] | None = None,
         frames: list[FakeFrame] | None = None,
         url: str = "https://app.example/login",
@@ -95,6 +98,8 @@ class FakePage:
         self.recaptcha_token = FakeLocator(count=1 if token_values is not None else 0, input_values=token_values)
         self.continue_button = FakeLocator(count=1 if checkbox else 0)
         self.continue_button.click = AsyncMock(side_effect=self._continue)
+        self.hcaptcha_marker = FakeLocator(count=1 if hcaptcha else 0)
+        self.marker = FakeLocator(count=1 if (recaptcha or hcaptcha or turnstile) else 0)
         self.frames = list(frames or [])
         self.url = url
         self.evaluated: list[str] = []
@@ -110,6 +115,10 @@ class FakePage:
             return self.checkbox
         if "button" in selector:
             return self.continue_button
+        if selector == captcha_solver_module._HCAPTCHA_MARKER_SELECTOR:
+            return self.hcaptcha_marker
+        if selector == captcha_solver_module._CAPTCHA_MARKER_SELECTOR:
+            return self.marker
         return self.challenge
 
     async def wait_for_timeout(self, _milliseconds: int) -> None:
@@ -643,3 +652,114 @@ async def test_an_anchor_click_that_left_a_token_is_not_reset_away(monkeypatch: 
         await block_module._code_block_solve_captcha_builtin(page, organization_id="org-1")
 
     assert not any("grecaptcha" in expression for expression in page.evaluated)
+
+
+@pytest.mark.asyncio
+async def test_hcaptcha_marker_reaches_extension_arm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page whose only marker is an hCaptcha iframe must still reach the extension arm.
+
+    Before hCaptcha markers were recognized, the initial probe saw no known marker and the ladder
+    returned False without ever awaiting the solver.
+    """
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=True),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(hcaptcha=True)
+
+    assert await solve_challenge_ladder(page) is True
+    agent_function.auto_solve_captchas.assert_awaited_once_with(page)
+
+
+@pytest.mark.asyncio
+async def test_hcaptcha_arm_bound_cuts_extension_before_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The extension arm's timeout must switch on the hCaptcha marker, not stay at the Turnstile-sized
+    default: a slow hCaptcha solve inside the hCaptcha bound must survive, but the same slowness on a
+    non-hCaptcha page must be cut by the shorter default."""
+    monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 5)
+
+    async def slow_solve(_page: FakePage) -> bool:
+        await asyncio.sleep(1.0)
+        return True
+
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    hcaptcha_page = FakePage(hcaptcha=True)
+    with pytest.raises(CaptchaChallengeUnsolvedError):
+        await solve_challenge_ladder(hcaptcha_page)
+
+    turnstile_page = FakePage(turnstile=True)
+    assert await solve_challenge_ladder(turnstile_page) is True
+
+
+@pytest.mark.asyncio
+async def test_extension_arm_bound_falls_back_to_default_when_no_hcaptcha_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the above with the timeouts swapped: the hCaptcha marker must still be what selects
+    the longer bound, not incidental ordering."""
+    monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.05)
+
+    async def slow_solve(_page: FakePage) -> bool:
+        await asyncio.sleep(1.0)
+        return True
+
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+
+    hcaptcha_page = FakePage(hcaptcha=True)
+    assert await solve_challenge_ladder(hcaptcha_page) is True
+
+    turnstile_page = FakePage(turnstile=True)
+    with pytest.raises(CaptchaChallengeUnsolvedError):
+        await solve_challenge_ladder(turnstile_page)
+
+
+@pytest.mark.asyncio
+async def test_token_arm_skipped_when_ladder_budget_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slow hCaptcha extension arm on a mixed-vendor page must not leave enough of the ladder's fixed
+    budget for the token arm to still run at its full timeout."""
+    monkeypatch.setattr(captcha_solver_module, "_LADDER_BUDGET_SECONDS", 0.1)
+    monkeypatch.setattr(captcha_solver_module, "_HCAPTCHA_ARM_TIMEOUT_SECONDS", 0.2)
+
+    async def slow_solve(_page: FakePage) -> bool:
+        await asyncio.sleep(0.25)
+        return False
+
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(side_effect=slow_solve),
+            "solve_recaptcha_token": AsyncMock(return_value=True),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    page = FakePage(hcaptcha=True, recaptcha=True)
+
+    with pytest.raises(CaptchaChallengeUnsolvedError):
+        await solve_challenge_ladder(page)
+
+    agent_function.solve_recaptcha_token.assert_not_awaited()

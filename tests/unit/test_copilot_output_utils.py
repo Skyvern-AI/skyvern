@@ -298,6 +298,11 @@ def test_sanitize_build_test_packet_projection_failure_keeps_tool_result_availab
                 "workflow_run_id": "wr_1",
                 "overall_status": "failed",
                 "build_test_packet": packet,
+                "authoring_repair_context": {
+                    "page_obstruction_summaries": ["modal_overlay #gate"],
+                    "page_obstructions": [{"kind": "modal_overlay", "visible_controls": []}],
+                    "page_obstruction_omission_notices": ["structured facts shortened"],
+                },
             },
         },
     )
@@ -306,6 +311,30 @@ def test_sanitize_build_test_packet_projection_failure_keeps_tool_result_availab
     assert sanitized["data"]["overall_status"] == "failed"
     assert "build_test_packet" not in sanitized["data"]
     assert sanitized["data"]["build_test_packet_omitted"] == "The internal packet projection failed."
+    assert sanitized["data"]["authoring_repair_context"] == {"page_obstruction_summaries": ["modal_overlay #gate"]}
+
+
+def test_sanitize_build_test_packet_validation_failure_does_not_expose_structured_repair_copy() -> None:
+    sanitized = sanitize_tool_result_for_llm(
+        "run_blocks_and_collect_debug",
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_1",
+                "overall_status": "failed",
+                "build_test_packet": {"contract_version": "unknown"},
+                "authoring_repair_context": {
+                    "page_obstruction_summaries": ["modal_overlay #gate"],
+                    "page_obstructions": [{"kind": "modal_overlay", "visible_controls": []}],
+                    "page_obstruction_omission_notices": ["structured facts shortened"],
+                },
+            },
+        },
+    )
+
+    assert "build_test_packet" not in sanitized["data"]
+    assert sanitized["data"]["build_test_packet_omitted"] == "The internal packet failed typed validation."
+    assert sanitized["data"]["authoring_repair_context"] == {"page_obstruction_summaries": ["modal_overlay #gate"]}
 
 
 def test_sanitize_run_blocks_debug_preserves_post_run_page_evidence() -> None:
