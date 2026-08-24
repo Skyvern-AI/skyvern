@@ -1,4 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 
 import {
   upsertDraftSteps,
@@ -9,6 +11,10 @@ import {
   type RecordingDraftStep,
   type RecordingInterpretationUpdate,
 } from "./useRecordingStore";
+
+vi.mock("@/util/recordBrowserTelemetry", () => ({
+  captureRecordBrowser: vi.fn(),
+}));
 
 let seq = 0;
 function opt(kind: OptimisticActionKind = "click"): OptimisticStep {
@@ -65,6 +71,8 @@ const store = () => useRecordingStore.getState();
 
 beforeEach(() => {
   store().reset();
+  store().setRecordingTransport("vnc");
+  vi.clearAllMocks();
 });
 
 describe("addOptimisticStep", () => {
@@ -187,6 +195,66 @@ describe("commit safety and resets", () => {
     const second = store().recordingAttemptId;
     expect(second).toBeTruthy();
     expect(second).not.toBe(first);
+  });
+
+  it("reports the selected transport when recording starts", () => {
+    store().setRecordingTransport("cdp");
+
+    store().setIsRecording(true, {
+      workflowPermanentId: "wpid-1",
+      browserSessionId: "pbs-1",
+    });
+
+    expect(captureRecordBrowser).toHaveBeenCalledWith(
+      "record_browser.started",
+      expect.objectContaining({ transport: "cdp" }),
+    );
+  });
+
+  it("preserves the selected transport for the next recording after reset", () => {
+    store().setRecordingTransport("cdp");
+    store().setIsRecording(true);
+    store().setIsRecording(false);
+    store().reset();
+    vi.mocked(captureRecordBrowser).mockClear();
+
+    store().setIsRecording(true);
+
+    expect(captureRecordBrowser).toHaveBeenCalledWith(
+      "record_browser.started",
+      expect.objectContaining({ transport: "cdp" }),
+    );
+  });
+
+  it("reports unfinished resets as abandoned but excludes finish and cancel paths", () => {
+    store().setRecordingTransport("cdp");
+    store().setIsRecording(true);
+    vi.mocked(captureRecordBrowser).mockClear();
+
+    store().reset();
+
+    expect(captureRecordBrowser).toHaveBeenCalledWith(
+      "record_browser.abandoned",
+      expect.objectContaining({ transport: "cdp" }),
+    );
+
+    store().setIsRecording(true);
+    store().requestFinish();
+    vi.mocked(captureRecordBrowser).mockClear();
+    store().reset();
+    expect(captureRecordBrowser).not.toHaveBeenCalledWith(
+      "record_browser.abandoned",
+      expect.anything(),
+    );
+
+    store().setIsRecording(true);
+    store().setIsRecording(false);
+    vi.mocked(captureRecordBrowser).mockClear();
+    store().reset();
+    expect(captureRecordBrowser).not.toHaveBeenCalledWith(
+      "record_browser.abandoned",
+      expect.anything(),
+    );
   });
 });
 

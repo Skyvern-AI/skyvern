@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
+import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
 import {
   markCommit,
@@ -31,6 +32,7 @@ import {
   streamReconnectDelayMs,
 } from "@/routes/streaming/streamLifecycle";
 import { useSettingsStore } from "@/store/SettingsStore";
+import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -90,6 +92,8 @@ interface Props {
   enableUrlInput?: boolean;
   // Passing this hands the window frame to the caller (see InteractiveStreamView).
   onFrameWidthChange?: (width: number | null) => void;
+  exfiltrate?: boolean;
+  workflowPermanentId?: string | null;
 }
 
 function BrowserSessionStream({
@@ -103,6 +107,8 @@ function BrowserSessionStream({
   forceCdp = false,
   enableUrlInput = false,
   onFrameWidthChange,
+  exfiltrate,
+  workflowPermanentId,
 }: Props) {
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamImgToken, setStreamImgToken] = useState<number>(0);
@@ -116,6 +122,15 @@ function BrowserSessionStream({
   const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
+  const streamImgSrcRef = useRef("");
+  const exfiltrateRef = useRef(!!exfiltrate);
+  const recordingFrameCountRef = useRef(0);
+  const recordingFpsSamplesRef = useRef<number[]>([]);
+  const recordingHealthFlushTimerRef = useRef<number | null>(null);
+  const recordingHealthEndedRef = useRef(false);
+  const recordingOwnsControlRef = useRef(false);
+  const previousControlExfiltrateRef = useRef(false);
+  const previousInputReadyRef = useRef(false);
   const onActivityRef = useRef(onActivity);
   const hasFrameRef = useRef(false);
   const pendingFrameRef = useRef<{
@@ -128,10 +143,92 @@ function BrowserSessionStream({
   const reconnectAttemptsRef = useRef(0);
   const streamFinishedRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recordingReconnectTimerRef = useRef<ReturnType<
+    typeof setTimeout
+  > | null>(null);
+  const recordingChannelDisconnectedRef = useRef(false);
+  const [recordingReconnectTrigger, setRecordingReconnectTrigger] = useState(0);
   // Why the stream stopped, when the server told us before closing. Survives into
   // the close handler so a reconnect notice augments that reason instead of
   // replacing it with a generic "closed with code 1000".
   const streamEndedDiagnosticRef = useRef<StreamDiagnostic | null>(null);
+  exfiltrateRef.current = !!exfiltrate;
+
+  const scheduleRecordingReconnect = useCallback(() => {
+    if (recordingReconnectTimerRef.current) {
+      return;
+    }
+    recordingReconnectTimerRef.current = setTimeout(() => {
+      recordingReconnectTimerRef.current = null;
+      if (exfiltrateRef.current) {
+        setRecordingReconnectTrigger((trigger) => trigger + 1);
+      }
+    }, 1000);
+  }, []);
+
+  const handleRecordingConnectionChange = useCallback(
+    (connected: boolean, event?: CloseEvent) => {
+      if (connected) {
+        recordingChannelDisconnectedRef.current = false;
+        if (recordingReconnectTimerRef.current) {
+          clearTimeout(recordingReconnectTimerRef.current);
+          recordingReconnectTimerRef.current = null;
+        }
+        return;
+      }
+      if (!event) {
+        return;
+      }
+      recordingChannelDisconnectedRef.current = true;
+      if (exfiltrateRef.current) {
+        scheduleRecordingReconnect();
+      }
+    },
+    [scheduleRecordingReconnect],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (recordingReconnectTimerRef.current) {
+        clearTimeout(recordingReconnectTimerRef.current);
+      }
+    };
+  }, []);
+
+  const recordingChannelEnabled = exfiltrate !== undefined;
+  const { isMessageConnected, sendCommand: sendRecordingCommand } =
+    useRecordingMessageChannel({
+      browserSessionId,
+      enabled: recordingChannelEnabled,
+      exfiltrate: !!exfiltrate,
+      workflowPermanentId: workflowPermanentId ?? null,
+      getFrameDataUrl: () =>
+        streamImgSrcRef.current
+          ? `data:image/${streamFormat};base64,${streamImgSrcRef.current}`
+          : null,
+      clipboard: "message",
+      reconnectTrigger: recordingReconnectTrigger,
+      onConnectionChange: handleRecordingConnectionChange,
+    });
+
+  useEffect(() => {
+    if (
+      exfiltrate &&
+      !isMessageConnected &&
+      recordingChannelDisconnectedRef.current
+    ) {
+      scheduleRecordingReconnect();
+    }
+  }, [exfiltrate, isMessageConnected, scheduleRecordingReconnect]);
+  const onClipboardPaste = useCallback(
+    (text: string) => {
+      sendRecordingCommand({ kind: "clipboard-paste", text });
+    },
+    [sendRecordingCommand],
+  );
+  const onClipboardCopy = useCallback(() => {
+    sendRecordingCommand({ kind: "clipboard-copy" });
+  }, [sendRecordingCommand]);
 
   // The CDP input socket must be wired whenever the stream can be controlled,
   // whether by default interaction or via the take-control button.
@@ -155,11 +252,89 @@ function BrowserSessionStream({
     interactive: controllable,
     viewportWidth,
     viewportHeight,
+    onClipboardPaste:
+      exfiltrate && isMessageConnected ? onClipboardPaste : undefined,
+    onClipboardCopy:
+      exfiltrate && isMessageConnected ? onClipboardCopy : undefined,
   });
+
+  useEffect(() => {
+    const recordingStarted =
+      !!exfiltrate && !previousControlExfiltrateRef.current;
+    const recordingEnded = !exfiltrate && previousControlExfiltrateRef.current;
+    const inputBecameReady = inputReady && !previousInputReadyRef.current;
+
+    if (recordingStarted) {
+      recordingOwnsControlRef.current = !userIsControlling;
+      setUserIsControlling(true);
+    } else if (exfiltrate && inputBecameReady) {
+      setUserIsControlling(true);
+    } else if (recordingEnded) {
+      if (recordingOwnsControlRef.current) {
+        setUserIsControlling(false);
+      }
+      recordingOwnsControlRef.current = false;
+    }
+
+    previousControlExfiltrateRef.current = !!exfiltrate;
+    previousInputReadyRef.current = inputReady;
+  }, [exfiltrate, inputReady, setUserIsControlling, userIsControlling]);
 
   useEffect(() => {
     onActivityRef.current = onActivity;
   }, [onActivity]);
+
+  useEffect(() => {
+    if (!exfiltrate) {
+      recordingHealthEndedRef.current = true;
+      return;
+    }
+
+    if (recordingHealthFlushTimerRef.current !== null) {
+      if (!recordingHealthEndedRef.current) {
+        window.clearTimeout(recordingHealthFlushTimerRef.current);
+      }
+      recordingHealthFlushTimerRef.current = null;
+    }
+    recordingHealthEndedRef.current = false;
+    recordingFrameCountRef.current = 0;
+    recordingFpsSamplesRef.current = [];
+    let sampleStartedAtMs = Date.now();
+    const recordSample = (ensureSample: boolean) => {
+      const now = Date.now();
+      const elapsedSeconds = (now - sampleStartedAtMs) / 1000;
+      if (elapsedSeconds > 0) {
+        recordingFpsSamplesRef.current.push(
+          recordingFrameCountRef.current / elapsedSeconds,
+        );
+      } else if (ensureSample && recordingFpsSamplesRef.current.length === 0) {
+        recordingFpsSamplesRef.current.push(0);
+      }
+      recordingFrameCountRef.current = 0;
+      sampleStartedAtMs = now;
+    };
+    const interval = window.setInterval(() => recordSample(false), 30_000);
+
+    return () => {
+      window.clearInterval(interval);
+      recordSample(true);
+      const samples = [...recordingFpsSamplesRef.current];
+      recordingFpsSamplesRef.current = [];
+      const flushTimer = window.setTimeout(() => {
+        captureRecordBrowser("record_browser.cdp_stream_health", {
+          fps_avg:
+            samples.reduce((total, sample) => total + sample, 0) /
+            samples.length,
+          fps_min: Math.min(...samples),
+          sample_count: samples.length,
+        });
+        if (recordingHealthFlushTimerRef.current === flushTimer) {
+          recordingHealthFlushTimerRef.current = null;
+        }
+      }, 0);
+      recordingHealthFlushTimerRef.current = flushTimer;
+    };
+  }, [exfiltrate]);
 
   useEffect(() => startDebugReport(), []);
 
@@ -173,6 +348,7 @@ function BrowserSessionStream({
 
   useEffect(() => {
     let cancelled = false;
+    streamImgSrcRef.current = "";
     setStreamImgSrc("");
     setStreamFormat("png");
     setViewportWidth(1280);
@@ -260,6 +436,9 @@ function BrowserSessionStream({
             }
           };
           if (message.screenshot) {
+            if (exfiltrateRef.current) {
+              recordingFrameCountRef.current += 1;
+            }
             hasFrameRef.current = true;
             reconnectAttemptsRef.current = 0;
             streamEndedDiagnosticRef.current = null;
@@ -276,6 +455,7 @@ function BrowserSessionStream({
                 if (!pending || !isCurrentSocket()) return;
                 pendingFrameRef.current = null;
                 lastCommittedTokenRef.current = pending.token;
+                streamImgSrcRef.current = pending.screenshot;
                 setStreamImgSrc(pending.screenshot);
                 setStreamImgToken(pending.token);
                 applyMetadata(pending.message);
@@ -312,6 +492,7 @@ function BrowserSessionStream({
             // screenshot covering the status panel.
             clearPendingFrame();
             hasFrameRef.current = false;
+            streamImgSrcRef.current = "";
             setStreamImgSrc("");
             // Only a terminal status forecloses reconnecting; a live session whose
             // screencast ended is exactly the case worth redialling.
@@ -373,6 +554,7 @@ function BrowserSessionStream({
             reconnectAttemptsRef.current > STREAM_STALE_FRAME_AFTER_ATTEMPTS
           ) {
             hasFrameRef.current = false;
+            streamImgSrcRef.current = "";
             setStreamImgSrc("");
           }
           if (!hasFrameRef.current) {
@@ -396,6 +578,7 @@ function BrowserSessionStream({
           // Out of retries with nothing live behind the last frame: say so instead
           // of leaving that frame up as if it were current.
           hasFrameRef.current = false;
+          streamImgSrcRef.current = "";
           setStreamImgSrc("");
           setDiagnostic(
             diagnosticForReconnectExhausted(BROWSER_SESSION_STREAM_SUBJECT),
@@ -454,7 +637,7 @@ function BrowserSessionStream({
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
         containerRef={containerRef}
-        showControlButtons={showControlButtons}
+        showControlButtons={showControlButtons && !exfiltrate}
         handlers={handlers}
         currentUrl={currentUrl}
         centered={centered}
