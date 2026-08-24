@@ -4,6 +4,7 @@ import hmac
 import json
 import re
 import secrets
+from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 
@@ -74,7 +75,18 @@ def _form_of(value: object) -> str:
     return type(value).__name__
 
 
-def redact_proxy_location(value: object) -> str:
+class RedactedProxyLogValue(str):
+    """A proxy value already rendered safely for logs and traces."""
+
+
+class ProxyObservabilityField(StrEnum):
+    PROXY_LOCATION = "proxy_location"
+    PROXY_URL = "proxy_url"
+    PROXY_HOST = "proxy_host"
+    GEO_TARGET = "geo_target"
+
+
+def redact_proxy_location(value: object) -> RedactedProxyLogValue:
     """A proxy_location named for a log line, never rendered into one.
 
     Only values a type or a closed character class proves cannot hold a credential are printed:
@@ -88,15 +100,27 @@ def redact_proxy_location(value: object) -> str:
     value's length or contents is emitted alongside it.
     """
     if isinstance(value, ProxyLocation):
-        return value.value
+        return RedactedProxyLogValue(value.value)
     if isinstance(value, GeoTarget):
         # NOT safe wholesale: city takes 100 characters of free text and subdivision 10, so a
         # validated GeoTarget can carry a URL. country is pinned to a supported set, so it is the
         # only field of it that can be shown.
-        return f"geo_target:{value.country}:{_identify(value)}"
+        return RedactedProxyLogValue(f"geo_target:{value.country}:{_identify(value)}")
     if isinstance(value, str) and _ENUM_SHAPED_RE.fullmatch(value):
-        return value
-    return f"{_form_of(value)}:{_identify(value)}"
+        return RedactedProxyLogValue(value)
+    return RedactedProxyLogValue(f"{_form_of(value)}:{_identify(value)}")
+
+
+def render_proxy_observability_value(
+    field: ProxyObservabilityField,
+    value: object,
+) -> RedactedProxyLogValue:
+    """Render a value according to its semantic proxy field family."""
+    if field is ProxyObservabilityField.PROXY_LOCATION:
+        return redact_proxy_location(value)
+    if field is ProxyObservabilityField.GEO_TARGET and isinstance(value, GeoTarget):
+        return RedactedProxyLogValue(f"geo_target:{value.country}:{_identify(value)}")
+    return RedactedProxyLogValue(f"{field.value}:{_identify(value)}")
 
 
 def should_generate_proxy_session_id(proxy_location: object | None) -> bool:
