@@ -18,21 +18,24 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltrationChannel,
     PageConsoleCapture,
 )
+from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannelContext
 
 
-def _make_vnc_channel() -> MagicMock:
+def _make_context() -> MagicMock:
     browser_session = MagicMock()
     browser_session.browser_address = "http://localhost:9222"
     browser_session.persistent_browser_session_id = "pbs_123"
 
-    vnc_channel = MagicMock()
-    vnc_channel.browser_session = browser_session
-    vnc_channel.identity = {
+    context = MagicMock()
+    context.organization_id = "org_123"
+    context.x_api_key = "api-key-123"
+    context.browser_session = browser_session
+    context.identity = {
         "client_id": "client-1",
         "browser_session_id": browser_session.persistent_browser_session_id,
     }
 
-    return vnc_channel
+    return context
 
 
 def _make_event_data() -> dict[str, object]:
@@ -65,7 +68,7 @@ def _make_page(url: str = "https://example.com") -> MagicMock:
 
 def _make_channel(on_event: MagicMock | None = None) -> tuple[ExfiltrationChannel, MagicMock]:
     event_callback = on_event or MagicMock()
-    return ExfiltrationChannel(on_event=event_callback, vnc_channel=_make_vnc_channel()), event_callback
+    return ExfiltrationChannel(on_event=event_callback, context=_make_context()), event_callback
 
 
 @pytest.fixture(autouse=True)
@@ -788,7 +791,7 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
     """
     import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
 
-    state = SimpleNamespace(start_calls=0, pws=[], browsers=[])
+    state = SimpleNamespace(start_calls=0, pws=[], browsers=[], connections=[])
 
     def _make_pw() -> _FakePw:
         state.start_calls += 1
@@ -802,6 +805,7 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
     async def _fake_connect(pw: object, url: str, headers: dict | None = None, **kwargs: object) -> _FakePwBrowser:
         browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
         state.browsers.append(browser)
+        state.connections.append((url, headers))
         return browser
 
     monkeypatch.setattr(cdp_mod, "async_playwright", _fake_async_playwright)
@@ -810,6 +814,38 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
 
 
 class TestExfiltrationChannelLifecycle:
+    @pytest.mark.asyncio
+    async def test_message_channel_context_connects_like_vnc_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
+
+        monkeypatch.setattr(cdp_mod.settings, "ENV", "local")
+        monkeypatch.setenv("LOCAL_CDP_HOST_PORT", "9224")
+        state = _patch_pw_stack(monkeypatch)
+
+        vnc_context = _make_context()
+        backing_message_channel = MagicMock()
+        backing_message_channel.organization_id = vnc_context.organization_id
+        backing_message_channel.browser_session = vnc_context.browser_session
+        backing_message_channel.identity = dict(vnc_context.identity)
+        message_context = MessageChannelContext(
+            message_channel=backing_message_channel,
+            x_api_key=vnc_context.x_api_key,
+        )
+        vnc_channel = ExfiltrationChannel(on_event=lambda _events: None, context=vnc_context)
+        message_channel = ExfiltrationChannel(on_event=lambda _events: None, context=message_context)
+
+        await vnc_channel.connect()
+        await message_channel.connect()
+
+        expected_connection = (
+            "http://localhost:9224",
+            {"x-api-key": "api-key-123", "X-Session-Id": "pbs_123"},
+        )
+        assert state.connections == [expected_connection, expected_connection]
+
+        await vnc_channel.stop()
+        await message_channel.stop()
+
     def test_js_asset_cache_is_keyed_by_file_not_instance(self) -> None:
         from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
 
@@ -829,8 +865,10 @@ class TestExfiltrationChannelLifecycle:
     def test_using_js_does_not_pin_channel_instance(self) -> None:
         # A cycle-free vnc stand-in so the channel is reclaimed by refcounting the
         # moment the JS cache stops pinning it (a MagicMock carries internal cycles).
-        vnc_channel = SimpleNamespace(identity={"client_id": "c"}, browser_session=None, x_api_key=None)
-        channel = ExfiltrationChannel(on_event=lambda _events: None, vnc_channel=vnc_channel)  # type: ignore[arg-type]
+        context = SimpleNamespace(
+            identity={"client_id": "c"}, organization_id="org_123", browser_session=None, x_api_key="api-key-123"
+        )
+        channel = ExfiltrationChannel(on_event=lambda _events: None, context=context)  # type: ignore[arg-type]
 
         channel.js("exfiltrate")
         ref = weakref.ref(channel)
