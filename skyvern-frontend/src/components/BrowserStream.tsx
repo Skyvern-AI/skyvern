@@ -5,9 +5,8 @@ import _RFB, { type RfbEvent } from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
 import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
-import { useEffect, useMemo, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useShallow } from "zustand/react/shallow";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -15,25 +14,22 @@ import {
   type TaskApiResponse,
   type WorkflowRunStatusApiResponse,
 } from "@/api/types";
+import { RecordingPill } from "@/components/RecordingPill";
 import { Tip } from "@/components/Tip";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useRecordingElapsedSeconds } from "@/hooks/useRecordingElapsedSeconds";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
-import {
-  useRecordingStore,
-  countVisibleDraftSteps,
-} from "@/store/useRecordingStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
-import { formatRecordingClock } from "@/util/recordingClock";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
 import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
+import { streamReconnectDelayMs } from "@/routes/streaming/streamLifecycle";
 import {
   handleVncClipboardPasteShortcut,
   type HeldMetaSides,
@@ -47,6 +43,7 @@ installNoVncGestureCrashGuard();
 
 const MESSAGE_RECONNECT_DELAY_MS = 1000;
 const MESSAGE_MAX_RECONNECT_ATTEMPTS = 20;
+const VNC_MAX_RECONNECT_ATTEMPTS = 8;
 const STREAM_GAVE_UP_DIAGNOSTIC: StreamDiagnostic = {
   title: "Browser stream connection lost",
   detail:
@@ -105,68 +102,6 @@ function applyVncStreamProfile(
   }
   rfb.compressionLevel = 2;
   rfb.qualityLevel = 6;
-}
-
-function RecordingPill() {
-  const {
-    finishRequested,
-    manualCapturePaused,
-    draftSteps,
-    deletedStepIds,
-    exposedEventCount,
-    optimisticStepCount,
-    interpretationEnabled,
-  } = useRecordingStore(
-    useShallow((state) => ({
-      finishRequested: state.finishRequested,
-      manualCapturePaused: state.manualCapturePaused,
-      draftSteps: state.draftSteps,
-      deletedStepIds: state.deletedStepIds,
-      exposedEventCount: state.exposedEventCount,
-      optimisticStepCount: state.optimisticSteps.length,
-      interpretationEnabled: state.workflowPermanentId !== null,
-    })),
-  );
-
-  const interpretedStepCount = useMemo(
-    () => countVisibleDraftSteps(draftSteps, deletedStepIds),
-    [draftSteps, deletedStepIds],
-  );
-  const elapsedSeconds = useRecordingElapsedSeconds();
-  // Show interpreted + optimistic steps whenever interpretation is enabled, not
-  // just after the first snapshot arrives — otherwise the first step waits a
-  // backend round-trip even though the optimistic placeholder is already local.
-  const count = interpretationEnabled
-    ? interpretedStepCount + optimisticStepCount
-    : exposedEventCount;
-
-  const paused = manualCapturePaused && !finishRequested;
-
-  return (
-    <div
-      className={cn(
-        "inline-flex h-6 items-center gap-2 rounded-full border px-3 text-xs font-semibold tabular-nums",
-        paused
-          ? "border-amber-500/50 bg-amber-950 text-amber-200"
-          : "border-red-500/50 bg-red-950 text-red-200",
-      )}
-    >
-      <span
-        className={cn("h-2 w-2 rounded-full", {
-          "bg-amber-500": paused,
-          "bg-red-500": !paused,
-          "animate-pulse": !finishRequested && !paused,
-          "opacity-50": finishRequested,
-        })}
-      />
-      {finishRequested ? "FINISHING" : paused ? "PAUSED" : "REC"}{" "}
-      {formatRecordingClock(elapsedSeconds)}
-      <span className={paused ? "text-amber-400/80" : "text-red-400/80"}>
-        ·
-      </span>
-      {count}
-    </div>
-  );
 }
 
 function BrowserStream({
@@ -267,6 +202,10 @@ function BrowserStream({
     right: false,
   });
   const observerRef = useRef<MutationObserver | null>(null);
+  const vncReconnectAttemptsRef = useRef(0);
+  const vncReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const messageReconnectAttemptsRef = useRef(0);
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -351,6 +290,11 @@ function BrowserStream({
     if (messageReconnectTimerRef.current) {
       clearTimeout(messageReconnectTimerRef.current);
       messageReconnectTimerRef.current = null;
+    }
+    vncReconnectAttemptsRef.current = 0;
+    if (vncReconnectTimerRef.current) {
+      clearTimeout(vncReconnectTimerRef.current);
+      vncReconnectTimerRef.current = null;
     }
     if (rfbRef.current) {
       rfbRef.current.disconnect();
@@ -549,6 +493,7 @@ function BrowserStream({
           setIsVncConnected(true);
           setTerminalDiagnostic(null);
           messageReconnectAttemptsRef.current = 0;
+          vncReconnectAttemptsRef.current = 0;
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
@@ -556,7 +501,22 @@ function BrowserStream({
           didDisconnect = true;
           setIsVncConnected(false);
           setIsCanvasReady(false);
-          setVncDisconnectedTrigger((x) => x + 1);
+          // Exponential backoff with jitter, capped attempts: a session with no
+          // reachable VNC endpoint dies in ~150ms per dial, and an immediate
+          // retrigger hammered the API at ~4 dials/second.
+          if (vncReconnectAttemptsRef.current < VNC_MAX_RECONNECT_ATTEMPTS) {
+            const delay = streamReconnectDelayMs(
+              vncReconnectAttemptsRef.current,
+            );
+            vncReconnectAttemptsRef.current += 1;
+            vncReconnectTimerRef.current = setTimeout(
+              () => {
+                vncReconnectTimerRef.current = null;
+                setVncDisconnectedTrigger((x) => x + 1);
+              },
+              delay + Math.random() * delay * 0.5,
+            );
+          }
           onClose?.();
           const clean = Boolean(e.detail?.clean);
           setTerminalDiagnostic(
@@ -579,6 +539,11 @@ function BrowserStream({
 
       return () => {
         cancelled = true;
+        // Every re-run redials via setupVnc, so a pending retry is redundant.
+        if (vncReconnectTimerRef.current) {
+          clearTimeout(vncReconnectTimerRef.current);
+          vncReconnectTimerRef.current = null;
+        }
         if (observerRef.current) {
           observerRef.current.disconnect();
           observerRef.current = null;

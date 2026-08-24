@@ -723,6 +723,172 @@ describe("CredentialsModal edit-mode inline test", () => {
   }, 15_000);
 });
 
+describe("CredentialsModal edit-mode password preservation", () => {
+  const noPasswordLabel = "This login has no password";
+
+  it("omits password from the overwrite payload when the field is left untouched", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    const usernameInput = screen.getByDisplayValue("user@example.com");
+    fireEvent.change(usernameInput, {
+      target: { value: "renamed@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            username: "renamed@example.com",
+          }),
+        }),
+      );
+    });
+    const submitted = postMock.mock.calls[0]?.[1] as {
+      credential: Record<string, unknown>;
+    };
+    expect(submitted.credential).not.toHaveProperty("password");
+  }, 10_000);
+
+  it("sends an empty password only when the no-password box is checked", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.click(screen.getByRole("checkbox", { name: noPasswordLabel }));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({ password: "" }),
+        }),
+      );
+    });
+  }, 10_000);
+
+  it("still sends a re-entered password on the overwrite", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.change(screen.getByPlaceholderText("••••••••"), {
+      target: { value: "rotated-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            password: "rotated-password",
+          }),
+        }),
+      );
+    });
+  }, 10_000);
+
+  it("hides the no-password box until the values group is opened", () => {
+    renderEditPasswordCredentialsModal();
+
+    expect(
+      screen.queryByRole("checkbox", { name: noPasswordLabel }),
+    ).toBeNull();
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    expect(
+      screen.getByRole("checkbox", { name: noPasswordLabel }),
+    ).toBeTruthy();
+  });
+
+  it("does not offer the no-password box on create, where a blank field already means none", async () => {
+    renderPasswordCredentialsModal();
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    expect(
+      screen.queryByRole("checkbox", { name: noPasswordLabel }),
+    ).toBeNull();
+  });
+});
+
+describe("CredentialsModal password-less inline test", () => {
+  it("enables Test on a create-mode credential with no password", async () => {
+    renderPasswordCredentialsModal();
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("credentials")).toBeTruthy();
+    });
+    const usernameInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("input"),
+    ).find(
+      (input) =>
+        input.type === "text" && input.value === "" && input.placeholder === "",
+    );
+    fireEvent.change(usernameInput as HTMLInputElement, {
+      target: { value: "user@example.com" },
+    });
+    fireEvent.click(
+      screen.getByLabelText("Save browser session for future logins"),
+    );
+    fireEvent.change(screen.getByPlaceholderText("https://example.com/login"), {
+      target: { value: "https://example.com/login" },
+    });
+
+    const testButton = screen.getByRole("button", {
+      name: "Test",
+    }) as HTMLButtonElement;
+    expect(testButton.disabled).toBe(false);
+
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "temp-cred-id", workflow_run_id: "wr-1" },
+    });
+    fireEvent.click(testButton);
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/test-login",
+        expect.objectContaining({
+          username: "user@example.com",
+          password: "",
+        }),
+      );
+    });
+  }, 10_000);
+
+  it("keeps Test disabled in edit mode until the password is entered or declared absent", async () => {
+    renderEditPasswordCredentialsModal();
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    const testButton = screen.getByRole("button", {
+      name: "Test",
+    }) as HTMLButtonElement;
+    // Blank here means "keep the stored password", which the inline test cannot read.
+    expect(testButton.disabled).toBe(true);
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "This login has no password" }),
+    );
+    expect(
+      (screen.getByRole("button", { name: "Test" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+});
+
 describe("CredentialsModal browser-memory profile section (flag on)", () => {
   beforeEach(() => {
     useFeatureFlagMock.mockImplementation(
@@ -1033,7 +1199,7 @@ describe("CredentialsModal copilot-context tested_url default", () => {
     );
   }
 
-  async function fillUsernameAndPassword() {
+  async function fillUsername() {
     await waitFor(() => {
       expect(screen.getByDisplayValue("credentials")).toBeTruthy();
     });
@@ -1047,6 +1213,10 @@ describe("CredentialsModal copilot-context tested_url default", () => {
     fireEvent.change(usernameInput as HTMLInputElement, {
       target: { value: "user@example.com" },
     });
+  }
+
+  async function fillUsernameAndPassword() {
+    await fillUsername();
     const passwordInput = document.querySelector('input[type="password"]');
     expect(passwordInput).toBeTruthy();
     fireEvent.change(passwordInput as HTMLInputElement, {
@@ -1078,6 +1248,28 @@ describe("CredentialsModal copilot-context tested_url default", () => {
       ),
     );
     expect(onCredentialCreated).toHaveBeenCalledWith("cred-x", "credentials");
+  }, 10_000);
+
+  it("saves a password-less credential when the password is left empty", async () => {
+    postMock.mockResolvedValueOnce({
+      data: { credential_id: "cred-z", name: "credentials" },
+    });
+    const onCredentialCreated = vi.fn();
+    renderCopilotPasswordModal({ onCredentialCreated });
+    await fillUsername();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            username: "user@example.com",
+            password: "",
+          }),
+        }),
+      ),
+    );
+    expect(onCredentialCreated).toHaveBeenCalledWith("cred-z", "credentials");
   }, 10_000);
 
   it("sends no tested_url when defaultTestUrl is absent (modal from elsewhere)", async () => {
