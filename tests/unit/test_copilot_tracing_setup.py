@@ -9,6 +9,7 @@ covered by an integration test once the copilot runtime wiring lands.
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 import threading
 from types import SimpleNamespace
@@ -19,6 +20,16 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import tracing_setup
+
+_SYNTHETIC_PROXY_CREDENTIAL = "synthetic-proxy-secret"
+_SYNTHETIC_PROXY_HOST = "internalproxy"
+_SYNTHETIC_PROXY_URL = f"http://user:{_SYNTHETIC_PROXY_CREDENTIAL}@{_SYNTHETIC_PROXY_HOST}:8080"
+
+
+def _nested_mapping(value: object, depth: int = 22) -> object:
+    for _ in range(depth):
+        value = {"child": value}
+    return value
 
 
 @pytest.fixture(autouse=True)
@@ -340,6 +351,92 @@ class TestTracingSetup:
 
         assert span is fake_span
         assert captured == {"name": "run_blocks", "data": {"block_count": 2}}
+
+    def test_copilot_span_redacts_proxy_data_when_enabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
+        captured: dict[str, Any] = {}
+        fake_span = object()
+
+        def fake_custom_span(name: str, data: dict[str, Any] | None = None) -> object:
+            captured["name"] = name
+            captured["data"] = data
+            return fake_span
+
+        monkeypatch.setattr("agents.tracing.custom_span", fake_custom_span)
+
+        span = tracing_setup.copilot_span(
+            "workflow_proxy_location_normalized",
+            {
+                "input_proxy_location": {
+                    "url": "http://user:synthetic-secret@token.proxy.example:8080",
+                },
+                "effective_proxy_location": "RESIDENTIAL",
+                "input_proxy_location_present": True,
+            },
+        )
+
+        assert span is fake_span
+        serialized = json.dumps(captured["data"])
+        assert "synthetic-secret" not in serialized
+        assert "token.proxy.example" not in serialized
+        assert captured["data"]["input_proxy_location"].startswith("custom_url:")
+        assert captured["data"]["effective_proxy_location"] == "RESIDENTIAL"
+        assert captured["data"]["input_proxy_location_present"] is True
+
+    def test_copilot_span_fails_closed_beyond_the_depth_cap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
+        captured: dict[str, Any] = {}
+
+        def fake_custom_span(name: str, data: dict[str, Any] | None = None) -> object:
+            captured["name"] = name
+            captured["data"] = data
+            return object()
+
+        monkeypatch.setattr("agents.tracing.custom_span", fake_custom_span)
+
+        tracing_setup.copilot_span(
+            "deep_proxy_data",
+            {"payload": _nested_mapping({"proxy_url": _SYNTHETIC_PROXY_URL})},
+        )
+
+        serialized = json.dumps(captured["data"])
+        assert _SYNTHETIC_PROXY_CREDENTIAL not in serialized
+        assert _SYNTHETIC_PROXY_HOST not in serialized
+        assert "****" in serialized
+
+    def test_copilot_span_drops_data_when_redaction_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
+        captured: dict[str, Any] = {}
+        fake_span = object()
+
+        def fail_redaction(value: object) -> object:
+            del value
+            raise RuntimeError("synthetic redaction failure")
+
+        def fake_custom_span(name: str, data: dict[str, Any] | None = None) -> object:
+            captured["name"] = name
+            captured["data"] = data
+            return fake_span
+
+        monkeypatch.setattr(tracing_setup, "redact_sensitive_fields", fail_redaction)
+        monkeypatch.setattr("agents.tracing.custom_span", fake_custom_span)
+
+        span = tracing_setup.copilot_span("redaction_failure", {"proxy_url": _SYNTHETIC_PROXY_URL})
+
+        assert span is fake_span
+        assert captured == {"name": "redaction_failure", "data": None}
 
 
 class TestPatchAgentSpanAttributes:

@@ -6,8 +6,11 @@ it from here would break logging on a core ``pip install skyvern``.
 
 Public surface (imported by ``forge_log``, ``request_logging`` and the copilot
 tracing modules): ``REDACTED``, ``SENSITIVE_HEADERS``, ``SENSITIVE_FIELDS``,
-``is_sensitive_key``, ``strip_artifact_url_query``, ``redact_bearer_tokens_in_text``
-and ``redact_sensitive_fields``.
+``is_sensitive_key``, ``strip_artifact_url_query``, ``redact_bearer_tokens_in_text``,
+``redact_sensitive_fields``, ``is_proxy_observability_key``,
+``register_proxy_observability_renderer`` and ``redact_proxy_observability_value``.
+``ProxyObservabilityField`` and ``RedactedProxyLogValue`` are defined in
+``skyvern.schemas.proxy_pinning``.
 """
 
 from __future__ import annotations
@@ -19,6 +22,11 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel
 
+from skyvern.schemas.proxy_pinning import (
+    ProxyObservabilityField,
+    RedactedProxyLogValue,
+    render_proxy_observability_value,
+)
 from skyvern.utils.action_redaction import redact_action_payload_for_log
 
 REDACTED = "****"
@@ -66,6 +74,12 @@ SENSITIVE_FIELDS: set[str] = {
     "totp_secret",
 } | SENSITIVE_HEADERS
 
+_PROXY_OBSERVABILITY_FIELDS = {field.value: field for field in ProxyObservabilityField}
+_PROXY_OBSERVABILITY_SUFFIXES = tuple((f"_{field.value}", field) for field in ProxyObservabilityField)
+_proxy_observability_renderer: typing.Callable[[ProxyObservabilityField, object], RedactedProxyLogValue] = (
+    render_proxy_observability_value
+)
+
 # Matches a signed artifact-content URL (absolute or path-relative) anywhere in a
 # string and captures everything up to — but excluding — its query, so re.sub can
 # drop the capability params (expiry/kid/sig) while leaving surrounding text and
@@ -109,6 +123,42 @@ def is_sensitive_key(key: typing.Any, *, redact_metadata: bool = False) -> bool:
     return normalized in SENSITIVE_FIELDS or (redact_metadata and normalized == "metadata")
 
 
+def is_proxy_observability_key(key: object) -> bool:
+    return _proxy_observability_field(key) is not None
+
+
+def _proxy_observability_field(key: object) -> ProxyObservabilityField | None:
+    if not isinstance(key, str):
+        return None
+    normalized = key.lower()
+    exact = _PROXY_OBSERVABILITY_FIELDS.get(normalized)
+    if exact is not None:
+        return exact
+    return next((field for suffix, field in _PROXY_OBSERVABILITY_SUFFIXES if normalized.endswith(suffix)), None)
+
+
+def register_proxy_observability_renderer(
+    renderer: typing.Callable[[ProxyObservabilityField, object], RedactedProxyLogValue],
+) -> None:
+    global _proxy_observability_renderer
+    _proxy_observability_renderer = renderer
+
+
+def redact_proxy_observability_value(key: object, value: object) -> RedactedProxyLogValue:
+    if isinstance(value, RedactedProxyLogValue):
+        return value
+    field = _proxy_observability_field(key)
+    if field is None:
+        return RedactedProxyLogValue(REDACTED)
+    try:
+        rendered = _proxy_observability_renderer(field, value)
+    except Exception:  # noqa: BLE001 - any renderer failure must fail closed at this boundary
+        return RedactedProxyLogValue(REDACTED)
+    if not isinstance(rendered, RedactedProxyLogValue):
+        return RedactedProxyLogValue(REDACTED)
+    return rendered
+
+
 def strip_artifact_url_query(value: str) -> str:
     return _ARTIFACT_CONTENT_URL_QUERY_RE.sub(r"\1", value)
 
@@ -141,7 +191,7 @@ def redact_sensitive_fields(
     redact_metadata: bool = False,
     _seen: set[int] | None = None,
 ) -> typing.Any:
-    """Redact sensitive fields, bearer credentials, and artifact-URL capability queries.
+    """Redact sensitive fields, semantic proxy fields, bearer credentials, and artifact-URL capability queries.
 
     Field names use exact-match (case-insensitive) rather than substring/regex
     to avoid false positives on fields like ``credential_id``, ``author``, or
@@ -149,11 +199,12 @@ def redact_sensitive_fields(
     credentials embedded in nested string values are stripped too, so a header dict
     like ``{"Proxy-Authorization": "Bearer sk-..."}`` cannot slip through under a
     key name the middleware does not classify.
+    Semantic proxy fields are rendered by the registered observability renderer.
     """
     if isinstance(obj, str):
         sanitized_value = _redact_string(obj)
         if _depth > 20:
-            return sanitized_value
+            return REDACTED if sanitized_value.lstrip()[:1] in {"{", "["} else sanitized_value
         try:
             parsed_value = json.loads(sanitized_value)
         except (json.JSONDecodeError, TypeError):
@@ -176,11 +227,8 @@ def redact_sensitive_fields(
         _seen.add(marker)
 
     if _depth > 20:
-        # Stop recursing but still redact sensitive keys at this level. Any Mapping
-        # (not just dict) so header containers such as httpx / starlette Headers,
-        # MappingProxyType and CIMultiDict are covered.
-        if isinstance(obj, Mapping):
-            return {k: REDACTED if is_sensitive_key(k, redact_metadata=redact_metadata) else v for k, v in obj.items()}
+        if isinstance(obj, (BaseModel, Mapping, list, tuple, set, frozenset)):
+            return REDACTED
         return obj
     if isinstance(obj, BaseModel):
         # A model kwarg is otherwise rendered in full by the log formatter, carrying
@@ -190,7 +238,7 @@ def redact_sensitive_fields(
         try:
             dumped = obj.model_dump()
         except Exception:
-            return obj
+            return REDACTED
         dumped = redact_action_payload_for_log(dumped)
         return redact_sensitive_fields(dumped, _depth + 1, redact_metadata=redact_metadata, _seen=_seen)
     if isinstance(obj, Mapping):
@@ -198,6 +246,8 @@ def redact_sensitive_fields(
             k: (
                 REDACTED
                 if is_sensitive_key(k, redact_metadata=redact_metadata)
+                else redact_proxy_observability_value(k, v)
+                if is_proxy_observability_key(k)
                 else redact_sensitive_fields(v, _depth + 1, redact_metadata=redact_metadata, _seen=_seen)
             )
             for k, v in obj.items()

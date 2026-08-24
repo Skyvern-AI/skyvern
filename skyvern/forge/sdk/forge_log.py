@@ -17,8 +17,10 @@ from skyvern._version import __version__
 from skyvern.config import settings
 from skyvern.forge.log_redaction import (
     REDACTED,
+    is_proxy_observability_key,
     is_sensitive_key,
     redact_bearer_tokens_in_text,
+    redact_proxy_observability_value,
     redact_sensitive_fields,
 )
 from skyvern.forge.sdk.core import skyvern_context
@@ -592,6 +594,8 @@ def redact_sensitive_event_fields(logger: logging.Logger, method_name: str, even
         try:
             if is_sensitive_key(key):
                 event_dict[key] = REDACTED
+            elif is_proxy_observability_key(key):
+                event_dict[key] = redact_proxy_observability_value(key, value)
             elif not isinstance(value, str):
                 event_dict[key] = redact_sensitive_fields(value)
         except Exception:
@@ -1069,6 +1073,7 @@ def setup_logger() -> None:
                 structlog.stdlib.ExtraAdder(),
                 add_error_processor,
                 structlog.processors.format_exc_info,
+                redact_sensitive_event_fields,
             ]
             + foreign_msg_chain,
             processors=[
@@ -1082,9 +1087,9 @@ def setup_logger() -> None:
                 # exc_info to a string by now, so a secret in the exception text is reachable.
                 # These stay duplicated in the structlog chain above on purpose: that pass also
                 # guards `context.log`, which is persisted to the per-run S3 log artifact.
-                # `redact_sensitive_event_fields` is deliberately NOT duplicated here: foreign
-                # records carry only string values, and native records arrive already redacted,
-                # so it could only re-walk every structured kwarg a second time.
+                # Native records are already redacted before `context.log`; foreign records get
+                # their one field-redaction pass in `foreign_pre_chain`. Keep this shared
+                # renderer chain unchanged so native structured values are not walked twice.
                 redact_bearer_tokens,
                 redact_registered_secrets,
                 redact_codeblock_parameters,

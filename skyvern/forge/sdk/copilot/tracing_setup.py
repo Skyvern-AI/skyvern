@@ -424,4 +424,8 @@ def copilot_span(name: str, data: dict[str, Any] | None = None) -> Any:
             return contextlib.nullcontext()
         raise
 
-    return custom_span(name, data=data)
+    try:
+        redacted_data = redact_sensitive_fields(data) if data is not None else None
+    except Exception:  # noqa: BLE001 - trace redaction must drop data rather than expose it or disrupt execution
+        redacted_data = None
+    return custom_span(name, data=redacted_data)
