@@ -5,7 +5,7 @@ Streaming auth.
 import typing as t
 
 import structlog
-from fastapi import WebSocket
+from fastapi import HTTPException, WebSocket, status
 from websockets.exceptions import ConnectionClosedOK
 
 from skyvern.forge import app
@@ -13,6 +13,8 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
 
 LOG = structlog.get_logger()
+
+EXPECTED_AUTH_FAILURE_STATUS_CODES = frozenset({status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN})
 
 
 def require_client_id(client_id: str | None, **log_kwargs: t.Any) -> bool:
@@ -44,6 +46,13 @@ async def get_x_api_key(organization_id: str) -> str:
     return x_api_key
 
 
+async def _close_unauthenticated(websocket: WebSocket, **log_kwargs: t.Any) -> None:
+    try:
+        await websocket.close(code=1002)
+    except ConnectionClosedOK:
+        LOG.info("WebSocket connection closed due to invalid credentials.", **log_kwargs)
+
+
 async def auth(apikey: str | None, token: str | None, websocket: WebSocket, **log_kwargs: t.Any) -> str | None:
     """
     Accepts the websocket connection.
@@ -68,12 +77,21 @@ async def auth(apikey: str | None, token: str | None, websocket: WebSocket, **lo
         if not organization_id:
             await websocket.close(code=1002)
             return None
+    except HTTPException as exc:
+        if exc.status_code in EXPECTED_AUTH_FAILURE_STATUS_CODES:
+            LOG.warning(
+                "Rejecting streaming connection with invalid credentials.",
+                status_code=exc.status_code,
+                detail=exc.detail,
+                **log_kwargs,
+            )
+        else:
+            LOG.exception("Error occurred while retrieving organization information.", **log_kwargs)
+        await _close_unauthenticated(websocket, **log_kwargs)
+        return None
     except Exception:
         LOG.exception("Error occurred while retrieving organization information.", **log_kwargs)
-        try:
-            await websocket.close(code=1002)
-        except ConnectionClosedOK:
-            LOG.info("WebSocket connection closed due to invalid credentials.", **log_kwargs)
+        await _close_unauthenticated(websocket, **log_kwargs)
         return None
 
     return organization_id

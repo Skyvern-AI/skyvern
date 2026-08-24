@@ -19,6 +19,30 @@ type ResolveBrowserPaneViewArgs = {
   failed: boolean;
 };
 
+type ResolveLiveSurfaceArgs = {
+  // A browser recording pins the live surface to the debug browser (the
+  // recorder drives it), even if an inspected run streams elsewhere.
+  recording: boolean;
+  running: boolean;
+  runInDebugSession: boolean;
+  hasRunId: boolean;
+};
+
+/**
+ * What the Live view shows: the shared debug-session singleton, or the
+ * inspected run's own per-run stream (running outside the debug session).
+ */
+export function resolveLiveSurface({
+  recording,
+  running,
+  runInDebugSession,
+  hasRunId,
+}: ResolveLiveSurfaceArgs): "debug" | "run" {
+  return !recording && running && !runInDebugSession && hasRunId
+    ? "run"
+    : "debug";
+}
+
 /**
  * The Browser pane's view machine, ported from RunHero's resolveRunHeroCenterView:
  * live while running, replay (recording/screenshots) on step-select or once the

@@ -12,7 +12,7 @@ from playwright._impl._errors import TargetClosedError
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, execution_channel
 from tests.unit.forge.sdk.routes.streaming.test_exfiltration_channel import (
     _FakePw,
-    _make_vnc_channel,
+    _make_context,
     _patch_pw_stack,
 )
 
@@ -37,7 +37,7 @@ async def test_execution_channel_cm_does_not_resurrect_driver(monkeypatch: pytes
     # on_close handler in CdpChannel.connect must not chain a fresh driver spawn.
     state = _patch_pw_stack(monkeypatch, fire_disconnect_on_close=True)
 
-    async with execution_channel(_make_vnc_channel()):
+    async with execution_channel(_make_context()):
         pass
     await _drain_loop()
 
@@ -47,7 +47,7 @@ async def test_execution_channel_cm_does_not_resurrect_driver(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_stop_releases_driver_when_browser_close_raises() -> None:
-    channel = ExecutionChannel(vnc_channel=_make_vnc_channel())
+    channel = ExecutionChannel(context=_make_context())
     browser = _RaisingBrowser()
     pw = _FakePw()
     channel.browser = browser  # type: ignore[assignment]

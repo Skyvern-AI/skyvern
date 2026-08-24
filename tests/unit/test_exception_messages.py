@@ -3,6 +3,8 @@ from http import HTTPStatus
 import pytest
 
 from skyvern.exceptions import (
+    BrowserSessionClosed,
+    BrowserSessionStartupTimeout,
     CaptchaNotSolvedInTime,
     CaptchaSolveError,
     CdpConnectionConfigurationError,
@@ -177,6 +179,28 @@ def test_skyvern_http_exception_normalizes_status_code_to_plain_int() -> None:
 
     assert error.status_code == 400
     assert type(error.status_code) is int
+
+
+def test_browser_session_timeout_exceptions_distinguish_startup_from_expiry() -> None:
+    startup_timeout = BrowserSessionStartupTimeout("pbs_test")
+    expired = BrowserSessionClosed(
+        "pbs_test",
+        reason="expired after reaching its configured lifetime",
+    )
+
+    assert startup_timeout.status_code == 504
+    assert expired.status_code == 410
+    assert str(startup_timeout) == "Browser session pbs_test failed to start within the timeout period."
+    assert str(expired) == (
+        "Browser session pbs_test expired after reaching its configured lifetime. "
+        "Create a new browser session and retry."
+    )
+
+
+def test_browser_session_closed_states_the_remedy_without_an_explicit_reason() -> None:
+    assert str(BrowserSessionClosed("pbs_test")) == (
+        "Browser session pbs_test is closed. Create a new browser session and retry."
+    )
 
 
 def test_raise_server_extra_required_translates_when_server_extra_missing(monkeypatch: pytest.MonkeyPatch) -> None:

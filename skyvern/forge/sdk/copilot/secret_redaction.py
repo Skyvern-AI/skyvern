@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from email_validator import EmailNotValidError, validate_email
@@ -87,3 +88,28 @@ def redact_raw_secrets_for_prompt(text: str) -> str:
     for segment in _email_password_pair_segments(redacted):
         redacted = redacted.replace(segment, "[REDACTED_SECRET]")
     return redacted
+
+
+def redact_raw_secrets_for_structured_prompt(text: str) -> str:
+    # Substituting over serialized JSON lets the assignment pattern consume the closing
+    # quote/comma after a value like "Password:", invalidating the whole document
+    # (SKY-13986); string values are redacted individually and the document reserialized.
+    raw = text or ""
+    stripped = raw.strip()
+    if not stripped.startswith(("{", "[")):
+        return redact_raw_secrets_for_prompt(raw)
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return redact_raw_secrets_for_prompt(raw)
+    return json.dumps(_redact_string_values(payload), indent=2)
+
+
+def _redact_string_values(node: object) -> object:
+    if isinstance(node, str):
+        return redact_raw_secrets_for_prompt(node)
+    if isinstance(node, dict):
+        return {key: _redact_string_values(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_redact_string_values(item) for item in node]
+    return node

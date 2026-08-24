@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import jwt
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from freezegun import freeze_time
 
@@ -916,3 +916,164 @@ def test_credential_bearing_routes_use_the_deployment_aware_gate() -> None:
         if parameter.default is not inspect.Parameter.empty
     }
     assert org_auth_service.get_current_org_for_credential_routes not in api_key_resolver_dependencies
+
+
+@pytest.mark.asyncio
+async def test_get_current_org_forwards_optional_attribution_header_to_authentication_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-attribution")
+    calls: list[tuple[str, str | None]] = []
+
+    async def authentication_callback(
+        token: str,
+        attribution_header: str | None = None,
+    ) -> Organization:
+        calls.append((token, attribution_header))
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    resolved = await org_auth_service.get_current_org(
+        authorization="Bearer clerk-token",
+        x_posthog_attribution="encoded-attribution",
+    )
+
+    assert resolved == organization
+    assert calls == [("clerk-token", "encoded-attribution")]
+
+
+def test_get_current_org_with_authentication_forwards_optional_attribution_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-attribution-authentication")
+    calls: list[tuple[str, str | None]] = []
+
+    async def authentication_callback(
+        token: str,
+        attribution_header: str | None = None,
+    ) -> Organization:
+        calls.append((token, attribution_header))
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    fastapi_app = FastAPI()
+
+    @fastapi_app.get("/organization")
+    async def get_organization(
+        current_organization: Organization = Depends(org_auth_service.get_current_org_with_authentication),
+    ) -> Organization:
+        return current_organization
+
+    parameters = fastapi_app.openapi()["paths"]["/organization"]["get"]["parameters"]
+    assert all(parameter["name"] != org_auth_service.POSTHOG_ATTRIBUTION_HEADER for parameter in parameters)
+
+    with TestClient(fastapi_app) as client:
+        attributed_response = client.get(
+            "/organization",
+            headers={
+                "Authorization": "Bearer clerk-token",
+                org_auth_service.POSTHOG_ATTRIBUTION_HEADER: "encoded-attribution",
+            },
+        )
+        un_attributed_response = client.get(
+            "/organization",
+            headers={"Authorization": "Bearer clerk-token"},
+        )
+
+    assert attributed_response.status_code == 200
+    assert un_attributed_response.status_code == 200
+    assert calls == [
+        ("clerk-token", "encoded-attribution"),
+        ("clerk-token", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authenticate_helper_requires_attribution_aware_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization = _make_org("org-legacy")
+    tokens: list[str] = []
+
+    async def authentication_callback(token: str) -> Organization:
+        tokens.append(token)
+        return organization
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    with pytest.raises(TypeError, match="positional argument"):
+        await org_auth_service.authenticate_helper(
+            "Bearer clerk-token",
+            attribution_header="encoded-attribution",
+        )
+
+    assert tokens == []
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_header_is_not_treated_as_a_skyvern_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A self-hosted UI origin gated by HTTP basic auth sends Basic credentials to the API too."""
+    calls: list[str] = []
+
+    async def authentication_callback(token: str, attribution_header: str | None = None) -> Organization:
+        calls.append(token)
+        return _make_org("org-basic")
+
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=authentication_callback),
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await org_auth_service.get_current_org(authorization="Basic dXNlcjpwYXNzd29yZA==")
+
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.detail == "Invalid credentials"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_header_does_not_shadow_a_valid_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization = _make_org("org-basic-with-key")
+
+    async def resolve(x_api_key: str, db: object) -> Organization:
+        return organization
+
+    monkeypatch.setattr(org_auth_service, "get_current_org_cached", resolve)
+    monkeypatch.setattr(
+        org_auth_service,
+        "app",
+        SimpleNamespace(authentication_function=None, DATABASE=object()),
+    )
+
+    resolved = await org_auth_service.get_current_org(
+        x_api_key="skyvern-api-key",
+        authorization="Basic dXNlcjpwYXNzd29yZA==",
+    )
+
+    assert resolved == organization
+
+
+def test_bearer_scheme_is_matched_case_insensitively() -> None:
+    assert org_auth_service._extract_bearer_token("bearer token-canary") == "token-canary"
+    assert org_auth_service._extract_bearer_token("BEARER token-canary") == "token-canary"
+    assert org_auth_service._extract_bearer_token("Basic token-canary") is None
+    assert org_auth_service._extract_bearer_token("token-canary") is None
+    assert org_auth_service._extract_bearer_token("Bearer ") is None

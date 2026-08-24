@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import base64
+import functools
 import hashlib
 import importlib.util
 import json
@@ -15,6 +16,7 @@ import libcst as cst
 import structlog
 from fastapi import BackgroundTasks, HTTPException
 from jinja2.sandbox import SandboxedEnvironment
+from opentelemetry import metrics
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -28,7 +30,6 @@ from skyvern.core.script_generations.script_skyvern_page import script_run_conte
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     CachedDownloadError,
-    CodeBlockRunnerSelectionError,
     DownloadSaveIncompleteError,
     IllegitCompleteScriptTermination,
     InProcessScriptExecutionDenied,
@@ -71,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CURRENT_DATE_FORMAT,
     DEFAULT_MAX_LOOP_ITERATIONS,
     ActionBlock,
+    BaseTaskBlock,
     CodeBlock,
     ExtractionBlock,
     FileDownloadBlock,
@@ -90,8 +92,15 @@ from skyvern.forge.sdk.workflow.models.block import (
     ValidationBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
+    get_all_blocks,
 )
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter, ParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
+    UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
+    AWSSecretParameter,
+    OutputParameter,
+    ParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, is_adaptive_caching
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.scripts import (
@@ -115,6 +124,33 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+
+IN_PROCESS_SCRIPT_EXECUTION_COUNTER = "skyvern.script.in_process_execution"
+
+
+@functools.cache
+def _in_process_script_execution_counter() -> Any | None:
+    if not settings.OTEL_METRICS_ENABLED:
+        return None
+    try:
+        return metrics.get_meter("skyvern.script_service").create_counter(
+            IN_PROCESS_SCRIPT_EXECUTION_COUNTER,
+            unit="{evaluation}",
+            description="In-process script execution gate evaluations by seam and outcome",
+        )
+    except Exception as exc:
+        LOG.warning("Failed to initialize in-process script execution counter", error=str(exc))
+        return None
+
+
+def _record_in_process_script_execution(*, seam: str, outcome: str, selection_reason: str) -> None:
+    try:
+        counter = _in_process_script_execution_counter()
+        if counter is not None:
+            counter.add(1, {"seam": seam, "outcome": outcome, "selection_reason": selection_reason})
+    except Exception as exc:
+        LOG.warning("Failed to record in-process script execution", error=str(exc))
+
 
 # Synthetic failure_reason recorded on a fallback episode when the AI fallback
 # ended `completed` with zero actions taken — i.e. the AI's complete-verify
@@ -534,7 +570,7 @@ async def _take_workflow_run_block_screenshot(
     """
     browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
     if not browser_state:
-        LOG.warning("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
+        LOG.info("No browser state found when creating workflow_run_block", workflow_run_id=workflow_run_id)
     else:
         screenshot = await browser_state.take_fullpage_screenshot()
         if screenshot:
@@ -829,7 +865,7 @@ async def _update_workflow_block(
         # This mirrors the agent path (agent.py flush_step_archive at step completion).
         # Known limitation: if flush fails (e.g. S3 timeout), accumulated artifacts for
         # this step are lost. This matches the agent path's behavior.
-        if context.use_artifact_bundling and step_id:
+        if step_id:
             try:
                 await app.ARTIFACT_MANAGER.flush_step_archive(step_id)
             except Exception:
@@ -1276,6 +1312,15 @@ async def _detect_user_defined_errors(
         return []
 
 
+def _resolve_original_block_engine(cache_key: str, workflow: Workflow) -> RunEngine | None:
+    # Recursive: a cached block inside a for/while loop must keep its engine too (labels are
+    # validated globally unique, so the first match is the block).
+    for block in get_all_blocks(workflow.workflow_definition.blocks):
+        if block.label == cache_key:
+            return block.engine if isinstance(block, BaseTaskBlock) else None
+    return None
+
+
 async def _fallback_to_ai_run(
     block_type: BlockType,
     cache_key: str,
@@ -1517,6 +1562,28 @@ async def _fallback_to_ai_run(
             step_id=script_step_id,
         )
 
+        # Inherit the original block's engine when the caller left it at default; fail open to v1 on any miss.
+        if engine == RunEngine.skyvern_v1:
+            try:
+                resolved_engine = _resolve_original_block_engine(cache_key, workflow)
+                if resolved_engine is not None and resolved_engine != RunEngine.skyvern_v1:
+                    engine = resolved_engine
+                    LOG.debug(
+                        "Resolved original block engine for AI fallback",
+                        cache_key=cache_key,
+                        engine=engine.value,
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run_id,
+                    )
+            except Exception:
+                LOG.debug(
+                    "Failed to resolve original block engine for AI fallback, defaulting to v1",
+                    cache_key=cache_key,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+
         task_block = TaskBlock(
             label=cache_key,
             url=task.url,
@@ -1542,6 +1609,9 @@ async def _fallback_to_ai_run(
             task=task,
             step=ai_step,
             task_block=task_block,
+            # The dispatch gate reads the engine PARAM, not task_block.engine — without this the
+            # inherited engine is inert and every fallback runs the default.
+            engine=engine,
         )
 
         # update workflow run to indicate that there's a script run
@@ -3068,38 +3138,25 @@ async def ensure_in_process_script_execution_allowed(
     script_id: str | None = None,
     script_revision_id: str | None = None,
 ) -> None:
-    try:
-        decision = await app.AGENT_FUNCTION.resolve_in_process_script_execution_policy(
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            workflow_permanent_id=workflow_permanent_id,
-            workflow_id=workflow_id,
-            script_id=script_id,
-        )
-    except CodeBlockRunnerSelectionError as exc:
-        LOG.error(
-            "script.in_process_execution_denied",
-            seam=seam,
-            selection_reason="policy_evaluation_error",
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            workflow_permanent_id=workflow_permanent_id,
-            workflow_id=workflow_id,
-            script_id=script_id,
-            script_revision_id=script_revision_id,
-            exc_info=True,
-        )
-        raise InProcessScriptExecutionDenied(
-            seam=seam,
-            selection_reason="policy_evaluation_error",
-        ) from exc
+    decision = await app.AGENT_FUNCTION.resolve_in_process_script_execution_policy(
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_id=workflow_id,
+        script_id=script_id,
+    )
 
+    _record_in_process_script_execution(
+        seam=seam,
+        outcome="allowed" if decision.allowed else "denied",
+        selection_reason=decision.selection_reason,
+    )
     if decision.allowed:
         return
 
-    # A degradable denial leaves the run to the agent, so it is not an error condition; keeping it
-    # off ERROR also keeps the fail-closed lines above distinguishable in the denial monitor.
-    log_denial = LOG.error if decision.fail_closed else LOG.warning
+    # A fail-open denial is the steady state on every tenant cached-script run (deny-all policy),
+    # so it stays at debug to keep out of indexed logs; fail-closed stays ERROR for the denial monitor.
+    log_denial = LOG.error if decision.fail_closed else LOG.debug
     log_denial(
         "script.in_process_execution_denied",
         seam=seam,
@@ -3217,7 +3274,7 @@ def _render_template_with_label(template: str, label: str | None = None) -> str:
                 if isinstance(current_value, dict):
                     block_reference_data.update(current_value)
                 else:
-                    LOG.warning(
+                    LOG.debug(
                         f"Script service: Parameter {label} has a registered reference value, going to overwrite it by block metadata"
                     )
 
@@ -3476,6 +3533,10 @@ async def send_email(
     file_attachments: list[str] = [],
     label: str | None = None,
     parameters: list[str] | None = None,
+    custom_smtp_host: str | None = None,
+    custom_smtp_port: int | None = None,
+    custom_smtp_username: str | None = None,
+    custom_smtp_password: str | None = None,
 ) -> None:
     block_validation_output = await _validate_and_get_output_parameter(label, parameters)
     sender = _render_template_with_label(sender, label)
@@ -3484,17 +3545,50 @@ async def send_email(
     subject = _render_template_with_label(subject, label)
     body = _render_template_with_label(body, label)
     workflow = block_validation_output.workflow
-    smtp_host_parameter = workflow.get_parameter("smtp_host")
-    smtp_port_parameter = workflow.get_parameter("smtp_port")
-    smtp_username_parameter = workflow.get_parameter("smtp_username")
-    smtp_password_parameter = workflow.get_parameter("smtp_password")
+
+    # A regular workflow input may collide with the canonical names (e.g. an input called
+    # "smtp_host"); only actual AWS-secret parameters satisfy the block model.
+    def _smtp_secret_parameter(key: str) -> AWSSecretParameter | None:
+        parameter = workflow.get_parameter(key)
+        return parameter if isinstance(parameter, AWSSecretParameter) else None
+
+    smtp_host_parameter = _smtp_secret_parameter("smtp_host")
+    smtp_port_parameter = _smtp_secret_parameter("smtp_port")
+    smtp_username_parameter = _smtp_secret_parameter("smtp_username")
+    smtp_password_parameter = _smtp_secret_parameter("smtp_password")
     if not smtp_host_parameter or not smtp_port_parameter or not smtp_username_parameter or not smtp_password_parameter:
-        raise Exception("SMTP host, port, username, and password parameters are required")
+        if not custom_smtp_host:
+            raise Exception("SMTP host, port, username, and password parameters are required")
+
+        # Custom SMTP path: the block never reads the default smtp_* secret parameters, but
+        # the model requires them structurally. Inert placeholders let a workflow authored
+        # without the platform sender's parameters still send through its own server.
+        def _placeholder_smtp_parameter(key: str) -> AWSSecretParameter:
+            now = datetime.now(timezone.utc)
+            return AWSSecretParameter(
+                parameter_type=ParameterType.AWS_SECRET,
+                key=key,
+                description="Unused placeholder; this block sends via custom SMTP.",
+                aws_key=UNUSED_CUSTOM_SMTP_PLACEHOLDER_AWS_KEY,
+                aws_secret_parameter_id=f"placeholder_{key}",
+                workflow_id=workflow.workflow_id,
+                created_at=now,
+                modified_at=now,
+            )
+
+        smtp_host_parameter = smtp_host_parameter or _placeholder_smtp_parameter("smtp_host")
+        smtp_port_parameter = smtp_port_parameter or _placeholder_smtp_parameter("smtp_port")
+        smtp_username_parameter = smtp_username_parameter or _placeholder_smtp_parameter("smtp_username")
+        smtp_password_parameter = smtp_password_parameter or _placeholder_smtp_parameter("smtp_password")
     send_email_block = SendEmailBlock(
         smtp_host=smtp_host_parameter,
         smtp_port=smtp_port_parameter,
         smtp_username=smtp_username_parameter,
         smtp_password=smtp_password_parameter,
+        custom_smtp_host=custom_smtp_host,
+        custom_smtp_port=custom_smtp_port,
+        custom_smtp_username=custom_smtp_username,
+        custom_smtp_password=custom_smtp_password,
         sender=sender,
         recipients=recipients,
         subject=subject,

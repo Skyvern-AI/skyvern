@@ -4,11 +4,12 @@ import asyncio
 import random
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Literal
 from urllib.parse import urlparse
 
 import structlog
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -18,6 +19,7 @@ from skyvern.constants import (
     NAVIGATION_MAX_RETRY_TIME,
 )
 from skyvern.exceptions import (
+    BrowserStateDiagnostic,
     EmptyBrowserContext,
     FailedToNavigateToUrl,
     FailedToReloadPage,
@@ -31,13 +33,15 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
+from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import disable_download_interceptor_for_context
+from skyvern.webeye.driver_connection import close_driver_connection_on_transport_loss
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 from skyvern.webeye.session_cookies import persist_session_cookies
-from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, is_engine_timeout
 
 LOG = structlog.get_logger()
 
@@ -100,6 +104,13 @@ class RealBrowserState(BrowserState):
         self._detached_teardown_tasks: set[asyncio.Task[None]] = set()
         # A release retry after a transient DB failure must not repeat local CDP teardown.
         self._remote_driver_detached = False
+        self._browser_state_diagnostic: BrowserStateDiagnostic | None = None
+        self._ever_connected = browser_context is not None
+        self._close_requested = False
+        self._disconnect_listener_context: BrowserContext | None = None
+        self._disconnect_listener_browser: Browser | None = None
+        if browser_context is not None:
+            self._register_disconnect_listeners(browser_context)
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -121,8 +132,18 @@ class RealBrowserState(BrowserState):
         if recovered_page is not None:
             return recovered_page
         pages = (self.browser_context.pages or []) if self.browser_context else []
-        LOG.error("BrowserState has no page", urls=[p.url for p in pages])
-        raise MissingBrowserStatePage()
+        detected_at = datetime.now(UTC)
+        diagnostic = self.get_browser_state_diagnostic()
+        LOG.error(
+            "BrowserState has no page",
+            urls=[p.url for p in pages],
+            browser_session_id=getattr(self.browser_artifacts, "remote_browser_session_id", None),
+            detected_at=detected_at.isoformat(),
+            disconnect_reason=diagnostic.reason if diagnostic else None,
+            disconnect_observed_at=diagnostic.disconnect_observed_at.isoformat() if diagnostic else None,
+            disconnect_observation_source=diagnostic.observation_source if diagnostic else None,
+        )
+        raise MissingBrowserStatePage(diagnostic=diagnostic, detected_at=detected_at)
 
     async def _reopen_lost_working_page(self) -> Page | None:
         # A tab can die on its own (a download-turned-navigation, a renderer crash) while the
@@ -264,6 +285,12 @@ class RealBrowserState(BrowserState):
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
             self.browser_cleanup = browser_cleanup
+            self._browser_state_diagnostic = None
+            self._ever_connected = True
+            self._close_requested = False
+            self._register_disconnect_listeners(browser_context)
+            # Strikes describe the browser that earned them; a replacement starts even.
+            skyvern_context.record_browser_success()
             LOG.info("browser context is created")
 
         if await self.get_working_page() is None:
@@ -501,27 +528,109 @@ class RealBrowserState(BrowserState):
             page = await self.__assert_page()
         return page
 
-    def is_connected(self) -> bool:
+    def _register_disconnect_listeners(self, context: BrowserContext) -> None:
+        if context is not getattr(self, "_disconnect_listener_context", None):
+            try:
+                context.on("close", self._on_browser_context_closed)
+                self._disconnect_listener_context = context
+            except Exception:
+                LOG.debug("Failed to register browser context disconnect listener", exc_info=True)
+
+        try:
+            browser = context.browser
+        except Exception:
+            LOG.debug("Failed to read browser for disconnect listener registration", exc_info=True)
+            return
+        if browser is None or browser is getattr(self, "_disconnect_listener_browser", None):
+            return
+        try:
+            browser.on("disconnected", self._on_browser_disconnected)
+            self._disconnect_listener_browser = browser
+        except Exception:
+            LOG.debug("Failed to register browser disconnect listener", exc_info=True)
+
+    def _on_browser_context_closed(self, context: BrowserContext) -> None:
+        if context is not self.browser_context:
+            return
+        self._record_disconnect(
+            "browser_context_close_event",
+            event="browser_context_close",
+            observation_source="browser_event",
+        )
+
+    def _on_browser_disconnected(self, browser: Browser) -> None:
+        if browser is not getattr(self, "_disconnect_listener_browser", None):
+            return
+        self._record_disconnect(
+            "browser_disconnected_event",
+            event="browser_disconnected",
+            observation_source="browser_event",
+        )
+
+    def _record_disconnect(
+        self,
+        reason: str,
+        *,
+        event: str = "browser_context_disconnected",
+        observation_source: str = "liveness_probe",
+    ) -> None:
+        if self._browser_state_diagnostic is not None or not self._ever_connected:
+            return
+        disconnect_observed_at = datetime.now(UTC)
+        browser_session_id = getattr(self.browser_artifacts, "remote_browser_session_id", None)
+        self._browser_state_diagnostic = BrowserStateDiagnostic(
+            reason=reason,
+            disconnect_observed_at=disconnect_observed_at,
+            browser_session_id=browser_session_id,
+            event=event,
+            observation_source=observation_source,
+        )
+        # A disconnect observed after close() was requested is the teardown we asked for; only an
+        # unrequested one is worth a warning.
+        log = LOG.info if self._close_requested else LOG.warning
+        log(
+            "Browser state disconnected",
+            browser_session_id=browser_session_id,
+            disconnect_reason=reason,
+            disconnect_event=event,
+            disconnect_observed_at=disconnect_observed_at.isoformat(),
+            disconnect_observation_source=observation_source,
+            close_requested=self._close_requested,
+        )
+
+    def get_browser_state_diagnostic(self) -> BrowserStateDiagnostic | None:
+        return self._browser_state_diagnostic
+
+    def _connection_status(self) -> tuple[bool, str | None]:
         # A reused browser state (e.g. a persistent debug session) can have a stopped driver
         # after a prior owner's cleanup; page.goto then raises "Connection closed while reading
         # from the driver". A bare pw.stop() leaves browser.is_connected() stale and never flips
         # _close_was_called, so also inspect the shared driver Connection's closed-error.
         context = self.browser_context
         if context is None:
-            return False
+            return False, "browser_context_missing"
         impl = getattr(context, "_impl_obj", None)
-        if getattr(impl, "_close_was_called", False) is True or getattr(impl, "_closed", False) is True:
-            return False
+        if getattr(impl, "_close_was_called", False) is True:
+            return False, "browser_context_close_called"
+        if getattr(impl, "_closed", False) is True:
+            return False, "browser_context_closed"
         connection = getattr(impl, "_connection", None)
         if getattr(connection, "_closed_error", None) is not None:
-            return False
+            return False, "playwright_driver_connection_closed"
         browser = getattr(context, "browser", None)
         if browser is None:
-            return True
+            return True, None
         try:
-            return browser.is_connected()
-        except Exception:
-            return False
+            connected = bool(browser.is_connected())
+        except Exception as exc:
+            return False, f"browser_connection_probe_failed:{type(exc).__name__}"
+        return connected, None if connected else "browser_context_disconnected"
+
+    def is_connected(self) -> bool:
+        connected, reason = self._connection_status()
+        if not connected and reason is not None:
+            self._record_disconnect(reason)
+        return connected
 
     async def reconnect(
         self,
@@ -551,6 +660,7 @@ class RealBrowserState(BrowserState):
             self.pw = await self.engine_selection.start_driver()
         else:
             self.pw = await async_playwright().start()
+            close_driver_connection_on_transport_loss(self.pw)
         try:
             await self.check_and_fix_state(
                 proxy_location=proxy_location,
@@ -602,6 +712,12 @@ class RealBrowserState(BrowserState):
             raise EmptyBrowserContext()
         return await self.browser_context.new_page()
 
+    def _record_reload_timeout(self, error: Exception) -> None:
+        """Only a deadline counts toward browser health. A reload that fails for a nameable reason —
+        a navigation error, a closed target — says the browser answered."""
+        if is_engine_timeout(error, self.engine_selection):
+            skyvern_context.record_browser_timeout(BrowserOperation.RELOAD)
+
     async def reload_page(self, degradation: bool = False) -> None:
         page = await self.__assert_page()
         url = page.url
@@ -612,9 +728,11 @@ class RealBrowserState(BrowserState):
                 start_time = time.time()
                 await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
                 LOG.info("Page loading time", loading_time=time.time() - start_time)
+                skyvern_context.record_browser_success()
                 await self._wait_for_settle()
                 await self._wait_for_challenge_solver(page=page)
             except Exception as e:
+                self._record_reload_timeout(e)
                 LOG.exception("Error while reload url", error=repr(e))
                 raise FailedToReloadPage(url=url, error_message=repr(e))
             return
@@ -631,10 +749,12 @@ class RealBrowserState(BrowserState):
                     wait_until=strategy,
                     degraded=i > 0,
                 )
+                skyvern_context.record_browser_success()
                 await self._wait_for_settle()
                 await self._wait_for_challenge_solver(page=page)
                 return
             except Exception as e:
+                self._record_reload_timeout(e)
                 if i < len(strategies) - 1:
                     LOG.warning(
                         "Reload timed out, degrading wait strategy",
@@ -713,6 +833,9 @@ class RealBrowserState(BrowserState):
                     "download interceptor disable",
                 )
         if close_browser_on_completion:
+            # Only a teardown that closes the context is a requested disconnect; the keep-alive path
+            # leaves the browser to a later owner, whose disconnects are still unrequested.
+            self._close_requested = True
             recording_finalized = await self._run_bounded_detachable(
                 self._teardown_context(),
                 BROWSER_CLOSE_TIMEOUT,

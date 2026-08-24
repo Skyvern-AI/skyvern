@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.tools._shared import _registered_output_parameter
 from skyvern.forge.sdk.copilot.tools.blockers import _code_output_has_goal_content
 from skyvern.forge.sdk.copilot.tools.completion import _apply_present_value_upgrades, _build_run_evidence_snapshot
 from skyvern.forge.sdk.copilot.tools.run_execution import _attach_registered_output_parameter_values
-from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
 
 @pytest.mark.parametrize(
@@ -137,6 +136,7 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=workflow_blocks))  # type: ignore[assignment]
     ctx.last_workflow_yaml = "blocks: []"
     ctx.verified_prefix_labels = labels
+    ctx.composition_verified_labels = list(labels)
     return ctx
 
 
@@ -512,7 +512,7 @@ def test_blocked_flag_run_reports_structured_blocker() -> None:
     assert "human verification challenge" in blocker
 
 
-def test_blocked_flag_run_records_terminal_challenge() -> None:
+def test_blocked_flag_run_records_challenge_observation_without_halting() -> None:
     result = _blocked_flag_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -527,12 +527,10 @@ def test_blocked_flag_run_records_terminal_challenge() -> None:
     assert ctx.last_failed_workflow_yaml == "blocks: []"
     categories = result["data"]["failure_categories"]
     assert any(category["category"] == "ANTI_BOT_DETECTION" for category in categories)
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
     assert verified_goal_satisfied_context(ctx) is False
     assert _verified_workflow_or_none(ctx) == (None, None)
     snapshot = getattr(ctx, "outcome_verification_trace_snapshot", {})
@@ -570,16 +568,14 @@ def test_blocked_status_value_rejected_deterministically(block_type: str) -> Non
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
     assert result["ok"] is False
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is False
 
 
-def test_terminal_challenge_blocker_preempts_satisfied_completion() -> None:
+def test_challenge_observation_prevents_false_satisfied_completion_without_halting() -> None:
     result = _blocked_flag_run_result()
     ctx = _ctx(result["data"]["blocks"])
     ctx.completion_criteria_turn_state = SimpleNamespace(
@@ -591,10 +587,8 @@ def test_terminal_challenge_blocker_preempts_satisfied_completion() -> None:
     _record_run_blocks_result(ctx, result, completion_verification=_satisfied("c0"))
 
     assert result["ok"] is False
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.last_test_suspicious_success is False
     assert verified_goal_satisfied_context(ctx) is False
     assert ctx.completion_criteria_turn_state.fully_satisfied_workflow_yaml is None
@@ -1051,16 +1045,16 @@ def test_satisfied_interactive_completion_does_not_make_empty_output_terminal_re
     assert ctx.latest_recorded_build_test_outcome.structural_key is None
 
 
-def test_terminal_blocker_does_not_leave_authoritative_prompt_outcome() -> None:
+def test_challenge_observation_does_not_leave_authoritative_prompt_outcome() -> None:
     result = _blocked_flag_run_result()
     ctx = _ctx(result["data"]["blocks"])
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
-    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal is None
     outcome = ctx.latest_recorded_build_test_outcome
     assert outcome is not None
-    assert outcome.reason_code == "terminal_challenge_blocker"
+    assert outcome.reason_code == "blocker_reported"
     assert outcome.is_authoritative is False
 
 

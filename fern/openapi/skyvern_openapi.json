@@ -8507,13 +8507,19 @@
           "recording",
           "audio",
           "session_replay",
+          "eval_score",
+          "eval_trajectory",
+          "eval_rubrics",
           "browser_console_log",
+          "browser_session_action_log",
           "skyvern_log",
           "skyvern_log_raw",
           "screenshot",
           "screenshot_llm",
           "screenshot_action",
           "screenshot_final",
+          "screenshot_proxy",
+          "screenshot_pre_submit",
           "llm_prompt",
           "llm_request",
           "llm_response",
@@ -8529,13 +8535,15 @@
           "html",
           "html_scrape",
           "html_action",
+          "html_pre_submit",
           "trace",
           "har",
           "script_file",
           "pdf",
           "step_archive",
           "task_archive",
-          "download"
+          "download",
+          "unknown"
         ],
         "title": "ArtifactType"
       },
@@ -10721,7 +10729,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -16507,11 +16515,13 @@
           },
           "timeout_seconds": {
             "type": "integer",
-            "title": "Timeout Seconds"
+            "title": "Timeout Seconds",
+            "default": 7200
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "default": "hello@skyvern.com"
           },
           "recipients": {
             "items": {
@@ -16522,21 +16532,19 @@
           },
           "subject": {
             "type": "string",
-            "title": "Subject"
+            "title": "Subject",
+            "default": "Human interaction required for workflow run"
           },
           "body": {
             "type": "string",
-            "title": "Body"
+            "title": "Body",
+            "default": "Your interaction is required for a workflow run!"
           }
         },
         "type": "object",
         "required": [
           "label",
-          "timeout_seconds",
-          "sender",
-          "recipients",
-          "subject",
-          "body"
+          "recipients"
         ],
         "title": "HumanInteractionBlockYAML"
       },
@@ -19499,6 +19507,7 @@
         "enum": [
           "skyvern-1.0",
           "skyvern-2.0",
+          "skyvern-3.0",
           "openai-cua",
           "anthropic-cua",
           "ui-tars",
@@ -20312,19 +20321,47 @@
             "default": false
           },
           "smtp_host_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Host Secret Parameter Key"
           },
           "smtp_port_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Port Secret Parameter Key"
           },
           "smtp_username_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Username Secret Parameter Key"
           },
           "smtp_password_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Password Secret Parameter Key"
           },
           "sender": {
@@ -20364,10 +20401,6 @@
         "type": "object",
         "required": [
           "label",
-          "smtp_host_secret_parameter_key",
-          "smtp_port_secret_parameter_key",
-          "smtp_username_secret_parameter_key",
-          "smtp_password_secret_parameter_key",
           "sender",
           "recipients",
           "subject",

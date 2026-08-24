@@ -5,6 +5,7 @@
 
 import { buildRevealOffsets } from "./actionReveal";
 import {
+  ConnectedAccountChoice,
   CopilotResponseType,
   ProposalDisposition,
   RunOutcomeRole,
@@ -153,6 +154,21 @@ export interface TerminalEnvelopeFacts {
   runDisplayReason: string | null;
 }
 
+export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+
+export interface ReviewProjection {
+  blocks: Array<{
+    label: string;
+    blockType: string;
+    change: ReviewChange;
+    neverTested?: boolean;
+  }>;
+  duplicateWrites: Array<{
+    blockType: string;
+    blockLabels: string[];
+  }>;
+}
+
 // Envelope dicts are backend model_dump output, so keys stay snake_case.
 // The backend anchors run_verdict from final outcomes only, so "evaluating"
 // is not a wire value here and parses to null like any unknown.
@@ -218,6 +234,9 @@ export interface ActivityEntry {
   // Consecutive same-tool retries folded into this row by
   // condenseActivityEntries. Unset outside that transform.
   attempts?: number;
+  // Server clock read for this event, persisted so a hydrated turn reports the
+  // same elapsed as the live one. Undefined against a backend that does not stamp.
+  timestamp?: string;
 }
 
 // Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
@@ -292,6 +311,16 @@ export interface TurnNarrativeState {
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
+  connectedAccountChoices: ConnectedAccountChoice[];
+  googleConnectionNotices: GoogleConnectionNotice[];
+  review: ReviewProjection | null;
+}
+
+export interface GoogleConnectionNotice {
+  provider: "google";
+  connectionId: string;
+  displayName: string | null;
+  condition: "missing" | "unusable";
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -320,6 +349,9 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   credentialPrompt: null,
   credentialPause: null,
   credentialAutoBound: null,
+  connectedAccountChoices: [],
+  googleConnectionNotices: [],
+  review: null,
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -378,6 +410,32 @@ export function parseCredentialPause(
   };
 }
 
+export function parseConnectedAccountChoices(
+  value: unknown,
+): ConnectedAccountChoice[] {
+  if (!Array.isArray(value)) return [];
+  const choices: ConnectedAccountChoice[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (
+      typeof row.connection_id !== "string" ||
+      typeof row.name !== "string" ||
+      typeof row.state !== "string"
+    ) {
+      continue;
+    }
+    choices.push({
+      connection_id: row.connection_id,
+      name: row.name,
+      state: row.state,
+      email_address:
+        typeof row.email_address === "string" ? row.email_address : null,
+    });
+  }
+  return choices;
+}
+
 export function parseCredentialAutoBound(
   value: unknown,
 ): TurnNarrativeState["credentialAutoBound"] {
@@ -393,6 +451,38 @@ export function parseCredentialAutoBound(
     : null;
 }
 
+export function parseGoogleConnectionNotices(
+  value: unknown,
+): GoogleConnectionNotice[] {
+  if (!Array.isArray(value)) return [];
+  const notices: GoogleConnectionNotice[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (
+      row.provider !== "google" ||
+      typeof row.connectionId !== "string" ||
+      row.connectionId.length === 0 ||
+      (row.condition !== "missing" && row.condition !== "unusable") ||
+      seen.has(row.connectionId)
+    ) {
+      continue;
+    }
+    seen.add(row.connectionId);
+    notices.push({
+      provider: "google",
+      connectionId: row.connectionId,
+      displayName:
+        typeof row.displayName === "string" && row.displayName.length > 0
+          ? row.displayName
+          : null,
+      condition: row.condition,
+    });
+  }
+  return notices;
+}
+
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
 // the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
@@ -400,9 +490,11 @@ export function parseCredentialAutoBound(
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
+  "edit_block_and_run",
 ]);
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
+  "edit_block_and_run",
   "run_blocks_and_collect_debug",
 ]);
 
@@ -418,6 +510,7 @@ const ACTIVITY_TOOL_DENYLIST = new Set([
 const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   update_workflow: "Updating workflow",
   update_and_run_blocks: "Testing workflow",
+  edit_block_and_run: "Editing and testing block",
   run_blocks_and_collect_debug: "Testing workflow",
   evaluate: "Inspecting page",
   click: "Interacting with page",
@@ -459,6 +552,7 @@ function buildActivityFromToolCall(
     toolName: event.tool_name,
     displayLabel,
     id: `tc-${event.tool_call_id}`,
+    timestamp: event.timestamp ?? undefined,
   };
 }
 
@@ -487,6 +581,7 @@ function buildActivityFromToolResult(
     displayLabel,
     success: event.success,
     id: `tr-${event.tool_call_id}`,
+    timestamp: event.timestamp ?? undefined,
   };
 }
 
@@ -498,6 +593,7 @@ function buildActivityFromNarration(
     text: event.narration,
     iteration: event.iteration,
     id: `n-${event.iteration}-${event.timestamp}`,
+    timestamp: event.timestamp,
   };
 }
 
@@ -726,10 +822,10 @@ export function isBlockOk(
   );
 }
 
-// Labels that occur exactly once in the given set — the only labels safe to
-// key recorded actions on when the run-block id is missing (the terminal
-// narrative_payload drops workflowRunBlockId). Loop iterations reuse a label,
-// so an ambiguous label falls back to today's drop rather than mis-attributing.
+// Labels that occur exactly once in the given set — the only labels safe to key
+// recorded actions on when the run-block id is missing (a block that never
+// reported progress, or an older backend). Loop iterations reuse a label, so an
+// ambiguous label falls back to today's drop rather than mis-attributing.
 function uniqueLabelSet(labels: Array<string | undefined>): Set<string> {
   const counts = new Map<string, number>();
   for (const label of labels) {
@@ -998,13 +1094,10 @@ export function applyNarrativeEvent(
     case "response": {
       const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
       if (hydrated) {
-        // The BE narrative_payload drops workflowRunBlockId and the client-only
-        // recordedActions. Re-associate each hydrated block with the live block
-        // of the same label to restore its real run-block id (and carry any
-        // recordedActions). Restoring the real id keeps this frozen turn keyed
-        // by id, so a later test run that reuses a label matches by id and can't
-        // graft its actions onto this turn. Unique labels only — loop iterations
-        // reuse a label and can't be told apart without the id.
+        // The BE narrative_payload carries no client-only recordedActions, and
+        // omits workflowRunBlockId for a block that never reported progress.
+        // Re-associating by label carries both across, but only for a label that
+        // occurs once — loop iterations reuse one and can't be told apart.
         const liveById = new Map(
           prev.blocks
             .filter((b) => b.workflowRunBlockId !== "")
@@ -1144,9 +1237,58 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       id: o.id,
+      timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });
   }
   return out;
+}
+
+function parseReviewProjection(raw: unknown): ReviewProjection | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.blocks) || !Array.isArray(value.duplicateWrites)) {
+    return null;
+  }
+  const blocks: ReviewProjection["blocks"] = [];
+  for (const rawBlock of value.blocks) {
+    if (!rawBlock || typeof rawBlock !== "object") return null;
+    const block = rawBlock as Record<string, unknown>;
+    if (
+      typeof block.label !== "string" ||
+      typeof block.blockType !== "string" ||
+      (block.change !== "added" &&
+        block.change !== "changed" &&
+        block.change !== "unchanged" &&
+        block.change !== "removed") ||
+      (block.neverTested !== undefined &&
+        typeof block.neverTested !== "boolean")
+    ) {
+      return null;
+    }
+    blocks.push({
+      label: block.label,
+      blockType: block.blockType,
+      change: block.change,
+      neverTested: block.neverTested,
+    });
+  }
+  const duplicateWrites: ReviewProjection["duplicateWrites"] = [];
+  for (const rawGroup of value.duplicateWrites) {
+    if (!rawGroup || typeof rawGroup !== "object") return null;
+    const group = rawGroup as Record<string, unknown>;
+    if (
+      typeof group.blockType !== "string" ||
+      !Array.isArray(group.blockLabels) ||
+      !group.blockLabels.every((label) => typeof label === "string")
+    ) {
+      return null;
+    }
+    duplicateWrites.push({
+      blockType: group.blockType,
+      blockLabels: group.blockLabels,
+    });
+  }
+  return { blocks, duplicateWrites };
 }
 
 export function hydrateNarrativeFromPayload(
@@ -1328,6 +1470,13 @@ export function hydrateNarrativeFromPayload(
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
+    connectedAccountChoices: parseConnectedAccountChoices(
+      payload.connectedAccountChoices,
+    ),
+    googleConnectionNotices: parseGoogleConnectionNotices(
+      payload.googleConnectionNotices,
+    ),
+    review: parseReviewProjection(payload.review),
   };
 }
 
@@ -1357,13 +1506,34 @@ export function effectiveMode(turn: TurnNarrativeState): string {
 // lifecycle and run facts, so grafting a response kind cannot change them.
 export function hydrateHistoryNarrative(
   payload: Record<string, unknown> | null | undefined,
-  turnOutcome: { response_kind?: string | null } | null | undefined,
+  turnOutcome:
+    | {
+        response_kind?: string | null;
+        connected_account_choices?: ConnectedAccountChoice[] | null;
+      }
+    | null
+    | undefined,
 ): TurnNarrativeState | undefined {
   const hydrated = hydrateNarrativeFromPayload(payload);
-  if (!hydrated || hydrated.responseKind !== null) return hydrated;
+  if (!hydrated) return hydrated;
   const grafted = parseResponseKind(turnOutcome?.response_kind);
-  if (grafted === null) return hydrated;
-  return { ...hydrated, responseKind: grafted };
+  const choices = parseConnectedAccountChoices(
+    turnOutcome?.connected_account_choices,
+  );
+  const hasTurnOutcomeChoices =
+    turnOutcome !== null &&
+    turnOutcome !== undefined &&
+    Object.prototype.hasOwnProperty.call(
+      turnOutcome,
+      "connected_account_choices",
+    );
+  return {
+    ...hydrated,
+    responseKind: hydrated.responseKind ?? grafted,
+    connectedAccountChoices: hasTurnOutcomeChoices
+      ? choices
+      : hydrated.connectedAccountChoices,
+  };
 }
 
 export function formatElapsed(

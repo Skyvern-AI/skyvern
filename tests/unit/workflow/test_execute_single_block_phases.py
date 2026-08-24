@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -121,6 +122,7 @@ async def _run_single_block(
     workflow_run: MagicMock | None = None,
     is_script_run: bool = False,
     script_blocks_by_label: dict | None = None,
+    loaded_script_module: Any = None,
     blocks_to_update: set[str] | None = None,
 ) -> tuple:
     organization = MagicMock()
@@ -135,7 +137,7 @@ async def _run_single_block(
         workflow_run_id="wr_test",
         browser_session_id=None,
         script_blocks_by_label=script_blocks_by_label if script_blocks_by_label is not None else {},
-        loaded_script_module=None,
+        loaded_script_module=loaded_script_module,
         is_script_run=is_script_run,
         blocks_to_update=blocks_to_update if blocks_to_update is not None else set(),
     )
@@ -262,6 +264,7 @@ async def test_ai_fallback_disabled_keeps_script_failure(monkeypatch: pytest.Mon
         workflow_run=_workflow_run(ai_fallback=False),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 / 0")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     execute_safe.assert_not_awaited()
@@ -295,6 +298,7 @@ async def test_script_success_skips_agent_execution(monkeypatch: pytest.MonkeyPa
         block,
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     execute_safe.assert_not_awaited()
@@ -461,6 +465,7 @@ async def test_adaptive_caching_script_failure_records_and_updates_fallback_epis
         workflow=_adaptive_workflow(),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
     record_episode.assert_awaited_once()
@@ -489,15 +494,10 @@ async def test_non_adaptive_script_failure_skips_fallback_episode(monkeypatch: p
     record_episode = AsyncMock(return_value=("ep_1", None))
     monkeypatch.setattr(WorkflowService, "_record_fallback_episode", record_episode)
     monkeypatch.setattr(WorkflowService, "_mark_script_fallback_triggered", AsyncMock())
-    monkeypatch.setattr(
-        NavigationBlock,
-        "execute_safe",
-        AsyncMock(
-            return_value=BlockResult(
-                success=True, output_parameter=block.output_parameter, status=BlockStatus.completed
-            )
-        ),
+    execute_safe = AsyncMock(
+        return_value=BlockResult(success=True, output_parameter=block.output_parameter, status=BlockStatus.completed)
     )
+    monkeypatch.setattr(NavigationBlock, "execute_safe", execute_safe)
     update_episode = AsyncMock()
     monkeypatch.setattr(app.DATABASE.scripts, "update_fallback_episode", update_episode)
 
@@ -509,8 +509,13 @@ async def test_non_adaptive_script_failure_skips_fallback_episode(monkeypatch: p
         workflow=_workflow(),
         is_script_run=True,
         script_blocks_by_label={"cached_nav": _script_block("cached_nav", "1 + 1")},
+        loaded_script_module=SimpleNamespace(),
     )
 
+    # The script path must actually have run (script executed, DB row says failed, mid-block
+    # fallback to the agent) for this test to say anything about the non-adaptive-caching skip;
+    # otherwise these assertions would hold vacuously because the script path was never entered.
+    execute_safe.assert_awaited_once()
     record_episode.assert_not_awaited()
     update_episode.assert_not_awaited()
 

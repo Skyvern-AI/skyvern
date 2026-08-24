@@ -8,13 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.agent import _finalize_result_with_blocker_override, _make_agent_result
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.build_test_outcome import record_build_test_outcome
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CopilotContext,
     StructuredContext,
 )
+from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
@@ -72,6 +73,35 @@ def test_backfill_tolerates_turn_outcome_none() -> None:
     result = _result(_ctx(), turn_outcome=None, narrative_payload=_payload())
     assert result.narrative_payload is not None
     assert "responseKind" not in result.narrative_payload
+
+
+def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
+    ctx = _ctx()
+    ctx.google_connection_notices = [
+        GoogleConnectionNotice(
+            connectionId="goac_needs_reconnect",
+            displayName="Sheets account",
+            condition="unusable",
+        )
+    ]
+
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["googleConnectionNotices"] == [
+        {
+            "provider": "google",
+            "connectionId": "goac_needs_reconnect",
+            "displayName": "Sheets account",
+            "condition": "unusable",
+        }
+    ]
+
+
+def test_backfill_omits_empty_google_connection_notices() -> None:
+    result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    assert result.narrative_payload is not None
+    assert "googleConnectionNotices" not in result.narrative_payload
 
 
 @pytest.mark.parametrize(
@@ -272,7 +302,8 @@ def test_build_turn_reports_the_failure_no_later_run_re_exercised() -> None:
     assert unresolved is not None
     assert unresolved.workflow_run_id == "wr_1"
     assert unresolved.block_label == "sign_in_and_read"
-    assert "wr_1" in result.user_response
+    assert "wr_1" not in result.user_response
+    assert contains_internal_machinery_leak(result.user_response) is False
     assert "sign_in_and_read" in result.user_response
     assert "Built it. The workflow reads the visitor count." in result.user_response
 
@@ -354,5 +385,6 @@ def test_the_qualification_also_rides_the_narrative_terminal_message() -> None:
 
     assert result.narrative_payload is not None
     for key in ("terminalMessage", "narrativeSummary"):
-        assert "wr_1" in result.narrative_payload[key], key
+        assert "wr_1" not in result.narrative_payload[key], key
+        assert contains_internal_machinery_leak(result.narrative_payload[key]) is False, key
         assert "sign_in_and_read" in result.narrative_payload[key], key

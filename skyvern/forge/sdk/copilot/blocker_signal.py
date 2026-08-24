@@ -6,12 +6,13 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 
 BlockerKind = Literal[
     "authority_denied",
@@ -26,6 +27,7 @@ RecoveryHint = Literal[
 ]
 
 LOG = structlog.get_logger()
+BROWSER_SESSION_LOST_BLOCKER_REASON_CODE = "tool_error_browser_session_lost"
 
 
 # Matched case-insensitively. Imperative variants are narrow ("do not run" etc.) so plain "do not worry" prose doesn't false-positive.
@@ -73,6 +75,7 @@ _INTERNAL_GUARD_TOKENS: tuple[str, ...] = (
 _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "update_workflow",
     "update_and_run_blocks",
+    "edit_block_and_run",
     "run_blocks_and_collect_debug",
     "get_run_results",
     "inspect_page_for_composition",
@@ -177,6 +180,7 @@ class _BlockerSignalCtx(_TerminalEvidenceCtx, Protocol):
 class _ActiveRunEvidenceResetCtx(Protocol):
     last_run_blocks_workflow_run_id: str | None
     last_successful_run_blocks_workflow_run_id: str | None
+    last_run_blocks_browser_session_id: str | None
     recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
@@ -196,6 +200,7 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     block_state_map: dict[str, str]
     block_started_at_map: dict[str, str]
     block_ended_at_map: dict[str, str]
+    block_run_identity_map: dict[str, BlockRunIdentity]
 
 
 def terminal_evidence_from_ctx(ctx: _TerminalEvidenceCtx) -> TerminalEvidence:
@@ -215,6 +220,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     """Detach the edited draft from prior-run pointers without erasing the run archive."""
     ctx.last_run_blocks_workflow_run_id = None
     ctx.last_successful_run_blocks_workflow_run_id = None
+    ctx.last_run_blocks_browser_session_id = None
     ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
     ctx.last_run_blocks_block_labels = []
@@ -234,17 +240,13 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.block_state_map = {}
     ctx.block_started_at_map = {}
     ctx.block_ended_at_map = {}
+    ctx.block_run_identity_map = {}
 
 
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 # A held blocker whose reason code is in this set must win both the rendered reply and the typed
 # halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
-GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
-    {
-        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        "tool_error_run_output_terminal_blocker",
-    }
-)
+GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset({BROWSER_SESSION_LOST_BLOCKER_REASON_CODE})
 
 
 def blocker_signal_is_genuinely_terminal(signal: CopilotToolBlockerSignal | None) -> bool:

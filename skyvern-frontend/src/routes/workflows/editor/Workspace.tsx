@@ -33,7 +33,7 @@ import {
   Edge,
 } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { usePostHog } from "posthog-js/react";
+import { useFeatureFlagEnabled, usePostHog } from "posthog-js/react";
 
 import {
   useWorkflowYamlEditorStore,
@@ -49,6 +49,11 @@ import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
+import {
+  resolveBrowserPanelMode,
+  resolveCdpRecordingExfiltrate,
+  updateBrowserPanelLatch,
+} from "./browserPanelMode";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
@@ -117,12 +122,17 @@ import {
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
-import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
+import {
+  getCode,
+  getOrderedBlockLabels,
+  shouldPollForGeneratedCode,
+} from "@/routes/workflows/utils";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
+import { RECORD_BROWSER_CDP_TRANSPORT_FLAG } from "@/util/featureFlags";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
@@ -381,7 +391,6 @@ function Workspace({
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
     copilotMessage?: unknown;
-    copilotFixOrigin?: unknown;
   } | null;
   const routeInitialCopilotMessage =
     typeof locationState?.copilotMessage === "string"
@@ -396,7 +405,6 @@ function Workspace({
     () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
     [routeInitialCopilotMessage, storedInitialCopilotMessage],
   );
-  const initialCopilotFixOrigin = locationState?.copilotFixOrigin === true;
   const handleInitialCopilotMessageConsumed = useCallback(() => {
     if (!initialCopilotMessage) return;
     clearStoredInitialCopilotMessage();
@@ -728,11 +736,13 @@ function Workspace({
     publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
 
   const isGeneratingCode =
-    !hasPublishedScript && !isFinalized && Boolean(workflowRun);
+    Boolean(workflowRun) &&
+    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
 
   const { data: blockScriptsPending } = useBlockScriptsQuery({
     cacheKey,
     cacheKeyValue,
+    enabled: isGeneratingCode,
     workflowPermanentId,
     pollIntervalMs: isGeneratingCode ? 3000 : undefined,
     status: "pending",
@@ -772,7 +782,7 @@ function Workspace({
               detail:
                 getAxiosErrorDetail(debugSessionError) ??
                 "More credits are required to start a browser session.",
-              hint: "Add credits or enable overage in Billing, then return here to start the browser session.",
+              hint: "Upgrade your plan in Billing, then return here to start the browser session.",
             }
           : {
               title: "Could not start browser session",
@@ -810,11 +820,37 @@ function Workspace({
   const { streamTransport } = useStreamTransport(
     activeDebugSession?.browser_session_id,
   );
-  const isCdpStreamingMode =
-    streamTransport === "cdp" && !recordingStore.isRecording;
-  // Record Browser exfiltration requires VNC even when the transport is CDP streaming.
-  const preferVncStream =
-    streamTransport !== "cdp" || recordingStore.isRecording;
+  const cdpRecordingFlagEnabled =
+    useFeatureFlagEnabled(RECORD_BROWSER_CDP_TRANSPORT_FLAG) ?? false;
+  const browserPanelLatchRef = useRef({
+    streamTransport,
+    cdpRecordingEnabled: cdpRecordingFlagEnabled,
+  });
+  browserPanelLatchRef.current = updateBrowserPanelLatch(
+    browserPanelLatchRef.current,
+    {
+      streamTransport,
+      cdpRecordingEnabled: cdpRecordingFlagEnabled,
+    },
+    recordingStore.isRecording,
+  );
+  const { streamTransport: latchedStreamTransport, cdpRecordingEnabled } =
+    browserPanelLatchRef.current;
+  // Keep the panel mode stable if transport resolution or PostHog changes mid-recording.
+  const { showCdp: isCdpStreamingMode, preferVnc: preferVncStream } =
+    resolveBrowserPanelMode({
+      streamTransport: latchedStreamTransport,
+      isRecording: recordingStore.isRecording,
+      cdpRecordingEnabled,
+    });
+  const recordingTransport =
+    showBrowser && latchedStreamTransport === "cdp" && cdpRecordingEnabled
+      ? "cdp"
+      : "vnc";
+  const setRecordingTransport = recordingStore.setRecordingTransport;
+  useLayoutEffect(() => {
+    setRecordingTransport(recordingTransport);
+  }, [setRecordingTransport, recordingTransport]);
 
   const workflowChangesStore = useWorkflowHasChangesStore();
 
@@ -1650,6 +1686,7 @@ function Workspace({
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
+      reuseBrowserSession: workflowData.reuse_browser_session ?? false,
       pinSavedSessionIp: workflowData.pin_saved_session_ip ?? false,
       browserProfileId: workflowData.browser_profile_id ?? null,
       browserProfileKey: workflowData.browser_profile_key ?? null,
@@ -1753,13 +1790,15 @@ function Workspace({
     useWorkflowYamlEditorStore.getState().open(yaml);
   };
 
-  // Expose Code-mode entry to the studio's Editor pane header via the store.
-  // A stable wrapper over a ref keeps the registration from churning while
-  // still calling the latest closure.
+  // Expose Code-mode entry via the store so header chrome outside this
+  // closure (studio's Editor pane header, the legacy overflow menu's "View
+  // schema" item) can enter Code mode without owning serialization. A stable
+  // wrapper over a ref keeps the registration from churning while still
+  // calling the latest closure.
   const enterYamlModeRef = useRef(enterYamlMode);
   enterYamlModeRef.current = enterYamlMode;
   useEffect(() => {
-    if (!embedded || isGlobalWorkflow) {
+    if (isGlobalWorkflow) {
       return;
     }
     const store = useWorkflowYamlEditorStore.getState();
@@ -1974,6 +2013,7 @@ function Workspace({
         selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
+      reuseBrowserSession: selectedVersion.reuse_browser_session ?? false,
       pinSavedSessionIp: selectedVersion.pin_saved_session_ip ?? false,
       browserProfileId: selectedVersion.browser_profile_id ?? null,
       browserProfileKey: selectedVersion.browser_profile_key ?? null,
@@ -2690,6 +2730,12 @@ function Workspace({
                       ) : isFlowCanvasReady || recordingStore.isRecording ? (
                         <BrowserSessionStream
                           browserSessionId={displayBrowserSessionId}
+                          exfiltrate={resolveCdpRecordingExfiltrate({
+                            cdpRecordingEnabled,
+                            isRecording: recordingStore.isRecording,
+                            finishRequested: recordingStore.finishRequested,
+                          })}
+                          workflowPermanentId={workflowPermanentId ?? null}
                           interactive={true}
                           showControlButtons={true}
                           // The CDP transport streams the page viewport only, so
@@ -2873,7 +2919,6 @@ function Workspace({
         requiresLiveBrowser={copilotRequiresLiveBrowser}
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
-        initialMessageFixOrigin={initialCopilotFixOrigin}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
         onBlockSelect={(blockLabel) => {
           const matches = (node: AppNode) =>
@@ -2974,6 +3019,7 @@ function Workspace({
               extra_http_headers: extraHttpHeaders,
               cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
+              reuse_browser_session: saveData.settings.reuseBrowserSession,
               pin_saved_session_ip: saveData.settings.pinSavedSessionIp,
               browser_profile_id: saveData.settings.browserProfileId,
               browser_profile_key: saveData.settings.browserProfileKey,

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import orjson
 import pytest
@@ -12,8 +12,8 @@ from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.workflow.models.tags import CallerType, TagSource
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
-from skyvern.schemas.run_enums import RunType
-from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
+from skyvern.schemas.run_enums import RunEngine, RunType
+from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
 
 
 def _caller(org_id: str = "org_123") -> SimpleNamespace:
@@ -159,15 +159,17 @@ async def test_get_runs_v2_rejects_workflow_filter_page_beyond_fetch_cap(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("handler", "expected_exclude_child_runs"),
+    ("handler", "extra_kwargs", "expected_exclude_child_runs"),
     [
-        (agent_protocol.get_workflow_runs_by_id, True),
-        (agent_protocol.get_workflow_runs_by_id_legacy, False),
+        (agent_protocol.get_workflow_runs_by_id, {}, True),
+        (agent_protocol.get_workflow_runs_by_id, {"include_child_runs": True}, False),
+        (agent_protocol.get_workflow_runs_by_id_legacy, {}, False),
     ],
 )
 async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
     monkeypatch: pytest.MonkeyPatch,
     handler: Any,
+    extra_kwargs: dict[str, Any],
     expected_exclude_child_runs: bool,
 ) -> None:
     mock_service = SimpleNamespace(
@@ -184,6 +186,7 @@ async def test_get_workflow_runs_by_id_child_filter_depends_on_route(
         search_key="login",
         error_code="LOGIN_FAILED",
         current_org=SimpleNamespace(organization_id="org_123"),
+        **extra_kwargs,
     )
 
     assert response == []
@@ -218,6 +221,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         browser_profile_id="bprof_123",
         browser_seed_source=None,
         start_fresh_browser=None,
+        reuse_browser_session=None,
         max_screenshot_scrolls=3,
         max_elapsed_time_minutes=None,
         extra_http_headers={"X-Test": "1"},
@@ -237,6 +241,8 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
         created_at=created_at,
         modified_at=created_at,
         browser_session_id="pbs_123",
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id="bprof_123",
         browser_seed_source=None,
         run_with="code",
@@ -268,6 +274,7 @@ async def test_retry_workflow_run_replays_original_run_parameters(monkeypatch: p
     monkeypatch.setattr(agent_protocol.skyvern_context, "ensure_context", lambda: SimpleNamespace(request_id="req_123"))
     mock_agent_function = SimpleNamespace(
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        on_run_created=AsyncMock(),
     )
     monkeypatch.setattr(app_instance, "AGENT_FUNCTION", mock_agent_function, raising=False)
 
@@ -412,6 +419,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         browser_profile_id=None,
         browser_seed_source=None,
         start_fresh_browser=None,
+        reuse_browser_session=None,
         max_screenshot_scrolls=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
@@ -431,6 +439,8 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         created_at=now,
         modified_at=now,
         browser_session_id=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         browser_profile_id=None,
         browser_seed_source=None,
         run_with=None,
@@ -458,6 +468,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         "AGENT_FUNCTION",
         SimpleNamespace(
             is_block_scoped_workflow_run=AsyncMock(return_value=False),
+            on_run_created=AsyncMock(),
         ),
         raising=False,
     )
@@ -575,3 +586,213 @@ async def test_retry_workflow_run_rejects_active_run(monkeypatch: pytest.MonkeyP
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Only terminal workflow runs can be retried"
+
+
+def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    on_run_created = AsyncMock()
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(
+        app_instance,
+        "RATE_LIMITER",
+        SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "EXPERIMENTATION_PROVIDER",
+        SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "DATABASE",
+        SimpleNamespace(observer=SimpleNamespace(get_task_v2=AsyncMock(return_value=None))),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "AGENT_FUNCTION",
+        SimpleNamespace(on_run_created=on_run_created),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_protocol.PermissionCheckerFactory,
+        "get_instance",
+        lambda: SimpleNamespace(check=AsyncMock()),
+    )
+    monkeypatch.setattr(agent_protocol, "_validate_enterprise_gated_task_run_features", AsyncMock())
+    monkeypatch.setattr(
+        agent_protocol.AsyncExecutorFactory,
+        "get_executor",
+        lambda: SimpleNamespace(execute_task_v2=AsyncMock()),
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent_protocol, "TaskRunRequest", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(agent_protocol, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
+    return on_run_created
+
+
+def _task_run_request(engine: RunEngine) -> TaskRunRequest:
+    return TaskRunRequest(
+        prompt="Do the task",
+        url="https://example.com",
+        engine=engine,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_task_v1_uses_resolved_caller_type_with_ui_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    on_run_created = _install_task_route_doubles(monkeypatch)
+    created_task = MagicMock(task_id="tsk_v1")
+    monkeypatch.setattr(
+        agent_protocol.task_v1_service,
+        "run_task",
+        AsyncMock(return_value=(created_task, RunEngine.skyvern_v1)),
+    )
+    background_tasks = BackgroundTasks()
+
+    await agent_protocol.run_task(
+        request=SimpleNamespace(),
+        background_tasks=background_tasks,
+        run_request=_task_run_request(RunEngine.skyvern_v1),
+        caller=SimpleNamespace(
+            organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
+            caller_type=CallerType.API_KEY,
+        ),
+        x_api_key="api-key",
+        x_user_agent=agent_protocol.org_auth_service.SKYVERN_UI_USER_AGENT,
+    )
+
+    assert len(background_tasks.tasks) == 1
+    await background_tasks()
+    on_run_created.assert_awaited_once_with(
+        organization_id="org_123",
+        run_id="tsk_v1",
+        run_type="task_v1",
+        caller_type=CallerType.API_KEY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_task_v2_schedules_run_created_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    on_run_created = _install_task_route_doubles(monkeypatch)
+    task_v2 = MagicMock(observer_cruise_id="tsk_v2", workflow_run_id=None)
+    monkeypatch.setattr(
+        agent_protocol.task_v2_service,
+        "initialize_task_v2",
+        AsyncMock(return_value=task_v2),
+    )
+    background_tasks = BackgroundTasks()
+
+    await agent_protocol.run_task(
+        request=SimpleNamespace(),
+        background_tasks=background_tasks,
+        run_request=_task_run_request(RunEngine.skyvern_v2),
+        caller=SimpleNamespace(
+            organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
+            caller_type=CallerType.API_KEY,
+        ),
+        x_api_key="api-key",
+    )
+
+    assert len(background_tasks.tasks) == 1
+    await background_tasks()
+    on_run_created.assert_awaited_once_with(
+        organization_id="org_123",
+        run_id="tsk_v2",
+        run_type="task_v2",
+        caller_type=CallerType.API_KEY,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [RunEngine.skyvern_v1, RunEngine.skyvern_v2])
+async def test_run_task_does_not_schedule_run_created_hook_when_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: RunEngine,
+) -> None:
+    on_run_created = _install_task_route_doubles(monkeypatch)
+    monkeypatch.setattr(
+        agent_protocol.task_v1_service,
+        "run_task",
+        AsyncMock(side_effect=RuntimeError("creation failed")),
+    )
+    monkeypatch.setattr(
+        agent_protocol.task_v2_service,
+        "initialize_task_v2",
+        AsyncMock(side_effect=RuntimeError("creation failed")),
+    )
+    background_tasks = BackgroundTasks()
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        await agent_protocol.run_task(
+            request=SimpleNamespace(),
+            background_tasks=background_tasks,
+            run_request=_task_run_request(engine),
+            caller=SimpleNamespace(
+                organization=SimpleNamespace(organization_id="org_123", max_steps_per_run=None),
+                caller_type=CallerType.API_KEY,
+            ),
+            x_api_key="api-key",
+        )
+
+    assert background_tasks.tasks == []
+    on_run_created.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_task_routes_schedule_run_created_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    on_run_created = _install_task_route_doubles(monkeypatch)
+    created_task_v1 = SimpleNamespace(task_id="tsk_legacy_v1")
+    created_task_v2 = MagicMock(observer_cruise_id="tsk_legacy_v2")
+    created_task_v2.model_dump.return_value = {"task_id": "tsk_legacy_v2"}
+    monkeypatch.setattr(
+        agent_protocol.task_v1_service,
+        "run_task",
+        AsyncMock(return_value=(created_task_v1, RunEngine.skyvern_v1)),
+    )
+    monkeypatch.setattr(
+        agent_protocol.task_v2_service,
+        "initialize_task_v2",
+        AsyncMock(return_value=created_task_v2),
+    )
+    background_tasks = BackgroundTasks()
+    organization = SimpleNamespace(organization_id="org_123")
+    caller = SimpleNamespace(organization=organization, caller_type=CallerType.API_KEY)
+
+    await agent_protocol.run_task_v1(
+        request=SimpleNamespace(),
+        background_tasks=background_tasks,
+        task=MagicMock(url="https://example.com", browser_session_id=None, model=None),
+        caller=caller,
+        x_api_key="api-key",
+        x_max_steps_override=None,
+        x_user_agent=None,
+    )
+    await agent_protocol.run_task_v2(
+        request=SimpleNamespace(),
+        background_tasks=background_tasks,
+        caller=caller,
+        data=MagicMock(browser_session_id=None),
+        x_max_iterations_override=None,
+        x_max_steps_override=None,
+        x_user_agent=None,
+        x_api_key="api-key",
+    )
+
+    assert len(background_tasks.tasks) == 2
+    await background_tasks()
+    assert on_run_created.await_args_list == [
+        call(
+            organization_id="org_123",
+            run_id="tsk_legacy_v1",
+            run_type=RunType.task_v1,
+            caller_type=CallerType.API_KEY,
+        ),
+        call(
+            organization_id="org_123",
+            run_id="tsk_legacy_v2",
+            run_type=RunType.task_v2,
+            caller_type=CallerType.API_KEY,
+        ),
+    ]

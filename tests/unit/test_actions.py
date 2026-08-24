@@ -1,17 +1,23 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.exceptions import UnsupportedActionType
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.schemas import sdk_actions
 from skyvern.forge.sdk.schemas.sdk_actions import InputTextAction as SdkInputTextAction
 from skyvern.forge.sdk.schemas.sdk_actions import SdkActionType
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.action_redaction import (
     REDACTED_OTP_IDENTIFIER,
@@ -28,6 +34,7 @@ from skyvern.webeye.actions.actions import (
     ClickAction,
     ClickContext,
     ClosePageAction,
+    DragAction,
     ExtractAction,
     GotoUrlAction,
     InputTextAction,
@@ -40,7 +47,7 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
-from skyvern.webeye.actions.parse_actions import parse_action
+from skyvern.webeye.actions.parse_actions import parse_action, parse_actions
 
 
 def _mock_scraped_page() -> MagicMock:
@@ -94,6 +101,19 @@ def test_action_parse__with_element_id() -> None:
     action = Action.model_validate(action_no_element_id_int)
     assert action.action_type == "click"
     assert action.element_id == "1"
+
+
+def test_drag_action_rejects_oversized_path_before_validating_points() -> None:
+    valid_path = [(index, index) for index in range(1_000)]
+    assert DragAction(path=valid_path).path == valid_path
+
+    with pytest.raises(ValidationError) as exc_info:
+        DragAction.model_validate({"path": [("not-an-int", "also-not-an-int")] * 100_000})
+
+    assert exc_info.value.error_count() == 1
+    assert [(error["loc"], error["type"]) for error in exc_info.value.errors(include_input=False)] == [
+        (("path",), "too_long")
+    ]
 
 
 def test_sdk_input_text_action_repr_redacts_otp_fields() -> None:
@@ -587,6 +607,27 @@ def test_parse_select_option_download_field(download_value: bool | None) -> None
     assert action.download is expected
 
 
+def test_parse_unknown_action_type_raises_unsupported_action_type() -> None:
+    with pytest.raises(UnsupportedActionType):
+        parse_action(
+            action={"action_type": "INPUT", "id": "1", "reasoning": "test"},
+            scraped_page=_mock_scraped_page(),
+        )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"action_type": "SELECT_OPTION", "id": "1", "reasoning": "test"},
+        {"action_type": "SELECT_OPTION", "id": "1", "reasoning": "test", "option": "Yes"},
+    ],
+    ids=["option_missing", "option_is_a_string"],
+)
+def test_parse_select_option_malformed_option_raises_value_error(action: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        parse_action(action=action, scraped_page=_mock_scraped_page())
+
+
 def test_parse_select_option_download_missing() -> None:
     """SELECT_OPTION with no download key should default to False."""
     action = parse_action(
@@ -600,6 +641,48 @@ def test_parse_select_option_download_missing() -> None:
     )
     assert isinstance(action, SelectOptionAction)
     assert action.download is False
+
+
+@pytest.mark.parametrize(
+    "raw_action",
+    [
+        {"action_type": "INPUT_TEXT", "id": "1"},
+        {"action_type": "PASTE_TEXT", "id": "1"},
+        {"action_type": "UPLOAD_FILE", "id": "1"},
+        {"action_type": "DOWNLOAD_FILE"},
+        {"action_type": "SELECT_OPTION", "id": "1"},
+        {"action_type": "CHECKBOX", "id": "1"},
+    ],
+)
+def test_parse_actions_treats_missing_required_fields_as_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_action: dict[str, object],
+) -> None:
+    context = MagicMock()
+    context.totp_codes = {}
+    monkeypatch.setattr(
+        "skyvern.webeye.actions.parse_actions.skyvern_context.ensure_context",
+        lambda: context,
+    )
+    task = MagicMock()
+    task.task_id = "tsk_test"
+    task.organization_id = "org_test"
+    task.workflow_run_id = "wr_test"
+    task.data_extraction_goal = None
+    task.extracted_information_schema = None
+
+    with capture_logs() as logs:
+        actions = parse_actions(
+            task=task,
+            step_id="stp_test",
+            step_order=1,
+            scraped_page=_mock_scraped_page(),
+            json_response=[raw_action],
+        )
+
+    assert actions == []
+    assert [log["event"] for log in logs] == ["Invalid action"]
+    assert logs[0]["log_level"] == "warning"
 
 
 @pytest.mark.parametrize("download_value", [None, False, True])
@@ -813,6 +896,54 @@ def test_parse_switch_tab_action_non_integer_index_returns_null() -> None:
         scraped_page=_mock_scraped_page(),
     )
     assert isinstance(action, NullAction)
+
+
+def test_parse_action_input_text_missing_text_never_types_the_prose_user_detail_answer() -> None:
+    # user_detail_answer is prose ("The user's full name is X"), not the bare literal value the
+    # field expects — falling back to it would enter the whole sentence into the form field.
+    prose_answer = "The user's full name is gHVRNk LZlM."
+    action = {
+        "action_type": "INPUT_TEXT",
+        "id": "AAAX",
+        "reasoning": "The 'Full name' field is a required text input.",
+        "user_detail_query": "What is the user's full name?",
+        "user_detail_answer": prose_answer,
+        "confidence_float": 1,
+    }
+    try:
+        result = parse_action(action=action, scraped_page=_mock_scraped_page())
+    except (KeyError, ValidationError):
+        # Both rejections keep the prose out of the field: KeyError from the historical
+        # action["text"] lookup, ValidationError since #15554 passes action.get("text")=None
+        # into the non-optional model field.
+        return
+    assert not (isinstance(result, InputTextAction) and result.text == prose_answer)
+
+
+def test_parse_actions_skips_non_object_entries_and_keeps_real_actions() -> None:
+    # A planner refusal repaired into the actions array arrives as prose fragments. They must
+    # be dropped without crashing, and the real action dicts alongside them must still parse.
+    now = datetime.now()
+    task = Task(
+        task_id="tsk_parse",
+        organization_id="o_test",
+        status=TaskStatus.running,
+        created_at=now,
+        modified_at=now,
+        url="https://example.com",
+    )
+    payload = [
+        "I cannot provide an action. The `actions` array will be empty.",
+        {"action_type": "CLICK", "id": "e1", "reasoning": "click the button"},
+        ["nested", "junk"],
+        None,
+    ]
+
+    with skyvern_context.scoped(SkyvernContext()):
+        actions = parse_actions(task, "stp_parse", 0, _mock_scraped_page(), payload)
+
+    assert [type(action) for action in actions] == [ClickAction]
+    assert actions[0].element_id == "e1"
 
 
 def test_tab_actions_registered_for_db_hydration() -> None:

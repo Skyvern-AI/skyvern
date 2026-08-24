@@ -21,18 +21,12 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useRecordingElapsedSeconds } from "@/hooks/useRecordingElapsedSeconds";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
-import { buildOptimisticStep } from "@/routes/workflows/editor/recording/optimisticSteps";
-import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   useRecordingStore,
   countVisibleDraftSteps,
-  type ExfiltratedEventConsoleParams,
-  type MessageInExfiltratedEvent,
-  type RecordingInterpretationUpdate,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { wssBaseUrl, newWssBaseUrl, getCredentialParam } from "@/util/env";
-import { copyText } from "@/util/copyText";
+import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { formatRecordingClock } from "@/util/recordingClock";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
@@ -44,6 +38,8 @@ import {
   handleVncClipboardPasteShortcut,
   type HeldMetaSides,
 } from "@/components/browserStreamClipboard";
+import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
+import { useWebSocketParams } from "@/routes/streaming/webSocketParams";
 
 import "./browser-stream.css";
 
@@ -65,87 +61,6 @@ interface BrowserSession {
   started_at?: string | null;
   completed_at?: string | null;
 }
-
-interface CommandBeginExfiltration {
-  kind: "begin-exfiltration";
-  workflow_permanent_id?: string;
-  live_interpretation_enabled?: boolean;
-  // Declares that this client understands delta interpretation updates, so the
-  // backend may send changed_steps instead of full snapshots.
-  supports_interpretation_deltas?: boolean;
-  // Per-recording id: stable across reconnects, new per recording, so the
-  // backend reuses the session on reconnect but starts fresh on a new recording.
-  recording_attempt_id?: string;
-}
-
-interface CommandCedeControl {
-  kind: "cede-control";
-}
-
-interface CommandEndExfiltration {
-  kind: "end-exfiltration";
-}
-
-interface CommandTakeControl {
-  kind: "take-control";
-}
-
-interface CommandRecordingCapturePause {
-  kind: "recording-capture-pause";
-}
-
-interface CommandRecordingCaptureResume {
-  kind: "recording-capture-resume";
-}
-
-interface CommandRecordingRearmCapture {
-  kind: "recording-rearm-capture";
-}
-
-// a "Command" is an fire-n-forget out-message - it does not require a response
-type Command =
-  | CommandBeginExfiltration
-  | CommandCedeControl
-  | CommandEndExfiltration
-  | CommandRecordingCapturePause
-  | CommandRecordingCaptureResume
-  | CommandRecordingRearmCapture
-  | CommandTakeControl;
-
-const messageInKinds = [
-  "ask-for-clipboard",
-  "copied-text",
-  "exfiltrated-event",
-  "recording-interpretation-update",
-] as const;
-
-type MessageInKind = (typeof messageInKinds)[number];
-
-interface MessageInAskForClipboard {
-  kind: "ask-for-clipboard";
-}
-
-interface MessageInCopiedText {
-  kind: "copied-text";
-  text: string;
-}
-
-interface MessageInRecordingInterpretationUpdate extends RecordingInterpretationUpdate {
-  kind: "recording-interpretation-update";
-}
-
-type MessageIn =
-  | MessageInCopiedText
-  | MessageInAskForClipboard
-  | MessageInExfiltratedEvent
-  | MessageInRecordingInterpretationUpdate;
-
-interface MessageOutAskForClipboardResponse {
-  kind: "ask-for-clipboard-response";
-  text: string;
-}
-
-type MessageOut = MessageOutAskForClipboardResponse;
 
 type Props = {
   browserSessionId?: string;
@@ -329,9 +244,7 @@ function BrowserStream({
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
   const [isBrowserSessionStarted, setIsBrowserSessionStarted] = useState(false);
   const [userIsControlling, setUserIsControlling] = useState(false);
-  const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [vncDisconnectedTrigger, setVncDisconnectedTrigger] = useState(0);
-  const prevVncConnectedRef = useRef<boolean>(false);
   const [isVncConnected, setIsVncConnected] = useState<boolean>(false);
   const [isCanvasReady, setIsCanvasReady] = useState<boolean>(false);
   const [terminalDiagnostic, setTerminalDiagnostic] =
@@ -340,7 +253,6 @@ function BrowserStream({
   const [messagesDisconnectedTrigger, setMessagesDisconnectedTrigger] =
     useState(0);
   const prevMessageConnectedRef = useRef<boolean>(false);
-  const [isMessageConnected, setIsMessageConnected] = useState<boolean>(false);
   const [canvasContainer, setCanvasContainer] = useState<HTMLDivElement | null>(
     null,
   );
@@ -359,14 +271,70 @@ function BrowserStream({
   const messageReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
-  const clientId = useClientIdStore((state) => state.clientId);
   const isRecording = useRecordingStore((state) => state.isRecording);
+  const workflowPermanentId = useRecordingStore(
+    (state) => state.workflowPermanentId,
+  );
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
+  const getWebSocketParams = useWebSocketParams();
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
     entity !== "browserSession" || isBrowserSessionStarted;
+  const getFrameDataUrl = useCallback(() => {
+    const canvas = canvasContainer?.querySelector("canvas");
+    return canvas?.toDataURL("image/jpeg", 0.5) ?? null;
+  }, [canvasContainer]);
+  const handleMessageConnectionChange = useCallback(
+    (connected: boolean, event?: CloseEvent) => {
+      if (connected) {
+        setTerminalDiagnostic(null);
+        return;
+      }
+      if (!event) {
+        return;
+      }
+      const { code, reason } = event;
+      setTerminalDiagnostic(
+        (prev) =>
+          prev ??
+          (code === 1006
+            ? {
+                title: "The messages channel slipped away",
+                detail: "The messages channel dropped before sending a frame.",
+                hint: "Check that the API server is reachable from the UI.",
+              }
+            : {
+                title: "The messages channel packed up and left",
+                detail: `Messages channel closed with code ${code}${reason ? ` (${reason})` : ""}.`,
+              }),
+      );
+    },
+    [],
+  );
+  const legacyMessageSocketUrl =
+    entity === "task" && runId
+      ? `${wssBaseUrl}/stream/messages/task/${runId}`
+      : entity === "workflow" && runId
+        ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}`
+        : undefined;
+  const { isMessageConnected, sendCommand } = useRecordingMessageChannel({
+    browserSessionId: runId,
+    enabled:
+      showStream &&
+      Boolean(canvasContainer) &&
+      Boolean(runId) &&
+      isBrowserSessionAvailable &&
+      isBrowserSessionBackendReady,
+    exfiltrate,
+    workflowPermanentId,
+    getFrameDataUrl,
+    clipboard: "vnc",
+    socketUrl: legacyMessageSocketUrl,
+    reconnectTrigger: messagesDisconnectedTrigger,
+    onConnectionChange: handleMessageConnectionChange,
+  });
 
   useEffect(() => {
     onActivityRef.current = onActivity;
@@ -377,7 +345,6 @@ function BrowserStream({
     setIsReady(false);
     setIsVncConnected(false);
     setIsCanvasReady(false);
-    setIsMessageConnected(false);
     setHasBrowserSession(true);
     setTerminalDiagnostic(null);
     messageReconnectAttemptsRef.current = 0;
@@ -390,14 +357,6 @@ function BrowserStream({
       rfbRef.current = null;
     }
   }, [browserSessionId]);
-
-  const getWebSocketParams = useCallback(async () => {
-    const params = new URLSearchParams(
-      await getCredentialParam(credentialGetter),
-    );
-    params.set("client_id", clientId);
-    return params.toString();
-  }, [clientId, credentialGetter]);
 
   // browser is ready
   useEffect(() => {
@@ -436,15 +395,6 @@ function BrowserStream({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, browserSessionId]);
-
-  // effect for vnc disconnects only
-  useEffect(() => {
-    if (prevVncConnectedRef.current && !isVncConnected) {
-      setVncDisconnectedTrigger((x) => x + 1);
-      onClose?.();
-    }
-    prevVncConnectedRef.current = isVncConnected;
-  }, [isVncConnected, onClose]);
 
   // message channel reconnect policy
   useEffect(() => {
@@ -513,6 +463,7 @@ function BrowserStream({
       }
 
       let cancelled = false;
+      let didDisconnect = false;
 
       async function setupVnc() {
         if (rfbRef.current && isVncConnected) {
@@ -601,9 +552,12 @@ function BrowserStream({
         });
 
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
+          if (cancelled || didDisconnect) return;
+          didDisconnect = true;
           setIsVncConnected(false);
           setIsCanvasReady(false);
-          if (cancelled) return;
+          setVncDisconnectedTrigger((x) => x + 1);
+          onClose?.();
           const clean = Boolean(e.detail?.clean);
           setTerminalDiagnostic(
             (prev) =>
@@ -662,121 +616,11 @@ function BrowserStream({
     );
   }, [vncInteractive]);
 
-  useEffect(() => {
-    if (!showStream || !canvasContainer || !runId) {
-      return;
-    }
-
-    let ws: WebSocket | null = null;
-    let cancelled = false;
-
-    const connect = async () => {
-      const wsParams = await getWebSocketParams();
-
-      const messageUrl =
-        entity === "browserSession"
-          ? `${newWssBaseUrl}/stream/messages/browser_session/${runId}?${wsParams}`
-          : entity === "task"
-            ? `${wssBaseUrl}/stream/messages/task/${runId}?${wsParams}`
-            : entity === "workflow"
-              ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}?${wsParams}`
-              : null;
-
-      if (!messageUrl) {
-        throw new Error("No message url");
-      }
-
-      if (!isBrowserSessionAvailable || !isBrowserSessionBackendReady) {
-        setIsMessageConnected(false);
-        return;
-      }
-
-      ws = new WebSocket(messageUrl);
-
-      ws.onopen = () => {
-        setIsMessageConnected(true);
-        setMessageSocket(ws);
-        setTerminalDiagnostic(null);
-      };
-
-      ws.onmessage = (event) => {
-        const data = event.data;
-
-        try {
-          const message = JSON.parse(data);
-
-          handleMessage(message, ws);
-
-          // handle incoming messages if needed
-        } catch (e) {
-          console.error(
-            "Error parsing message from message channel:",
-            e,
-            event,
-          );
-        }
-      };
-
-      ws.onclose = (event) => {
-        setIsMessageConnected(false);
-        setMessageSocket(null);
-        if (cancelled) return;
-        const { code, reason } = event;
-        setTerminalDiagnostic(
-          (prev) =>
-            prev ??
-            (code === 1006
-              ? {
-                  title: "The messages channel slipped away",
-                  detail:
-                    "The messages channel dropped before sending a frame.",
-                  hint: "Check that the API server is reachable from the UI.",
-                }
-              : {
-                  title: "The messages channel packed up and left",
-                  detail: `Messages channel closed with code ${code}${reason ? ` (${reason})` : ""}.`,
-                }),
-        );
-      };
-    };
-
-    connect();
-
-    return () => {
-      cancelled = true;
-      try {
-        ws && ws.close();
-      } catch (e) {
-        // pass
-      }
-    };
-    // NOTE: adding getWebSocketParams causes constant reconnects of message channel when,
-    // for instance, take-control or cede-control is clicked
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    browserSessionId,
-    canvasContainer,
-    messagesDisconnectedTrigger,
-    entity,
-    isBrowserSessionAvailable,
-    isBrowserSessionBackendReady,
-    runId,
-    showStream,
-  ]);
-
   // effect to send a message when the user is controlling, vs not controlling
   useEffect(() => {
     if (!isMessageConnected) {
       return;
     }
-
-    const sendCommand = (command: Command) => {
-      if (!messageSocket) {
-        return;
-      }
-
-      messageSocket.send(JSON.stringify(command));
-    };
 
     if (interactive || userIsControlling) {
       sendCommand({ kind: "take-control" });
@@ -835,74 +679,6 @@ function BrowserStream({
       });
     }
   }, [task, workflow]);
-
-  const { workflowPermanentId, recordingAttemptId } = useRecordingStore(
-    useShallow((state) => ({
-      workflowPermanentId: state.workflowPermanentId,
-      recordingAttemptId: state.recordingAttemptId,
-    })),
-  );
-
-  // effect for exfiltration
-  useEffect(() => {
-    const sendCommand = (command: Command) => {
-      if (!messageSocket) {
-        return;
-      }
-
-      messageSocket.send(JSON.stringify(command));
-    };
-
-    if (exfiltrate) {
-      // Including a workflow id turns on backend live interpretation: the
-      // server streams recording-interpretation-update draft step snapshots
-      // back over this same socket while the user records.
-      sendCommand({
-        kind: "begin-exfiltration",
-        workflow_permanent_id: workflowPermanentId ?? undefined,
-        live_interpretation_enabled: Boolean(workflowPermanentId),
-        // Client capability: the backend only emits per-step delta updates
-        // (changed_steps upserted by step_id) to clients that declare support;
-        // otherwise it falls back to full snapshots.
-        supports_interpretation_deltas: true,
-        // Stable across reconnects of this recording; a new recording mints a
-        // new id so the backend starts a fresh interpretation session.
-        recording_attempt_id: recordingAttemptId ?? undefined,
-      });
-    } else {
-      sendCommand({ kind: "end-exfiltration" });
-    }
-  }, [exfiltrate, messageSocket, workflowPermanentId, recordingAttemptId]);
-
-  const manualCapturePaused = useRecordingStore(
-    (state) => state.manualCapturePaused,
-  );
-  const draftEditDepth = useRecordingStore((state) => state.draftEditDepth);
-  const capturePaused = manualCapturePaused || draftEditDepth > 0;
-  const previousCapturePausedRef = useRef(false);
-
-  // Pause exfiltration + live interpretation while the operator edits drafts
-  // or explicitly pauses capture.
-  useEffect(() => {
-    if (!exfiltrate || !messageSocket) {
-      // Backend pause state is per exfiltration session, so start the next
-      // session's edge detection from "not paused". A recording that ended
-      // while paused would otherwise fire a spurious resume on the next start;
-      // and if capture IS paused on a mid-recording reconnect, this re-sends
-      // the pause to the new socket (idempotent) instead of assuming it.
-      previousCapturePausedRef.current = false;
-      return;
-    }
-
-    const wasPaused = previousCapturePausedRef.current;
-    if (!wasPaused && capturePaused) {
-      messageSocket.send(JSON.stringify({ kind: "recording-capture-pause" }));
-    } else if (wasPaused && !capturePaused) {
-      messageSocket.send(JSON.stringify({ kind: "recording-capture-resume" }));
-    }
-
-    previousCapturePausedRef.current = capturePaused;
-  }, [capturePaused, exfiltrate, messageSocket]);
 
   useEffect(() => {
     if (!interactive) {
@@ -1019,282 +795,9 @@ function BrowserStream({
       return;
     }
 
-    const sendCommand = (command: Command) => {
-      if (!messageSocket) {
-        return;
-      }
-
-      messageSocket.send(JSON.stringify(command));
-    };
-
     sendCommand({ kind: "take-control" });
     setUserIsControlling(true);
-  }, [isRecording, isMessageConnected, messageSocket]);
-
-  /**
-   * TODO(jdo): could use zod or smth similar
-   */
-  const getMessage = (data: unknown): MessageIn | undefined => {
-    if (!data) {
-      return;
-    }
-
-    if (typeof data !== "object") {
-      return;
-    }
-
-    if (!("kind" in data)) {
-      return;
-    }
-
-    const k = data.kind;
-
-    if (typeof k !== "string") {
-      return;
-    }
-
-    if (!messageInKinds.includes(k as MessageInKind)) {
-      return;
-    }
-
-    const kind = k as MessageInKind;
-
-    switch (kind) {
-      case "ask-for-clipboard": {
-        return data as MessageInAskForClipboard;
-      }
-      case "copied-text": {
-        if ("text" in data && typeof data.text === "string") {
-          return {
-            kind: "copied-text",
-            text: data.text,
-          };
-        }
-        break;
-      }
-      case "exfiltrated-event": {
-        if (
-          "event_name" in data &&
-          typeof data.event_name === "string" &&
-          "params" in data &&
-          typeof data.params === "object" &&
-          data.params !== null &&
-          "source" in data &&
-          typeof data.source === "string"
-        ) {
-          const event = data as MessageInExfiltratedEvent;
-
-          return {
-            kind: "exfiltrated-event",
-            event_name: event.event_name,
-            params: event.params,
-            source: event.source,
-            timestamp: event.timestamp,
-          } as MessageInExfiltratedEvent;
-        }
-        break;
-      }
-      case "recording-interpretation-update": {
-        // steps is optional: a delta update carries changed_steps instead. Only
-        // session_revision is required to accept the message.
-        if (
-          "session_revision" in data &&
-          typeof data.session_revision === "number"
-        ) {
-          const update = data as MessageInRecordingInterpretationUpdate;
-          return {
-            kind: "recording-interpretation-update",
-            interpretation_session_id:
-              typeof update.interpretation_session_id === "string"
-                ? update.interpretation_session_id
-                : "",
-            session_revision: update.session_revision,
-            steps: Array.isArray(update.steps) ? update.steps : [],
-            changed_steps: Array.isArray(update.changed_steps)
-              ? update.changed_steps
-              : [],
-            // Absent/true => full snapshot (legacy). Only false triggers delta merge.
-            is_snapshot:
-              typeof update.is_snapshot === "boolean"
-                ? update.is_snapshot
-                : true,
-            pending:
-              typeof update.pending === "boolean" ? update.pending : false,
-            finalized:
-              typeof update.finalized === "boolean" ? update.finalized : false,
-          };
-        }
-        break;
-      }
-      default: {
-        const _exhaustive: never = kind;
-        return _exhaustive;
-      }
-    }
-  };
-
-  // Best-effort frame grab from the VNC canvas at the moment of a recorded
-  // click, so the live feed can show a zoomed shot at the action point.
-  const captureRecordingScreenshot = (
-    params: ExfiltratedEventConsoleParams,
-  ) => {
-    const schedule =
-      typeof requestIdleCallback === "function"
-        ? (fn: () => void) => requestIdleCallback(fn, { timeout: 750 })
-        : (fn: () => void) => window.setTimeout(fn, 0);
-
-    schedule(() => {
-      try {
-        const canvas = canvasContainer?.querySelector("canvas");
-        if (!canvas) {
-          return;
-        }
-        useRecordingStore.getState().addScreenshot({
-          timestampMs: params.timestamp,
-          dataUrl: canvas.toDataURL("image/jpeg", 0.5),
-          xp: params.mousePosition.xp,
-          yp: params.mousePosition.yp,
-        });
-      } catch {
-        // toDataURL can throw on a tainted/headless canvas; shots are optional
-      }
-    });
-  };
-
-  const handleMessage = (data: unknown, ws: WebSocket | null) => {
-    const message = getMessage(data);
-
-    if (!message) {
-      console.warn("Unknown message received on message channel:", data);
-      return;
-    }
-
-    const kind = message.kind;
-
-    const respond = (message: MessageOut) => {
-      if (!ws) {
-        console.warn("Cannot send message, as message socket is null.");
-        console.warn(message);
-        return;
-      }
-
-      ws.send(JSON.stringify(message));
-    };
-
-    switch (kind) {
-      case "ask-for-clipboard": {
-        if (!navigator.clipboard) {
-          console.warn("Clipboard API not available.");
-          return;
-        }
-
-        navigator.clipboard
-          .readText()
-          .then((text) => {
-            toast({
-              title: "Pasting Into Browser",
-              description:
-                "Pasting your current clipboard text into the browser.",
-            });
-
-            const response: MessageOutAskForClipboardResponse = {
-              kind: "ask-for-clipboard-response",
-              text,
-            };
-
-            respond(response);
-          })
-          .catch((err) => {
-            console.error("Failed to read clipboard contents: ", err);
-          });
-
-        break;
-      }
-      case "copied-text": {
-        const text = message.text;
-
-        copyText(text)
-          .then((success) => {
-            if (success) {
-              toast({
-                title: "Copied to Clipboard",
-                description: "The text has been copied to your clipboard.",
-              });
-            } else {
-              toast({
-                variant: "destructive",
-                title: "Failed to write to Clipboard",
-                description: "The text could not be copied to your clipboard.",
-              });
-            }
-          })
-          .catch((err) => {
-            console.error("Failed to write to clipboard:", err);
-
-            toast({
-              variant: "destructive",
-              title: "Failed to write to Clipboard",
-              description: "The text could not be copied to your clipboard.",
-            });
-          });
-
-        break;
-      }
-      case "exfiltrated-event": {
-        // Read store state fresh: this handler is attached once per socket
-        // and would otherwise see a stale isRecording.
-        const store = useRecordingStore.getState();
-        if (!store.isRecording && !store.finishRequested) {
-          break;
-        }
-        if (store.isCapturePaused()) {
-          break;
-        }
-        if (
-          store.isRecording &&
-          message.source === "console" &&
-          message.params.type === "click"
-        ) {
-          captureRecordingScreenshot(message.params);
-        }
-        if (
-          store.isRecording &&
-          !store.finishRequested &&
-          message.source === "cdp" &&
-          (message.event_name === "nav:frame_navigated" ||
-            message.event_name === "nav:navigated_within_document")
-        ) {
-          if (ws) {
-            ws.send(JSON.stringify({ kind: "recording-rearm-capture" }));
-          }
-        }
-        if (store.isRecording && !store.finishRequested) {
-          const optimistic = buildOptimisticStep(message);
-          if (optimistic) {
-            store.addOptimisticStep(optimistic);
-          }
-        }
-        store.add(message);
-        break;
-      }
-      case "recording-interpretation-update": {
-        useRecordingStore.getState().applyInterpretationUpdate({
-          interpretation_session_id: message.interpretation_session_id,
-          session_revision: message.session_revision,
-          steps: message.steps,
-          changed_steps: message.changed_steps,
-          is_snapshot: message.is_snapshot,
-          pending: message.pending,
-          finalized: message.finalized,
-        });
-        break;
-      }
-      default: {
-        const _exhaustive: never = kind;
-        return _exhaustive;
-      }
-    }
-  };
+  }, [isRecording, isMessageConnected, sendCommand]);
 
   const streamDiagnostic: StreamDiagnostic =
     !showStream || !runId
@@ -1348,7 +851,21 @@ function BrowserStream({
         ref={setCanvasContainerRef}
       >
         {isReady && isVisible && (
-          <div className="overlay z-10 flex items-center justify-center overflow-hidden">
+          // Same as InteractiveStreamView: while the take-control button is
+          // offered, a click anywhere on the picture takes control instead of
+          // being swallowed by this layer.
+          <div
+            data-testid="browser-stream-overlay"
+            className={cn(
+              "overlay z-10 flex items-center justify-center overflow-hidden",
+              { "can-take-control": showControlButtons && !userIsControlling },
+            )}
+            onClick={
+              showControlButtons && !userIsControlling
+                ? () => setUserIsControlling(true)
+                : undefined
+            }
+          >
             {showControlButtons && (
               <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
                 <Button

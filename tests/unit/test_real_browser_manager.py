@@ -1483,14 +1483,17 @@ async def test_pbs_task_adoption_rebinds_regardless_of_remote_interceptor(has_re
 
     with (
         patch("skyvern.webeye.real_browser_manager.app") as mock_app,
-        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+        patch(
+            "skyvern.webeye.real_browser_manager._rebind_pbs_download_dir",
+            new_callable=AsyncMock,
+        ) as mock_rebind,
     ):
         configure_browser_context_acquired_hook(mock_app)
-        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock()
+        mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session = AsyncMock(return_value=None)
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
         await manager.get_or_create_for_task(task, browser_session_id="bs_adopt")
 
-    assert mock_rebind.await_args == ((adopted_browser,), {"run_id": "tsk_adopt"})
+    mock_rebind.assert_awaited_once_with(pbs_state, "tsk_adopt", "bs_adopt")
     mock_app.PERSISTENT_SESSIONS_MANAGER.begin_session.assert_awaited_once_with(
         browser_session_id="bs_adopt",
         runnable_type="task",

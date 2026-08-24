@@ -15,19 +15,19 @@ _CANDIDATE_METHODS = frozenset(
 )
 
 _DISCOVERED_BROWSER_API_CALLS = {
-    "skyvern/forge/agent.py": Counter({"new_page": 1}),
+    "skyvern/forge/agent.py": Counter({"evaluate": 1, "new_page": 1}),
     "skyvern/forge/agent_functions.py": Counter({"close": 1, "scroll_into_view_if_needed": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "bring_to_front": 2,
             "check": 2,
-            "click": 22,
+            "click": 24,
             "clear": 4,
             "close": 5,
             "dblclick": 2,
-            "evaluate": 11,
+            "evaluate": 15,
             "fill": 2,
-            "focus": 2,
+            "focus": 3,
             "go_back": 1,
             "go_forward": 1,
             "goto": 2,
@@ -47,7 +47,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
     ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"down": 3, "fill": 1, "press": 1, "up": 3}),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
-    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 4}),
+    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 5}),
     "skyvern/webeye/utils/dom.py": Counter(
         {
             "check": 2,
@@ -71,14 +71,21 @@ _DISCOVERED_BROWSER_API_CALLS = {
 }
 
 _EVALUATE_CALLERS = {
+    # Read-only DOM fingerprint sample for the v3 settle-before-complete check.
+    "skyvern/forge/agent.py": Counter({"_page_fingerprint": 1}),
     "skyvern/webeye/actions/handler.py": Counter(
         {
             "_blob_iframe_src_titles": 1,
             "_collect_inline_iframe_src_candidates": 1,
             "_evaluate_element_scoped": 1,
+            # grid row-selection snapshot read, post-click settle re-read, and cell hit-test (SKY-13695)
+            "_read_grid_row_selection": 1,
+            "_grid_row_reached_state": 1,
+            "_drive_grid_row_selection": 1,
             # detached-clone constraint check inside _static_declared_constraint_evidence's nested _inner (SKY-13631)
             "_inner": 1,
             "_normal_select_readback_contradicts": 1,
+            "_probe_tel_browser_validity": 1,
             "handle_click_action": 2,
             "handle_scroll_action": 4,
         }
@@ -86,6 +93,8 @@ _EVALUATE_CALLERS = {
     "skyvern/webeye/dom_inspection.py": Counter(
         {
             "read_current_url": 1,
+            # locator-scoped live selected/checked read for the cached click guard (SKY-14051)
+            "read_locator_selected_state": 1,
             "read_locator_tag_name": 1,
             "read_resolved_anchor_href": 1,
             "read_whether_link_or_button": 1,
@@ -201,21 +210,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 146
+    assert sum(sum(methods.values()) for methods in observed.values()) == 155
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 5
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 141
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 150
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 18
+    assert sum(sum(callers.values()) for callers in observed.values()) == 24
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

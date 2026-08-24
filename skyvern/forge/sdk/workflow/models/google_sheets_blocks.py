@@ -1,11 +1,15 @@
 import json
+import os
 import re
 from dataclasses import dataclass
+from itertools import count
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import structlog
 from jinja2 import UndefinedError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
@@ -22,13 +26,68 @@ from skyvern.schemas.google_sheets import (
     build_append_dimension_request,
     column_index_to_letter,
     column_letters_to_index,
+    destination_start_column,
     extract_a1_sheet_prefix,
     extract_spreadsheet_id,
     leading_column_offset,
+    strip_a1_sheet_prefix,
 )
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 
 LOG = structlog.get_logger()
+
+_SHEETS_WRITE_SEQ = count()
+
+
+def _occupancy_only_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The snapshot with cell text replaced by a marker. The anchor only reads whether a cell is
+    occupied, so this replays identically without carrying the customer's cell contents."""
+    if snapshot is None:
+        return None
+    sheets = []
+    for sheet in snapshot.get("sheets") or []:
+        data = []
+        for block in sheet.get("data") or []:
+            rows = [
+                {
+                    "values": [
+                        {"formattedValue": "x"} if cell.get("formattedValue") else {}
+                        for cell in (row.get("values") or [])
+                    ]
+                }
+                for row in (block.get("rowData") or [])
+            ]
+            data.append({"startRow": block.get("startRow", 0), "rowData": rows})
+        # Carry the absence of data through: inventing the key would make a replay anchor where the
+        # live run declined to.
+        redacted: dict[str, Any] = {"properties": sheet.get("properties") or {}}
+        if "data" in sheet:
+            redacted["data"] = data
+        sheets.append(redacted)
+    return {"sheets": sheets}
+
+
+def _maybe_dump_sheets_write(record: dict[str, Any]) -> None:
+    """Record the destination a write asked for next to the one the API reports it got.
+
+    The range actually sent is otherwise not observable from a run, so writing it takes both an
+    explicit path and a local environment: the record carries the rendered cell values.
+    """
+    dump_dir = os.getenv("COPILOT_DUMP_SHEETS_WRITE")
+    if not dump_dir or settings.ENV != "local":
+        return
+    try:
+        target = Path(dump_dir).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        # The counter restarts with the process, so a later run would otherwise overwrite the
+        # records of an earlier one in the same directory.
+        path = target / f"sheets-write-{next(_SHEETS_WRITE_SEQ):04d}.json"
+        while path.exists():
+            path = target / f"sheets-write-{next(_SHEETS_WRITE_SEQ):04d}.json"
+        path.write_text(json.dumps(record, indent=2, default=str))
+        path.chmod(0o600)
+    except Exception:
+        LOG.warning("Failed to dump Google Sheets write")
 
 
 def _disambiguate_header(header: list[str]) -> list[str]:
@@ -223,18 +282,8 @@ class GoogleSheetsReadBlock(Block):
                 organization_id=organization_id,
             )
         sheets = payload.get("sheets") or []
-        # spreadsheets.get returns every sheet object even when ranges= is set, so
-        # selecting [0] would silently grab the first tab instead of the requested one.
         target_sheet_title = self.sheet_name or extract_a1_sheet_prefix(a1)
-        sheet_block: dict[str, Any] = {}
-        if target_sheet_title:
-            for candidate in sheets:
-                candidate_title = (candidate.get("properties") or {}).get("title")
-                if candidate_title == target_sheet_title:
-                    sheet_block = candidate
-                    break
-        if not sheet_block:
-            sheet_block = sheets[0] if sheets else {}
+        sheet_block = _select_sheet_block(sheets, target_sheet_title) or (sheets[0] if sheets else {})
         properties = sheet_block.get("properties") or {}
         data_blocks = sheet_block.get("data") or []
         first_data = data_blocks[0] if data_blocks else {}
@@ -349,6 +398,81 @@ def _failure_reason_from_sheets_error(action: str, exc: GoogleSheetsAPIError) ->
     return f"Google Sheets {action} failed (HTTP {exc.status}): {exc.message}"
 
 
+def _normalized_sheet_title(title: str | None) -> str | None:
+    """Sheets resolves a requested tab title leniently and echoes the canonical one back, so titles
+    only compare meaningfully once quoting, surrounding space, and case are removed. Only a matched
+    pair is unquoted: an apostrophe is legal in a tab title, and `'24 Data` is its own sheet."""
+    if not title:
+        return None
+    stripped = title.strip()
+    if len(stripped) > 1 and stripped.startswith("'") and stripped.endswith("'"):
+        stripped = stripped[1:-1]
+    return stripped.strip().casefold() or None
+
+
+def _select_sheet_block(sheets: list[dict[str, Any]], title: str | None) -> dict[str, Any] | None:
+    """The sheet object for `title`, or None when the snapshot does not carry it. Anchoring off an
+    unrelated tab reads as an empty column and produces a row-1 anchor over populated data.
+
+    Titles compare case-insensitively, so two tabs differing only in case resolve to whichever comes
+    first in the response."""
+    wanted = _normalized_sheet_title(title)
+    if wanted is None:
+        return sheets[0] if sheets else None
+    for candidate in sheets:
+        if _normalized_sheet_title((candidate.get("properties") or {}).get("title")) == wanted:
+            return candidate
+    return None
+
+
+def _same_sheet_title(left: str | None, right: str | None) -> bool:
+    left_title = _normalized_sheet_title(left)
+    right_title = _normalized_sheet_title(right)
+    if left_title is None or right_title is None:
+        return True
+    return left_title == right_title
+
+
+def _destination_mismatch(
+    *,
+    requested_a1: str,
+    start_letters: str | None,
+    sheet_name: str | None,
+    rows: list[list[Any]],
+    updated_range: str | None,
+    write_mode: str,
+) -> str | None:
+    """Failure text when the API reports the write reached outside the destination the block asked
+    for: a different sheet, a different start column, or more columns than the block sent. The bound
+    is one-sided because a report narrower than the rows sent still lands where the block asked, and
+    a sheet-only destination names no column to compare at all.
+
+    Rows are laid out relative to the range's start column whether or not column_mapping is used, so
+    this holds without a resolved anchor: a report starting elsewhere means the data landed there."""
+    if not start_letters or not updated_range:
+        return None
+    requested_sheet = sheet_name or extract_a1_sheet_prefix(requested_a1)
+    if not _same_sheet_title(requested_sheet, extract_a1_sheet_prefix(updated_range)):
+        return _mismatch_reason(requested_a1, updated_range, write_mode)
+    start_column = column_letters_to_index(start_letters)
+    if leading_column_offset(updated_range) != start_column:
+        return _mismatch_reason(requested_a1, updated_range, write_mode)
+    widest_row = max((len(row) for row in rows), default=1)
+    actual_end = strip_a1_sheet_prefix(updated_range).split(":")[-1]
+    if leading_column_offset(actual_end) > start_column + max(widest_row, 1) - 1:
+        return _mismatch_reason(requested_a1, updated_range, write_mode)
+    return None
+
+
+def _mismatch_reason(requested_a1: str, updated_range: str, write_mode: str) -> str:
+    rerun = " so re-running this workflow appends them again" if write_mode == "append" else ""
+    return (
+        f"Google Sheets reported the write landed outside the requested destination: "
+        f"requested {requested_a1}, actually updated {updated_range}. The rows were written to that "
+        f"range,{rerun or ' and were not rolled back'}."
+    )
+
+
 def _try_rich_sheets_input(parsed: Any) -> RichSheetsInput | None:
     if not isinstance(parsed, dict):
         return None
@@ -438,14 +562,8 @@ class GoogleSheetsWriteBlock(Block):
                 "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
             ) from exc
 
-    def _coerce_values(self, raw: Any, *, column_offset: int = 0, absolute_columns: bool = False) -> list[list[Any]]:
-        """Rows for the write payload.
-
-        ``absolute_columns`` selects who the row's index 0 addresses: ``values.append`` writes from
-        the first column of the table it finds — not from the range's start column — so an append
-        addresses column A and a pinned range has to be padded for, while ``values.update`` writes
-        from its own start cell and addresses columns relative to it.
-        """
+    def _coerce_values(self, raw: Any, *, column_offset: int = 0) -> list[list[Any]]:
+        """Rows for the write payload, addressed relative to the column the write starts at."""
         if isinstance(raw, dict):
             if isinstance(raw.get("values"), list) and isinstance(raw.get("rows"), list):
                 LOG.warning("Google Sheets write payload has both 'values' and 'rows'; using 'values'")
@@ -463,8 +581,6 @@ class GoogleSheetsWriteBlock(Block):
             return []
         if all(isinstance(row, list) for row in raw):
             rows = cast(list[list[Any]], raw)
-            if absolute_columns and column_offset:
-                return [[None] * column_offset + row for row in rows]
             return rows
         if all(isinstance(row, dict) for row in raw):
             if not self.column_mapping:
@@ -482,7 +598,7 @@ class GoogleSheetsWriteBlock(Block):
                     raise ValueError(f"column_mapping target {target!r} exceeds the Google Sheets column limit (ZZZ)")
                 if col_index in seen_columns:
                     raise ValueError(f"column_mapping has duplicate destination column: {target!r}")
-                pos = col_index if absolute_columns else col_index - column_offset
+                pos = col_index - column_offset
                 if pos < 0:
                     raise ValueError(
                         f"column_mapping target {target!r} falls before the range start column; "
@@ -677,11 +793,7 @@ class GoogleSheetsWriteBlock(Block):
             )
 
         try:
-            rows = self._coerce_values(
-                parsed_values,
-                column_offset=leading_column_offset(a1),
-                absolute_columns=self.write_mode == "append",
-            )
+            rows = self._coerce_values(parsed_values, column_offset=leading_column_offset(a1))
         except ValueError as e:
             snippet = self.values[:200] if self.values else ""
             return await self.build_block_result(
@@ -693,19 +805,42 @@ class GoogleSheetsWriteBlock(Block):
                 organization_id=organization_id,
             )
 
+        range_sent = a1
+        start_letters = destination_start_column(self.range)
+        destination_snapshot: dict[str, Any] | None = None
+        anchor_source: str = "not_applicable"
+        if self.write_mode == "append" and start_letters:
+            destination_snapshot = await self._fetch_destination_snapshot(
+                spreadsheet_id=spreadsheet_id,
+                access_token=access_token,
+                a1=a1,
+                column=start_letters,
+                width=max((len(row) for row in rows), default=1),
+            )
+            anchored = (
+                self._append_anchor(destination_snapshot, a1=a1, column=start_letters)
+                if destination_snapshot is not None
+                else None
+            )
+            if anchored is None:
+                anchor_source = "snapshot_unavailable"
+            else:
+                range_sent = anchored
+                anchor_source = "resolved"
+
         try:
             if self.write_mode == "append":
                 payload = await app.AGENT_FUNCTION.google_sheets_values_append(
                     access_token=access_token,
                     spreadsheet_id=spreadsheet_id,
-                    range_=a1,
+                    range_=range_sent,
                     values=rows,
                 )
             else:
                 payload = await app.AGENT_FUNCTION.google_sheets_values_update(
                     access_token=access_token,
                     spreadsheet_id=spreadsheet_id,
-                    range_=a1,
+                    range_=range_sent,
                     values=rows,
                 )
         except GoogleSheetsAPIError as e:
@@ -744,13 +879,56 @@ class GoogleSheetsWriteBlock(Block):
                 organization_id=organization_id,
             )
 
+        updates = payload.get("updates") or payload
+        updated_range = updates.get("updatedRange")
         output_data: dict[str, Any] = {
             "spreadsheet_id": spreadsheet_id,
             "write_mode": self.write_mode,
-            "rows_written": len(rows),
+            "requested_destination": a1,
+            "range_sent": range_sent,
+            "updated_range": updated_range,
+            "updated_range_source": "values_api_updated_range",
+            "destination_anchor_source": anchor_source,
+            "rows_written": updates.get("updatedRows", len(rows)),
             "response": payload,
         }
+        _maybe_dump_sheets_write(
+            {
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "credential_id": self.credential_id,
+                "spreadsheet_url": self.spreadsheet_url,
+                "sheet_name": self.sheet_name,
+                "range": self.range,
+                "write_mode": self.write_mode,
+                "column_mapping": self.column_mapping,
+                "values": self.values,
+                "requested_destination": a1,
+                "range_sent": range_sent,
+                "destination_anchor_source": anchor_source,
+                "rows": rows,
+                "destination_snapshot": _occupancy_only_snapshot(destination_snapshot),
+                "response": payload,
+            }
+        )
+        mismatch = _destination_mismatch(
+            requested_a1=a1,
+            start_letters=start_letters,
+            sheet_name=self.sheet_name,
+            rows=rows,
+            updated_range=updated_range,
+            write_mode=self.write_mode,
+        )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_data)
+        if mismatch:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=mismatch,
+                output_parameter_value=output_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         return await self.build_block_result(
             success=True,
             failure_reason=None,
@@ -759,6 +937,60 @@ class GoogleSheetsWriteBlock(Block):
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
         )
+
+    async def _fetch_destination_snapshot(
+        self,
+        *,
+        spreadsheet_id: str,
+        access_token: str,
+        a1: str,
+        column: str,
+        width: int,
+    ) -> dict[str, Any] | None:
+        # Whole columns, not the configured range, which would truncate the rows we can see. Every
+        # column this write fills, not just the pinned one: a mapped row can leave the start column
+        # empty on every run, and reading it alone would report row 1 forever.
+        end_column = column_index_to_letter(column_letters_to_index(column) + max(width, 1) - 1)
+        column_range = build_a1(self.sheet_name or extract_a1_sheet_prefix(a1), f"{column}:{end_column}") or a1
+        try:
+            return await app.AGENT_FUNCTION.google_sheets_values_get(
+                access_token=access_token,
+                spreadsheet_id=spreadsheet_id,
+                ranges=column_range,
+                fields="sheets(properties(title,gridProperties(rowCount)),data(startRow,rowData(values(formattedValue))))",
+            )
+        except Exception as e:
+            LOG.warning(
+                "Failed to read the destination column; sending the configured range",
+                spreadsheet_id=spreadsheet_id,
+                range=a1,
+                error=str(e),
+            )
+            return None
+
+    def _append_anchor(self, snapshot: dict[str, Any], *, a1: str, column: str) -> str | None:
+        """The pinned column's first free cell, so an append starts where the block asked rather than
+        wherever the API's own table search lands. None when the snapshot cannot answer that."""
+        sheet_title = self.sheet_name or extract_a1_sheet_prefix(a1)
+        sheet_block = _select_sheet_block(snapshot.get("sheets") or [], sheet_title)
+        # A missing data key means the read could not answer; only a present-but-empty one means the
+        # column is free. Conflating them anchors at row 1 of a populated sheet.
+        if sheet_block is None or "data" not in sheet_block:
+            return None
+        data_blocks = sheet_block.get("data") or []
+        first_data = data_blocks[0] if data_blocks else {}
+        row_data = first_data.get("rowData") or []
+        last_filled = 0
+        for index, row in enumerate(row_data, start=1):
+            if any(cell.get("formattedValue") for cell in (row.get("values") or [])):
+                last_filled = index
+        next_row = int(first_data.get("startRow", 0)) + last_filled + 1
+        # Past the last grid row an anchored A1 is rejected outright, while the unanchored range lets
+        # Sheets grow the sheet the way it did before anchoring existed.
+        row_count = ((sheet_block.get("properties") or {}).get("gridProperties") or {}).get("rowCount")
+        if isinstance(row_count, int) and next_row > row_count:
+            return None
+        return build_a1(sheet_title, f"{column}{next_row}")
 
     async def _execute_rich(
         self,
@@ -827,6 +1059,7 @@ class GoogleSheetsWriteBlock(Block):
         requests: list[dict[str, Any]] = []
         required_width = 0
 
+        range_sent: str | None = None
         if self.write_mode == "append":
             append_col_offset = leading_column_offset(a1)
             padded_cells: list[list[dict[str, Any]]]
@@ -873,6 +1106,7 @@ class GoogleSheetsWriteBlock(Block):
             merge_origin_row = grid_range["startRowIndex"]
             merge_origin_col = grid_range["startColumnIndex"]
             required_width = grid_range["endColumnIndex"]
+            range_sent = a1
 
         for merge in rich.merges:
             if self.write_mode == "append":
@@ -1000,6 +1234,11 @@ class GoogleSheetsWriteBlock(Block):
         output_data: dict[str, Any] = {
             "spreadsheet_id": spreadsheet_id,
             "write_mode": self.write_mode,
+            "requested_destination": a1,
+            "range_sent": range_sent,
+            "updated_range": None,
+            "updated_range_source": "batch_update_reports_no_range",
+            "destination_anchor_source": "not_applicable",
             "rows_written": len(rich.cells),
             "response": payload,
         }

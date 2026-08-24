@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
+from enum import StrEnum
 from typing import Any
 
 import structlog
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_cont
 from skyvern.forge.sdk.copilot.config import (
     BlockAuthoringPolicy,
     download_scout_act_required_for_policy,
+    normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import is_resolved_page_url, load_credentials
@@ -22,6 +24,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.output_extraction_plan import unbound_candidate_relations
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -41,6 +44,8 @@ from ._shared import (
 )
 from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
+    _COPILOT_BANNED_BLOCK_TYPES,
+    _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
     _code_only_browser_schema_guidance,
     _code_only_browser_unavailable_summary,
     _copilot_banned_block_alternatives,
@@ -61,15 +66,15 @@ from .scouting import (
     _attach_scout_observation_step,
     _attach_scout_page_summary,
     _capture_post_interaction_screenshot,
-    _capture_scout_ambiguity,
-    _capture_scout_role_name,
-    _capture_scout_selector_candidates,
+    _capture_scout_pre_action,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
+    _clear_pending_scout_selector_facts,
     _consume_scout_source_url,
     _mark_pending_browser_interaction_observation,
     _maybe_attach_observed_download_target,
     _maybe_attach_observed_render_target,
+    _page_evidence_names_obstruction,
     _prenav_ambiguity_for_selector,
     _prenav_role_name_for_selector,
     _record_scout_trajectory_fact,
@@ -239,12 +244,26 @@ async def _get_block_schema_post_hook(
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
             data["code_only_note"] = _code_only_browser_unavailable_summary()
-            settled_block_types = ctx.code_only_settled_block_types if isinstance(ctx, CopilotContext) else frozenset()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance(settled_block_types)
+            data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
+    return result
+
+
+async def _get_workflow_knowledge_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    if isinstance(data, dict) and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        data["active_policy_note"] = (
+            "This knowledge describes workflow concepts across all block types. Under the active code-only browser "
+            "policy, author browser work with code blocks only; get_block_schema is authoritative for what the active "
+            "policy permits."
+        )
     return result
 
 
@@ -315,6 +334,10 @@ def _demonstrated_step_facts(ctx: AgentContext) -> list[dict[str, Any]]:
     for interaction in ctx.scout_trajectory:
         interaction_mapping: Mapping[str, Any] = interaction
         fact = {key: interaction_mapping[key] for key in _MODEL_SCOUT_FACT_KEYS if key in interaction_mapping}
+        for key in ("source_url", "result_url"):
+            value = fact.get(key)
+            if isinstance(value, str):
+                fact[key] = safe_page_origin(value)
         for key in _MODEL_SCOUT_NULLABLE_FACT_KEYS:
             fact.setdefault(key, None)
         facts.append(fact)
@@ -370,6 +393,19 @@ async def _evaluate_pre_hook(
     return None
 
 
+async def _screenshot_pre_hook(_params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+    if ctx.codeblock_redaction_parameters:
+        return {"ok": False, "error": "Screenshots are unavailable during runtime self-heal."}
+    return None
+
+
+async def _scroll_pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+    intent = params.get("intent")
+    if ctx.codeblock_redaction_parameters and isinstance(intent, str) and intent.strip():
+        return {"ok": False, "error": "AI-assisted scrolling is unavailable during runtime self-heal."}
+    return None
+
+
 def _code_only_has_target_page_evidence(data: object) -> bool:
     if not isinstance(data, dict):
         return False
@@ -390,24 +426,17 @@ async def _click_pre_hook(
 ) -> dict[str, Any] | None:
     # Cleared up front so an early return below (deterministic result or no selector)
     # cannot leave a prior click's stash for this click's post-hook to consume.
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
     ctx.pending_scout_click_selector = None
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
     ctx.pending_scout_download_snapshot = None
     ctx.pending_scout_download = False
     ctx.pending_scout_popup = None
     ctx.pending_scout_popup_content_type = None
     await _capture_scout_source_url(ctx)
     selector = params.get("selector", "")
+    await _capture_scout_pre_action(ctx, selector if isinstance(selector, str) else None)
     if not selector:
         return None
     ctx.pending_scout_click_selector = selector if isinstance(selector, str) else None
-    await _capture_scout_role_name(ctx, selector)
-    await _capture_scout_selector_candidates(ctx, selector)
-    await _capture_scout_ambiguity(ctx, selector)
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         ctx.pending_scout_download_snapshot = await _scout_session_download_names(ctx)
         await _arm_scout_download_listener(ctx)
@@ -420,10 +449,7 @@ async def _type_text_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
+    _clear_pending_scout_selector_facts(ctx)
     ctx.pending_scout_input_value = None
     text = params.get("text")
     selector = str(params.get("selector") or "")
@@ -442,9 +468,7 @@ async def _type_text_pre_hook(
         }
     if isinstance(text, str) and text:
         ctx.pending_scout_input_value = text
-    await _capture_scout_role_name(ctx, selector)
-    await _capture_scout_selector_candidates(ctx, selector)
-    await _capture_scout_ambiguity(ctx, selector)
+    await _capture_scout_pre_action(ctx, selector)
     return None
 
 
@@ -452,16 +476,8 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_reanchor = None
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
     await _capture_scout_source_url(ctx)
-    await _capture_scout_role_name(ctx, params.get("selector", ""))
-    await _capture_scout_selector_candidates(ctx, params.get("selector", ""))
-    await _capture_scout_ambiguity(ctx, params.get("selector", ""))
+    await _capture_scout_pre_action(ctx, params.get("selector", ""))
     return None
 
 
@@ -470,16 +486,7 @@ async def _press_key_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    ctx.pending_scout_role_name = None
-    ctx.pending_scout_role_name_match_count = None
-    ctx.pending_scout_ambiguous = None
-    ctx.pending_scout_reanchor = None
-    ctx.pending_scout_selector_match_count = None
-    ctx.pending_scout_selector_candidates = None
-    if params.get("selector"):
-        await _capture_scout_role_name(ctx, params.get("selector"))
-        await _capture_scout_selector_candidates(ctx, params.get("selector"))
-        await _capture_scout_ambiguity(ctx, params.get("selector"))
+    await _capture_scout_pre_action(ctx, params.get("selector"))
     return None
 
 
@@ -521,7 +528,6 @@ async def _bind_login_credential_for_observed_url(ctx: AgentContext, url: str, r
             "copilot credential live-page admission",
             outcome="resolver_error",
             seam="page_observation",
-            exc_info=True,
         )
         return
 
@@ -556,12 +562,22 @@ async def _navigate_post_hook(
             result_url=result["url"],
         )
         await _bind_login_credential_for_observed_url(ctx, result["url"], result)
-        result["next_step"] = (
-            "Page loaded, and a screenshot of it is attached. Use evaluate or "
-            "inspect_page_for_composition when you need the page's structure or selectors "
-            "before responding."
+        staged = await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=result["url"],
         )
-        await _capture_post_interaction_screenshot(ctx)
+        attached = " A screenshot is attached." if staged else ""
+        result["next_step"] = (
+            f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
+            "page's structure or selectors before responding."
+        )
+    else:
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=source_url,
+        )
     return result
 
 
@@ -624,6 +640,9 @@ async def _click_post_hook(
 ) -> dict[str, Any]:
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
+    page_evidence: dict[str, Any] | None = None
+    captured_url: str | None = None
+    observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
@@ -648,7 +667,7 @@ async def _click_post_hook(
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
             "selector": selector,
-            "url": url,
+            "url": safe_page_origin(url) or "",
             "title": title,
         }
         await _bind_login_credential_for_observed_url(ctx, url, result)
@@ -697,14 +716,30 @@ async def _click_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        captured_url = url or None
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
             # A download this click produced is proof the affordance works, so it outranks the
             # href-shape prediction — and is the only source that sees a command-URL download.
             await _maybe_attach_observed_download_target(ctx, result, selector=selector, url=url)
             await _maybe_attach_observed_render_target(ctx, result, selector=selector, url=url)
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
-    await _capture_post_interaction_screenshot(ctx)
+            _attach_scout_page_summary(ctx, result, page_evidence)
+        elif ctx.last_scout_act_observe_outcome == "unchanged":
+            result["data"]["page_observation"] = {
+                "status": "unchanged",
+                "message": (
+                    "The page observation did not change after the click; no post-click page evidence was attached."
+                ),
+            }
+    # The round-trip is skipped only when the evidence positively names the obstruction a frame
+    # would have shown; evidence that merely parsed is not a substitute for looking at the page.
+    if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="click",
+            captured_url=captured_url or source_url,
+            observation_step=observation_step,
+        )
     return result
 
 
@@ -736,7 +771,7 @@ async def _read_scout_field_value(ctx: AgentContext, selector: str) -> str | Non
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        LOG.debug("scout field-value read failed; leaving the value unread", exc_info=True)
+        LOG.debug("scout field-value read failed; leaving the value unread")
         return None
     if not isinstance(readback, dict) or not readback.get("ok"):
         return None
@@ -771,11 +806,14 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
         return None, None
     try:
         result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_evaluate", {"expression": scout_control_state_expression(selector)}),
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": scout_control_state_expression(selector), "verbosity": "full"},
+            ),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        LOG.debug("scout control-state probe failed; treating editability as unknown", exc_info=True)
+        LOG.debug("scout control-state probe failed; treating editability as unknown")
         return None, None
     if not isinstance(result, dict) or not result.get("ok"):
         return None, None
@@ -785,8 +823,48 @@ async def _probe_scout_control_state(ctx: AgentContext, selector: str) -> tuple[
     return bool(state.get("readonly")), bool(state.get("disabled"))
 
 
-def _significant_character_count(value: str) -> int:
-    return sum(1 for character in value if character.isalnum())
+class ScoutReadbackOutcome(StrEnum):
+    """Factual readback outcome: what was observed in the field, not a verdict about where it belongs."""
+
+    EXACT_MATCH = "exact_match"
+    EMPTY = "empty"
+    DIFFERENT = "different"
+    UNAVAILABLE = "unavailable"
+
+
+def _scout_readback_outcome(readback: str | None, typed_value: str) -> ScoutReadbackOutcome:
+    """Report the factual readback outcome for a fill, sound only for a readback taken from the page
+    itself: a value read back through the tool layer has any registered secret replaced by a
+    placeholder, so its content describes the scrubber and not the field (`GOTCHAS.md` §28).
+    """
+    if not isinstance(readback, str):
+        return ScoutReadbackOutcome.UNAVAILABLE
+    # Equality is tested first so a typed value that is itself blank and lands exactly reads as a
+    # match rather than as the empty field the fill lost.
+    if readback == typed_value:
+        return ScoutReadbackOutcome.EXACT_MATCH
+    if readback.strip() == "":
+        return ScoutReadbackOutcome.EMPTY
+    return ScoutReadbackOutcome.DIFFERENT
+
+
+def _scout_type_landing_failure(
+    outcome: ScoutReadbackOutcome,
+    *,
+    tool_name: str,
+    selector: str,
+) -> dict[str, Any] | None:
+    if outcome is ScoutReadbackOutcome.EMPTY:
+        return {
+            "ok": False,
+            "error": (
+                f"{tool_name} reported success but the field is still empty. "
+                f"Re-inspect the current page and retry {tool_name} on the target field. "
+                "If an overlay (cookie/marketing popup) consumed the focus, the first "
+                "interaction usually dismisses it."
+            ),
+        }
+    return None
 
 
 async def _verify_scout_type_landed(
@@ -805,6 +883,12 @@ async def _verify_scout_type_landed(
     fires when there is a selector to read and a positive typed length, so it never
     second-guesses intent-only types or masked/formatted values, which keep a
     non-empty value.
+
+    The readback rides the tool layer, which replaces any registered secret it finds — including
+    one the field already held, not only one this call typed. A caller that fills a registered
+    secret must classify its own readback and call `_scout_type_landing_failure` instead; a
+    readback of a field still holding a credential filled earlier in the same browser session is
+    inflated the same way and is not covered here.
     """
     if not isinstance(selector, str) or not selector.strip():
         return None
@@ -820,31 +904,11 @@ async def _verify_scout_type_landed(
         await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
         value = await _read_scout_field_value(ctx, selector)
     if isinstance(value, str) and value.strip() == "":
-        return {
-            "ok": False,
-            "error": (
-                "type_text reported success but the field is still empty — an overlay "
-                "(cookie/marketing popup) likely consumed the keystrokes or focus. "
-                "Re-inspect the current page and retry typing into the target field; "
-                "the overlay is usually dismissed by that first interaction."
-            ),
-        }
-    # A field holding more than was typed means the text joined a value already there — a re-render
-    # can move a selector onto a neighbouring input, so a second fill appends to the wrong field and
-    # leaves the intended one empty. Count only alphanumerics: a phone/card/date input that inserts
-    # its own separators grows past the typed length without anything having landed in the wrong
-    # field, and rejecting those would fail every auto-formatting form.
-    if isinstance(value, str) and _significant_character_count(value) > typed_length:
-        return {
-            "ok": False,
-            "error": (
-                f"type_text landed in a field that already held a value: {selector!r} now holds "
-                f"{_significant_character_count(value)} characters after typing {typed_length}. The selector "
-                "likely resolved to a different input than intended, leaving the target field empty. "
-                "Re-inspect the current page, confirm which input each value belongs in, clear the field, "
-                "and retry."
-            ),
-        }
+        return _scout_type_landing_failure(
+            ScoutReadbackOutcome.EMPTY,
+            tool_name="type_text",
+            selector=selector,
+        )
     return None
 
 
@@ -958,7 +1022,7 @@ async def _type_text_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
@@ -1053,10 +1117,10 @@ def _record_scouted_read(
         "copilot_scouted_read_attribution",
         declared=bool(declared_output_path),
         attributed_by="declaration" if declared_output_path == output_path else "elimination",
-        bound_output_path=output_path,
-        declaration_only_output_path=declared_output_path or "output.scouted_read",
+        bound_output_path_present=bool(output_path),
+        declaration_only_output_path_present=bool(declared_output_path),
         requested_output_count=len(requested),
-        read_result_shape=type(result).__name__,
+        read_result_present=result is not None,
     )
     interaction: ScoutedInteraction = {
         "tool_name": "read_value",
@@ -1138,8 +1202,8 @@ async def _evaluate_post_hook(
     if recorded is not None:
         LOG.info(
             "copilot_scouted_read_recorded",
-            read_result_shape=recorded.get("read_result_shape"),
-            read_output_path=recorded.get("read_output_path"),
+            read_result_present=bool(recorded.get("read_result_shape")),
+            read_output_path_present=bool(recorded.get("read_output_path")),
             witnessed_value_kept=bool(recorded.get("read_result_value")),
             trajectory_len=len(ctx.scout_trajectory),
         )
@@ -1155,13 +1219,13 @@ async def _evaluate_post_hook(
             }
             LOG.info(
                 "copilot_scouted_read_claimed_output_without_value",
-                read_output_path=claimed_path,
-                read_result_shape=recorded.get("read_result_shape"),
+                read_output_path_present=bool(claimed_path),
+                read_result_present=bool(recorded.get("read_result_shape")),
             )
     unread_requested = _unread_requested_output_paths(ctx)
     if unread_requested:
         data["requested_outputs_still_unread"] = unread_requested
-        LOG.info("copilot_requested_output_unread_after_read", unread=unread_requested)
+        LOG.info("copilot_requested_output_unread_after_read", unread_count=len(unread_requested))
     if _copilot_block_authoring_policy(
         ctx
     ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(data):
@@ -1290,7 +1354,7 @@ async def _select_option_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
@@ -1373,12 +1437,13 @@ async def _press_key_post_hook(
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
-            _attach_scout_page_summary(result, page_evidence)
+            _attach_scout_page_summary(ctx, result, page_evidence)
     return result
 
 
 def get_skyvern_mcp_alias_map() -> dict[str, str]:
     return {
+        "get_workflow_knowledge": "skyvern_workflow_knowledge",
         "get_block_schema": "skyvern_block_schema",
         "validate_block": "skyvern_block_validate",
         "navigate_browser": "skyvern_navigate",
@@ -1395,17 +1460,27 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
 
 
 _EVALUATE_BASE_DESCRIPTION = (
-    "Execute JavaScript in the browser and return the result. "
-    "Use this to inspect DOM state, read values, or run arbitrary JS."
+    "Execute JavaScript in the browser and return the result. Use it to inspect DOM state and read "
+    "values. JavaScript run here can also change the page, but only click, type_text, select_option "
+    "and press_key record a scouted interaction, so a change made through this tool leaves nothing to "
+    "author from -- act with those tools and read with this one."
+)
+_WORKFLOW_KNOWLEDGE_DESCRIPTION = (
+    "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
+    "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
+    "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
+    "choosing_a_block, common_patterns, and best_practices; omit topics to list every available ID. "
+    "Request only the relevant sections. For exact fields of a specific block type, use "
+    "get_block_schema instead."
 )
 # Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
 # target only once its page is reached. The model reaches that page with navigate/click and
-# observes it here — evaluate cannot click — so the model can author the terminal download step.
+# observes it here -- evaluate records no interaction -- so the model can author the download step.
 _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     _EVALUATE_BASE_DESCRIPTION
     + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
-    "once the page holding them is reached. Use this tool to OBSERVE that page — it cannot click; "
-    "reach the page with the navigate/click tools first. For a download, observe the page that "
+    "once the page holding them is reached. Use this tool to OBSERVE that page; reach it with the "
+    "navigate/click tools first. For a download, observe the page that "
     "exposes the download control and capture a stable selector, then author the terminal download "
     "step from the code-block schema contract."
 )
@@ -1419,11 +1494,30 @@ def _evaluate_overlay_description(
     return _EVALUATE_BASE_DESCRIPTION
 
 
+def _block_schema_banned_types_note(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> str:
+    """Name the rejected types from the same constant the schema pre-hook rejects on. The set is
+    policy-dependent, which a static prompt line cannot track."""
+    banned = (
+        _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
+        if normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        else _COPILOT_BANNED_BLOCK_TYPES
+    )
+    return f"Unavailable under the active policy and rejected on request: {', '.join(sorted(banned))}."
+
+
 def _build_skyvern_mcp_overlays(
     block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
 ) -> dict[str, SchemaOverlay]:
     return {
+        "get_workflow_knowledge": SchemaOverlay(
+            description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
+            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
+            post_hook=_get_workflow_knowledge_post_hook,
+        ),
         "get_block_schema": SchemaOverlay(
+            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),
@@ -1447,6 +1541,7 @@ def _build_skyvern_mcp_overlays(
             hide_params=frozenset({"session_id", "cdp_url", "selector"}),
             forced_args={"inline": True},
             requires_browser=True,
+            pre_hook=_screenshot_pre_hook,
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
@@ -1500,8 +1595,8 @@ def _build_skyvern_mcp_overlays(
                 "Optionally clear the field first. Use this for form filling. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
                 "codes, private keys, or other raw credentials/secrets received in "
-                "chat — stop and follow the CREDENTIAL HANDLING refusal rule in the "
-                "system prompt instead."
+                "chat. Ask the user to store the value as a saved credential and "
+                "reply with its name; do not type or submit the raw value."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "delay", "intent"}),
             forced_args={"selector_mode": "direct"},
@@ -1520,6 +1615,7 @@ def _build_skyvern_mcp_overlays(
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
+            pre_hook=_scroll_pre_hook,
             post_hook=_scroll_post_hook,
         ),
         "console_messages": SchemaOverlay(

@@ -10,15 +10,11 @@ from urllib.parse import urljoin, urlparse
 import structlog
 from playwright.async_api import (
     ElementHandle,
-)
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import (
     FloatRect,
     Frame,
     FrameLocator,
     Locator,
     Page,
-    TimeoutError,
 )
 
 from skyvern.config import settings
@@ -41,6 +37,7 @@ from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wa
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
+from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
     read_locator_tag_name,
@@ -61,30 +58,37 @@ def is_incompatible_text_input_error(exc: BaseException) -> bool:
     # from fill()/clear() when the resolved node can't accept text (button, link, span,
     # dialog/container, iframe). The static tag_name can disagree with the live node after
     # a re-render, so callers relying on the tag alone still reach these APIs.
-    return "is not an" in str(exc).lower()
+    #
+    # It raises `Input of type "{type}" cannot be filled` for the other shape: the tag IS an
+    # input, so a tag-only check like supports_text_input() lets it through, but the type
+    # (checkbox, radio, file...) is not fillable. Both mean the live node cannot accept text.
+    message = str(exc).lower()
+    return "is not an" in message or "cannot be filled" in message
 
 
 def is_element_detached_error(exc: BaseException) -> bool:
-    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node) and
-    # "Frame was detached" (ops routed through a frame that navigated or was removed)
-    # both mean the resolved target no longer exists in the live page.
+    # "Element is not attached to the DOM" (ElementHandle ops on a replaced node), "Frame was
+    # detached" (ops routed through a frame that navigated or was removed) and "Frame has been
+    # detached" (frame_element() on such a frame) all mean the target no longer exists in the live page.
     message = str(exc).lower()
-    return "not attached to the dom" in message or "frame was detached" in message
+    return (
+        "not attached to the dom" in message or "frame was detached" in message or "frame has been detached" in message
+    )
 
 
 def is_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
     """Whether ``exc`` is a driver-family error from THIS run's engine. Routes through the per-run
-    selection when one is pinned so a non-Playwright engine's natives are recognised; falls back to the
-    stock Playwright identity when no engine is pinned (callers built outside the per-run engine seam),
-    preserving exact stock behavior. A foreign engine's native error is rejected either way."""
-    return engine_selection.is_engine_error(exc) if engine_selection is not None else isinstance(exc, PlaywrightError)
+    selection when one is pinned so a non-Playwright engine's natives are recognised; falls back to
+    every installed Playwright-family driver's identity when no engine is pinned (callers built outside
+    the per-run engine seam). A foreign engine's native error is rejected either way."""
+    return engine_selection.is_engine_error(exc) if engine_selection is not None else is_driver_error(exc)
 
 
 def is_engine_timeout_error(exc: BaseException, engine_selection: BrowserEngineSelection | None = None) -> bool:
-    """Whether ``exc`` is THIS run's engine timeout. Same selection-vs-stock routing as
-    ``is_engine_error``; the stock fallback keeps the historical ``TimeoutError`` identity."""
+    """Whether ``exc`` is THIS run's engine timeout. Same selection-vs-driver routing as
+    ``is_engine_error``."""
     return (
-        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else isinstance(exc, TimeoutError)
+        engine_selection.is_engine_timeout_error(exc) if engine_selection is not None else is_driver_timeout_error(exc)
     )
 
 
@@ -354,6 +358,28 @@ class SkyvernElement:
 
     async def is_file_input(self) -> bool:
         return self.get_tag_name() == InteractiveElement.INPUT and await self.get_attr("type") == "file"
+
+    async def is_explicit_submit(self) -> bool:
+        """Exact ``button[type=submit]`` / ``input[type=submit]`` from static scrape metadata.
+
+        Strict positive raw-attribute allowlist: only these two tag+type pairs
+        qualify, matched ASCII case-insensitively with no whitespace trimming. A
+        padded, empty, missing, or non-string ``type`` never qualifies because the
+        match is exact, and role=button, tag alone, and visible text are never
+        inferred. Any read failure returns False so callers fail closed onto the
+        default path.
+        """
+        try:
+            tag_name = self.get_tag_name()
+            type_attr = await self.get_attr("type", mode="static")
+        except Exception:
+            LOG.debug("is_explicit_submit read failed; treating as non-submit", element_id=self.get_id())
+            return False
+        if not isinstance(tag_name, str) or tag_name.lower() not in ("button", "input"):
+            return False
+        if not isinstance(type_attr, str):
+            return False
+        return type_attr.lower() == "submit"
 
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
@@ -882,7 +908,11 @@ class SkyvernElement:
         if unique_id is None:
             return None
 
-        return await dom.get_skyvern_element_by_id(unique_id)
+        try:
+            return await dom.get_skyvern_element_by_id(unique_id)
+        except MissingElementDict:
+            # The for= control is live but was not scraped; an unmapped control is None, not a failed click.
+            return None
 
     @staticmethod
     async def _label_click_forwards_to_descendant(label_locator: Locator, *, fail_closed: bool = False) -> bool:
@@ -1370,11 +1400,29 @@ class SkyvernElement:
                     element_x = rect["x"] if rect["x"] > 0 else None
                     element_y = rect["y"] if rect["y"] > 0 else None
 
+                # Center the element on the live viewport, not the settings default: the viewport
+                # can be smaller (a dynamic override), and centering on 1920x1080 would scroll the
+                # element off the actual surface. get_frame() is a Page | Frame — a Frame exposes its
+                # owning Page via .page while a Page owns viewport_size directly, so resolve to
+                # whichever carries the viewport. Only a concrete dict with positive integer
+                # width/height is used; otherwise fall back to settings.
+                frame_or_page = self.get_frame()
+                viewport_owner = frame_or_page.page if hasattr(frame_or_page, "page") else frame_or_page
+                frame_viewport = getattr(viewport_owner, "viewport_size", None)
+                viewport_width = settings.BROWSER_WIDTH
+                viewport_height = settings.BROWSER_HEIGHT
+                if isinstance(frame_viewport, dict):
+                    fv_width = frame_viewport.get("width")
+                    fv_height = frame_viewport.get("height")
+                    if isinstance(fv_width, int) and isinstance(fv_height, int) and fv_width > 0 and fv_height > 0:
+                        viewport_width = fv_width
+                        viewport_height = fv_height
+
                 if element_y is not None:
-                    target_y = max(int(element_y - (settings.BROWSER_HEIGHT / 2)), 0)
+                    target_y = max(int(element_y - (viewport_height / 2)), 0)
 
                 if element_x is not None:
-                    target_x = max(int(element_x - (settings.BROWSER_WIDTH / 2)), 0)
+                    target_x = max(int(element_x - (viewport_width / 2)), 0)
 
                 skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
                 if target_x is not None and target_y is not None:
@@ -1388,14 +1436,16 @@ class SkyvernElement:
 
         # Step 2: Playwright actionability confirmation. After Step 1, the element should
         # already be in the viewport so this check passes quickly.
+        # Confirm via the Locator, not a resolved ElementHandle: a Locator re-resolves the
+        # selector on every internal actionability retry, so a mid-wait DOM re-render can't
+        # leave it holding a stale, detached handle.
         try:
-            element_handler = await self.get_element_handler(timeout=timeout)
-            await element_handler.scroll_into_view_if_needed(timeout=timeout)
+            await self.get_locator().scroll_into_view_if_needed(timeout=timeout)
         except Exception as exc:
-            if not is_engine_timeout_error(exc, self._engine_selection):
+            if not is_engine_timeout_error(exc, self._engine_selection) and not is_element_detached_error(exc):
                 raise
             LOG.warning(
-                "Scroll into view timed out",
+                "Scroll into view timed out or element detached mid-scroll",
                 element_id=self.get_id(),
             )
             await self.blur()
@@ -1602,3 +1652,68 @@ class DomUtil:
         except Exception:
             LOG.warning("Failed to get skyvern element by id", element_id=element_id, exc_info=True)
             return None
+
+    def _ancestor_path(self, element_id: str) -> list[dict]:
+        def _find(nodes: list[dict], ancestors: list[dict]) -> list[dict] | None:
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("id") == element_id:
+                    return ancestors
+                children = node.get("children")
+                if isinstance(children, list):
+                    result = _find(children, [*ancestors, node])
+                    if result is not None:
+                        return result
+            return None
+
+        tree = self.scraped_page.element_tree
+        if not isinstance(tree, list):
+            return []
+        return _find(tree, []) or []
+
+    async def resolve_effective_click_target(self, element: SkyvernElement) -> SkyvernElement:
+        static = element.get_element_dict()
+        tag_name = element.get_tag_name().lower()
+        if tag_name in {InteractiveElement.A, InteractiveElement.INPUT, InteractiveElement.SELECT}:
+            return element
+        if tag_name == InteractiveElement.BUTTON and not static.get("hoverOnly", False):
+            return element
+        if static.get("interactable", False) and not static.get("hoverOnly", False):
+            return element
+
+        for ancestor in reversed(self._ancestor_path(element.get_id())):
+            ancestor_id = ancestor.get("id")
+            if not isinstance(ancestor_id, str) or not ancestor_id:
+                continue
+            if not ancestor.get("interactable", False) or ancestor.get("hoverOnly", False):
+                continue
+            attrs = ancestor.get("attributes")
+            if not isinstance(attrs, dict):
+                continue
+            role = str(attrs.get("role") or "").strip().lower()
+            haspopup = str(attrs.get("aria-haspopup") or "").strip().lower()
+            if role != "combobox" and haspopup not in {"true", "listbox", "menu", "tree", "grid"}:
+                continue
+            css = self.scraped_page.id_to_css_dict.get(ancestor_id)
+            if not isinstance(css, str) or not css:
+                continue
+            locator = element.get_frame().locator(css)
+            if await locator.count() != 1:
+                continue
+            owner = SkyvernElement(
+                locator,
+                element.get_frame(),
+                ancestor,
+                self.scraped_page.id_to_element_hash.get(ancestor_id, ""),
+                engine_selection=self.engine_selection,
+            )
+            if not await owner.is_visible():
+                continue
+            LOG.info(
+                "Resolved decorative click target to stable composite owner",
+                element_id=element.get_id(),
+                owner_id=owner.get_id(),
+            )
+            return owner
+        return element

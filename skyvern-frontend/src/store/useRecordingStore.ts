@@ -2,6 +2,8 @@ import { create } from "zustand";
 
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
 
+export type RecordingTransport = "cdp" | "vnc";
+
 const EVENT_CAPTURED_SAMPLE_RATE = 0.1;
 
 /**
@@ -197,8 +199,9 @@ export const nextOptimisticStepId = (): string =>
   `optimistic-${(optimisticStepSeq += 1)}`;
 
 /**
- * A frame grabbed from the live VNC canvas at the moment of a recorded click,
- * matched to draft steps by source-event timestamp (ms epoch).
+ * The last committed frame of the live browser stream, grabbed at the moment
+ * of a recorded click, matched to draft steps by source-event timestamp
+ * (ms epoch).
  */
 export interface RecordingScreenshot {
   timestampMs: number;
@@ -243,6 +246,7 @@ interface RecordingStore {
    */
   isRecording: boolean;
   recordingStartedAtMs: number | null;
+  recordingTransport: RecordingTransport;
   /**
    * The workflow the recording will be committed to. Required to enable
    * backend live interpretation.
@@ -344,6 +348,7 @@ interface RecordingStore {
       browserSessionId?: string | null;
     },
   ) => void;
+  setRecordingTransport: (transport: RecordingTransport) => void;
   /**
    * Flush any pending events into a compressed chunk.
    * Call this before consuming the data.
@@ -521,6 +526,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   isCompressing: false,
   isRecording: false,
   recordingStartedAtMs: null,
+  recordingTransport: "vnc",
   workflowPermanentId: null,
   recordingAttemptId: null,
   draftSteps: [],
@@ -744,28 +750,47 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set(emptyRecordingState());
   },
 
-  reset: () =>
+  reset: () => {
+    const state = get();
+    if (state.isRecording && !state.finishRequested) {
+      captureRecordBrowser("record_browser.abandoned", {
+        transport: state.recordingTransport,
+        duration_ms: Math.round(state.getSecondsRecording() * 1000),
+        event_count: state.getEventCount(),
+        optimistic_step_count: state.optimisticSteps.length,
+      });
+    }
     set({
       ...emptyRecordingState(),
       isCompressing: false,
       isRecording: false,
       workflowPermanentId: null,
-    }),
+    });
+  },
+
+  setRecordingTransport: (recordingTransport) => {
+    if (!get().isRecording) {
+      set({ recordingTransport });
+    }
+  },
 
   setIsRecording: (isRecording, meta) => {
     if (isRecording) {
       const state = get();
       if (!state.isRecording) {
+        const recordingTransport = state.recordingTransport;
         get().clear();
         set({
           isRecording: true,
           recordingStartedAtMs: Date.now(),
+          recordingTransport,
           workflowPermanentId: meta?.workflowPermanentId ?? null,
           recordingAttemptId: crypto.randomUUID(),
         });
         captureRecordBrowser("record_browser.started", {
           workflow_permanent_id: meta?.workflowPermanentId ?? undefined,
           browser_session_id: meta?.browserSessionId ?? undefined,
+          transport: recordingTransport,
         });
       }
       return;
@@ -773,7 +798,6 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
 
     set({
       isRecording: false,
-      recordingStartedAtMs: null,
       finishRequested: false,
       isCommitting: false,
     });

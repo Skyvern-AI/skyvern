@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,13 +25,16 @@ from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, Credential
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _HIGH_LEVEL_ACTION_MAP,
     _LOCATOR_ACTION_MAP,
     _PAGE_ACTION_MAP,
     CODE_BLOCK_FILENAME,
     CODE_LINE_OFFSET,
+    RECORDED_FAILURE_CAPTURE_MAX_CHARS,
+    RECORDED_FAILURE_RESPONSE_MAX_CHARS,
+    PendingAction,
     RecordingKeyboard,
     RecordingLocator,
     RecordingPage,
@@ -37,16 +42,43 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     json_safe_recorder_output,
     user_code_line_from_exception,
 )
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.forge.sdk.workflow.models.credential_release import (
+    _VALUE_RELEASE_NAMES,
+    ArmedSecret,
+    CodeBlockCredentialReleaseError,
+    CredentialReleaseGuard,
+)
+from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, OutputParameter, ParameterType
+from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus, ClickAction, GotoUrlAction, InputTextAction
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
+class FakeFrame:
+    def __init__(self, url):  # noqa: ANN001
+        self.url = url
+
+
+class FakeElementHandle:
+    """Mirrors playwright's ElementHandle: it has owner_frame but NOT element_handle."""
+
+    def __init__(self, url):  # noqa: ANN001
+        self._url = url
+        self.filled: list[str] = []
+
+    async def owner_frame(self):  # noqa: ANN201
+        return FakeFrame(self._url)
+
+    async def fill(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.filled.append(value)
+
+
 class FakeLocator:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.frame_url = "https://dash.example.com/account/login"
+        self.element_handle_calls = 0
 
     def locator(self, selector):  # noqa: ANN001, ANN201
         return self
@@ -58,6 +90,13 @@ class FakeLocator:
     def first(self):  # noqa: ANN201
         return self
 
+    async def element_handle(self, timeout=None):  # noqa: ANN001, ANN201
+        self.element_handle_calls += 1
+        return FakeElementHandle(self.frame_url)
+
+    async def wait_for(self, **kwargs):  # noqa: ANN003, ANN201
+        return None
+
     async def click(self, **kwargs):  # noqa: ANN003, ANN201
         self.calls.append("click")
 
@@ -66,6 +105,9 @@ class FakeLocator:
 
     async def type(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
         self.calls.append(f"type:{value}")
+
+    async def press_sequentially(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.calls.append(f"press_sequentially:{text}")
 
     async def select_option(self, value, **kwargs):  # noqa: ANN001, ANN003, ANN201
         self.calls.append(f"select:{value}")
@@ -78,8 +120,14 @@ class FakeLocator:
 
 
 class FakeKeyboard:
+    def __init__(self) -> None:
+        self.typed: list[str] = []
+
     async def press(self, key, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
+
+    async def type(self, text, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.typed.append(text)
 
 
 class FakePage:
@@ -87,6 +135,7 @@ class FakePage:
         self.inner = FakeLocator()
         self.keyboard = FakeKeyboard()
         self.url = "about:blank"
+        self.autocompleted: list[str] = []
 
     async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
         return None
@@ -109,6 +158,9 @@ class FakePage:
     async def screenshot(self, **kwargs):  # noqa: ANN003, ANN201
         return b"img"
 
+    async def fill_autocomplete(self, selector=None, value=None, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.autocompleted.append(value)
+
     async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
         return None
 
@@ -117,6 +169,21 @@ class FakePage:
 
     async def scroll(self, **kwargs):  # noqa: ANN003, ANN201
         return None
+
+
+class ControlledGotoPage(FakePage):
+    def __init__(self, outcome: object = None) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.outcome = outcome
+
+    async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
+        self.started.set()
+        await self.release.wait()
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
 
 
 @asynccontextmanager
@@ -142,6 +209,192 @@ async def _record_timed_action() -> Action:
     action.step_id = "stp_timing"
     action.step_order = 0
     return action
+
+
+# Compiled under the code block filename and offset so the recorder's frame walk resolves a real
+# authored line (the await sits on source line 4, which reports as authored line 2).
+_AUTHORED_GOTO_SOURCE = (
+    "\nasync def authored_goto(page):\n"
+    "    url = 'https://example.com/private?token=secret'\n"
+    "    return await page.goto(url)\n"
+)
+_authored_namespace: dict[str, Any] = {}
+exec(compile(_AUTHORED_GOTO_SOURCE, CODE_BLOCK_FILENAME, "exec"), _authored_namespace)
+_authored_goto: Callable[[RecordingPage], Awaitable[str]] = _authored_namespace["authored_goto"]
+
+
+@pytest.mark.asyncio
+async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.01)
+
+    pending: list[PendingAction] = []
+    emitted = asyncio.Event()
+
+    async def capture_pending(fact: PendingAction) -> None:
+        pending.append(fact)
+        emitted.set()
+
+    stalled = ControlledGotoPage(outcome="response")
+    page = RecordingPage(stalled, on_pending_action=capture_pending)
+    call = asyncio.create_task(_authored_goto(page))
+    await asyncio.wait_for(emitted.wait(), timeout=0.5)
+
+    assert pending == [
+        PendingAction(
+            call_name="page.goto",
+            threshold_seconds=0.01,
+            code_line=2,
+            action_type=ActionType.GOTO_URL,
+            action_order=0,
+        )
+    ]
+    assert page.recorded_actions() == []
+
+    stalled.release.set()
+    assert await call == "response"
+    assert len(pending) == 1
+    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
+
+    fast_pending: list[PendingAction] = []
+    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)  # type: ignore[arg-type]
+    await fast_page.goto("https://example.com/fast")
+    await asyncio.sleep(0.02)
+    assert fast_pending == []
+
+    failed_pending: list[PendingAction] = []
+    failed_inner = ControlledGotoPage(outcome=RuntimeError("navigation failed"))
+    failed_inner.release.set()
+    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="navigation failed"):
+        await failed_page.goto("https://example.com/fail")
+    await asyncio.sleep(0.02)
+    assert failed_pending == []
+
+    cancelled_pending: list[PendingAction] = []
+    cancelled_inner = ControlledGotoPage()
+    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)  # type: ignore[arg-type]
+    cancelled_call = asyncio.create_task(cancelled_page.goto("https://example.com/cancel"))
+    await cancelled_inner.started.wait()
+    cancelled_call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_call
+    await asyncio.sleep(0.02)
+    assert cancelled_pending == []
+
+    callback_started = asyncio.Event()
+
+    async def failing_callback(fact: PendingAction) -> None:
+        callback_started.set()
+        raise RuntimeError("pending callback failed")
+
+    callback_failure_inner = ControlledGotoPage(outcome="unchanged")
+    callback_failure_page = RecordingPage(callback_failure_inner, on_pending_action=failing_callback)
+    callback_failure_call = asyncio.create_task(callback_failure_page.goto("https://example.com/callback"))
+    await asyncio.wait_for(callback_started.wait(), timeout=0.5)
+    callback_failure_inner.release.set()
+    assert await callback_failure_call == "unchanged"
+    assert [action.status for action in callback_failure_page.recorded_actions()] == [ActionStatus.completed]
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
+
+
+@pytest.mark.asyncio
+async def test_keyboard_calls_arm_the_pending_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.0)
+    release = asyncio.Event()
+    emitted = asyncio.Event()
+    pending: list[PendingAction] = []
+
+    async def capture(fact: PendingAction) -> None:
+        pending.append(fact)
+        emitted.set()
+
+    async def stall(*args: object, **kwargs: object) -> None:
+        await release.wait()
+
+    page = RecordingPage(
+        SimpleNamespace(url="about:blank", keyboard=SimpleNamespace(down=stall, insert_text=stall)),
+        on_pending_action=capture,
+    )
+
+    async def pending_for(invoke: Callable[[], Awaitable[object]]) -> PendingAction:
+        emitted.clear()
+        call = asyncio.create_task(invoke())
+        try:
+            await asyncio.wait_for(emitted.wait(), timeout=1)
+        finally:
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        return pending[-1]
+
+    assert (await pending_for(lambda: page.keyboard.down("Shift"))).call_name == "keyboard.down"
+    assert (await pending_for(lambda: page.keyboard.insert_text("value"))).call_name == "keyboard.insert_text"
+
+    stalled_guard = CredentialReleaseGuard()
+    monkeypatch.setattr(stalled_guard, "enforce", stall)
+    guarded_page = RecordingPage(
+        SimpleNamespace(url="about:blank", keyboard=SimpleNamespace(type=stall)),
+        on_pending_action=capture,
+        credential_release_guard=stalled_guard,
+    )
+    assert (await pending_for(lambda: guarded_page.keyboard.type("value"))).call_name == "keyboard.type"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_draining_pending_navigation_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending_started = asyncio.Event()
+    pending_cancelled = asyncio.Event()
+    release_pending = asyncio.Event()
+
+    async def slow_pending_action(self: _Recorder, fact: PendingAction) -> None:
+        pending_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pending_cancelled.set()
+            await release_pending.wait()
+            raise
+
+    class YieldingGotoPage(FakePage):
+        async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
+            await asyncio.sleep(0)
+            return "response"
+
+    monkeypatch.setattr(_Recorder, "_emit_pending_action", slow_pending_action)
+    page = RecordingPage(YieldingGotoPage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
+    call = asyncio.create_task(page.goto("https://example.com/cancel-during-cleanup"))
+
+    await asyncio.wait_for(pending_started.wait(), timeout=0.5)
+    await asyncio.wait_for(pending_cancelled.wait(), timeout=0.5)
+    call.cancel()
+    release_pending.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
+    assert not any(task.get_name() == "code-block-call-pending" for task in asyncio.all_tasks())
+
+
+@pytest.mark.asyncio
+async def test_prior_cancellation_does_not_cancel_pending_navigation_cleanup() -> None:
+    page = RecordingPage(FakePage(), on_pending_action=lambda fact: None)  # type: ignore[arg-type]
+
+    async def navigate_after_caught_cancellation() -> object:
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        current_task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        assert current_task.cancelling() == 1
+        return await page.goto("https://example.com/after-caught-cancellation")
+
+    assert await asyncio.create_task(navigate_after_caught_cancellation()) is None
+    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
 
 
 @pytest.mark.asyncio
@@ -307,11 +560,19 @@ async def test_filter_locator_chain_click_is_recorded() -> None:
     assert [a.action_type for a in recorded] == [ActionType.CLICK]
 
 
+_ACTIONABILITY_ERROR = (
+    "Locator.click: Timeout 5000ms exceeded.\n"
+    "Call log:\n"
+    '  - waiting for locator("#submit")\n'
+    '  - <div class="privacy-notice-veil" role="dialog">…</div> intercepts pointer events'
+)
+
+
 @pytest.mark.asyncio
-async def test_failed_call_records_failed_action_and_reraises() -> None:
+async def test_failed_call_records_the_browser_error_text_and_reraises() -> None:
     class ExplodingLocator(FakeLocator):
         async def click(self, **kwargs):  # noqa: ANN003, ANN201
-            raise RuntimeError("element detached")
+            raise RuntimeError(_ACTIONABILITY_ERROR)
 
     fake = FakePage()
     fake.inner = ExplodingLocator()
@@ -321,7 +582,54 @@ async def test_failed_call_records_failed_action_and_reraises() -> None:
     recorded = page.recorded_actions()
     assert recorded[-1].action_type == ActionType.CLICK
     assert recorded[-1].status == ActionStatus.failed
-    assert "element detached" in (recorded[-1].response or "")
+    assert recorded[-1].response != "Browser operation failed."
+    assert "privacy-notice-veil" in (recorded[-1].response or "")
+    assert "intercepts pointer events" in (recorded[-1].response or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_str",
+    [
+        pytest.param(lambda self: (_ for _ in ()).throw(RuntimeError("__str__ exploded")), id="raising"),
+        pytest.param(lambda self: 42, id="non_str"),
+    ],
+)
+async def test_a_hostile_dunder_str_cannot_swallow_the_original_failure(bad_str) -> None:  # noqa: ANN001
+    """Capturing the message must not cost the fault: the original exception still propagates."""
+
+    class Hostile(Exception):
+        __str__ = bad_str
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise Hostile()
+
+    fake = FakePage()
+    fake.inner = ExplodingLocator()
+    page = RecordingPage(fake)
+    with pytest.raises(Hostile):
+        await page.locator("#x").click()
+    assert page.recorded_actions()[-1].response == "Hostile"
+
+
+@pytest.mark.asyncio
+async def test_a_huge_error_is_captured_above_the_mask_bound_but_still_capped() -> None:
+    """Unbounded capture would exceed the parameter redactor's disclosure budget, which returns a
+    replacement string instead of the payload and drops the whole row."""
+
+    class ExplodingLocator(FakeLocator):
+        async def click(self, **kwargs):  # noqa: ANN003, ANN201
+            raise RuntimeError("x" * 70000)
+
+    fake = FakePage()
+    fake.inner = ExplodingLocator()
+    page = RecordingPage(fake)
+    with pytest.raises(RuntimeError):
+        await page.locator("#x").click()
+    captured = page.recorded_actions()[-1].response or ""
+    assert len(captured) > RECORDED_FAILURE_RESPONSE_MAX_CHARS
+    assert len(captured) == RECORDED_FAILURE_CAPTURE_MAX_CHARS
 
 
 @pytest.mark.asyncio
@@ -414,6 +722,7 @@ class FakeWorkflowRunContext:
 
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
+        self.credential_tested_urls: dict[str, str] = {}
 
     def get_block_metadata(self, label):  # noqa: ANN001, ANN201
         return {}
@@ -683,6 +992,7 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
         AsyncMock(return_value=1),
     )
     monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_self_heal_api_key", AsyncMock(return_value=None))
+    block = _make_code_block("await page.locator('#x').click()", goal="go")
     # Stub the heal to a success result; this tests execute()'s seat-finalization wiring, not the
     # heal itself. The stub carries the full BlockResult surface the finalizer reads — heal
     # finalization rebuilds the result when download binding changes its output.
@@ -690,17 +1000,16 @@ async def test_self_heal_success_finalizes_seat_completed(monkeypatch: pytest.Mo
         CodeBlock,
         "_attempt_self_heal",
         AsyncMock(
-            return_value=SimpleNamespace(
+            return_value=BlockResult(
                 success=True,
+                output_parameter=block.output_parameter,
                 output_parameter_value=None,
                 failure_reason=None,
                 status=BlockStatus.completed,
-                error_codes=[],
             )
         ),
     )
 
-    block = _make_code_block("await page.locator('#x').click()", goal="go")
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
     assert result.success is True
@@ -1179,7 +1488,7 @@ async def test_caught_page_failure_then_unrelated_raise_persists_synthetic_actio
     assert actions[-1].action_type == ActionType.NULL_ACTION
     assert actions[-1].status == ActionStatus.failed
     assert isinstance(actions[-1].output, dict) and actions[-1].output["code_line"] == 5
-    assert "later failure" in (actions[-1].response or "")
+    assert actions[-1].response == "Failed to execute code block. Reason: Exception: later failure"
     # The synthetic error row is built outside the recorder; it still needs a stable id or the upsert
     # inserts a null primary key and the code-error row is lost.
     assert all(a.action_id for a in _upsert_calls(mocks))
@@ -1276,3 +1585,359 @@ async def test_code_block_output_registers_leaked_locator_as_selector(monkeypatc
     json.dumps(result.output_parameter_value)  # registration payload is JSON-safe
     assert result.output_parameter_value["name"] == "Invoice_2026.pdf"  # sibling preserved
     assert result.output_parameter_value["link"] == "<RecordingLocator>"  # locator normalized, not a raw proxy
+
+
+def _release_guard(allowed_url: str = "https://dash.example.com/account/login") -> CredentialReleaseGuard:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_guard_test", block_label="login")
+    guard.arm("Sup3rSecretPW!", allowed_url, "login_credentials")
+    return guard
+
+
+@pytest.mark.asyncio
+async def test_off_site_credential_fill_is_refused_before_release() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "https://accounts.example.org/challenge/pwd"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
+        await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
+    assert "login_credentials" in str(exc_info.value)
+    assert re.search(r"https://example\.org", str(exc_info.value))
+    assert not any(call.startswith("fill:") for call in fake.inner.calls)
+    [action] = page.recorded_actions()
+    # The recorded row is redacted by the transport hardening (SKY-13764); the refusal text reaches
+    # the run record through the raised exception's failure_reason, not through this field.
+    assert action.status == ActionStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_same_site_credential_fill_releases() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "https://login.example.com/session"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    await page.locator('input[type="password"]').fill("Sup3rSecretPW!")
+    assert "fill:Sup3rSecretPW!" in fake.inner.calls
+
+
+@pytest.mark.asyncio
+async def test_same_origin_without_registrable_domain_releases() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "http://localhost:8907/portal"
+    page = RecordingPage(fake, credential_release_guard=_release_guard("http://localhost:8907/login"))
+    await page.locator("#password").fill("Sup3rSecretPW!")
+    assert "fill:Sup3rSecretPW!" in fake.inner.calls
+
+
+@pytest.mark.asyncio
+async def test_non_secret_values_skip_element_resolution() -> None:
+    fake = FakePage()
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    await page.locator("#search").fill("hello world")
+    assert fake.inner.element_handle_calls == 0
+    assert "fill:hello world" in fake.inner.calls
+
+
+@pytest.mark.asyncio
+async def test_page_level_fill_is_guarded() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "https://accounts.example.org/challenge"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await page.fill("#password", "Sup3rSecretPW!")
+
+
+@pytest.mark.asyncio
+async def test_keyboard_type_is_guarded_by_page_url() -> None:
+    fake = FakePage()
+    fake.url = "https://accounts.example.org/challenge"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await page.keyboard.type("Sup3rSecretPW!")
+    assert fake.keyboard.typed == []
+
+
+@pytest.mark.asyncio
+async def test_unguarded_page_records_and_releases_as_before() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "https://accounts.example.org/challenge"
+    page = RecordingPage(fake)
+    await page.locator("#password").fill("Sup3rSecretPW!")
+    assert "fill:Sup3rSecretPW!" in fake.inner.calls
+    assert fake.inner.element_handle_calls == 0
+
+
+_SSO_MISROUTE_CODE = """
+await page.goto("https://dash.example.com/logs")
+sso_button = page.get_by_role("button", name="Sign in with IdP")
+await sso_button.wait_for(state="visible", timeout=1000)
+await sso_button.click()
+identifier = page.locator("#identifierId")
+await identifier.fill(login_credentials.username)
+password_field = page.locator('input[type="password"]')
+await password_field.fill(login_credentials.password)
+"""
+
+
+@pytest.mark.asyncio
+async def test_sso_misroute_code_is_refused_at_the_first_off_site_release() -> None:
+    """A block that clicks into a third-party sign-in and fills the saved credential there
+    must fail with the site mismatch before any credential value reaches the page."""
+    fake = FakePage()
+    fake.inner.frame_url = "https://accounts.example.org/signin/identifier"
+    guard = CredentialReleaseGuard(workflow_run_id="wr_guard_test", block_label="start_sso_sign_in")
+    guard.arm("user@example.com", "https://dash.example.com/account/login", "login_credentials")
+    guard.arm("Sup3rSecretPW!", "https://dash.example.com/account/login", "login_credentials")
+    page = RecordingPage(fake, credential_release_guard=guard)
+    block = _make_code_block(_SSO_MISROUTE_CODE)
+    user_function = block.generate_async_user_function(
+        _SSO_MISROUTE_CODE,
+        page,
+        {"login_credentials": Credential(username="user@example.com", password="Sup3rSecretPW!")},
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
+        await user_function()
+    message = str(exc_info.value)
+    assert "belongs to https://example.com" in message
+    assert re.search(r"https://example\.org", message)
+    assert not any(call.startswith(("fill:", "type:")) for call in fake.inner.calls)
+
+
+@pytest.mark.asyncio
+async def test_element_handle_fill_releases_on_site() -> None:
+    """`page.wait_for_selector` yields an ElementHandle, which the recorder wraps in a
+    RecordingLocator just like a Locator — but an ElementHandle has no element_handle() of its own.
+    The guard must read its owner frame directly rather than dying on the credential's own site."""
+    handle = FakeElementHandle("https://login.example.com/session")
+    recorder = _Recorder(None, _release_guard())
+    wrapped = RecordingLocator(handle, recorder, "#password")
+    await wrapped.fill("Sup3rSecretPW!")
+    assert handle.filled == ["Sup3rSecretPW!"]
+
+
+@pytest.mark.asyncio
+async def test_element_handle_fill_is_refused_off_site() -> None:
+    handle = FakeElementHandle("https://accounts.example.org/challenge")
+    recorder = _Recorder(None, _release_guard())
+    wrapped = RecordingLocator(handle, recorder, "#password")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await wrapped.fill("Sup3rSecretPW!")
+    assert handle.filled == []
+
+
+@pytest.mark.asyncio
+async def test_press_sequentially_is_recorded_and_guarded() -> None:
+    fake = FakePage()
+    fake.inner.frame_url = "https://accounts.example.org/challenge"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await page.locator("#password").press_sequentially("Sup3rSecretPW!")
+    assert fake.inner.calls == []
+
+
+def test_value_release_names_are_recorded_operations() -> None:
+    """The guard only runs inside the recorder's wrapper, which exists only for mapped names. A
+    release name absent from the maps is silently unguarded — the drift that left
+    press_sequentially unrecorded in the first place."""
+    mapped = {
+        *(f"locator.{name}" for name in _LOCATOR_ACTION_MAP),
+        *(f"page.{name}" for name in _LOCATOR_ACTION_MAP),
+        *(f"page.{name}" for name in _PAGE_ACTION_MAP),
+        *(f"page.{name}" for name in _HIGH_LEVEL_ACTION_MAP),
+    }
+    unmapped = {name for name in _VALUE_RELEASE_NAMES if not name.startswith("keyboard.")} - mapped
+    assert not unmapped, (
+        f"{sorted(unmapped)} are in _VALUE_RELEASE_NAMES but not in any recording map, so the "
+        "recorder never wraps them and the credential release guard never runs for them"
+    )
+
+
+@pytest.mark.asyncio
+async def test_readable_off_site_frames_do_not_refuse_an_on_site_keystroke() -> None:
+    """A login page embeds third-party frames (captcha, analytics) as a matter of course. Only a
+    frame we could not read can be hiding focus, so readable off-site frames must not refuse."""
+    fake = FakePage()
+    fake.url = "https://login.example.com/session"
+
+    class Quiet:
+        def __init__(self, url):  # noqa: ANN001
+            self.url = url
+
+        async def evaluate(self, _expression):  # noqa: ANN001, ANN202
+            return False
+
+    fake.frames = [Quiet("https://login.example.com/session"), Quiet("https://captcha.example.org/widget")]
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    await page.keyboard.type("Sup3rSecretPW!")
+    assert fake.keyboard.typed == ["Sup3rSecretPW!"]
+
+
+def test_a_credential_with_an_unusable_tested_url_is_not_armed() -> None:
+    """An unparseable saved login site yields no scope to compare against. Arming it anyway would
+    refuse every fill of that credential; leaving it unarmed matches the absent-tested_url case."""
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    # A basic-auth tested_url is refused by origin canonicalisation, so it yields no scope.
+    assert guard.arm("Sup3rSecretPW!", "https://user:pass@example.com/login", "login_credentials") is False
+    assert guard.is_armed is False
+
+
+def test_a_value_shared_by_two_credentials_releases_on_either_site() -> None:
+    """The same username is commonly saved against two sites; refusing on the second because the
+    first was armed first would be an order-dependent false refusal."""
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    guard.arm("user@example.com", "https://one.example.com/login", "first_credentials")
+    guard.arm("user@example.com", "https://two.example.net/login", "second_credentials")
+    candidates = guard.matches("user@example.com")
+    assert len(candidates) == 2
+    guard.check_release(
+        candidates[0], "https://two.example.net/login", operation="locator.fill", alternatives=candidates[1:]
+    )
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(
+            candidates[0], "https://accounts.example.org/x", operation="locator.fill", alternatives=candidates[1:]
+        )
+
+
+def test_a_shorter_secret_cannot_authorize_releasing_a_longer_one() -> None:
+    """Two credentials sharing one value may each authorize it, but a shorter secret that merely
+    appears inside the typed value is a different secret: site A's password must not ride out on
+    site B's shorter one."""
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    guard.arm("hunter2!", "https://one.example.com/login", "first_credentials")
+    guard.arm("hunter2", "https://two.example.net/login", "second_credentials")
+    candidates = guard.matches("hunter2!")
+    assert len(candidates) == 2
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        guard.check_release(
+            candidates[0], "https://two.example.net/login", operation="locator.fill", alternatives=candidates[1:]
+        )
+
+
+def test_unreadable_allowed_url_is_not_echoed_into_the_refusal() -> None:
+    """tested_url can carry basic-auth or a token in its query; the refusal text and the log line
+    both reach persisted records, so an unparseable scope must degrade to a placeholder."""
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    guard._armed.append(ArmedSecret("Sup3rSecretPW!", "https://user:tok3n@example.com/login", "login_credentials"))
+    entry = guard.match("Sup3rSecretPW!")
+    assert entry is not None
+    with pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
+        guard.check_release(entry, "https://accounts.example.org/x", operation="locator.fill")
+    assert "tok3n" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_credential_release_refusal_reaches_the_run_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refusal names both sites, and that text is the observation the next authoring iteration
+    repairs from — so it must survive into failure_reason rather than the generic reason every
+    other exception collapses to."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("raise RuntimeError('placeholder')")
+
+    def _raise_refusal(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise CodeBlockCredentialReleaseError(
+            "Refused to type the saved credential `login_credentials` here: the credential belongs "
+            "to https://example.com, but this field is on https://example.org."
+        )
+
+    monkeypatch.setattr(CodeBlock, "generate_async_user_function", _raise_refusal)
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert "belongs to https://example.com" in (result.failure_reason or "")
+    assert re.search(r"https://example\.org", result.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_prompt_only_fill_is_judged_by_the_page_not_refused() -> None:
+    """A prompt-only fill names no selector to resolve; judging it unresolvable would refuse a
+    credential fill on the credential's own site."""
+    fake = FakePage()
+    fake.url = "https://login.example.com/session"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    await page.fill_autocomplete(value="Sup3rSecretPW!", prompt="the password field")
+
+
+@pytest.mark.asyncio
+async def test_prompt_only_fill_is_still_refused_off_site() -> None:
+    fake = FakePage()
+    fake.url = "https://accounts.example.org/challenge"
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await page.fill_autocomplete(value="Sup3rSecretPW!", prompt="the password field")
+
+
+@pytest.mark.asyncio
+async def test_keyboard_release_refuses_when_an_unreadable_frame_is_off_site() -> None:
+    """Nothing claiming focus is ordinary in a headless window, so it cannot refuse by itself —
+    but an unreadable off-site frame might be the one holding focus."""
+    fake = FakePage()
+    fake.url = "https://login.example.com/session"
+
+    class Unreadable:
+        url = "https://accounts.example.org/challenge"
+
+        async def evaluate(self, _expression):  # noqa: ANN001, ANN202
+            raise RuntimeError("frame detached")
+
+    class Quiet:
+        url = "https://login.example.com/session"
+
+        async def evaluate(self, _expression):  # noqa: ANN001, ANN202
+            return False
+
+    fake.frames = [Quiet(), Unreadable()]
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        await page.keyboard.type("Sup3rSecretPW!")
+
+
+@pytest.mark.asyncio
+async def test_keyboard_release_allows_when_all_frames_are_on_site() -> None:
+    fake = FakePage()
+    fake.url = "https://login.example.com/session"
+
+    class Quiet:
+        url = "https://login.example.com/session"
+
+        async def evaluate(self, _expression):  # noqa: ANN001, ANN202
+            return False
+
+    fake.frames = [Quiet()]
+    page = RecordingPage(fake, credential_release_guard=_release_guard())
+    await page.keyboard.type("Sup3rSecretPW!")
+    assert fake.keyboard.typed == ["Sup3rSecretPW!"]
+
+
+@pytest.mark.asyncio
+async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wiring, not the guard: a real credential parameter with a tested login site must arm the
+    release check for the block's own run. Hand-armed guards in the other tests cannot see this
+    path, so disabling it here is invisible to them."""
+    page = FakePage()
+    page.inner.frame_url = "https://accounts.example.org/challenge"
+    context = FakeWorkflowRunContext()
+    context.credential_tested_urls = {"login_credentials": "https://login.example.com/account"}
+    _patch_execute_environment(monkeypatch, page, context)
+
+    credential_parameter = CredentialParameter(
+        key="login_credentials",
+        credential_id="cred_test",
+        description="test credential",
+        credential_parameter_id="cpid_test",
+        workflow_id="w_test",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context.values = {"login_credentials": {"context": "placeholders", "password": "Sup3rSecretPW!"}}
+    monkeypatch.setattr(
+        FakeWorkflowRunContext, "get_original_secret_value_or_none", lambda self, value: value, raising=False
+    )
+
+    block = _make_code_block('await page.locator("#password").fill(login_credentials.password)')
+    block.parameters = [credential_parameter]
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is False
+    assert "belongs to https://example.com" in (result.failure_reason or "")
+    assert not any(call.startswith("fill:") for call in page.inner.calls)

@@ -316,6 +316,35 @@ class TasksRepository(BaseRepository):
             query = select(func.count()).select_from(unique_step_orders)
             return (await session.execute(query)).scalar()
 
+    @db_operation("get_total_unique_progress_round_count_by_task_ids")
+    async def get_total_unique_progress_round_count_by_task_ids(
+        self,
+        *,
+        task_ids: list[str],
+        organization_id: str,
+    ) -> int:
+        """Distinct (task_id, order) pairs across steps UNION actions' round-stamped step_order.
+
+        A step-engine action's step_order mirrors an existing step order, so the union equals the
+        step count; a task_v3 task has one Step row but round-stamped actions, so each of its
+        action rounds counts individually. This is the workflow-run step-budget unit.
+        """
+        async with self.Session() as session:
+            step_pairs = (
+                select(StepModel.task_id, StepModel.order)
+                .where(StepModel.task_id.in_(task_ids))
+                .where(StepModel.organization_id == organization_id)
+            )
+            action_pairs = (
+                select(ActionModel.task_id, ActionModel.step_order)
+                .where(ActionModel.task_id.in_(task_ids))
+                .where(ActionModel.organization_id == organization_id)
+                .where(ActionModel.step_order.is_not(None))
+            )
+            union_pairs = step_pairs.union(action_pairs).subquery()
+            query = select(func.count()).select_from(union_pairs)
+            return (await session.execute(query)).scalar() or 0
+
     @db_operation("get_task_step_models")
     async def get_task_step_models(self, task_id: str, organization_id: str | None = None) -> Sequence[StepModel]:
         async with self.Session() as session:
@@ -486,48 +515,52 @@ class TasksRepository(BaseRepository):
         created_by: str | None = None,
         last_llm_model: str | None = None,
     ) -> Step:
-        async with self.Session() as session:
-            if step := (
-                await session.scalars(
-                    select(StepModel)
-                    .filter_by(task_id=task_id)
-                    .filter_by(step_id=step_id)
-                    .filter_by(organization_id=organization_id)
+        values: dict[str, Any] = {}
+        if status is not None:
+            values["status"] = status
+            if status.is_terminal():
+                values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+        if output is not None:
+            values["output"] = output.model_dump(exclude_none=True)
+        if is_last is not None:
+            values["is_last"] = is_last
+        if retry_index is not None:
+            values["retry_index"] = retry_index
+        # Accumulated in SQL, not Python: concurrent LLM calls against the same step would
+        # otherwise both read the pre-increment value and the later commit would drop the earlier one.
+        for column, delta in (
+            (StepModel.step_cost, incremental_cost),
+            (StepModel.input_token_count, incremental_input_tokens),
+            (StepModel.output_token_count, incremental_output_tokens),
+            (StepModel.reasoning_token_count, incremental_reasoning_tokens),
+            (StepModel.cached_token_count, incremental_cached_tokens),
+        ):
+            if delta is not None:
+                values[column.key] = func.coalesce(column, 0) + delta
+        if created_by is not None:
+            values["created_by"] = created_by
+        if last_llm_model is not None:
+            values["last_llm_model"] = last_llm_model
+
+        if values:
+            async with self.Session() as session:
+                result = await session.execute(
+                    update(StepModel)
+                    .where(StepModel.task_id == task_id)
+                    .where(StepModel.step_id == step_id)
+                    .where(StepModel.organization_id == organization_id)
+                    .values(values)
                 )
-            ).first():
-                if status is not None:
-                    step.status = status
-
-                    if status.is_terminal() and step.finished_at is None:
-                        step.finished_at = naive_utc_now()
-                if output is not None:
-                    step.output = output.model_dump(exclude_none=True)
-                if is_last is not None:
-                    step.is_last = is_last
-                if retry_index is not None:
-                    step.retry_index = retry_index
-                if incremental_cost is not None:
-                    step.step_cost = incremental_cost + float(step.step_cost or 0)
-                if incremental_input_tokens is not None:
-                    step.input_token_count = incremental_input_tokens + (step.input_token_count or 0)
-                if incremental_output_tokens is not None:
-                    step.output_token_count = incremental_output_tokens + (step.output_token_count or 0)
-                if incremental_reasoning_tokens is not None:
-                    step.reasoning_token_count = incremental_reasoning_tokens + (step.reasoning_token_count or 0)
-                if incremental_cached_tokens is not None:
-                    step.cached_token_count = incremental_cached_tokens + (step.cached_token_count or 0)
-                if created_by is not None:
-                    step.created_by = created_by
-                if last_llm_model is not None:
-                    step.last_llm_model = last_llm_model
-
-                await session.commit()
-                updated_step = await self.get_step(step_id, organization_id)
-                if not updated_step:
+                if result.rowcount == 0:
                     raise NotFoundError("Step not found")
-                return updated_step
-            else:
-                raise NotFoundError("Step not found")
+                await session.commit()
+
+        updated_step = await self.get_step(step_id, organization_id)
+        # get_step does not scope by task_id, so re-check it here: a call carrying no field to
+        # update never runs the statement above and would otherwise skip that filter entirely.
+        if not updated_step or updated_step.task_id != task_id:
+            raise NotFoundError("Step not found")
+        return updated_step
 
     @db_operation("clear_task_failure_reason")
     async def clear_task_failure_reason(self, organization_id: str, task_id: str) -> Task:
@@ -558,6 +591,64 @@ class TasksRepository(BaseRepository):
         organization_id: str | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
+        updated_task, _ = await self._update_task_with_finish_claim(
+            task_id,
+            status=status,
+            extracted_information=extracted_information,
+            webhook_failure_reason=webhook_failure_reason,
+            failure_reason=failure_reason,
+            errors=errors,
+            max_steps_per_run=max_steps_per_run,
+            organization_id=organization_id,
+            failure_category=failure_category,
+        )
+        return updated_task
+
+    @traced(name="skyvern.db.update_task_and_claim_finish")
+    @db_operation("update_task_and_claim_finish")
+    async def update_task_and_claim_finish(
+        self,
+        task_id: str,
+        status: TaskStatus | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        max_steps_per_run: int | None = None,
+        organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> tuple[Task, bool]:
+        """``update_task``, plus whether THIS write flipped ``finished_at`` from NULL.
+
+        The flip happens under a row lock and every finalizer stamps ``finished_at``
+        atomically with its terminal status (here and in the bulk CAS paths), so at
+        most one concurrent finalizer sees True. Callers use it as the exactly-once
+        gate for per-task side effects such as the run-minutes emission.
+        """
+        return await self._update_task_with_finish_claim(
+            task_id,
+            status=status,
+            extracted_information=extracted_information,
+            webhook_failure_reason=webhook_failure_reason,
+            failure_reason=failure_reason,
+            errors=errors,
+            max_steps_per_run=max_steps_per_run,
+            organization_id=organization_id,
+            failure_category=failure_category,
+        )
+
+    async def _update_task_with_finish_claim(
+        self,
+        task_id: str,
+        status: TaskStatus | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        max_steps_per_run: int | None = None,
+        organization_id: str | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+    ) -> tuple[Task, bool]:
         if (
             status is None
             and extracted_information is None
@@ -570,10 +661,17 @@ class TasksRepository(BaseRepository):
             raise ValueError(
                 "At least one of status, extracted_information, or failure_reason must be provided to update the task"
             )
+        finish_claimed = False
         async with self.Session() as session:
             if task := (
                 await session.scalars(
-                    select(TaskModel).filter_by(task_id=task_id).filter_by(organization_id=organization_id)
+                    select(TaskModel)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                    # The row lock makes the finished_at NULL->set flip below an atomic
+                    # claim: concurrent finalizers serialize here, and only the first
+                    # sees finished_at still NULL.
+                    .with_for_update()
                 )
             ).first():
                 if status is not None:
@@ -584,6 +682,7 @@ class TasksRepository(BaseRepository):
                         task.started_at = naive_utc_now()
                     if status.is_final() and task.finished_at is None:
                         task.finished_at = naive_utc_now()
+                        finish_claimed = True
                 if extracted_information is not None:
                     task.extracted_information = extracted_information
                 if failure_reason is not None:
@@ -616,9 +715,45 @@ class TasksRepository(BaseRepository):
                     self._background_tasks.add(bg)
                     bg.add_done_callback(self._background_tasks.discard)
 
-                return updated_task
+                return updated_task, finish_claimed
             else:
                 raise NotFoundError("Task not found")
+
+    @traced(name="skyvern.db.reset_task_for_rerun")
+    @db_operation("reset_task_for_rerun")
+    async def reset_task_for_rerun(self, task_id: str, organization_id: str) -> Task:
+        """Return a task to ``created`` with its lifecycle timestamps cleared.
+
+        ``update_task`` only ever stamps timestamps forward, so it cannot undo a finished
+        run. Clearing ``finished_at`` here is what re-arms the exactly-once finish claim in
+        ``_update_task_with_finish_claim``: leaving it set spends the rerun's claim before it
+        begins, and the rerun's real compute never emits.
+        """
+        async with self.Session() as session:
+            if task := (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(task_id=task_id)
+                    .filter_by(organization_id=organization_id)
+                    .with_for_update()
+                )
+            ).first():
+                task.status = TaskStatus.created
+                task.queued_at = None
+                task.started_at = None
+                task.finished_at = None
+                await session.commit()
+                await session.refresh(task)
+                reset_task = convert_to_task(task, debug_enabled=self.debug_enabled)
+            else:
+                raise NotFoundError("Task not found")
+
+        await self.sync_task_run_status(
+            organization_id=organization_id,
+            run_id=task_id,
+            status=TaskStatus.created.value,
+        )
+        return reset_task
 
     @db_operation("update_task_2fa_state")
     async def update_task_2fa_state(
@@ -659,28 +794,45 @@ class TasksRepository(BaseRepository):
         task_ids: list[str],
         status: TaskStatus | None = None,
         failure_reason: str | None = None,
-    ) -> None:
+        only_if_status_in: list[TaskStatus] | None = None,
+    ) -> list[str]:
         """Bulk update tasks by their IDs.
 
         Args:
             task_ids: List of task IDs to update
             status: Optional status to set for all tasks
             failure_reason: Optional failure reason to set for all tasks
+            only_if_status_in: Optional status whitelist used as a compare-and-set guard
+
+        Returns:
+            IDs of rows that matched the update. Callers that fan out side effects
+            (webhooks) must drive them from this list, not from `task_ids`, so a task
+            claimed by another sweeper is not acted on twice.
         """
         if not task_ids:
-            return
+            return []
 
         async with self.Session() as session:
-            update_values = {}
+            update_values: dict[str, Any] = {}
             if status:
                 update_values["status"] = status.value
+                if status.is_final():
+                    update_values["finished_at"] = func.coalesce(TaskModel.finished_at, naive_utc_now())
             if failure_reason:
                 update_values["failure_reason"] = failure_reason
 
-            if update_values:
-                update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids)).values(**update_values)
-                await session.execute(update_stmt)
-                await session.commit()
+            if not update_values:
+                return []
+
+            update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids))
+            if only_if_status_in is not None:
+                update_stmt = update_stmt.where(
+                    TaskModel.status.in_([eligible_status.value for eligible_status in only_if_status_in])
+                )
+            result = await session.execute(update_stmt.values(**update_values).returning(TaskModel.task_id))
+            updated_task_ids = list(result.scalars().all())
+            await session.commit()
+            return updated_task_ids
 
     @db_operation("bulk_update_tasks_by_workflow_run_ids")
     async def bulk_update_tasks_by_workflow_run_ids(

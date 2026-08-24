@@ -786,6 +786,105 @@ async def test_document_identity_source_degradation_fails_closed(
     click.assert_not_awaited()
 
 
+@pytest.mark.parametrize("detach_fails", [False, True], ids=["success", "detach-failure"])
+@pytest.mark.asyncio
+async def test_document_identity_failure_unpublishes_before_best_effort_detach(detach_fails: bool) -> None:
+    stale_cdp = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("stale CDP session")),
+        detach=AsyncMock(),
+    )
+    fresh_cdp = SimpleNamespace(
+        send=AsyncMock(return_value={"frameTree": {"frame": {"loaderId": "doc-2"}}}),
+        detach=AsyncMock(),
+    )
+    raw_page = SimpleNamespace(
+        context=SimpleNamespace(new_cdp_session=AsyncMock(return_value=fresh_cdp)),
+        _skyvern_observe_cdp_session=stale_cdp,
+    )
+    page = SimpleNamespace(
+        page=raw_page,
+        _working_frame=None,
+        evaluate=AsyncMock(side_effect=AssertionError("page fallback should not run")),
+    )
+    cached_during_detach: list[object | None] = []
+
+    async def detach_stale() -> None:
+        cached_during_detach.append(getattr(raw_page, "_skyvern_observe_cdp_session", None))
+        if detach_fails:
+            raise RuntimeError("detach failed")
+
+    stale_cdp.detach.side_effect = detach_stale
+
+    assert await browser_ops.get_observe_document_id(page) == "cdp:doc-2"
+
+    stale_cdp.detach.assert_awaited_once_with()
+    assert cached_during_detach == [None]
+    assert raw_page._skyvern_observe_cdp_session is fresh_cdp
+    fresh_cdp.detach.assert_not_awaited()
+    page.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_document_identity_failure_adopts_concurrent_replacement_during_detach() -> None:
+    detach_started = asyncio.Event()
+    release_detach = asyncio.Event()
+    fresh_used = asyncio.Event()
+    stale_cdp = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("stale CDP session")),
+        detach=AsyncMock(),
+    )
+
+    async def send_fresh(_method: str) -> dict[str, dict[str, dict[str, str]]]:
+        fresh_used.set()
+        return {"frameTree": {"frame": {"loaderId": "doc-2"}}}
+
+    fresh_cdp = SimpleNamespace(send=AsyncMock(side_effect=send_fresh), detach=AsyncMock())
+    extra_cdp = SimpleNamespace(
+        send=AsyncMock(return_value={"frameTree": {"frame": {"loaderId": "doc-3"}}}),
+        detach=AsyncMock(),
+    )
+    raw_page = SimpleNamespace(
+        context=SimpleNamespace(new_cdp_session=AsyncMock(side_effect=[fresh_cdp, extra_cdp])),
+        _skyvern_observe_cdp_session=stale_cdp,
+    )
+    page = SimpleNamespace(
+        page=raw_page,
+        _working_frame=None,
+        evaluate=AsyncMock(side_effect=AssertionError("page fallback should not run")),
+    )
+
+    async def block_detach() -> None:
+        detach_started.set()
+        await release_detach.wait()
+
+    stale_cdp.detach.side_effect = block_detach
+    first_observer = asyncio.create_task(browser_ops.get_observe_document_id(page))
+    concurrent_observer: asyncio.Task[str | None] | None = None
+
+    try:
+        await asyncio.wait_for(detach_started.wait(), timeout=1)
+        concurrent_observer = asyncio.create_task(browser_ops.get_observe_document_id(page))
+        await asyncio.wait_for(fresh_used.wait(), timeout=1)
+        concurrent_result = await concurrent_observer
+    finally:
+        release_detach.set()
+        pending = [first_observer]
+        if concurrent_observer is not None:
+            pending.append(concurrent_observer)
+        results = await asyncio.gather(*pending, return_exceptions=True)
+
+    assert concurrent_result == "cdp:doc-2"
+    assert results[0] == "cdp:doc-2"
+    assert raw_page._skyvern_observe_cdp_session is fresh_cdp
+    raw_page.context.new_cdp_session.assert_awaited_once_with(raw_page)
+    stale_cdp.send.assert_awaited_once_with("Page.getFrameTree")
+    stale_cdp.detach.assert_awaited_once_with()
+    assert fresh_cdp.send.await_count == 2
+    fresh_cdp.detach.assert_not_awaited()
+    extra_cdp.send.assert_not_awaited()
+    page.evaluate.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_targeted_refresh_replays_scope_and_preserves_unrelated_session_refs(
     monkeypatch: pytest.MonkeyPatch,
@@ -3117,3 +3216,37 @@ async def test_navigation_during_aria_attachment_check_discards_scoped_snapshot(
     assert automatic.await_args_list[2].kwargs.get("selector") is None
     # Only the unscoped snapshot of the new document is published.
     assert {element["selector"] for element in state._observe_v2_state.refs.values()} == {"#new-doc-unscoped"}
+
+
+def test_observe_v2_override_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The per-request rollout override (cloud org flag) beats the process env var."""
+    from skyvern.cli.core.browser_ops import (
+        observe_v2_enabled,
+        reset_observe_v2_override,
+        set_observe_v2_override,
+    )
+
+    monkeypatch.delenv(_FLAG, raising=False)
+    assert observe_v2_enabled() is False
+    token = set_observe_v2_override(True)
+    try:
+        assert observe_v2_enabled() is True
+    finally:
+        reset_observe_v2_override(token)
+    assert observe_v2_enabled() is False
+
+    monkeypatch.setenv(_FLAG, "1")
+    assert observe_v2_enabled() is True
+    token = set_observe_v2_override(False)
+    try:
+        assert observe_v2_enabled() is False
+    finally:
+        reset_observe_v2_override(token)
+    assert observe_v2_enabled() is True
+
+    # None means "no decision": env keeps authority.
+    token = set_observe_v2_override(None)
+    try:
+        assert observe_v2_enabled() is True
+    finally:
+        reset_observe_v2_override(token)

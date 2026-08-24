@@ -7,6 +7,8 @@ from fastapi import BackgroundTasks, HTTPException, status
 
 from skyvern.exceptions import RateLimitExceeded
 from skyvern.forge.sdk.routes import run_blocks as run_blocks_mod
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.schemas.credential_type import CredentialType
 from skyvern.schemas.run_blocks import DownloadFilesRequest, LoginRequest
 
@@ -53,12 +55,20 @@ ENDPOINTS = [
 ]
 
 
+def _caller(organization: SimpleNamespace) -> org_auth_service.CallerContext:
+    return org_auth_service.CallerContext(
+        organization=organization,
+        caller_id=organization.organization_id,
+        caller_type=CallerType.API_KEY,
+    )
+
+
 async def _invoke(handler_name: str, request_kwarg: str, request_obj: Any, organization: SimpleNamespace) -> Any:
     handler = getattr(run_blocks_mod, handler_name)
     return await handler(
         request=MagicMock(),
         background_tasks=BackgroundTasks(),
-        organization=organization,
+        caller=_caller(organization),
         **{request_kwarg: request_obj},
     )
 
@@ -74,7 +84,7 @@ async def test_task_endpoint_refuses_credit_exhausted_org(
         check=AsyncMock(
             side_effect=HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail="Credits exhausted. Enable overage or upgrade your plan.",
+                detail="Credits exhausted. Upgrade your plan in Billing.",
             )
         )
     )

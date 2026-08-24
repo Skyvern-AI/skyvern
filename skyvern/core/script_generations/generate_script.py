@@ -338,6 +338,7 @@ ACTION_MAP = {
     "upload_file": "upload_file",
     "select_option": "select_option",
     "goto": "goto",
+    "goto_url": "goto",
     "scroll": "scroll",
     "keypress": "keypress",
     "type": "type",
@@ -406,7 +407,7 @@ def _build_semantic_selector(act: dict[str, Any]) -> str | None:
     return None
 
 
-ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract"]
+ACTIONS_OPT_OUT_INTENTION_FOR_PROMPT = ["extract", "goto", "magic_link"]
 
 INDENT = " " * 4
 DOUBLE_INDENT = " " * 8
@@ -928,12 +929,14 @@ def _action_to_stmt(
             selector_emitted = True
 
     if method == "click":
+        click_context = act.get("click_context")
+        if not isinstance(click_context, dict):
+            click_context = {}
         if use_semantic_selectors:
             ai_mode = GENERATE_CODE_AI_MODE_FALLBACK if selector_emitted else GENERATE_CODE_AI_MODE_PROACTIVE
         else:
             ai_mode = GENERATE_CODE_AI_MODE_PROACTIVE
-            click_context = act.get("click_context")
-            if click_context and isinstance(click_context, dict) and click_context.get("single_option_click"):
+            if click_context.get("single_option_click"):
                 ai_mode = GENERATE_CODE_AI_MODE_FALLBACK
         args.append(
             cst.Arg(
@@ -945,6 +948,19 @@ def _action_to_stmt(
                 ),
             )
         )
+
+        desired_state = click_context.get("desired_state")
+        if isinstance(desired_state, bool):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("desired_state"),
+                    value=_value(desired_state),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     elif method == "hover":
         hold_seconds = act.get("hold_seconds")
         if hold_seconds and hold_seconds > 0:
@@ -1239,6 +1255,59 @@ def _action_to_stmt(
                     ),
                 )
             )
+    elif method == "goto":
+        if act.get("is_magic_link"):
+            # The recorded URL is single-use and already spent by replay time, so the cached
+            # script re-requests a link instead of navigating to the captured value.
+            method = "magic_link"
+            magic_link_identifier: cst.BaseExpression | None = None
+            if task.get("totp_identifier"):
+                magic_link_identifier = _value(task.get("totp_identifier"))
+            elif credential_key := pick_credential_root_for_block(
+                goal_template=goal_template,
+                credential_param_keys=credential_param_keys,
+            ):
+                magic_link_identifier = cst.Call(
+                    func=cst.Attribute(
+                        value=cst.Name("context"),
+                        attr=cst.Name("credential_totp_identifier"),
+                    ),
+                    args=[cst.Arg(value=_value(credential_key))],
+                )
+            if magic_link_identifier is not None:
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=magic_link_identifier,
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+            if task.get("totp_verification_url"):
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_url"),
+                        value=_value(task.get("totp_verification_url")),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
+        elif act.get("url"):
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name("url"),
+                    value=_value(act.get("url")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
+
     elif method == "extract":
         args.append(
             cst.Arg(
@@ -1924,6 +1993,24 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 last_line=cst.SimpleWhitespace(INDENT),
             ),
         ),
+    ]
+
+    for custom_smtp_field in ("custom_smtp_host", "custom_smtp_port", "custom_smtp_username", "custom_smtp_password"):
+        custom_smtp_value = block.get(custom_smtp_field)
+        if custom_smtp_value is None or custom_smtp_value == "":
+            continue
+        args.append(
+            cst.Arg(
+                keyword=cst.Name(custom_smtp_field),
+                value=_value(custom_smtp_value),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    args.append(
         cst.Arg(
             keyword=cst.Name("label"),
             value=_value(block.get("label", "")),
@@ -1931,8 +2018,8 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
                 indent=True,
             ),
             comma=cst.Comma(),
-        ),
-    ]
+        )
+    )
 
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("send_email")),
@@ -3349,13 +3436,20 @@ async def generate_workflow_script_python_code(
     task_v1_blocks = [block for block in blocks if block["block_type"] in SCRIPT_TASK_BLOCKS]
     task_v2_blocks = [block for block in blocks if block["block_type"] == "task_v2"]
 
-    def append_block_code(block_code: str) -> None:
+    # Source of the blocks this run actually generated, kept apart from blocks
+    # reused verbatim from the cache so the parameter-reference guard only sees
+    # code this run is responsible for (SKY-13946).
+    generated_block_code: list[str] = []
+
+    def append_block_code(block_code: str, *, carried_forward: bool = False) -> None:
         nonlocal block_fns
         parsed = cst.parse_module(block_code)
         if block_fns:
             block_fns.append(cst.EmptyLine())
             block_fns.append(cst.EmptyLine())
         block_fns.extend(parsed.body)
+        if not carried_forward:
+            generated_block_code.append(block_code)
 
     # Handle task v1 blocks (excluding child blocks of task_v2)
     for idx, task in enumerate(task_v1_blocks):
@@ -3440,7 +3534,7 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
-        append_block_code(block_code)
+        append_block_code(block_code, carried_forward=use_cached)
 
     # Handle task_v2 blocks
     for task_v2 in task_v2_blocks:
@@ -3526,7 +3620,7 @@ async def generate_workflow_script_python_code(
             else:
                 blocks_failed += 1
 
-        append_block_code(block_code)
+        append_block_code(block_code, carried_forward=use_cached)
 
     # Handle for_loop and while_loop blocks
     _SCRIPT_LOOP_BUILDERS: list[tuple[str, Callable[[str, dict[str, Any]], cst.For]]] = [
@@ -3739,7 +3833,7 @@ async def generate_workflow_script_python_code(
                     else:
                         blocks_failed += 1
 
-                append_block_code(inner_block_code)
+                append_block_code(inner_block_code, carried_forward=use_inner_cached)
 
     # --- agent-required blocks (adaptive caching) -----------------------
     # Structural blocks (conditional, text_prompt, wait) can't be code-generated
@@ -3773,7 +3867,7 @@ async def generate_workflow_script_python_code(
                         blocks_created += 1
                     else:
                         blocks_failed += 1
-                    append_block_code(cached_source.code)
+                    append_block_code(cached_source.code, carried_forward=True)
             else:
                 # Create a requires_agent entry (no code, no run_signature)
                 placeholder_code = f"# Block '{arb_label}' ({arb['block_type']}) — executed via agent"
@@ -3867,7 +3961,7 @@ async def generate_workflow_script_python_code(
         if _is_inline_only_loop_cached_code(cached_source.code):
             continue
 
-        append_block_code(cached_source.code)
+        append_block_code(cached_source.code, carried_forward=True)
         preserved_count += 1
 
     if preserved_count > 0:
@@ -3955,10 +4049,18 @@ async def generate_workflow_script_python_code(
     # violation, preventing phantom-parameter scripts from being cached.
     # Phase 1 (now in prod) logged warnings; 13 violations in 7 days confirmed
     # the bug is real and low-frequency (~0.05%), safe to enforce.
+    #
+    # SKY-13946: only the code this run generated is in scope. Blocks reused
+    # verbatim from the cache were validated when they were generated, and the
+    # schema this run synthesizes is derived from this run's actions — so a
+    # reference inside a carried-forward block can never enter the valid-keys
+    # set no matter how legitimate it is, and enforcing against it fails codegen
+    # on every replay with no path to recovery.
     try:
+        guarded_source = "\n".join([cst.Module(body=start_block_body).code, *generated_block_code])
         synthesized_keys = _collect_synthesized_field_keys(generated_schema)
         guard_result = validate_context_parameter_refs(
-            code=source_code,
+            code=guarded_source,
             declared_param_keys=declared_keys,
             upstream_schema_keys=upstream_keys,
             synthesized_keys=synthesized_keys,

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
@@ -288,6 +289,8 @@ async def test_owned_and_running_returns_id(monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.mark.asyncio
 async def test_db_exception_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ownership fails closed, unlike liveness: an org/workflow binding that could not be confirmed
+    is never reused, while a liveness lookup that could not complete keeps the session."""
     monkeypatch.setattr(
         app.DATABASE,
         "debug",
@@ -346,3 +349,71 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
     assert result is None
     assert ctx.browser_session_id == "pbs_fresh"
     create_session_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_liveness_lookup_failure_keeps_the_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ownership is established, so a liveness lookup that could not complete is not evidence
+    the browser is gone. Returning None here is what discarded a healthy session under pool
+    exhaustion, before ensure_browser_session ever got to classify it."""
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=SQLATimeoutError("QueuePool limit of size 20 overflow 20 reached")),
+    )
+
+    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+
+    assert result == "pbs_live"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_health_signal_keeps_the_session_at_the_first_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered-state check feeds this gate's liveness decision. Collapsing an unavailable
+    connectivity signal to "not usable" discards an owned, running session before the probe runs."""
+
+    class _RaisingBrowser:
+        def is_connected(self) -> bool:
+            raise ConnectionError("cdp endpoint unreachable")
+
+    class _RaisingContext:
+        def __init__(self) -> None:
+            self.browser = _RaisingBrowser()
+            self._impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(return_value=_session(status="running", browser_address=None)),
+    )
+    monkeypatch.setattr(
+        app.PERSISTENT_SESSIONS_MANAGER,
+        "can_probe_registered_browser_state",
+        lambda: True,
+    )
+    state = SimpleNamespace(browser_context=_RaisingContext())
+    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "get_browser_state", AsyncMock(return_value=state))
+
+    result = await _resolve_live_browser_session_id(_request(browser_session_id="pbs_live"), organization_id="org-1")
+
+    assert result == "pbs_live"

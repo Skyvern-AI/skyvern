@@ -76,13 +76,19 @@ async function renderInputHook() {
   });
 }
 
-async function renderControllingInputHook() {
+async function renderControllingInputHook(
+  clipboardCallbacks: {
+    onClipboardPaste?: (text: string) => void;
+    onClipboardCopy?: () => void;
+  } = {},
+) {
   const { result } = renderHook(() =>
     useCdpInput({
       inputWsUrl: "wss://input.test",
       interactive: true,
       viewportWidth: 1280,
       viewportHeight: 720,
+      ...clipboardCallbacks,
     }),
   );
 
@@ -96,21 +102,63 @@ async function renderControllingInputHook() {
   return result;
 }
 
+async function renderWheelInputHook() {
+  const hook = renderHook(() =>
+    useCdpInput({
+      inputWsUrl: "wss://input.test",
+      interactive: true,
+      viewportWidth: 1280,
+      viewportHeight: 720,
+    }),
+  );
+
+  await act(async () => {
+    await Promise.resolve();
+  });
+
+  const container = document.createElement("div");
+  const image = document.createElement("img");
+  vi.spyOn(image, "getBoundingClientRect").mockReturnValue({
+    x: 0,
+    y: 0,
+    top: 0,
+    right: 1280,
+    bottom: 720,
+    left: 0,
+    width: 1280,
+    height: 720,
+    toJSON: () => ({}),
+  });
+  container.appendChild(image);
+  Object.defineProperty(hook.result.current.containerRef, "current", {
+    configurable: true,
+    value: container,
+  });
+
+  act(() => {
+    hook.result.current.setUserIsControlling(true);
+  });
+  latestSocketSend().mockClear();
+
+  return { ...hook, container };
+}
+
 function fakeKeyboardEvent(
   key: string,
   code: string,
-  overrides: Partial<React.KeyboardEvent> = {},
+  modifiers: Partial<
+    Pick<React.KeyboardEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey">
+  > = {},
 ): React.KeyboardEvent {
   return {
     key,
     code,
-    altKey: false,
-    ctrlKey: false,
-    metaKey: false,
-    shiftKey: false,
+    altKey: modifiers.altKey ?? false,
+    ctrlKey: modifiers.ctrlKey ?? false,
+    metaKey: modifiers.metaKey ?? false,
+    shiftKey: modifiers.shiftKey ?? false,
     preventDefault: vi.fn(),
     stopPropagation: vi.fn(),
-    ...overrides,
   } as unknown as React.KeyboardEvent;
 }
 
@@ -188,6 +236,30 @@ describe("useCdpInput reconnects", () => {
     expect(MockWebSocket.instances).toHaveLength(2);
   });
 
+  it("requires and sends a fresh take-control after reconnect", async () => {
+    const result = await renderControllingInputHook();
+    const firstSocket = MockWebSocket.instances[0]!;
+    expect(firstSocket.send).toHaveBeenCalledWith(
+      JSON.stringify({ kind: "take-control" }),
+    );
+
+    closeLatestSocket(4411);
+    await advanceReconnectDelay();
+    const reconnectedSocket = MockWebSocket.instances[1]!;
+    act(() => {
+      reconnectedSocket.emitMessage(JSON.stringify({ kind: "ready" }));
+    });
+    expect(result.current.userIsControlling).toBe(false);
+
+    reconnectedSocket.send.mockClear();
+    act(() => {
+      result.current.setUserIsControlling(true);
+    });
+    expect(reconnectedSocket.send).toHaveBeenCalledWith(
+      JSON.stringify({ kind: "take-control" }),
+    );
+  });
+
   it("does not reconnect after a normal close", async () => {
     await renderInputHook();
     expect(MockWebSocket.instances).toHaveLength(1);
@@ -213,6 +285,118 @@ describe("useCdpInput reconnects", () => {
     await advanceReconnectDelay();
 
     expect(MockWebSocket.instances).toHaveLength(6);
+  });
+
+  it("resets its five-attempt budget only after the fresh socket is ready", async () => {
+    await renderInputHook();
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      closeLatestSocket(4410);
+      await advanceReconnectDelay();
+    }
+    expect(MockWebSocket.instances).toHaveLength(5);
+
+    act(() => {
+      MockWebSocket.instances[MockWebSocket.instances.length - 1]!.emitMessage(
+        JSON.stringify({ kind: "ready" }),
+      );
+    });
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      closeLatestSocket(4410);
+      await advanceReconnectDelay();
+    }
+    expect(MockWebSocket.instances).toHaveLength(10);
+
+    closeLatestSocket(4410);
+    await advanceReconnectDelay();
+    expect(MockWebSocket.instances).toHaveLength(10);
+  });
+});
+
+describe("useCdpInput wheel handling", () => {
+  let animationFrameCallback: FrameRequestCallback | undefined;
+  let nextAnimationFrameId: number;
+  let requestAnimationFrame: ReturnType<typeof vi.fn>;
+  let cancelAnimationFrame: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    nextAnimationFrameId = 1;
+    requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+      animationFrameCallback = callback;
+      return nextAnimationFrameId++;
+    });
+    vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
+    cancelAnimationFrame = vi.fn();
+    vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("coalesces wheel events within one animation frame", async () => {
+    const { container } = await renderWheelInputHook();
+    expect(requestAnimationFrame).not.toHaveBeenCalled();
+    const first = new WheelEvent("wheel", {
+      clientX: 100,
+      clientY: 200,
+      deltaX: 1.2,
+      deltaY: 2.4,
+      ctrlKey: true,
+      cancelable: true,
+    });
+    const second = new WheelEvent("wheel", {
+      clientX: 300,
+      clientY: 400,
+      deltaX: 2.4,
+      deltaY: 3.2,
+      shiftKey: true,
+      cancelable: true,
+    });
+
+    container.dispatchEvent(first);
+    container.dispatchEvent(second);
+
+    expect(first.defaultPrevented).toBe(true);
+    expect(second.defaultPrevented).toBe(true);
+    expect(requestAnimationFrame).toHaveBeenCalledOnce();
+    expect(latestSocketSend()).not.toHaveBeenCalled();
+
+    act(() => {
+      animationFrameCallback?.(16);
+    });
+
+    expect(latestSocketSend()).toHaveBeenCalledOnce();
+    expect(latestSocketSend()).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "wheelEvent",
+        x: 300,
+        y: 400,
+        deltaX: 4,
+        deltaY: 6,
+        modifiers: 8,
+      }),
+    );
+    expect(requestAnimationFrame).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a pending wheel animation frame on cleanup", async () => {
+    const { container, unmount } = await renderWheelInputHook();
+    container.dispatchEvent(
+      new WheelEvent("wheel", {
+        clientX: 100,
+        clientY: 200,
+        deltaY: 1,
+        cancelable: true,
+      }),
+    );
+
+    unmount();
+
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
   });
 });
 
@@ -514,7 +698,7 @@ describe("useCdpInput key handling", () => {
     );
   });
 
-  it("copies the remote selection to the local clipboard for Command+C", async () => {
+  it("copies through direct CDP when no recording callback is present", async () => {
     const result = await renderControllingInputHook();
 
     act(() => {
@@ -537,8 +721,26 @@ describe("useCdpInput key handling", () => {
     expect(mocks.copyText).toHaveBeenCalledWith("selected remotely");
   });
 
-  it("inserts text from a local paste event without sending Command+V", async () => {
+  it("copies through the recording callback when one is present", async () => {
+    const onClipboardCopy = vi.fn();
+    const result = await renderControllingInputHook({ onClipboardCopy });
+    const send = latestSocketSend();
+    send.mockClear();
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("c", "KeyC", { metaKey: true }),
+      );
+    });
+
+    expect(onClipboardCopy).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("inserts text from a local paste event when no recording callback is present", async () => {
     const result = await renderControllingInputHook();
+    const send = latestSocketSend();
+    send.mockClear();
     const keyDown = fakeKeyboardEvent("v", "KeyV", { metaKey: true });
 
     act(() => {
@@ -556,7 +758,8 @@ describe("useCdpInput key handling", () => {
       result.current.handlers.handlePaste(pasteEvent);
     });
 
-    expect(latestSocketSend()).toHaveBeenLastCalledWith(
+    expect(keyDown.preventDefault).not.toHaveBeenCalled();
+    expect(send).toHaveBeenLastCalledWith(
       JSON.stringify({ type: "insertText", text: "pasted locally" }),
     );
     expect(pasteEvent.preventDefault).toHaveBeenCalled();
@@ -604,6 +807,105 @@ describe("useCdpInput key handling", () => {
         modifiers: 0,
       }),
     );
+  });
+
+  it("sends Cmd+V through the recording message callback instead of CDP key events", async () => {
+    const onClipboardPaste = vi.fn();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: vi.fn(async () => "clipboard text") },
+    });
+    const result = await renderControllingInputHook({ onClipboardPaste });
+    const send = latestSocketSend();
+    send.mockClear();
+    const keyDown = fakeKeyboardEvent("v", "KeyV", { metaKey: true });
+    const keyUp = fakeKeyboardEvent("v", "KeyV");
+
+    await act(async () => {
+      result.current.handlers.handleKeyDown(keyDown);
+      await Promise.resolve();
+      result.current.handlers.handleKeyUp(keyUp);
+    });
+
+    expect(onClipboardPaste).toHaveBeenCalledWith("clipboard text");
+    expect(send).not.toHaveBeenCalled();
+    expect(keyDown.preventDefault).toHaveBeenCalled();
+    expect(keyUp.preventDefault).toHaveBeenCalled();
+  });
+
+  it("drops a clipboard read that resolves after recording callbacks are removed", async () => {
+    let resolveClipboard: ((text: string) => void) | undefined;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: vi.fn(
+          () =>
+            new Promise<string>((resolve) => {
+              resolveClipboard = resolve;
+            }),
+        ),
+      },
+    });
+    const onClipboardPaste = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ paste }: { paste?: (text: string) => void }) =>
+        useCdpInput({
+          inputWsUrl: "wss://input.test",
+          interactive: true,
+          viewportWidth: 1280,
+          viewportHeight: 720,
+          onClipboardPaste: paste,
+        }),
+      {
+        initialProps: {
+          paste: onClipboardPaste as ((text: string) => void) | undefined,
+        },
+      },
+    );
+    await act(async () => Promise.resolve());
+    act(() => result.current.setUserIsControlling(true));
+
+    act(() => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("v", "KeyV", { metaKey: true }),
+      );
+    });
+    rerender({ paste: undefined });
+    await act(async () => {
+      resolveClipboard?.("late clipboard text");
+      await Promise.resolve();
+    });
+
+    expect(onClipboardPaste).not.toHaveBeenCalled();
+  });
+
+  it("forwards an ordinary key pair after intercepting a clipboard chord", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: vi.fn(async () => "clipboard text") },
+    });
+    const result = await renderControllingInputHook({
+      onClipboardPaste: vi.fn(),
+    });
+    const send = latestSocketSend();
+    send.mockClear();
+
+    await act(async () => {
+      result.current.handlers.handleKeyDown(
+        fakeKeyboardEvent("v", "KeyV", { metaKey: true }),
+      );
+      await Promise.resolve();
+      result.current.handlers.handleKeyUp(fakeKeyboardEvent("v", "KeyV"));
+    });
+    act(() => {
+      result.current.handlers.handleKeyDown(fakeKeyboardEvent("v", "KeyV"));
+      result.current.handlers.handleKeyUp(fakeKeyboardEvent("v", "KeyV"));
+    });
+
+    expect(send.mock.calls.map((call) => JSON.parse(String(call[0])))).toEqual([
+      expect.objectContaining({ eventType: "keyDown", code: "KeyV" }),
+      expect.objectContaining({ eventType: "keyUp", code: "KeyV" }),
+    ]);
   });
 });
 

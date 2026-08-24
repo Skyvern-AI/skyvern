@@ -10,7 +10,11 @@ import { PostHogContext } from "posthog-js/react";
 import type { PostHog } from "posthog-js";
 
 import { BlockActionContext } from "@/store/BlockActionContext";
-import { DebugStoreProvider } from "@/store/DebugStoreContext";
+import {
+  DebugStoreContext,
+  DebugStoreProvider,
+  type DebugStoreContextType,
+} from "@/store/DebugStoreContext";
 
 import { NodeHeader } from "./NodeHeader";
 
@@ -37,7 +41,20 @@ const blockActionStub = {
   toggleScriptForNodeCallback: () => {},
 };
 
-function renderNodeHeader(props: Partial<ComponentProps<typeof NodeHeader>>) {
+function renderNodeHeader(
+  props: Partial<ComponentProps<typeof NodeHeader>>,
+  // The Play control only mounts under debug mode / block runs, so a test that
+  // needs it injects the store rather than driving the flag hooks.
+  debugStore?: DebugStoreContextType,
+) {
+  const DebugWrapper = ({ children }: { children: React.ReactNode }) =>
+    debugStore ? (
+      <DebugStoreContext.Provider value={debugStore}>
+        {children}
+      </DebugStoreContext.Provider>
+    ) : (
+      <DebugStoreProvider>{children}</DebugStoreProvider>
+    );
   return render(
     <QueryClientProvider client={queryClient}>
       <PostHogContext.Provider
@@ -50,7 +67,7 @@ function renderNodeHeader(props: Partial<ComponentProps<typeof NodeHeader>>) {
               element={
                 <ReactFlowProvider>
                   <BlockActionContext.Provider value={blockActionStub}>
-                    <DebugStoreProvider>
+                    <DebugWrapper>
                       <NodeHeader
                         blockLabel="block_1"
                         editable
@@ -60,7 +77,7 @@ function renderNodeHeader(props: Partial<ComponentProps<typeof NodeHeader>>) {
                         type="code"
                         {...props}
                       />
-                    </DebugStoreProvider>
+                    </DebugWrapper>
                   </BlockActionContext.Provider>
                 </ReactFlowProvider>
               }
@@ -102,5 +119,27 @@ describe("NodeHeader icon/title regressions (SKY-11885 / SKY-11887)", () => {
     expect(input.className).toContain("relative");
     expect(input.className).toContain("-left-1");
     expect(input.className).not.toMatch(/-mx-/);
+  });
+});
+
+describe("NodeHeader block controls are named (SKY-12995)", () => {
+  test("the ⋯ block-actions trigger is a real, labelled button rather than a bare icon", () => {
+    renderNodeHeader({ blockLabel: "block_1" });
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    expect(trigger.tagName).toBe("BUTTON");
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+  });
+
+  // The click handler early-returns on the full inert set, so any inert state
+  // the `disabled` attribute misses is a control that still takes focus and
+  // announces as enabled while doing nothing (WCAG 4.1.2). No debug session
+  // resolves in jsdom, which is one of those states.
+  test("the Play control is disabled — not merely dimmed — while running the block would be a no-op", () => {
+    renderNodeHeader(
+      { blockLabel: "block_1" },
+      { isDebugMode: true, blockRunsEnabled: false },
+    );
+    const play = screen.getByRole("button", { name: "Run this block" });
+    expect((play as HTMLButtonElement).disabled).toBe(true);
   });
 });

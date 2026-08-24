@@ -281,6 +281,17 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "prompt": "Split this combined PDF into one file per document; name each by document type.",
         "parameter_keys": ["source_pdf_output"],
     },
+    "human_interaction": {
+        "block_type": "human_interaction",
+        "label": "approve_order",
+        "timeout_seconds": 3600,
+        "recipients": ["ops@example.com"],
+        "subject": "Approval needed before the order is submitted",
+        "body": "A workflow run is paused and needs someone to approve the order before it is submitted.",
+        "instructions": "Review the order total and line items, then approve to submit or reject to cancel the run.",
+        "positive_descriptor": "Approve order",
+        "negative_descriptor": "Cancel",
+    },
     "google_sheets_read": {
         "block_type": "google_sheets_read",
         "label": "read_sheet_data",
@@ -318,7 +329,90 @@ _KB_PATH = Path(__file__).resolve().parents[2] / "forge" / "prompts" / "skyvern"
 
 _HEADER_RE = re.compile(r"^\*\*\s+(.+?)\s+\((\w+)\)\s+\*\*$")
 
+WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
+    "workflow_structure_overview": "** WORKFLOW STRUCTURE OVERVIEW **",
+    "workflow_parameters": "** WORKFLOW PARAMETERS **",
+    "common_block_fields": "** COMMON BLOCK FIELDS **",
+    "choosing_a_block": "** CHOOSING A BLOCK (use the most specific block that fits the step) **",
+    "navigation_block": "** NAVIGATION BLOCK (navigation) **",
+    "url_block": "** URL BLOCK (goto_url) **",
+    "action_block": "** ACTION BLOCK (action) **",
+    "task_block_task_not_available_in_workflow_copilot": (
+        "** TASK BLOCK (task) — NOT AVAILABLE IN WORKFLOW COPILOT **"
+    ),
+    "task_v2_block_task_v2_deprecated": "** TASK V2 BLOCK (task_v2) — DEPRECATED **",
+    "for_loop_block": "** FOR LOOP BLOCK (for_loop) **",
+    "while_loop_block": "** WHILE LOOP BLOCK (while_loop) **",
+    "conditional_block": "** CONDITIONAL BLOCK (conditional) **",
+    "login_block": "** LOGIN BLOCK (login) **",
+    "validation_block": "** VALIDATION BLOCK (validation) **",
+    "wait_block": "** WAIT BLOCK (wait) **",
+    "extraction_block": "** EXTRACTION BLOCK (extraction) **",
+    "file_download_block": "** FILE DOWNLOAD BLOCK (file_download) **",
+    "cloud_storage_block": "** CLOUD STORAGE BLOCK (file_upload) **",
+    "file_parser_block": "** FILE PARSER BLOCK (file_url_parser) **",
+    "send_email_block": "** SEND EMAIL BLOCK (send_email) **",
+    "human_interaction_block": "** HUMAN INTERACTION BLOCK (human_interaction) **",
+    "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
+    "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
+    "parameter_templating": "** PARAMETER TEMPLATING **",
+    "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
+    "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",
+    "best_practices": "** BEST PRACTICES **",
+    "common_patterns": "** COMMON PATTERNS **",
+    "validation_rules": "** VALIDATION RULES **",
+    "complete_workflow_example": "** COMPLETE WORKFLOW EXAMPLE **",
+}
+
 _kb_cache: dict[str, dict[str, Any]] | None = None
+_knowledge_topic_cache: dict[str, dict[str, str]] | None = None
+
+
+def _parse_knowledge_topics() -> dict[str, dict[str, str]]:
+    """Index the knowledge document by its authored top-level sections."""
+    global _knowledge_topic_cache
+    if _knowledge_topic_cache is not None:
+        return _knowledge_topic_cache
+
+    try:
+        text = _KB_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        LOG.warning("workflow_knowledge_base_not_found", path=str(_KB_PATH))
+        _knowledge_topic_cache = {}
+        return _knowledge_topic_cache
+
+    topics: dict[str, dict[str, str]] = {}
+    header_to_topic = {header: topic for topic, header in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS.items()}
+    current_topic: str | None = None
+    current_lines: list[str] = []
+
+    def store_current() -> None:
+        if current_topic is None:
+            return
+        header = WORKFLOW_KNOWLEDGE_TOPIC_HEADERS[current_topic]
+        topics[current_topic] = {
+            "topic": current_topic,
+            "title": header.removeprefix("** ").removesuffix(" **"),
+            "content": "\n".join(current_lines).strip(),
+        }
+
+    for line in text.splitlines():
+        next_topic = header_to_topic.get(line.strip())
+        if next_topic is not None:
+            store_current()
+            current_topic = next_topic
+            current_lines = [line]
+        elif current_topic is not None:
+            current_lines.append(line)
+    store_current()
+
+    missing_topics = set(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS).difference(topics)
+    if missing_topics:
+        LOG.error("workflow_knowledge_topics_missing", topics=sorted(missing_topics), path=str(_KB_PATH))
+        topics = {}
+
+    _knowledge_topic_cache = topics
+    return topics
 
 
 def _parse_knowledge_base() -> dict[str, dict[str, Any]]:
@@ -403,6 +497,72 @@ def _parse_knowledge_base() -> dict[str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Tool
 # ---------------------------------------------------------------------------
+
+
+async def skyvern_workflow_knowledge(
+    topics: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
+                "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
+                "common_patterns, and best_practices."
+            )
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    """Read authoritative Skyvern workflow concepts and authoring guidance.
+
+    Use this before answering questions about workflow structure, parameters, execution,
+    authoring patterns, or block selection. Omit topics to discover every available topic ID.
+    For exact fields of a specific block type, use skyvern_block_schema instead.
+    """
+
+    action = "skyvern_workflow_knowledge"
+    knowledge = _parse_knowledge_topics()
+    catalog = list(knowledge)
+    if not catalog:
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.SDK_ERROR,
+                "Workflow knowledge is unavailable.",
+                "Use get_block_schema for exact block fields and retry workflow knowledge later.",
+            ),
+        )
+
+    if topics is None:
+        return make_result(action, data={"topics": catalog, "count": len(catalog)})
+
+    if not topics:
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "At least one workflow knowledge topic is required.",
+                "Omit topics to list the available catalog.",
+            ),
+        )
+
+    requested = list(dict.fromkeys(topic.strip().lower() for topic in topics))
+    unknown = [topic for topic in requested if topic not in knowledge]
+    if unknown:
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Unknown workflow knowledge topic(s): {', '.join(unknown)}",
+                f"Available topics: {', '.join(catalog)}",
+            ),
+        )
+
+    return make_result(
+        action,
+        data={"sections": {topic: knowledge[topic] for topic in requested}},
+    )
 
 
 async def skyvern_block_schema(

@@ -8,10 +8,12 @@ the same backend api instance. This is because the two registries here are
 tied together via a `client_id` string.
 
 The tale-of-the-tape is this:
-  - frontend app requires two different channels (WS connections) to the backend api
+  - legacy VNC viewers open two paired channels (WS connections) to the backend api
     - one dedicated to streaming VNC's RFB protocol
     - the other dedicated to messaging (JSON)
-  - both of these channels are stateful and need to coordinate with one another
+  - the CDP Record Browser path opens only the Message channel here; frames and
+    user-event capture ride CDP (screencast + ExfiltrationChannel) instead of VNC
+  - stateful channels sharing a `client_id` need to coordinate with one another
 
 Additionally, this module manages:
   - CDP input channels for interactive browser control
@@ -245,6 +247,18 @@ async def stream_ref_dec(workflow_run_id: str) -> None:
 
 def stream_ref_active(workflow_run_id: str) -> bool:
     return _stream_refcounts.get(workflow_run_id, 0) > 0
+
+
+def stream_tombstone_holds_session_lease(workflow_run_id: str, browser_session_id: str) -> bool:
+    """Whether workflow cleanup still owns its persistent-session lease.
+
+    The closing tombstone is installed before terminal status publication and before cleanup can
+    populate deferred-close parameters. Therefore its presence alone holds the run's lease until
+    ``complete_stream_teardown`` removes it. ``browser_session_id`` remains in the public contract
+    because trusted release supplies both owner identities.
+    """
+    _ = browser_session_id
+    return workflow_run_id in _closing_streams
 
 
 def set_deferred_close_params(

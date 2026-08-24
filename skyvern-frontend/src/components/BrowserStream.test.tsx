@@ -7,9 +7,11 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BrowserStream } from "./BrowserStream";
+import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
 
 const mocks = vi.hoisted(() => {
   type RfbListener = (event: { detail?: unknown }) => void;
@@ -20,6 +22,7 @@ const mocks = vi.hoisted(() => {
     disconnect: ReturnType<typeof vi.fn>;
     _framebufferUpdate: () => boolean;
   }> = [];
+  const autoConnect = { value: true };
   const apiGet = vi.fn(async () => ({
     data: {
       browser_session_id: "pbs_test",
@@ -27,6 +30,8 @@ const mocks = vi.hoisted(() => {
       browser_address: "ws://browser.test",
       started_at: "2026-01-01T00:00:00Z",
       completed_at: null,
+      stream_transport: "vnc",
+      vnc_streaming_supported: true,
     },
   }));
 
@@ -42,7 +47,9 @@ const mocks = vi.hoisted(() => {
     constructor(target: HTMLElement) {
       rfbInstances.push(this);
       target.appendChild(document.createElement("canvas"));
-      queueMicrotask(() => this.emit("connect"));
+      if (autoConnect.value) {
+        queueMicrotask(() => this.emit("connect"));
+      }
     }
 
     addEventListener(type: string, listener: RfbListener) {
@@ -98,6 +105,7 @@ const mocks = vi.hoisted(() => {
     MockRFB,
     MockWebSocket,
     apiGet,
+    autoConnect,
     rfbInstances,
     recordingStore,
     settingsStore,
@@ -115,6 +123,62 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => async () => null,
+}));
+
+vi.mock("@/hooks/useRuntimeConfig", () => ({
+  resolveStreamTransport: (
+    globalMode: string,
+    sessionTransport: string | null | undefined,
+  ) => sessionTransport ?? globalMode,
+  useBrowserStreamingMode: () => ({ browserStreamingMode: "vnc" }),
+}));
+
+vi.mock(
+  "@/routes/browserSessions/hooks/useCloseBrowserSessionMutation",
+  () => ({
+    useCloseBrowserSessionMutation: () => ({
+      isPending: false,
+      mutate: vi.fn(),
+    }),
+  }),
+);
+vi.mock(
+  "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate",
+  () => ({
+    useBackgroundBrowserProfileCreate: () => ({
+      startBackgroundCreate: vi.fn(),
+    }),
+  }),
+);
+vi.mock("@/routes/workflows/editor/Workspace", () => ({
+  CopyText: () => null,
+}));
+vi.mock("@/components/ui/toaster", () => ({ Toaster: () => null }));
+vi.mock("@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog", () => ({
+  SaveSessionAsBrowserProfileDialog: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionDownloads", () => ({
+  BrowserSessionDownloads: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionOccupiedBy", () => ({
+  BrowserSessionOccupiedBy: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionVideo", () => ({
+  BrowserSessionVideo: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionTimeline", () => ({
+  BrowserSessionTimeline: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionWorkflowRuns", () => ({
+  BrowserSessionWorkflowRuns: () => null,
+}));
+vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
+  BrowserSessionStream: ({ forceCdp }: { forceCdp?: boolean }) => (
+    <div
+      data-force-cdp={forceCdp ? "true" : "false"}
+      data-testid="cdp-screencast"
+    />
+  ),
 }));
 
 vi.mock("@/store/useClientIdStore", () => ({
@@ -188,8 +252,28 @@ function renderWithRecordingReset(
   return render(strict ? <StrictMode>{tree}</StrictMode> : tree);
 }
 
+function renderBrowserSession() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/browser-sessions/pbs_test/stream"]}>
+        <Routes>
+          <Route
+            path="/browser-sessions/:browserSessionId/*"
+            element={<BrowserSession />}
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
 describe("BrowserStream", () => {
   beforeEach(() => {
+    mocks.autoConnect.value = true;
     Object.defineProperty(globalThis, "WebSocket", {
       configurable: true,
       value: mocks.MockWebSocket,
@@ -485,6 +569,26 @@ describe("BrowserStream", () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
 
+  it("takes control on a click anywhere on the read-only picture, not just the button", async () => {
+    const { container } = renderBrowserStream();
+    await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream")!;
+    expect(stream.classList.contains("user-is-controlling")).toBe(false);
+
+    fireEvent.click(screen.getByTestId("browser-stream-overlay"));
+
+    expect(stream.classList.contains("user-is-controlling")).toBe(true);
+    expect(
+      screen
+        .getByTestId("browser-stream-overlay")
+        .classList.contains("can-take-control"),
+    ).toBe(false);
+  });
+
   it("notifies activity after a VNC framebuffer update completes", async () => {
     const onActivity = vi.fn();
 
@@ -499,6 +603,27 @@ describe("BrowserStream", () => {
     expect(onActivity).toHaveBeenCalledTimes(1);
   });
 
+  it("falls back to CDP when VNC disconnects before the handshake", async () => {
+    mocks.autoConnect.value = false;
+
+    renderBrowserSession();
+
+    await waitFor(() => {
+      expect(mocks.rfbInstances).toHaveLength(1);
+    });
+
+    const rfb = mocks.rfbInstances[0] as unknown as {
+      emit: (type: string, detail?: unknown) => void;
+    };
+    rfb.emit("disconnect", { clean: false });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("cdp-screencast").getAttribute("data-force-cdp"),
+      ).toBe("true");
+    });
+  });
+
   it("shows a two-sentence message on an unclean VNC disconnect", async () => {
     renderBrowserStream();
 
@@ -509,6 +634,10 @@ describe("BrowserStream", () => {
     const rfb = mocks.rfbInstances[0] as unknown as {
       emit: (type: string, detail?: unknown) => void;
     };
+    await waitFor(() => {
+      expect(mocks.settingsStore.setIsUsingABrowser).toHaveBeenCalledWith(true);
+    });
+    mocks.autoConnect.value = false;
     rfb.emit("disconnect", { clean: false });
 
     // The component reconnects after a disconnect, which flips isReady back

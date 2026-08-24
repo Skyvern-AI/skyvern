@@ -30,6 +30,8 @@ export const OPS = Object.freeze({
 
 export const EVENTS = Object.freeze({
   EXTENSION_HELLO: "extension.hello",
+  PAIRING_APPROVED: "pairing.approved",
+  PAIRING_APPROVED_ACK: "pairing.approved_ack",
   DEBUGGER_EVENT: "debugger.event",
   DEBUGGER_DETACHED: "debugger.detached",
   SCOPE_TAB_ADDED: "scope.tabAdded",
@@ -43,9 +45,11 @@ export const ERROR_CODES = Object.freeze({
   TAB_NOT_FOUND: "TAB_NOT_FOUND",
   TAB_NOT_SCOPED: "TAB_NOT_SCOPED",
   RESTRICTED_URL: "RESTRICTED_URL",
+  ATTACH_FAILED: "ATTACH_FAILED",
   DEBUGGER_DETACHED: "DEBUGGER_DETACHED",
   CDP_METHOD_NOT_ALLOWED: "CDP_METHOD_NOT_ALLOWED",
   CDP_ERROR: "CDP_ERROR",
+  COMMAND_TIMEOUT: "COMMAND_TIMEOUT",
   INTERNAL: "INTERNAL",
 });
 

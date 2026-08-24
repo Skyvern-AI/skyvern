@@ -14,9 +14,18 @@ export type OnboardingState = {
   seen_hint_template?: boolean | null;
 };
 
+export type RecoveryGuidanceAssignment = {
+  experiment_version: string;
+  organization_id: string;
+  eligible_run_id: string;
+  eligible_at: string;
+  arm: "control" | "treatment";
+};
+
 export type OnboardingStateResponse = {
   onboarding_state: OnboardingState;
   launch_date_at_signup: string | null;
+  recovery_guidance_assignment: RecoveryGuidanceAssignment | null;
 };
 
 export type OnboardingStatePatch = Partial<OnboardingState>;

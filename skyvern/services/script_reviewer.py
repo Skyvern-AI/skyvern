@@ -1978,7 +1978,9 @@ class ScriptReviewer:
     # Anything not in the set triggers a retry so the LLM fixes its code.
     _METHOD_KWARGS: dict[str, frozenset[str]] = {
         "classify": frozenset({"options", "url_patterns", "text_patterns"}),
-        "click": frozenset({"selector", "prompt", "ai", "intention", "data", "timeout", "recoverable_marker_id"}),
+        "click": frozenset(
+            {"selector", "prompt", "ai", "intention", "data", "timeout", "recoverable_marker_id", "desired_state"}
+        ),
         "fill": frozenset(
             {
                 "selector",

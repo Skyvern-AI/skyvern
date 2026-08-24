@@ -59,8 +59,9 @@ GOOGLE_REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 # Spreadsheets + Drive scopes for the picker UX:
 # - spreadsheets: read/write sheet cells and create new spreadsheets
 # - drive.metadata.readonly: list file metadata (required for the picker search)
+GOOGLE_SHEETS_DATA_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 GOOGLE_SHEETS_SCOPES: tuple[str, ...] = (
-    "https://www.googleapis.com/auth/spreadsheets",
+    GOOGLE_SHEETS_DATA_SCOPE,
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 )
 GOOGLE_GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"

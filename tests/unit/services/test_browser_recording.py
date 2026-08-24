@@ -604,7 +604,7 @@ async def test_network_activity_trailing_flush_preserves_throttled_activity() ->
     events: list[StreamingExfiltratedEvent] = []
     channel = ExfiltrationChannel(
         on_event=lambda messages: events.extend(messages),
-        vnc_channel=t.cast(t.Any, DummyVncChannel()),
+        context=t.cast(t.Any, DummyVncChannel()),
     )
     channel.NETWORK_ACTIVITY_THROTTLE_SECONDS = 0.01
 

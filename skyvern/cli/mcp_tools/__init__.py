@@ -7,6 +7,7 @@ AI assistants like Claude.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 try:
@@ -49,6 +50,7 @@ from skyvern.cli.mcp_tools.browser import EITHER_STATE_OUTPUT_SCHEMA
 from .blocks import (
     skyvern_block_schema,
     skyvern_block_validate,
+    skyvern_workflow_knowledge,
 )
 from .browser import (
     skyvern_act,
@@ -138,7 +140,15 @@ from .output_tools import (
     skyvern_finish,
 )
 from .prompts import build_workflow, debug_automation, extract_data, qa_test
-from .response import size_capped
+from .response import response_transformed, size_capped
+from .response_browser import format_browser_response
+from .response_network import (
+    format_har_response,
+    format_network_request_detail_response,
+    format_network_requests_response,
+)
+from .response_storage import format_storage_response
+from .response_workflow import format_workflow_response
 from .schedule import (
     skyvern_schedule_create,
     skyvern_schedule_delete,
@@ -275,9 +285,20 @@ mcp.tool(tags={"browser_profile"}, annotations=_dest("Delete Browser Profile"))(
 # Browser tools run against arbitrary websites. Read-only inspection remains
 # non-destructive, but still open-world because the target site is unbounded.
 mcp.tool(tags={"ai_powered", "browser_primitive"}, annotations=_web_dest("Perform Browser Action (AI)"))(skyvern_act)
-mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(size_capped(skyvern_extract))
+mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data from Page (AI)"))(
+    response_transformed(
+        formatter=format_browser_response,
+        recovery_hint="Retry skyvern_extract with verbosity='full' to recover raw extracted data, subject to the final size cap.",
+    )(skyvern_extract)
+)
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Extract Data + Screenshot (AI)"))(
-    size_capped(skyvern_extract_and_screenshot)
+    response_transformed(
+        formatter=format_browser_response,
+        recovery_hint=(
+            "Retry skyvern_extract_and_screenshot with verbosity='full' to recover raw extracted data, "
+            "subject to the final size cap."
+        ),
+    )(skyvern_extract_and_screenshot)
 )
 mcp.tool(tags={"ai_powered"}, annotations=_web_ro("Validate Page Condition (AI)"))(skyvern_validate)
 mcp.tool(
@@ -293,12 +314,29 @@ mcp.tool(tags={"browser_primitive"}, annotations=_web_mut("Navigate to URL + Scr
     size_capped(skyvern_navigate_and_screenshot)
 )
 mcp.tool(tags={"ai_powered"}, annotations=_web_mut("Navigate + Extract Data + Screenshot (AI)"))(
-    size_capped(skyvern_navigate_extract_and_screenshot)
+    response_transformed(
+        formatter=format_browser_response,
+        recovery_hint=(
+            "Retry skyvern_navigate_extract_and_screenshot with verbosity='full' to recover raw extracted data, "
+            "subject to the final size cap."
+        ),
+    )(skyvern_navigate_extract_and_screenshot)
 )
 mcp.tool(tags={"browser_primitive", "lean"}, annotations=_web_ro("Take Screenshot"))(skyvern_screenshot)
-mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript"))(skyvern_evaluate)
+mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript"))(
+    response_transformed(
+        formatter=format_browser_response,
+        recovery_hint="Retry skyvern_evaluate with verbosity='full' to recover the raw value, subject to the final size cap.",
+    )(skyvern_evaluate)
+)
 mcp.tool(tags={"browser_primitive"}, annotations=_web_dest("Evaluate JavaScript + Screenshot"))(
-    size_capped(skyvern_evaluate_and_screenshot)
+    response_transformed(
+        formatter=format_browser_response,
+        recovery_hint=(
+            "Retry skyvern_evaluate_and_screenshot with verbosity='full' to recover the raw value, "
+            "subject to the final size cap."
+        ),
+    )(skyvern_evaluate_and_screenshot)
 )
 
 # -- Clipboard --
@@ -352,25 +390,56 @@ mcp.tool(tags={"state"}, annotations=_web_mut("Load Browser State"))(skyvern_sta
 # console_messages, network_requests, handle_dialog, and get_errors accept
 # clear=True, which mutates captured session buffers.
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Console Messages"))(skyvern_console_messages)
-mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Network Requests"))(size_capped(skyvern_network_requests))
-mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Network Request Detail"))(skyvern_network_request_detail)
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Network Requests"))(
+    response_transformed(
+        formatter=format_network_requests_response,
+        recovery_hint=(
+            "Use a retained request_id with skyvern_network_request_detail for headers/body. "
+            "If clear=False, retry with verbosity='full' for all compact list metadata. "
+            "If clear=True, omitted requests were cleared and cannot be recovered."
+        ),
+    )(skyvern_network_requests)
+)
+mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Network Request Detail"))(
+    response_transformed(
+        formatter=format_network_request_detail_response,
+        recovery_hint=(
+            "Retry skyvern_network_request_detail with verbosity='full' for the sanitized request and captured "
+            "body, subject to the final size cap."
+        ),
+    )(skyvern_network_request_detail)
+)
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Route Network Requests"))(skyvern_network_route)
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Remove Network Route"))(skyvern_network_unroute)
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Handle Browser Dialog"))(skyvern_handle_dialog)
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Get Page Errors"))(skyvern_get_errors)
 mcp.tool(tags={"inspection"}, annotations=_web_mut("Start HAR Recording"))(skyvern_har_start)
-mcp.tool(tags={"inspection"}, annotations=_web_mut("Stop HAR Recording"))(size_capped(skyvern_har_stop))
+mcp.tool(tags={"inspection"}, annotations=_web_mut("Stop HAR Recording"))(
+    response_transformed(
+        formatter=format_har_response,
+        recovery_hint=(
+            "The stopped capture is not recoverable. Re-record with skyvern_har_start, then call "
+            "skyvern_har_stop with verbosity='full'."
+        ),
+    )(skyvern_har_stop)
+)
 mcp.tool(tags={"inspection", "lean"}, annotations=_web_ro("Get Element HTML"))(size_capped(skyvern_get_html))
 mcp.tool(tags={"inspection", "lean"}, annotations=_web_ro("Get Element Value"))(skyvern_get_value)
 mcp.tool(tags={"inspection"}, annotations=_web_ro("Get Element Styles"))(skyvern_get_styles)
 
 # -- Web storage (sessionStorage + localStorage) --
-mcp.tool(tags={"storage"}, annotations=_web_ro("Get Session Storage"))(skyvern_get_session_storage)
+mcp.tool(tags={"storage"}, annotations=_web_ro("Get Session Storage"))(
+    response_transformed(
+        formatter=format_storage_response,
+        recovery_hint="Retry skyvern_get_session_storage with verbosity='full' to recover raw values, subject to the final size cap.",
+    )(skyvern_get_session_storage)
+)
 mcp.tool(tags={"storage"}, annotations=_web_mut("Set Session Storage"))(skyvern_set_session_storage)
 mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Session Storage"))(skyvern_clear_session_storage)
 mcp.tool(tags={"storage"}, annotations=_web_dest("Clear Local Storage"))(skyvern_clear_local_storage)
 
 # -- Block discovery + validation (no browser needed) --
+mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Knowledge"))(skyvern_workflow_knowledge)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Get Workflow Block Schema"))(skyvern_block_schema)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Validate Workflow Block"))(skyvern_block_validate)
 mcp.tool(tags={"block_discovery"}, annotations=_ro("Lint Code Block"))(skyvern_code_block_lint)
@@ -419,8 +488,22 @@ mcp.tool(tags={"workflow"}, annotations=_mut("Create Workflow"))(skyvern_workflo
 mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflow_update)
 mcp.tool(tags={"workflow"}, annotations=_mut("Move Workflow to Folder"))(skyvern_workflow_update_folder)
 mcp.tool(tags={"workflow"}, annotations=_dest("Delete Workflow"))(skyvern_workflow_delete)
-mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(skyvern_workflow_run)
-mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(size_capped(skyvern_workflow_status))
+mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(
+    response_transformed(
+        formatter=functools.partial(format_workflow_response, tool_name="skyvern_workflow_run"),
+        recovery_hint=(
+            "Call skyvern_workflow_status with the returned run_id and verbosity='full' to recover full run output."
+        ),
+    )(skyvern_workflow_run)
+)
+mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(
+    response_transformed(
+        formatter=functools.partial(format_workflow_response, tool_name="skyvern_workflow_status"),
+        recovery_hint=(
+            "Retry skyvern_workflow_status with the same run_id and verbosity='full' to recover full run output."
+        ),
+    )(skyvern_workflow_status)
+)
 mcp.tool(tags={"workflow"}, annotations=_web_dest("Retry Workflow Run"))(skyvern_workflow_retry)
 mcp.tool(tags={"workflow"}, annotations=_dest("Cancel Workflow Run"))(skyvern_workflow_cancel)
 
@@ -534,6 +617,7 @@ __all__ = [
     "skyvern_clear_session_storage",
     "skyvern_clear_local_storage",
     # Block discovery + validation
+    "skyvern_workflow_knowledge",
     "skyvern_block_schema",
     "skyvern_block_validate",
     "skyvern_code_block_lint",

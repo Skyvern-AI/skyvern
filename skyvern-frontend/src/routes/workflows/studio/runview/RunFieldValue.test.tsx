@@ -35,7 +35,7 @@ describe("RunFieldValue", () => {
 
   test("renders nested objects as the collapsible searchable tree, not clamped prose", () => {
     render(<RunFieldValue value={{ count: 3 }} label="line_items" />);
-    expect(screen.queryByPlaceholderText("Search JSON")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Search JSON" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
   });
 

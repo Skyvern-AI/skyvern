@@ -24,6 +24,8 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
+from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
+from skyvern.forge.sdk.routes.streaming.channels.cdp import ChannelContext
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
@@ -44,6 +46,7 @@ from skyvern.services.browser_recording.session_registry import interpretation_r
 from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
 
 LOG = structlog.get_logger()
+_MAX_IN_FLIGHT_CLIPBOARD_TASKS = 2
 
 Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 
@@ -491,6 +494,28 @@ class MessageChannel:
         self.out_queue.put_nowait({"kind": "copied-text", "text": copied_text})
 
 
+@dataclasses.dataclass
+class MessageChannelContext:
+    """ChannelContext for recording without a VNC channel. Delegates to the live
+    message channel so a browser_session the verifier swaps or clears mid-recording
+    is observed, matching how a VncChannel-backed context behaves."""
+
+    message_channel: MessageChannel
+    x_api_key: str
+
+    @property
+    def organization_id(self) -> str:
+        return self.message_channel.organization_id
+
+    @property
+    def browser_session(self) -> AddressablePersistentBrowserSession | None:
+        return self.message_channel.browser_session
+
+    @property
+    def identity(self) -> dict[str, t.Any]:
+        return dict(self.message_channel.identity)
+
+
 async def loop_stream_messages(message_channel: MessageChannel) -> None:
     """
     Stream messages and their results back and forth.
@@ -501,6 +526,25 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     class_name = message_channel.class_name
     exfiltration_channel: ExfiltrationChannel | None = None
     live_interpretation_browser_session_id: str | None = None
+    clipboard_tasks: set[asyncio.Task[None]] = set()
+    clipboard_task_count = 0
+
+    async def track_clipboard_task(coroutine_factory: t.Callable[[], t.Coroutine[t.Any, t.Any, None]]) -> None:
+        nonlocal clipboard_task_count
+        try:
+            await coroutine_factory()
+        finally:
+            clipboard_task_count -= 1
+
+    def run_clipboard_task(coroutine_factory: t.Callable[[], t.Coroutine[t.Any, t.Any, None]]) -> bool:
+        nonlocal clipboard_task_count
+        if clipboard_task_count >= _MAX_IN_FLIGHT_CLIPBOARD_TASKS:
+            return False
+        clipboard_task_count += 1
+        task = asyncio.create_task(track_clipboard_task(coroutine_factory))
+        clipboard_tasks.add(task)
+        task.add_done_callback(clipboard_tasks.discard)
+        return True
 
     async def send(message: MessageOut) -> None:
         # Single-writer: enqueue only; backend_to_frontend is the sole task that
@@ -538,37 +582,46 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
         match message.kind:
             case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
-                text = message.text
 
-                paste_byte_len = len(text.encode("utf-8"))
-                if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
-                    LOG.warning(
-                        f"{class_name} ask-for-clipboard-response paste exceeds size cap; rejecting.",
-                        size=paste_byte_len,
-                        max_size=MAX_CLIPBOARD_PASTE_BYTES,
-                        **message_channel.identity,
-                    )
-                    await send_error(message.kind, "Clipboard payload too large.")
-                    return
+                async def paste_clipboard_response() -> None:
+                    text = message.text
 
-                try:
-                    async with execution_for_message_channel(message_channel) as execute:
-                        await execute.paste_text(text)
-                except Exception:
-                    LOG.exception(
-                        f"{class_name} failed to paste clipboard response into browser.",
-                        **message_channel.identity,
-                    )
-                    await send_error(message.kind, "Failed to paste into browser.")
+                    paste_byte_len = len(text.encode("utf-8"))
+                    if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
+                        LOG.warning(
+                            f"{class_name} ask-for-clipboard-response paste exceeds size cap; rejecting.",
+                            size=paste_byte_len,
+                            max_size=MAX_CLIPBOARD_PASTE_BYTES,
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Clipboard payload too large.")
+                        return
+
+                    try:
+                        async with execution_for_message_channel(message_channel) as execute:
+                            await execute.paste_text(text)
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to paste clipboard response into browser.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to paste into browser.")
+
+                if not run_clipboard_task(paste_clipboard_response):
+                    await send_error(message.kind, "Clipboard is busy; try again.")
 
             case MessageKind.BEGIN_EXFILTRATION:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
-                if not vnc_channel:
+                if vnc_channel is None and message_channel.browser_session is None:
                     LOG.warning(
-                        f"{class_name} no vnc channel client found for message channel - cannot exfiltrate.",
+                        f"{class_name} no vnc channel and no browser session for message channel - cannot exfiltrate.",
                         message=message,
                         **message_channel.identity,
+                    )
+                    # Tell the client instead of dropping silently; it re-sends begin-exfiltration once the live view (re)connects.
+                    await send_error(
+                        message.kind, "Recording capture is not ready yet; retrying as live view connects."
                     )
                     return
 
@@ -640,13 +693,30 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     if live_interpretation_browser_session_id:
                         interpretation_registry.ingest_events(live_interpretation_browser_session_id, events)
 
+                if vnc_channel is not None:
+                    context: ChannelContext = vnc_channel
+                else:
+                    # A transient token-lookup failure must not escape handle_data
+                    # and kill the websocket loop; the client re-sends
+                    # begin-exfiltration on its next attempt.
+                    try:
+                        x_api_key = await get_x_api_key(message_channel.organization_id)
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to resolve api key for recording capture.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to start recording capture.")
+                        return
+                    context = MessageChannelContext(message_channel=message_channel, x_api_key=x_api_key)
+
                 # A dead browser target (ECONNREFUSED / 502 from connect_over_cdp) must
                 # not escape handle_data: that kills the websocket loop, the frontend
                 # reconnects and re-sends begin-exfiltration, and the recording spins
                 # in a crash-loop capturing nothing.
                 new_channel = ExfiltrationChannel(
                     on_event=on_event,
-                    vnc_channel=vnc_channel,
+                    context=context,
                 )
                 try:
                     exfiltration_channel = await new_channel.start()
@@ -712,57 +782,65 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, "Failed to clear browsing history.")
 
             case MessageKind.CLIPBOARD_COPY:
-                try:
-                    async with execution_for_message_channel(message_channel) as execute:
-                        copied_text = await execute.get_selected_text()
-                        await message_channel.send_copied_text(copied_text)
-                except Exception:
-                    LOG.exception(
-                        f"{class_name} failed to copy text from browser.",
-                        **message_channel.identity,
-                    )
-                    await send_error(message.kind, "Failed to copy selected text.")
+
+                async def copy_clipboard() -> None:
+                    try:
+                        async with execution_for_message_channel(message_channel) as execute:
+                            copied_text = await execute.get_selected_text()
+                            await message_channel.send_copied_text(copied_text)
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to copy text from browser.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to copy selected text.")
+
+                if not run_clipboard_task(copy_clipboard):
+                    await send_error(message.kind, "Clipboard is busy; try again.")
 
             case MessageKind.CLIPBOARD_PASTE:
-                text = message.text
 
-                paste_byte_len = len(text.encode("utf-8"))
-                if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
-                    LOG.warning(
-                        f"{class_name} clipboard-paste payload exceeds size cap; rejecting.",
-                        size=paste_byte_len,
-                        max_size=MAX_CLIPBOARD_PASTE_BYTES,
-                        **message_channel.identity,
-                    )
-                    await send_error(message.kind, "Clipboard payload too large.")
-                    return
+                async def paste_clipboard() -> None:
+                    text = message.text
 
-                try:
-                    async with execution_for_message_channel(message_channel) as execute:
-                        await execute.paste_text(text)
-                except Exception:
-                    LOG.exception(
-                        f"{class_name} failed to paste text into browser.",
-                        **message_channel.identity,
-                    )
-                    await send_error(message.kind, "Failed to paste into browser.")
+                    paste_byte_len = len(text.encode("utf-8"))
+                    if paste_byte_len > MAX_CLIPBOARD_PASTE_BYTES:
+                        LOG.warning(
+                            f"{class_name} clipboard-paste payload exceeds size cap; rejecting.",
+                            size=paste_byte_len,
+                            max_size=MAX_CLIPBOARD_PASTE_BYTES,
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Clipboard payload too large.")
+                        return
+
+                    try:
+                        async with execution_for_message_channel(message_channel) as execute:
+                            await execute.paste_text(text)
+                    except Exception:
+                        LOG.exception(
+                            f"{class_name} failed to paste text into browser.",
+                            **message_channel.identity,
+                        )
+                        await send_error(message.kind, "Failed to paste into browser.")
+
+                if not run_clipboard_task(paste_clipboard):
+                    await send_error(message.kind, "Clipboard is busy; try again.")
 
             case MessageKind.END_EXFILTRATION:
-                if exfiltration_channel is None:
-                    return
-
                 # Channel teardown is best-effort: a browser whose target already
                 # closed raises here, and that must never skip the interpretation
                 # flush below — losing every draft the user just recorded.
-                try:
-                    await exfiltration_channel.stop()
-                except Exception:
-                    # Expected race (target already closed), so warning, not error.
-                    LOG.warning(
-                        f"{class_name} failed to stop recording capture cleanly.",
-                        **message_channel.identity,
-                        exc_info=True,
-                    )
+                if exfiltration_channel is not None:
+                    try:
+                        await exfiltration_channel.stop()
+                    except Exception:
+                        # Expected race (target already closed), so warning, not error.
+                        LOG.warning(
+                            f"{class_name} failed to stop recording capture cleanly.",
+                            **message_channel.identity,
+                            exc_info=True,
+                        )
 
                 exfiltration_channel = None
                 if live_interpretation_browser_session_id:
@@ -978,6 +1056,11 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         for task in loops:
             task.cancel()
         await asyncio.gather(*loops, return_exceptions=True)
+        pending_clipboard_tasks = tuple(clipboard_tasks)
+        for task in pending_clipboard_tasks:
+            task.cancel()
+        if pending_clipboard_tasks:
+            await asyncio.gather(*pending_clipboard_tasks, return_exceptions=True)
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
         if exfiltration_channel is not None:
             try:

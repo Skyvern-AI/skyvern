@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, cast
+from typing import Any, Awaitable, Callable, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
@@ -75,6 +75,11 @@ LOG = structlog.get_logger()
 
 
 BrowserCleanupFunc = Callable[[], Awaitable[None]] | None
+# Playwright defaults a ".har" path to content="embed", which holds every response body in the driver's
+# JS heap for the life of the context and serializes them all in one JSON.stringify at close, so long runs
+# blow the ~3 GB V8 heap there and the driver dies with every task on it. "omit" keeps the HAR bounded by
+# request count instead.
+HAR_CONTENT_POLICY: Literal["omit"] = "omit"
 # Header to signal fresh browser context creation (stripped before sending to websites)
 # When set to "true", creates a new incognito-like context instead of reusing existing ones
 FRESH_CONTEXT_HEADER = "X-Skyvern-Fresh-Context"
@@ -322,6 +327,23 @@ def _consume_abandoned_task_result(task: asyncio.Task) -> None:
         task.exception()
 
 
+DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS = 5.0
+
+
+async def read_download_failure(download: Download) -> str | None:
+    """Return the browser's failure string for a download, or None if it finished or is unreadable.
+
+    Chromium deletes the partial file when it aborts a transfer, so an aborted download and a
+    completed one look identical from a directory listing; this is the only authoritative signal.
+    Never raises — callers use it to report an outcome, not to control the download.
+    """
+    try:
+        async with asyncio.timeout(DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS):
+            return await download.failure()
+    except Exception:
+        return None
+
+
 def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     tracked_paths: set[str] = set()
 
@@ -452,6 +474,18 @@ def set_download_file_listener(
             # TODO: maybe should try to parse it from URL response
 
         except Exception:
+            # An aborted transfer surfaces here as a path() error; reporting it as a rename failure
+            # sends triage to the wrong subsystem and hides that no file was ever saved.
+            failure = await read_download_failure(download)
+            if failure is not None:
+                LOG.warning(
+                    "Browser aborted the download before any file was saved",
+                    workflow_run_id=workflow_run_id,
+                    task_id=task_id,
+                    failure=failure,
+                    url=_redact_url_query(download.url),
+                )
+                return
             LOG.exception(
                 "Failed to add file extension name to downloaded file",
                 workflow_run_id=workflow_run_id,
@@ -544,6 +578,9 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
                 "downloadPath": download_dir,
             },
         )
+        # Deliberately never detached: Chromium scopes setDownloadBehavior to the session that set
+        # it and reverts the binding when that session detaches, so this session must outlive the
+        # run's downloads. The interceptor's monitor_owns_binding is the same invariant.
         setdownloadbehavior_applied = True
     except Exception:
         # Fail open: a rebind/setDownloadBehavior failure must never break a browser launch or run.
@@ -665,6 +702,7 @@ class BrowserContextFactory:
                 "--enable-automation",
             ],
             "record_har_path": har_dir,
+            "record_har_content": HAR_CONTENT_POLICY,
             "record_video_dir": video_dir,
             "viewport": {
                 "width": settings.BROWSER_WIDTH,

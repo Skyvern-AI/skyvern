@@ -1,3 +1,4 @@
+import { RunEngine } from "@/api/types";
 import { useMemo, useState } from "react";
 
 import {
@@ -69,6 +70,12 @@ function LoginEditorBody({
   blockId: string;
   data: LoginNodeData;
 }) {
+  const availableEngines = [
+    RunEngine.SkyvernV1,
+    RunEngine.SkyvernV3,
+    RunEngine.OpenaiCua,
+    RunEngine.AnthropicCua,
+  ];
   const { editable } = data;
   const update = useUpdate<LoginNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
@@ -346,6 +353,7 @@ function LoginEditorBody({
                   value={data.engine}
                   onChange={(value) => update({ engine: value })}
                   className="nopan w-52 text-xs"
+                  availableEngines={availableEngines}
                 />
               </div>
               <div className="flex items-center justify-between">

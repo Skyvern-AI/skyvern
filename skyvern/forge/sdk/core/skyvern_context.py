@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from skyvern.config import settings
+from skyvern.schemas.run_enums import RunEngine
+from skyvern.webeye.browser_health import BrowserHealth, BrowserOperation
 
 if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
@@ -32,6 +34,9 @@ MAX_RECENT_DIALOG_MESSAGES = 5
 # Per-message length cap so a single pathological alert (multi-KB page-stack
 # trace, etc.) cannot dominate the prompt budget.
 MAX_DIALOG_MESSAGE_CHARS = 500
+
+# Visible stand-in for a value scrubbed from the model's view via hide_from_model.
+MODEL_HIDDEN_PLACEHOLDER = "[withheld: sign-in link]"
 
 
 def _unwired_authority() -> RuntimeOriginAuthority:
@@ -112,6 +117,7 @@ class SkyvernContext:
     is_sdk_inline_action: bool = False
     browser_runtime: str | None = None
     browser_address_is_server_assigned: bool = False
+    browser_health: BrowserHealth = field(default_factory=BrowserHealth)
     tz_info: ZoneInfo | None = None
     run_id: str | None = None
     copilot_session_id: str | None = None
@@ -130,6 +136,14 @@ class SkyvernContext:
     # builtins.set, not set: the module-level `set` context setter below shadows the
     # builtin for anything that resolves the name after import.
     downloaded_pdf_sources: set[str] = field(default_factory=builtins.set)
+    # Per-task secret values (e.g. a resolved verification code) to scrub from artifacts/logs. Task-
+    # scoped so bare tasks with no workflow-run context are still redacted; unioned into
+    # WorkflowContextManager.get_secret_values_for_run, which both redaction consumers read.
+    runtime_secret_values: set[str] = field(default_factory=builtins.set)
+    # Subset of runtime_secret_values that must also never reach the model's own view of tool
+    # output (e.g. a magic sign-in link), as opposed to values the model needs to read (e.g. a TOTP
+    # code) that are only scrubbed from artifacts/logs.
+    model_hidden_values: set[str] = field(default_factory=builtins.set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -151,7 +165,6 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    use_artifact_bundling: bool = False
     # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
@@ -175,6 +188,15 @@ class SkyvernContext:
     # Both sites for a run run sequentially, so the read-modify-write needs no lock; verification /
     # extraction / error-detection scrapes never touch it.
     transient_ui_consecutive_suppressions: int = 0
+    # WORKFLOW_TASK_V3_AB arm, resolved once per workflow run: the engine every default-engine
+    # task block of that run dispatches to, or None for control.
+    workflow_block_engine_override: RunEngine | None = None
+    # The workflow run the override above was resolved for. A nested execution sharing this context
+    # (an inline child workflow run) has its own id and its own definition, so it must re-resolve
+    # rather than inherit an arm that was never checked against its blocks.
+    workflow_block_engine_resolved_run_id: str | None = None
+    # Single-flight the first-use provider resolution when parallel branches share one context.
+    workflow_block_engine_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
@@ -241,6 +263,10 @@ class SkyvernContext:
     # stores pre-scraped data for next step to avoid re-scraping
     next_step_pre_scraped_data: dict[str, Any] | None = None
     speculative_plans: dict[str, Any] = field(default_factory=dict)
+    # Writes that persist the cost of an already-billed speculative LLM call. They are
+    # started as background tasks so the completion path doesn't wait on the LLM call,
+    # and drained at task clean-up so the write can't be dropped when the run tears down.
+    pending_speculative_persist_tasks: list[asyncio.Task] = field(default_factory=list)
 
     """
     Example output value:
@@ -261,6 +287,21 @@ class SkyvernContext:
     # Circuit breaker: consecutive captcha solve timeouts for this workflow run.
     # When this reaches the threshold, further captcha solve attempts are short-circuited.
     consecutive_captcha_timeouts: int = 0
+
+    # Circuit breaker: repeated successful captcha solves for one identity (the solve-budget
+    # key below). Bounds a solve-succeeds-repeatedly-but-run-never-advances loop that the
+    # timeout counter cannot see. Independent from consecutive_captcha_timeouts above.
+    consecutive_captcha_solves: int = 0
+    # Solve-budget key (task id + exact page url + concrete solver identity) of the last
+    # reliably-successful solve; a solve with a matching key spends one unit of the budget.
+    # None means no such solve has run yet. Opaque comparison string only; never log it.
+    last_captcha_solve_key: str | None = None
+    # Fast-fail latch (task id + exact page url) set when the solve budget above trips, so a retry
+    # of the captcha action short-circuits at the entry point before invoking a solver instead of
+    # paying another vendor call to re-raise the same failure. Coarser than last_captcha_solve_key
+    # (no solver identity — a pre-entry check can't know it without running the detector); a url
+    # change re-opens it. None means not latched. Opaque comparison string only; never log it.
+    captcha_solve_latch_key: str | None = None
 
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
@@ -354,6 +395,26 @@ class SkyvernContext:
     def pop_totp_code(self, task_id: str) -> None:
         if task_id in self.totp_codes:
             self.totp_codes.pop(task_id)
+
+    def register_secret_value(self, value: str | None, *, hide_from_model: bool = False) -> None:
+        """Mark a value for redaction from this task's artifacts/logs (task-scoped, no workflow needed).
+        When hide_from_model is True, also scrub it from the model's own view of tool output via hide_from_model()."""
+        if value:
+            self.runtime_secret_values.add(value)
+            if hide_from_model:
+                self.model_hidden_values.add(value)
+
+    def hide_from_model(self, text: str) -> str:
+        """Exact-match replace every model_hidden_values entry with MODEL_HIDDEN_PLACEHOLDER, longest
+        value first so a substring value can't fragment a longer one. Same object when nothing matches."""
+        if not self.model_hidden_values:
+            return text
+        for value in sorted(self.model_hidden_values, key=len, reverse=True):
+            if not value:
+                continue
+            if value in text:
+                text = text.replace(value, MODEL_HIDDEN_PLACEHOLDER)
+        return text
 
     def record_dialog_message(self, dialog_type: str, dialog_message: str) -> None:
         """Buffer a dialog with FIFO cap; identical entries bump a count instead of duplicating."""
@@ -467,6 +528,20 @@ def ensure_context() -> SkyvernContext:
     if context is None:
         raise RuntimeError("No skyvern context")
     return context
+
+
+def record_browser_timeout(operation: BrowserOperation) -> None:
+    """Note that a browser-protocol operation went unanswered. Outside a run there is nothing to
+    tally against, and callers are hot paths, so a missing context is silently a no-op."""
+    context = current()
+    if context is not None:
+        context.browser_health.record_timeout(operation)
+
+
+def record_browser_success() -> None:
+    context = current()
+    if context is not None:
+        context.browser_health.record_success()
 
 
 def set(context: SkyvernContext) -> None:

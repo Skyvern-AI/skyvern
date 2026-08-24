@@ -122,3 +122,32 @@ async def test_delete_browser_profile_hard_delete_raises_on_failure(
             await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=True)
         # default delete stays best-effort (swallowed).
         await local_storage.delete_browser_profile(TEST_ORGANIZATION_ID, "bp_1", hard_delete=False)
+
+
+@pytest.mark.asyncio
+async def test_delete_legacy_file_deletes_managed_artifact(tmp_path: Path) -> None:
+    storage = LocalStorage(artifact_path=str(tmp_path))
+    artifact_paths = [
+        tmp_path / TEST_ORGANIZATION_ID / "tasks" / "legacy-artifact.png",
+        tmp_path / settings.ENV / TEST_ORGANIZATION_ID / "tasks" / "artifact.png",
+    ]
+    for artifact_path in artifact_paths:
+        artifact_path.parent.mkdir(parents=True)
+        artifact_path.write_bytes(b"artifact")
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+
+    assert not any(artifact_path.exists() for artifact_path in artifact_paths)
+
+
+@pytest.mark.asyncio
+async def test_delete_legacy_file_rejects_other_organization_path(tmp_path: Path) -> None:
+    storage = LocalStorage(artifact_path=str(tmp_path))
+    artifact_path = tmp_path / "other-organization" / "tasks" / "artifact.png"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(b"artifact")
+
+    with pytest.raises(PermissionError):
+        await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
+
+    assert artifact_path.exists()

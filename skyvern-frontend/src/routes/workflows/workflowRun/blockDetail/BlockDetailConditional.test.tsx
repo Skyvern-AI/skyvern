@@ -97,6 +97,56 @@ describe("BlockDetailConditional", () => {
     expect(screen.getByText("fallback")).toBeDefined();
   });
 
+  it("renders keyword-led rule lines: the branch that ran trails its destination, the rest their result", () => {
+    const block = buildConditional({
+      executed_branch_id: "b_true",
+      output: {
+        evaluations: [
+          {
+            branch_id: "b_true",
+            branch_index: 0,
+            criteria_type: "jinja2_template",
+            original_expression: "{{ count > 3 }}",
+            rendered_expression: "5 > 3",
+            result: true,
+            is_matched: true,
+            is_default: false,
+            next_block_label: "notify_team",
+            error: null,
+          },
+          {
+            branch_id: "b_default",
+            branch_index: 1,
+            criteria_type: null,
+            original_expression: null,
+            rendered_expression: null,
+            result: null,
+            is_matched: false,
+            is_default: true,
+            next_block_label: "fallback",
+            error: null,
+          },
+        ],
+      },
+    });
+
+    render(<BlockDetailConditional block={block} />);
+    // The keywords carry the order, so there is no hint sentence.
+    expect(screen.getByText("if")).toBeDefined();
+    expect(screen.getByText("else")).toBeDefined();
+    expect(screen.queryByText(/first match/i)).toBeNull();
+    // One emphasized outcome: the destination on the branch that ran.
+    expect(screen.getAllByRole("img", { name: "taken" })).toHaveLength(1);
+    expect(screen.getByText("notify_team")).toBeDefined();
+    expect(screen.queryByText("fallback")).toBeNull();
+    // A condition that held shows no bare result; no Result/Matched prose.
+    expect(screen.queryByText(/Result/)).toBeNull();
+    expect(screen.queryByText(/Matched/)).toBeNull();
+    // The rendered value leads the line; the template follows it.
+    expect(screen.getByText("5 > 3")).toBeDefined();
+    expect(screen.getByText("{{ count > 3 }}")).toBeDefined();
+  });
+
   it("falls back to the legacy executed_branch_expression rendering when no evaluations array", () => {
     const block = buildConditional({
       executed_branch_id: "b_match",
@@ -138,7 +188,7 @@ describe("BlockDetailConditional", () => {
     expect(screen.getByText("200")).toBeDefined();
     expect(screen.getByText(/X-Stage.*signin/)).toBeDefined();
     expect(screen.queryByText(/Object\(\d+\)/)).toBeNull();
-    expect(screen.getByPlaceholderText("Search JSON")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Search JSON" })).toBeDefined();
   });
 
   it("renders a clear message when the default branch executed and no expression matched", () => {

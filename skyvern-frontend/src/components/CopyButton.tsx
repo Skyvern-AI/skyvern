@@ -8,12 +8,20 @@ function CopyButton({
   value,
   className,
   ariaLabel,
+  id,
+  tabIndex,
+  onFocus,
 }: {
   // A getter defers building the copied text until click, so callers rendering
   // many buttons (e.g. per JSON-tree row) don't serialize on every render.
   value: string | (() => string);
   className?: string;
   ariaLabel?: string;
+  // Set together when the button sits in a roving-tabindex toolbar and must be
+  // reachable by the toolbar's arrow keys rather than as its own tab stop.
+  id?: string;
+  tabIndex?: number;
+  onFocus?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -33,6 +41,9 @@ function CopyButton({
       onClick={handleCopy}
       className={className}
       aria-label={ariaLabel ?? "Copy to clipboard"}
+      id={id}
+      tabIndex={tabIndex}
+      onFocus={onFocus}
     >
       {copied ? <CheckIcon /> : <CopyIcon />}
     </Button>

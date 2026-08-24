@@ -18,7 +18,6 @@ from skyvern.browser_extension.broker_state import (
     atomic_write_json,
     enable_broker_state,
     ensure_run_directory,
-    initialize_empty_journal,
     matching_startup_failure,
     prepare_startup_log,
     process_identity_matches,
@@ -27,7 +26,9 @@ from skyvern.browser_extension.broker_state import (
     read_owner_json,
     read_readiness,
     record_startup_failure,
+    reset_lease_journal,
     run_directory_identity,
+    validate_lease_journal,
     validate_run_directory,
     write_readiness,
 )
@@ -89,7 +90,7 @@ def test_run_directory_identity_change_is_rejected(tmp_path: Path) -> None:
 
 def test_atomic_state_and_empty_journal_are_owner_only(tmp_path: Path) -> None:
     paths = ensure_run_directory(19777, base_dir=tmp_path / "run")
-    initialize_empty_journal(paths)
+    validate_lease_journal(paths)
     state = BrokerState(
         schemaVersion=1,
         externalPort=19777,
@@ -113,9 +114,30 @@ def test_atomic_state_and_empty_journal_are_owner_only(tmp_path: Path) -> None:
     assert paths.state.stat().st_mode & 0o777 == 0o600
     assert paths.leases.stat().st_mode & 0o777 == 0o600
 
-    atomic_write_json(paths.leases, {"schemaVersion": 1, "leases": [{"state": "active"}]})
+    atomic_write_json(paths.leases, {"schemaVersion": 99, "leases": []})
     with pytest.raises(BrowserExtensionBrokerError, match="UNSAFE_STATE"):
-        initialize_empty_journal(paths)
+        validate_lease_journal(paths)
+
+
+def test_validate_lease_journal_preserves_live_entries(tmp_path: Path) -> None:
+    paths = ensure_run_directory(19777, base_dir=tmp_path / "run")
+    atomic_write_json(paths.leases, {"schemaVersion": 1, "leases": [{"tabId": 7, "clientId": "c-1"}]})
+
+    validate_lease_journal(paths)
+
+    assert read_owner_json(paths.leases) == {"schemaVersion": 1, "leases": [{"tabId": 7, "clientId": "c-1"}]}
+
+
+def test_reset_lease_journal_archives_crash_residue(tmp_path: Path) -> None:
+    paths = ensure_run_directory(19777, base_dir=tmp_path / "run")
+    atomic_write_json(paths.leases, {"schemaVersion": 1, "leases": [{"tabId": 7, "clientId": "c-1"}]})
+
+    archived = reset_lease_journal(paths)
+
+    assert archived == 1
+    assert read_owner_json(paths.leases) == {"schemaVersion": 1, "leases": []}
+    assert read_owner_json(paths.leases_stale)["leases"] == [{"tabId": 7, "clientId": "c-1"}]
+    assert paths.leases_stale.stat().st_mode & 0o777 == 0o600
 
 
 def test_atomic_publication_rejects_existing_symlink(tmp_path: Path) -> None:
@@ -293,6 +315,35 @@ def test_readiness_success_error_and_timeout() -> None:
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\n",
+        b"not-json\n",
+        b'{"status":"READY"}\n',
+        b'{"status":"READY","port":0}\n',
+        b'{"status":"ERROR"}\n',
+        b'{"status":"ERROR","code":""}\n',
+    ],
+)
+def test_readiness_rejects_malformed_probe_payloads(payload: bytes) -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, payload)
+        os.close(write_fd)
+        write_fd = -1
+
+        with pytest.raises(BrowserExtensionBrokerError) as error_info:
+            read_readiness(read_fd, timeout=0.1)
+
+        assert error_info.value.code == "INVALID_READINESS"
+        assert error_info.value.message == "Broker readiness response is invalid"
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 def test_startup_log_is_bounded_while_child_is_writing(tmp_path: Path) -> None:

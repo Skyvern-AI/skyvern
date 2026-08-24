@@ -2953,8 +2953,8 @@ async def evaluate_completion_criteria(
             contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
             structural_unfired_criterion_ids=structural_unfired_ids,
         )
-    except Exception as exc:
-        LOG.warning("completion-verification judge failed", error=str(exc))
+    except Exception:
+        LOG.warning("completion-verification judge failed")
         return CompletionVerificationResult(
             status="unavailable",
             criterion_ids=criterion_ids,

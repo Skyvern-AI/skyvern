@@ -10,8 +10,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
@@ -22,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
     OutputParameter,
     ParameterType,
     WorkflowParameter,
@@ -743,6 +747,59 @@ async def wrapper({default_args}):
         assert secret_marker not in json.dumps(entry, default=str)
 
     @pytest.mark.asyncio
+    async def test_inline_exec_emits_completion_log_with_duration(self) -> None:
+        """Completion pairs with inline_exec_entered so a legacy run's duration needs no log join."""
+        from unittest.mock import MagicMock
+
+        from structlog.testing import capture_logs
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="duration_output",
+            description="test output",
+            output_parameter_id="op_duration",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="duration_block", code="return {'x': 1}", output_parameter=output_parameter)
+
+        user_function = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            result = await user_function()
+        assert result == {"x": 1}
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        entry = events[0]
+        assert isinstance(entry["duration_ms"], float) and entry["duration_ms"] >= 0
+        assert entry["success"] is True
+        assert entry["organization_id"] == "org-dur"
+        assert entry["workflow_run_id"] == "wr-dur"
+        assert entry["workflow_run_block_id"] == "wrb-dur"
+
+        failing_function = block.generate_async_user_function(
+            "x = 1 / 0",
+            MagicMock(),
+            workflow_run_id="wr-dur",
+            organization_id="org-dur",
+            workflow_run_block_id="wrb-dur",
+        )
+        with capture_logs() as logs:
+            with pytest.raises(ZeroDivisionError):
+                await failing_function()
+        events = [entry for entry in logs if entry.get("event") == "codeblock.inline_exec_completed"]
+        assert len(events) == 1
+        assert events[0]["success"] is False
+        assert isinstance(events[0]["duration_ms"], float)
+
+    @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
         """Legitimate code should execute and return results."""
         fn = self._exec_user_code("x = 1 + 2")
@@ -943,11 +1000,11 @@ async def wrapper({default_args}):
         assert (open_attempts, created_pages) == (1, 0)
         assert result.success is False
         assert result.status == BlockStatus.failed
-        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (RuntimeError)"
+        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
         assert result.failure_reason != "No page found to run the code block"
 
     @pytest.mark.asyncio
-    async def test_execute_reports_the_driver_error_name_when_the_tab_cannot_open(
+    async def test_execute_does_not_relay_the_driver_error_name_when_the_tab_cannot_open(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Playwright surfaces most driver failures as its base Error class, whose .name carries
@@ -960,7 +1017,8 @@ async def wrapper({default_args}):
         result, _, _ = await self._execute_against_tabless_session(monkeypatch, open_page_error=driver_error)
 
         assert result.success is False
-        assert result.failure_reason == f"{CODE_BLOCK_TAB_OPEN_FAILURE_REASON} (TypeError)"
+        assert driver_error.name == "TypeError"
+        assert result.failure_reason == CODE_BLOCK_TAB_OPEN_FAILURE_REASON
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""
@@ -1107,6 +1165,20 @@ _WORKFLOW_RUN_ID = "wr_otp_test"
 _ORG_ID = "o_otp_test"
 
 
+def _register_credential_parameter(wrc, key: str = _CREDENTIAL_KEY) -> None:
+    """Register a real CredentialParameter under ``key``, mirroring production so
+    is_registered_credential_parameter_key gates the credential-only TOTP paths."""
+    now = datetime.now(timezone.utc)
+    wrc.parameters[key] = CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="w",
+        credential_id="vault:item",
+        created_at=now,
+        modified_at=now,
+    )
+
+
 def _build_wrc_with_totp_seed(seed: str = _RFC_TOTP_SEED):
     """Build a real WorkflowRunContext carrying a TOTP-bearing credential.
 
@@ -1132,6 +1204,7 @@ def _build_wrc_with_totp_seed(seed: str = _RFC_TOTP_SEED):
     wrc.secrets[totp_secret_id] = BitwardenConstants.TOTP
     wrc.secrets[wrc.totp_secret_value_key(totp_secret_id)] = seed
     wrc.values[_CREDENTIAL_KEY] = {"context": "placeholder note", "totp": totp_secret_id}
+    _register_credential_parameter(wrc)
     return wrc
 
 
@@ -1151,6 +1224,7 @@ def _build_wrc_with_identifier(identifier: str = "otp@example.com"):
     )
     wrc.values[_CREDENTIAL_KEY] = {"context": "placeholder note"}
     wrc.credential_totp_identifiers[_CREDENTIAL_KEY] = identifier
+    _register_credential_parameter(wrc)
     return wrc
 
 
@@ -1158,7 +1232,31 @@ class _FakeWorkflowRun:
     def __init__(self) -> None:
         self.workflow_id = "w"
         self.workflow_permanent_id = "wpid"
-        self.started_at = datetime(2026, 6, 14, 0, 0, 0, tzinfo=timezone.utc)
+        # Naive, like workflow_runs.started_at (Column(DateTime)). An aware value here would let a
+        # local-clock anchor pass the call-time assertion below in every timezone.
+        self.started_at = datetime(2026, 6, 14, 0, 0, 0)
+
+
+def _fake_code_block_page(navigations: list | None = None, fills: list | None = None):
+    """A page the production binder will accept: it type-checks as a real Playwright Page."""
+    from unittest.mock import MagicMock
+
+    from playwright.async_api import Page
+
+    page = MagicMock(spec=Page)
+
+    async def goto(url: str, **kwargs: object) -> None:
+        if navigations is not None:
+            navigations.append(url)
+        return None
+
+    async def fill(*args: object, **kwargs: object) -> None:
+        if fills is not None:
+            fills.append(args)
+
+    page.goto = goto
+    page.fill = fill
+    return page
 
 
 def _patch_context_resolution(monkeypatch: "pytest.MonkeyPatch", wrc) -> None:
@@ -1747,6 +1845,74 @@ class TestCodeBlockOtpNoLeak:
         assert result.failure_reason is not None
         assert expected_code not in result.failure_reason
         assert _RFC_TOTP_SEED not in result.failure_reason
+        # Masking the secret must not cost the run the cause of its own failure (SKY-14294).
+        assert result.failure_reason == "Failed to execute code block. Reason: Exception: *****"
+
+    @pytest.mark.asyncio
+    async def test_otp_not_leaked_in_assembled_repair_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        import pyotp
+
+        from skyvern.forge.sdk.copilot.output_utils import build_run_blocks_response, sanitize_tool_result_for_llm
+        from skyvern.forge.sdk.copilot.tools import _attach_action_traces
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+        from skyvern.forge.sdk.copilot.tools.run_execution import _summarize_action_trace
+        from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
+        from skyvern.webeye.actions.actions import Action
+
+        wrc = _build_wrc_with_totp_seed()
+        expected_code = pyotp.TOTP(_RFC_TOTP_SEED).now()
+        recorded_actions: list[Action] = []
+
+        async def capture_actions(self: CodeBlockActionRecording, actions: list[Action]) -> None:
+            del self
+            recorded_actions.extend(actions)
+
+        monkeypatch.setattr(CodeBlockActionRecording, "persist", capture_actions)
+        result, _ = await _run_credential_code_block(
+            monkeypatch,
+            wrc,
+            code=f"code = await {_CREDENTIAL_KEY}.otp()\nraise Exception(code)",
+            label="otp_raise_payload",
+        )
+
+        for action in recorded_actions:
+            action.task_id = "task-otp"
+        mock_db = MagicMock()
+        mock_db.tasks = MagicMock()
+        mock_db.tasks.get_recent_actions_for_tasks = AsyncMock(return_value=recorded_actions)
+
+        class _AppStub:
+            DATABASE = mock_db
+
+        monkeypatch.setattr(run_execution_module, "app", _AppStub())
+        block = MagicMock(task_id="task-otp")
+        block_result = {
+            "label": "otp_raise_payload",
+            "block_type": "code",
+            "status": "failed",
+            "failure_reason": result.failure_reason,
+        }
+        await _attach_action_traces([block], [block_result], _ORG_ID)
+        action_trace_summary = _summarize_action_trace(block_result["action_trace"])
+        del block_result["action_trace"]
+        payload = build_run_blocks_response(
+            False,
+            {
+                "workflow_run_id": _WORKFLOW_RUN_ID,
+                "overall_status": "failed",
+                "failure_reason": result.failure_reason,
+                "blocks": [block_result],
+                "action_trace_summary": action_trace_summary,
+            },
+        )
+        sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", payload)
+        serialized = json.dumps(sanitized)
+
+        assert expected_code not in serialized
+        assert _RFC_TOTP_SEED not in serialized
+        assert "code_line" in serialized
 
     @pytest.mark.asyncio
     async def test_legacy_totp_not_leaked_in_failure_reason(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1906,6 +2072,275 @@ class TestIsSafeCodeClassStatements:
         is_safe_script_code("class Weird(metaclass=type):\n    pass")
 
 
+class TestCodeBlockMagicLink:
+    """SKY-14056: a credential can request an emailed sign-in link and open it."""
+
+    @staticmethod
+    def _patch_poll(monkeypatch: pytest.MonkeyPatch, wrc, polled, *, raises: BaseException | None = None):
+        from skyvern.forge.sdk.workflow.models import block as block_module
+
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        captured: dict[str, object] = {}
+
+        async def fake_poll(**kwargs: object):
+            captured.update(kwargs)
+            if raises is not None:
+                raise raises
+            return polled
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_polls_for_a_link_and_navigates_once_without_filling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/signin?token=" + "z" * 900
+        wrc = _build_wrc_with_identifier()
+        captured = self._patch_poll(monkeypatch, wrc, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+
+        navigations: list[str] = []
+        fills: list[object] = []
+
+        page = _fake_code_block_page(navigations=navigations, fills=fills)
+
+        magic_link = _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)
+        await magic_link(page)
+
+        assert captured["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert navigations == [link]
+        assert fills == []
+
+    @pytest.mark.asyncio
+    async def test_anchors_created_after_at_call_time_not_run_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.forge.sdk.workflow.models.block import _bind_code_block_magic_link
+        from skyvern.services.otp_service import OTPValue
+
+        wrc = _build_wrc_with_identifier()
+        captured = self._patch_poll(
+            monkeypatch, wrc, OTPValue(value="https://example.com/go?t=1", type=OTPType.MAGIC_LINK)
+        )
+
+        page = _fake_code_block_page()
+
+        await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+        from skyvern.services.otp_service import MAGIC_LINK_ANCHOR_GRACE
+
+        # A link minted earlier in the run may already be spent, so the run-start anchor
+        # the code path uses would re-serve it.
+        anchor = captured["created_after"]
+        assert anchor > _FakeWorkflowRun().started_at
+        # Naive UTC, which is what the DB column and the inbox cutoff are both compared against.
+        # A local-clock anchor drifts by the host's offset: east of UTC it filters out every
+        # delivery, west of UTC it re-opens the window this anchor exists to close.
+        assert anchor.tzinfo is None
+        expected_anchor = datetime.now(timezone.utc).replace(tzinfo=None) - MAGIC_LINK_ANCHOR_GRACE
+        assert abs((anchor - expected_anchor).total_seconds()) < 30
+
+    @pytest.mark.asyncio
+    async def test_a_seed_only_credential_fails_closed_naming_the_missing_identifier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An authenticator seed can only mint a 6-digit code; navigating to one is nonsense."""
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_totp_seed()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        navigations: list[str] = []
+
+        page = _fake_code_block_page(navigations=navigations)
+
+        magic_link = _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)
+        with pytest.raises(CodeBlockOTPError) as excinfo:
+            await magic_link(page)
+
+        message = str(excinfo.value)
+        assert "email" in message.lower()
+        assert "authenticator" in message.lower()
+        assert navigations == []
+
+    @pytest.mark.asyncio
+    async def test_wrong_verb_reports_the_type_that_actually_arrived(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repair signal: a link-verb call against a code mailbox must not read as an empty inbox."""
+        import asyncio
+
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            # Stand in for the real poll: a code was seen and rejected for the requested type.
+            kwargs["raw_context"].observed_otp_types.add(OTPType.TOTP)
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        page = _fake_code_block_page()
+
+        with pytest.raises(CodeBlockOTPError) as excinfo:
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+        message = str(excinfo.value)
+        assert "magic_link" in message
+        assert "totp" in message
+        assert "otp()" in message
+
+    @pytest.mark.asyncio
+    async def test_code_verb_against_a_link_mailbox_reports_the_mismatch_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _resolve_code_block_otp
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            kwargs["email_context"].observed_otp_types.add(OTPType.MAGIC_LINK)
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        with pytest.raises(CodeBlockOTPError) as excinfo:
+            await _resolve_code_block_otp(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, budget_seconds=120)
+
+        message = str(excinfo.value)
+        assert "magic_link" in message
+        assert "totp" in message
+
+    @pytest.mark.asyncio
+    async def test_a_silent_mailbox_still_reports_a_plain_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No mismatch was observed, so the message must not invent one."""
+        import asyncio
+
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        async def fake_get_workflow_run(*args: object, **kwargs: object) -> _FakeWorkflowRun:
+            return _FakeWorkflowRun()
+
+        async def fake_poll(**kwargs: object):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(
+            block_module.app.DATABASE.workflow_runs, "get_workflow_run", fake_get_workflow_run, raising=False
+        )
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        page = _fake_code_block_page()
+
+        with pytest.raises(CodeBlockOTPError, match="was not received within"):
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(page)
+
+    @pytest.mark.asyncio
+    async def test_a_page_of_the_blocks_own_making_is_refused_before_polling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Authored code passes the page in, so an impostor would otherwise receive the link."""
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        polls: list[object] = []
+
+        async def fake_poll(**kwargs: object):
+            polls.append(kwargs)
+            return None
+
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        captured: list[str] = []
+
+        class _Impostor:
+            async def goto(self, url: str, **kwargs: object) -> None:
+                captured.append(url)
+
+        with pytest.raises(CodeBlockOTPError, match="requires the code block's page"):
+            await _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID)(_Impostor())
+
+        # Refused before the link is even resolved, so nothing was there to capture.
+        assert captured == []
+        assert polls == []
+
+    @pytest.mark.asyncio
+    async def test_a_forgery_carrying_page_capabilities_is_still_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Authored code can define a class, so a capability check is satisfiable; identity is not."""
+        from skyvern.forge.sdk.workflow.models import block as block_module
+        from skyvern.forge.sdk.workflow.models.block import CodeBlockOTPError, _bind_code_block_magic_link
+
+        wrc = _build_wrc_with_identifier()
+        _patch_context_resolution(monkeypatch, wrc)
+
+        polls: list[object] = []
+
+        async def fake_poll(**kwargs: object):
+            polls.append(kwargs)
+            return None
+
+        monkeypatch.setattr(block_module.otp_service, "poll_otp_value", fake_poll)
+
+        captured: list[str] = []
+
+        class _Forgery:
+            """Carries every capability is_page_like requires, plus a goto that keeps the link."""
+
+            main_frame = None
+            context = None
+
+            def bring_to_front(self) -> None:
+                return None
+
+            def evaluate(self, *args: object, **kwargs: object) -> None:
+                return None
+
+            async def goto(self, url: str, **kwargs: object) -> None:
+                captured.append(url)
+
+        real_page = _fake_code_block_page()
+        bound = _bind_code_block_magic_link(_CREDENTIAL_KEY, _ORG_ID, _WORKFLOW_RUN_ID, expected_page=real_page)
+
+        with pytest.raises(CodeBlockOTPError, match="requires the code block's page"):
+            await bound(_Forgery())
+
+        assert captured == []
+        assert polls == []
+
+
 class TestCodeBlockTemplateSecretScoping:
     """Template data carries secrets only for credential parameters the block declares (SKY-14047),
     mirroring the execution namespace, so a block cannot render another block's credential."""
@@ -1988,3 +2423,80 @@ class TestCodeBlockTemplateSecretScoping:
         assert "ph_p2" not in template_data
         assert not any(key.endswith("_real_password") for key in template_data)
         assert template_data[self.UNDECLARED_KEY]["password"] == "ph_p2"
+
+
+class TestFailedReadinessWaitPropagates:
+    @staticmethod
+    def _page_whose_readiness_wait_times_out() -> object:
+        class TimingOutLocator:
+            async def wait_for(self, **kwargs: object) -> None:
+                raise PlaywrightTimeoutError(
+                    'Locator.wait_for: Timeout 30000ms exceeded.\nwaiting for locator("body") to be visible'
+                )
+
+        page = MagicMock(spec=Page)
+        page.locator = lambda _selector: TimingOutLocator()
+        return page
+
+    async def _execute(self, monkeypatch: pytest.MonkeyPatch, code: str) -> tuple[object, list[object]]:
+        page = self._page_whose_readiness_wait_times_out()
+
+        class ReadyBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+
+            async def get_working_page(self) -> object:
+                return page
+
+        persisted: list[object] = []
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> ReadyBrowserState:
+            return ReadyBrowserState()
+
+        async def record_output(self: object, ctx: object, run_id: object, value: object) -> None:
+            persisted.append(value)
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(
+            CodeBlock, "get_workflow_run_context", lambda self, run_id: FakeWorkflowRunContext(values={})
+        )
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        now = datetime.now(timezone.utc)
+        block = CodeBlock(
+            label="read_summary",
+            code=code,
+            output_parameter=OutputParameter(
+                parameter_type=ParameterType.OUTPUT,
+                key="read_summary_output",
+                description="test output",
+                output_parameter_id="op_read_summary",
+                workflow_id="w_test",
+                created_at=now,
+                modified_at=now,
+            ),
+        )
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+        return result, persisted
+
+    @pytest.mark.asyncio
+    async def test_failed_readiness_wait_fails_the_run_without_a_derived_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, persisted = await self._execute(
+            monkeypatch,
+            'await page.locator("body").wait_for(state="visible", timeout=30000)\n'
+            'return {"summary": "24 results found"}\n',
+        )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "24 results found" not in json.dumps(persisted)
+        assert all(value in (None, {}) for value in persisted)

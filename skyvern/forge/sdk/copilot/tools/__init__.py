@@ -30,7 +30,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.pending_operation import pending_operation
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    enqueue_screenshot_from_result,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import (
@@ -85,6 +90,7 @@ from .composition_capture import _composition_visual_handler as _composition_vis
 from .composition_capture import _composition_visual_prompt as _composition_visual_prompt
 from .composition_capture import (
     _inspect_page_for_composition_impl,
+    _model_facing_inspect_result,
 )
 from .composition_capture import _normalized_inspect_url as _normalized_inspect_url
 from .composition_capture import _same_inspect_target as _same_inspect_target
@@ -120,6 +126,7 @@ from .frontier import _SKYVERN_TEMPLATE_CONTEXT_ROOTS as _SKYVERN_TEMPLATE_CONTE
 from .frontier import _TEMPLATE_BUILTIN_ROOTS as _TEMPLATE_BUILTIN_ROOTS
 from .frontier import _detect_stale_block_metadata as _detect_stale_block_metadata
 from .frontier import _find_invalidated_labels as _find_invalidated_labels
+from .frontier import _frontier_runtime_page_url as _frontier_runtime_page_url
 from .frontier import _get_prior_workflow as _get_prior_workflow
 from .frontier import _get_prior_workflow_definition as _get_prior_workflow_definition
 from .frontier import _invalidate_verified_state_on_edit as _invalidate_verified_state_on_edit
@@ -163,6 +170,7 @@ from .run_execution import RUN_BLOCKS_STAGNATION_WINDOW_SECONDS as RUN_BLOCKS_ST
 from .run_execution import WatchdogExitReason as WatchdogExitReason
 from .run_execution import _any_quiet_block_requested as _any_quiet_block_requested
 from .run_execution import _attach_action_traces as _attach_action_traces
+from .run_execution import _block_end_urls_by_label as _block_end_urls_by_label
 from .run_execution import _cancel_run_task_if_not_final as _cancel_run_task_if_not_final
 from .run_execution import _composition_anti_bot_reason as _composition_anti_bot_reason
 from .run_execution import _detect_non_retriable_nav_error as _detect_non_retriable_nav_error
@@ -172,9 +180,7 @@ from .run_execution import (
 )
 from .run_execution import _progress_marker as _progress_marker
 from .run_execution import _read_progress_sources as _read_progress_sources
-from .run_execution import (
-    _record_diagnosis_repair_contract,
-)
+from .run_execution import _record_diagnosis_repair_contract as _record_diagnosis_repair_contract
 from .run_execution import _record_run_blocks_result as _record_run_blocks_result
 from .run_execution import (
     _run_blocks_and_collect_debug,
@@ -182,11 +188,12 @@ from .run_execution import (
     _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
-from .run_execution import _watchdog_user_failure_reason as _watchdog_user_failure_reason
+from .run_execution import (
+    finalize_build_test_result,
+)
 from .scouting import _MAX_SCOUTED_INTERACTIONS as _MAX_SCOUTED_INTERACTIONS
 from .scouting import _capture_accessible_role_name as _capture_accessible_role_name
-from .scouting import _capture_scout_ambiguity as _capture_scout_ambiguity
-from .scouting import _capture_scout_role_name as _capture_scout_role_name
+from .scouting import _capture_scout_pre_action as _capture_scout_pre_action
 from .scouting import _capture_scout_source_url as _capture_scout_source_url
 from .scouting import _clear_pending_browser_interaction_observation as _clear_pending_browser_interaction_observation
 from .scouting import (
@@ -292,12 +299,13 @@ async def update_workflow_tool(
             _mark_credential_deferred_draft(copilot_ctx, result)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
-        if result.get("ok") is False:
-            _record_diagnosis_repair_contract(
-                copilot_ctx,
-                source_tool="update_workflow",
-                result=result,
-            )
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="update_workflow",
+            result=result,
+            workflow_updated=result.get("ok") is True,
+            diagnosis_shadow_eligible=result.get("ok") is False,
+        )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
@@ -328,8 +336,13 @@ async def _persist_block_scoped_edit(
         result = await _update_workflow(params, copilot_ctx)
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-        if result.get("ok") is False:
-            _record_diagnosis_repair_contract(copilot_ctx, source_tool=tool_name, result=result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool=tool_name,
+            result=result,
+            workflow_updated=result.get("ok") is True,
+            diagnosis_shadow_eligible=result.get("ok") is False,
+        )
     return json.dumps(sanitize_tool_result_for_llm(tool_name, result))
 
 
@@ -363,7 +376,14 @@ async def edit_block_tool(
     arguments = {"label": label, "fields": fields, "has_code_edit": expected_code is not None}
     authority_error = _authority_tool_error(copilot_ctx, "edit_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     try:
         workflow_yaml = apply_block_edit(
             _stored_workflow_yaml(copilot_ctx),
@@ -375,8 +395,129 @@ async def edit_block_tool(
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "edit_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block", result))
     return await _persist_block_scoped_edit(copilot_ctx, "edit_block", workflow_yaml, arguments)
+
+
+@function_tool(
+    name_override="edit_block_and_run",
+    timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
+    strict_mode=False,
+)
+async def edit_block_and_run_tool(
+    ctx: RunContextWrapper,
+    label: str,
+    expected_code: str,
+    replacement_code: str,
+    block_labels: list[str] | None = None,
+    parameters: dict[str, Any] | None = None,
+) -> str:
+    """Apply one anchored code edit and immediately test the affected frontier.
+
+    Use this for a repair to an existing code block. ``label`` must name exactly one existing block,
+    and ``expected_code`` must occur exactly once in its current stored code. The tool changes only
+    that code span, persists the reversible draft through the normal author-time safety boundary,
+    then runs ``block_labels`` (or just ``label`` when omitted).
+
+    This is one model-invoked edit and one run. It does not choose an edit, create a block, retry, or
+    decide whether the result achieved the user's goal. Its response is the same sanitized run/debug
+    evidence returned by ``run_blocks_and_collect_debug``; a failed run still leaves the edited draft
+    and recorded workflow run available for the next turn.
+
+    Pass current non-secret values for runtime workflow parameters in ``parameters``. For sensitive
+    values (password, secret, token, api_key, credential, totp, otp, one_time_code, private_key,
+    auth), do NOT pass an inline value. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with the raw value.
+    """
+    copilot_ctx = ctx.context
+    copilot_ctx.completion_verification_result = None
+    handler_start = time.monotonic()
+    requested_labels = list(block_labels) if block_labels else [label]
+    runtime_parameters = parameters or {}
+    arguments = {
+        "label": label,
+        "block_labels": requested_labels,
+        "parameters": runtime_parameters,
+        "has_code_edit": True,
+    }
+    skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "edit_block_and_run")
+    copilot_ctx.last_run_skipped_unbound_credentials = False
+    if label not in requested_labels:
+        result = {
+            "ok": False,
+            "error": f"block_labels must include the edited block {label!r} so this call tests the persisted repair.",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block_and_run", result))
+    authority_error = _authority_tool_error(copilot_ctx, "edit_block_and_run")
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "edit_block_and_run", authority_error)
+
+    _clear_pending_browser_interaction_observation(copilot_ctx)
+    try:
+        workflow_yaml = apply_block_edit(
+            _stored_workflow_yaml(copilot_ctx),
+            label,
+            expected_code=expected_code,
+            replacement_code=replacement_code,
+        )
+    except BlockEditError as exc:
+        result = {"ok": False, "error": str(exc)}
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=result,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("edit_block_and_run", result))
+
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    with copilot_span("edit_block_and_run.update", data={"yaml_length": len(workflow_yaml)}):
+        update_result = await _update_workflow(
+            {"workflow_yaml": workflow_yaml},
+            copilot_ctx,
+            allow_missing_credentials=skip_run_after_update,
+        )
+        _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
+    if not update_result.get("ok"):
+        record_tool_step_result_for_ctx(copilot_ctx, "edit_block_and_run", arguments, update_result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="edit_block_and_run",
+            result=update_result,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("update_workflow", update_result))
+
+    if skip_run_after_update:
+        return _credential_deferred_combined_tool_result(
+            copilot_ctx,
+            tool_name="edit_block_and_run",
+            arguments=arguments,
+            update_result=update_result,
+        )
+
+    return await _run_updated_workflow_blocks(
+        copilot_ctx,
+        tool_name="edit_block_and_run",
+        arguments=arguments,
+        update_result=update_result,
+        prior_definition=prior_definition,
+        block_labels=requested_labels,
+        parameters=runtime_parameters,
+        handler_start=handler_start,
+    )
 
 
 @function_tool(name_override="add_block", strict_mode=False)
@@ -400,13 +541,26 @@ async def add_block_tool(
     have to land in the same call, or the workflow is briefly saved in a state that cannot run. For a
     code block pass its `code_artifact_metadata` row here too, since a brand-new block has none yet.
 
+    Each workflow parameter is a flat object. For example:
+    `{"parameter_type": "workflow", "key": "billing_history_path",
+    "workflow_parameter_type": "string", "default_value": "BillingHistory.jsp"}`.
+    Inspect or run the saved workflow to obtain a useful editable default when
+    the page can reveal it; do not nest these fields under `workflow`.
+
     To change a block that already exists use edit_block; to remove one use delete_block.
     """
     copilot_ctx = ctx.context
     arguments = {"after_label": after_label, "parameters": parameters}
     authority_error = _authority_tool_error(copilot_ctx, "add_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="add_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("add_block", result))
     try:
         workflow_yaml = add_block_to_workflow(
             _stored_workflow_yaml(copilot_ctx),
@@ -417,7 +571,13 @@ async def add_block_tool(
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "add_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="add_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("add_block", result))
     return await _persist_block_scoped_edit(
         copilot_ctx,
         "add_block",
@@ -439,13 +599,26 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
     arguments = {"label": label}
     authority_error = _authority_tool_error(copilot_ctx, "delete_block")
     if authority_error:
-        return json.dumps({"ok": False, "error": authority_error})
+        result = {"ok": False, "error": authority_error}
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="delete_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     try:
         workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
     except BlockEditError as exc:
         result = {"ok": False, "error": str(exc)}
         record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
-        return json.dumps(result)
+        finalize_build_test_result(
+            copilot_ctx,
+            source_tool="delete_block",
+            result=result,
+            diagnosis_shadow_eligible=False,
+        )
+        return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     return await _persist_block_scoped_edit(copilot_ctx, "delete_block", workflow_yaml, arguments)
 
 
@@ -586,14 +759,17 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     These are OAuth connections made on the Integrations page, NOT the stored
     login credentials returned by `list_credentials` — the two lists are disjoint,
     so check this one before concluding the user has no Google or Microsoft access.
-    Blocks such as `google_sheets_write` take a `connection_id` from here directly
-    as their credential field. Not paginated; one call returns every connection.
+    Prefer a purpose-built native integration block over automating that connected
+    service through its browser UI. For Google Sheets, call `get_block_schema` for
+    `google_sheets_read` or `google_sheets_write`, then pass an active compatible
+    connection's `connection_id` as the block's `credential_id`. Not paginated; one
+    call returns every connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
-    fails at run time. Only a connection whose `state` is `active` can be used — an
-    expired grant stays listed so you can ask the user to reconnect that account
-    rather than tell them nothing is connected.
+    fails at run time. A connection whose `state` is `active` can mint an access token.
+    A connection whose `state` is `error` remains listed but cannot mint one until it
+    is authorized again.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -624,11 +800,15 @@ async def run_blocks_tool(
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
 
-    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
-    If the complaint has no prior edit goal, inspect current workflow context
-    and existing run evidence before deciding whether a fresh run is needed.
-    If prior context establishes a resolvable edit, use `update_and_run_blocks`
-    instead of rerunning unchanged blocks.
+    If an existing saved block can establish the state you need, run that
+    block unchanged before scouting the resulting page. In particular, a saved
+    login block can use its bound credential during the workflow run even when
+    that credential is not authorized for direct debug-browser filling.
+
+    For diagnostic complaints with no prior edit goal, inspect the current
+    workflow and existing run evidence before deciding whether a fresh run is
+    needed. If prior context establishes a resolvable edit, use
+    `update_and_run_blocks` instead of rerunning unchanged blocks.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
@@ -638,8 +818,9 @@ async def run_blocks_tool(
     credential, totp, otp, one_time_code, private_key, auth) — call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`; stop and follow the CREDENTIAL
-    HANDLING refusal rule in the system prompt.
+    the inline value via `parameters`. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with
+    the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps before
     changing the workflow. If visible state is uncertain, inspect the live
@@ -655,9 +836,12 @@ async def run_blocks_tool(
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
+    # No definition change on this path, so the frontier never reaches the edit-in-place branch
+    # and a live page read would be spent on nothing.
+    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, prior_definition
     )
+    copilot_ctx.frontier_start_provenance = start_provenance
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(
@@ -668,21 +852,26 @@ async def run_blocks_tool(
             copilot_ctx,
         ),
     ):
-        result = await _run_blocks_and_collect_debug(
-            arguments,
-            copilot_ctx,
-            labels_to_execute=labels_to_execute,
-            block_outputs_to_seed=block_outputs_to_seed,
-            frontier_start_label=frontier_start_label,
-        )
+        with pending_operation("tool.run_blocks_and_collect_debug"):
+            result = await _run_blocks_and_collect_debug(
+                arguments,
+                copilot_ctx,
+                labels_to_execute=labels_to_execute,
+                block_outputs_to_seed=block_outputs_to_seed,
+                frontier_start_label=frontier_start_label,
+            )
         await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
             result=result,
         )
-        enqueue_screenshot_from_result(copilot_ctx, result)
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            result,
+            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+        )
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
     return json.dumps(sanitized)
@@ -729,6 +918,10 @@ async def update_and_run_blocks_tool(
     parameters: dict[str, Any] | None = None,
 ) -> Any:
     """Update the workflow YAML and immediately run the specified blocks in one step.
+    This persists the workflow and remotely executes the selected frontier, waiting for it to
+    finish, so it is materially higher latency than a bounded page read. It is the surface for
+    testing durable behaviour, and for reaching a state that only execution can establish --
+    authentication, a credential or OTP step, or state an upstream block creates.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
 
@@ -741,10 +934,9 @@ async def update_and_run_blocks_tool(
     reusable domain value the user supplies, not the page widget or action used
     to enter it.
 
-    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
-    A complaint with no prior edit goal needs context inspection or
-    clarification first. A diagnostic follow-up after an explicit edit goal may
-    update/run once the correction is clear.
+    For diagnostic complaints with no prior edit goal, inspect the current
+    workflow and run evidence first. A diagnostic follow-up after an explicit
+    edit goal may update and run once the correction is clear.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
@@ -754,8 +946,9 @@ async def update_and_run_blocks_tool(
     credential, totp, otp, one_time_code, private_key, auth) — call
     `list_credentials` and use a credential parameter whose default_value is
     the stored `credential_id`. If no stored credential matches, do NOT pass
-    the inline value via `parameters`; stop and follow the CREDENTIAL
-    HANDLING refusal rule in the system prompt.
+    the inline value via `parameters`. Ask the user to store it as a saved
+    credential and reply with the credential name; do not build or run with
+    the raw value.
 
     Use browser inspection and run evidence to fill knowledge gaps while
     building, editing, or debugging the workflow. Do not invent URL params,
@@ -824,7 +1017,7 @@ async def update_and_run_blocks_tool(
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
-        _record_diagnosis_repair_contract(
+        finalize_build_test_result(
             copilot_ctx,
             source_tool="update_and_run_blocks",
             result=update_result,
@@ -833,40 +1026,84 @@ async def update_and_run_blocks_tool(
         return json.dumps(sanitized)
 
     if skip_run_after_update:
-        copilot_ctx.last_run_skipped_unbound_credentials = True
-        skip_message = "Skipped test run: required credentials are not configured."
-        skip_result = {
-            "ok": True,
-            "message": skip_message,
-            "data": {
-                "block_count": copilot_ctx.last_update_block_count,
-                "workflow_updated": True,
-                "skipped_run": True,
-                "skip_reason": "workflow_credential_inputs_unbound",
-            },
-        }
-        carry_author_time_findings(update_result, skip_result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
-        _record_diagnosis_repair_contract(
+        return _credential_deferred_combined_tool_result(
             copilot_ctx,
-            source_tool="update_and_run_blocks",
-            result=skip_result,
-            workflow_updated=True,
+            tool_name="update_and_run_blocks",
+            arguments=arguments,
+            update_result=update_result,
         )
-        LOG.info(
-            "update_and_run_blocks skipped run on unbound credential workflow inputs",
-            workflow_permanent_id=copilot_ctx.workflow_permanent_id,
-        )
-        return json.dumps(skip_result)
 
-    # Step 2: Compute frontier and run the blocks.
+    return await _run_updated_workflow_blocks(
+        copilot_ctx,
+        tool_name="update_and_run_blocks",
+        arguments=arguments,
+        update_result=update_result,
+        prior_definition=prior_definition,
+        block_labels=block_labels,
+        parameters=parameters or {},
+        handler_start=handler_start,
+    )
+
+
+def _credential_deferred_combined_tool_result(
+    copilot_ctx: CopilotContext,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    update_result: dict[str, Any],
+) -> str:
+    """Record a persisted draft when a combined edit/update cannot safely run yet."""
+    copilot_ctx.last_run_skipped_unbound_credentials = True
+    skip_result = {
+        "ok": True,
+        "message": "Skipped test run: required credentials are not configured.",
+        "data": {
+            "block_count": copilot_ctx.last_update_block_count,
+            "workflow_updated": True,
+            "skipped_run": True,
+            "skip_reason": "workflow_credential_inputs_unbound",
+        },
+    }
+    carry_author_time_findings(update_result, skip_result)
+    record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
+    finalize_build_test_result(
+        copilot_ctx,
+        source_tool=tool_name,
+        result=skip_result,
+        workflow_updated=True,
+    )
+    LOG.info(
+        "combined workflow tool skipped run on unbound credential workflow inputs",
+        tool_name=tool_name,
+        workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+    )
+    return json.dumps(sanitize_tool_result_for_llm(tool_name, skip_result))
+
+
+async def _run_updated_workflow_blocks(
+    copilot_ctx: CopilotContext,
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    update_result: dict[str, Any],
+    prior_definition: object | None,
+    block_labels: list[str],
+    parameters: dict[str, Any],
+    handler_start: float,
+) -> str:
+    """Run a just-persisted definition through the shared frontier and debug-evidence seam."""
     new_definition = None
     if copilot_ctx.last_workflow is not None:
         new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
 
-    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
-        copilot_ctx, block_labels, prior_definition, new_definition
+    labels_to_execute, block_outputs_to_seed, frontier_start_label, start_provenance = _plan_frontier(
+        copilot_ctx,
+        block_labels,
+        prior_definition,
+        new_definition,
+        await _frontier_runtime_page_url(copilot_ctx),
     )
+    copilot_ctx.frontier_start_provenance = start_provenance
     with copilot_span(
         "run_blocks",
         data=_run_blocks_span_data(
@@ -877,25 +1114,56 @@ async def update_and_run_blocks_tool(
             copilot_ctx,
         ),
     ):
-        run_result = await _run_blocks_and_collect_debug(
-            {"block_labels": block_labels, "parameters": parameters or {}},
-            copilot_ctx,
-            labels_to_execute=labels_to_execute,
-            block_outputs_to_seed=block_outputs_to_seed,
-            frontier_start_label=frontier_start_label,
-        )
+        with pending_operation("tool.update_and_run_blocks"):
+            run_result = await _run_blocks_and_collect_debug(
+                {"block_labels": block_labels, "parameters": parameters},
+                copilot_ctx,
+                labels_to_execute=labels_to_execute,
+                block_outputs_to_seed=block_outputs_to_seed,
+                frontier_start_label=frontier_start_label,
+            )
         await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         carry_author_time_findings(update_result, run_result)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
-        _record_diagnosis_repair_contract(
+        record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, run_result)
+        finalize_build_test_result(
             copilot_ctx,
-            source_tool="update_and_run_blocks",
+            source_tool=tool_name,
             result=run_result,
             workflow_updated=True,
         )
-        enqueue_screenshot_from_result(copilot_ctx, run_result)
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            run_result,
+            provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
+        )
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     return json.dumps(sanitized)
+
+
+def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: str) -> ScreenshotProvenance:
+    """Bind a run-result frame to the facts carried by the run payload.
+
+    Run execution returns its identity fields under ``data``. Some older call
+    sites and error paths still expose them at the top level, so retain that as
+    a factual fallback rather than stamping the frame as unidentified.
+    """
+    data = result.get("data")
+    facts = data if isinstance(data, dict) else {}
+
+    def _string_fact(key: str) -> str | None:
+        value = facts.get(key)
+        if not isinstance(value, str) or not value:
+            value = result.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return ScreenshotProvenance(
+        source_tool=source_tool,
+        captured_url=_string_fact("current_url"),
+        observation_step=None,
+        browser_session_id=_string_fact("browser_session_id"),
+        workflow_run_id=_string_fact("workflow_run_id"),
+        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+    )
 
 
 @function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)
@@ -940,11 +1208,18 @@ async def inspect_page_for_composition_tool(
 ) -> str:
     """Inspect a known page before composing form/search workflow blocks.
 
+    This is a bounded read of known or current page state: it is the surface for uncertainty about
+    controls, selectors, visible state or layout, where no workflow execution is required.
     Use this after the entrypoint URL is known and before authoring blocks that
     fill fields, submit searches, filter results, or expand result rows. It
     can also inspect the current browser page after a run by passing
     target_url="current_page"; use that after partial/budgeted runs so you do
-    not replay a search that already advanced the page.
+    not replay a search that already advanced the page. Passing any other
+    `target_url` navigates the live browser there and reports the reached
+    `current_url`, so a further `navigate_browser` to that same URL is redundant. The packet
+    describes the page only as it is at that moment: a control that appears solely after an
+    interaction -- a Delete control after an Add click, a cart after add-to-cart, the secure area
+    after login -- is absent from it until that interaction has happened.
 
     Returns observed page evidence: current URL, title, navigation targets, form
     fields with labels and selectors, submit/search controls, result containers,
@@ -953,10 +1228,12 @@ async def inspect_page_for_composition_tool(
     `observation_step` is the side-channel id to pass in `block_observation_refs`
     when a newly authored block acts on this observed page. Do NOT paste the
     evidence into workflow YAML; use it to ground concise block prompts. If a
-    block run changes pages, inspect the reached page before authoring downstream
-    form/search/result blocks. If the
-    evidence shows required fields or controls that the user did not supply
-    enough information for, ASK_QUESTION with that observed missing input. If
+    select reports `options_omitted=true`, `option_count` is the observed total and
+    its selector remains available. If those options are needed, use one existing
+    `evaluate` call to read only that select; do not repeat the full-page inspection.
+    If a block run changes pages, inspect the reached page before authoring downstream
+    form/search/result blocks. If the evidence shows required fields or controls that
+    the user did not supply enough information for, ASK_QUESTION with that observed missing input. If
     evidence is sufficient, compose and run workflow blocks from the observed fields.
     `challenge_state` reports what the page looks like, which is not what a run will do:
     it does not establish that a submit/search path is closed, and a run settles that.
@@ -978,7 +1255,8 @@ async def inspect_page_for_composition_tool(
             data["requested_output_designations"] = verified
             if unverified:
                 data["unverified_output_designations"] = unverified
-    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+    scrubbed_result = scrub_secrets_from_structure(ctx.context, result)
+    return json.dumps(_model_facing_inspect_result(scrubbed_result))
 
 
 @function_tool(name_override="fill_credential_field", strict_mode=False)
@@ -987,6 +1265,7 @@ async def fill_credential_field_tool(
     selector: str,
     credential_id: str,
     field: str,
+    submit_selector: str | None = None,
 ) -> str:
     """Fill ONE field of a SAVED credential into the live debug browser during code-only scouting.
 
@@ -997,6 +1276,17 @@ async def fill_credential_field_tool(
     OTP credentials are not filled during scouting because scouting has no
     workflow run/task context for safe polling.
 
+    The result's `readback_outcome` reports what the field held right after the fill —
+    `exact_match`, `different` (the field holds something other than what was typed),
+    `empty`, or `unavailable` (the field could not be read) — and only `empty` fails
+    the fill; decide from that outcome whether the page still needs another action.
+    An `empty` readback still succeeds when `landing_inferred_from_navigation` is true:
+    the page left the one the fill acted on, so the field was cleared by its own submit.
+
+    Do not use this tool to reproduce an existing saved login block. Run that
+    block unchanged with `run_blocks_and_collect_debug`, then inspect the page
+    it reaches; the block's bound credential resolves in the workflow run.
+
     `selector` must be a CSS selector for the exact input field (no comma-union
     fallbacks — inspect the page first and target the proven field).
     `credential_id`: when a page observation returns
@@ -1005,8 +1295,24 @@ async def fill_credential_field_tool(
     `candidate_login_credentials`, ask the user which one to use and pass the
     `credential_id` they choose. `field` is one of `username`, `password`, `totp`.
 
-    This tool only fills; it never clicks or submits. Each successful fill is
-    recorded as a scouted interaction with the credential identity and field.
+    `submit_selector` is optional and submits in the SAME call: pass the CSS
+    selector of the form's submit control and this tool clicks it once the fill
+    has been typed, including when the field could not be read back. The one case
+    it does not click is a `totp` field that reads back holding something else,
+    because submitting a code the field does not hold voids it. The
+    result's `submitted` says outright whether the control was clicked; when it is
+    false, `submit_skipped` or `submit_error` says why, and the code is still
+    waiting to be submitted. A selector matching more than one control is not
+    clicked at all rather than guessed between. A one-time code expires in
+    seconds, so for `field="totp"` always
+    inspect the page for the submit control FIRST and pass its selector here —
+    submitting on a later turn can send an already-expired code. Take that
+    selector from `inspect_page_for_composition`, which you have already run on
+    the sign-in page; this tool's own `form_submit_controls` is reported only when
+    nothing was submitted, so it cannot supply the selector for the same call. Omit `submit_selector` and the
+    tool fills only; it never clicks on its own. Each successful fill is recorded
+    as a scouted interaction with the credential identity and field, and an
+    in-call submit is recorded as the click that followed it.
 
     In model-authored code blocks, one-time codes resolve via two paths:
     **credential-bound:** `await <parameter_key>.otp()` for a saved credential whose
@@ -1020,13 +1326,14 @@ async def fill_credential_field_tool(
     address string to `otp()` and ensure an active Gmail or Outlook connection exists
     for that mailbox.
     """
-    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
+    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field, submit_selector)
     return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
 NATIVE_TOOLS = [
     update_workflow_tool,
     edit_block_tool,
+    edit_block_and_run_tool,
     add_block_tool,
     delete_block_tool,
     list_credentials_tool,

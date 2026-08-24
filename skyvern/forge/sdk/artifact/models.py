@@ -28,6 +28,7 @@ class ArtifactType(StrEnum):
     SCREENSHOT_ACTION = "screenshot_action"
     SCREENSHOT_FINAL = "screenshot_final"
     SCREENSHOT_PROXY = "screenshot_proxy"
+    SCREENSHOT_PRE_SUBMIT = "screenshot_pre_submit"
 
     LLM_PROMPT = "llm_prompt"
     LLM_REQUEST = "llm_request"
@@ -51,6 +52,8 @@ class ArtifactType(StrEnum):
     # USE THESE for htmls
     HTML_SCRAPE = "html_scrape"
     HTML_ACTION = "html_action"
+    # Task V3: the page as it stood immediately before a submit-shaped action, form state reflected.
+    HTML_PRE_SUBMIT = "html_pre_submit"
 
     # Debugging
     TRACE = "trace"
@@ -70,6 +73,9 @@ class ArtifactType(StrEnum):
 
     # Files downloaded by the browser during a run (stored in the uploads bucket, not the artifacts bucket).
     DOWNLOAD = "download"
+
+    # Read-side sentinel for a row written by a newer image; never written.
+    UNKNOWN = "unknown"
 
 
 class Artifact(BaseModel):

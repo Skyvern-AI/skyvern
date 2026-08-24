@@ -8,6 +8,7 @@ import structlog
 import yaml
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.credential_resolution import (
     credential_reference_spans,
     grounded_credential_references,
@@ -21,7 +22,9 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     saved_credential_ids,
     workflow_blocks,
 )
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -39,6 +42,11 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
     def visit(item: Any) -> None:
         if isinstance(item, str):
             found.extend(_CREDENTIAL_ID_RE.findall(item))
+            # Google connection IDs are accepted only as an exact structured slot value. Do not
+            # search prose for them: account authority comes from a verified click or persisted
+            # workflow binding, and this extractor is only the later existence-validation seam.
+            if item.startswith("goac_"):
+                found.append(item)
         elif isinstance(item, dict):
             for nested in item.values():
                 visit(nested)
@@ -242,7 +250,11 @@ def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[st
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
-    return resolved | _saved_workflow_credential_ids(request_policy)
+    return (
+        resolved
+        | _saved_workflow_credential_ids(request_policy)
+        | set(request_policy.run_approved_google_connection_ids)
+    )
 
 
 def _credential_run_approval_error(credential_ids: list[str], request_policy: RequestPolicy | None) -> str | None:
@@ -255,13 +267,73 @@ def _credential_run_approval_error(credential_ids: list[str], request_policy: Re
     return _unapproved_credential_reference_tool_error(unapproved_ids)
 
 
+def _credential_run_approval_blocker_signal(
+    credential_ids: list[str], request_policy: RequestPolicy | None
+) -> CopilotToolBlockerSignal | None:
+    approved_ids = _approved_run_credential_ids(request_policy)
+    unapproved_google_ids = [
+        credential_id
+        for credential_id in credential_ids
+        if credential_id.startswith("goac_") and credential_id not in approved_ids
+    ]
+    if not unapproved_google_ids:
+        return None
+    return CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text="Ask the user to choose one of the server-provided connected Google accounts.",
+        user_facing_reason=(
+            "Choose one of the connected Google accounts below so I can run the workflow. "
+            "Reconnect any unavailable account on the Integrations page first."
+        ),
+        recovery_hint="ask_user_clarifying",
+        preserves_workflow_draft=True,
+        internal_reason_code="unapproved_google_connection_reference",
+        blocked_tool="update_and_run_blocks",
+    )
+
+
+async def _server_verified_google_account_choices(
+    organization_id: str,
+) -> list[ConnectedAccountChoice] | None:
+    try:
+        visible = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+    except Exception:
+        LOG.warning(
+            "copilot_connected_account_recovery_lookup_failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return None
+    choices = [
+        ConnectedAccountChoice(
+            connection_id=credential.id,
+            name=credential.credential_name,
+            state=credential.state,
+            email_address=credential.email_address,
+        )
+        for credential in visible
+    ]
+    return choices or None
+
+
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
     if not credential_ids:
         return None
+    google_connection_ids = [credential_id for credential_id in credential_ids if credential_id.startswith("goac_")]
+    password_credential_ids = [
+        credential_id for credential_id in credential_ids if not credential_id.startswith("goac_")
+    ]
     try:
-        existing_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
-            credential_ids,
-            organization_id=ctx.organization_id,
+        existing_credentials = (
+            await app.DATABASE.credentials.get_credentials_by_ids(
+                password_credential_ids,
+                organization_id=ctx.organization_id,
+            )
+            if password_credential_ids
+            else []
+        )
+        active_google_connections = (
+            await google_oauth_service.get_credentials_for_org(ctx.organization_id) if google_connection_ids else []
         )
     except Exception:
         LOG.warning(
@@ -276,11 +348,20 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
             "workflow that will not be run until credentials are available."
         )
 
-    found_ids = {credential.credential_id for credential in existing_credentials}
-    missing_ids = [credential_id for credential_id in credential_ids if credential_id not in found_ids]
-    if not missing_ids:
-        return None
-    return _missing_credential_reference_tool_error(missing_ids)
+    found_password_ids = {credential.credential_id for credential in existing_credentials}
+    missing_password_ids = [
+        credential_id for credential_id in password_credential_ids if credential_id not in found_password_ids
+    ]
+    if missing_password_ids:
+        return _missing_credential_reference_tool_error(missing_password_ids)
+    active_google_ids = {connection.id for connection in active_google_connections}
+    if any(connection_id not in active_google_ids for connection_id in google_connection_ids):
+        return (
+            "The selected Google account is unavailable or needs to be reconnected. "
+            "Stop before running the workflow and ask the user to reconnect or select an active account "
+            "on the Integrations page."
+        )
+    return None
 
 
 async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
@@ -303,6 +384,25 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
         if credential.totp_identifier:
             entry["totp_identifier"] = credential.totp_identifier
+        if credential.totp_type in {TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT}:
+            scouting: dict[str, Any]
+            if credential.totp_type == TotpType.AUTHENTICATOR:
+                scouting = {
+                    "tool": "fill_credential_field",
+                    "credential_id": credential.credential_id,
+                    "field": "totp",
+                }
+            else:
+                scouting = {"available": False, "reason": "workflow_run_context_required"}
+            entry["one_time_code"] = {
+                "available": True,
+                "source": str(credential.totp_type),
+                "scouting": scouting,
+                "code": {
+                    "workflow_parameter_type": "credential_id",
+                    "accessor": "await <credential_parameter_key>.otp()",
+                },
+            }
     elif credential.card_last4:
         entry["card_last_four"] = credential.card_last4
         entry["card_brand"] = credential.card_brand

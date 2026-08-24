@@ -41,7 +41,15 @@ export function formatElapsed(
   if (sec < 60) {
     return `${sec}s`;
   }
-  return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  if (sec < 3600) {
+    return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+  }
+  // Without these, a long run reads as raw minutes — a 40-day run rendered
+  // "58403m 52s", which is unreadable exactly when elapsed matters most.
+  if (sec < 86400) {
+    return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+  }
+  return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
 }
 
 // The elapsed value's hover tooltip: the full created/queued/started/finished

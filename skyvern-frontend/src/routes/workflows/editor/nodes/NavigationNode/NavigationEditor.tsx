@@ -76,10 +76,16 @@ function NavigationEditorBody({
     ? [
         RunEngine.SkyvernV1,
         RunEngine.SkyvernV2,
+        RunEngine.SkyvernV3,
         RunEngine.OpenaiCua,
         RunEngine.AnthropicCua,
       ]
-    : [RunEngine.SkyvernV1, RunEngine.OpenaiCua, RunEngine.AnthropicCua];
+    : [
+        RunEngine.SkyvernV1,
+        RunEngine.SkyvernV3,
+        RunEngine.OpenaiCua,
+        RunEngine.AnthropicCua,
+      ];
   const hasInteracted = useHasInteractedThisSession();
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,

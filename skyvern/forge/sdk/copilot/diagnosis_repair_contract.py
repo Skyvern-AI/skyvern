@@ -19,6 +19,10 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
+    run_challenge_is_runtime_clearable,
+    run_id_from_result_data,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
@@ -31,7 +35,6 @@ _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
 _CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
 _REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE"}
-_TERMINAL_ANTI_BOT_TERMS = ("captcha", "challenge", "verification", "anti-bot", "anti bot", "turnstile")
 _AUTHORING_REPAIR_SIGNATURE_VERSION = "authoring_repair_context:v1"
 _AUTHORING_REPAIR_CATEGORY = "CODE_AUTHORING_REPAIR"
 
@@ -170,6 +173,7 @@ def build_diagnosis_repair_contract(
         result,
         data,
         repair_context,
+        challenge_runtime_clearable=run_challenge_is_runtime_clearable(ctx, run_id_from_result_data(data)),
     )
     next_action = _next_action(failure_type, ctx, data, repair_context)
     frontier = _safe_str(data.get("frontier_start_label"))
@@ -328,14 +332,13 @@ def _repair_context_root_cause_identity(
         payload["runtime_failure_class"] = runtime_failure_class
         payload["failed_block_status"] = _safe_text(repair_context.failed_block_status, 80)
         payload["current_origin"] = _safe_text(repair_context.current_origin, 120)
-        payload["current_url_present"] = repair_context.current_url_present
-        payload["current_title_present"] = repair_context.current_title_present
         payload["page_evidence_source"] = _safe_text(repair_context.page_evidence_source, 80)
         payload["observed_after_workflow_run"] = repair_context.observed_after_workflow_run
         payload["page_form_summaries"] = _safe_identity_list(repair_context.page_form_summaries)
         payload["page_result_summaries"] = _safe_identity_list(repair_context.page_result_summaries)
         payload["page_action_summaries"] = _safe_identity_list(repair_context.page_action_summaries)
         payload["page_challenge_summaries"] = _safe_identity_list(repair_context.page_challenge_summaries)
+        payload["page_obstruction_summaries"] = _safe_identity_list(repair_context.page_obstruction_summaries)
     elif reason_code == "runtime_missing_output_dependency":
         payload["missing_output_key"] = _safe_text(repair_context.missing_output_key, 120)
         payload["available_output_keys"] = _safe_identity_list(repair_context.available_output_keys)
@@ -426,13 +429,18 @@ def _failure_type(
     result: dict[str, Any],
     data: dict[str, Any],
     repair_context: CodeAuthoringRepairContext | None,
+    challenge_runtime_clearable: bool = False,
 ) -> DiagnosisFailureType:
+    # A paused run is waiting on a person, not failing: classifying it as a failure would tell the
+    # model to repair a workflow whose only problem is that nobody has approved it yet.
+    if (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
+        return DiagnosisFailureType.NO_FAILURE
     skip_reason = _safe_str(data.get("skip_reason"))
     if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     # Trusted challenge categories win over a clean-looking run status because
     # verified challenge evidence means the apparent success is not usable.
-    if terminal_challenge_categories:
+    if terminal_challenge_categories and not challenge_runtime_clearable:
         return DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
     category_set = set(categories)
     error_text = " ".join(
@@ -486,11 +494,16 @@ def _next_action(
         return RepairNextAction.STOP
     if ctx.last_test_non_retriable_nav_error:
         return RepairNextAction.STOP
-    if _last_test_anti_bot_is_terminal(ctx, data) and failure_type in {
-        DiagnosisFailureType.FAILED_RUN,
-        DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
-        DiagnosisFailureType.SUSPICIOUS_SUCCESS,
-    }:
+    if (
+        _last_test_anti_bot_is_terminal(ctx)
+        and not run_challenge_is_runtime_clearable(ctx, run_id_from_result_data(data))
+        and failure_type
+        in {
+            DiagnosisFailureType.FAILED_RUN,
+            DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
+            DiagnosisFailureType.SUSPICIOUS_SUCCESS,
+        }
+    ):
         return RepairNextAction.STOP
     if repair_context is not None:
         return RepairNextAction.REPAIR
@@ -518,7 +531,7 @@ def _current_code_authoring_repair_context(data: dict[str, Any]) -> CodeAuthorin
         return None
 
 
-def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -> bool:
+def _last_test_anti_bot_is_terminal(ctx: CopilotContext) -> bool:
     anti_bot_reason = getattr(ctx, "last_test_anti_bot", None)
     if not isinstance(anti_bot_reason, str) or not anti_bot_reason.strip():
         return False
@@ -535,20 +548,7 @@ def _last_test_anti_bot_is_terminal(ctx: CopilotContext, data: dict[str, Any]) -
         if isinstance(controls, list) and interactive_challenge_controls(controls):
             return True
 
-    failure_reason = getattr(ctx, "last_test_failure_reason", None)
-    if not isinstance(failure_reason, str) or not failure_reason.strip():
-        failure_reason = _safe_str(data.get("failure_reason"))
-    reason_lower = anti_bot_reason.lower()
-    failure_lower = str(failure_reason or "").lower()
-    combined = f"{reason_lower} {failure_lower}"
-    has_challenge_term = any(term in combined for term in _TERMINAL_ANTI_BOT_TERMS)
-    if not has_challenge_term:
-        return False
-    if "challenge-gated disabled submit/search control" in reason_lower and "disabled" in failure_lower:
-        return True
-    return ("blocker" in combined or "blocked" in combined) and (
-        "verify" in combined or "human" in combined or "captcha" in combined or "challenge" in combined
-    )
+    return False
 
 
 def _verification_satisfaction(

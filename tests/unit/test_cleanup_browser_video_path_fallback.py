@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -306,10 +305,9 @@ async def test_cleanup_preserves_update_path_for_pre_registered_artifact(tmp_pat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("artifact_redaction_enabled", [False, True])
-async def test_cleanup_gates_har_and_console_redaction_on_environment_flag(
-    monkeypatch: pytest.MonkeyPatch,
-    artifact_redaction_enabled: bool,
+@pytest.mark.parametrize("redaction_enabled", [False, True])
+async def test_cleanup_gates_har_and_console_redaction_on_run_gate(
+    redaction_enabled: bool,
 ) -> None:
     har_data = json.dumps(
         {
@@ -328,22 +326,18 @@ async def test_cleanup_gates_har_and_console_redaction_on_environment_flag(
     task = _make_task(workflow_run_id="wr_1")
     browser_state = _browser_state()
     context_manager = SimpleNamespace(
-        mask_secrets_enabled_for_run=MagicMock(return_value=False),
+        artifact_redaction_enabled=MagicMock(return_value=redaction_enabled),
         get_secret_values_for_run=MagicMock(return_value={"console-secret"}),
+        runtime_secret_values_for_artifacts=MagicMock(return_value=set()),
     )
 
-    monkeypatch.setattr(
-        agent_module.settings,
-        "ENABLE_SECRET_ARTIFACT_REDACTION",
-        artifact_redaction_enabled,
-    )
     with patch("skyvern.forge.agent.app") as mock_app:
         mock_app.WORKFLOW_CONTEXT_MANAGER = context_manager
         mock_app.BROWSER_MANAGER.cleanup_for_task = AsyncMock(return_value=browser_state)
         mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
         mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
         mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=console_log)
-        mock_app.ARTIFACT_MANAGER.create_artifact = AsyncMock(return_value="a_har")
+        mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
 
         await ForgeAgent().cleanup_browser_and_create_artifacts(
             close_browser_on_completion=True,
@@ -351,26 +345,55 @@ async def test_cleanup_gates_har_and_console_redaction_on_environment_flag(
             task=task,
         )
 
-    har_calls = [
-        call
-        for call in mock_app.ARTIFACT_MANAGER.create_artifact.await_args_list
-        if call.kwargs.get("artifact_type") == ArtifactType.HAR
-    ]
-    console_calls = [
-        call
-        for call in mock_app.ARTIFACT_MANAGER.create_artifact.await_args_list
-        if call.kwargs.get("artifact_type") == ArtifactType.BROWSER_CONSOLE_LOG
-    ]
-    stored_har = har_calls[0].kwargs["data"]
-    stored_console_log = console_calls[0].kwargs["data"]
-    context_manager.mask_secrets_enabled_for_run.assert_not_called()
-    if artifact_redaction_enabled:
+    entries = mock_app.ARTIFACT_MANAGER.create_task_archive.await_args.kwargs["entries"]
+    stored_har = entries["har.har"][1]
+    stored_console_log = entries["browser_console.log"][1]
+    context_manager.artifact_redaction_enabled.assert_called_once_with("wr_1")
+    if redaction_enabled:
         assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_har
         assert b"Bearer token" not in stored_har
         assert REDACTED_SECRET_PLACEHOLDER.encode() in stored_console_log
         assert b"console-secret" not in stored_console_log
         context_manager.get_secret_values_for_run.assert_called_once_with("wr_1")
     else:
+        # Opted-out with no runtime secrets registered: bytes pass through, and only the
+        # runtime floor (not the gated per-run set) was consulted.
         assert stored_har == har_data
         assert stored_console_log == console_log
         context_manager.get_secret_values_for_run.assert_not_called()
+        context_manager.runtime_secret_values_for_artifacts.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_floors_runtime_secret_when_opted_out() -> None:
+    # A runtime-resolved code must not survive into task HAR/console even without the
+    # per-run Mask-Secrets opt-in.
+    har_data = json.dumps(
+        {"log": {"entries": [{"request": {"headers": [{"name": "X-Code", "value": "code 424242"}]}}]}}
+    ).encode()
+    console_log = b"typed code 424242"
+    task = _make_task(workflow_run_id="wr_1")
+    browser_state = _browser_state()
+    context_manager = SimpleNamespace(
+        artifact_redaction_enabled=MagicMock(return_value=False),
+        get_secret_values_for_run=MagicMock(side_effect=AssertionError("gated set must not be consulted")),
+        runtime_secret_values_for_artifacts=MagicMock(return_value={"424242"}),
+    )
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.WORKFLOW_CONTEXT_MANAGER = context_manager
+        mock_app.BROWSER_MANAGER.cleanup_for_task = AsyncMock(return_value=browser_state)
+        mock_app.BROWSER_MANAGER.get_video_artifacts = AsyncMock(return_value=[])
+        mock_app.BROWSER_MANAGER.get_har_data = AsyncMock(return_value=har_data)
+        mock_app.BROWSER_MANAGER.get_browser_console_log = AsyncMock(return_value=console_log)
+        mock_app.ARTIFACT_MANAGER.create_task_archive = AsyncMock()
+
+        await ForgeAgent().cleanup_browser_and_create_artifacts(
+            close_browser_on_completion=True,
+            last_step=_make_step(),
+            task=task,
+        )
+
+    entries = mock_app.ARTIFACT_MANAGER.create_task_archive.await_args.kwargs["entries"]
+    assert b"424242" not in entries["har.har"][1]
+    assert b"424242" not in entries["browser_console.log"][1]

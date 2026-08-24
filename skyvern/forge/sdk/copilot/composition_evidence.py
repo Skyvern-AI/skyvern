@@ -18,12 +18,15 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
+    CHALLENGE_KIND_KEY,
     CONSENT_OBSTRUCTION_KIND,
     ChallengeEvidenceSource,
     interactive_challenge_controls,
+    normalized_challenge_kind,
     vision_challenge_carrier,
 )
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -60,9 +63,15 @@ _MAX_SELECT_OPTIONS = 30
 _MAX_CHALLENGE_CONTROLS = 8
 _MAX_MODAL_OVERLAYS = 5
 _MAX_MODAL_DISMISS_CONTROLS = 6
+_MAX_CARRIED_VALUE_CHARS = 240
+# The browser caps every field it emits in-page at this width, which is what makes
+# _structured_identity's whole report safe there. Nothing caps the parsed caller, so it matches.
+_MAX_PARSED_LABEL_CONTEXT_CHARS = 2048
+_MAX_LABEL_CONTEXT_HOPS = 4
 _MAX_PAGE_OBSTRUCTIONS = 5
 _MAX_VISIBLE_CONTROLS = 6
 _MAX_CLICKABLE_CONTROLS = 12
+_MAX_DISCLOSURE_CONTROL_ID_CHARS = 120
 _MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
 _MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
 _MAX_VISIBLE_TEXT_EXCERPT_CHARS = 3000
@@ -95,6 +104,9 @@ _EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
 _ANTI_BOT_SCAN_BYTES = 250_000
+_NON_ENTRY_FIELD_TYPES: frozenset[str] = frozenset(
+    {"hidden", "submit", "button", "reset", "checkbox", "radio", "file", "image"}
+)
 
 
 class _PostRunCompositionContext(Protocol):
@@ -119,7 +131,7 @@ def _challenge_kind(indicators: list[str]) -> str:
     if "access denied" in indicator_text:
         return "access_denied"
     if any(term in indicator_text for term in ("challenge", "human verification", "verify you are human")):
-        return "human_verification"
+        return "captcha"
     return "unknown" if indicators else "none"
 
 
@@ -161,6 +173,12 @@ def _control_disabled(node: Any) -> bool:
     )
 
 
+def _control_readonly(node: Any) -> bool:
+    if not hasattr(node, "has_attr"):
+        return False
+    return bool(node.has_attr("readonly") or str(node.get("aria-readonly") or "").strip().lower() == "true")
+
+
 def _gated_submit_controls(forms: list[dict[str, Any]]) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     for form in forms:
@@ -189,6 +207,8 @@ def _evidence_metadata(
     reveal_relations_truncated: bool = False,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
+    # A non-empty inspection_warnings voids value binding for the whole packet, so only a signal
+    # about the value channels belongs here. Navigation truncation rides its own boolean field.
     inspection_warnings = ["reveal_relations_truncated"] if reveal_relations_truncated else []
     return {
         "evidence_sources": [DOM_EVIDENCE_SOURCE],
@@ -247,13 +267,126 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
+def _usable_control(control: Any) -> bool:
+    # Static HTML cannot see a stylesheet, so the fallback parser reports no `visible` flag at all
+    # and absent has to read as usable here; a control it never showed can still count.
+    return (
+        isinstance(control, dict)
+        and control.get("disabled") is not True
+        and control.get("readonly") is not True
+        and control.get("visible") is not False
+    )
+
+
+def _reachable_submit_control(control: Any, *, disabled_explained_by_empty_form: bool) -> bool:
+    if not isinstance(control, dict) or control.get("readonly") is True or control.get("visible") is False:
+        return False
+    return control.get("disabled") is not True or disabled_explained_by_empty_form
+
+
+def _satisfiable_form_path(forms: Any, *, challenge_markup_present: bool) -> bool:
+    """True when the page offers an entry field plus an enabled submit control, so the turn can
+    complete it without a person.
+
+    The claim under refutation is that the submit control is gated. The page is authoritative about
+    disabled state, so a form whose own submit control it reports disabled corroborates the claim and
+    cannot refute it; matching the claim's prose to a control would be the harness interpreting prose.
+    A disabled control in some unrelated form says nothing about the form under consideration.
+    """
+    if not isinstance(forms, list):
+        return False
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        entry_fields = [
+            field
+            for field in form.get("fields") or []
+            if _usable_control(field) and str(field.get("type") or "").strip() not in _NON_ENTRY_FIELD_TYPES
+        ]
+        if not entry_fields:
+            continue
+        submit_controls = [control for control in form.get("submit_controls") or [] if isinstance(control, dict)]
+        disabled_submits = [control for control in submit_controls if control.get("disabled") is True]
+        # A form whose every submit is disabled while its own entry fields are all empty is explained
+        # by the empty form -- a one-time-code form disables submit until the code is typed -- unless
+        # the page carries challenge-vendor markup, which an empty form does not account for.
+        disabled_explained_by_empty_form = (
+            bool(disabled_submits)
+            and len(disabled_submits) == len(submit_controls)
+            and not challenge_markup_present
+            and all(field.get("filled") is not True for field in entry_fields)
+        )
+        if disabled_submits and not disabled_explained_by_empty_form:
+            continue
+        # A bare <button> in a form already captures as "submit"; an explicit type="button" is
+        # JS-driven and indistinguishable from Cancel without reading its label, so it does not
+        # count and the claim stands.
+        if any(
+            _reachable_submit_control(control, disabled_explained_by_empty_form=disabled_explained_by_empty_form)
+            and str(control.get("type") or "").strip() == "submit"
+            for control in submit_controls
+        ):
+            return True
+    return False
+
+
+def _collapsed_disclosure_controls(controls: Any) -> list[dict[str, Any]]:
+    if not isinstance(controls, list):
+        return []
+    return [
+        control
+        for control in controls
+        if isinstance(control, dict)
+        and control.get("expanded") is False
+        and isinstance(control.get("controls"), str)
+        and bool(control["controls"].strip())
+        and control.get("controlled_region_visible") is False
+    ]
+
+
+def has_satisfiable_collapsed_disclosure_path(evidence: dict[str, Any]) -> bool:
+    """Return whether evidence carries an enabled control for a collapsed region."""
+    if not settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+        return False
+    controls = list(evidence.get("clickable_controls") or [])
+    controls.extend(
+        control
+        for form in evidence.get("forms") or []
+        if isinstance(form, dict)
+        for control in form.get("submit_controls") or []
+        if isinstance(control, dict)
+    )
+    # This exception stops recapture, so only rendered structured evidence may establish it. Static
+    # HTML intentionally omits `visible` because stylesheets and layout are unavailable there.
+    return any(
+        _usable_control(control) and control.get("visible") is True
+        for control in _collapsed_disclosure_controls(controls)
+    )
+
+
 def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
     if visual_summary.get("challenge_detected") is not True:
         return False
     if interactive_challenge_controls(evidence.get("challenge_controls")):
         return True
     obstruction_kind = str(visual_summary.get("obstruction_kind") or "").strip().lower()
-    return obstruction_kind != CONSENT_OBSTRUCTION_KIND
+    if obstruction_kind == CONSENT_OBSTRUCTION_KIND:
+        return False
+    if evidence.get("visual_obstruction_candidates") or evidence.get("modal_overlays"):
+        return True
+    # Form shape may only refute the one commensurable vision claim, that the submit control
+    # is gated; occlusion is answered by the obstruction evidence above, never by shape.
+    blocked_claims = [
+        item for item in visual_summary.get("blocked_submit_controls") or [] if isinstance(item, str) and item.strip()
+    ]
+    # submit_blocked normalizes to None whenever the model omits it, so a named blocked control
+    # carries the same gating claim; keying on the boolean alone would silently disable this.
+    if visual_summary.get("submit_blocked") is not True and not blocked_claims:
+        return True
+    return not _satisfiable_form_path(
+        evidence.get("forms"),
+        challenge_markup_present=bool(evidence.get("challenge_controls")),
+    )
 
 
 def merge_visual_composition_evidence(
@@ -295,7 +428,7 @@ def merge_visual_composition_evidence(
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
         challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
-        if vision_challenge_carrier(visual_summary):
+        if challenge_confirmed and vision_challenge_carrier(visual_summary):
             challenge_state.setdefault(CHALLENGE_EVIDENCE_SOURCE_KEY, ChallengeEvidenceSource.VISION.value)
         if challenge_confirmed:
             challenge_state["detected"] = True
@@ -307,6 +440,9 @@ def merge_visual_composition_evidence(
             challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
             if challenge_kind:
                 challenge_state["kind"] = challenge_kind
+            typed_kind = normalized_challenge_kind(challenge_kind)
+            if typed_kind is not None:
+                challenge_state[CHALLENGE_KIND_KEY] = typed_kind.value
             challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
             if challenge_location:
                 challenge_state["visual_location"] = challenge_location
@@ -576,6 +712,59 @@ def _post_run_observed_url_goto_error(
     )
 
 
+def page_evidence_source_matches_run(source_browser_session_id: str | None, run_browser_session_id: str | None) -> bool:
+    """False only on a positive mismatch: both session ids known and different.
+
+    An unknown id on either side grants, so watchdog, cancellation, and reconciliation diagnosis
+    keep reading evidence captured before a run session id was ever recorded.
+    """
+    if not source_browser_session_id or not run_browser_session_id:
+        return True
+    return source_browser_session_id == run_browser_session_id
+
+
+def post_run_evidence_source_refused(
+    *,
+    run_id: str | None,
+    source_browser_session_id: str | None,
+    run_browser_session_id: str | None,
+) -> bool:
+    if not run_id or page_evidence_source_matches_run(source_browser_session_id, run_browser_session_id):
+        return False
+    LOG.info(
+        "copilot_post_run_evidence_source_mismatch_refused",
+        workflow_run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=run_browser_session_id,
+    )
+    return True
+
+
+def stamp_page_evidence_provenance(
+    evidence: dict[str, Any],
+    *,
+    source_browser_session_id: str | None,
+    run_id: str | None,
+    run_browser_session_id: str | None,
+) -> dict[str, Any]:
+    """Record which browser session an observation came from, and grant post-run identity for
+    ``run_id`` only when that session is the one the run executed in."""
+    stamped = {**evidence, "source_browser_session_id": source_browser_session_id or None}
+    if not run_id:
+        return stamped
+    if post_run_evidence_source_refused(
+        run_id=run_id,
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id=run_browser_session_id,
+    ):
+        stamped.pop("workflow_run_id", None)
+        stamped["observed_after_workflow_run"] = False
+        return stamped
+    stamped["workflow_run_id"] = run_id
+    stamped["observed_after_workflow_run"] = True
+    return stamped
+
+
 def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
     for key in ("forms", "navigation_targets", "result_containers", "challenge_controls"):
         value = evidence.get(key)
@@ -677,7 +866,7 @@ def _evidence_matches_target(
     current_url = current_url if isinstance(current_url, str) else None
     inspected_url = inspected_url if isinstance(inspected_url, str) else None
     if _is_scout_interaction_evidence(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
         if allow_post_run_browser_observation and (
             _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
@@ -689,10 +878,10 @@ def _evidence_matches_target(
     # alone must not satisfy the gate. Require a bounded page schema for every
     # evidence source, the inspector included.
     if source_tool == _SCHEMA_EVIDENCE_TOOL and has_bounded_page_schema(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
     if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and has_bounded_page_schema(evidence):
-        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+        if page_record_matches_url(evidence, target_url):
             return True
         if allow_post_run_browser_observation and (
             _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
@@ -837,7 +1026,7 @@ def _page_observed(ctx: Any, target_url: str | None, *, allow_post_run: bool) ->
     # agent never saw. The within-turn post-run same-origin continuation still
     # applies above via _evidence_matches_target.
     for page in _prior_observed_pages(ctx):
-        if page.get("had_bounded_schema") and _same_page(page.get("url"), target_url):
+        if page.get("had_bounded_schema") and page_record_matches_url(page, target_url):
             return True
     return False
 
@@ -881,7 +1070,7 @@ def _current_page_evidence_has_reached_page_credit(
             continue
         if not has_bounded_page_schema(prior_evidence):
             continue
-        if _same_page(observed_url, _evidence_observed_url(prior_evidence)):
+        if page_records_share_location(evidence, prior_evidence):
             return True
     return False
 
@@ -1133,6 +1322,7 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "page_title": "",
         "forms": [],
         "navigation_targets": [],
+        "navigation_targets_truncated": False,
         "result_containers": [],
         "result_containers_truncated": False,
         "key_value_relations": [],
@@ -1359,7 +1549,158 @@ def _control_label(node: Any) -> str:
     return ""
 
 
+_NAMING_TAGS = ("label", "h1", "h2", "h3", "h4")
+_CONTROL_TAGS = ("input", "select", "textarea", "button")
+_CONTROL_ROLES = frozenset({"textbox", "combobox"})
+_NAMED_BY_OWN_TEXT_ROLES = frozenset({"button", "link", "menuitem", "tab", "option", "checkbox", "radio"})
+_INPUT_TYPE_ROLES = {
+    "button": "button",
+    "submit": "button",
+    "reset": "button",
+    "checkbox": "checkbox",
+    "radio": "radio",
+    "text": "textbox",
+    "search": "textbox",
+    "email": "textbox",
+    "tel": "textbox",
+    "url": "textbox",
+    "password": "textbox",
+    "": "textbox",
+}
+
+
+def _implicit_role(node: Any) -> str:
+    """Mirror of ``implicitRole``. The browser reports an element's implicit role in ``identity``, so a
+    twin that reads only the explicit attribute names the same element differently."""
+    tag = getattr(node, "name", None) or ""
+    if tag == "a":
+        return "link" if node.has_attr("href") else ""
+    if tag == "button":
+        return "button"
+    if tag == "select":
+        return "combobox"
+    if tag == "textarea":
+        return "textbox"
+    if tag == "input":
+        return _INPUT_TYPE_ROLES.get(_attr_value(node, "type").lower(), "")
+    return "heading" if re.fullmatch(r"h[1-6]", tag) else ""
+
+
+def _value_like(text: str) -> bool:
+    """Mirror of ``valueLike``: a datum rather than a name."""
+    return any(character.isdigit() for character in text) and not re.search(r"[A-Za-z]{3}", text)
+
+
+def _naming_text_of(node: Any) -> str:
+    return _attr_value(node, "aria-label") or _node_text(node)
+
+
+def _is_naming_node(node: Any) -> bool:
+    return getattr(node, "name", None) in _NAMING_TAGS or bool(_attr_value(node, "aria-label"))
+
+
+def _is_or_holds_control(node: Any) -> bool:
+    if getattr(node, "name", None) in _CONTROL_TAGS or _attr_value(node, "role") in _CONTROL_ROLES:
+        return True
+    return node.find(_CONTROL_TAGS) is not None
+
+
+def _named_by_own_text(node: Any) -> bool:
+    """``NAMED_BY_OWN_TEXT_ROLES`` over the tags this path reports. The browser resolves an implicit
+    role for any element; only a control whose own text reads as a datum needs the distinction."""
+    return (_attr_value(node, "role") or _implicit_role(node)) in _NAMED_BY_OWN_TEXT_ROLES
+
+
+def _label_context_for(node: Any) -> str:
+    """Mirror of ``labelContextFor``. The parsed twin previously fed ``identity.label_context`` from
+    ``_control_label`` — the mirror of ``controlLabel``, which feeds ``text`` — so the two producers
+    named the same element differently and the field carried nothing ``text`` did not."""
+    own = _attr_value(node, "aria-label")
+    if own:
+        return own
+    node_id = _attr_value(node, "id")
+    if node_id:
+        root = node
+        while getattr(root, "parent", None) is not None:
+            root = root.parent
+        for candidate in root.find_all("label"):
+            if _attr_value(candidate, "for") == node_id:
+                return _naming_text_of(candidate)
+    wrapping = node.find_parent("label")
+    if wrapping is not None:
+        own_text = _node_text(node)
+        wrapping_text = _node_text(wrapping)
+        # A control with no text of its own subtracts nothing, which is the whole point for a
+        # checkbox: the label wrapping it is the only thing naming it.
+        text = "".join(wrapping_text.split(own_text)).strip() if own_text else wrapping_text.strip()
+        if text:
+            return text
+    if _reads_as_one_leaf(node):
+        own_text = _node_text(node)
+        if own_text and (_named_by_own_text(node) or not _value_like(own_text)):
+            return own_text
+    inner = next((child for child in node.find_all(True) if _is_naming_node(child)), None)
+    if inner is not None:
+        return _naming_text_of(inner)
+    children = node.find_all(True, recursive=False)
+    if children and not children[0].find(True) and len(children) > 1:
+        leading = _node_text(children[0])
+        if leading and not _value_like(leading):
+            return leading
+    return _label_context_from_ancestors(node)
+
+
+def _label_context_from_ancestors(node: Any) -> str:
+    """A label sitting beside a field names the field it precedes, so document order decides which one
+    is ours and a control standing between the two means the label belongs to that one instead."""
+    current = node.parent
+    for _ in range(_MAX_LABEL_CONTEXT_HOPS):
+        if current is None or getattr(current, "name", None) is None:
+            break
+        children = current.find_all(True, recursive=False)
+        mine = next((index for index, child in enumerate(children) if child is node or node in child.descendants), -1)
+        if mine >= 0:
+            naming = [
+                index
+                for index, child in enumerate(children)
+                if index != mine and node not in child.descendants and _is_naming_node(child)
+            ]
+            adjacent = [
+                index
+                for index in naming
+                if not any(
+                    _is_or_holds_control(children[between]) for between in range(min(index, mine) + 1, max(index, mine))
+                )
+            ]
+            if adjacent:
+                preceding = [index for index in adjacent if index < mine]
+                # Nothing precedes us and several could apply: no honest pick, so say nothing.
+                if not preceding and len(adjacent) > 1:
+                    return ""
+                return _naming_text_of(children[preceding[-1] if preceding else adjacent[0]])
+        current = current.parent
+    return ""
+
+
 _MAX_SELECTOR_CHARS = 160
+# The rung that produced a candidate, so the model can tell a name-anchored offer from a positional
+# one. An untyped candidate is not passed on: nothing downstream can rank or grade it.
+# The rungs this side knows how to rank. Unknown values are carried, not dropped.
+_UNKNOWN_SELECTOR_SOURCE = "unknown"
+_SELECTOR_CANDIDATE_SOURCES = frozenset(
+    {
+        "id",
+        "name",
+        "name_value",
+        "class",
+        "class_value",
+        "class_type",
+        "aria_label",
+        "href",
+        "text_anchor",
+        "structural",
+    }
+)
 
 
 def _bounded_selector(selector: str) -> str:
@@ -1368,42 +1709,73 @@ def _bounded_selector(selector: str) -> str:
     return selector if len(selector) <= _MAX_SELECTOR_CHARS else ""
 
 
-def _selector_for(node: Any) -> str:
-    """Mirror of ``selectorFor`` in composition_browser_expressions. The selector is a contract: the
-    model clicks it and authors it into generated blocks, so every candidate is verified to match
-    this exact node and nothing else before it is handed out."""
+def _selector_candidates_for(node: Any, *, include_aria_label: bool = False) -> list[dict[str, str]]:
+    """Mirror of ``selectorCandidatesFor``'s attribute rungs, in the same order. The positional path
+    and the aria-label rung are offered only to callers that ask: the first costs an ancestor walk,
+    and the second would change which selector ``_selector_for`` settles on."""
     tag_name = getattr(node, "name", None) or "*"
-    candidates: list[str] = []
+    candidates: list[dict[str, str]] = []
     node_id = _attr_value(node, "id")
     if node_id:
         candidates.append(
-            f"#{node_id}" if _simple_css_identifier(node_id) else f'{tag_name}[id="{_css_attr(node_id)}"]'
+            {
+                "selector": f"#{node_id}"
+                if _simple_css_identifier(node_id)
+                else f'{tag_name}[id="{_css_attr(node_id)}"]',
+                "source": "id",
+            }
         )
     node_name = _attr_value(node, "name")
     node_value = _attr_value(node, "value")
     if node_name and node_value:
-        candidates.append(f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]')
+        candidates.append(
+            {
+                "selector": f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]',
+                "source": "name_value",
+            }
+        )
     classes = _classes_for(node)
     class_selector = _class_selector(classes)
     if class_selector and node_value:
-        candidates.append(f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]')
+        candidates.append(
+            {"selector": f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]', "source": "class_value"}
+        )
     if node_name:
-        candidates.append(f'{tag_name}[name="{_css_attr(node_name)}"]')
+        candidates.append({"selector": f'{tag_name}[name="{_css_attr(node_name)}"]', "source": "name"})
+    aria_label = _attr_value(node, "aria-label") if include_aria_label else ""
+    if aria_label:
+        candidates.append({"selector": f'{tag_name}[aria-label="{_css_attr(aria_label)}"]', "source": "aria_label"})
     href = _attr_value(node, "href")
     if tag_name == "a" and href:
-        candidates.append(f'a[href="{_css_attr(href)}"]')
+        candidates.append({"selector": f'a[href="{_css_attr(href)}"]', "source": "href"})
     if class_selector:
-        candidates.append(f"{tag_name}{class_selector}")
+        candidates.append({"selector": f"{tag_name}{class_selector}", "source": "class"})
     node_type = _attr_value(node, "type")
     if class_selector and node_type:
-        candidates.append(f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]')
+        candidates.append(
+            {"selector": f'{tag_name}{class_selector}[type="{_css_attr(node_type)}"]', "source": "class_type"}
+        )
+    return candidates
+
+
+def _carried_selector_candidates(node: Any) -> list[dict[str, str]]:
+    candidates = _selector_candidates_for(node, include_aria_label=True)
+    candidates.append({"selector": _structural_path(node), "source": "structural"})
+    return _structured_selector_candidates(candidates)
+
+
+def _selector_for(node: Any) -> str:
+    """Mirror of ``selectorFor`` in composition_browser_expressions. The selector is a contract: the
+    model clicks it and authors it into generated blocks, so every candidate is verified to match
+    this exact node and nothing else before it is handed out."""
+    candidates = [entry["selector"] for entry in _selector_candidates_for(node)]
     for candidate in candidates:
         if _resolves_uniquely(node, candidate):
             return candidate
     path = _structural_path(node)
     if _resolves_uniquely(node, path):
         return path
-    return candidates[0] if candidates else str(tag_name)
+    return candidates[0] if candidates else str(getattr(node, "name", None) or "*")
 
 
 def _clickable_controls_channel(controls: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -1456,7 +1828,26 @@ def _selector_is_live_unique_in_soup(soup: Any, selector: str) -> bool:
         return False
 
 
-def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dict[str, Any]]:
+def _html_disclosure_facts(node: Any, controlled_region_visibility: dict[str, bool]) -> dict[str, Any]:
+    expanded = _attr_value(node, "aria-expanded").strip().lower()
+    if expanded not in {"true", "false"}:
+        return {}
+    facts: dict[str, Any] = {"expanded": expanded == "true"}
+    controls = _attr_value(node, "aria-controls").strip()
+    if not controls or len(controls) > _MAX_DISCLOSURE_CONTROL_ID_CHARS:
+        return facts
+    facts["controls"] = controls
+    controlled_ids = controls.split()
+    if controlled_ids and all(controlled_id in controlled_region_visibility for controlled_id in controlled_ids):
+        facts["controlled_region_visible"] = any(
+            controlled_region_visibility[controlled_id] for controlled_id in controlled_ids
+        )
+    return facts
+
+
+def _clickable_controls_html(
+    soup: Any, *, used_selectors: set[str], controlled_region_visibility: dict[str, bool]
+) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     seen_selectors = set(used_selectors)
     seen_text: set[str] = set()
@@ -1475,14 +1866,29 @@ def _clickable_controls_html(soup: Any, *, used_selectors: set[str]) -> list[dic
         text = _schema_text(_clickable_control_text(node), 120)
         selector = _clickable_control_selector(node)
         if selector and selector not in seen_selectors and _selector_is_live_unique_in_soup(soup, selector):
-            controls.append({"text": text, "selector": _bounded_selector(selector), "tag": tag_name})
+            controls.append(
+                {
+                    "text": text,
+                    "selector": _bounded_selector(selector),
+                    "tag": tag_name,
+                    **({"disabled": True} if _control_disabled(node) else {}),
+                    **_html_disclosure_facts(node, controlled_region_visibility),
+                }
+            )
             seen_selectors.add(selector)
             if text:
                 seen_text.add(text)
             continue
         if not text or text in seen_text:
             continue
-        controls.append({"text": text, "tag": tag_name})
+        controls.append(
+            {
+                "text": text,
+                "tag": tag_name,
+                **({"disabled": True} if _control_disabled(node) else {}),
+                **_html_disclosure_facts(node, controlled_region_visibility),
+            }
+        )
         seen_text.add(text)
     return controls
 
@@ -2240,17 +2646,28 @@ def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
         aria_label = _schema_text(_attr_value(control, "aria-label"), 120)
         title = _schema_text(_attr_value(control, "title"), 120)
         seen_selectors.add(selector)
+        entry = {
+            "tag": str(getattr(control, "name", "") or "").lower()[:40],
+            "text": text,
+            "aria_label": aria_label,
+            "title": title,
+            "selector": selector,
+            "type": _attr_value(control, "type")[:40],
+        }
         controls.append(
-            {
-                "tag": str(getattr(control, "name", "") or "").lower()[:40],
-                "text": text,
-                "aria_label": aria_label,
-                "title": title,
-                "selector": selector,
-                "type": _attr_value(control, "type")[:40],
-            }
+            _attach_node_evidence(
+                {key: value for key, value in entry.items() if value != ""},
+                {
+                    "selector_candidates": _carried_selector_candidates(control),
+                    "identity": {
+                        "tag": entry["tag"],
+                        "role": _attr_value(control, "role") or _implicit_role(control),
+                        "label_context": _schema_text(_label_context_for(control), _MAX_PARSED_LABEL_CONTEXT_CHARS),
+                    },
+                },
+            )
         )
-    return [{key: value for key, value in entry.items() if value} for entry in controls]
+    return controls
 
 
 def _modal_overlay_entry(node: Any) -> dict[str, Any]:
@@ -2307,10 +2724,16 @@ def _page_obstructions_from_modal_overlays(modal_overlays: list[dict[str, Any]])
                 continue
             text = _bounded_string(control.get("text") or control.get("aria_label") or control.get("title"), 120)
             selector = _bounded_string(control.get("selector"), 160)
-            if text or selector:
-                visible_controls.append(
-                    {key: value for key, value in {"text": text, "selector": selector}.items() if value}
-                )
+            if not (text or selector):
+                continue
+            # The capture is the only place these facts exist; a control that reaches the model with
+            # one selector and no fallbacks cannot be clicked again once that selector goes stale.
+            carried = dict(control)
+            if text:
+                carried["text"] = text
+            if selector:
+                carried["selector"] = selector
+            visible_controls.append(carried)
         entry = {
             "kind": "modal_overlay",
             "source": DOM_EVIDENCE_SOURCE,
@@ -2327,6 +2750,51 @@ def _anti_bot_indicators(html: str, page_title: str) -> list[str]:
     return [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in haystack]
 
 
+_DOCUMENT_REGIONS = ("header", "nav", "footer", "main")
+
+
+class _DocumentNode(Protocol):
+    name: str
+
+    def find_parents(self) -> list[_DocumentNode]: ...
+
+
+def _document_region(node: _DocumentNode) -> str:
+    """Outermost landmark ancestor, so a card <header> inside <main> counts as content.
+
+    Resolving to the nearest landmark instead splits nested landmarks into extra buckets, which
+    costs page content its share of a budget divided evenly across them.
+    """
+    region = "other"
+    for parent in node.find_parents():
+        if parent.name in _DOCUMENT_REGIONS:
+            region = parent.name
+    return region
+
+
+def _balanced_by_region(items: list[tuple[str, Any]], cap: int) -> tuple[list[Any], bool]:
+    """Take up to cap items one region at a time, keeping document order inside each region."""
+    if len(items) <= cap:
+        return [item for _, item in items], False
+    buckets: dict[str, list[Any]] = {}
+    for region, item in items:
+        buckets.setdefault(region, []).append(item)
+    selected: list[Any] = []
+    depth = 0
+    while len(selected) < cap:
+        placed = False
+        for bucket in buckets.values():
+            if len(selected) >= cap:
+                break
+            if depth < len(bucket):
+                selected.append(bucket[depth])
+                placed = True
+        if not placed:
+            break
+        depth += 1
+    return selected, len(items) > len(selected)
+
+
 def parse_composition_html(
     html: str, *, inspected_url: str, current_url: str, requested_targets: tuple[str, ...] = ()
 ) -> dict[str, Any]:
@@ -2341,6 +2809,12 @@ def parse_composition_html(
     page_title = _page_title(soup)
     challenge_controls = _challenge_controls(soup)
     anti_bot_indicators = _anti_bot_indicators(html or "", page_title)
+    controlled_region_visibility: dict[str, bool] = {}
+    for control in soup.select("[aria-expanded][aria-controls]"):
+        for controlled_id in _attr_value(control, "aria-controls").split():
+            controlled_region = soup.find(id=controlled_id)
+            if controlled_region is not None:
+                controlled_region_visibility[controlled_id] = not _is_hidden_modal_candidate(controlled_region)
 
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
@@ -2381,31 +2855,35 @@ def parse_composition_html(
                         "type": field_type[:40],
                         "disabled": _control_disabled(node),
                         "selector": _bounded_selector(_selector_for(node)),
+                        **_html_disclosure_facts(node, controlled_region_visibility),
                     }
                 )
                 continue
             if len(fields) >= _MAX_FIELDS_PER_FORM:
                 continue
-            fields.append(
-                {
-                    "name": str(node.get("name") or "")[:120],
-                    "id": str(node.get("id") or "")[:120],
-                    "label": _schema_text(_field_label(soup, node), 240),
-                    "type": field_type[:40],
-                    "value": _attr_value(node, "value")[:160],
-                    # Static HTML carries no live value, so this mirrors the attribute the parser can see.
-                    "filled": bool(_attr_value(node, "value")),
-                    "class": " ".join(_classes_for(node)[:5])[:160],
-                    "placeholder": _schema_text(str(node.get("placeholder") or ""), 240),
-                    "required": bool(
-                        node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"
-                    ),
-                    "disabled": _control_disabled(node),
-                    "checked": bool(node.has_attr("checked")),
-                    "options": _select_options(node) if tag_name == "select" else [],
-                    "selector": _bounded_selector(_selector_for(node)),
-                }
-            )
+            options = _select_options(node) if tag_name == "select" else []
+            field = {
+                "name": str(node.get("name") or "")[:120],
+                "id": str(node.get("id") or "")[:120],
+                "label": _schema_text(_field_label(soup, node), 240),
+                "type": field_type[:40],
+                "value": _attr_value(node, "value")[:160],
+                # Static HTML carries no live value, so this mirrors the attribute the parser can see.
+                "filled": bool(_attr_value(node, "value")),
+                "class": " ".join(_classes_for(node)[:5])[:160],
+                "placeholder": _schema_text(str(node.get("placeholder") or ""), 240),
+                "required": bool(node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"),
+                "disabled": _control_disabled(node),
+                "readonly": _control_readonly(node),
+                "checked": bool(node.has_attr("checked")),
+                "options": options,
+                "selector": _bounded_selector(_selector_for(node)),
+            }
+            if tag_name == "select":
+                option_count = len(node.find_all("option"))
+                field["option_count"] = option_count
+                field["options_omitted"] = option_count > len(options)
+            fields.append(field)
         forms.append(
             {
                 "id": str(form.get("id") or "")[:120],
@@ -2417,23 +2895,30 @@ def parse_composition_html(
             }
         )
 
-    navigation_targets: list[dict[str, Any]] = []
+    # Selection first: _selector_for walks the whole document per link, so building an entry for
+    # every link before capping is quadratic on link-dense pages.
+    eligible_navigation: list[tuple[str, tuple[Any, str, str]]] = []
     for link in soup.find_all("a", href=True):
-        if len(navigation_targets) >= _MAX_NAVIGATION_TARGETS:
-            break
         href = str(link.get("href") or "").strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
         resolved_href = urljoin(current_url or inspected_url, href)
         if not _same_origin(resolved_href, current_url or inspected_url):
             continue
-        text = _node_text(link)
-        nav_entry: dict[str, Any] = {
-            "text": _schema_text(text, 160),
+        region = _document_region(link)
+        eligible_navigation.append((region, (link, resolved_href, region)))
+    selected_navigation, navigation_targets_truncated = _balanced_by_region(
+        eligible_navigation, _MAX_NAVIGATION_TARGETS
+    )
+    navigation_targets: list[dict[str, Any]] = [
+        {
+            "text": _schema_text(_node_text(link), 160),
             "href": resolved_href[:300],
+            "region": region,
             "selector": _bounded_selector(_selector_for(link)),
         }
-        navigation_targets.append(nav_entry)
+        for link, resolved_href, region in selected_navigation
+    ]
 
     result_containers: list[dict[str, Any]] = []
     result_containers_truncated = False
@@ -2464,7 +2949,11 @@ def parse_composition_html(
         selector = target.get("selector")
         if isinstance(selector, str) and selector:
             used_selectors.add(selector)
-    clickable_controls = _clickable_controls_html(soup, used_selectors=used_selectors)
+    clickable_controls = _clickable_controls_html(
+        soup,
+        used_selectors=used_selectors,
+        controlled_region_visibility=controlled_region_visibility,
+    )
 
     field_count = sum(len(form.get("fields") or []) for form in forms)
     control_count = sum(len(form.get("submit_controls") or []) for form in forms)
@@ -2485,6 +2974,9 @@ def parse_composition_html(
         "current_url": current_url,
         "page_title": page_title,
         "forms": forms,
+        # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
+        # long navigation_targets is dropped exactly on the pages where it is true.
+        "navigation_targets_truncated": navigation_targets_truncated,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
         "result_containers_truncated": result_containers_truncated,
@@ -2539,6 +3031,83 @@ def _structured_select_options(value: Any) -> list[dict[str, Any]]:
     return options
 
 
+def _structured_select_option_facts(node: dict[str, Any], options: list[dict[str, Any]]) -> dict[str, Any]:
+    reported_count = node.get("option_count")
+    option_count = (
+        reported_count
+        if isinstance(reported_count, int) and not isinstance(reported_count, bool) and reported_count >= len(options)
+        else len(options)
+    )
+    return {
+        "option_count": option_count,
+        "options_omitted": node.get("options_omitted") is True or option_count > len(options),
+    }
+
+
+def _structured_selector_candidates(value: Any) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    if not isinstance(value, list):
+        return candidates
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        selector = _structured_str(item.get("selector")).strip()
+        # A vocabulary shared across a language boundary keeps the record and preserves the value it
+        # does not recognise (proto3 open enums do exactly this); the known set below ranks candidates,
+        # it does not decide admission. Discarding a selector already verified unique against the live
+        # DOM, because its rung name is unfamiliar, loses evidence to a naming mismatch.
+        source = _structured_str(item.get("source"))[:40]
+        if not source or not source.replace("_", "").isalnum():
+            source = _UNKNOWN_SELECTOR_SOURCE
+        if not selector or selector in seen:
+            continue
+        if len(selector) > _MAX_SELECTOR_CHARS:
+            continue
+        seen.add(selector)
+        candidates.append({"selector": selector, "source": source})
+    return candidates
+
+
+def _structured_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    tag = _structured_str(value.get("tag")).lower()[:40]
+    if not tag:
+        return None
+    return {
+        "tag": tag,
+        "role": _structured_str(value.get("role")).lower()[:40],
+        # Reported whole: this is the field a later check compares an element against, and a silently
+        # cut prefix would read as a rename. Its sources are already bounded upstream.
+        "label_context": _structured_str(value.get("label_context")),
+    }
+
+
+def _attach_node_evidence(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    candidates = _structured_selector_candidates(node.get("selector_candidates"))
+    if candidates:
+        entry["selector_candidates"] = candidates
+    identity = _structured_identity(node.get("identity"))
+    if identity:
+        entry["identity"] = identity
+    return entry
+
+
+def _attach_structured_disclosure_facts(entry: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    expanded = node.get("expanded")
+    if not isinstance(expanded, bool):
+        return entry
+    entry["expanded"] = expanded
+    controlled_id = _structured_str(node.get("controls")).strip()
+    if not controlled_id or len(controlled_id) > _MAX_DISCLOSURE_CONTROL_ID_CHARS:
+        return entry
+    entry["controls"] = controlled_id
+    if isinstance(node.get("controlled_region_visible"), bool):
+        entry["controlled_region_visible"] = node["controlled_region_visible"]
+    return entry
+
+
 def _structured_form(form: Any) -> dict[str, Any] | None:
     if not isinstance(form, dict):
         return None
@@ -2547,6 +3116,7 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
             continue
         field_type = (_structured_str(node.get("type")) or "text").lower()
+        options = _structured_select_options(node.get("options"))
         field = {
             "name": _structured_str(node.get("name"))[:120],
             "id": _structured_str(node.get("id"))[:120],
@@ -2558,13 +3128,16 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
             "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
             "required": node.get("required") is True,
             "disabled": node.get("disabled") is True,
+            "readonly": node.get("readonly") is True,
             "checked": node.get("checked") is True,
-            "options": _structured_select_options(node.get("options")),
+            "options": options,
             "selector": _bounded_selector(_structured_str(node.get("selector"))),
         }
+        if field_type == "select":
+            field.update(_structured_select_option_facts(node, options))
         if isinstance(node.get("visible"), bool):
             field["visible"] = node["visible"]
-        fields.append(field)
+        fields.append(_attach_node_evidence(field, node))
     submit_controls: list[dict[str, Any]] = []
     for control in form.get("submit_controls") or []:
         if not isinstance(control, dict):
@@ -2581,7 +3154,9 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
         }
         if isinstance(control.get("visible"), bool):
             submit_control["visible"] = control["visible"]
-        submit_controls.append(submit_control)
+        submit_controls.append(
+            _attach_structured_disclosure_facts(_attach_node_evidence(submit_control, control), control)
+        )
     return {
         "id": _structured_str(form.get("id"))[:120],
         "name": _structured_str(form.get("name"))[:120],
@@ -2592,13 +3167,11 @@ def _structured_form(form: Any) -> dict[str, Any] | None:
     }
 
 
-def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[str, Any]]:
-    targets: list[dict[str, Any]] = []
+def _structured_navigation_targets(value: Any, *, base_url: str) -> tuple[list[dict[str, Any]], bool]:
     if not isinstance(value, list):
-        return targets
+        return [], False
+    eligible: list[tuple[str, dict[str, Any]]] = []
     for link in value:
-        if len(targets) >= _MAX_NAVIGATION_TARGETS:
-            break
         if not isinstance(link, dict):
             continue
         href = _structured_str(link.get("href")).strip()
@@ -2606,13 +3179,18 @@ def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[st
             continue
         if not _same_origin(href, base_url):
             continue
+        # The payload comes from the page's own main world, so this is attacker-controlled text
+        # until it is clamped to the vocabulary the extractor emits.
+        reported_region = _structured_str(link.get("region"))
+        region = reported_region if reported_region in _DOCUMENT_REGIONS else "other"
         entry: dict[str, Any] = {
             "text": _schema_text(_structured_str(link.get("text")), 160),
             "href": href[:300],
+            "region": region,
             "selector": _bounded_selector(_structured_str(link.get("selector"))),
         }
-        targets.append(entry)
-    return targets
+        eligible.append((region, _attach_node_evidence(entry, link)))
+    return _balanced_by_region(eligible, _MAX_NAVIGATION_TARGETS)
 
 
 def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
@@ -2715,7 +3293,7 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
                 f"{selector} tbody tr a",
                 f"{selector} tbody tr td:first-child",
             ]
-        containers.append(entry)
+        containers.append(_attach_node_evidence(entry, node))
     return containers
 
 
@@ -2779,7 +3357,7 @@ def _structured_key_value_relations(value: Any) -> list[dict[str, Any]]:
             relation["value_text_walked_count"] = value_count
         if len(str(relation.get("value_text") or "")) >= _MAX_RELATION_VALUE_CHARS:
             relation["value_truncated"] = True
-        relations.append(relation)
+        relations.append(_attach_node_evidence(relation, item))
     return relations
 
 
@@ -2800,8 +3378,12 @@ def _structured_clickable_controls(value: Any) -> list[dict[str, Any]]:
         tag = (_structured_str(item.get("tag")) or "").lower()[:40]
         if tag:
             entry["tag"] = tag
+        if item.get("disabled") is True:
+            entry["disabled"] = True
+        if isinstance(item.get("visible"), bool):
+            entry["visible"] = item["visible"]
         if entry.get("selector") or entry.get("text"):
-            controls.append(entry)
+            controls.append(_attach_structured_disclosure_facts(_attach_node_evidence(entry, item), item))
     return controls
 
 
@@ -2833,6 +3415,22 @@ def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
     return controls
 
 
+def _is_carried_control_key(key: Any) -> bool:
+    return isinstance(key, str) and 0 < len(key) <= 40 and key.replace("_", "").isalnum()
+
+
+def _carry_value(value: Any) -> str | bool | int | float:
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _bounded_string(value, _MAX_CARRIED_VALUE_CHARS)
+    # null and an empty collection are the producer's ordinary "not applicable", so they leave as the
+    # empty string the caller already drops; every other unmodelled shape arrives bounded, not dropped.
+    if value is None or (isinstance(value, (list, dict, tuple, set)) and not value):
+        return ""
+    return _bounded_string(str(value), _MAX_CARRIED_VALUE_CHARS)
+
+
 def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
     controls: list[dict[str, Any]] = []
     if not isinstance(value, list):
@@ -2840,15 +3438,23 @@ def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
     for control in value[:_MAX_MODAL_DISMISS_CONTROLS]:
         if not isinstance(control, dict):
             continue
-        entry = {
-            "tag": (_structured_str(control.get("tag")) or "").lower()[:40],
-            "text": _schema_text(_structured_str(control.get("text")), 120),
-            "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
-            "title": _schema_text(_structured_str(control.get("title")), 120),
-            "selector": _bounded_selector(_structured_str(control.get("selector"))),
-            "type": _structured_str(control.get("type"))[:40],
-        }
-        controls.append({k: v for k, v in entry.items() if v})
+        # selector_candidates and identity are excluded from the carry so _attach_node_evidence stays
+        # their only writer; a raw copy would smuggle in the shapes that normalization rejects.
+        carried_keys = [
+            key for key in control if key not in ("selector_candidates", "identity") and _is_carried_control_key(key)
+        ]
+        entry: dict[str, Any] = {key: _carry_value(control[key]) for key in carried_keys}
+        entry.update(
+            {
+                "tag": (_structured_str(control.get("tag")) or "").lower()[:40],
+                "text": _schema_text(_structured_str(control.get("text")), 120),
+                "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
+                "title": _schema_text(_structured_str(control.get("title")), 120),
+                "selector": _bounded_selector(_structured_str(control.get("selector"))),
+                "type": _structured_str(control.get("type"))[:40],
+            }
+        )
+        controls.append(_attach_node_evidence({k: v for k, v in entry.items() if v != ""}, control))
     return controls
 
 
@@ -2899,14 +3505,19 @@ def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]
 
 
 def parse_composition_structured(data: Any, *, inspected_url: str, current_url: str) -> dict[str, Any] | None:
-    """Map the structured-evidence JSON to the same PageEvidence dict; None falls back to the get_html path."""
+    """Map bounded structured JSON to PageEvidence; None denotes an invalid structured result."""
     if not isinstance(data, dict):
         return None
     base_url = current_url or inspected_url
     page_title = _schema_text(_structured_str(data.get("page_title")), 240)
     forms = [form for form in (_structured_form(item) for item in data.get("forms") or []) if form is not None]
     forms = forms[:_MAX_FORMS]
-    navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
+    navigation_targets, navigation_targets_reparsed_truncated = _structured_navigation_targets(
+        data.get("navigation_targets"), base_url=base_url
+    )
+    navigation_targets_truncated = (
+        data.get("navigation_targets_truncated") is True or navigation_targets_reparsed_truncated
+    )
     result_containers = _structured_result_containers(data.get("result_containers"))
     key_value_relations = _structured_key_value_relations(data.get("key_value_relations"))
     reveal_relations_truncated = (
@@ -2942,6 +3553,9 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "current_url": current_url,
         "page_title": page_title,
         "forms": forms,
+        # Ahead of the list it describes: tool output is head-truncated, so a flag placed after a
+        # long navigation_targets is dropped exactly on the pages where it is true.
+        "navigation_targets_truncated": navigation_targets_truncated,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
         "result_containers_truncated": data.get("result_containers_truncated") is True,

@@ -15,7 +15,6 @@ from pydantic import ValidationError
 from skyvern.exceptions import require_server_extra_modules
 
 require_server_extra_modules("skyvern.forge.api_app", ("fastapi", "starlette", "starlette_context"))
-
 from fastapi import FastAPI, Response, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -23,6 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -34,7 +35,7 @@ from skyvern.cors import credentialed_cors_allow_origin_regex, credentialed_cors
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_request_exception
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
@@ -228,6 +229,18 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
+def _upgrade_sqlite_organization_slug(connection: Connection) -> None:
+    """Add the organization slug column and index to an existing local SQLite database."""
+    inspector = inspect(connection)
+    if "organizations" not in inspector.get_table_names():
+        return
+    if "slug" not in {column["name"] for column in inspector.get_columns("organizations")}:
+        connection.execute(text("ALTER TABLE organizations ADD COLUMN slug VARCHAR"))
+    connection.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL")
+    )
+
+
 async def _bootstrap_sqlite() -> None:
     """Auto-bootstrap SQLite on first server start.
 
@@ -240,6 +253,7 @@ async def _bootstrap_sqlite() -> None:
     db = forge_app.DATABASE
     async with db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_upgrade_sqlite_organization_slug)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.
@@ -493,11 +507,13 @@ def create_api_app() -> FastAPI:
         # Base-Exception handlers run inside Starlette's ServerErrorMiddleware, which sits
         # outside SecurityHeadersMiddleware, so stamp the framing headers here too.
         # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
-        return JSONResponse(
+        response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
             headers=SECURITY_HEADERS,
         )
+        log_raw_request_exception(response.status_code)
+        return response
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -513,12 +529,12 @@ def create_api_app() -> FastAPI:
         finally:
             skyvern_context.reset()
 
-    @fastapi_app.middleware("http")
-    async def raw_request_logging(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        return await log_raw_request_middleware(request, call_next)
-
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Register after extensions so it stays outside cloud BaseHTTPMiddleware
+    # layers, whose child tasks do not propagate request ContextVars upstream.
+    fastapi_app.add_middleware(RequestLoggingMiddleware)
 
     # Added last so it is outermost: stamps every response, including CORS
     # preflights short-circuited by the cloud middleware registered above.

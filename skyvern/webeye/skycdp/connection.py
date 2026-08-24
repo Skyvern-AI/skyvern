@@ -207,6 +207,21 @@ class CdpConnection:
                 session = self._register(session_id, self.targets.get(target_id) or TargetInfo(target_id, "page", ""))
             return session
 
+    async def attach_supplementary(self, target_id: str) -> CdpSession:
+        """A second session on an already-attached target, never the target's primary.
+
+        Domain state -- Fetch patterns, paused requests, enabled domains -- lives per session, not
+        per target. A caller that runs Fetch alongside the page's own route machinery therefore
+        needs its own session, which is exactly what Playwright's ``new_cdp_session`` attaches.
+        """
+        result = await self.transport.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+        session_id = result["sessionId"]
+        session = self.sessions.get(session_id)
+        if session is None:
+            target = self.targets.get(target_id) or TargetInfo(target_id, "page", "")
+            session = self._register(session_id, target, primary=False)
+        return session
+
     async def create_target(self, url: str = "about:blank", browser_context_id: str | None = None) -> CdpSession:
         params: dict[str, Any] = {"url": url}
         if browser_context_id:
@@ -222,10 +237,11 @@ class CdpConnection:
 
     # -- session setup ------------------------------------------------------
 
-    def _register(self, session_id: str, target: TargetInfo) -> CdpSession:
+    def _register(self, session_id: str, target: TargetInfo, *, primary: bool = True) -> CdpSession:
         session = CdpSession(self, session_id, target)
         self.sessions[session_id] = session
-        self._target_sessions[target.target_id] = session_id
+        if primary:
+            self._target_sessions[target.target_id] = session_id
         self.targets.setdefault(target.target_id, target)
         # Context bookkeeping is subscribed per session rather than connection-wide, because the
         # events carry no target identity in their params -- only the frame's routing does.
@@ -285,6 +301,13 @@ class CdpConnection:
         if session_id in self.sessions:
             self.sessions[session_id].target = target
             return
+        primary_id = self._target_sessions.get(target.target_id)
+        if primary_id and primary_id in self.sessions:
+            # A second session on a target that already has one is a supplementary attach: raw
+            # scoped access, not a new page. Announcing it would build a duplicate Page facade,
+            # and mapping it would displace the page's own session.
+            self._register(session_id, target, primary=False)
+            return
         session = self._register(session_id, target)
         if target.type in ("page", "iframe"):
             asyncio.ensure_future(self._announce_page(session))
@@ -308,9 +331,13 @@ class CdpConnection:
         if not target_id:
             return
         self.targets.pop(target_id, None)
-        session_id = self._target_sessions.pop(target_id, None)
-        if session_id:
-            self._drop_session(session_id, already_unmapped=True)
+        self._target_sessions.pop(target_id, None)
+        # The mapping names only the primary; a target can also carry supplementary sessions, and
+        # a destroyed target must reap every one or they stay live in bookkeeping and on the
+        # transport's subscriber index.
+        for session_id, session in list(self.sessions.items()):
+            if session.target.target_id == target_id:
+                self._drop_session(session_id, already_unmapped=True)
 
     def _on_target_info_changed(self, params: dict) -> None:
         raw = params.get("targetInfo") or {}
@@ -332,7 +359,9 @@ class CdpConnection:
         session = self.sessions.pop(session_id, None)
         if session is None:
             return
-        if not already_unmapped:
+        # Only the mapped (primary) session owns the target entry; a supplementary session going
+        # away must not strand the page's live session without its mapping.
+        if not already_unmapped and self._target_sessions.get(session.target.target_id) == session_id:
             self._target_sessions.pop(session.target.target_id, None)
         session.mark_detached()
         self.transport.fail_session_commands(session_id, "session detached")

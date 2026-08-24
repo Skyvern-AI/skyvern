@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeGuard
 
+from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
+
 
 class LiveReadKind(StrEnum):
     KEY_VALUE = "key_value"
@@ -1076,8 +1078,8 @@ def candidate_page_context(flow_evidence: list[dict[str, Any]]) -> str:
     """Where `unbound_candidate_relations` read its offer from, selected by the same walk.
 
     A separate walk lands on a different packet — a later post-run or obstructed observation carries
-    a URL the candidates did not come from — and the page's own query is what tells a reader whether
-    a generic label is the requested quantity (SKY-13485).
+    context the candidates did not come from. Only the origin crosses into model context; path/query
+    identity remains a keyed internal fingerprint.
     """
     for entry in reversed(flow_evidence):
         if not _entry_observed_the_page(entry):
@@ -1085,7 +1087,8 @@ def candidate_page_context(flow_evidence: list[dict[str, Any]]) -> str:
         packet = entry.get("evidence")
         if not isinstance(packet, dict):
             return ""
-        url = str(packet.get("current_url") or packet.get("inspected_url") or "").strip()
+        raw_url = str(packet.get("current_url") or packet.get("inspected_url") or "").strip()
+        url = safe_page_origin(raw_url) or ""
         title = str(packet.get("page_title") or "").strip()
         parts = [part for part in (f"url: {url}" if url else "", f"title: {title}" if title else "") if part]
         return "\n".join(parts)

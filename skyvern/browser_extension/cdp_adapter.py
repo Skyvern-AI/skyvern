@@ -10,7 +10,11 @@ from typing import Any, Protocol
 import structlog
 from aiohttp import WSMsgType, web
 
-from skyvern.browser_extension.errors import BrowserExtensionError, ExtensionRequestError
+from skyvern.browser_extension.errors import (
+    BrowserExtensionBrokerError,
+    BrowserExtensionError,
+    ExtensionRequestError,
+)
 from skyvern.browser_extension.protocol import is_cdp_method_allowed
 from skyvern.browser_extension.relay import _MAX_WS_MESSAGE_BYTES
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
@@ -58,6 +62,10 @@ class _ExtensionRelay(Protocol):
     scoped_tabs: list[dict[str, Any]]
 
     async def request(self, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]: ...
+
+    async def ensure_root_lease(self) -> dict[str, Any] | None: ...
+
+    async def release_tab(self, tab_id: int) -> None: ...
 
 
 class ExtensionCdpAdapter:
@@ -139,7 +147,7 @@ class ExtensionCdpAdapter:
                     pass
                 else:
                     return
-            generation = self._begin_tab_scope(tab_id)
+            generation = self._resume_tab_scope(tab_id)
             if self._auto_attach:
                 self._spawn(
                     self._handle_tab_added(
@@ -159,7 +167,7 @@ class ExtensionCdpAdapter:
             scoped_tabs = params.get("scopedTabs")
             if isinstance(scoped_tabs, list):
                 tabs = [
-                    (tab, self._begin_tab_scope(tab["tabId"]))
+                    (tab, self._resume_tab_scope(tab["tabId"]))
                     for tab in scoped_tabs
                     if isinstance(tab, dict) and type(tab.get("tabId")) is int
                 ]
@@ -232,7 +240,7 @@ class ExtensionCdpAdapter:
                     await self._handle_session_command(ws, request_id, session_id, method, params)
             else:
                 await self._handle_root_command(ws, request_id, method, params)
-        except ExtensionRequestError as exc:
+        except (ExtensionRequestError, BrowserExtensionBrokerError) as exc:
             error = {"code": -32000, "message": f"{exc.code}: {exc.message}"}
             response = {"id": request_id, "error": error}
             if isinstance(session_id, str):
@@ -345,43 +353,63 @@ class ExtensionCdpAdapter:
         params: dict,
         response_session_id: str | None,
     ) -> None:
+        previous_auto_attach = self._auto_attach
         self._auto_attach = params.get("autoAttach") is True
-        await self._reply(ws, request_id, {}, response_session_id)
         if not self._auto_attach:
+            await self._reply(ws, request_id, {}, response_session_id)
             return
         tabs = [tab for tab in self._relay.scoped_tabs if isinstance(tab, dict)]
+        if not tabs:
+            # Acquire a root tab through the transport: a multi-client broker grants a
+            # lease (free user-shared tab or a new scoped tab); the embedded relay
+            # returns its first scoped tab or None.
+            try:
+                root = await self._relay.ensure_root_lease()
+            except Exception as exc:
+                LOG.debug(
+                    "browser_extension_root_lease_failed",
+                    error_type=type(exc).__name__,
+                )
+                root = None
+            if root is not None and type(root.get("tabId")) is int:
+                tabs = [root]
         if not tabs:
             try:
                 created = await self._relay.request("tabs.create", {"url": "about:blank"})
                 tab_id = created["tabId"]
                 if type(tab_id) is not int:
                     raise BrowserExtensionError("Created tab id is invalid")
-                tabs = [{"tabId": tab_id, "url": "about:blank", "title": ""}]
-            except Exception as exc:
-                LOG.debug(
-                    "browser_extension_auto_attach_target_skipped",
-                    error_type=type(exc).__name__,
-                )
-                return
-        for tab in tabs:
-            tab_id = tab.get("tabId")
-            if type(tab_id) is not int:
-                continue
-            generation = self._active_scope_generation(tab_id)
-            if generation is None:
-                continue
-            try:
+            except BaseException:
+                self._auto_attach = previous_auto_attach
+                raise
+            tabs = [{"tabId": tab_id, "url": "about:blank", "title": ""}]
+
+        newly_attached: list[tuple[int, str, int]] = []
+        try:
+            for tab in tabs:
+                tab_id = tab.get("tabId")
+                if type(tab_id) is not int:
+                    continue
+                generation = self._active_scope_generation(tab_id)
+                if generation is None:
+                    continue
                 attached = await self._ensure_attached(tab, generation=generation)
                 if attached is not None:
                     target_id, is_new = attached
                     if is_new:
-                        await self._emit_attached(tab_id, target_id, generation)
-            except Exception as exc:
-                LOG.debug(
-                    "browser_extension_auto_attach_target_skipped",
-                    tab_id=tab_id,
-                    error_type=type(exc).__name__,
+                        newly_attached.append((tab_id, target_id, generation))
+        except BaseException:
+            self._auto_attach = previous_auto_attach
+            for attached_tab_id, _, _ in reversed(newly_attached):
+                await self._discard_failed_attachment_safely(
+                    attached_tab_id,
+                    suppress_interrupts=True,
                 )
+            raise
+
+        await self._reply(ws, request_id, {}, response_session_id)
+        for tab_id, target_id, generation in newly_attached:
+            await self._emit_attached(tab_id, target_id, generation)
 
     async def _set_discover_targets(
         self,
@@ -446,13 +474,14 @@ class ExtensionCdpAdapter:
         if type(tab_id) is not int:
             await self._send_error(ws, request_id, -32000, "created target is invalid", response_session_id)
             return
-        generation = self._begin_tab_scope(tab_id)
+        generation = self._resume_tab_scope(tab_id)
         attached = await self._ensure_attached(tab, generation=generation)
         if attached is None:
             await self._send_error(ws, request_id, -32000, "target was revoked", response_session_id)
             return
-        target_id, _ = attached
-        await self._emit_attached(tab_id, target_id, generation)
+        target_id, is_new = attached
+        if is_new:
+            await self._emit_attached(tab_id, target_id, generation)
         await self._reply(ws, request_id, {"targetId": target_id}, response_session_id)
 
     async def _close_target(
@@ -769,6 +798,13 @@ class ExtensionCdpAdapter:
             await self._handle_tab_added(tab, include_opener=False, generation=generation)
 
     async def _handle_tab_added(self, params: dict, include_opener: bool, generation: int) -> None:
+        if self._auto_attach:
+            async with self._root_target_setup_lock:
+                await self._handle_tab_added_locked(params, include_opener, generation)
+            return
+        await self._handle_tab_added_locked(params, include_opener, generation)
+
+    async def _handle_tab_added_locked(self, params: dict, include_opener: bool, generation: int) -> None:
         tab_id = params.get("tabId")
         if type(tab_id) is not int:
             return
@@ -794,8 +830,9 @@ class ExtensionCdpAdapter:
         else:
             if not self._scope_is_current(tab_id, generation):
                 return
-            target_id = self._register_tab(tab, opener_id)
-        if self._discover_targets and self._scope_is_current(tab_id, generation):
+            is_new = not self._registry.has_tab(tab_id)
+            self._register_tab(tab, opener_id)
+        if is_new and self._discover_targets and self._scope_is_current(tab_id, generation):
             await self._emit(
                 "Target.targetCreated",
                 {"targetInfo": self._target_info(tab_id)},
@@ -839,33 +876,69 @@ class ExtensionCdpAdapter:
             if not self._scope_is_current(tab_id, generation):
                 return None
             is_new = tab_id not in self._attached_tabs
-            real_target_id: str | None = None
             if is_new:
+                debugger_attached = False
+                attachment_committed = False
+                cleanup_suppress_interrupts = True
                 try:
-                    await self._relay.request("debugger.attach", {"tabId": tab_id})
-                except ExtensionRequestError as exc:
-                    if "already attached" not in exc.message.lower():
-                        raise
-                real_target_id = await self._fetch_main_frame_id(tab_id)
-            if not self._scope_is_current(tab_id, generation):
-                return None
-            target_id = self._register_tab(tab, opener_id, real_target_id)
+                    try:
+                        await self._relay.request("debugger.attach", {"tabId": tab_id})
+                        debugger_attached = True
+                    except ExtensionRequestError as exc:
+                        if exc.code != "CDP_ERROR" or "already attached" not in exc.message.lower():
+                            raise
+                        debugger_attached = True
+                    real_target_id = await self._fetch_main_frame_id(tab_id)
+                    if not self._scope_is_current(tab_id, generation):
+                        cleanup_suppress_interrupts = False
+                        return None
+                    target_id = self._register_tab(tab, opener_id, real_target_id)
+                    self._attached_tabs.add(tab_id)
+                    attachment_committed = True
+                finally:
+                    if debugger_attached and not attachment_committed:
+                        await self._discard_failed_attachment_safely(
+                            tab_id,
+                            suppress_interrupts=cleanup_suppress_interrupts,
+                        )
+                return target_id, is_new
+            target_id = self._register_tab(tab, opener_id)
             self._attached_tabs.add(tab_id)
         return target_id, is_new
+
+    async def _discard_failed_attachment_safely(
+        self,
+        tab_id: int,
+        *,
+        suppress_interrupts: bool,
+    ) -> None:
+        try:
+            await asyncio.shield(self._discard_failed_attachment(tab_id))
+        except Exception:
+            pass
+        except BaseException:
+            if suppress_interrupts:
+                pass
+            else:
+                raise
 
     async def _fetch_main_frame_id(self, tab_id: int) -> str | None:
         # Playwright resolves the main frame's session by targetId, so the exposed
         # page targetId must equal Chrome's real main-frame id for this tab.
-        try:
-            tree = await self._relay.request(
-                "debugger.send",
-                {"tabId": tab_id, "method": "Page.getFrameTree", "params": {}},
-            )
-        except ExtensionRequestError:
-            return None
+        tree = await self._relay.request(
+            "debugger.send",
+            {"tabId": tab_id, "method": "Page.getFrameTree", "params": {}},
+        )
         frame = tree.get("result", {}).get("frameTree", {}).get("frame", {})
         frame_id = frame.get("id") if isinstance(frame, dict) else None
         return frame_id if isinstance(frame_id, str) and frame_id else None
+
+    async def _discard_failed_attachment(self, tab_id: int) -> None:
+        try:
+            await self._relay.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
+        except BrowserExtensionError:
+            pass
+        self._forget_tab(tab_id)
 
     def _register_tab(self, tab: dict, opener_id: str | None = None, target_id_override: str | None = None) -> str:
         tab_id = tab["tabId"]
@@ -934,14 +1007,13 @@ class ExtensionCdpAdapter:
         self._registry.update_tab(tab_id, url, title)
 
     async def _detach_all_tabs(self) -> None:
-        tab_ids = [self._registry.tab_for_target(info["targetId"]) for info in self._registry.list_page_targets()]
-        for tab_id in tab_ids:
+        tab_ids = {self._registry.tab_for_target(info["targetId"]) for info in self._registry.list_page_targets()}
+        tab_ids.update(tab["tabId"] for tab in self._relay.scoped_tabs if type(tab.get("tabId")) is int)
+        for tab_id in sorted(tab_ids):
             try:
-                await self._relay.request("debugger.detach", {"tabId": tab_id}, timeout=2.0)
+                await self._relay.release_tab(tab_id)
             except Exception as exc:
-                LOG.debug(
-                    "browser_extension_debugger_detach_failed", method="debugger.detach", error_type=type(exc).__name__
-                )
+                LOG.debug("browser_extension_tab_release_failed", method="lease.release", error_type=type(exc).__name__)
 
     async def _shutdown_client(self, ws: web.WebSocketResponse) -> None:
         await self._detach_all_tabs()
@@ -962,6 +1034,12 @@ class ExtensionCdpAdapter:
         self._scope_generations[tab_id] = generation
         self._scope_tombstones.discard(tab_id)
         return generation
+
+    def _resume_tab_scope(self, tab_id: int) -> int:
+        # A tab's announcement and its Target.createTarget both name the same tab, so whichever
+        # arrives second must reuse the live scope rather than revoke the attach already in flight.
+        generation = self._active_scope_generation(tab_id)
+        return self._begin_tab_scope(tab_id) if generation is None else generation
 
     def _revoke_tab_scope(self, tab_id: int) -> int:
         generation = self._scope_generations.get(tab_id, 0) + 1

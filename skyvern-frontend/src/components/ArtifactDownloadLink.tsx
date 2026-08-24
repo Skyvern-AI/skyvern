@@ -3,15 +3,18 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 type Props = Omit<React.ComponentPropsWithoutRef<"a">, "href"> & {
   href: string;
+  refreshHref?: () => Promise<string>;
 };
 
 /**
  * Anchor for artifact content URLs that mints a fresh short-lived URL at
  * click time (SKY-12541), so links keep working after the embedded URL
- * expires. Non-artifact hrefs (storage presigned URLs) navigate natively.
+ * expires. Non-artifact hrefs navigate natively unless a caller can refresh
+ * their storage-presigned URL.
  */
 function ArtifactDownloadLink({
   href,
+  refreshHref,
   onClick,
   children,
   ...anchorProps
@@ -31,9 +34,10 @@ function ArtifactDownloadLink({
     ) {
       return;
     }
-    // Non-mintable hrefs navigate natively: keeps rel semantics (noreferrer)
-    // and avoids the blank-tab flash for links that never need re-minting.
-    if (!artifactIdFromContentUrl(href)) {
+    const artifactId = artifactIdFromContentUrl(href);
+    // Storage-presigned URLs can opt into a caller-supplied refresh on click;
+    // other non-artifact links keep native anchor semantics.
+    if (!refreshHref && !artifactId) {
       return;
     }
     event.preventDefault();
@@ -46,13 +50,18 @@ function ArtifactDownloadLink({
     if (newTab) {
       newTab.opener = null;
     }
-    void freshArtifactUrl(credentialGetter, href).then((url) => {
-      if (newTab) {
-        newTab.location.href = url;
-      } else {
-        window.location.assign(url);
-      }
-    });
+    const resolveHref = refreshHref
+      ? refreshHref
+      : () => freshArtifactUrl(credentialGetter, href);
+    void resolveHref()
+      .catch(() => freshArtifactUrl(credentialGetter, href))
+      .then((url) => {
+        if (newTab) {
+          newTab.location.href = url;
+        } else {
+          window.location.assign(url);
+        }
+      });
   };
 
   return (

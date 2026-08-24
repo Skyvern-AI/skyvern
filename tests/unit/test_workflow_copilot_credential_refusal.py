@@ -9,6 +9,9 @@ or the agent follows whichever it weights higher.
 """
 
 from skyvern.forge.sdk.copilot.tools import (
+    add_block_tool,
+    edit_block_and_run_tool,
+    fill_credential_field_tool,
     run_blocks_tool,
     update_and_run_blocks_tool,
 )
@@ -18,90 +21,18 @@ from tests.unit.conftest import render_agent_prompt as _render_agent_prompt
 class TestAgentPromptRefusalClause:
     """The rewritten system prompt must carry the hard refusal rule."""
 
-    def test_uppercase_marker_present(self) -> None:
-        """The recognizability marker preserved from v1 must render verbatim."""
+    def test_raw_secret_is_not_echoed_used_or_run(self) -> None:
         rendered = _render_agent_prompt()
-        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in rendered
+        assert "do not echo it" in rendered
+        assert "do not type or submit it into a page" in rendered
+        assert "do not pass it as a run parameter" in rendered
+        assert "do not use the browser or run anything with it" in rendered
+        assert "persist only a redacted draft that uses a saved credential parameter" in rendered
 
-    def test_critical_section_header_present(self) -> None:
-        """The section is labelled CRITICAL so prompt scanners can find it."""
+    def test_saved_credentials_are_resolved_by_name_or_id(self) -> None:
         rendered = _render_agent_prompt()
-        assert "CREDENTIAL HANDLING - CRITICAL" in rendered
-
-    def test_ask_question_response_required(self) -> None:
-        """On refusal, the agent must use ASK_QUESTION, not a workflow build."""
-        rendered = _render_agent_prompt()
-        assert "ASK_QUESTION" in rendered
-        assert "MUST NOT build, update, or run a workflow" in rendered
-
-    def test_generalized_secret_surface_enumerated(self) -> None:
-        """Refusal covers more than username/password — all the common leakage shapes."""
-        rendered = _render_agent_prompt()
-        for term in (
-            "API keys",
-            "OAuth tokens",
-            "Authorization: Bearer",
-            "JWTs",
-            "session cookies",
-            "TOTP seeds",
-            "OTP",
-            "private keys",
-            "credit card numbers",
-            "CVVs",
-        ):
-            assert term in rendered, f"missing secret-surface term: {term}"
-
-    def test_browser_tools_also_forbidden(self) -> None:
-        """The refusal must block not just workflow build/run but direct browser-tool paths too.
-
-        Without this, an agent can 'comply' by skipping workflow tools and still
-        type_text the pasted password into a live login form. Explicit names of
-        the browser tools keep the rule concrete for the LLM.
-        """
-        rendered = _render_agent_prompt()
-        assert "type_text" in rendered
-        assert "click" in rendered
-        assert "press_key" in rendered
-        assert "any other direct browser tool" in rendered
-
-    def test_exact_saved_reference_uses_atomic_resolution(self) -> None:
-        """An exact saved name must use the authority-granting lookup, not discovery."""
-        rendered = _render_agent_prompt()
-
-        assert "list_credentials(exact_reference=<verbatim reference>)" in rendered
-        assert "one organization-scoped exact match grounded in this turn" in rendered
-        assert "Never infer a name from nearby prose" in rendered
-
-    def test_negative_bare_identifier_is_not_a_credential(self) -> None:
-        """A bare username/email alone must not trigger the refusal rule.
-
-        The section explicitly calls out that bare non-secret identifiers don't
-        count, so the prompt doesn't over-refuse ('my username is alice').
-        """
-        rendered = _render_agent_prompt()
-        assert "bare username" in rendered
-        assert "NOT a raw credential" in rendered
-        assert "does not trigger this rule" in rendered
-
-    def test_raw_secret_refusal_does_not_select_from_discovery(self) -> None:
-        """A raw-secret turn asks for an exact saved reference instead of choosing inventory."""
-        rendered = _render_agent_prompt()
-
-        assert "Ask the user to choose a saved credential in the UI" in rendered
-        assert "Do not derive a choice from a discovery result" in rendered
-
-    def test_vague_reference_discovery_is_metadata_only(self) -> None:
-        """Inventory discovery cannot silently become credential-use authority."""
-        rendered = _render_agent_prompt()
-
-        assert "genuinely vague credential reference" in rendered
-        assert "Discovery results are metadata, not authority" in rendered
-        assert "ask the user to state the exact name before using one" in rendered
-
-    def test_no_raw_secret_echoed(self) -> None:
-        """The agent must not echo the raw secret into its reply or persistent context."""
-        rendered = _render_agent_prompt()
-        assert "Do NOT echo the raw secret back" in rendered
+        assert "resolve one the user names, by exact name or credential ID" in rendered
+        assert "When a credential has already been resolved for the page you are on, use it" in rendered
 
     def test_old_permissive_clause_is_gone(self) -> None:
         """The v2 template used to authorize inline secrets via `parameters` — must be removed."""
@@ -114,7 +45,7 @@ class TestToolDocstringsRefusalClause:
     """Tool docstrings reach the agent via FunctionTool.description — they must agree with the prompt."""
 
     def _tools(self) -> list[object]:
-        return [run_blocks_tool, update_and_run_blocks_tool]
+        return [run_blocks_tool, update_and_run_blocks_tool, edit_block_and_run_tool]
 
     def test_old_permissive_clause_gone_from_tools(self) -> None:
         """The clause that told the agent inline secrets were fine via `parameters` is removed."""
@@ -123,15 +54,15 @@ class TestToolDocstringsRefusalClause:
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"  # type: ignore[attr-defined]
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"  # type: ignore[attr-defined]
 
-    def test_new_refusal_reference_in_tools(self) -> None:
-        """Docstrings point back at the CREDENTIAL HANDLING refusal rule in the system prompt."""
-        import re
-
-        cross_ref = re.compile(r"CREDENTIAL\s+HANDLING refusal rule")
+    def test_tools_state_the_refusal_without_a_dangling_prompt_reference(self) -> None:
         for tool in self._tools():
             desc = tool.description  # type: ignore[attr-defined]
             assert "do NOT pass" in desc, f"{tool.name} does not forbid inline secret pass-through"  # type: ignore[attr-defined]
-            assert cross_ref.search(desc), f"{tool.name} does not cross-reference the refusal rule"  # type: ignore[attr-defined]
+            assert "Ask the user to store it as a saved" in desc
+            assert "credential and reply with the credential name" in desc
+            assert "do not build or run with" in desc
+            assert "the raw value" in desc
+            assert "CREDENTIAL HANDLING refusal rule" not in desc
 
     def test_non_secret_parameters_guidance_preserved(self) -> None:
         """The `parameters` dict is still the right channel for non-secret runtime values."""
@@ -146,6 +77,23 @@ class TestToolDocstringsRefusalClause:
         desc = list_credentials_tool.description  # type: ignore[attr-defined]
         assert "has_more" in desc
         assert "already stored on a later page" in desc
+
+    def test_saved_login_state_is_reused_instead_of_rescouted(self) -> None:
+        run_desc = " ".join(run_blocks_tool.description.split())  # type: ignore[attr-defined]
+        fill_desc = " ".join(fill_credential_field_tool.description.split()).lower()  # type: ignore[attr-defined]
+
+        assert "existing saved block" in run_desc
+        assert "run that block unchanged" in run_desc
+        assert "existing saved login block" in fill_desc
+        assert "run that block unchanged" in fill_desc
+
+    def test_add_block_describes_the_flat_workflow_parameter_shape(self) -> None:
+        desc = add_block_tool.description  # type: ignore[attr-defined]
+
+        assert '"parameter_type": "workflow"' in desc
+        assert '"workflow_parameter_type": "string"' in desc
+        assert '"default_value": "BillingHistory.jsp"' in desc
+        assert "Inspect or run the saved workflow" in desc
 
 
 class TestBrowserToolOverlayRefusalCaveat:
@@ -164,4 +112,6 @@ class TestBrowserToolOverlayRefusalCaveat:
         assert "type_text" in overlays
         desc = overlays["type_text"].description or ""
         assert "NEVER type inline passwords" in desc
-        assert "CREDENTIAL HANDLING refusal rule" in desc
+        assert "Ask the user to store the value as a saved credential" in desc
+        assert "do not type or submit the raw value" in desc
+        assert "CREDENTIAL HANDLING refusal rule" not in desc

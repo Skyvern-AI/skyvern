@@ -23,11 +23,43 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api import files
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
 from tests.unit.force_stub_app import start_forge_stub_app
+
+# Four distinct ways to leave the legacy downloads root; each defeats a different weak check.
+LEGACY_DOWNLOAD_ESCAPE_CASES = ("parent_traversal", "encoded_dot_dot", "sibling_prefix", "symlink_escape")
+
+
+@pytest.fixture
+def legacy_download_uris(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """file:// URIs into a synthetic legacy repo root: one canonical file plus every escape class.
+
+    Points the module's ``REPO_ROOT_DIR`` at the temporary root, so anything reaching the legacy
+    file:// branch resolves against this lab rather than the real repository.
+    """
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    (downloads / "STORMBREAKER-safe.txt").write_text("STORMBREAKER-safe-body")
+    (tmp_path / "downloads-evil").mkdir()
+    (tmp_path / "downloads-evil" / "STORMBREAKER-secret.txt").write_text("STORMBREAKER-sibling-secret")
+    (tmp_path / "outside").mkdir()
+    outside_secret = tmp_path / "outside" / "STORMBREAKER-secret.txt"
+    outside_secret.write_text("STORMBREAKER-outside-secret")
+    (downloads / "STORMBREAKER-link").symlink_to(outside_secret)
+
+    monkeypatch.setattr(files, "REPO_ROOT_DIR", tmp_path)
+    return {
+        "canonical": (downloads / "STORMBREAKER-safe.txt").as_uri(),
+        "parent_traversal": (downloads / ".." / "outside" / "STORMBREAKER-secret.txt").as_uri(),
+        # Percent-encoded, so a check running before URL decoding cannot be what blocks it.
+        "encoded_dot_dot": f"file://{downloads}/%2E%2E/outside/STORMBREAKER-secret.txt",
+        "sibling_prefix": (tmp_path / "downloads-evil" / "STORMBREAKER-secret.txt").as_uri(),
+        "symlink_escape": (downloads / "STORMBREAKER-link").as_uri(),
+    }
 
 
 @pytest.fixture
@@ -107,6 +139,18 @@ def reset_collapse_xp_assignment_memo():
     _clear()
     yield
     _clear()
+
+
+@pytest.fixture(autouse=True)
+def restore_interpreter_traceback_hooks() -> Iterator[None]:
+    """setup_logger() replaces the three interpreter hooks process-wide.
+
+    Left installed they outlive the test that configured logging and shadow pytest's own
+    unraisable/thread-exception plugins, which install their hooks per test.
+    """
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    yield
+    sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
 
 
 @pytest.fixture(autouse=True)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +14,12 @@ from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificati
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.workflow.context_manager import _CREDENTIAL_PARAMETER_TYPES
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.services import otp_service
 from skyvern.services.otp_service import (
     OTPValue,
@@ -176,6 +182,101 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         assert result is credential_value
         credential.assert_called_once_with("wr_test")
+        poll.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_input_dict_falls_through_to_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An ordinary run input dict with a placeholder `totp` is not a credential.
+
+        With the real credential lookup running against a realistic registration shape,
+        the ordinary dict must fall through to polling (awaited once) rather than being
+        resolved as a credential-backed TOTP and short-circuiting resolution.
+        """
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "111111")
+        fake_context = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        fake_app = SimpleNamespace(
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake_context,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
+            DATABASE=SimpleNamespace(
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            ),
+        )
+        monkeypatch.setattr(otp_service, "app", fake_app)
+
+        task = SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            totp_verification_url="https://example.com/webhook",
+            totp_identifier=None,
+            navigation_payload={},
+        )
+        polled = OTPValue(value="424242", type=OTPType.TOTP)
+        poll = AsyncMock(return_value=polled)
+        monkeypatch.setattr(otp_service, "poll_otp_value", poll)
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = await resolve_otp_value(task)
+
+        assert result is polled
+        poll.assert_awaited_once()
+
+
+class TestResolveOtpValueExpectedOtpTypeGating:
+    """resolve_otp_value must honor expected_otp_type for the credential-TOTP branch, the same way
+    has_otp_source already gates it: a credential TOTP can only ever answer a TOTP expectation."""
+
+    @staticmethod
+    def _task() -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_test",
+            workflow_run_id=None,
+            organization_id="o_test",
+            totp_verification_url=None,
+            totp_identifier="2fa.identifier",
+            navigation_payload=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_credential_totp_falls_through_to_polling_when_expecting_a_magic_link(self) -> None:
+        credential_value = OTPValue(value="424242", type=OTPType.TOTP)
+        polled_value = OTPValue(value="https://example.com/magic", type=OTPType.MAGIC_LINK)
+        with (
+            patch(
+                "skyvern.services.otp_service.try_generate_totp_from_credential",
+                return_value=credential_value,
+            ),
+            patch(
+                "skyvern.services.otp_service.poll_otp_value",
+                new=AsyncMock(return_value=polled_value),
+            ) as poll,
+        ):
+            result = await resolve_otp_value(self._task(), expected_otp_type=OTPType.MAGIC_LINK)
+
+        assert result is polled_value
+        poll.assert_awaited_once()
+        assert poll.await_args.kwargs["expected_otp_type"] == OTPType.MAGIC_LINK
+
+    @pytest.mark.asyncio
+    async def test_credential_totp_still_returned_when_expecting_a_totp(self) -> None:
+        credential_value = OTPValue(value="424242", type=OTPType.TOTP)
+        with (
+            patch(
+                "skyvern.services.otp_service.try_generate_totp_from_credential",
+                return_value=credential_value,
+            ) as credential,
+            patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock()) as poll,
+        ):
+            result = await resolve_otp_value(self._task(), expected_otp_type=OTPType.TOTP)
+
+        assert result is credential_value
+        credential.assert_called_once_with(None)
         poll.assert_not_called()
 
 
@@ -1123,6 +1224,60 @@ class TestPollOtpValueRetry:
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
     @patch("skyvern.services.otp_service.settings")
+    async def test_max_wait_shortens_the_window_and_raises_the_timeout_itself(
+        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
+    ) -> None:
+        # A caller polling in bounded slices gets the regular NoTOTPVerificationCodeFound at its own
+        # cap instead of cancelling the poll mid-request.
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_fetch.return_value = None
+
+        with pytest.raises(NoTOTPVerificationCodeFound):
+            await poll_otp_value(
+                organization_id="o_test",
+                task_id="tsk_test",
+                totp_verification_url="https://example.com/mfa",
+                max_wait_seconds=0.0,
+            )
+        assert mock_fetch.await_count == 0
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_db", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_email", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.settings")
+    async def test_poll_started_at_anchors_the_email_search_but_not_the_db_search(
+        self,
+        mock_settings: MagicMock,
+        mock_email: AsyncMock,
+        mock_db: AsyncMock,
+        mock_sleep: AsyncMock,
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_email.return_value = None
+        otp = OTPValue(value="123456")
+        mock_db.return_value = otp
+        first_slice_started = datetime.utcnow() - timedelta(minutes=3)
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            totp_identifier="otp@example.test",
+            max_wait_seconds=120.0,
+            poll_started_at=first_slice_started,
+        )
+
+        assert result == otp
+        assert mock_email.await_args is not None and mock_db.await_args is not None
+        assert mock_email.await_args.kwargs["created_after"] == first_slice_started
+        assert mock_db.await_args.kwargs["created_after"] is None
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
     async def test_passes_workflow_permanent_id_to_totp_url_fetch(
         self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
     ) -> None:
@@ -1140,14 +1295,12 @@ class TestPollOtpValueRetry:
         )
 
         assert result == otp
-        mock_fetch.assert_awaited_once_with(
-            "o_test",
-            "https://example.com/mfa",
-            "fake-token",
-            task_id="tsk_test",
-            workflow_run_id="wr_test",
-            workflow_permanent_id="wpid_test",
-        )
+        assert mock_fetch.await_count == 1
+        args, kwargs = mock_fetch.await_args
+        assert args == ("o_test", "https://example.com/mfa", "fake-token")
+        assert kwargs["task_id"] == "tsk_test"
+        assert kwargs["workflow_run_id"] == "wr_test"
+        assert kwargs["workflow_permanent_id"] == "wpid_test"
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -1448,6 +1601,52 @@ class TestPollOtpValueRetry:
                 )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "webhook_response, expected_diagnostics",
+        [
+            # Every poll answered, never with the documented body: the customer's endpoint
+            # is broken, and the timeout has to say so rather than read as "no code yet".
+            ((204, {}, "", False), "webhook_responses=2 http_status=204x2"),
+            # Documented shape, code simply had not arrived: a plain timeout, no diagnostics.
+            ((200, {"Content-Type": "application/json"}, {"verification_code": ""}, True), None),
+        ],
+    )
+    async def test_timeout_reports_webhook_status_only_when_endpoint_never_conformed(
+        self,
+        webhook_response: tuple[int, dict[str, str], object, bool],
+        expected_diagnostics: str | None,
+    ) -> None:
+        """A totp_verification_url that answers but never honors the contract must be named at timeout."""
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        utcnow_returns = [
+            base,
+            base + timedelta(seconds=30),
+            base + timedelta(seconds=60),
+            base + timedelta(minutes=16),
+        ]
+
+        with (
+            patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock),
+            patch("skyvern.services.otp_service._post_totp_verification_url", new_callable=AsyncMock) as mock_post,
+            patch("skyvern.services.otp_service.app") as mock_app,
+            patch("skyvern.services.otp_service.settings") as mock_settings,
+            patch("skyvern.services.otp_service.datetime") as mock_datetime,
+        ):
+            mock_datetime.utcnow.side_effect = utcnow_returns
+            mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+            mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+            mock_post.return_value = webhook_response
+
+            with pytest.raises(NoTOTPVerificationCodeFound) as exc_info:
+                await poll_otp_value(
+                    organization_id="o_test",
+                    task_id="tsk_test",
+                    totp_verification_url="https://example.com/mfa",
+                )
+
+        assert exc_info.value.webhook_diagnostics == expected_diagnostics
+
+    @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
@@ -1509,12 +1708,54 @@ class TestPollOtpValueRetry:
         assert raw not in str(polling.values())
 
 
-class _FakeWorkflowRunContext:
-    """Minimal stub mirroring WorkflowRunContext shape for try_generate_totp_from_credential."""
+def _credential_parameter(key: str) -> CredentialParameter:
+    now = datetime.now(timezone.utc)
+    return CredentialParameter(
+        key=key,
+        credential_parameter_id=f"cp_{key}",
+        workflow_id="wf_test",
+        credential_id=f"cred_{key}",
+        created_at=now,
+        modified_at=now,
+    )
 
-    def __init__(self, values: dict[str, dict[str, str]], secrets: dict[str, str]) -> None:
+
+def _ordinary_workflow_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(timezone.utc)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_type=WorkflowParameterType.JSON,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_id="wf_test",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+class _FakeWorkflowRunContext:
+    """Stub mirroring WorkflowRunContext shape (values/secrets/parameters) for TOTP lookup.
+
+    ``parameters`` maps each key to a real Parameter model so
+    ``is_registered_credential_parameter_key`` exercises the same
+    ``_CREDENTIAL_PARAMETER_TYPES`` isinstance check as production. When omitted,
+    every values key is registered as a real credential parameter (the shape the
+    original credential-selection tests assume).
+    """
+
+    def __init__(
+        self,
+        values: dict[str, dict[str, str]],
+        secrets: dict[str, str],
+        parameters: dict[str, object] | None = None,
+    ) -> None:
         self.values = values
         self.secrets = secrets
+        if parameters is None:
+            parameters = {key: _credential_parameter(key) for key in values}
+        self.parameters = parameters
+
+    def is_registered_credential_parameter_key(self, key: str) -> bool:
+        return isinstance(self.parameters.get(key), _CREDENTIAL_PARAMETER_TYPES)
 
     def totp_secret_value_key(self, totp_secret_id: str) -> str:
         return f"{totp_secret_id}_value"
@@ -1539,7 +1780,10 @@ class TestTryGenerateTotpFromCredential:
         from skyvern.services import otp_service
 
         fake_app = SimpleNamespace(
-            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(get_workflow_run_context=lambda _wr_id: fake),
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: fake,
+                has_workflow_run_context=lambda _wr_id: True,
+            ),
         )
         monkeypatch.setattr(otp_service, "app", fake_app)
 
@@ -1630,6 +1874,58 @@ class TestTryGenerateTotpFromCredential:
         assert result is not None
         assert result.value == "131313"
 
+    def test_ordinary_input_dict_with_placeholder_totp_is_not_a_candidate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An ordinary run input dict with a placeholder-shaped `totp` is not a credential.
+
+        Before the registration boundary it was the sole fallback candidate and its
+        `totp` value was resolved and generated, letting an ordinary input masquerade as
+        a credential-backed TOTP instead of falling through to polling.
+        """
+        fake = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "111111")
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is None
+
+    def test_active_key_not_registered_credential_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale/arbitrary active key pointing at an ordinary dict cannot bypass the boundary."""
+        fake = _FakeWorkflowRunContext(
+            values={"user_input": {"totp": "tot_x"}},
+            secrets={"tot_x_value": _VALID_TOTP_SEED},
+            parameters={"user_input": _ordinary_workflow_parameter("user_input")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+
+        with skyvern_context.scoped(_scoped_context(active="user_input")):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is None
+
+    def test_registered_credential_parameter_generates_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A registered credential parameter with a TOTP secret still generates normally."""
+        fake = _FakeWorkflowRunContext(
+            values={"credentials": {"username": "u", "totp": "tot_b"}},
+            secrets={"tot_b_value": _VALID_TOTP_SEED},
+            parameters={"credentials": _credential_parameter("credentials")},
+        )
+        self._patch_workflow_context(monkeypatch, fake)
+        monkeypatch.setattr(pyotp.TOTP, "now", lambda _self: "246810")
+
+        with skyvern_context.scoped(_scoped_context(active=None)):
+            result = try_generate_totp_from_credential("wr_test")
+
+        assert result is not None
+        assert result.value == "246810"
+
     def test_workflow_run_id_none_returns_none(self) -> None:
         assert try_generate_totp_from_credential(None) is None
 
@@ -1637,7 +1933,10 @@ class TestTryGenerateTotpFromCredential:
         from skyvern.services import otp_service
 
         fake_app = SimpleNamespace(
-            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(get_workflow_run_context=lambda _wr_id: None),
+            WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+                get_workflow_run_context=lambda _wr_id: None,
+                has_workflow_run_context=lambda _wr_id: False,
+            ),
         )
         monkeypatch.setattr(otp_service, "app", fake_app)
 
@@ -2492,3 +2791,28 @@ async def test_raw_otp_rows_are_skipped_without_expected_type() -> None:
         mock_app.DATABASE.otp.get_raw_otp_codes = AsyncMock()
         assert await _get_otp_value_from_db("o_test", "otp@example.test") is None
     mock_app.DATABASE.otp.get_raw_otp_codes.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("expected_otp_type", "expected"),
+    [
+        (OTPType.MAGIC_LINK, False),
+        (OTPType.TOTP, True),
+        (None, True),
+    ],
+)
+def test_has_otp_source_credential_totp_candidate_gated_on_expected_type(
+    monkeypatch: pytest.MonkeyPatch, expected_otp_type: OTPType | None, expected: bool
+) -> None:
+    # A credential-TOTP candidate can only ever yield a TOTP code, so it must not count as a
+    # source when the caller expects a magic link.
+    task = SimpleNamespace(
+        navigation_payload=None,
+        totp_verification_url=None,
+        totp_identifier=None,
+        organization_id="o_1",
+        workflow_run_id="wr_1",
+    )
+    monkeypatch.setattr(otp_service, "has_credential_totp_candidate", lambda run_id: True)
+
+    assert otp_service.has_otp_source(task, expected_otp_type=expected_otp_type) is expected

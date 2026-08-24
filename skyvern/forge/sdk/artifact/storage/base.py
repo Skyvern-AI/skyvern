@@ -18,6 +18,18 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 SENSITIVE_SHARE_URL_EXPIRY_HOURS = max(1, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS // 3600)
 
 
+def key_is_org_scoped(key: str, allowed_prefixes: tuple[str, ...]) -> bool:
+    """Whether an object key sits under one of the caller's org-scoped prefixes.
+
+    A ``..`` segment is rejected rather than resolved: a bare prefix match on an
+    unnormalized key accepts ``{env}/{org_a}/../{org_b}/secret.pdf`` for org_a, and no key
+    this service writes ever contains one.
+    """
+    if any(segment == ".." for segment in key.split("/")):
+        return False
+    return any(key.startswith(prefix) for prefix in allowed_prefixes)
+
+
 async def presign_with_sensitive_cap(
     artifacts: list[Artifact],
     presign: Callable[[list[str]], Awaitable[list[str] | None]],
@@ -83,6 +95,16 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
     return infos
 
 
+def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
+    """URI -> SHA-256 for DOWNLOAD rows that carry one.
+
+    A row is only written after its bytes land in storage, so a file whose checksum
+    matches its row is already saved and the save loop can skip re-uploading it
+    (SKY-14752). Rows without a checksum are omitted: they cannot vouch for content.
+    """
+    return {artifact.uri: artifact.checksum for artifact in artifacts if artifact.uri and artifact.checksum}
+
+
 async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
     """Backward-compat alias for DOWNLOAD-typed callers.
 
@@ -101,6 +123,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.BROWSER_CONSOLE_LOG: "log",
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "png",
     ArtifactType.SCREENSHOT_FINAL: "png",
     ArtifactType.SKYVERN_LOG: "log",
     ArtifactType.SKYVERN_LOG_RAW: "json",
@@ -116,6 +139,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "txt",
     ArtifactType.HTML_SCRAPE: "html",
     ArtifactType.HTML_ACTION: "html",
+    ArtifactType.HTML_PRE_SUBMIT: "html",
     ArtifactType.TRACE: "zip",
     ArtifactType.HAR: "har",
     ArtifactType.HASHED_HREF_MAP: "json",
@@ -299,6 +323,16 @@ class BaseStorage(ABC):
         pass
 
     @abstractmethod
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        """Delete an uploaded file's bytes.
+
+        Implementations must run ``assert_managed_file_access`` first: the URI reaches here
+        from a stored row, and this is the last place a row that points outside the
+        organization's prefix can be stopped from deleting another tenant's object. Raises
+        PermissionError when the URI is out of bounds.
+        """
+
+    @abstractmethod
     async def sync_browser_session_file(
         self,
         organization_id: str,
@@ -308,6 +342,7 @@ class BaseStorage(ABC):
         remote_path: str,
         date: str | None = None,
         recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         pass
 

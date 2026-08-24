@@ -119,10 +119,8 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
 
     monkeypatch.setattr(agent_module, "datetime", _FixedDateTime)
     config = agent_module.CopilotConfig()
-    workflow_knowledge_base = agent_module.WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
     expected = agent_module.prompt_engine.load_prompt(
         template=config.prompt_template.removesuffix(".j2"),
-        workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=fixed_now.isoformat(),
         tool_usage_guide="tool guide",
         security_rules=config.security_rules,
@@ -131,7 +129,9 @@ def test_system_prompt_text_is_identical_to_direct_template_render(
     actual = agent_module._build_system_prompt(tool_usage_guide="tool guide", config=config)
 
     assert isinstance(actual, CacheableSystemInstructions)
-    assert str(actual) == expected
+    # The envelope adds nothing to the rendered template except the code-owned MCP authority
+    # clause, which no template may drop or displace.
+    assert str(actual) == f"{agent_module._MCP_RESULT_SECURITY_BOUNDARY}\n\n{expected}"
 
 
 def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
@@ -146,7 +146,7 @@ def test_system_prompt_places_datetime_and_runtime_context_after_breakpoint(
     monkeypatch.setattr(agent_module.prompt_engine, "load_prompt", fake_load_prompt)
     base_prompt = agent_module._build_system_prompt(tool_usage_guide="tools")
     assert isinstance(base_prompt, CacheableSystemInstructions)
-    assert base_prompt.stable_prefix == "stable prefix\n"
+    assert base_prompt.stable_prefix == f"{agent_module._MCP_RESULT_SECURITY_BOUNDARY}\n\nstable prefix\n"
     assert "SKYVERN_COPILOT_DYNAMIC_DATETIME_BOUNDARY" not in str(base_prompt)
     assert "static template tail" in base_prompt.dynamic_suffix
     assert rendered_kwargs["tool_usage_guide"] == "tools"

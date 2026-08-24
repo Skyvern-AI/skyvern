@@ -5,12 +5,14 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 
 import httpx
 import structlog
 
 from skyvern.client.core.request_options import RequestOptions
+from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 from skyvern.library.skyvern import Skyvern
 from skyvern.schemas.action_log import (
     ACTION_LOG_MAX_BODY_BYTES,
@@ -205,6 +207,37 @@ action_log_worker = ActionLogWorker()
 _event_indexes: OrderedDict[str, int] = OrderedDict()
 
 
+def _redaction_shape_preserved(source: Any, redacted: Any) -> bool:
+    if type(source) is dict:
+        if type(redacted) is not dict or len(source) != len(redacted):
+            return False
+        return all(
+            type(left) is type(right) and left == right and _redaction_shape_preserved(source[left], redacted[right])
+            for left, right in zip(source, redacted, strict=True)
+        )
+    if type(source) in (list, tuple):
+        return (
+            type(source) is type(redacted)
+            and len(source) == len(redacted)
+            and all(_redaction_shape_preserved(left, right) for left, right in zip(source, redacted, strict=True))
+        )
+    return type(source) in (str, int, float, bool, type(None)) and type(source) is type(redacted)
+
+
+def _redact_action_log_event(event: ActionLogEvent) -> ActionLogEvent | None:
+    redactor = current_codeblock_log_redactor()
+    if redactor is None:
+        return event
+    payload = event.model_dump(mode="json")
+    try:
+        redacted = redactor(payload)
+        if type(redacted) is not dict or not _redaction_shape_preserved(payload, redacted):
+            return None
+        return ActionLogEvent.model_validate(redacted)
+    except BaseException:
+        return None
+
+
 def _next_event_index(browser_session_id: str) -> int:
     index = _event_indexes.pop(browser_session_id, 0)
     _event_indexes[browser_session_id] = index + 1
@@ -247,11 +280,15 @@ def enqueue_action_event(
             error_code=None if ok else (error_code or "ACTION_FAILED"),
             index=_next_event_index(browser_context.session_id),
         )
-        encoded_bytes = len(event.model_dump_json().encode())
+        safe_event = _redact_action_log_event(event)
+        if safe_event is None:
+            action_log_worker.capture_drop("projection_error")
+            return
+        encoded_bytes = len(safe_event.model_dump_json().encode())
         action_log_worker.enqueue(
             ActionLogQueueEntry(
                 browser_session_id=browser_context.session_id,
-                event=event,
+                event=safe_event,
                 principal=principal,
                 origin=origin,
                 encoded_bytes=encoded_bytes,

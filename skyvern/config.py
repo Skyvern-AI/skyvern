@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
+    # Configurable safety caps. The defaults are rollout candidates, not capacity-calibrated policy.
+    BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES: int = Field(default=100 * 1024 * 1024, gt=0)
+    BROWSER_DOWNLOAD_MAX_RUN_SIZE_BYTES: int = Field(default=512 * 1024 * 1024, gt=0)
+    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=64, gt=0)
     # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
     # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
     # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
@@ -129,6 +133,11 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
+    # a run stops starting new steps against that browser. Sized so a healthy run — which lands
+    # hundreds of successful operations per step, any one of which resets the count — cannot reach
+    # it, while a browser answering nothing does within a single step. 0 disables the check.
+    BROWSER_DEGRADED_TIMEOUT_STRIKES: int = 8
     # Best-effort per-action capture inside a code block. Awaited in the user's own call chain,
     # so its cost lands on CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS; kept far under the browser
     # default because a page that cannot answer in this budget is already dying.
@@ -263,6 +272,14 @@ class Settings(BaseSettings):
     SELF_HEAL_MAX_ACTIONS: int = 15
     SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
     PORT: int = 8000
+    # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
+    # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
+    # /stream sockets all count -- so size it against connections per task, not request concurrency.
+    # Set it empty or 0 to disable shedding.
+    API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
+    # the ALB reuses a connection the server already closed and answers the client with a 502.
+    UVICORN_TIMEOUT_KEEP_ALIVE: int = 125
     ALLOWED_ORIGINS: list[str] = ["*"]
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
@@ -270,6 +287,9 @@ class Settings(BaseSettings):
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
+    # Custom SMTP sends connect directly from the worker, so private/internal hosts are
+    # blocked by default; self-hosted deployments with internal SMTP relays can enable.
+    ALLOW_SMTP_INTERNAL_HOSTS: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
@@ -292,6 +312,15 @@ class Settings(BaseSettings):
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
+    # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
+    # retention period cannot be used to pin storage indefinitely; omitting retention_days
+    # still means "no expiry of its own", governed by the org's data-retention policy.
+    MAX_UPLOADED_FILE_RETENTION_DAYS: int = Field(default=365, gt=0)
+    # Backstop expiry given to a file attached to a run, so a run that never reaches its
+    # terminal handler (cancelled worker, lost node) still cannot strand the bytes. Must stay
+    # comfortably above WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES plus queue time, since deleting
+    # a file mid-run would fail the run that is using it.
+    RUN_ATTACHED_FILE_BACKSTOP_HOURS: int = Field(default=24, gt=0)
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
@@ -387,7 +416,7 @@ class Settings(BaseSettings):
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
-    BITWARDEN_MAX_RETRIES: int = 2
+    BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
 
     # task generation settings
@@ -457,6 +486,12 @@ class Settings(BaseSettings):
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
     # Task V3 native engine (skyvern-3.0) model; empty falls back to LLM_KEY. Cloud pins the validated model.
     TASK_V3_LLM_KEY: str = ""
+    # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
+    # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
+    TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
+    # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
+    # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
+    TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -902,6 +937,14 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    @field_validator("API_LIMIT_CONCURRENCY", mode="before")
+    @classmethod
+    def _api_limit_concurrency_unlimited_sentinels(cls, value: Any) -> Any:
+        # gt=0 otherwise leaves the unlimited setting unreachable from the environment.
+        if value is None or str(value).strip().lower() in ("", "0", "none", "null"):
+            return None
+        return value
 
     @field_validator("WORKER_STALL_DUMP_SECONDS", mode="before")
     @classmethod

@@ -246,8 +246,8 @@ class ExecutionChannel(CdpChannel):
 
 class LocalExecutionChannel(ExecutionChannel):
     def __init__(self, *, page: Page) -> None:  # type: ignore[override]
-        # bypass CdpChannel.__init__ which requires a VncChannel
-        self.vnc_channel = None  # type: ignore[assignment]
+        # bypass CdpChannel.__init__ which requires a ChannelContext
+        self.context = None  # type: ignore[assignment]
         self.browser = None
         self.browser_context = page.context
         self.page = page
@@ -266,7 +266,7 @@ class LocalExecutionChannel(ExecutionChannel):
         expression: str,
         arg: str | int | float | bool | list | dict | None = None,
     ) -> str | int | float | bool | list | dict | None:
-        # Skip the inherited connect() — it dereferences self.vnc_channel,
+        # Skip the inherited connect() — it dereferences self.context,
         # which LocalExecutionChannel intentionally leaves None.
         if not self.page:
             raise RuntimeError(f"{self.class_name} evaluate_js: no page available.")
@@ -345,7 +345,7 @@ async def execution_channel(vnc_channel: VncChannel) -> t.AsyncIterator[Executio
     If it turns out it's too slow, we can refactor to keep a persistent channel per vnc client.
     """
 
-    channel = ExecutionChannel(vnc_channel=vnc_channel)
+    channel = ExecutionChannel(context=vnc_channel)
 
     try:
         await channel.connect()

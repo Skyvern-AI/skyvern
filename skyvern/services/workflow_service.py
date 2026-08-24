@@ -10,6 +10,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.tags import TagWriteContext
+from skyvern.forge.sdk.workflow.models.validators import drop_reserved_tag_values
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
 from skyvern.schemas.runs import (
     BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY,
@@ -50,6 +51,7 @@ def workflow_request_body_from_existing_run(
             ),
             # The original request's fresh-browser intent propagates to the retry (re-resolves fresh).
             "start_fresh_browser": bool(workflow_run.start_fresh_browser),
+            "reuse_browser_session": workflow_run.reuse_browser_session,
             "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
             "max_elapsed_time_minutes": workflow_run.max_elapsed_time_minutes,
             "extra_http_headers": workflow_run.extra_http_headers,
@@ -57,7 +59,9 @@ def workflow_request_body_from_existing_run(
             "browser_address": workflow_run.browser_address,
             "run_with": workflow_run.run_with,
             "ai_fallback": workflow_run.ai_fallback,
-            "run_metadata": run_metadata,
+            # Replayed tags may predate the reserved-value rule; drop those entries rather than
+            # letting the request-model validator fail the whole retry.
+            "run_metadata": drop_reserved_tag_values(run_metadata),
         },
         context=_SERVER_ASSIGNED_BROWSER_ADDRESS_CONTEXT,
     )

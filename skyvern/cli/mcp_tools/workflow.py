@@ -120,7 +120,11 @@ def _serialize_run(run: Any) -> dict[str, Any]:
     }
     for field in (
         "run_type",
+        "workflow_id",
+        "workflow_permanent_id",
+        "workflow_title",
         "step_count",
+        "total_steps",
         "failure_reason",
         "recording_url",
         "app_url",
@@ -301,15 +305,20 @@ def _summarize_output_value(output_value: Any) -> tuple[dict[str, Any], dict[str
 
 
 def _summarize_artifacts(run: Any, output_stats: dict[str, Any]) -> dict[str, Any]:
-    downloaded_files = _jsonable(_get_value(run, "downloaded_files")) or []
-    screenshot_urls = _jsonable(_get_value(run, "screenshot_urls")) or []
+    missing = object()
+    downloaded_files_value = _get_value(run, "downloaded_files", missing)
+    screenshot_urls_value = _get_value(run, "screenshot_urls", missing)
+    downloaded_files = [] if downloaded_files_value is missing else (_jsonable(downloaded_files_value) or [])
+    screenshot_urls = [] if screenshot_urls_value is missing else (_jsonable(screenshot_urls_value) or [])
 
     summary: dict[str, Any] = {
         "recording_available": bool(_get_value(run, "recording_url")),
-        "workflow_screenshot_count": len(screenshot_urls),
-        "downloaded_file_count": len(downloaded_files),
         "artifact_id_count": output_stats["artifact_id_count"],
     }
+    if screenshot_urls_value is not missing:
+        summary["workflow_screenshot_count"] = len(screenshot_urls)
+    if downloaded_files_value is not missing:
+        summary["downloaded_file_count"] = len(downloaded_files)
 
     filenames = [
         filename
@@ -344,6 +353,10 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         "artifact_summary": _summarize_artifacts(run, output_stats),
         "output_summary": output_summary,
     }
+
+    parent_run_id = _get_value(run, "parent_workflow_run_id")
+    if parent_run_id:
+        summary["parent_run_id"] = parent_run_id
 
     failure_reason = _get_value(run, "failure_reason")
     if failure_reason:
@@ -508,6 +521,7 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "totp_verification_url",
     "totp_identifier",
     "persist_browser_session",
+    "reuse_browser_session",
     "mask_secrets",
     "pin_saved_session_ip",
     "browser_profile_id",
@@ -1615,9 +1629,20 @@ async def skyvern_workflow_run_list(
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
     search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
+    include_child_runs: Annotated[
+        bool,
+        Field(
+            description=(
+                "Include child runs — runs of this workflow started from inside another workflow run. "
+                "False by default, so only top-level runs are listed."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """List runs for a specific workflow. Use this when you have a workflow permanent ID
-    and need to browse its run history with pagination and optional filters."""
+    and need to browse its run history with pagination and optional filters.
+    Child runs — runs started by another workflow — are excluded by default, so the count here can be
+    far lower than the workflow's total run history; pass include_child_runs=true to list them too."""
     if err := validate_workflow_id(workflow_id, "skyvern_workflow_run_list"):
         return err
 
@@ -1631,6 +1656,7 @@ async def skyvern_workflow_run_list(
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
+                include_child_runs=include_child_runs,
             )
             timer.mark("sdk")
         except NotFoundError:
@@ -1664,9 +1690,14 @@ async def skyvern_workflow_run_list(
             "page_size": page_size,
             "count": len(runs),
             "has_more": has_more,
+            "include_child_runs": include_child_runs,
             "sdk_equivalent": (
-                f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
-                f"page={page}, page_size={page_size})"
+                f"# No SDK argument yet — GET /v1/workflows/{workflow_id}/runs?include_child_runs=true"
+                if include_child_runs
+                else (
+                    f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
+                    f"page={page}, page_size={page_size})"
+                )
             ),
         },
         timing_ms=timer.timing_ms,
@@ -2063,6 +2094,10 @@ async def skyvern_workflow_run(
             description="Execution mode override (e.g., 'code' for cached script execution). Null inherits from workflow setting."
         ),
     ] = None,
+    verbosity: Annotated[
+        Literal["summary", "full"],
+        Field(description="Return compact run output or the full response, subject to the final size caps."),
+    ] = "summary",
 ) -> dict[str, Any]:
     """Run a Skyvern workflow with parameters. Use when you need to execute an automation workflow.
     Starts a NEW run and requires a workflow_id (wpid_...), NOT a workflow_run_id. To re-run an existing
@@ -2152,6 +2187,7 @@ async def skyvern_workflow_run(
 
     LOG.info("workflow_run_started", workflow_id=workflow_id, run_id=run.run_id, wait=wait)
     data = _serialize_run(run)
+    data.setdefault("workflow_id", workflow_id)
     params_str = f", parameters={parsed_params}" if parsed_params else ""
     wait_str = f", wait_for_completion=True, timeout={timeout_seconds}" if wait else ""
     data["sdk_equivalent"] = f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{wait_str})"

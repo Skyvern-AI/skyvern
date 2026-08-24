@@ -50,6 +50,8 @@ interface InteractiveStreamViewProps {
   // width and is expected to draw the window (border, rounding, width) around us,
   // so we render flush instead. Omitted, we keep framing ourselves.
   onFrameWidthChange?: (width: number | null) => void;
+  frameToken?: number;
+  onFrameLoad?: (token: number) => void;
 }
 
 function UrlBar({
@@ -200,6 +202,8 @@ function InteractiveStreamView({
   navigateError,
   onHistoryNavigate,
   onFrameWidthChange,
+  frameToken,
+  onFrameLoad,
 }: InteractiveStreamViewProps) {
   const imgDataUrl = `data:image/${streamFormat};base64,${streamImgSrc}`;
   const imgRef = useRef<HTMLImageElement>(null);
@@ -320,6 +324,8 @@ function InteractiveStreamView({
 
     const imgInteractionProps = {
       src: imgDataUrl,
+      "data-frame-token": frameToken,
+      onLoad: () => onFrameLoad?.(frameToken ?? 0),
       onMouseDown: handlers.handleMouseDown,
       onMouseUp: handlers.handleMouseUp,
       onMouseMove: handlers.handleMouseMove,
@@ -330,7 +336,15 @@ function InteractiveStreamView({
     const controlOverlays = (
       <>
         {showControlButtons && !userIsControlling && inputReady && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center">
+          // The overlay covers the whole picture, so a click anywhere on it is
+          // someone trying to use the page: take control instead of eating the
+          // click (this layer alone drew ~470 dead clicks from a fifth of studio
+          // users). The button stays the keyboard/screen-reader path.
+          <div
+            data-testid="take-control-overlay"
+            className="absolute inset-0 z-10 flex cursor-pointer items-center justify-center"
+            onClick={() => setUserIsControlling(true)}
+          >
             <Button
               size="sm"
               className="border"
@@ -366,10 +380,13 @@ function InteractiveStreamView({
         {/* Chrome and viewport share previewWidth so the window sizes to the letterboxed
             picture rather than the pane, the way a real browser window frames its page.
             When the parent owns the frame it applies that width (and the border) itself,
-            around its own tab strip too, so here we just fill it. */}
+            around its own tab strip too, so here we just fill it.
+            previewWidth comes from the height alone, so a pane taller than the picture's
+            aspect ratio (the studio's browser pane) asks for more width than it has;
+            max-w-full keeps the window inside it and letterboxes instead of cropping. */}
         <div
           className={cn(
-            "mx-auto flex h-full flex-col items-center overflow-hidden",
+            "mx-auto flex h-full max-w-full flex-col items-center overflow-hidden",
             !parentOwnsFrame && "rounded-md shadow-elevated",
           )}
           style={
@@ -402,6 +419,9 @@ function InteractiveStreamView({
         {currentUrl && <UrlBar url={currentUrl} />}
         <img
           src={imgDataUrl}
+          data-frame-token={frameToken}
+          onLoad={() => onFrameLoad?.(frameToken ?? 0)}
+          decoding="async"
           className={cn(
             "min-h-0 w-full flex-1 object-contain",
             currentUrl ? "rounded-b-md" : "rounded-md",

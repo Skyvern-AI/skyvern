@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _request_policy_agent_inputs,
     _store_request_policy_on_context,
 )
+from skyvern.forge.sdk.copilot.context import ApprovedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
     SAFETY_SCREEN_UNAVAILABLE_QUESTION,
@@ -48,6 +49,36 @@ async def _build(
             handler=handler,
         )
     return policy, handler
+
+
+@pytest.mark.asyncio
+async def test_carried_password_label_does_not_erase_prior_credential_approval() -> None:
+    approved = SimpleNamespace(credential_id="cred_portal", name="portal-login")
+    trusted_context = StructuredContext(
+        approved_credentials=[ApprovedCredential(credential_id="cred_portal")],
+        carried_trajectory=[{"tool_name": "fill", "selector": "#Password", "label": "Password:", "carried": True}],
+    ).to_json_str()
+    handler = AsyncMock(return_value={"version": "1", "state": "clean", "citations": []})
+    with (
+        patch(
+            "skyvern.forge.app.DATABASE.credentials.get_credentials",
+            new=AsyncMock(return_value=[approved]),
+        ),
+        patch(
+            "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
+            new=AsyncMock(return_value=[approved]),
+        ),
+    ):
+        policy = await build_request_policy_trust_floor(
+            user_message="run the workflow",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=trusted_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+
+    assert [credential.credential_id for credential in policy.resolved_credentials] == ["cred_portal"]
 
 
 @pytest.mark.asyncio
@@ -180,6 +211,23 @@ async def test_credential_id_citation_is_exonerated() -> None:
 
     assert policy.raw_secret_safety_status == "clean"
     assert policy.canonical_user_message == "Use cred_530111222333444555 for the login"
+
+
+@pytest.mark.asyncio
+async def test_org_visible_google_connection_id_citation_is_exonerated() -> None:
+    connection_id = "goac_530111222333444555"
+    with patch(
+        "skyvern.forge.sdk.copilot.request_policy.google_oauth_service.get_visible_credentials_for_org",
+        new=AsyncMock(return_value=[SimpleNamespace(id=connection_id)]),
+    ):
+        policy, _ = await _build(
+            connection_id,
+            {"version": "1", "state": "detected", "citations": [connection_id]},
+        )
+
+    assert policy.raw_secret_safety_status == "clean"
+    assert policy.raw_secret_safety_exonerated_citation_count == 1
+    assert policy.canonical_user_message == connection_id
 
 
 @pytest.mark.asyncio

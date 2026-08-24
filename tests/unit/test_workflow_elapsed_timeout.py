@@ -2,13 +2,14 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pydantic import ValidationError
 
 from skyvern.forge.sdk.routes.agent_protocol import _workflow_run_request_to_legacy_request
 from skyvern.forge.sdk.workflow import service as service_module
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
@@ -37,8 +38,11 @@ def _workflow_run(
         workflow_id="wf_1",
         workflow_permanent_id="wp_1",
         organization_id="org_1",
+        browser_session_id=None,
         browser_profile_id="bp_1",
         browser_address=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=status,
         failure_reason=None,
         ignore_inherited_workflow_system_prompt=False,
@@ -47,6 +51,7 @@ def _workflow_run(
         max_elapsed_time_minutes=max_elapsed_time_minutes,
         started_at=started_at,
         created_at=started_at,
+        finished_at=None,
         code_gen=False,
         run_with="agent",
     )
@@ -189,6 +194,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -197,7 +203,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -270,6 +276,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -278,7 +285,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -347,6 +354,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -355,7 +363,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -439,6 +447,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -447,7 +456,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -537,6 +546,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -545,7 +555,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -714,6 +724,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -722,7 +733,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -806,6 +817,7 @@ async def test_execute_workflow_refreshes_failed_status_after_finally_write_time
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -814,7 +826,7 @@ async def test_execute_workflow_refreshes_failed_status_after_finally_write_time
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -900,6 +912,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Timeout workflow",
         organization_id="org_1",
@@ -908,7 +921,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -979,12 +992,11 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_terminal(
+async def test_execute_workflow_preserves_escaped_failure_cause_before_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # SKY-12860: block execution is interrupted before it captures a terminal intent
-    # (pre_finally_status stays None). The run must be finalized as failed, not left
-    # orphaned in `running`, and clean_up_workflow must still run.
+    # A non-cancellation exception before terminal intent must not be labeled as an
+    # interruption. The run still needs terminalization and cleanup.
     started_at = datetime.now(timezone.utc)
     created_run = _workflow_run(WorkflowRunStatus.created, started_at=started_at)
     running_run = _workflow_run(WorkflowRunStatus.running, started_at=started_at)
@@ -993,6 +1005,7 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Interrupted workflow",
         organization_id="org_1",
@@ -1001,7 +1014,7 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label=None,
-            blocks=[],
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
         ),
     )
     organization = SimpleNamespace(organization_id="org_1")
@@ -1020,9 +1033,10 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
     monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
 
     svc = WorkflowService()
-    interrupted_blocks = AsyncMock(side_effect=RuntimeError("blocks interrupted"))
+    interrupted_blocks = AsyncMock(side_effect=TimeoutError("blocks timed out"))
     mark_failed_if_not_final = AsyncMock(return_value=failed_run)
     clean_up_workflow = AsyncMock()
+    failure_log = Mock()
 
     monkeypatch.setattr(svc, "get_workflow_run", AsyncMock(return_value=created_run))
     monkeypatch.setattr(svc, "get_workflow", AsyncMock(return_value=workflow))
@@ -1036,8 +1050,9 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
     monkeypatch.setattr(svc, "_execute_workflow_blocks", interrupted_blocks)
     monkeypatch.setattr(svc, "mark_workflow_run_as_failed_if_not_final", mark_failed_if_not_final)
     monkeypatch.setattr(svc, "clean_up_workflow", clean_up_workflow)
+    monkeypatch.setattr(service_module.LOG, "warning", failure_log)
 
-    with pytest.raises(RuntimeError, match="blocks interrupted"):
+    with pytest.raises(TimeoutError, match="blocks timed out"):
         await svc.execute_workflow(
             workflow_run_id="wr_1",
             api_key=None,
@@ -1047,13 +1062,18 @@ async def test_execute_workflow_finalizes_failed_when_body_interrupted_before_te
     mark_failed_if_not_final.assert_awaited_once()
     assert mark_failed_if_not_final.await_args is not None
     assert mark_failed_if_not_final.await_args.kwargs["workflow_run_id"] == "wr_1"
-    assert (
-        mark_failed_if_not_final.await_args.kwargs["failure_reason"]
-        == service_module.WORKFLOW_RUN_INTERRUPTED_FAILURE_REASON
-    )
-    # The interrupted case has no executor left to terminalize children — the in-flight
-    # block/task/step rows must be cascaded alongside the run.
+    failure_reason = mark_failed_if_not_final.await_args.kwargs["failure_reason"]
+    assert "TimeoutError" in failure_reason
+    assert "interrupted" not in failure_reason.lower()
+    assert mark_failed_if_not_final.await_args.kwargs["failure_category"] == [
+        {
+            "category": "UNKNOWN",
+            "confidence_float": 0.5,
+            "reasoning": "No keyword match found",
+        }
+    ]
     assert mark_failed_if_not_final.await_args.kwargs["cascade_children"] is True
+    assert any(call.kwargs.get("exc_info") is True for call in failure_log.call_args_list)
     clean_up_workflow.assert_awaited_once()
 
 
@@ -1157,12 +1177,17 @@ async def test_execute_workflow_skips_interrupted_finalize_for_cancellation(
     workflow = SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=False,
+        reuse_browser_session=False,
         workflow_permanent_id="wp_1",
         title="Cancelled workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
         model=None,
-        workflow_definition=SimpleNamespace(parameters=[], finally_block_label=None, blocks=[]),
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            finally_block_label=None,
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+        ),
     )
     organization = SimpleNamespace(organization_id="org_1")
 

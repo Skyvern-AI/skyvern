@@ -23,15 +23,11 @@ RunOutcomeReasonCode = Literal[
 ]
 
 TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE: RunOutcomeReasonCode = "terminal_challenge_blocker"
-TERMINAL_CHALLENGE_BLOCKER_REASON_CODE = "tool_error_terminal_challenge_blocker"
 # Alias the root-cause classifier set so newly added anti-bot challenge aliases
 # automatically participate in the terminal-challenge gate.
 TERMINAL_CHALLENGE_FAILURE_CATEGORIES = ANTI_BOT_CHALLENGE_FAILURE_CATEGORIES
 TERMINAL_CHALLENGE_FAILURE_CATEGORY_MIN_CONFIDENCE = 0.7
-TERMINAL_CHALLENGE_USER_FACING_REASON = (
-    "The page is gated by a site verification challenge, so I stopped instead of retrying the same path. "
-    "The draft workflow is preserved, but it is not verified end-to-end."
-)
+
 
 _DISPLAY_REASON_MAX_CHARS = 160
 _OUTPUT_REPORT_MAX_CHARS = 1200

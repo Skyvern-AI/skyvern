@@ -362,6 +362,7 @@ async def test_selectable_input_receives_generated_totp_instead_of_marker(monkey
     element.get_selectable = AsyncMock(return_value=True)
     element.is_disabled = AsyncMock(return_value=False)
     element.supports_text_input = AsyncMock(return_value=True)
+    element.get_attr = AsyncMock(return_value=None)
     dom = MagicMock()
     dom.get_skyvern_element_by_id = AsyncMock(return_value=element)
     dom_type = MagicMock(return_value=dom)
@@ -686,3 +687,79 @@ class TestGetTotpDigitBasic:
                         digit_index=idx,
                     )
                     assert result == expected, f"Expected digit {expected} at index {idx}, got {result}"
+
+
+class TestMultiFieldTotpAbsoluteIndexExecution:
+    """Execution-path coverage for the multi-field TOTP absolute action-index contract.
+
+    ``ForgeAgent._is_multi_field_totp_sequence`` decides, per INPUT_TEXT action, whether the runtime
+    stamps ``totp_timing_info`` with the action's ABSOLUTE index in the whole batch, and
+    ``_handle_multi_field_totp_sequence`` only seeds the TOTP cache when that index is 0. These tests
+    prove the accepted ``[digits..., CLICK submit]`` plan reaches execution with digit indexes 0..N-1
+    and the handler generates/caches/reuses, while a leading action is not treated as a sequence."""
+
+    @staticmethod
+    def _digit(text: str) -> SimpleNamespace:
+        return SimpleNamespace(action_type=ActionType.INPUT_TEXT, text=text)
+
+    @staticmethod
+    def _click() -> SimpleNamespace:
+        return SimpleNamespace(action_type=ActionType.CLICK, text=None)
+
+    def _stamped_digit_indexes(self, actions: list) -> list[int]:
+        """Replicate the agent execution loop: stamp INPUT_TEXT actions with their absolute index only
+        when the batch is a multi-field TOTP sequence."""
+        from skyvern.forge.agent import ForgeAgent
+
+        agent = ForgeAgent.__new__(ForgeAgent)
+        if not agent._is_multi_field_totp_sequence(actions):
+            return []
+        return [action_idx for action_idx, action in enumerate(actions) if action.action_type == ActionType.INPUT_TEXT]
+
+    def test_digits_then_submit_click_reaches_execution_at_indexes_0_to_n(self) -> None:
+        actions = [self._digit(str(d)) for d in range(1, 7)] + [self._click()]
+        assert self._stamped_digit_indexes(actions) == [0, 1, 2, 3, 4, 5]
+
+    def test_leading_action_is_not_a_multi_field_sequence(self) -> None:
+        actions = [self._click()] + [self._digit(str(d)) for d in range(1, 7)]
+        assert self._stamped_digit_indexes(actions) == []
+
+    @pytest.mark.asyncio
+    async def test_stamped_indexes_drive_generate_then_reuse(self) -> None:
+        """The 0..N-1 indexes the accepted plan produces let the handler generate+cache at the first
+        digit and reuse the cache for a later digit without regenerating. Asserts cache is populated
+        (not its plaintext value) so no code/secret is exposed."""
+        actions = [self._digit(str(d)) for d in range(1, 7)] + [self._click()]
+        indexes = self._stamped_digit_indexes(actions)
+        assert indexes[0] == 0 and indexes[-1] == len(indexes) - 1
+
+        context = SimpleNamespace(totp_codes={})
+        fake_totp = _FakeTotp()
+        task = SimpleNamespace(task_id="task_exec")
+        cache_key = f"{task.task_id}_totp_cache"
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+        ):
+            first = await _handle_multi_field_totp_sequence(
+                {"action_index": indexes[0], "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+        assert first is None
+        assert context.totp_codes.get(cache_key)
+        generated_at_first = list(fake_totp.at_values)
+
+        with (
+            patch("skyvern.webeye.actions.handler.skyvern_context.ensure_context", return_value=context),
+            patch("skyvern.webeye.actions.handler.parse_totp_config", return_value=fake_totp),
+            patch("skyvern.webeye.actions.handler.time.time", return_value=44),
+            patch("skyvern.webeye.actions.handler._totp_window_sleep", new_callable=AsyncMock),
+        ):
+            later = await _handle_multi_field_totp_sequence(
+                {"action_index": indexes[-1], "totp_secret": "otpauth://totp/example?secret=abc"},
+                task,
+            )
+        assert later is None
+        assert fake_totp.at_values == generated_at_first

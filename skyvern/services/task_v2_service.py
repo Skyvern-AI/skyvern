@@ -1504,7 +1504,7 @@ async def handle_block_result(
             "Block with type {block.block_type} was canceled for workflow run {workflow_run_id}, cancelling workflow run",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1520,7 +1520,7 @@ async def handle_block_result(
             f"Block with type {block.block_type} failed for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1529,7 +1529,7 @@ async def handle_block_result(
                 f"Block with type {block.block_type} failed but will continue executing the workflow run {workflow_run_id}",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run.workflow_run_id,
-                block_result=block_result,
+                block_status=block_result.status,
                 continue_on_failure=block.continue_on_failure,
                 block_type_var=block.block_type,
                 block_label=block.label,
@@ -1540,7 +1540,7 @@ async def handle_block_result(
             f"Block with type {block.block_type} was terminated for workflow run {workflow_run_id}",
             block_type=block.block_type,
             workflow_run_id=workflow_run.workflow_run_id,
-            block_result=block_result,
+            block_status=block_result.status,
             block_type_var=block.block_type,
             block_label=block.label,
         )
@@ -1549,7 +1549,7 @@ async def handle_block_result(
                 f"Block with type {block.block_type} was terminated for workflow run {workflow_run_id}, but will continue executing the workflow run",
                 block_type=block.block_type,
                 workflow_run_id=workflow_run.workflow_run_id,
-                block_result=block_result,
+                block_status=block_result.status,
                 continue_on_failure=block.continue_on_failure,
                 block_type_var=block.block_type,
                 block_label=block.label,
@@ -2840,7 +2840,6 @@ async def send_task_v2_webhook(task_v2: TaskV2, *, success_marker: str = "") -> 
             LOG.info(
                 "Task v2 webhook failed",
                 task_v2_id=task_v2.observer_cruise_id,
-                resp=resp,
                 resp_code=resp.status_code,
                 resp_text=resp.text,
             )

@@ -238,6 +238,28 @@ describe("InteractiveStreamView URL bar", () => {
   });
 });
 
+describe("InteractiveStreamView take-control overlay", () => {
+  it("takes control on a click anywhere on the read-only picture, not just the button", () => {
+    const props = baseProps();
+    render(<InteractiveStreamView {...props} />);
+
+    fireEvent.click(screen.getByTestId("take-control-overlay"));
+
+    expect(props.setUserIsControlling).toHaveBeenCalledWith(true);
+    // The picture's own mouse handlers stay untouched by the overlay click.
+    expect(props.handlers.handleMouseDown).not.toHaveBeenCalled();
+  });
+
+  it("has no overlay to swallow clicks once the user is controlling", () => {
+    render(<InteractiveStreamView {...baseProps()} userIsControlling />);
+
+    expect(screen.queryByTestId("take-control-overlay")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /stop controlling/ }),
+    ).toBeTruthy();
+  });
+});
+
 describe("InteractiveStreamView input forwarding", () => {
   it("forwards paste events from the focused stream container", () => {
     const handlePaste = vi.fn();
@@ -399,6 +421,22 @@ describe("InteractiveStreamView preview width", () => {
     );
 
     expect(img.parentElement?.style.width).toBe("800px");
+
+    observer.restore();
+  });
+
+  it("clamps that width to the pane, so a pane taller than the picture letterboxes instead of cropping", () => {
+    const observer = observeOneResize({
+      height: 450,
+      naturalWidth: 1600,
+      naturalHeight: 900,
+    });
+
+    const img = observer.fire(() =>
+      render(<InteractiveStreamView {...baseProps()} />),
+    );
+
+    expect(img.parentElement?.className).toContain("max-w-full");
 
     observer.restore();
   });

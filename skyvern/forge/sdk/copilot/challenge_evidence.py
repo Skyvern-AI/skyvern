@@ -20,6 +20,22 @@ class ChallengeEvidenceSource(StrEnum):
     KEYWORD_ONLY = "keyword_only"
 
 
+class ChallengeKind(StrEnum):
+    """Closed set the vision classifier picks from; ``challenge_state.kind`` stays free-form."""
+
+    CAPTCHA = "captcha"
+    ACCESS_DENIED = "access_denied"
+    OTHER = "other"
+
+
+# Kinds the code runtime has a solver arm for. Membership alone does not mean a given run can
+# clear one: the arms sit behind AGENT_FUNCTION, whose open-source base solves nothing and whose
+# cloud arm is enabled per organization and per domain, so callers must pair this with
+# ``captcha_solving_available``.
+RUNTIME_SOLVABLE_CHALLENGE_KINDS: frozenset[ChallengeKind] = frozenset({ChallengeKind.CAPTCHA})
+
+
+CHALLENGE_KIND_KEY = "challenge_kind"
 CHALLENGE_EVIDENCE_SOURCE_KEY = "evidence_source"
 CARRIER_CHALLENGE_EVIDENCE_SOURCES: frozenset[ChallengeEvidenceSource] = frozenset(
     {
@@ -128,6 +144,25 @@ def challenge_evidence_source_from_entry(entry: Mapping[str, Any]) -> ChallengeE
         return None
 
 
+def normalized_challenge_kind(value: object) -> ChallengeKind | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return ChallengeKind(value.strip().lower())
+    except ValueError:
+        return None
+
+
+def typed_challenge_kind(evidence: Mapping[str, Any] | None) -> ChallengeKind | None:
+    """The closed-enum kind stamped on ``challenge_state``, or ``None`` when unclassified."""
+    if not isinstance(evidence, Mapping):
+        return None
+    challenge_state = evidence.get("challenge_state")
+    if not isinstance(challenge_state, Mapping):
+        return None
+    return normalized_challenge_kind(challenge_state.get(CHALLENGE_KIND_KEY))
+
+
 def is_carrier_backed_category_entry(entry: object) -> bool:
     """True for every non-anti-bot category; anti-bot aliases require a carrier
     ``evidence_source`` and an absent or unknown value fails closed."""
@@ -185,7 +220,7 @@ def composition_challenge_carrier(evidence: Mapping[str, Any] | None) -> Challen
     if stamped in CARRIER_CHALLENGE_EVIDENCE_SOURCES:
         return stamped
     # gates_submit_controls is only ever derived from rendered controls or a
-    # vision confirmation, so it carries the same weight as either.
+    # structurally corroborated vision confirmation, so it carries the same weight as either.
     if (
         challenge_state.get("requires_human_verification") is True
         or challenge_state.get("gates_submit_controls") is True

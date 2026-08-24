@@ -19,9 +19,13 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from skyvern.forge.sdk.copilot.agent import _build_timeout_exit_result
+from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
 from skyvern.forge.sdk.routes.workflow_copilot import (
+    _assistant_execution_receipts,
     _blockless_submission_fallback,
+    _build_proposed_workflow_data,
     _effective_auto_accept,
     _ensure_terminal_frame,
     _normalize_copilot_yaml,
@@ -52,6 +56,39 @@ def test_workflow_copilot_ingress_log_fields_are_content_free() -> None:
 
     assert fields == {"message_length": len(f"The password is {literal}")}
     assert literal not in repr(fields)
+
+
+def test_proposed_workflow_persists_exact_version_execution_receipts() -> None:
+    workflow = MagicMock()
+    workflow.title = "Draft"
+    workflow.model_dump.return_value = {"workflow_id": "w_test"}
+    result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml="title: Draft\nworkflow_definition:\n  blocks: []\n",
+        executed_block_fingerprints={"step": {"version_b", "version_a"}},
+    )
+
+    proposed = _build_proposed_workflow_data(workflow, result)
+
+    assert proposed["_copilot_tested_block_fingerprints"] == {"step": ["version_a", "version_b"]}
+
+
+def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> None:
+    first = MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload={"testedBlockFingerprints": {"step": ["version_a"]}},
+    )
+    second = MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload={"testedBlockFingerprints": {"step": ["version_b"], "other": ["version_c"]}},
+    )
+
+    assert _assistant_execution_receipts([first, second]) == {
+        "step": {"version_a", "version_b"},
+        "other": {"version_c"},
+    }
 
 
 def _agent_result(
@@ -612,3 +649,46 @@ def test_run_grant_yaml_ignores_a_binding_that_exists_only_on_the_submitted_canv
 
 def test_run_grant_yaml_is_none_when_the_row_has_no_blocks() -> None:
     assert _run_grant_workflow_yaml(None) is None
+
+
+def _timed_out_ctx(*, workflow_yaml: str | None, last_test_ok: bool | None) -> MagicMock:
+    ctx = MagicMock()
+    ctx.last_workflow = MagicMock(name="wf")
+    ctx.last_workflow_yaml = workflow_yaml
+    ctx.last_test_ok = last_test_ok
+    ctx.last_full_workflow_test_ok = False
+    ctx.last_test_suspicious_success = False
+    ctx.copilot_total_timeout_exceeded = True
+    ctx.last_failure_category_top = None
+    ctx.workflow_persisted = False
+    ctx.total_tokens_used = None
+    ctx.last_good_workflow = None
+    ctx.last_good_workflow_yaml = None
+    ctx.tool_activity = []
+    ctx.latest_diagnosis_repair_contract = None
+    ctx.test_after_update_done = last_test_ok is not None
+    ctx.last_update_block_count = None
+    ctx.has_staged_proposal = True
+    ctx.request_policy.selected_connected_account_id = None
+    return ctx
+
+
+class TestTimedOutFailedTestDraftIsNotAutoApplied:
+    def test_timeout_failed_test_result_offers_review_instead_of_committing(self) -> None:
+        ctx = _timed_out_ctx(workflow_yaml="version: '1.0'", last_test_ok=False)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_workflow
+        assert result.proposal_disposition == "review_untested"
+        assert _effective_auto_accept(True, result) is False
+        assert _should_commit_staged_workflow(True, result) is False
+
+    def test_empty_timeout_result_does_not_commit_a_staged_workflow(self) -> None:
+        ctx = _timed_out_ctx(workflow_yaml=None, last_test_ok=None)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+        assert _should_commit_staged_workflow(True, result) is False

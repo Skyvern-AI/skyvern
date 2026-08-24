@@ -1,0 +1,239 @@
+{
+  "anti_bot_indicators": [],
+  "body_has_markup": true,
+  "challenge_controls": [],
+  "clickable_controls": [
+    {
+      "disabled": false,
+      "identity": {
+        "label_context": "Continue to statements",
+        "role": "button",
+        "tag": "button"
+      },
+      "selector": "#btn-open-statements",
+      "selector_candidates": [
+        {
+          "selector": "#btn-open-statements",
+          "source": "id"
+        },
+        {
+          "selector": "body:nth-of-type(1) > main:nth-of-type(1) > button:nth-of-type(1)",
+          "source": "structural"
+        }
+      ],
+      "tag": "button",
+      "text": "Continue to statements",
+      "visible": true
+    }
+  ],
+  "forms": [
+    {
+      "action": "",
+      "fields": [
+        {
+          "checked": false,
+          "class": [],
+          "disabled": false,
+          "filled": true,
+          "id": "accept-terms",
+          "identity": {
+            "label_context": "I agree.",
+            "role": "checkbox",
+            "tag": "input"
+          },
+          "label": "I agree.",
+          "name": "accept_terms",
+          "options": [],
+          "placeholder": "",
+          "readonly": false,
+          "required": false,
+          "selector": "#accept-terms",
+          "selector_candidates": [
+            {
+              "selector": "#accept-terms",
+              "source": "id"
+            },
+            {
+              "selector": "input[name=\"accept_terms\"]",
+              "source": "name"
+            },
+            {
+              "selector": "#terms-modal > label:nth-of-type(1) > input:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "type": "checkbox",
+          "value": "",
+          "visible": true
+        }
+      ],
+      "id": "terms-modal",
+      "method": "",
+      "name": "",
+      "submit_controls": [
+        {
+          "class": [],
+          "disabled": false,
+          "id": "btn-continue",
+          "identity": {
+            "label_context": "Continue",
+            "role": "button",
+            "tag": "button"
+          },
+          "name": "",
+          "selector": "#btn-continue",
+          "selector_candidates": [
+            {
+              "selector": "#btn-continue",
+              "source": "id"
+            },
+            {
+              "selector": "#terms-modal > button:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "text": "Continue",
+          "type": "submit",
+          "value": "",
+          "visible": true
+        }
+      ]
+    }
+  ],
+  "key_value_relations": [],
+  "key_value_relations_truncated": false,
+  "modal_overlays": [
+    {
+      "aria_modal": false,
+      "class": [
+        "overlay"
+      ],
+      "dismiss_controls": [
+        {
+          "aria_label": "",
+          "identity": {
+            "label_context": "I agree.",
+            "role": "checkbox",
+            "tag": "input"
+          },
+          "selector": "#accept-terms",
+          "selector_candidates": [
+            {
+              "selector": "#accept-terms",
+              "source": "id"
+            },
+            {
+              "selector": "input[name=\"accept_terms\"]",
+              "source": "name"
+            },
+            {
+              "selector": "#terms-modal > label:nth-of-type(1) > input:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "tag": "input",
+          "text": "",
+          "title": "",
+          "type": "checkbox"
+        },
+        {
+          "aria_label": "",
+          "identity": {
+            "label_context": "Continue",
+            "role": "button",
+            "tag": "button"
+          },
+          "selector": "#btn-continue",
+          "selector_candidates": [
+            {
+              "selector": "#btn-continue",
+              "source": "id"
+            },
+            {
+              "selector": "#terms-modal > button:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "tag": "button",
+          "text": "Continue",
+          "title": "",
+          "type": "submit"
+        }
+      ],
+      "id": "terms-overlay",
+      "role": "",
+      "selector": "#terms-overlay",
+      "text": "Terms and Privacy I agree. Continue"
+    },
+    {
+      "aria_modal": true,
+      "class": [
+        "modal"
+      ],
+      "dismiss_controls": [
+        {
+          "aria_label": "",
+          "identity": {
+            "label_context": "I agree.",
+            "role": "checkbox",
+            "tag": "input"
+          },
+          "selector": "#accept-terms",
+          "selector_candidates": [
+            {
+              "selector": "#accept-terms",
+              "source": "id"
+            },
+            {
+              "selector": "input[name=\"accept_terms\"]",
+              "source": "name"
+            },
+            {
+              "selector": "#terms-modal > label:nth-of-type(1) > input:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "tag": "input",
+          "text": "",
+          "title": "",
+          "type": "checkbox"
+        },
+        {
+          "aria_label": "",
+          "identity": {
+            "label_context": "Continue",
+            "role": "button",
+            "tag": "button"
+          },
+          "selector": "#btn-continue",
+          "selector_candidates": [
+            {
+              "selector": "#btn-continue",
+              "source": "id"
+            },
+            {
+              "selector": "#terms-modal > button:nth-of-type(1)",
+              "source": "structural"
+            }
+          ],
+          "tag": "button",
+          "text": "Continue",
+          "title": "",
+          "type": "submit"
+        }
+      ],
+      "id": "terms-modal",
+      "role": "dialog",
+      "selector": "#terms-modal",
+      "text": "Terms and Privacy I agree. Continue"
+    }
+  ],
+  "navigation_targets": [],
+  "navigation_targets_truncated": false,
+  "page_title": "",
+  "result_containers": [],
+  "result_containers_truncated": false,
+  "reveal_relations_truncated": false,
+  "visible_text_excerpt": "Continue to statements\nTerms and Privacy\nI agree. Continue",
+  "visual_obstruction_candidates": []
+}

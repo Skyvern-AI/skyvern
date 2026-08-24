@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 
 import structlog
 
@@ -144,15 +147,19 @@ async def _rebind_pbs_download_dir(
     browser_context = browser_state.browser_context
     if browser_context is None:
         return
-    adopted_browser = browser_context.browser
-    if adopted_browser is None:
-        return
     try:
+        adopted_browser = browser_context.browser
+        rebind_page = None if adopted_browser is not None else await browser_state.get_working_page()
+        if adopted_browser is None and rebind_page is None:
+            return
         if getattr(browser_context, "_skyvern_download_run_id", None) == download_run_id:
             return
         # Not gated on the interceptor: a Skyvern-hosted context has none, and rebind_download_dir
         # is what repoints its Browser.setDownloadBehavior off the session-scoped connect-time path.
-        await rebind_download_dir(adopted_browser, run_id=download_run_id)
+        if adopted_browser is not None:
+            await rebind_download_dir(adopted_browser, run_id=download_run_id)
+        else:
+            await rebind_download_dir(None, run_id=download_run_id, page=rebind_page)
         browser_context._skyvern_download_run_id = download_run_id  # type: ignore[attr-defined]
     except Exception:
         LOG.warning(
@@ -255,10 +262,11 @@ class RealBrowserManager(BrowserManager):
         # The runnable identity accepted by begin_session, carried unchanged into teardown. Cleanup
         # reads this lease instead of reconstructing identity from Task/Workflow fields.
         self._persistent_session_leases: dict[str, _PersistentSessionLease] = {}
-        # Runnables between begin_session and their lease. Occupancy is published first and occupy
-        # does not extend the session's timeout, so without this a reused-but-expired session is
-        # unprotected for the whole attach.
-        self._acquiring_session_runnables: set[str] = set()
+        # Runnables between begin_session and their lease, refcounted by runnable id. Occupancy is
+        # published first and occupy does not extend the session's timeout, so without this a
+        # reused-but-expired session is unprotected for the whole attach. Refcounts keep overlapping
+        # acquisitions for the same owner live until their last span exits.
+        self._acquiring_session_runnables: dict[str, int] = {}
         # CDP frame publishers keyed by stream key (``{wr}.png`` / ``{task}.png``).
         self._frame_publishers: dict[str, CDPFramePublisher] = {}
         # Serializes the check/create/start/store/register sequence in
@@ -306,8 +314,29 @@ class RealBrowserManager(BrowserManager):
         if lease is not None and self._persistent_session_leases.get(run_id) is lease:
             self._persistent_session_leases.pop(run_id, None)
 
+    @asynccontextmanager
+    async def acquiring_session_runnable(self, runnable_id: str | None) -> AsyncIterator[None]:
+        acquiring_runnables = getattr(self, "_acquiring_session_runnables", None)
+        if acquiring_runnables is None:
+            acquiring_runnables = self._acquiring_session_runnables = {}
+        if runnable_id is not None:
+            acquiring_runnables[runnable_id] = acquiring_runnables.get(runnable_id, 0) + 1
+        try:
+            yield
+        finally:
+            if runnable_id is not None:
+                remaining = acquiring_runnables.get(runnable_id, 0) - 1
+                if remaining > 0:
+                    acquiring_runnables[runnable_id] = remaining
+                else:
+                    acquiring_runnables.pop(runnable_id, None)
+
     def live_session_runnable_ids(self) -> set[str]:
-        return set(self._persistent_session_leases) | self._acquiring_session_runnables
+        lease_runnable_ids = {lease.runnable_id for lease in self._persistent_session_leases.values()}
+        acquiring_runnable_ids = {
+            runnable_id for runnable_id, count in self._acquiring_session_runnables.items() if count > 0
+        }
+        return set(self._persistent_session_leases) | lease_runnable_ids | acquiring_runnable_ids
 
     async def _start_frame_publisher(
         self,
@@ -514,6 +543,7 @@ class RealBrowserManager(BrowserManager):
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
+        cdp_port: int | None = None,
         browser_profile_id: str | None = None,
         engine_run_key: str | None = None,
         engine_workflow_run_id: str | None = None,
@@ -571,6 +601,7 @@ class RealBrowserManager(BrowserManager):
                     extra_http_headers=extra_http_headers,
                     cdp_connect_headers=cdp_connect_headers,
                     browser_address=browser_address,
+                    cdp_port=cdp_port,
                     browser_address_is_server_assigned=bool(context and context.browser_address_is_server_assigned),
                     browser_profile_id=browser_profile_id,
                     engine_selection=selection,
@@ -649,69 +680,85 @@ class RealBrowserManager(BrowserManager):
     ) -> BrowserState:
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         if browser_state is not None:
-            return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
+            if browser_session_id and not browser_state.is_connected():
+                LOG.warning(
+                    "Cached persistent-session browser state for task is disconnected; reconnecting",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+                for stale_key in (task.task_id, task.workflow_run_id):
+                    if stale_key and self.pages.get(stale_key) is browser_state:
+                        self.pages.pop(stale_key, None)
+                browser_state = None
+            else:
+                return await _on_browser_state_acquired(browser_state, task.workflow_run_id)
 
         if browser_session_id:
             if not task.organization_id:
                 raise MissingOrganizationForBrowserSession(browser_session_id)
-            if task.workflow_run_id is None:
-                raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
-                    browser_session_id=browser_session_id,
-                    runnable_type=PBS_TASK_RUNNABLE_TYPE,
-                    runnable_id=task.task_id,
-                    organization_id=task.organization_id,
-                )
-                expected_runnable_generation_id = raw_generation_id if isinstance(raw_generation_id, str) else None
-                expected_runnable_id = task.task_id
-                context = skyvern_context.current()
-                if context is not None:
-                    context.browser_session_runnable_id = expected_runnable_id
-                    context.browser_session_runnable_generation_id = expected_runnable_generation_id
-            else:
-                # The workflow service already acquired this lease. A task inside that workflow
-                # inherits the immutable workflow identity and never creates a competing task lease.
-                context = skyvern_context.current()
-                expected_runnable_id = (
-                    context.browser_session_runnable_id if context else None
-                ) or task.workflow_run_id
-                expected_runnable_generation_id = context.browser_session_runnable_generation_id if context else None
-            download_run_id = (
-                resolve_run_download_id(skyvern_context.current(), fallback_run_id=expected_runnable_id)
-                or expected_runnable_id
+            context = skyvern_context.current()
+            expected_runnable_id = (
+                task.task_id
+                if task.workflow_run_id is None
+                else (context.browser_session_runnable_id if context else None) or task.workflow_run_id
             )
-            LOG.info(
-                "Getting browser state for task from persistent sessions manager",
-                browser_session_id=browser_session_id,
-            )
-            get_state_kwargs = {
-                "organization_id": task.organization_id,
-                "expected_runnable_id": expected_runnable_id,
-                "download_run_id": download_run_id,
-            }
-            if expected_runnable_generation_id is not None:
-                get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id,
-                **get_state_kwargs,
-            )
-            if browser_state is None:
-                LOG.warning(
-                    "Browser state not found in persistent sessions manager",
-                    browser_session_id=browser_session_id,
-                )
-            else:
-                if task.organization_id:
-                    LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
+            async with self.acquiring_session_runnable(expected_runnable_id):
+                expected_runnable_generation_id: str | None
+                if task.workflow_run_id is None:
+                    expected_runnable_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
+                        browser_session_id=browser_session_id,
+                        runnable_type=PBS_TASK_RUNNABLE_TYPE,
+                        runnable_id=task.task_id,
+                        organization_id=task.organization_id,
+                    )
+                    if context is not None:
+                        context.browser_session_runnable_id = expected_runnable_id
+                        context.browser_session_runnable_generation_id = expected_runnable_generation_id
                 else:
-                    LOG.warning("Organization ID is not set for task", task_id=task.task_id)
-                await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
-                self._persistent_session_leases[expected_runnable_id] = _PersistentSessionLease(
-                    session_id=browser_session_id,
-                    organization_id=task.organization_id,
-                    runnable_id=expected_runnable_id,
-                    runnable_generation_id=expected_runnable_generation_id,
-                    browser_state=browser_state,
+                    # The workflow service already acquired this lease. A task inside that workflow
+                    # inherits the immutable workflow identity and never creates a competing task lease.
+                    expected_runnable_generation_id = (
+                        context.browser_session_runnable_generation_id if context else None
+                    )
+                download_run_id = (
+                    resolve_run_download_id(skyvern_context.current(), fallback_run_id=expected_runnable_id)
+                    or expected_runnable_id
                 )
+                LOG.info(
+                    "Getting browser state for task from persistent sessions manager",
+                    browser_session_id=browser_session_id,
+                )
+                get_state_kwargs = {
+                    "organization_id": task.organization_id,
+                    "expected_runnable_id": expected_runnable_id,
+                    "download_run_id": download_run_id,
+                }
+                if expected_runnable_generation_id is not None:
+                    get_state_kwargs["expected_runnable_generation_id"] = expected_runnable_generation_id
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    browser_session_id,
+                    **get_state_kwargs,
+                )
+                if browser_state is None:
+                    LOG.warning(
+                        "Browser state not found in persistent sessions manager",
+                        browser_session_id=browser_session_id,
+                    )
+                else:
+                    if task.organization_id:
+                        LOG.info("User to occupy browser session here", browser_session_id=browser_session_id)
+                    else:
+                        LOG.warning("Organization ID is not set for task", task_id=task.task_id)
+                    await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                    self._persistent_session_leases[expected_runnable_id] = _PersistentSessionLease(
+                        session_id=browser_session_id,
+                        organization_id=task.organization_id,
+                        runnable_id=expected_runnable_id,
+                        runnable_generation_id=expected_runnable_generation_id,
+                        browser_state=browser_state,
+                    )
+            if browser_state is not None:
                 page = await browser_state.get_working_page()
                 if page:
                     await browser_state.navigate_to_url(page=page, url=task.url)
@@ -796,8 +843,18 @@ class RealBrowserManager(BrowserManager):
         # below so PBS runs don't accidentally inherit the parent's browser.
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
         if browser_state:
-            LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
-            return await _on_browser_state_acquired(browser_state, workflow_run_id)
+            if browser_session_id and not browser_state.is_connected():
+                LOG.warning(
+                    "Cached persistent-session browser state for workflow run is disconnected; reconnecting",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+                if self.pages.get(workflow_run_id) is browser_state:
+                    self.pages.pop(workflow_run_id, None)
+                browser_state = None
+            else:
+                LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
+                return await _on_browser_state_acquired(browser_state, workflow_run_id)
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
@@ -887,36 +944,38 @@ class RealBrowserManager(BrowserManager):
                 "Getting browser state for workflow run from persistent sessions manager",
                 browser_session_id=browser_session_id,
             )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                browser_session_id,
-                **{
-                    "organization_id": workflow_run.organization_id,
-                    "expected_runnable_id": expected_runnable_id,
-                    "download_run_id": download_run_id,
-                    **(
-                        {"expected_runnable_generation_id": expected_runnable_generation_id}
-                        if expected_runnable_generation_id is not None
-                        else {}
-                    ),
-                },
-            )
+            async with self.acquiring_session_runnable(expected_runnable_id):
+                browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                    browser_session_id,
+                    **{
+                        "organization_id": workflow_run.organization_id,
+                        "expected_runnable_id": expected_runnable_id,
+                        "download_run_id": download_run_id,
+                        **(
+                            {"expected_runnable_generation_id": expected_runnable_generation_id}
+                            if expected_runnable_generation_id is not None
+                            else {}
+                        ),
+                    },
+                )
+                if browser_state is not None:
+                    LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                    # An SDK-minted synthetic run only reads a session owned by another runnable.
+                    # It cannot rebind that runnable's download directory or acquire a cleanup lease.
+                    if expected_runnable_id is not None:
+                        await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
+                        self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
+                            session_id=browser_session_id,
+                            organization_id=workflow_run.organization_id,
+                            runnable_id=expected_runnable_id,
+                            runnable_generation_id=expected_runnable_generation_id,
+                            browser_state=browser_state,
+                        )
             if browser_state is None:
                 LOG.warning(
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
             else:
-                LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
-                # An SDK-minted synthetic run only reads a session owned by another runnable.
-                # It cannot rebind that runnable's download directory or acquire a cleanup lease.
-                if expected_runnable_id is not None:
-                    await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
-                    self._persistent_session_leases[workflow_run.workflow_run_id] = _PersistentSessionLease(
-                        session_id=browser_session_id,
-                        organization_id=workflow_run.organization_id,
-                        runnable_id=expected_runnable_id,
-                        runnable_generation_id=expected_runnable_generation_id,
-                        browser_state=browser_state,
-                    )
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
@@ -1076,7 +1135,12 @@ class RealBrowserManager(BrowserManager):
             self.pages[task.task_id].browser_artifacts.video_artifacts = artifacts
             return
 
-        raise MissingBrowserState(task_id=task.task_id)
+        raise MissingBrowserState(
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            detected_at=datetime.now(UTC),
+            failure_reason="browser_state_registry_lookup_miss",
+        )
 
     async def get_video_artifacts(
         self,
@@ -1273,7 +1337,8 @@ class RealBrowserManager(BrowserManager):
     ) -> BrowserCleanupResult:
         LOG.info("Cleaning up for workflow run", sampling=True)
         # No await before the tombstone: a concurrent stream attach either increments first and is
-        # observed below, or sees CLOSING and is rejected at the public websocket entry point.
+        # observed below, or sees CLOSING. The tombstone also holds the session lease immediately,
+        # before deferred-close parameters exist, until complete_stream_teardown releases it.
         mark_stream_closing(workflow_run_id)
         browser_state_to_close = self.pages.get(workflow_run_id)
         session_lease = self._persistent_session_leases.get(workflow_run_id)
@@ -1465,8 +1530,7 @@ class RealBrowserManager(BrowserManager):
                 raise MissingOrganizationForBrowserSession(browser_session_id)
             if not script_id:
                 raise MissingBrowserStateForBrowserSession(browser_session_id)
-            self._acquiring_session_runnables.add(script_id)
-            try:
+            async with self.acquiring_session_runnable(script_id):
                 raw_generation_id = await app.PERSISTENT_SESSIONS_MANAGER.begin_session(
                     browser_session_id=browser_session_id,
                     runnable_type="script",
@@ -1509,8 +1573,6 @@ class RealBrowserManager(BrowserManager):
                     runnable_generation_id=expected_runnable_generation_id,
                     browser_state=browser_state,
                 )
-            finally:
-                self._acquiring_session_runnables.discard(script_id)
             page = await browser_state.get_working_page()
             if not page:
                 LOG.warning("Browser state has no page to run the script", script_id=script_id)

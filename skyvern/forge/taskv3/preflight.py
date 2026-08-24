@@ -25,6 +25,7 @@ from skyvern.webeye.actions.actions import (
     Action,
     ClickAction,
     GotoUrlAction,
+    HoverAction,
     InputTextAction,
     KeypressAction,
     SelectOption,
@@ -37,15 +38,21 @@ LOG = structlog.get_logger()
 # The tools that carry a browser action the policy can reason about — exactly the names
 # `_build_action` maps. This is the single source of truth for which tool handlers get wrapped;
 # `build_browser_tools` imports it rather than keeping a second list that can drift.
-PREFLIGHT_TOOL_NAMES = frozenset({"click", "type", "select_option", "press_key", "file_upload", "navigate"})
+PREFLIGHT_TOOL_NAMES = frozenset(
+    {"click", "hover", "type", "select_combobox", "select_option", "press_key", "file_upload", "navigate"}
+)
 
 
 def _build_action(tool_name: str, args: dict[str, Any]) -> Action | None:
     selector = str(args.get("selector") or "")
     if tool_name == "click":
         return ClickAction(element_id=selector)
+    if tool_name == "hover":
+        return HoverAction(element_id=selector)
     if tool_name == "type":
         return InputTextAction(element_id=selector, text=str(args.get("text", "")))
+    if tool_name == "select_combobox":
+        return InputTextAction(element_id=selector, text=str(args.get("value", "")))
     if tool_name == "select_option":
         return SelectOptionAction(
             element_id=selector, option=SelectOption(value=args.get("value"), label=args.get("label"))

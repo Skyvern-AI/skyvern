@@ -517,6 +517,7 @@ def _producer_ctx(pre_run_prose: str | None = "Submit your request below.") -> S
         composition_page_evidence=baseline,
         pre_run_page_reference=None,
         workflow_verification_evidence=SimpleNamespace(),
+        browser_session_id=None,
     )
 
 
@@ -607,7 +608,7 @@ async def test_dispatched_producer_confirms_value_only_post_run(monkeypatch: pyt
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence["observed_after_workflow_run"] is True
     assert ctx.composition_page_evidence["workflow_run_id"] == "wr_disp"
@@ -617,6 +618,33 @@ async def test_dispatched_producer_confirms_value_only_post_run(monkeypatch: pyt
     assert verdict.state == "satisfied"
     assert verdict.reason_code == "evidence_confirms"
     assert verdict.evidence_source == "independent_page_evidence"
+
+
+@pytest.mark.asyncio
+async def test_dispatched_producer_prefers_worker_artifact_over_a_substituted_session_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CDP read that landed on a replacement session still satisfies the usable check, so without
+    the session comparison it would be stamped, refused, and leave the run with no evidence."""
+    artifacts = [_html_artifact("art_action", ArtifactType.HTML_ACTION)]
+    _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
+    ctx = _producer_ctx()
+
+    async def fake_read(
+        inner_ctx: object, *, run_session_id: str, current_url: str
+    ) -> tuple[dict[str, object], str, None, None]:
+        return {"observed_empty_page": True, "current_url": current_url}, "pbs_replacement", None, None
+
+    monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", fake_read)
+
+    await run_execution_module._capture_dispatched_terminal_page_evidence(
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
+    )
+
+    stored = ctx.composition_page_evidence
+    assert stored["source_browser_session_id"] == "pbs_run_disp"
+    assert stored["observed_after_workflow_run"] is True
+    assert "WTR-1842-DEMO" in page_evidence_prose_text(stored)
 
 
 def test_select_terminal_prefers_html_action_over_later_scrape() -> None:
@@ -662,7 +690,7 @@ async def test_dispatched_producer_selects_terminal_html_action(monkeypatch: pyt
     )
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     prose = page_evidence_prose_text(ctx.composition_page_evidence)
     assert "WTR-1842-DEMO" in prose
@@ -675,7 +703,7 @@ async def test_dispatched_producer_confirms_from_html_scrape_when_only_family(mo
     _stub_app(monkeypatch, artifacts, {"art_scrape": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.evidence_source == "independent_page_evidence"
@@ -687,7 +715,7 @@ async def test_dispatched_producer_negative_control_value_absent(monkeypatch: py
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_NO_VALUE.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.reason_code != "evidence_confirms"
@@ -699,7 +727,7 @@ async def test_dispatched_producer_value_in_baseline_does_not_confirm(monkeypatc
     _stub_app(monkeypatch, artifacts, {"art_action": _HTML_WITH_VALUE.encode()})
     ctx = _producer_ctx(pre_run_prose="Prior page already showed WTR-1842-DEMO earlier.")
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
     assert verdict.reason_code != "evidence_confirms"
@@ -716,7 +744,7 @@ async def test_dispatched_producer_stale_baseline_not_pinned_fails_closed(monkey
         "workflow_run_id": "wr_prior",
     }
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.pre_run_page_reference is None
     verdict = _grade(_requested_criterion("WTR-1842-DEMO"), _snapshot_from_ctx(ctx, "wr_disp"))
@@ -728,7 +756,7 @@ async def test_dispatched_producer_abstains_without_terminal_artifact(monkeypatc
     _stub_app(monkeypatch, artifacts=[], retrieved={})
     ctx = _producer_ctx(pre_run_prose=None)
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence is None
 
@@ -760,7 +788,7 @@ async def _dispatched_packet(monkeypatch: pytest.MonkeyPatch, html: str) -> dict
     _stub_app(monkeypatch, [_html_artifact("art_page", ArtifactType.HTML_ACTION)], {"art_page": html.encode()})
     ctx = _producer_ctx()
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_disp", organization_id="o_1", current_url=""
+        ctx, run_id="wr_disp", run_session_id="pbs_run_disp", organization_id="o_1", current_url=""
     )
     assert ctx.composition_page_evidence is not None
     return ctx.composition_page_evidence

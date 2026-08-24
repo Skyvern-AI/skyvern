@@ -38,6 +38,7 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.cache.base import CACHE_EXPIRE_TIME
+from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
@@ -65,7 +66,7 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
-from skyvern.schemas.run_enums import RunEngine
+from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.utils.email_validation import normalize_identifier_if_email
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
+    from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.services.otp_service import OTPValue
     from skyvern.webeye.browser_artifacts import DownloadBinding
@@ -884,11 +886,14 @@ class AgentFunction:
         duration_seconds: float,
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
+        excluded_reason: str | None = None,
     ) -> None:
         """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
 
         workflow_run_id/organization_id let the override refine run_type (e.g. a
         workflow run that backs a task_v2) without the caller paying for the lookup.
+        excluded_reason marks a run whose duration must not count as compute (e.g.
+        it never started); the override records it as an exclusion, not as minutes.
         """
         return None
 
@@ -1086,6 +1091,7 @@ class AgentFunction:
         organization_id: str | None,
         block_label: str | None,
         browser_session_id: str | None,
+        code: str | None = None,
     ) -> bool:
         """Whether a workflow CodeBlock run should execute in the secure runner.
 
@@ -1095,6 +1101,24 @@ class AgentFunction:
         only routes runs that have a browser session for the runner to broker against.
         """
         return False
+
+    def serialize_codeblock_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        """Cloud overrides this with the runner's canonical parameter serialization."""
+        return parameters
+
+    def redact_codeblock_parameter_values(self, value: Any, parameters: dict[str, Any]) -> Any:
+        """Cloud overrides this with the runner's canonical parameter scrubber."""
+        return value
+
+    def prepare_codeblock_control_flow_exception(self, exception: BaseException) -> bool:
+        if type(exception) not in {asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit}:
+            return False
+        exception.args = ()
+        exception.__traceback__ = exception.__context__ = exception.__cause__ = None
+        exception.__notes__ = []
+        if type(exception) is SystemExit:
+            exception.code = None
+        return True
 
     async def resolve_in_process_script_execution_policy(
         self,
@@ -1172,6 +1196,22 @@ class AgentFunction:
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
         return None
+
+    async def scan_code_block_source(
+        self,
+        code: str,
+        *,
+        organization_id: str | None = None,
+        timeout_seconds: float = 3.0,
+    ) -> list[CodeBlockScanFinding]:
+        """Advisory code-scanner findings for author-time surfaces (copilot diagnostics, MCP lint).
+
+        Findings are warnings, never refusals, and finding text must come from scanner rule
+        metadata only — never the matched snippet. Implementations must never raise: fail open
+        to an empty list on scanner error, timeout, or unavailability. OSS has no scanner and
+        returns no findings; cloud overrides with its bounded, cached advisory scan.
+        """
+        return []
 
     def allow_copilot_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is
@@ -1660,6 +1700,10 @@ class AgentFunction:
         """Compute the user-facing ``total_cost`` for a workflow run. OSS returns None."""
         return None
 
+    async def captcha_solving_available(self, organization_id: str | None, url: str | None) -> bool:
+        """Whether a captcha on this page could be solved without a person."""
+        return False
+
     async def auto_solve_captchas(self, page: Page) -> bool:
         """Proactively detect and solve captchas on the current page.
         Returns True if a captcha was detected and solved.
@@ -1810,7 +1854,12 @@ class AgentFunction:
         if "@" not in totp_identifier:
             return None
 
-        from skyvern.services.otp_service import InsufficientCreditsForOTPParse, parse_otp_login
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import (
+            InsufficientCreditsForOTPParse,
+            looks_like_magic_link,
+            parse_otp_login,
+        )
 
         lookup_context = context or EmailOTPVerificationContext()
         sources = build_email_otp_sources(self)
@@ -1893,11 +1942,17 @@ class AgentFunction:
                             )
                             continue
                         source_context.remember_message(credential_id, candidate.message_id)
+                        if otp_value is None and expected_otp_type is OTPType.TOTP:
+                            # An enforced parse reports "not found" rather than the type it did see,
+                            # so a link arriving for a code-verb call is only visible by its shape.
+                            if looks_like_magic_link(candidate.content):
+                                lookup_context.observed_otp_types.add(OTPType.MAGIC_LINK)
                         if (
                             otp_value
                             and expected_otp_type is not None
                             and otp_value.get_otp_type() != expected_otp_type
                         ):
+                            lookup_context.observed_otp_types.add(otp_value.get_otp_type())
                             continue
                         if otp_value:
                             try:
@@ -2268,7 +2323,7 @@ class AgentFunction:
             return destination.customer_uri
 
         if destination.storage_type == FileStorageType.GOOGLE_DRIVE:
-            if not destination.google_access_token or not destination.google_drive_folder_id:
+            if not destination.google_access_token:
                 raise ValueError("Google Drive destination is missing required fields")
             uploaded_file = await google_drive_service.upload_file(
                 access_token=destination.google_access_token,
@@ -2538,6 +2593,7 @@ class AgentFunction:
         self,
         organization_id: str,
         edited_by: str | None,
+        workflow_permanent_id: str | None = None,
     ) -> None:
         """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
         return None
@@ -2547,8 +2603,31 @@ class AgentFunction:
         organization_id: str,
         workflow_id: str,
         status: WorkflowRunStatus | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run: WorkflowRun | None = None,
     ) -> None:
-        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        """Fired after a workflow run reaches a final status. The run may be supplied to avoid a fallback read."""
+        return None
+
+    async def on_credential_saved(
+        self,
+        *,
+        organization_id: str,
+        credential_id: str,
+        credential_type: CredentialType,
+    ) -> None:
+        """Fired after a credential is persisted. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_run_created(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        run_type: RunType,
+        caller_type: CallerType,
+    ) -> None:
+        """Fired after any run type is created; run_type is attribution only. Overrides must be best-effort."""
         return None
 
     async def on_workflow_run_terminal(

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import keyword
+import os
 import re
 import textwrap
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -21,7 +22,6 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
-from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.author_time_block import (
     BANNED_BLOCKS_BLOCK_ID,
     CODE_SAFETY_BLOCK_ID,
@@ -39,6 +39,10 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     recorded_outcome_from_author_time_reject,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
+from skyvern.forge.sdk.copilot.code_block_preflight import (
+    advisory_code_block_diagnostics,
+    scanner_advisory_diagnostics,
+)
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
@@ -52,6 +56,12 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
+from skyvern.forge.sdk.copilot.google_connection_notice import (
+    collect_google_connection_notices,
+    google_sheet_connection_bindings,
+    retain_notices_after_lookup_failure,
+    write_google_connection_notice_capture,
+)
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
     declared_string_workflow_parameter_keys,
@@ -99,6 +109,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
 )
+from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -708,13 +719,7 @@ def _withheld_labels_within(labels: list[str], budget: int) -> list[str]:
     return exhausted if len(json.dumps(exhausted)) <= budget else []
 
 
-def _accepted_code_delta(
-    prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str
-) -> tuple[dict[str, str], list[str]]:
-    """Code blocks the accepted submission changed, as stored after server-side rewrites, paired
-    with the labels that did not fit the budget so an omission is named rather than silent. A block
-    the server did not rewrite is returned too, because the anchor has to survive context
-    compaction and a payload that carried only rewrites would make its own absence ambiguous."""
+def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str) -> dict[str, str]:
     prior = _workflow_yaml_code_blocks_by_label(prior_yaml)
     submitted = _workflow_yaml_code_blocks_by_label(submitted_yaml)
     accepted = _workflow_yaml_code_blocks_by_label(accepted_yaml)
@@ -730,6 +735,40 @@ def _accepted_code_delta(
         if unchanged_since_prior and matches_submission:
             continue
         changed[label] = code
+    return changed
+
+
+def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[str, list[str]]:
+    """Labels per advisory message, computed from every changed block rather than the
+    budget-truncated ``stored_code`` so an oversized block still gets its note."""
+    labels_by_message: dict[str, list[str]] = {}
+    for label, code in sorted(changed_code_blocks.items()):
+        for diagnostic in advisory_code_block_diagnostics(code):
+            labels = labels_by_message.setdefault(diagnostic.message, [])
+            if label not in labels:
+                labels.append(label)
+    return labels_by_message
+
+
+async def _scanner_advisory_labels_by_message(
+    changed_code_blocks: Mapping[str, str], organization_id: str | None
+) -> dict[str, list[str]]:
+    """Labels per scanner-advisory message; each scan is bounded and fail-open inside
+    ``scanner_advisory_diagnostics``, so this never delays or fails the update."""
+    labels_by_message: dict[str, list[str]] = {}
+    for label, code in sorted(changed_code_blocks.items()):
+        for diagnostic in await scanner_advisory_diagnostics(code, organization_id=organization_id):
+            labels = labels_by_message.setdefault(diagnostic.message, [])
+            if label not in labels:
+                labels.append(label)
+    return labels_by_message
+
+
+def _accepted_code_delta(changed: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Code blocks the accepted submission changed, as stored after server-side rewrites, paired
+    with the labels that did not fit the budget so an omission is named rather than silent. A block
+    the server did not rewrite is returned too, because the anchor has to survive context
+    compaction and a payload that carried only rewrites would make its own absence ambiguous."""
     if not changed:
         return {}, []
 
@@ -3415,39 +3454,6 @@ def _extraction_schema_incompatibility(
     )
 
 
-_EXPECT_DOWNLOAD_ATTR = "expect_download"
-
-
-def _call_is_expect_download(node: ast.expr) -> bool:
-    if isinstance(node, ast.Await):
-        return _call_is_expect_download(node.value)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        return node.func.attr == _EXPECT_DOWNLOAD_ATTR
-    return False
-
-
-def _code_registers_download(code: str) -> bool:
-    """Either terminal that actually fires a registered download: the ``expect_download`` idiom or
-    the worker-owned download claim."""
-    return _code_uses_expect_download(code) or code_uses_download_claim(code)
-
-
-def _code_uses_expect_download(code: str) -> bool:
-    """True only for the registering form: `expect_download()` called as the context
-    expression of an `async with`/`with`. A bare `page.expect_download` attribute or an
-    uncaptured call fires no download, so it does not count."""
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
-        return False
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncWith, ast.With)):
-            for item in node.items:
-                if _call_is_expect_download(item.context_expr):
-                    return True
-    return False
-
-
 _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET = frozenset({"downloaded_file_path", "download_url"})
 
 
@@ -3523,12 +3529,12 @@ def _artifact_declares_registration_keys(artifact: Mapping[str, Any]) -> bool:
 
 def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
     """Disjoint from extraction-intent (`goal_value_paths` on non-registration keys):
-    a block is download-intent when it carries the expect_download idiom, self-asserts a
-    registration key in a top-level dict, or declares a registration key as a goal path."""
+    a block is download-intent when it claims a download, self-asserts a registration key in a
+    top-level dict, or declares a registration key as a goal path."""
     if not code.strip():
         return False
     return (
-        _code_registers_download(code)
+        code_uses_download_claim(code)
         or _code_returns_registration_keys(code)
         or _artifact_declares_registration_keys(artifact)
     )
@@ -3744,6 +3750,8 @@ def _author_time_findings(
     *,
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
+    code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
     test-run would not surface it; anything a run reveals belongs in the run, not here."""
@@ -3765,6 +3773,30 @@ def _author_time_findings(
             {
                 "reason_code": "code_artifact_metadata_incomplete",
                 "summary": "\n".join(str(violation) for violation in metadata_violations),
+            }
+        )
+    # A contentless readiness wait is intermittent by construction: it passes on every run where the
+    # page happens to settle, so a green test-run cannot tell the author the wait encodes nothing.
+    if code_block_diagnostics:
+        findings.append(
+            {
+                "reason_code": "code_block_readiness_wait_advisory",
+                "summary": "\n".join(
+                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
+                    for message, labels in code_block_diagnostics.items()
+                ),
+            }
+        )
+    # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
+    # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
+    if scanner_diagnostics:
+        findings.append(
+            {
+                "reason_code": "code_block_scanner_advisory",
+                "summary": "\n".join(
+                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
+                    for message, labels in scanner_diagnostics.items()
+                ),
             }
         )
     return findings
@@ -4004,7 +4036,6 @@ async def _update_workflow(
         # values; terminal handlers roll back on non-auto-accept.
         requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
         if requires_canonical_persist:
-            created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
             await app.WORKFLOW_SERVICE.update_workflow_definition(
                 workflow_id=ctx.workflow_id,
                 organization_id=ctx.organization_id,
@@ -4016,6 +4047,7 @@ async def _update_workflow(
                 totp_verification_url=workflow.totp_verification_url,
                 totp_identifier=workflow.totp_identifier,
                 persist_browser_session=workflow.persist_browser_session,
+                reuse_browser_session=workflow.reuse_browser_session,
                 mask_secrets=getattr(workflow, "mask_secrets", False),
                 pin_saved_session_ip=workflow.pin_saved_session_ip,
                 browser_profile_id=workflow.browser_profile_id,
@@ -4032,7 +4064,6 @@ async def _update_workflow(
                 code_version=workflow.code_version,
                 run_sequentially=workflow.run_sequentially,
                 sequential_key=workflow.sequential_key,
-                created_by=created_by_stamp,
                 edited_by="copilot",
                 preserve_completion_contract=not getattr(ctx, "clear_persisted_completion_contract", False),
             )
@@ -4045,6 +4076,59 @@ async def _update_workflow(
         ctx.staged_workflow = workflow
         ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
+        if isinstance(ctx, CopilotContext):
+            current_google_connection_bindings = google_sheet_connection_bindings(workflow)
+            turn_start_workflow = prior_workflow
+            if ctx.google_connection_turn_start_bindings is None:
+                baseline_ready = True
+                turn_start_workflow_yaml = ctx.google_connection_turn_start_workflow_yaml
+                if turn_start_workflow_yaml:
+                    try:
+                        turn_start_workflow = await _process_workflow_yaml(
+                            workflow_id=ctx.workflow_id,
+                            workflow_permanent_id=ctx.workflow_permanent_id,
+                            organization_id=ctx.organization_id,
+                            workflow_yaml=turn_start_workflow_yaml,
+                        )
+                    except Exception as baseline_err:
+                        baseline_ready = False
+                        LOG.warning("copilot_google_connection_notice_baseline_failed", error=str(baseline_err))
+                if baseline_ready:
+                    ctx.google_connection_turn_start_bindings = google_sheet_connection_bindings(turn_start_workflow)
+            current_google_connection_ids = tuple(
+                dict.fromkeys(connection_id for _, connection_id in current_google_connection_bindings)
+            )
+            if ctx.google_connection_turn_start_bindings is not None:
+                try:
+                    visible_google_credentials = await google_oauth_service.get_visible_credentials_for_org(
+                        ctx.organization_id
+                    )
+                    next_google_connection_notices = collect_google_connection_notices(
+                        turn_start_bindings=ctx.google_connection_turn_start_bindings,
+                        current_bindings=current_google_connection_bindings,
+                        visible_credentials=visible_google_credentials,
+                    )
+                    capture_root = os.environ.get("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS")
+                    if capture_root and current_google_connection_bindings:
+                        try:
+                            write_google_connection_notice_capture(
+                                output_root=capture_root,
+                                turn_id=ctx.turn_id,
+                                turn_start_workflow=turn_start_workflow,
+                                final_workflow=workflow,
+                                accepted_workflow_yaml=workflow_yaml,
+                                visible_credentials=visible_google_credentials,
+                                observed_notices=next_google_connection_notices,
+                            )
+                        except Exception as capture_err:
+                            LOG.warning("copilot_google_connection_notice_capture_failed", error=str(capture_err))
+                    ctx.google_connection_notices = next_google_connection_notices
+                except Exception as lookup_err:
+                    ctx.google_connection_notices = retain_notices_after_lookup_failure(
+                        current_connection_ids=current_google_connection_ids,
+                        notices=ctx.google_connection_notices,
+                    )
+                    LOG.warning("copilot_google_connection_notice_lookup_failed", error=str(lookup_err))
         _clear_code_authoring_repair_context(ctx)
         accepted_metadata = ctx.code_artifact_metadata
         if isinstance(accepted_metadata, dict) and accepted_metadata:
@@ -4067,9 +4151,8 @@ async def _update_workflow(
             "message": "Workflow updated successfully.",
             "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
         }
-        stored_code, stored_code_withheld = _accepted_code_delta(
-            prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
-        )
+        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        stored_code, stored_code_withheld = _accepted_code_delta(changed_code_blocks)
         if stored_code:
             data["stored_code"] = stored_code
         if stored_code_withheld:
@@ -4080,9 +4163,23 @@ async def _update_workflow(
                 returned_chars={label: len(code) for label, code in stored_code.items()},
                 withheld_labels=stored_code_withheld,
             )
+        # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
+        # crafted block code must never turn a successful update into a failed turn.
+        try:
+            advisory_labels = _advisory_labels_by_message(changed_code_blocks)
+        except Exception as advisory_err:
+            LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
+            advisory_labels = {}
+        try:
+            scanner_labels = await _scanner_advisory_labels_by_message(changed_code_blocks, ctx.organization_id)
+        except Exception as scanner_err:
+            LOG.warning("copilot_scanner_advisory_diagnostics_failed", error=str(scanner_err))
+            scanner_labels = {}
         findings = _author_time_findings(
             schema_incompatibility=schema_incompatibility_finding,
             metadata_violations=normalization.violations,
+            code_block_diagnostics=advisory_labels,
+            scanner_diagnostics=scanner_labels,
         )
         if findings:
             data["findings"] = findings

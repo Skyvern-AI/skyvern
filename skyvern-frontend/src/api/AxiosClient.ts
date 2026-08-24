@@ -5,6 +5,8 @@ import {
   getRuntimeApiKeyExpiresAt,
   persistRuntimeApiKey,
   clearRuntimeApiKey,
+  setRuntimeCredentialReady,
+  whenRuntimeCredentialReady,
 } from "@/util/env";
 import { useAuthIssueStore } from "@/store/AuthIssueStore";
 import axios, { type InternalAxiosRequestConfig } from "axios";
@@ -18,6 +20,8 @@ const pathname = url.pathname.replace("/api", "");
 const apiSansApiV1BaseUrl = `${url.origin}${pathname}`;
 
 const initialApiKey = getRuntimeApiKey();
+
+export const POSTHOG_ATTRIBUTION_HEADER = "X-PostHog-Attribution";
 const apiKeyHeader = initialApiKey ? { "X-API-Key": initialApiKey } : {};
 
 const client = axios.create({
@@ -104,6 +108,17 @@ function scheduleUiSessionRefresh(expiresAt: number) {
   );
 }
 
+async function readUiSessionFailureDetail(
+  response: Response,
+): Promise<string | undefined> {
+  try {
+    const payload: unknown = await response.json();
+    return getResponseDetail(payload);
+  } catch {
+    return undefined;
+  }
+}
+
 async function requestUiSession(bypassCache = false): Promise<boolean> {
   const abortController = new AbortController();
   const timeoutId = setTimeout(
@@ -132,6 +147,14 @@ async function requestUiSession(bypassCache = false): Promise<boolean> {
           uiSessionEnabled = false;
         }
       }
+      // A deployment without the endpoint is not a misconfiguration; only a server that answered
+      // and refused has something an operator can act on.
+      if (!endpointAbsent && hasJsonContentType) {
+        useAuthIssueStore.getState().reportUiSessionFailure({
+          statusCode: response.status,
+          detail: await readUiSessionFailureDetail(response),
+        });
+      }
       return false;
     }
     const payload: unknown = await response.json();
@@ -140,6 +163,7 @@ async function requestUiSession(bypassCache = false): Promise<boolean> {
     }
     uiSessionEndpointConfirmed = true;
     uiSessionEndpointAbsentStreak = 0;
+    useAuthIssueStore.getState().clearUiSessionFailure();
     setApiKeyHeader(payload.token, payload.expires_at);
     scheduleUiSessionRefresh(payload.expires_at);
     return true;
@@ -198,6 +222,9 @@ export function initializeUiSession(): Promise<void> {
         }
       }
     })();
+    // Callers render before this settles, so hand the promise to the request layer rather
+    // than letting the first wave of queries go out with no credential.
+    setRuntimeCredentialReady(uiSessionInitialization.catch(() => undefined));
   }
   return uiSessionInitialization;
 }
@@ -212,7 +239,12 @@ function getResponseDetail(data: unknown): string | undefined {
 
 clients.forEach((instance) => {
   instance.interceptors.response.use(
-    (response) => response,
+    (response) => {
+      // Without this a single boot-race 403 pins the "requests are unauthorized" banner for the
+      // life of the tab, long after the session token mints and every request succeeds.
+      useAuthIssueStore.getState().clearAuthIssue();
+      return response;
+    },
     async (error) => {
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
@@ -264,6 +296,14 @@ function removeHeaderForAllClients(header: string) {
     delete instance.defaults.headers.common[header];
     delete (instance.defaults.headers as Record<string, unknown>)[header];
   });
+}
+
+export function setPostHogAttributionHeader(value: string | undefined) {
+  if (value) {
+    setHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER, value);
+  } else {
+    removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
+  }
 }
 
 export function setAuthorizationHeader(token: string) {
@@ -318,6 +358,9 @@ async function getClient(
     setAuthorizationHeader(credential);
   } else {
     removeAuthorizationHeader();
+    // Self-hosted has no other browser credential, so a request issued before the first mint
+    // lands would go out unauthenticated and 403.
+    await whenRuntimeCredentialReady();
   }
 
   const apiKey = getRuntimeApiKey();

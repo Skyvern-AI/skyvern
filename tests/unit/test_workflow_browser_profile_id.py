@@ -136,6 +136,32 @@ async def test_create_workflow_from_request_preserves_existing_max_elapsed_time_
 
 
 @pytest.mark.asyncio
+async def test_create_workflow_from_request_preserves_existing_created_by_when_omitted() -> None:
+    service, _ = _make_workflow_update_service(
+        existing_max_elapsed_time_minutes=None,
+        existing_created_by="o_1_user",
+    )
+
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+    )
+
+    await service.create_workflow_from_request(
+        organization=cast(Any, SimpleNamespace(organization_id="org_1")),
+        request=request,
+        workflow_permanent_id="wpid_test",
+        edited_by="copilot",
+    )
+
+    create_workflow_mock = service.create_workflow
+    assert isinstance(create_workflow_mock, AsyncMock)
+    assert create_workflow_mock.await_args is not None
+    assert create_workflow_mock.await_args.kwargs["created_by"] == "o_1_user"
+    assert create_workflow_mock.await_args.kwargs["edited_by"] == "copilot"
+
+
+@pytest.mark.asyncio
 async def test_create_workflow_from_request_preserves_enable_self_healing_when_omitted() -> None:
     service, _ = _make_workflow_update_service(
         existing_max_elapsed_time_minutes=None, existing_enable_self_healing=True
@@ -315,6 +341,7 @@ def _make_workflow_update_service(
     existing_enable_self_healing: bool = True,
     existing_pin_saved_session_ip: bool = False,
     existing_webhook_callback_url: str | None = None,
+    existing_created_by: str | None = None,
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
@@ -327,6 +354,7 @@ def _make_workflow_update_service(
         enable_self_healing=existing_enable_self_healing,
         pin_saved_session_ip=existing_pin_saved_session_ip,
         webhook_callback_url=existing_webhook_callback_url,
+        created_by=existing_created_by,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
     updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")

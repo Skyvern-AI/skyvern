@@ -18,6 +18,8 @@ never skips the draft flush or the channel close.
 from __future__ import annotations
 
 import asyncio
+import typing as t
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -74,7 +76,12 @@ def _install_recording_doubles(
     channel: object,
 ) -> MagicMock:
     """Stub the vnc registry, exfiltration channel factory, and interpretation registry."""
-    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: MagicMock())
+    context = MagicMock()
+    context.organization_id = "org_123"
+    context.x_api_key = "api-key-123"
+    context.browser_session = MagicMock(persistent_browser_session_id=PBS_ID)
+    context.identity = {"organization_id": "org_123", "browser_session_id": PBS_ID}
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: context)
     monkeypatch.setattr(message_module, "ExfiltrationChannel", MagicMock(return_value=channel))
 
     registry = MagicMock()
@@ -83,6 +90,40 @@ def _install_recording_doubles(
     registry.stop_session = AsyncMock(return_value=[])
     monkeypatch.setattr(message_module, "interpretation_registry", registry)
     return registry
+
+
+@pytest.mark.asyncio
+async def test_begin_exfiltration_starts_without_vnc_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    created_channel: object | None = None
+
+    class RecordingChannel:
+        def __init__(self, *, on_event: object, context: object) -> None:
+            nonlocal created_channel
+            self.context = context
+            self.started = False
+            created_channel = self
+
+        async def start(self) -> RecordingChannel:
+            self.started = True
+            return self
+
+        async def stop(self) -> RecordingChannel:
+            return self
+
+    message_channel = _message_channel([BEGIN_EXFILTRATION_DATA, WebSocketDisconnect()])
+    browser_session = message_channel.browser_session
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: None)
+    monkeypatch.setattr(message_module, "get_x_api_key", AsyncMock(return_value="message-api-key"))
+    monkeypatch.setattr(message_module, "ExfiltrationChannel", RecordingChannel)
+    monkeypatch.setattr(message_module, "interpretation_registry", MagicMock())
+
+    await loop_stream_messages(message_channel)
+
+    assert isinstance(created_channel, RecordingChannel)
+    assert created_channel.started is True
+    assert created_channel.context.browser_session is browser_session
+    assert created_channel.context.x_api_key == "message-api-key"
+    assert created_channel.context.organization_id == message_channel.organization_id
 
 
 def _started_channel(*, stop_error: Exception | None = None) -> MagicMock:
@@ -112,7 +153,7 @@ async def test_begin_exfiltration_start_failure_does_not_kill_message_loop(
     message_channel = _message_channel(
         [BEGIN_EXFILTRATION_DATA, END_EXFILTRATION_DATA, WebSocketDisconnect()],
     )
-    _install_recording_doubles(monkeypatch, channel=channel)
+    registry = _install_recording_doubles(monkeypatch, channel=channel)
 
     await loop_stream_messages(message_channel)
 
@@ -120,6 +161,119 @@ async def test_begin_exfiltration_start_failure_does_not_kill_message_loop(
     assert message_channel.websocket.receive_json.await_count == 3
     # The failure was surfaced to the frontend rather than swallowed silently.
     assert MessageKind.BEGIN_EXFILTRATION.value in _sent_error_kinds(message_channel)
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+
+
+@pytest.mark.asyncio
+async def test_blocked_clipboard_does_not_delay_end_and_is_cancelled_on_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = _started_channel()
+    message_channel = _message_channel([])
+    registry = _install_recording_doubles(monkeypatch, channel=channel)
+    clipboard_started = asyncio.Event()
+    clipboard_cancelled = asyncio.Event()
+    receive_count = 0
+
+    async def receive_json() -> dict[str, str]:
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return BEGIN_EXFILTRATION_DATA
+        if receive_count == 2:
+            return {"kind": MessageKind.CLIPBOARD_COPY.value}
+        if receive_count == 3:
+            await clipboard_started.wait()
+            return END_EXFILTRATION_DATA
+        raise WebSocketDisconnect()
+
+    @asynccontextmanager
+    async def blocked_execution(_: object) -> t.AsyncIterator[MagicMock]:
+        clipboard_started.set()
+        try:
+            await asyncio.Event().wait()
+            yield MagicMock()
+        finally:
+            clipboard_cancelled.set()
+
+    message_channel.websocket.receive_json = receive_json
+    monkeypatch.setattr(message_module, "execution_for_message_channel", blocked_execution)
+
+    await asyncio.wait_for(loop_stream_messages(message_channel), timeout=2)
+
+    assert receive_count == 4
+    channel.stop.assert_awaited_once()
+    registry.stop_session.assert_awaited_once_with(PBS_ID)
+    assert clipboard_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_clipboard_task_limit_rejects_third_and_frees_slot_after_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message_channel = _message_channel([])
+    two_started = asyncio.Event()
+    release_first = asyncio.Event()
+    first_completed = asyncio.Event()
+    slot_reused = asyncio.Event()
+    executions_started = 0
+    started_at_capacity: list[int] = []
+    receive_count = 0
+
+    async def receive_json() -> dict[str, str]:
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count <= 2:
+            return {"kind": MessageKind.CLIPBOARD_COPY.value}
+        if receive_count == 3:
+            await two_started.wait()
+            return {"kind": MessageKind.CLIPBOARD_COPY.value}
+        if receive_count == 4:
+            started_at_capacity.append(executions_started)
+            release_first.set()
+            await first_completed.wait()
+            return {"kind": MessageKind.CLIPBOARD_COPY.value}
+        await slot_reused.wait()
+        raise WebSocketDisconnect()
+
+    @asynccontextmanager
+    async def controlled_execution(_: object) -> t.AsyncIterator[MagicMock]:
+        nonlocal executions_started
+        execution_index = executions_started
+        executions_started += 1
+        if executions_started == 2:
+            two_started.set()
+        elif executions_started == 3:
+            slot_reused.set()
+        try:
+            if execution_index == 0:
+                await release_first.wait()
+            else:
+                await asyncio.Event().wait()
+            execute = MagicMock()
+            execute.get_selected_text = AsyncMock(return_value=f"copy-{execution_index}")
+            yield execute
+        finally:
+            if execution_index == 0:
+                first_completed.set()
+
+    message_channel.websocket.receive_json = receive_json
+    message_channel.send_copied_text = AsyncMock()
+    monkeypatch.setattr(message_module, "execution_for_message_channel", controlled_execution)
+
+    await asyncio.wait_for(loop_stream_messages(message_channel), timeout=2)
+
+    sent_errors = [
+        sent
+        for call in message_channel.send_nowait.call_args_list
+        for sent in call.kwargs.get("messages", [])
+        if isinstance(sent, MessageOutError)
+    ]
+    assert started_at_capacity == [2]
+    assert executions_started == 3
+    assert [(error.failed_kind, error.message) for error in sent_errors] == [
+        (MessageKind.CLIPBOARD_COPY.value, "Clipboard is busy; try again.")
+    ]
 
 
 @pytest.mark.asyncio

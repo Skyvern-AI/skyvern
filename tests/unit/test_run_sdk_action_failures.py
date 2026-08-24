@@ -7,8 +7,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
+from skyvern.exceptions import (
+    ConcurrencyLimitExceeded,
+    MissingBrowserStatePage,
+    ScrapingFailed,
+    ScreenshotTargetClosed,
+    SkyvernActionFailed,
+)
+from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.routes.sdk import _sdk_action_context_refcounts, run_sdk_action
+from tests.unit.conftest import LEGACY_DOWNLOAD_ESCAPE_CASES
 
 
 @pytest.fixture
@@ -54,7 +62,85 @@ def mock_app() -> Any:
 
 
 @pytest.mark.asyncio
-async def test_auto_generated_run_is_completed_through_workflow_service(
+async def test_auto_generated_run_commits_marker_before_completion(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_request.workflow_run_id = None
+    workflow = MagicMock(workflow_id="w_test", workflow_permanent_id="wpid_test", title="t")
+    workflow_run = MagicMock(workflow_run_id="wr_test", workflow_id="w_test")
+    task = mock_app.DATABASE.tasks.create_task.return_value
+    step = mock_app.DATABASE.tasks.create_step.return_value
+    events: list[str] = []
+
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock(return_value=workflow)
+    mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=workflow_run)
+
+    mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock()
+
+    async def create_task(**_: Any) -> Any:
+        events.append("task")
+        return task
+
+    async def mark_workflow_run_as_completed(**_: Any) -> Any:
+        events.append("complete")
+        return workflow_run
+
+    async def create_step(*_: Any, **__: Any) -> Any:
+        events.append("step")
+        return step
+
+    async def create_workflow_run_block(**_: Any) -> None:
+        events.append("block")
+
+    mock_app.DATABASE.tasks.create_task = AsyncMock(side_effect=create_task)
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock(side_effect=mark_workflow_run_as_completed)
+    mock_app.DATABASE.tasks.create_step = AsyncMock(side_effect=create_step)
+    mock_app.DATABASE.observer.create_workflow_run_block = AsyncMock(side_effect=create_workflow_run_block)
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop after setup"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop after setup"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert events[:4] == ["task", "complete", "step", "block"]
+    assert mock_app.DATABASE.tasks.create_task.await_args.kwargs["task_type"] == TaskType.synthetic_sdk_action
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed.assert_awaited_once_with(workflow_run_id="wr_test")
+    mock_app.DATABASE.workflow_runs.update_workflow_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_caller_provided_run_keeps_general_task_type(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock()
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("stop inside action"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(RuntimeError, match="stop inside action"):
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert mock_app.DATABASE.tasks.create_task.await_args.kwargs["task_type"] == TaskType.general
+    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_minted_sdk_action_uses_inline_dispatch_without_generic_executor(
     mock_request: Any, mock_organization: Any, mock_app: Any
 ) -> None:
     mock_request.workflow_run_id = None
@@ -63,15 +149,35 @@ async def test_auto_generated_run_is_completed_through_workflow_service(
     mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock(return_value=workflow)
     mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=workflow_run)
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = AsyncMock(return_value=workflow_run)
-    mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock(return_value=workflow_run)
-    mock_app.DATABASE.tasks.create_task = AsyncMock(side_effect=RuntimeError("stop after completion"))
+    mock_app.WORKFLOW_SERVICE.create_workflow_from_prompt = AsyncMock()
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock(return_value=MagicMock())))
+    page_ai = MagicMock(ai_click=AsyncMock(return_value={"clicked": True}))
+    generic_executor = MagicMock()
+    generic_executor.execute_task = AsyncMock()
+    generic_executor.execute_workflow = AsyncMock()
 
-    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
-        with pytest.raises(RuntimeError, match="stop after completion"):
-            await run_sdk_action(mock_request, organization=mock_organization)
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            return_value=scraped_page,
+        ),
+        patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        patch(
+            "skyvern.forge.sdk.executor.factory.AsyncExecutorFactory.get_executor",
+            return_value=generic_executor,
+        ) as get_executor,
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        response = await run_sdk_action(mock_request, organization=mock_organization)
 
-    mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed.assert_awaited_once_with(workflow_run_id="wr_test")
-    mock_app.DATABASE.workflow_runs.update_workflow_run.assert_not_awaited()
+    assert response.result == {"clicked": True}
+    get_executor.assert_not_called()
+    generic_executor.execute_task.assert_not_awaited()
+    generic_executor.execute_workflow.assert_not_awaited()
+    mock_app.WORKFLOW_SERVICE.create_workflow_from_prompt.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -114,6 +220,52 @@ async def test_handler_returns_400_when_action_raises_scraping_failed(
             await run_sdk_action(mock_request, organization=mock_organization)
 
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_handler_returns_422_when_browser_target_closed(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=ScreenshotTargetClosed(
+                error_message="Page.screenshot: Target page, context or browser has been closed"
+            ),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(HTTPException) as exc_info:
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert exc_info.value.status_code == 422
+    mock_app.DATABASE.tasks.update_task.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_returns_422_when_browser_state_page_is_missing(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """A closed browser context is the same caller-visible condition as a closed target, so it
+    must not fall through to the generic handler and surface as a 500."""
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            side_effect=MissingBrowserStatePage(task_id="tsk_gone"),
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        with pytest.raises(HTTPException) as exc_info:
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert exc_info.value.status_code == 422
+    mock_app.DATABASE.tasks.update_task.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -352,3 +504,86 @@ async def test_context_refcount_released_when_upload_drain_is_cancelled(
 
     assert "wr_test" not in _sdk_action_context_refcounts
     mock_app.WORKFLOW_CONTEXT_MANAGER.remove_workflow_run_context.assert_called_once_with("wr_test")
+
+
+async def _run_upload_action(
+    mock_request: Any, mock_organization: Any, mock_app: Any, file_url: str
+) -> tuple[Any, HTTPException | None]:
+    """Drive the ai_upload_file route branch and report the upload sink plus any rejection."""
+    page_ai = MagicMock(ai_upload_file=AsyncMock(return_value=file_url))
+    scraped_page = MagicMock(_browser_state=MagicMock(must_get_working_page=AsyncMock()))
+    mock_request.action.type = "ai_upload_file"
+    mock_request.action.file_url = file_url
+
+    with (
+        patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
+        patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
+        patch("skyvern.forge.sdk.routes.sdk.RealSkyvernPageAi", return_value=page_ai),
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
+            new_callable=AsyncMock,
+            return_value=scraped_page,
+        ),
+    ):
+        mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
+        try:
+            await run_sdk_action(mock_request, organization=mock_organization)
+        except HTTPException as exc:
+            return page_ai, exc
+    return page_ai, None
+
+
+@pytest.mark.asyncio
+async def test_ai_upload_file_route_accepts_canonical_legacy_file_url(
+    mock_request: Any, mock_organization: Any, mock_app: Any, legacy_download_uris: dict[str, str]
+) -> None:
+    """Positive control: the guard must still let a real in-root file through to the upload."""
+    page_ai, rejection = await _run_upload_action(
+        mock_request, mock_organization, mock_app, legacy_download_uris["canonical"]
+    )
+
+    assert rejection is None
+    page_ai.ai_upload_file.assert_awaited_once()
+    assert page_ai.ai_upload_file.await_args.kwargs["files"] == legacy_download_uris["canonical"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", LEGACY_DOWNLOAD_ESCAPE_CASES)
+async def test_ai_upload_file_route_rejects_legacy_file_url_escape(
+    mock_request: Any, mock_organization: Any, mock_app: Any, legacy_download_uris: dict[str, str], case: str
+) -> None:
+    page_ai, rejection = await _run_upload_action(mock_request, mock_organization, mock_app, legacy_download_uris[case])
+
+    assert rejection is not None
+    assert rejection.status_code == 400
+    page_ai.ai_upload_file.assert_not_awaited()
+
+
+class _RejectingSlot:
+    def __init__(self, organization_id: str) -> None:
+        self._organization_id = organization_id
+
+    async def __aenter__(self) -> None:
+        raise ConcurrencyLimitExceeded(organization_id=self._organization_id, operation="SDK action", limit=4)
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_action_over_the_concurrency_cap_is_rejected_before_any_run_is_created(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    """A rejected action must cost a request, not a workflow run, a task or a step."""
+    mock_request.workflow_run_id = None
+    mock_app.RATE_LIMITER.limit_sdk_action_concurrency = MagicMock(side_effect=_RejectingSlot)
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow = AsyncMock()
+
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
+        with pytest.raises(ConcurrencyLimitExceeded) as rejected:
+            await run_sdk_action(mock_request, organization=mock_organization)
+
+    assert rejected.value.status_code == 429
+    mock_app.WORKFLOW_SERVICE.create_empty_workflow.assert_not_awaited()
+    mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+    mock_app.DATABASE.tasks.create_step.assert_not_awaited()

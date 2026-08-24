@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import gc
 import io
 import json
 import logging
+import sys
+import threading
 from collections.abc import Iterator
+from decimal import Decimal
 
 import pytest
 import structlog
@@ -60,6 +65,83 @@ def test_foreign_stdlib_exception_renders_single_structured_line(json_stream: io
     assert record["error_type"] == "builtins.ValueError"
     assert record["error_category"] == "ERROR"
     assert record["exception_hash"]
+
+
+class _FinalizerRaises:
+    """A __del__ that raises is routed to sys.unraisablehook, which prints straight to stderr."""
+
+    def __del__(self) -> None:
+        _raise_through_wrapper()
+
+
+def test_unraisable_traceback_becomes_one_structured_event(json_stream: io.StringIO) -> None:
+    """CPython's default hook prints one stderr line per frame, so a line-oriented collector bills
+    a single exception as ~30 error events, none of them carrying exception_hash to group on."""
+    # pytest's own unraisable/thread-exception plugins save and restore these hooks, so re-assert
+    # them from inside the test body rather than relying on the fixture's setup-phase install.
+    forge_log._install_interpreter_traceback_hooks()
+
+    doomed = _FinalizerRaises()
+    del doomed
+    gc.collect()
+
+    lines = json_stream.getvalue().strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+
+    assert record["msg"].startswith("Exception ignored in interpreter callback")
+    assert record["error_type"] == "builtins.ValueError"
+    assert record["exception_hash"]
+    assert "ValueError: kaboom from an activity" in record["exception"]
+    assert "async_wrapper" in record["exception"]
+    # The finalized object is what the default hook puts on its first line. CPython moved its repr
+    # from `object` into `err_msg` between 3.11 and 3.14, so assert only that it survives somewhere.
+    assert "_FinalizerRaises" in f"{record.get('unraisable_err_msg', '')}{record.get('unraisable_object', '')}"
+
+
+def test_uncaught_thread_exception_becomes_one_structured_event(json_stream: io.StringIO) -> None:
+    forge_log._install_interpreter_traceback_hooks()
+
+    thread = threading.Thread(target=_raise_through_wrapper, name="background-poller")
+    thread.start()
+    thread.join()
+
+    lines = json_stream.getvalue().strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+
+    assert record["thread_name"] == "background-poller"
+    assert record["error_type"] == "builtins.ValueError"
+    assert record["exception_hash"]
+    assert "async_wrapper" in record["exception"]
+
+
+def test_uncaught_main_thread_exception_becomes_one_structured_event(json_stream: io.StringIO) -> None:
+    try:
+        _raise_through_wrapper()
+    except ValueError:
+        sys.excepthook(*sys.exc_info())
+
+    lines = json_stream.getvalue().strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+
+    assert record["error_type"] == "builtins.ValueError"
+    assert record["exception_hash"]
+
+
+def test_keyboard_interrupt_keeps_default_stderr_behaviour(json_stream: io.StringIO) -> None:
+    """Ctrl-C is a one-line traceback nobody groups on; turning it into an ERROR event would
+    make every interactive shutdown look like a failure."""
+    stderr = io.StringIO()
+    try:
+        raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        with contextlib.redirect_stderr(stderr):
+            sys.excepthook(*sys.exc_info())
+
+    assert json_stream.getvalue() == ""
+    assert "KeyboardInterrupt" in stderr.getvalue()
 
 
 def test_oversized_structured_payload_is_bounded_to_one_log_record(json_stream: io.StringIO) -> None:
@@ -232,3 +314,47 @@ def test_native_structlog_exception_not_double_processed(json_stream: io.StringI
     assert "Traceback (most recent call last)" in record["exception"]
     assert record["exception"].count("Traceback (most recent call last)") == 1
     assert record["error_type"] == "builtins.ValueError"
+
+
+def test_decimal_log_values_render_as_json_numbers() -> None:
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "Recorded run costs", "compute_cost": Decimal("0.00098117"), "proxy_cost": Decimal("0.00400000")},
+    )
+    record = json.loads(rendered)
+
+    assert record["compute_cost"] == pytest.approx(0.00098117)
+    assert record["proxy_cost"] == pytest.approx(0.004)
+    assert isinstance(record["compute_cost"], float)
+    assert "Decimal(" not in rendered
+
+
+def test_structlog_serialization_hook_survives_the_decimal_default() -> None:
+    """Passing `default=` to JSONRenderer disables its built-in __structlog__ support."""
+
+    class _Custom:
+        def __structlog__(self) -> str:
+            return "custom-repr"
+
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "hook", "obj": _Custom()},
+    )
+
+    assert json.loads(rendered)["obj"] == "custom-repr"
+
+
+def test_unserializable_value_falls_back_to_repr_instead_of_raising() -> None:
+    class _Opaque:
+        def __repr__(self) -> str:
+            return "<opaque>"
+
+    rendered = forge_log.render_bounded_json(
+        None,  # type: ignore[arg-type]
+        "info",
+        {"msg": "opaque", "obj": _Opaque()},
+    )
+
+    assert json.loads(rendered)["obj"] == "<opaque>"

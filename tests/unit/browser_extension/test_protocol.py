@@ -84,6 +84,7 @@ def test_protocol_allowlists_match_contract() -> None:
     assert ALLOWED_EVENTS == frozenset(
         {
             "extension.hello",
+            "pairing.approved",
             "debugger.event",
             "debugger.detached",
             "scope.tabAdded",
@@ -98,9 +99,11 @@ def test_protocol_allowlists_match_contract() -> None:
             "TAB_NOT_FOUND",
             "TAB_NOT_SCOPED",
             "RESTRICTED_URL",
+            "ATTACH_FAILED",
             "DEBUGGER_DETACHED",
             "CDP_METHOD_NOT_ALLOWED",
             "CDP_ERROR",
+            "COMMAND_TIMEOUT",
             "INTERNAL",
         }
     )
@@ -214,12 +217,17 @@ const resetResults = [
   {{ executed: true, ok: false, failedTabCount: 1 }},
   {{ executed: true, ok: true, failedTabCount: 0 }},
 ];
+const brokerEvents = [];
 const bridge = new BridgeConnection({{
   onRequest: async () => ({{}}),
   onAuthenticated: async () => undefined,
   onReset: async () => resetResults.shift(),
+  onEvent: async (event, params) => brokerEvents.push([event, params]),
   onStateChange: () => undefined,
 }});
+if (bridge.socket !== null || bridge.authenticated !== false) {{
+  throw new Error("fresh bridge connection state was not initialized");
+}}
 bridge.authenticated = true;
 bridge.socket = {{ readyState: 1, send: (raw) => frames.push(JSON.parse(raw)) }};
 const resetFrame = (generation) => JSON.stringify({{
@@ -242,6 +250,18 @@ await bridge.handleMessage(resetFrame(2));
 if (frames[2]?.ok !== true || frames[2]?.epoch !== "daemon-epoch") {{
   throw new Error("failed reset identity did not re-execute successfully");
 }}
+await bridge.handleMessage(JSON.stringify({{
+  v: 2,
+  type: "event",
+  event: "pairing.approved_ack",
+  params: {{ approvalNonce: "approval-nonce", approved: true }},
+}}));
+if (
+  brokerEvents[0]?.[0] !== "pairing.approved_ack" ||
+  brokerEvents[0]?.[1]?.approvalNonce !== "approval-nonce"
+) {{
+  throw new Error("broker pairing approval acknowledgement was not dispatched");
+}}
 
 let targets = [{{ tabId: 7, attached: true }}];
 chrome.debugger.detach = async () => {{ throw new Error("detach failed"); }};
@@ -252,14 +272,143 @@ const router = new DebuggerRouter({{
   onAttachedChange: () => undefined,
 }});
 router.attachedTabs.add(7);
+router.attachStates.set(7, {{ status: "attached" }});
 const failed = await router.reset();
-if (failed.failedTabCount !== 1 || !router.attachedTabs.has(7)) {{
-  throw new Error("live debugger attachment was certified as detached");
+if (
+  failed.failedTabCount !== 1 ||
+  router.attachedTabs.has(7) ||
+  router.attachStates.get(7)?.status !== "quarantined"
+) {{
+  throw new Error("live debugger attachment was not quarantined after detach failure");
 }}
 targets = [];
 const benign = await router.reset();
-if (benign.failedTabCount !== 0 || router.attachedTabs.has(7)) {{
+if (benign.failedTabCount !== 0 || router.attachedTabs.has(7) || router.attachStates.has(7)) {{
   throw new Error("already-detached or missing target was not accepted");
+}}
+let detachCleanupCount = 0;
+router.tabScope = {{
+  runTabOperation: async (_tabId, operation) => operation(),
+  assertScoped: async () => undefined,
+  handleDebuggerDetachLocked: async () => {{ detachCleanupCount += 1; }},
+}};
+router.attachedTabs.add(8);
+targets = [];
+await router.detach({{ tabId: 8 }});
+if (router.attachedTabs.has(8) || detachCleanupCount !== 1) {{
+  throw new Error("already-detached cleanup did not release extension scope");
+}}
+await router.detach({{ tabId: 9 }});
+if (detachCleanupCount !== 2) {{
+  throw new Error("never-attached cleanup did not release extension scope");
+}}
+router.attachedTabs.add(10);
+targets = [{{ tabId: 10, attached: true }}];
+let detachError;
+try {{
+  await router.detach({{ tabId: 10 }});
+}} catch (error) {{
+  detachError = error;
+}}
+if (
+  detachError?.code !== "CDP_ERROR" ||
+  !router.attachedTabs.has(10) ||
+  detachCleanupCount !== 2
+) {{
+  throw new Error("failed live detach did not remain fenced");
+}}
+"""
+
+    result = subprocess.run(
+        [node, "--input-type=module", "--eval", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_pairing_confirmation_renders_next_agent_offer_after_success() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pairing confirmation contract test")
+    extension_dir = Path(__file__).parents[3] / "skyvern" / "browser_extension" / "extension"
+    pairing_uri = (extension_dir / "pairing_confirm.js").as_uri()
+    script = f"""
+class Element {{
+  constructor() {{
+    this.dataset = {{}};
+    this.hidden = true;
+    this.disabled = false;
+    this.textContent = "";
+    this.listeners = new Map();
+    this.attributes = new Map();
+  }}
+  addEventListener(type, listener) {{ this.listeners.set(type, listener); }}
+  setAttribute(name, value) {{ this.attributes.set(name, value); }}
+  removeAttribute(name) {{ this.attributes.delete(name); }}
+}}
+const selectors = [
+  "#pairing-question",
+  "#pairing-port",
+  "#pairing-fingerprint",
+  "#approve-button",
+  "#approve-label",
+  "#cancel-button",
+  ".actions",
+  "#pairing-result",
+  "#result-title",
+  "#result-message",
+  "#recovery",
+];
+const elements = Object.fromEntries(selectors.map((selector) => [selector, new Element()]));
+globalThis.document = {{
+  body: {{ dataset: {{}} }},
+  querySelector: (selector) => elements[selector],
+}};
+let offer = {{
+  port: 19777,
+  token: "token",
+  approvalNonce: "first-nonce",
+  requestFingerprint: "first123",
+}};
+let storageListener = null;
+globalThis.chrome = {{
+  runtime: {{
+    sendMessage: async () => ({{ ok: true, result: {{}} }}),
+  }},
+  storage: {{
+    session: {{
+      get: async () => ({{ pendingPairingOffer: offer }}),
+    }},
+    onChanged: {{
+      addListener(listener) {{ storageListener = listener; }},
+    }},
+  }},
+}};
+await import({json.dumps(pairing_uri)});
+if (elements["#pairing-fingerprint"].textContent !== "first123") {{
+  throw new Error("first agent offer was not rendered");
+}}
+elements["#approve-button"].listeners.get("click")();
+await new Promise((resolve) => setTimeout(resolve, 0));
+if (elements["#result-title"].textContent !== "Connected") {{
+  throw new Error("first agent approval did not reach its terminal state");
+}}
+offer = {{
+  port: 19777,
+  token: "token",
+  approvalNonce: "second-nonce",
+  requestFingerprint: "next4567",
+}};
+storageListener(
+  {{ pendingPairingOffer: {{ newValue: offer }} }},
+  "session",
+);
+await new Promise((resolve) => setTimeout(resolve, 0));
+if (
+  elements["#pairing-fingerprint"].textContent !== "next4567" ||
+  elements["#approve-button"].disabled
+) {{
+  throw new Error("second agent offer did not replace the completed approval");
 }}
 """
 

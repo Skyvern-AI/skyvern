@@ -10,9 +10,13 @@ from __future__ import annotations
 import json
 import textwrap
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -21,21 +25,29 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
-from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompletionCriterion, _update_workflow
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    CodeArtifactCompletionCriterion,
+    _accepted_code_delta,
+    _advisory_labels_by_message,
+    _author_time_findings,
+    _changed_code_blocks,
+    _update_workflow,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
+from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 
 
 def _yaml(body: str) -> str:
     return textwrap.dedent(body).strip() + "\n"
 
 
-def _ctx() -> CopilotContext:
+def _ctx(workflow_yaml: str = "") -> CopilotContext:
     ctx = CopilotContext(
         organization_id="o",
         workflow_id="w",
         workflow_permanent_id="wp",
-        workflow_yaml="",
+        workflow_yaml=workflow_yaml,
         browser_session_id=None,
         stream=None,
     )
@@ -101,6 +113,7 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     ctx = _ctx()
     submitted = _code_yaml(
         """
+        await page.locator("body").wait_for(state="visible", timeout=45000)
         await page.get_by_role("button", name="Search", exact=True).click()
         result = (await page.get_by_role("status").inner_text()).strip()
         return {"output": {"result": result}}
@@ -117,6 +130,9 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     assert persisted == [submitted]
     assert ctx.workflow_yaml == submitted
     assert _single_code(ctx.workflow_yaml) == _single_code(submitted)
+    assert result["data"]["stored_code"]["submit_search"] == _single_code(submitted)
+    assert 'page.locator("body").wait_for(state="visible", timeout=45000)' in _single_code(ctx.workflow_yaml)
+    assert [finding["reason_code"] for finding in result["data"]["findings"]] == ["code_block_readiness_wait_advisory"]
     assert "imposed_substitutions" not in result["data"]
 
 
@@ -153,6 +169,204 @@ async def test_requested_output_contract_does_not_rewrite_model_code(monkeypatch
     assert _single_code(ctx.workflow_yaml) == (
         'record_id = "{{ business_name }}"\nreturn {"output": {"record_id": record_id}}\n'
     )
+
+
+@pytest.mark.asyncio
+async def test_google_lookup_failure_reuses_collected_bindings_without_retraversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    ctx.google_connection_turn_start_bindings = ()
+    collected = False
+
+    def _collect_once(_workflow: SimpleNamespace) -> tuple[tuple[str, str], ...]:
+        nonlocal collected
+        if collected:
+            raise AssertionError("Google bindings were traversed more than once")
+        collected = True
+        return ()
+
+    async def _lookup_fails(_organization_id: str) -> NoReturn:
+        raise RuntimeError("lookup unavailable")
+
+    monkeypatch.setattr(workflow_update_module, "google_sheet_connection_bindings", _collect_once)
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _lookup_fails,
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": _code_yaml('return {"ok": True}')},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert collected is True
+
+
+@pytest.mark.asyncio
+async def test_google_notice_baseline_is_captured_before_an_update_without_sheets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
+    submitted_yaml = _code_yaml('return {"step": 1}')
+    baseline_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(("existing_sheet", "goac_existing"),),
+    )
+    submitted_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(),
+    )
+
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        if kwargs["workflow_yaml"] == baseline_yaml:
+            return baseline_workflow
+        return submitted_workflow
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda workflow: workflow.google_bindings,
+    )
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        lambda _organization_id: _empty_credentials(),
+    )
+    ctx = _ctx(baseline_yaml)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted_yaml},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.google_connection_turn_start_bindings == (("existing_sheet", "goac_existing"),)
+
+
+@pytest.mark.asyncio
+async def test_google_notice_skips_lookup_when_turn_start_baseline_cannot_be_parsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
+    submitted_yaml = _code_yaml('return {"step": 1}')
+    submitted_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[]),
+        proxy_location=None,
+        webhook_callback_url=None,
+        google_bindings=(("new_sheet", "goac_error"),),
+    )
+
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        if kwargs["workflow_yaml"] == baseline_yaml:
+            raise RuntimeError("baseline unavailable")
+        return submitted_workflow
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    async def _unexpected_lookup(_organization_id: str) -> NoReturn:
+        raise AssertionError("credential lookup must wait for a valid baseline")
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda workflow: workflow.google_bindings,
+    )
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _unexpected_lookup,
+    )
+    ctx = _ctx(baseline_yaml)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted_yaml},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.google_connection_turn_start_bindings is None
+    assert ctx.google_connection_notices == []
+
+
+async def _empty_credentials() -> list[SimpleNamespace]:
+    return []
+
+
+@pytest.mark.asyncio
+async def test_google_notice_capture_records_every_sheets_binding_including_resolvable_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    ctx.google_connection_turn_start_bindings = ()
+    current_bindings = iter(((), (("write_sheet", "goac_active"),), (("write_sheet", "goac_active"),)))
+    captures: list[dict[str, object]] = []
+
+    monkeypatch.setenv("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS", "/tmp/google-notice-capture")
+    monkeypatch.setattr(
+        workflow_update_module,
+        "google_sheet_connection_bindings",
+        lambda _workflow: next(current_bindings),
+    )
+
+    async def _visible_credentials(_organization_id: str) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                id="goac_active",
+                state="active",
+                credential_name="Sheets account",
+                scopes_granted=[GOOGLE_SHEETS_DATA_SCOPE],
+            )
+        ]
+
+    monkeypatch.setattr(
+        workflow_update_module.google_oauth_service,
+        "get_visible_credentials_for_org",
+        _visible_credentials,
+    )
+    monkeypatch.setattr(
+        workflow_update_module,
+        "write_google_connection_notice_capture",
+        lambda **kwargs: captures.append(kwargs),
+    )
+
+    first = await _update_workflow(
+        {"workflow_yaml": _code_yaml('return {"step": 1}')},
+        ctx,
+        allow_missing_credentials=True,
+    )
+    assert first["ok"] is True
+    assert captures == []
+
+    for step in (2, 3):
+        accepted = await _update_workflow(
+            {"workflow_yaml": _code_yaml(f'return {{"step": {step}}}')},
+            ctx,
+            allow_missing_credentials=True,
+        )
+        assert accepted["ok"] is True
+
+    assert [capture["observed_notices"] for capture in captures] == [[], []]
+    assert [capture["turn_id"] for capture in captures] == [ctx.turn_id, ctx.turn_id]
 
 
 @pytest.mark.asyncio
@@ -402,3 +616,108 @@ def test_no_output_contract_actuation_meta_plane_exports_remain() -> None:
     assert "consume_output_contract_advisory_grant_for_run" not in names
     assert "consume_output_contract_advisory_grant_for_run_result" not in names
     assert "record_output_contract_run_output_evidence" not in names
+
+
+class TestBodyReadinessAdvisoryDelivery:
+    _BODY_WAIT = 'body = page.locator("body")\nawait body.wait_for(state="visible", timeout=30000)\n'
+
+    def _oversized_block(self) -> str:
+        padding = "\n".join(f'value_{index} = "{index}"' for index in range(6000))
+        return f'{self._BODY_WAIT}{padding}\nreturn {{"ok": True}}\n'
+
+    def _findings(self, prior: str | None, accepted: str) -> list[dict[str, object]]:
+        return _author_time_findings(
+            schema_incompatibility=None,
+            metadata_violations=[],
+            code_block_diagnostics=_advisory_labels_by_message(_changed_code_blocks(prior, accepted, accepted)),
+        )
+
+    def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
+        accepted = _code_yaml(self._oversized_block(), label="read_summary")
+
+        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted))
+        findings = self._findings(None, accepted)
+
+        assert stored_code == {}
+        assert withheld
+        assert [finding["reason_code"] for finding in findings] == ["code_block_readiness_wait_advisory"]
+        assert "`read_summary`" in str(findings[0]["summary"])
+
+    def test_unchanged_block_carries_no_advisory(self) -> None:
+        prior = _code_yaml(self._BODY_WAIT, label="read_summary")
+
+        assert self._findings(prior, prior) == []
+
+
+@pytest.mark.asyncio
+async def test_scanner_advisory_findings_never_block_a_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    finding = CodeBlockScanFinding(rule_id="exfiltrate-sensitive-data", line=1, message="Sends data off-page.")
+
+    async def _scan(
+        code: str, *, organization_id: str | None = None, timeout_seconds: float = 3.0
+    ) -> list[CodeBlockScanFinding]:
+        return [finding]
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", _scan)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    scanner_findings = [f for f in result["data"]["findings"] if f["reason_code"] == "code_block_scanner_advisory"]
+    assert len(scanner_findings) == 1
+    assert "`submit_search`" in scanner_findings[0]["summary"]
+    assert (
+        "Flagged by scanner rule `exfiltrate-sensitive-data` at line 1. Sends data off-page."
+        in scanner_findings[0]["summary"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_scanner_failure_never_blocks_a_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+
+    async def _scan(code: str, *, organization_id: str | None = None, timeout_seconds: float = 3.0) -> NoReturn:
+        raise RuntimeError("scanner unavailable")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", _scan)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))
+
+
+@pytest.mark.asyncio
+async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.MonkeyPatch) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "scan_code_block_source", AgentFunction().scan_code_block_source)
+    submitted = _code_yaml('await page.goto("https://example.com")\nreturn {"ok": True}')
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))

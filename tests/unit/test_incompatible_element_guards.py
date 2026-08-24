@@ -17,6 +17,7 @@ from skyvern.webeye.utils.dom import SkyvernElement, is_incompatible_text_input_
 _NOT_INPUT_ERROR = "Element is not an <input>, <textarea> or [contenteditable] element"
 _NOT_HTMLELEMENT_ERROR = "Node is not an HTMLElement"
 _NOT_INPUTELEMENT_ERROR = "Node is not an HTMLInputElement, HTMLTextAreaElement or HTMLSelectElement"
+_NON_FILLABLE_TYPE_ERROR = 'Input of type "checkbox" cannot be filled'
 _TIMEOUT_ERROR = "Timeout 30000ms exceeded"
 
 
@@ -76,6 +77,7 @@ def test_predicate_matches_incompatible_type_errors() -> None:
     assert is_incompatible_text_input_error(PlaywrightError(_NOT_INPUT_ERROR)) is True
     assert is_incompatible_text_input_error(PlaywrightError(_NOT_HTMLELEMENT_ERROR)) is True
     assert is_incompatible_text_input_error(PlaywrightError(_NOT_INPUTELEMENT_ERROR)) is True
+    assert is_incompatible_text_input_error(PlaywrightError(_NON_FILLABLE_TYPE_ERROR)) is True
     assert is_incompatible_text_input_error(PlaywrightError(_TIMEOUT_ERROR)) is False
 
 

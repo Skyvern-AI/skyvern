@@ -12,6 +12,19 @@ MAX_TIMEOUT = 60 * 4  # 4 hours
 MAX_LIFETIME_SECONDS = MAX_TIMEOUT * 60
 DEFAULT_TIMEOUT = 60
 
+MAX_TIMEOUT_EXCEEDED_MESSAGE = (
+    "Longer browser durations are available on our enterprise plan, please contact sales@skyvern.com"
+)
+
+
+def max_timeout_exceeded_warning(requested_timeout_minutes: int) -> str:
+    """Warning returned when a create request asked for more than the cap allows."""
+    return (
+        f"Requested timeout of {requested_timeout_minutes} minutes exceeds the maximum of "
+        f"{MAX_TIMEOUT} minutes ({MAX_TIMEOUT // 60} hours); this session was capped at "
+        f"{MAX_TIMEOUT} minutes. {MAX_TIMEOUT_EXCEEDED_MESSAGE}"
+    )
+
 
 def seconds_until_expiry(
     *,

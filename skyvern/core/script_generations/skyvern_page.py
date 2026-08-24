@@ -33,6 +33,7 @@ from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.dom_inspection import read_locator_selected_state
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 if TYPE_CHECKING:
@@ -192,6 +193,15 @@ class SkyvernPage(Page):
     ) -> str:
         return value
 
+    async def magic_link(
+        self,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> None:
+        # Raises rather than no-opping like the value helpers above: a silent return would let a
+        # script continue past a sign-in that never happened.
+        raise NotImplementedError("Magic link sign-in is not supported outside server context")
+
     def _is_secret_reference(self, value: str) -> bool:
         return False
 
@@ -339,6 +349,24 @@ class SkyvernPage(Page):
 
     ######### Public Interfaces #########
 
+    async def _click_is_redundant(self, locator: Locator, desired_state: bool | None, timeout: float) -> bool:
+        """Whether a level-triggered click must be suppressed because the control the selector
+        resolved already holds ``desired_state``. An unreadable or unresolvable state falls open to
+        one ordinary click, so a control this reader can't classify is never left unclicked. The read
+        shares the click's own timeout budget — on the prep opt-out path the locator has not been
+        waited on, and Playwright's default would otherwise stall a miss far past that budget."""
+        if desired_state is None:
+            return False
+        try:
+            live_state = await read_locator_selected_state(locator, timeout=timeout)
+        except Exception:
+            LOG.debug("Failed to read live selected state, continuing the normal click", exc_info=True)
+            return False
+        if live_state != desired_state:
+            return False
+        LOG.info("Control already in the desired state, suppressing the redundant click", desired_state=desired_state)
+        return True
+
     @overload
     async def click(
         self,
@@ -347,6 +375,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
@@ -358,6 +387,7 @@ class SkyvernPage(Page):
         prompt: str,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str | None: ...
@@ -370,6 +400,7 @@ class SkyvernPage(Page):
         prompt: str | None = None,
         ai: str | None = "fallback",
         mode: str | None = None,
+        desired_state: bool | None = None,
         recoverable_marker_id: int | None = None,
         _skip_element_prep: bool = False,
         **kwargs: Any,
@@ -388,6 +419,10 @@ class SkyvernPage(Page):
             mode: When ``"direct"``, perform a raw Playwright click with no AI
                 fallback or element preparation.  The action is still recorded
                 in the DB so it appears in the timeline.
+            desired_state: Level-triggered toggle intent recorded with the action. When set, a
+                selector-first click is suppressed if the control already holds that state, so a
+                replay never toggles an already-satisfied control back off. Ignored by
+                ``mode="direct"``.
             **kwargs: All Playwright click parameters (timeout, force, modifiers, etc.)
 
         Returns:
@@ -444,6 +479,8 @@ class SkyvernPage(Page):
                     else:
                         locator = await self._wait_for_selector_with_retry(selector, timeout=timeout)
                         await self._prepare_element(locator, timeout=timeout)
+                    if await self._click_is_redundant(locator, desired_state, timeout):
+                        return selector
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
@@ -470,6 +507,10 @@ class SkyvernPage(Page):
                             await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
                             locator = self._locator_scope.locator(selector).first
+                            # The primary click may have dispatched and reached the desired state
+                            # before raising, in which case retrying would toggle it back off.
+                            if await self._click_is_redundant(locator, desired_state, timeout):
+                                return selector
                             await locator.click(timeout=timeout, **kwargs)
                             LOG.info(
                                 "CSS selector click succeeded after dismissing overlay",
@@ -521,8 +562,9 @@ class SkyvernPage(Page):
                 )
 
         if selector:
-            locator = self._locator_scope.locator(selector)
-            await locator.click(timeout=timeout, **kwargs)
+            locator = self._locator_scope.locator(selector).first
+            if not await self._click_is_redundant(locator, desired_state, timeout):
+                await locator.click(timeout=timeout, **kwargs)
 
         return selector
 

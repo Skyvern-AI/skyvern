@@ -201,14 +201,19 @@ async def test_client_is_relay_compatible_and_fences_stale_disconnect() -> None:
     client = BrokerClient(19778, on_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
     try:
-        relay.scoped_tabs = [{"tabId": 11, "url": "https://example.test", "title": "Example"}]
-        await relay.hello()
         await _eventually(lambda: client.connected)
+        assert client.scoped_tabs == []
+        assert events[-1] == ("extension.hello", {"scopedTabs": []})
 
-        assert client.connected
-        assert client.scoped_tabs == relay.scoped_tabs
-        assert await client.ensure_root_lease() == relay.scoped_tabs[0]
-        assert events[-1][0] == "extension.hello"
+        relay.scoped_tabs = [{"tabId": 11, "url": "https://example.test", "title": "Example"}]
+        hello_count = len(events)
+        await relay.hello()
+        await _eventually(lambda: len(events) > hello_count)
+        assert events[-1] == ("extension.hello", {"scopedTabs": []})
+
+        leased_tab = await client.ensure_root_lease()
+        assert leased_tab == relay.scoped_tabs[0]
+        assert client.scoped_tabs == [leased_tab]
 
         old_generation = client._transport_generation
         client._transport_generation += 1
@@ -242,8 +247,12 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
     server_task = await _connect_over_socketpair(server, client)
     try:
         await _eventually(lambda: client.connected)
-        assert observed_tabs == [relay.scoped_tabs]
-        assert client.scoped_tabs == relay.scoped_tabs
+        assert observed_tabs == [[]]
+        assert client.scoped_tabs == []
+
+        leased_tab = await client.ensure_root_lease()
+        assert leased_tab == relay.scoped_tabs[0]
+        assert client.scoped_tabs == [leased_tab]
     finally:
         await client.stop()
         await asyncio.wait_for(server_task, 1.0)
@@ -253,9 +262,11 @@ async def test_connected_is_published_only_after_synthetic_hello_snapshot() -> N
 @pytest.mark.asyncio
 async def test_client_preserves_extension_request_error_type() -> None:
     server = BrowserExtensionBrokerServer(19778)
-    server._relay = ErrorRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
+    relay = ErrorRelay("extension-secret", 19778, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
     client = BrokerClient(19778, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 11}]
     try:
         with pytest.raises(ExtensionRequestError) as error_info:
             await client.request("tabs.activate", {"tabId": 11})
@@ -269,16 +280,18 @@ async def test_client_preserves_extension_request_error_type() -> None:
 @pytest.mark.asyncio
 async def test_client_accepts_large_response_only_for_extension_request() -> None:
     server = BrowserExtensionBrokerServer(19778)
-    server._relay = LargeResponseRelay(
+    relay = LargeResponseRelay(
         "extension-secret",
         19778,
         server._handle_extension_event,
         server._handle_disconnect,
     )
+    server._relay = relay
     client = BrokerClient(19778, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 11}]
     try:
-        result = await client.request("debugger.send", {})
+        result = await client.request("debugger.send", {"tabId": 11})
         assert result == {"payload": "x" * (64 * 1024)}
     finally:
         await client.stop()
@@ -298,8 +311,9 @@ async def test_client_delivers_twenty_mib_response_on_empty_output_queue() -> No
     server._relay = relay
     client = BrokerClient(19778, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 11}]
     try:
-        result = await client.request("debugger.send", {})
+        result = await client.request("debugger.send", {"tabId": 11})
 
         assert len(result["payload"]) == 20 * 1024 * 1024
         assert client.broker_connected
@@ -321,6 +335,7 @@ async def test_cancelled_large_response_is_discarded_without_closing_transport()
     server._relay = relay
     client = BrokerClient(19778, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 11}]
     large_request = asyncio.create_task(client.request("debugger.send", {"tabId": 11}))
     other_request: asyncio.Task[dict] | None = None
     try:
@@ -369,6 +384,7 @@ async def test_cancellation_during_drain_keeps_late_large_response_authorized(
     server._relay = relay
     client = BrokerClient(19778, _ignore_event, auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 11}]
     writer = client._writer
     assert writer is not None
     original_drain = writer.drain
@@ -696,6 +712,30 @@ def test_first_spawn_leaves_extension_credentials_for_daemon_child(
     )
 
 
+def test_spawn_rejects_ready_response_for_a_different_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    paths = ensure_run_directory(19778, base_dir=tmp_path / "run")
+    process = MagicMock()
+    monkeypatch.setattr(broker_client_module, "_broker_is_reachable", lambda _paths: False)
+    monkeypatch.setattr(broker_client_module.subprocess, "Popen", MagicMock(return_value=process))
+    monkeypatch.setattr(
+        broker_client_module,
+        "read_readiness",
+        MagicMock(return_value={"status": "READY", "port": 19779}),
+    )
+    terminate = MagicMock()
+    monkeypatch.setattr(broker_client_module, "_terminate_spawned_process", terminate)
+
+    with pytest.raises(BrowserExtensionBrokerError, match="readiness response is invalid") as error_info:
+        broker_client_module._ensure_broker_process(19778, paths)
+
+    assert error_info.value.code == "INVALID_READINESS"
+    terminate.assert_called_once_with(process)
+
+
 def test_client_only_surfaces_daemon_auto_enable_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -934,4 +974,5 @@ async def _connect_over_socketpair(
     client._reader_task = asyncio.create_task(
         client._read_loop(client_reader, client_writer, client._transport_generation)
     )
+    await server._approve_client(client._client_id)
     return server_task

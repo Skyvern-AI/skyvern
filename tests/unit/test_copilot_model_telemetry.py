@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from agents import ModelSettings, function_tool
@@ -15,6 +18,7 @@ from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import ModelResponseStream, StreamingChoices, Usage
 from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk
+from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import model_telemetry as model_telemetry_module
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
@@ -23,6 +27,21 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
     current_model_call_telemetry,
     model_call_telemetry_scope,
 )
+from skyvern.forge.sdk.copilot.pending_operation import (
+    _turn_operations,
+    install_pending_operation_slot,
+    pending_operation,
+    pending_operation_fields,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_operation_slot() -> Iterator[None]:
+    """Tests here install a turn slot directly; without this it leaks into every later test in the
+    worker, and the suite runs under pytest-randomly."""
+    token = _turn_operations.set(None)
+    yield
+    _turn_operations.reset(token)
 
 
 @function_tool
@@ -713,3 +732,211 @@ def test_otel_provider_name_detects_azure_hosts(base_url: str) -> None:
 def test_otel_provider_name_rejects_lookalike_azure_urls(base_url: str) -> None:
     # A bare substring check labelled all of these as Azure; the host check must not.
     assert model_telemetry_module._otel_provider_name("some-model", base_url) is None
+
+
+def test_model_call_scope_names_the_open_operation_and_retires_it_on_exit() -> None:
+    install_pending_operation_slot()
+
+    with model_call_telemetry_scope(0, model="gpt-5.6-sol"):
+        while_open = pending_operation_fields()
+
+    after_exit = pending_operation_fields()
+
+    assert while_open["pending_operation"] == "model.call:gpt-5.6-sol"
+    assert isinstance(while_open["pending_operation_started_monotonic"], float)
+    assert while_open["pending_operation_state"] == "open"
+    assert while_open["pending_operation_open_count"] == 1
+    assert after_exit["pending_operation"] == "model.call:gpt-5.6-sol"
+    assert after_exit["pending_operation_state"] == "returned"
+    assert after_exit["pending_operation_open_count"] == 0
+
+
+def test_the_innermost_scope_wins_over_an_outer_one_that_is_still_open() -> None:
+    install_pending_operation_slot()
+
+    outer = pending_operation("turn.stream", span=True)
+    inner = pending_operation("mcp.call_tool:run_block")
+    outer.__enter__()
+    inner.__enter__()
+    while_both_open = pending_operation_fields()
+    inner.__exit__(None, None, None)
+    after_inner_returned = pending_operation_fields()
+    outer.__exit__(None, None, None)
+
+    assert while_both_open["pending_operation"] == "mcp.call_tool:run_block"
+    assert after_inner_returned["pending_operation"] == "mcp.call_tool:run_block"
+    assert after_inner_returned["pending_operation_state"] == "returned"
+    assert after_inner_returned["pending_operation_open_count"] == 1
+
+
+def test_a_scope_that_exits_by_exception_is_never_reported_as_still_open() -> None:
+    install_pending_operation_slot()
+
+    with pytest.raises(RuntimeError):
+        with pending_operation("mcp.call_tool:run_block"):
+            raise RuntimeError("tool blew up")
+
+    fields = pending_operation_fields()
+    assert fields["pending_operation"] == "mcp.call_tool:run_block"
+    assert fields["pending_operation_state"] == "unwound_by_error"
+    assert fields["pending_operation_open_count"] == 0
+
+
+def test_a_scope_slower_than_the_threshold_logs_itself_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.pending_operation.PENDING_OPERATION_LOG_THRESHOLD_SECONDS",
+        0.0,
+    )
+    install_pending_operation_slot()
+
+    with capture_logs() as logs:
+        with pending_operation("mcp.call_tool:run_block"):
+            pass
+
+    slow = [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"]
+    assert len(slow) == 1
+    assert slow[0]["pending_operation"] == "mcp.call_tool:run_block"
+    assert isinstance(slow[0]["pending_operation_started_monotonic"], float)
+
+
+def test_a_fingerprint_carries_the_turn_identifiers_that_join_it_to_its_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.pending_operation.PENDING_OPERATION_LOG_THRESHOLD_SECONDS",
+        0.0,
+    )
+    install_pending_operation_slot(
+        SimpleNamespace(
+            workflow_permanent_id="wpid_1",
+            turn_id="turn_1",
+            workflow_copilot_chat_id="wcc_1",
+        )
+    )
+
+    with capture_logs() as logs:
+        with pending_operation("mcp.call_tool:run_block"):
+            fields = pending_operation_fields()
+
+    slow = [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"]
+    assert len(slow) == 1
+    for key, value in (
+        ("workflow_permanent_id", "wpid_1"),
+        ("turn_id", "turn_1"),
+        ("workflow_copilot_chat_id", "wcc_1"),
+    ):
+        assert slow[0][key] == value
+        assert fields[key] == value
+
+
+def test_a_context_carrying_no_real_identifiers_adds_no_correlation_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.pending_operation.PENDING_OPERATION_LOG_THRESHOLD_SECONDS",
+        0.0,
+    )
+    install_pending_operation_slot(cast(Any, MagicMock()))
+
+    with pending_operation("mcp.call_tool:run_block"):
+        fields = pending_operation_fields()
+
+    assert not {"workflow_permanent_id", "turn_id", "workflow_copilot_chat_id"} & set(fields)
+
+
+def test_an_early_tool_error_does_not_pin_the_fingerprint_for_the_rest_of_the_turn() -> None:
+    install_pending_operation_slot()
+
+    # mcp_adapter raises for code-block control flow, so an ordinary turn retires an errored scope
+    # early. It must not outrank everything that runs afterwards.
+    with contextlib.suppress(RuntimeError):
+        with pending_operation("mcp.call_tool:codeblock_control_flow"):
+            raise RuntimeError("control flow")
+    with pending_operation("mcp.call_tool:later"):
+        pass
+
+    fields = pending_operation_fields()
+    assert fields["pending_operation"] == "mcp.call_tool:later"
+    assert fields["pending_operation_state"] == "returned"
+
+
+def test_a_sibling_still_hanging_outranks_a_later_one_that_already_returned() -> None:
+    install_pending_operation_slot()
+    turn = pending_operation("turn.stream", span=True)
+    turn.__enter__()
+
+    hung = pending_operation("mcp.call_tool:hung")
+    hung.__enter__()
+    # The SDK cancels concurrent tool tasks without awaiting cleanup, so a later-started sibling can
+    # retire while the one that hung is still open.
+    with pending_operation("mcp.call_tool:fast"):
+        pass
+
+    fields = pending_operation_fields()
+    hung.__exit__(None, None, None)
+    turn.__exit__(None, None, None)
+
+    assert fields["pending_operation"] == "mcp.call_tool:hung"
+    assert fields["pending_operation_state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_a_scope_abandoned_by_an_unfinalised_generator_does_not_own_the_next_iteration() -> None:
+    install_pending_operation_slot()
+
+    async def abandoned() -> AsyncIterator[int]:
+        with pending_operation("model.call:terra"):
+            for value in range(100):
+                yield value
+
+    iteration_one = pending_operation("turn.stream", span=True)
+    iteration_one.__enter__()
+    generator = abandoned()
+    async for _ in generator:
+        break
+    del generator
+    iteration_one.__exit__(None, None, None)
+
+    with pending_operation("turn.stream", span=True):
+        with pending_operation("mcp.call_tool:later"):
+            pass
+        fields = pending_operation_fields()
+
+    assert fields["pending_operation"] == "mcp.call_tool:later"
+    assert fields["pending_operation_state"] == "returned"
+
+
+def test_a_finished_scope_reports_its_own_duration_not_the_time_since_it_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.pending_operation.time.monotonic",
+        lambda: clock["now"],
+    )
+    install_pending_operation_slot()
+
+    with pending_operation("model.call:terra"):
+        clock["now"] = 1002.0
+    clock["now"] = 1900.0  # the turn then stalls for ~15 min somewhere uninstrumented
+
+    fields = pending_operation_fields()
+    assert fields["pending_operation"] == "model.call:terra"
+    assert fields["pending_operation_state"] == "returned"
+    assert fields["pending_operation_seconds"] == 2.0, "a 2s call must not read as though it hung for 900s"
+
+
+def test_a_scope_spanning_the_whole_iteration_does_not_emit_the_slow_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.pending_operation.PENDING_OPERATION_LOG_THRESHOLD_SECONDS",
+        0.0,
+    )
+    install_pending_operation_slot()
+
+    with capture_logs() as logs:
+        with pending_operation("turn.stream", span=True):
+            pass
+
+    assert [entry for entry in logs if entry.get("event") == "copilot_pending_operation_slow"] == []

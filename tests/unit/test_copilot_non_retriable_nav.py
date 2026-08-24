@@ -34,6 +34,9 @@ _CERT_FAILURE_REASON = "Failed to navigate to url https://expired.example. Error
 _TUNNEL_FAILURE_REASON = (
     "Failed to navigate to url https://proxy.example. Error message: net::ERR_TUNNEL_CONNECTION_FAILED"
 )
+_SOCKS_FAILURE_REASON = (
+    "Failed to navigate to url https://www.example.test/. Error message: net::ERR_SOCKS_CONNECTION_FAILED"
+)
 _GENERIC_FAILURE_REASON = "Timeout waiting for element #submit"
 
 
@@ -64,6 +67,11 @@ def _fresh_context() -> CopilotContext:
         pytest.param("net::ERR_NAME_RESOLUTION_FAILED happened mid-flight", id="name_resolution_mid_string"),
         pytest.param("SSL error: net::ERR_SSL_PROTOCOL_ERROR", id="ssl_prefixed"),
         pytest.param(_TUNNEL_FAILURE_REASON, id="tunnel_connection_failed"),
+        pytest.param(_SOCKS_FAILURE_REASON, id="socks_connection_failed"),
+        pytest.param(
+            "Failed to navigate to url https://x.test. Error message: net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+            id="socks_host_unreachable",
+        ),
     ],
 )
 def test_detect_matches_error_in_block_failure_reason(reason: str) -> None:
@@ -309,17 +317,24 @@ def test_exception_carries_url_and_error_message() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_full_flow_record_then_check_then_raise() -> None:
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(_DNS_FAILURE_REASON, id="dns"),
+        pytest.param(_SOCKS_FAILURE_REASON, id="socks_connection_failed"),
+    ],
+)
+def test_full_flow_record_then_check_then_raise(reason: str) -> None:
     ctx = _fresh_context()
     ctx.test_after_update_done = True
-    # Simulate a failed run with a DNS error.
     _record_run_blocks_result(
         ctx,
         {
             "ok": False,
-            "data": {"blocks": [{"failure_reason": _DNS_FAILURE_REASON}]},
+            "data": {"blocks": [{"failure_reason": reason}]},
         },
     )
+    assert ctx.last_test_non_retriable_nav_error == reason
     # The exit-path guard raises because last_test_ok is still False.
     with pytest.raises(CopilotNonRetriableNavError):
         _maybe_raise_non_retriable_nav(ctx)

@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 
 import structlog
 
+from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -77,7 +78,7 @@ ACTIVITY_TOOL_DENYLIST = frozenset({"get_run_results", "get_browser_screenshot"}
 # Their tool_call is recorded before the run flips running_block_label to the
 # running block, so the matching tool_result is pinned to the call's bucket (see
 # NarratorState._activity_bucket_label) rather than routed live.
-_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "run_blocks_and_collect_debug"})
+_RUN_ACTIVITY_TOOLS = frozenset({"update_and_run_blocks", "edit_block_and_run", "run_blocks_and_collect_debug"})
 
 # Shared classification for a code-authoring reject the streaming adapter renders
 # as quiet de-duplicated progress. Tagged on the reject (workflow_update) and
@@ -89,6 +90,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
     "update_workflow": "Updating workflow",
     "update_and_run_blocks": "Testing workflow",
+    "edit_block_and_run": "Editing and testing block",
     "run_blocks_and_collect_debug": "Testing workflow",
     "evaluate": "Inspecting page",
     "click": "Interacting with page",
@@ -98,6 +100,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "press_key": "Interacting with page",
     "navigate_browser": "Opening page",
     "get_block_schema": "Checking workflow block options",
+    "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
     "inspect_current_workflow": "Inspecting workflow",
     "discover_workflow_entrypoint": "Finding the entry page",
@@ -114,7 +117,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
 
 # Tools whose label names the block they operate on, read from the tool's own
 # `label` argument.
-_BLOCK_TARGET_LABEL_TOOLS = frozenset({"edit_block", "delete_block"})
+_BLOCK_TARGET_LABEL_TOOLS = frozenset({"edit_block", "edit_block_and_run", "delete_block"})
 _BLOCK_TARGET_VERSION_SUFFIX_RE = re.compile(r"_v\d+$", re.IGNORECASE)
 
 
@@ -142,7 +145,7 @@ def tool_activity_display_label(tool_name: str, tool_input: dict[str, Any] | Non
 
 
 def build_tool_call_activity(
-    tool_name: str, iteration: int, tool_call_id: str, display_label: str | None = None
+    tool_name: str, iteration: int, tool_call_id: str, *, timestamp: datetime, display_label: str | None = None
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
@@ -154,6 +157,7 @@ def build_tool_call_activity(
         "toolName": tool_name,
         "displayLabel": display_label,
         "id": f"tc-{tool_call_id}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -163,6 +167,8 @@ def build_tool_result_activity(
     success: bool,
     iteration: int,
     tool_call_id: str,
+    *,
+    timestamp: datetime,
     display_label: str | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
@@ -176,6 +182,7 @@ def build_tool_result_activity(
         "displayLabel": display_label,
         "success": success,
         "id": f"tr-{tool_call_id}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -185,6 +192,7 @@ def build_narration_activity(narration: str, iteration: int, timestamp: datetime
         "text": narration,
         "iteration": iteration,
         "id": f"n-{iteration}-{timestamp.isoformat()}",
+        "timestamp": timestamp.isoformat(),
     }
 
 
@@ -623,6 +631,7 @@ def _build_narrator_prompt(prompt_ctx: _NarratorPromptContext) -> str:
 _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "update_workflow": "revising the workflow draft",
     "update_and_run_blocks": "revising and testing the workflow",
+    "edit_block_and_run": "revising and testing one workflow step",
     "run_blocks_and_collect_debug": "running a test of the workflow",
     "navigate_browser": "opening a page in the browser",
     "get_browser_screenshot": "taking a screenshot",
@@ -636,6 +645,7 @@ _USER_FACING_TOOL_LABELS: dict[str, str] = {
     "list_credentials": "checking saved credentials",
     "list_integrations": "checking connected integrations",
     "get_block_schema": "looking up workflow block options",
+    "get_workflow_knowledge": "looking up workflow guidance",
     "validate_block": "checking workflow block configuration",
     "get_run_results": "checking results of a prior run",
     "block_started": "starting a step in the workflow",
@@ -685,7 +695,7 @@ def extract_tool_details(tool_name: str, parsed: dict[str, Any], *, success: boo
     if tool_name == "update_workflow" or tool_name == "update_and_run_blocks":
         return _format_step_status(data.get("block_count"), data)
 
-    if tool_name == "run_blocks_and_collect_debug":
+    if tool_name in {"run_blocks_and_collect_debug", "edit_block_and_run"}:
         executed = data.get("executed_block_labels") or [
             b.get("label") for b in data.get("blocks", []) if isinstance(b, dict)
         ]
@@ -918,6 +928,7 @@ async def narrator_poll_tick(
     block_state_map: dict[str, str] | None = None,
     block_started_at_map: dict[str, str] | None = None,
     block_ended_at_map: dict[str, str] | None = None,
+    block_run_identity_map: dict[str, BlockRunIdentity] | None = None,
     workflow_run_id: str | None = None,
 ) -> NarratorPollTickResult:
     """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
@@ -975,6 +986,11 @@ async def narrator_poll_tick(
                 event_ts_iso = event_ts.isoformat()
                 if block_state_map is not None:
                     block_state_map[event.block_label] = event.status
+                if block_run_identity_map is not None:
+                    block_run_identity_map[event.block_label] = BlockRunIdentity(
+                        workflow_run_block_id=event.block_id,
+                        iteration=state.current_iteration,
+                    )
                 if event.status == "running":
                     state.running_block_label = event.block_label
                 elif event.status in _TERMINAL_BLOCK_STATUSES and state.running_block_label == event.block_label:

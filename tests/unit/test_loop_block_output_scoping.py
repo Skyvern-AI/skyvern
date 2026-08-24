@@ -5,12 +5,12 @@ Verifies that when the same block runs multiple times inside a for-loop,
 later iterations' extracted_information takes precedence over earlier ones.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import MissingBrowserStatePage
+from skyvern.exceptions import BrowserStateDiagnostic, MissingBrowserStatePage
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, Block, TaskBlock, TextPromptBlock
 from skyvern.forge.sdk.workflow.models.parameter import ContextParameter, OutputParameter, ParameterType
@@ -178,6 +178,37 @@ class TestFailedBlockDoesNotLeakPriorIterationValue:
         assert result.success is False
         assert ctx.values["extract_details_output"] is None
         assert ctx.get_value("extract_details") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_browser_state_failure_redacts_disconnect_diagnostic(self) -> None:
+        ctx = _make_ctx()
+        block = _make_task_block("extract_details")
+        detected_at = datetime.now(timezone.utc)
+        exception = MissingBrowserStatePage(
+            workflow_run_id="wr_test",
+            diagnostic=BrowserStateDiagnostic(
+                reason="browser_context_disconnected",
+                disconnect_observed_at=detected_at - timedelta(seconds=2),
+                browser_session_id="pbs_test",
+            ),
+            detected_at=detected_at,
+        )
+
+        with (
+            patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+            patch.object(BaseTaskBlock, "execute", new_callable=AsyncMock, side_effect=exception),
+            patch.object(Block, "_generate_workflow_run_block_description", new_callable=AsyncMock),
+        ):
+            _wire_app(mock_app, ctx)
+            result = await block.execute_safe(workflow_run_id="wr_test")
+
+        assert result.success is False
+        assert result.failure_reason is not None
+        assert result.failure_reason == exception.user_facing_message
+        assert "browser_context_disconnected" not in result.failure_reason
+        assert "browser_session_id=pbs_test" not in result.failure_reason
+        assert "observation_gap_seconds=2.000" not in result.failure_reason
+        assert "browser_context_disconnected" in str(exception)
 
     @pytest.mark.asyncio
     async def test_failed_loop_block_preserves_value_recorded_this_execution(self) -> None:
@@ -439,3 +470,22 @@ def test_traced_decorator_owns_execute_safe_not_the_invalidation_helper() -> Non
     # wrapper sets __wrapped__ via functools.wraps.
     assert Block.execute_safe.__wrapped__.__qualname__ == "Block.execute_safe"
     assert not hasattr(Block._invalidate_stale_output_on_failure, "__wrapped__")
+
+
+@pytest.mark.asyncio
+async def test_loop_iteration_reregistration_is_not_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-registering a block's output on the next loop iteration is the designed path (every
+    # iteration overwrites the last), so it must not compete with real warnings in the log stream.
+    from skyvern.forge.sdk.workflow import context_manager as context_manager_module
+
+    log = MagicMock()
+    monkeypatch.setattr(context_manager_module, "LOG", log)
+    ctx = _make_ctx()
+    param = _make_output_parameter("extract_details_output")
+
+    await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-1"})
+    await ctx.register_output_parameter_value_post_execution(param, {"quote": "iteration-2"})
+
+    assert ctx.values["extract_details_output"] == {"quote": "iteration-2"}
+    log.warning.assert_not_called()
+    assert log.debug.call_count >= 1

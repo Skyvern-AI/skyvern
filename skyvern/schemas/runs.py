@@ -42,6 +42,7 @@ from skyvern.schemas.docs.doc_strings import (
     MAX_STEPS_DOC_STRING,
     MODEL_CONFIG,
     PROXY_LOCATION_DOC_STRING,
+    RUN_FILE_IDS_DOC_STRING,
     TASK_ENGINE_DOC_STRING,
     TASK_PROMPT_DOC_STRING,
     TASK_URL_DOC_STRING,
@@ -69,6 +70,7 @@ from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
+MAX_RUN_ATTACHED_FILES = 50
 _BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
 BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
 
@@ -224,6 +226,12 @@ class TaskRunRequest(BaseModel):
         description="Whether to run the task with agent or code. Null means use the default.",
         examples=["agent", "code"],
     )
+    file_ids: list[str] | None = Field(
+        default=None,
+        max_length=MAX_RUN_ATTACHED_FILES,
+        description=RUN_FILE_IDS_DOC_STRING,
+        examples=[["file_123456789"]],
+    )
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -336,6 +344,10 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="ID of a Skyvern browser session to reuse, having it continue from the current screen state",
     )
+    reuse_browser_session: bool | None = Field(
+        default=None,
+        description="Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account.",
+    )
     browser_profile_id: str | None = Field(
         default=None,
         description="ID of a browser profile to reuse for this workflow run",
@@ -392,6 +404,12 @@ class WorkflowRunRequest(BaseModel):
     run_metadata: dict[str, str] | None = Field(
         default=None,
         description="String key/value metadata to attach to this workflow run for analytics tag filtering.",
+    )
+    file_ids: list[str] | None = Field(
+        default=None,
+        max_length=MAX_RUN_ATTACHED_FILES,
+        description=RUN_FILE_IDS_DOC_STRING,
+        examples=[["file_123456789"]],
     )
 
     @field_validator("run_with", mode="before")
@@ -528,6 +546,17 @@ class ScriptRunResponse(BaseModel):
 class UploadFileResponse(BaseModel):
     s3_uri: str = Field(description="S3 URI where the file was uploaded")
     presigned_url: str = Field(description="Presigned URL to access the uploaded file")
+    file_id: str | None = Field(
+        default=None,
+        description="Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file.",
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the file will be deleted, if a retention_days was supplied. "
+            "Null means the file has no expiry of its own and follows the organization's data retention policy."
+        ),
+    )
 
 
 class BaseRunResponse(BaseModel):

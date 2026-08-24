@@ -29,8 +29,10 @@ from skyvern.forge.sdk.copilot.tools import run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     _INTERNAL_REGISTERED_OUTPUT_IDENTITY_MISMATCH_KEY,
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+    _record_executed_block_labels,
     _record_run_blocks_result,
     _recorded_run_outcome,
+    _recorded_watchdog_block_receipts,
     _stash_recorded_run_outcome,
     _verify_and_record_run_blocks_result,
 )
@@ -55,11 +57,82 @@ def _run_result(blocks: list[dict[str, Any]], *, ok: bool = True) -> dict[str, A
         "ok": ok,
         "data": {
             "workflow_run_id": "wr_test",
+            "browser_session_id": "pbs_run",
             "overall_status": "completed" if ok else "failed",
             "current_url": "https://registry.example.com/search",
             "blocks": blocks,
         },
     }
+
+
+def test_recorded_execution_labels_accumulate_across_runs_and_ignore_unexecuted_statuses() -> None:
+    ctx = _ctx()
+
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "completed_step", "status": "completed"},
+                {"label": "failed_step", "status": "failed"},
+                {"label": "skipped_step", "status": "skipped"},
+                {"label": "queued_step", "status": "queued"},
+            ],
+            ok=False,
+        ),
+    )
+    ctx.block_state_map.clear()
+    _record_executed_block_labels(
+        ctx,
+        _run_result(
+            [
+                {"label": "timed_out_step", "status": "timed_out"},
+                {"label": "skipped_step", "status": "skipped"},
+            ],
+            ok=False,
+        ),
+    )
+
+    assert ctx.executed_block_labels == {"completed_step", "failed_step", "timed_out_step"}
+
+
+def test_recorded_execution_fingerprint_changes_with_the_workflow_shape() -> None:
+    ctx = _ctx()
+    ctx.workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: step
+      prompt: Before
+"""
+
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+    before = set(ctx.executed_block_fingerprints["step"])
+    ctx.workflow_yaml = ctx.workflow_yaml.replace("Before", "After")
+    _record_executed_block_labels(ctx, _run_result([{"label": "step", "status": "completed"}]))
+
+    assert before < ctx.executed_block_fingerprints["step"]
+
+
+@pytest.mark.asyncio
+async def test_watchdog_receipts_preserve_terminal_block_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    observer = SimpleNamespace(
+        get_workflow_run_blocks=lambda **_kwargs: None,
+    )
+
+    async def get_workflow_run_blocks(**_kwargs: Any) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(label="ran", status=SimpleNamespace(value="failed")),
+            SimpleNamespace(label="waiting", status=SimpleNamespace(value="queued")),
+        ]
+
+    observer.get_workflow_run_blocks = get_workflow_run_blocks
+    monkeypatch.setattr(run_execution.app.DATABASE, "observer", observer)
+
+    assert await _recorded_watchdog_block_receipts("wr_test", "org") == [
+        {"label": "ran", "status": "failed"},
+        {"label": "waiting", "status": "queued"},
+    ]
 
 
 def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
@@ -70,6 +143,8 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
         workflow_yaml="blocks: []",
         browser_session_id=None,
         stream=_FakeStream(),  # type: ignore[arg-type]
+        turn_id="turn_test",
+        workflow_copilot_chat_id="chat_test",
         user_message="search the public registry for a person and expand their result rows",
     )
     ctx.request_policy = RequestPolicy(
@@ -80,6 +155,7 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=workflow_blocks))  # type: ignore[assignment]
     ctx.last_workflow_yaml = "blocks: []"
     ctx.verified_prefix_labels = labels
+    ctx.composition_verified_labels = list(labels)
     ctx.last_run_blocks_block_ids = [f"wrb_{label}" for label in labels]
     ctx.last_run_blocks_block_labels = labels
     return ctx
@@ -216,7 +292,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
     frames = _run_outcome_frames(ctx.stream)  # type: ignore[arg-type]
     assert [frame.verdict for frame in frames] == ["not_demonstrated"]
     final = frames[-1]
-    assert final.reason_code == "terminal_challenge_blocker"
+    assert final.reason_code == "blocker_reported"
     assert final.workflow_run_id == "wr_test"
     assert final.workflow_run_block_ids == ["wrb_open_registry_search", "wrb_search_registry_person"]
     assert final.block_labels == ["open_registry_search", "search_registry_person"]
@@ -232,7 +308,7 @@ async def test_blocker_run_emits_not_demonstrated() -> None:
     assert ctx.last_run_outcome_block_labels == final.block_labels
 
 
-def test_challenge_failure_records_terminal_blocker_outcome() -> None:
+def test_challenge_failure_records_observation_without_halting_agent() -> None:
     result = _challenge_failure_result()
     ctx = _ctx(result["data"]["blocks"])
 
@@ -240,24 +316,19 @@ def test_challenge_failure_records_terminal_blocker_outcome() -> None:
 
     assert outcome == RecordedRunOutcome(
         verdict="not_demonstrated",
-        reason_code="terminal_challenge_blocker",
-        display_reason=run_outcome_display_reason(
-            "Run output reported a blocker: Human verification challenge blocked the search."
-        ),
+        reason_code="blocker_reported",
+        display_reason=run_outcome_display_reason("Human verification challenge blocked the search."),
         workflow_run_id="wr_challenge",
     )
     assert ctx.last_run_outcome == outcome
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_test_anti_bot is not None
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "tool_error_terminal_challenge_blocker"
-    assert ctx.blocker_signal.extra["run_outcome_reason_code"] == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.extra["evidence_source"] == "structured_blocker"
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
 
 
-def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
+def test_challenge_failure_sanitizes_model_observation_reason() -> None:
     result = _challenge_failure_result()
     raw_reason = (
         "Human verification challenge blocked https://user:secret@example.com/path?token=abc "
@@ -267,10 +338,11 @@ def test_challenge_failure_sanitizes_halt_metadata_reason() -> None:
     result["data"]["blocks"][0]["failure_reason"] = raw_reason
     ctx = _ctx(result["data"]["blocks"])
 
-    _record_run_blocks_result(ctx, result, completion_verification=None)
+    outcome = _record_run_blocks_result(ctx, result, completion_verification=None)
 
-    assert ctx.turn_halt is not None
-    evidence_reason = ctx.turn_halt.extra["evidence_reason"]
+    assert ctx.turn_halt is None
+    assert outcome is not None
+    evidence_reason = outcome.display_reason or ""
     assert re.search(r"https://example\.com", evidence_reason) is not None
     assert "[REDACTED_SECRET]" in evidence_reason
     assert "user:secret" not in evidence_reason
@@ -354,6 +426,12 @@ async def test_completed_run_emits_factual_ungraded_record() -> None:
     assert [frame.verdict for frame in frames] == ["not_evaluated"]
     assert frames[-1].reason_code is None
     assert frames[-1].role == "recorded"
+    assert frames[-1].browser_session_id == "pbs_run"
+    assert frames[-1].workflow_permanent_id == "wp"
+    assert frames[-1].turn_id == "turn_test"
+    assert frames[-1].workflow_copilot_chat_id == "chat_test"
+    assert frames[-1].continuity_source == "workflow_run"
+    assert frames[-1].terminal_disposition == "completed"
     assert ctx.last_full_workflow_test_ok is True
 
 

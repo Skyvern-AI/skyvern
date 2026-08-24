@@ -46,7 +46,7 @@ from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import MAGIC_LINK_ANCHOR_GRACE, poll_otp_value
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -69,6 +69,7 @@ from skyvern.webeye.actions.handler import (
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -663,21 +664,14 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        data=screenshot,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=[screenshot],
+                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             ctx = skyvern_context.current()
@@ -732,20 +726,13 @@ class ScriptSkyvernPage(SkyvernPage):
                     return
 
                 html_bytes = html.encode("utf-8")
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
-                        step=step,
-                        html_action=html_bytes,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.HTML_ACTION,
-                        data=html_bytes,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(
+                    step=step,
+                    html_action=html_bytes,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             LOG.warning("Failed to create HTML artifact after action", exc_info=True)
@@ -779,21 +766,14 @@ class ScriptSkyvernPage(SkyvernPage):
                 if not step:
                     return
 
-                if context.use_artifact_bundling:
-                    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
-                        step=step,
-                        screenshots=[screenshot],
-                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                        workflow_run_id=context.workflow_run_id,
-                        workflow_run_block_id=context.workflow_run_block_id,
-                        run_id=context.run_id,
-                    )
-                else:
-                    await app.ARTIFACT_MANAGER.create_artifact(
-                        step=step,
-                        artifact_type=ArtifactType.SCREENSHOT_FINAL,
-                        data=screenshot,
-                    )
+                app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+                    step=step,
+                    screenshots=[screenshot],
+                    artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                    workflow_run_id=context.workflow_run_id,
+                    workflow_run_block_id=context.workflow_run_block_id,
+                    run_id=context.run_id,
+                )
 
         except Exception:
             LOG.warning("Failed to create final screenshot", exc_info=True)
@@ -1075,6 +1055,57 @@ class ScriptSkyvernPage(SkyvernPage):
         if last_error is None:
             raise RuntimeError("Navigation failed but no error was captured")
         raise last_error
+
+    async def magic_link(
+        self,
+        totp_identifier: str | None = None,
+        totp_url: str | None = None,
+    ) -> None:
+        """Poll for an emailed sign-in link and open it on this page.
+
+        The polled URL is never passed through ``render_template``: it is single-use, opaque, and
+        may contain sequences the renderer would treat as markup.
+        """
+        context = skyvern_context.current()
+        organization_id = context.organization_id if context else None
+        if not organization_id:
+            raise RuntimeError("A sign-in link is unavailable: no organization is associated with this run.")
+
+        if totp_identifier:
+            totp_identifier = render_template(totp_identifier)
+        if totp_url:
+            totp_url = render_template(totp_url)
+        if not totp_identifier and not totp_url:
+            raise RuntimeError("A sign-in link is unavailable: this step has no email/SMS identifier to receive it on.")
+
+        polled = await poll_otp_value(
+            organization_id=organization_id,
+            task_id=context.task_id if context else None,
+            workflow_run_id=context.workflow_run_id if context else None,
+            totp_verification_url=totp_url,
+            totp_identifier=totp_identifier,
+            created_after=naive_utc_now() - MAGIC_LINK_ANCHOR_GRACE,
+            expected_otp_type=OTPType.MAGIC_LINK,
+        )
+        if polled is None:
+            raise RuntimeError("A sign-in link could not be retrieved for this step.")
+        # A configured webhook answers without honouring expected_otp_type, so a one-time code can
+        # come back here; navigating to it would report a confusing blocked-destination instead.
+        if polled.get_otp_type() is not OTPType.MAGIC_LINK:
+            raise RuntimeError(
+                f"Expected a sign-in link but this step received {polled.get_otp_type().value}. "
+                "Use the one-time code verb for this site instead of magic_link."
+            )
+
+        await navigate_with_retry(
+            navigate=lambda strategy: self.page.goto(
+                polled.value, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy
+            ),
+            url=polled.value,
+            retry_times=NAVIGATION_MAX_RETRY_TIME,
+            settle=default_navigation_settle,
+            log_url=redact_url_secrets(polled.value),
+        )
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
     async def solve_captcha(

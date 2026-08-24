@@ -27,6 +27,8 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    download_checksums_by_uri,
+    key_is_org_scoped,
     presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
@@ -552,7 +554,17 @@ class AzureStorage(BaseStorage):
         """Save files from local download directory to Azure."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        if not files:
+            return
+        already_saved = (
+            download_checksums_by_uri(
+                await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            )
+            if run_id is not None
+            else {}
+        )
         skipped_files: list[str] = []
+        unchanged_file_count = 0
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -563,6 +575,11 @@ class AzureStorage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+            # Cleanup runs repeatedly over a growing download dir; re-sending bytes that are
+            # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
+            if already_saved.get(uri) == checksum:
+                unchanged_file_count += 1
+                continue
             file_size = _safe_get_file_size(fpath)
             # Azure Blob metadata values must be ASCII; preserve the full
             # filename via the blob path / Artifact URI instead.
@@ -613,6 +630,14 @@ class AzureStorage(BaseStorage):
                         exc_info=True,
                     )
                     skipped_files.append(file)
+        if unchanged_file_count:
+            LOG.info(
+                "Skipped downloaded files already saved with the same checksum",
+                organization_id=organization_id,
+                run_id=run_id,
+                unchanged_file_count=unchanged_file_count,
+                total_file_count=len(files),
+            )
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)
 
@@ -734,6 +759,10 @@ class AzureStorage(BaseStorage):
             return None
         return sas_urls[0], uploaded_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -757,6 +786,7 @@ class AzureStorage(BaseStorage):
         remote_path: str,
         date: str | None = None,
         recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to Azure."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -827,6 +857,7 @@ class AzureStorage(BaseStorage):
                 filename=os.path.basename(remote_path),
                 checksum=download_checksum,
                 file_size=download_file_size,
+                run_id=None if is_partial else producer_run_id,
             )
         return uri
 
@@ -891,13 +922,13 @@ class AzureStorage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.blob_path.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.blob_path, allowed_prefixes):
                 return
 
         # Artifacts container: blob paths use v1/{env}/{org}/
         if parsed_uri.container == settings.AZURE_STORAGE_CONTAINER_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.blob_path.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.blob_path, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

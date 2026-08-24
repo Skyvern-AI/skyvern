@@ -56,22 +56,49 @@ class FrameLocator:
         return frame
 
 
-# Selector resolution mirrors the xpath-vs-css split of Playwright's engine for the shapes
-# Skyvern's DOM layer emits: `xpath=`-, `//`-, and `..`-prefixed steps are XPath, everything else
-# is CSS. (Playwright's other engines -- `text=`, `:visible`, `>>` chains -- still fail loudly as
-# invalid CSS here.) Three Playwright behaviors are deliberately copied: a leading `/` is
-# rewritten relative when the root is an element, so chained absolute paths stay inside their
-# scope instead of silently escaping to the document; XPath results keep only element nodes, so a
-# `..` hop onto an attribute/text/shadow-root node vanishes instead of impersonating an element;
-# and the CSS branch pierces open shadow roots -- including when the root itself is the host,
-# which dom.py's interactive-descendant guards rely on because they fail open on count 0. Shadow
-# matches are appended after their host root's own matches, a document-order approximation that is
-# exact for the unique-match selectors (`[unique_id=...]`, ids) the DOM layer emits.
+# Selector resolution mirrors Playwright's engine for the shapes Skyvern's producers emit.
+# Engine dispatch: `xpath=` / `css=` / `id=` / `text=` prefixes, bare XPath auto-detection
+# (`//`, `..`, and parenthesised `(//x)[n]`), and the css engine's `:has-text()` / `:visible`
+# tail pseudo-extensions. Anything else still fails loudly as invalid CSS. Copied Playwright
+# behaviors that matter for correctness: a leading `/` is rewritten relative when the root is an
+# element (chained absolute paths stay inside their scope); XPath results keep only element nodes
+# (a `..` hop onto an attribute/text/shadow-root node vanishes); CSS pierces open shadow roots,
+# including when the root itself is the host, with a root's light-DOM matches emitted before its
+# shadow matches; `text=` matches the smallest containing element, case-insensitively when
+# unquoted, exactly when quoted. `:has-text()`/`:visible` resolve
+# anywhere Playwright allows them -- comma lists, composed with native pseudos, intermediate
+# compounds (via a :scope recursion per candidate). Text containment across nested shadow
+# boundaries follows textContent, which does not cross shadow roots -- same as per-root matching.
 _QUERY_ALL_JS = """
 const __queryAll = (root, selector) => {
-  const explicit = selector.startsWith('xpath=');
-  if (explicit || selector.startsWith('//') || selector.startsWith('..')) {
-    let xp = explicit ? selector.slice('xpath='.length) : selector;
+  const normText = (s) => s.replace(/\\s+/g, ' ').trim();
+  const elementText = (el) => {
+    if (el.tagName === 'INPUT' && (el.type === 'button' || el.type === 'submit')) return el.value || '';
+    if (/^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName)) return '';
+    let text = '';
+    for (const child of el.childNodes) {
+      if (child.nodeType === 3) text += child.nodeValue;
+      else if (child.nodeType === 1) text += elementText(child);
+    }
+    return text;
+  };
+  const isVisible = (el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+  };
+  const queryCss = (from, css) => {
+    const out = [];
+    const visit = (r) => {
+      for (const el of r.querySelectorAll(css)) out.push(el);
+      if (r.nodeType === 1 && r.shadowRoot) visit(r.shadowRoot);
+      for (const el of r.querySelectorAll('*')) {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      }
+    };
+    visit(from);
+    return out;
+  };
+  const queryXPath = (xp) => {
     if (xp.startsWith('/') && root.nodeType !== 9) xp = '.' + xp;
     const doc = root.nodeType === 9 ? root : root.ownerDocument;
     const it = doc.evaluate(xp, root, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
@@ -81,19 +108,197 @@ const __queryAll = (root, selector) => {
       if (n && n.nodeType === 1) out.push(n);
     }
     return out;
-  }
-  const out = [];
-  const visit = (r) => {
-    for (const el of r.querySelectorAll(selector)) out.push(el);
-    if (r.nodeType === 1 && r.shadowRoot) visit(r.shadowRoot);
-    for (const el of r.querySelectorAll('*')) {
-      if (el.shadowRoot) visit(el.shadowRoot);
-    }
   };
-  visit(root);
-  return out;
+
+  let engine = 'css';
+  let body = selector;
+  const prefixed = /^([a-zA-Z][a-zA-Z0-9-]*)=([\\s\\S]*)$/.exec(selector);
+  if (prefixed && ['css', 'xpath', 'id', 'text'].includes(prefixed[1])) {
+    engine = prefixed[1];
+    body = prefixed[2];
+  } else if (selector.startsWith('//') || selector.startsWith('..') || /^\\(+\\s*\\.?\\//.test(selector)) {
+    engine = 'xpath';
+  }
+
+  if (engine === 'xpath') return queryXPath(body);
+  if (engine === 'id') return queryCss(root, '[id=' + JSON.stringify(body) + ']');
+  if (engine === 'text') {
+    let matchesText;
+    const re = /^\\/(.*)\\/([a-z]*)$/s.exec(body);
+    const quoted =
+      body.length > 1 &&
+      ((body.startsWith('"') && body.endsWith('"')) || (body.startsWith("'") && body.endsWith("'")));
+    if (re) {
+      matchesText = (t) => new RegExp(re[1], re[2]).test(t);
+    } else if (quoted) {
+      const exact = normText(body.slice(1, -1));
+      matchesText = (t) => t === exact;
+    } else {
+      const needle = normText(body).toLowerCase();
+      matchesText = (t) => t.toLowerCase().includes(needle);
+    }
+    // Playwright's text engine never matches inside head/script/style content.
+    const matches = queryCss(root, '*').filter(
+      (el) => !/^(HEAD|SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName) && matchesText(normText(elementText(el)))
+    );
+    return matches.filter(
+      (el) => !matches.some((m) => m !== el && (el.contains(m) || (el.shadowRoot && el.shadowRoot.contains(m))))
+    );
+  }
+
+  // CSS with the :visible / :has-text() extensions anywhere Playwright allows them: in
+  // comma-separated lists, composed with native pseudos, and on intermediate compounds.
+  // scanCss marks indices outside quotes, brackets, and parens so splitting and pseudo
+  // detection never trip on selector-internal punctuation.
+  const scanCss = (s) => {
+    const top = new Array(s.length).fill(false);
+    let quote = null;
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (quote) {
+        if (ch === '\\\\') { i++; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === '[' || ch === '(') { depth++; continue; }
+      if (ch === ']' || ch === ')') { depth--; continue; }
+      if (depth === 0) top[i] = true;
+    }
+    return top;
+  };
+  const findPseudo = (s) => {
+    const top = scanCss(s);
+    for (let i = 0; i < s.length; i++) {
+      if (!top[i] || s[i] !== ':') continue;
+      if (s.startsWith(':visible', i) && !/[a-zA-Z-]/.test(s[i + 8] || '')) {
+        return { start: i, end: i + 8, kind: 'visible' };
+      }
+      if (s.startsWith(':has-text(', i)) {
+        let j = i + 10;
+        let quote = null;
+        for (; j < s.length; j++) {
+          const ch = s[j];
+          if (quote) {
+            if (ch === '\\\\') { j++; continue; }
+            if (ch === quote) quote = null;
+            continue;
+          }
+          if (ch === '"' || ch === "'") { quote = ch; continue; }
+          if (ch === ')') break;
+        }
+        return { start: i, end: j + 1, kind: 'has-text', raw: s.slice(i + 10, j).trim() };
+      }
+    }
+    return null;
+  };
+  const hasTextPredicate = (raw) => {
+    if (raw.length > 1 && (raw[0] === '"' || raw[0] === "'") && raw[raw.length - 1] === raw[0]) {
+      raw = raw.slice(1, -1).replace(/\\\\(.)/g, '$1');
+    }
+    const needle = normText(raw).toLowerCase();
+    return (el) => normText(elementText(el)).toLowerCase().includes(needle);
+  };
+  const resolveComplex = (r, sel) => {
+    const found = findPseudo(sel);
+    if (!found) return queryCss(r, sel);
+    const top = scanCss(sel);
+    let cStart = 0;
+    for (let i = found.start - 1; i >= 0; i--) {
+      if (top[i] && ' >+~'.includes(sel[i])) { cStart = i + 1; break; }
+    }
+    let cEnd = sel.length;
+    for (let i = found.end; i < sel.length; i++) {
+      if (top[i] && ' >+~'.includes(sel[i])) { cEnd = i; break; }
+    }
+    let compound = sel.slice(cStart, cEnd);
+    const predicates = [];
+    for (;;) {
+      const p = findPseudo(compound);
+      if (!p) break;
+      predicates.push(p.kind === 'visible' ? isVisible : hasTextPredicate(p.raw));
+      compound = compound.slice(0, p.start) + compound.slice(p.end);
+    }
+    const base = sel.slice(0, cStart) + (compound.trim() === '' ? '*' : compound);
+    let candidates = queryCss(r, base);
+    for (const pred of predicates) candidates = candidates.filter(pred);
+    const rest = sel.slice(cEnd);
+    if (rest.trim() === '') return candidates;
+    if (rest.trimStart()[0] === '+' || rest.trimStart()[0] === '~') {
+      // Loud, not silently empty: :scope queries only reach descendants, so a sibling
+      // combinator after a custom pseudo would always resolve to nothing.
+      throw new Error('sibling combinator after :visible/:has-text() is not supported: ' + sel);
+    }
+    const seen = new Set();
+    const out = [];
+    for (const c of candidates) {
+      for (const el of resolveSelector(c, ':scope' + rest)) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+    }
+    return out;
+  };
+  const resolveSelector = (r, sel) => {
+    const top = scanCss(sel);
+    const parts = [];
+    let start = 0;
+    for (let i = 0; i < sel.length; i++) {
+      if (top[i] && sel[i] === ',') { parts.push(sel.slice(start, i)); start = i + 1; }
+    }
+    parts.push(sel.slice(start));
+    const trimmed = parts.map((p) => p.trim()).filter(Boolean);
+    if (trimmed.length <= 1) return resolveComplex(r, trimmed[0] || sel);
+    // A pseudo-free comma list is native CSS: one query keeps document order exactly.
+    if (trimmed.every((part) => !findPseudo(part))) return queryCss(r, sel);
+    const seen = new Set();
+    const out = [];
+    for (const part of trimmed) {
+      for (const el of resolveComplex(r, part)) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+    }
+    // Merged branches must come back in document order -- .first/.nth() and capped consumers
+    // depend on it. Stable sort leaves cross-shadow (disconnected) pairs in insertion order.
+    out.sort((a, b) => {
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+    return out;
+  };
+  return resolveSelector(root, body);
 };
 """
+
+
+def _split_selector_chain(selector: str) -> list[str]:
+    """Split a Playwright `a >> b` chain into steps at the top level, leaving quoted `>>` alone."""
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(selector):
+        ch = selector[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            current.append(ch)
+        elif selector.startswith(">>", i):
+            parts.append("".join(current).strip())
+            current = []
+            i += 2
+            continue
+        else:
+            current.append(ch)
+        i += 1
+    parts.append("".join(current).strip())
+    return [part for part in parts if part] or [selector.strip()]
+
 
 # Walks a locator chain inside the page: each step queries within the previous step's matches, and a
 # step carrying an index narrows to exactly that match (negative counts from the end) before the next
@@ -143,7 +348,8 @@ class Locator:
         # caller builds the chain synchronously.
         self._frame_source = frame
         if isinstance(selector, str):
-            self._steps: list[tuple[str, int | None]] = [(selector, index)]
+            chain = _split_selector_chain(selector)
+            self._steps: list[tuple[str, int | None]] = [(part, None) for part in chain[:-1]] + [(chain[-1], index)]
         else:
             self._steps = list(selector)
             if index is not None:
@@ -165,7 +371,8 @@ class Locator:
     # -- narrowing ----------------------------------------------------------
 
     def locator(self, selector: str) -> Locator:
-        return Locator(self._frame_source, [*self._steps, (selector, None)])
+        chained = [(part, None) for part in _split_selector_chain(selector)]
+        return Locator(self._frame_source, [*self._steps, *chained])
 
     def nth(self, index: int) -> Locator:
         return Locator(self._frame_source, self._steps, index=index)

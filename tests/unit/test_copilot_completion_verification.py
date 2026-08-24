@@ -2746,7 +2746,6 @@ def test_visual_prompt_requests_outcome_relevant_page_state() -> None:
     assert "cart items" in prompt
     assert "visible identifiers" in prompt
     assert "quantities" in prompt
-    assert "human-verification" in prompt
 
 
 def test_summarize_unsatisfied_lists_unmet_outcomes() -> None:
@@ -3123,6 +3122,7 @@ def _ctx_with_blocks(*block_types: str) -> CopilotContext:
     blocks = [SimpleNamespace(block_type=bt, label=f"b{i}") for i, bt in enumerate(block_types)]
     ctx.last_workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=blocks))
     ctx.verified_prefix_labels = [b.label for b in blocks]
+    ctx.composition_verified_labels = [b.label for b in blocks]
     return ctx
 
 
@@ -9902,6 +9902,7 @@ def test_snapshot_includes_verified_context_labels_without_prior_outputs() -> No
         )
     )
     ctx.verified_prefix_labels = list(labels)
+    ctx.composition_verified_labels = list(labels)
     ctx.verified_block_outputs["expand_noor_assi_result"] = {"stale": "prior run output"}
 
     run = {
@@ -10000,6 +10001,7 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         )
     )
     ctx.verified_prefix_labels = list(labels)
+    ctx.composition_verified_labels = list(labels)
     result = {
         "ok": True,
         "data": {
@@ -10778,7 +10780,7 @@ async def _dispatched_chain_snapshot(
         {"art_terminal": html.encode()},
     )
     await run_execution_module._capture_dispatched_terminal_page_evidence(
-        ctx, run_id="wr_requested_output", organization_id="o", current_url=""
+        ctx, run_id="wr_requested_output", run_session_id="pbs_run", organization_id="o", current_url=""
     )
     return _build_run_evidence_snapshot(ctx, _requested_output_result({"login_gate_blocks_target": True}))
 

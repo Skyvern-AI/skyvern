@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
+    CopilotToolBlockerSignal,
+)
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
     TurnHaltKind,
@@ -26,16 +28,39 @@ def _signal(reason_code: str, *, blocker_kind: str = "tool_error") -> CopilotToo
     )
 
 
-def test_terminal_challenge_stashes_local_halt() -> None:
+def test_failed_browser_session_recovery_stashes_session_loss_halt() -> None:
     ctx = SimpleNamespace(turn_halt=None)
 
     halt = stash_turn_halt_from_blocker_signal(
         ctx,
-        _signal(TERMINAL_CHALLENGE_BLOCKER_REASON_CODE),
+        _signal(BROWSER_SESSION_LOST_BLOCKER_REASON_CODE),
         source="test",
     )
 
     assert halt is not None
-    assert halt.kind is TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert halt.kind is TurnHaltKind.BROWSER_SESSION_LOST
     with pytest.raises(CopilotTurnHalt):
         raise_if_turn_halt(ctx)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "tool_error_terminal_challenge_blocker",
+        "tool_error_device_approval_challenge_blocker",
+        "tool_error_anything_a_later_change_invents",
+    ],
+)
+def test_only_a_lost_browser_session_ends_the_turn(reason_code: str) -> None:
+    """A challenge is a fact the model reads off page evidence and acts on, not a verdict the harness
+    imposes. Nothing but a lost browser session halts a turn now, so this holds for the codes the old
+    mechanism used and for any a later change introduces."""
+    ctx = SimpleNamespace(turn_halt=None)
+
+    assert stash_turn_halt_from_blocker_signal(ctx, _signal(reason_code), source="test") is None
+    assert ctx.turn_halt is None
+    raise_if_turn_halt(ctx)
+
+
+def test_the_only_remaining_halt_kind_is_a_lost_browser_session() -> None:
+    assert [kind.value for kind in TurnHaltKind] == ["browser_session_lost"]

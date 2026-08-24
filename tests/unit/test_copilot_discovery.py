@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+import structlog.testing
 
 from skyvern.forge.agent_functions import CopilotEntrypointCandidate, CopilotSiteOriginAssociation
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION,
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import (
@@ -25,6 +36,10 @@ from skyvern.forge.sdk.copilot.tools.discovery import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
+_VALID_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAE0lEQVR4nGP8z4APMOGVZRip0gBBLAETee26JgAAAABJRU5ErkJggg=="
+)
+
 
 class _Ctx:
     def __init__(self, server: object) -> None:
@@ -39,8 +54,116 @@ class _Ctx:
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
         self.browser_session_id = None
+        self.last_run_blocks_browser_session_id = None
         self.request_policy = None
         self.org_credentials_for_turn = None
+        self.supports_vision = True
+        self.pending_screenshots: list[Any] = []
+
+
+def _dense_structured_page() -> dict[str, Any]:
+    forms: list[dict[str, Any]] = []
+    for form_index in range(2):
+        fields: list[dict[str, Any]] = []
+        for select_index in range(5):
+            field_index = form_index * 5 + select_index
+            options = [
+                {
+                    "text": f"Option {field_index}-{option_index} " + "T" * 105,
+                    "value": f"value-{field_index}-{option_index}-" + "V" * 145,
+                    "selected": option_index == 0,
+                }
+                for option_index in range(30)
+            ]
+            fields.append(
+                {
+                    "name": f"select_{field_index}",
+                    "id": f"select_{field_index}",
+                    "label": f"Dense select {field_index}",
+                    "type": "select",
+                    "value": "",
+                    "class": [],
+                    "placeholder": "",
+                    "required": field_index % 2 == 0,
+                    "disabled": False,
+                    "readonly": False,
+                    "visible": True,
+                    "checked": False,
+                    "options": options,
+                    "option_count": len(options),
+                    "options_omitted": False,
+                    "selector": f"#select_{field_index}",
+                }
+            )
+        forms.append(
+            {
+                "id": f"dense_form_{form_index}",
+                "name": f"dense_form_{form_index}",
+                "action": f"/submit/{form_index}",
+                "method": "post",
+                "fields": fields,
+                "submit_controls": [
+                    {
+                        "text": f"Submit form {form_index}",
+                        "id": f"submit_{form_index}",
+                        "type": "submit",
+                        "selector": f"#submit_{form_index}",
+                    }
+                ],
+            }
+        )
+    return {
+        "page_title": "Dense Form",
+        "body_has_markup": True,
+        "forms": forms,
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Dense form controls",
+        "anti_bot_indicators": [],
+    }
+
+
+class _DensePageServer:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        assert tool_name == "skyvern_evaluate"
+        return {"ok": True, "data": {"result": _dense_structured_page()}}
+
+
+def _structured_search_page(*, with_obstruction: bool = False) -> dict[str, Any]:
+    return {
+        "page_title": "Results",
+        "body_has_markup": True,
+        "forms": [
+            {
+                "selector": "form",
+                "fields": [
+                    {
+                        "name": "firstName",
+                        "type": "text",
+                        "selector": 'input[name="firstName"]',
+                    }
+                ],
+                "submit_controls": [{"text": "Search", "type": "submit", "selector": "button"}],
+            }
+        ],
+        "visual_obstruction_candidates": [
+            {
+                "source": "computed_style",
+                "position": "fixed",
+                "coverage": "viewport",
+                "has_visible_controls": True,
+            }
+        ]
+        if with_obstruction
+        else [],
+    }
 
 
 class _FailingNavigateServer:
@@ -199,8 +322,8 @@ class _CurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -238,23 +361,16 @@ class _GenericBarrierServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page(with_obstruction=True)}}
+        if tool_name == "skyvern_screenshot":
+            expected_session = arguments.get("session_id")
+            assert arguments == {"inline": True, **({"session_id": expected_session} if expected_session else {})}
             return {
                 "ok": True,
-                "data": {
-                    "result": [
-                        {
-                            "source": "computed_style",
-                            "position": "fixed",
-                            "coverage": "viewport",
-                            "has_visible_controls": True,
-                        }
-                    ]
-                },
+                "browser_context": {"session_id": expected_session},
+                "data": {"screenshot_base64": _VALID_PNG_B64},
             }
-        if tool_name == "skyvern_screenshot":
-            assert arguments == {"inline": True}
-            return {"ok": True, "data": {"screenshot_base64": "aGVsbG8="}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -277,8 +393,8 @@ class _TargetThenCurrentPageServer:
                 },
             }
         if tool_name == "skyvern_evaluate":
-            assert "getComputedStyle" in arguments["expression"]
-            return {"ok": True, "data": {"result": []}}
+            assert arguments["expression"] == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION
+            return {"ok": True, "data": {"result": _structured_search_page()}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -522,7 +638,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -530,11 +646,65 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    # structured extractor probe (None on the [] mock) -> get_html fallback -> obstruction-candidates probe
-    assert server.calls == ["skyvern_evaluate", "skyvern_get_html", "skyvern_evaluate"]
+    assert server.calls == ["skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_dense_inspect_packet_sheds_only_select_options_before_recent_tool_pruning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _DensePageServer()
+    ctx = _Ctx(server)
+
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
+        return "https://www.example.com/dense-form", "Dense Form"
+
+    async def fake_bind_credential(_ctx: object, _url: str, result: dict[str, Any]) -> None:
+        result["resolved_login_credential_id"] = "cred_saved_login"
+        result["resolved_login_credential_name"] = "Saved login"
+        result["resolved_login_credential_totp_type"] = "authenticator"
+        result["resolved_login_page_url"] = "https://www.example.com/dense-form"
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(
+        tools_module.composition_capture,
+        "_bind_login_credential_for_observed_url",
+        fake_bind_credential,
+    )
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+    serialized = json.dumps(result)
+    with structlog.testing.capture_logs() as logs:
+        pruned = _prune_input_list([{"type": "function_call_output", "call_id": "dense-inspect", "output": serialized}])
+
+    assert result["ok"] is True
+    assert len(serialized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert pruned[0]["output"] == serialized
+    assert not any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
+    assert result["observation_step"] == 0
+    assert result["resolved_login_credential_id"] == "cred_saved_login"
+    assert result["resolved_login_credential_name"] == "Saved login"
+    assert result["resolved_login_credential_totp_type"] == "authenticator"
+    assert result["resolved_login_page_url"] == "https://www.example.com/dense-form"
+
+    forms = result["data"]["forms"]
+    assert [form["id"] for form in forms] == ["dense_form_0", "dense_form_1"]
+    assert [form["submit_controls"][0]["selector"] for form in forms] == ["#submit_0", "#submit_1"]
+    fields = [field for form in forms for field in form["fields"]]
+    assert [field["selector"] for field in fields] == [f"#select_{index}" for index in range(10)]
+    omitted = [field for field in fields if field["options_omitted"]]
+    retained = [field for field in fields if not field["options_omitted"]]
+    assert omitted
+    assert retained
+    assert all(field["option_count"] == 30 and field["options"] == [] for field in omitted)
+    assert all(field["option_count"] == 30 and len(field["options"]) == 30 for field in retained)
+
+    # Packet shaping is model-facing only; stored composition and trajectory evidence stay complete.
+    assert len(ctx.composition_page_evidence["forms"][0]["fields"][0]["options"]) == 30
+    assert len(ctx.flow_evidence[0]["evidence"]["forms"][0]["fields"][0]["options"]) == 30
 
 
 @pytest.mark.asyncio
@@ -549,7 +719,7 @@ async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_c
     ctx.last_test_ok = True  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -570,7 +740,7 @@ async def test_current_page_inspection_without_earned_interaction_is_not_click_r
     server = _CurrentPageServer()
     ctx = _Ctx(server)
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -593,7 +763,7 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
         url="https://www.example.com/results",
     )
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -638,7 +808,7 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
         evidence: dict[str, Any],
         screenshot_b64: str,
     ) -> tuple[dict[str, Any], None]:
-        assert screenshot_b64 == "aGVsbG8="
+        assert screenshot_b64 == _VALID_PNG_B64
         assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
         return {
             "summary": "A checkpoint panel blocks the search form.",
@@ -665,6 +835,8 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
     assert "skyvern_evaluate" in server.calls
     assert "skyvern_screenshot" in server.calls
     assert result["data"]["screenshot_used"] is True
+    json.dumps(result["data"])
+    assert all("CapturedFrame" not in repr(value) for value in result["data"].values())
     assert result["data"]["page_obstructions"] == [
         {
             "kind": "checkpoint_panel",
@@ -674,6 +846,74 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
             "underlying_page_blocked": True,
         }
     ]
+    assert len(ctx.pending_screenshots) == 1
+    frame = ctx.pending_screenshots[0]
+    assert frame.provenance.source_tool == "inspect_page_for_composition"
+    assert frame.provenance.captured_url is None
+    assert frame.provenance.dispatch_url == "https://www.example.com/search"
+    assert frame.provenance.observation_step == result["observation_step"]
+    assert frame.provenance.browser_session_id is None
+    assert frame.provenance.session_binding.value == "unavailable"
+    assert frame.provenance.workflow_run_id is None
+    assert frame.provenance.action_relation.value == "same_page_observation"
+    assert frame.capture_id == f"sha256:{hashlib.sha256(base64.b64decode(_VALID_PNG_B64)).hexdigest()}"
+
+
+@pytest.mark.asyncio
+async def test_post_run_visual_fallback_binds_the_observed_run_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _GenericBarrierServer()
+    ctx = _Ctx(server)
+    ctx.browser_session_id = "pbs_scout"
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
+
+    async def fake_page_info(_ctx: object, session_id: str | None = None) -> tuple[str, str]:
+        assert session_id == "pbs_run"
+        return "https://www.example.com/search", "Search"
+
+    async def fake_visual_summary(
+        _ctx: object,
+        *,
+        evidence: dict[str, Any],
+        screenshot_b64: str,
+    ) -> tuple[dict[str, Any], None]:
+        assert screenshot_b64 == _VALID_PNG_B64
+        return {
+            "summary": "A checkpoint panel blocks the search form.",
+            "challenge_detected": False,
+            "challenge_kind": "",
+            "challenge_location": "",
+            "submit_blocked": False,
+            "blocked_submit_controls": [],
+            "empty_page_visible": False,
+            "loading_state_visible": False,
+            "page_obstruction_detected": True,
+            "obstruction_kind": "checkpoint_panel",
+            "obstruction_location": "Centered over the form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
+            "omissions": [],
+        }, None
+
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["data"]["source_browser_session_id"] == "pbs_run"
+    assert result["data"]["workflow_run_id"] == "wr_123"
+    frame = ctx.pending_screenshots[0]
+    assert frame.provenance.captured_url is None
+    assert frame.provenance.dispatch_url == "https://www.example.com/search"
+    assert frame.provenance.observation_step == result["observation_step"]
+    assert frame.provenance.browser_session_id == "pbs_run"
+    assert frame.provenance.dispatch_browser_session_id == "pbs_run"
+    assert frame.provenance.producer_browser_session_id == "pbs_run"
+    assert frame.provenance.session_binding.value == "agree"
+    assert frame.provenance.workflow_run_id == "wr_123"
+    assert ctx.browser_session_id == "pbs_scout"
 
 
 @pytest.mark.asyncio
@@ -693,7 +933,7 @@ async def test_target_url_inspection_clears_pending_interaction_credit(
     assert target_result["reached_via"] == "navigate"
     assert ctx.pending_browser_interaction_observation is None
 
-    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object, _session_id_override: str | None = None) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
@@ -759,7 +999,14 @@ class _StrippedHtmlServer:
         if tool_name == "skyvern_get_html":
             return {"ok": True, "data": {"size_capped": True}}
         if tool_name == "skyvern_evaluate":
-            return {"ok": True, "data": {"result": self._stripped}}
+            expression = arguments["expression"]
+            if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                return {"ok": True, "data": {"result": {"page_title": "Loading", "forms": []}}}
+            if expression == COMPOSITION_STRIPPED_HTML_EXPRESSION:
+                assert arguments["verbosity"] == "full"
+                return {"ok": True, "data": {"result": self._stripped}}
+            assert expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION
+            return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -779,7 +1026,7 @@ async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap
 
 
 @pytest.mark.asyncio
-async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> None:
+async def test_capture_composition_evidence_warns_when_html_sliced_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _capture_composition_evidence
 
     # A real form near the top yields bounded schema (no hollow-recapture loop); the trailing
@@ -788,6 +1035,7 @@ async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> N
         "<body><form><input name='firstName'><button>Search</button></form>"
         + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
     )
+    monkeypatch.setattr(tools_module.composition_capture.asyncio, "sleep", AsyncMock())
     evidence, error = await _capture_composition_evidence(
         _Ctx(_StrippedHtmlServer(body)),
         inspected_url="https://www.example.com/search",

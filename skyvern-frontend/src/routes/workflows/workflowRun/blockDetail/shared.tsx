@@ -1,6 +1,5 @@
 import { ExclamationTriangleIcon } from "@radix-ui/react-icons";
 import { CopyButton } from "@/components/CopyButton";
-import { StatusBadge } from "@/components/StatusBadge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
@@ -10,6 +9,7 @@ import {
 } from "@/components/ui/tooltip";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
+import { StatusDot } from "../WorkflowRunTimelineBlockItem";
 import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
 import { cn } from "@/util/utils";
 import {
@@ -18,6 +18,8 @@ import {
 } from "../../types/workflowRunTypes";
 import type { WorkflowRunOverviewActiveElement } from "../WorkflowRunOverview";
 import { ThoughtCard } from "../ThoughtCard";
+import { CodeBlockFailureDetails } from "../CodeBlockFailureDetails";
+import { describeCodeBlockFailure } from "../codeBlockFailure";
 import { stringifyTimelineValue } from "./formatValue";
 
 function TruncatedWithTooltip({
@@ -46,15 +48,28 @@ function TruncatedWithTooltip({
   );
 }
 
+function isLoopBlock(block: WorkflowRunBlock): boolean {
+  return block.block_type === "for_loop" || block.block_type === "while_loop";
+}
+
 function BlockDetailHeader({
   block,
   iterationOverride,
+  runFinalized,
 }: {
   block: WorkflowRunBlock;
   iterationOverride?: number | null;
+  // A finalized run has no live block; without it a stale Running status would
+  // spin here forever, the same way it would in the timeline row.
+  runFinalized: boolean;
 }) {
   const duration =
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
+  const blockTypeTitle = workflowBlockTitle[block.block_type];
+  // The backend mirrors current_index/current_value onto every block inside a
+  // loop, but the timeline's "Iteration N · value" row one pane up already
+  // says it for those — only the loop block itself states its own iteration.
+  const isLoop = isLoopBlock(block);
   const hasIterationOverride =
     iterationOverride !== undefined && iterationOverride !== null;
   const hasResolvedIterationOverride =
@@ -68,7 +83,7 @@ function BlockDetailHeader({
       ? null
       : block.current_index;
   const iterationLabel =
-    iterationIndex !== null && iterationIndex !== undefined
+    isLoop && iterationIndex !== null && iterationIndex !== undefined
       ? `Iteration ${iterationIndex + 1}`
       : null;
   // When a loop block has an explicit iteration selection, source the chip
@@ -76,10 +91,14 @@ function BlockDetailHeader({
   // this, the chip displays block.current_value (the latest iteration)
   // alongside a label for an older iteration — a contradictory pairing.
   let valueToShow: unknown = null;
-  if (hasResolvedIterationOverride && Array.isArray(block.loop_values)) {
+  if (
+    isLoop &&
+    hasResolvedIterationOverride &&
+    Array.isArray(block.loop_values)
+  ) {
     const resolvedIterationIndex = iterationOverride as number;
     valueToShow = block.loop_values[resolvedIterationIndex];
-  } else if (!hasIterationOverride) {
+  } else if (isLoop && !hasIterationOverride) {
     valueToShow = block.current_value;
   }
   const currentValueFull =
@@ -97,23 +116,32 @@ function BlockDetailHeader({
         data-slot="block-detail-header-primary"
         className="flex items-center gap-2 px-3 py-2"
       >
+        {/* Same glyph, same slot as the timeline row one pane up: status leads,
+            duration trails. The row's glyph is unlabeled because the row text
+            follows it; here it is the only status the header carries. */}
+        <span
+          role="img"
+          aria-label={block.status?.replace("_", " ") ?? "not started"}
+          className="flex shrink-0"
+        >
+          <StatusDot status={block.status} isFinalized={runFinalized} />
+        </span>
         <WorkflowBlockIcon
           workflowBlockType={block.block_type}
           className="size-4 shrink-0 text-tertiary-foreground"
         />
-        <span className="min-w-0 truncate text-sm font-semibold text-foreground">
-          {workflowBlockTitle[block.block_type]}
-        </span>
-        <span className="ml-auto flex shrink-0 items-center gap-2">
-          {duration && (
-            <span className="text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
-              {duration}
-            </span>
-          )}
-          {block.status && (
-            <StatusBadge status={block.status} alwaysShowLabel />
-          )}
-        </span>
+        {/* The user's name for the block is its identity, the type its class —
+            the same order the timeline row reads in (label first, type as the
+            icon). Unlabeled blocks fall back to the type, as the row does. */}
+        <TruncatedWithTooltip
+          full={block.label ?? blockTypeTitle}
+          className="text-sm font-semibold text-foreground"
+        />
+        {duration && (
+          <span className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
+            {duration}
+          </span>
+        )}
       </div>
       <div
         data-slot="block-detail-header-meta"
@@ -121,10 +149,7 @@ function BlockDetailHeader({
       >
         {block.label && (
           <>
-            <TruncatedWithTooltip
-              full={block.label}
-              className="max-w-[12rem] text-muted-foreground"
-            />
+            <span className="shrink-0">{blockTypeTitle}</span>
             <span className="shrink-0 text-slate-600">·</span>
           </>
         )}
@@ -175,12 +200,10 @@ function BlockDetailHeaderSkeleton() {
   return (
     <div className="border-b border-border bg-slate-elevation1">
       <div className="flex items-center gap-2 px-3 py-2">
+        <Skeleton className="size-3.5 shrink-0 rounded-full" />
         <Skeleton className="size-4 shrink-0 rounded" />
         <Skeleton className="h-4 w-24 rounded" />
-        <span className="ml-auto flex shrink-0 items-center gap-2">
-          <Skeleton className="h-3 w-10 rounded" />
-          <Skeleton className="h-5 w-20 rounded" />
-        </span>
+        <Skeleton className="ml-auto h-3 w-10 shrink-0 rounded" />
       </div>
       <div className="flex items-center gap-1.5 px-3 pb-2">
         <Skeleton className="h-3 w-16 rounded" />
@@ -215,17 +238,33 @@ function Section({
 }
 
 function BlockDetailFailure({ block }: { block: WorkflowRunBlock }) {
-  if (!block.failure_reason) return null;
+  const codeFailure = describeCodeBlockFailure(block);
+  if (!block.failure_reason && !codeFailure) return null;
   return (
     <div className="space-y-1.5 duration-200 animate-in fade-in slide-in-from-top-2">
       <div className="text-[11px] font-medium uppercase tracking-wide text-destructive">
         Failure
       </div>
-      <div className="flex items-start gap-1.5 rounded border border-destructive/40 bg-slate-elevation1 px-2.5 py-2 text-xs leading-relaxed text-foreground">
-        <ExclamationTriangleIcon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
-        <span className="min-w-0 flex-1 break-words">
-          {block.failure_reason}
-        </span>
+      <div className="flex items-start gap-2.5 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs leading-relaxed text-foreground dark:bg-destructive/10">
+        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        {codeFailure ? (
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold leading-5">
+              {codeFailure.title}
+            </div>
+            <p className="mt-1 break-words text-muted-foreground">
+              {codeFailure.guidance}
+            </p>
+            <CodeBlockFailureDetails
+              failure={codeFailure}
+              reason={block.failure_reason}
+            />
+          </div>
+        ) : (
+          <span className="min-w-0 flex-1 break-words">
+            {block.failure_reason}
+          </span>
+        )}
       </div>
     </div>
   );

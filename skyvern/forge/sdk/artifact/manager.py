@@ -73,6 +73,7 @@ _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
     ArtifactType.SCREENSHOT_ACTION: "screenshot_action",
     ArtifactType.SCREENSHOT_FINAL: "screenshot_final",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "screenshot_pre_submit",
 }
 
 _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
@@ -80,6 +81,7 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
         ArtifactType.HTML,
         ArtifactType.HTML_SCRAPE,
         ArtifactType.HTML_ACTION,
+        ArtifactType.HTML_PRE_SUBMIT,
         ArtifactType.VISIBLE_ELEMENTS_TREE,
         ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
         ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
@@ -99,13 +101,20 @@ _REDACTABLE_TEXT_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
 def _maybe_redact_artifact_data(artifact_type: ArtifactType, data: bytes, workflow_run_id: str | None = None) -> bytes:
     if artifact_type not in _REDACTABLE_TEXT_ARTIFACT_TYPES and artifact_type != ArtifactType.HAR:
         return data
-    if not settings.ENABLE_SECRET_ARTIFACT_REDACTION:
-        return data
 
     try:
         context = skyvern_context.current()
         resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
-        secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
+        if not app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled(resolved_workflow_run_id):
+            # Runtime-resolved secrets (e.g. verification codes) still redact from browser
+            # diagnostics under the global switch alone, matching the workflow-finalization floor.
+            if artifact_type not in (ArtifactType.HAR, ArtifactType.BROWSER_CONSOLE_LOG):
+                return data
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts()
+            if not secret_values:
+                return data
+        else:
+            secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(resolved_workflow_run_id)
     except Exception:
         return data
     if artifact_type == ArtifactType.HAR:
@@ -508,21 +517,13 @@ class ArtifactManager:
         filename: str,
         checksum: str | None = None,
         file_size: int | None = None,
+        run_id: str | None = None,
     ) -> str:
-        """Register a session-scoped downloaded file as an Artifact row.
-
-        Used by the browser_controller's watcher write site
-        (``S3Storage.sync_browser_session_file(artifact_type="downloads")``).
-        Idempotent on ``(organization_id, browser_session_id, uri)`` — the
-        watcher fires repeatedly as a downloaded file grows, so we look up
-        the existing row before inserting.
-
-        ``run_id`` is intentionally NOT set here. The watcher runs in a
-        separate process from the agent and does not know which run is
-        currently using the session. Run finalization runs the
-        ``claim_session_download_artifacts_for_run`` UPDATE to tag rows
-        whose ``created_at`` falls inside the run's window.
-        """
+        """Register a session-scoped downloaded file as an Artifact row, idempotent on
+        ``(organization_id, browser_session_id, uri)`` because the watcher fires repeatedly as the
+        file grows. ``run_id`` is the run occupying the session when the download was observed and
+        must be resolved at that observation, not here, where a late write would name whichever run
+        holds the session now."""
         return await self._create_browser_session_artifact(
             organization_id=organization_id,
             browser_session_id=browser_session_id,
@@ -531,6 +532,7 @@ class ArtifactManager:
             artifact_type=ArtifactType.DOWNLOAD,
             checksum=checksum,
             file_size=file_size,
+            run_id=run_id,
         )
 
     async def create_browser_session_recording_artifact(
@@ -676,6 +678,7 @@ class ArtifactManager:
         artifact_type: ArtifactType,
         checksum: str | None = None,
         file_size: int | None = None,
+        run_id: str | None = None,
     ) -> str:
         """Insert a browser-session artifact, deduplicating every type except action logs."""
         if artifact_type != ArtifactType.BROWSER_SESSION_ACTION_LOG:
@@ -686,6 +689,12 @@ class ArtifactManager:
                 artifact_type=artifact_type,
             )
             if existing is not None:
+                if run_id is not None and existing.run_id is None:
+                    await app.DATABASE.artifacts.bind_session_download_artifact_producer(
+                        artifact_id=existing.artifact_id,
+                        organization_id=organization_id,
+                        run_id=run_id,
+                    )
                 return existing.artifact_id
 
         artifact_id = generate_artifact_id()
@@ -695,6 +704,7 @@ class ArtifactManager:
             uri=uri,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
+            run_id=run_id,
             checksum=checksum,
             file_size=file_size,
         )
@@ -1272,6 +1282,10 @@ class ArtifactManager:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
+            return None
+        if artifact.artifact_type == ArtifactType.UNKNOWN:
+            # This image cannot tell whether the row's type is redactable; fail closed, write nothing.
+            LOG.warning("Refusing to update data of an artifact of unknown type", artifact_id=artifact_id)
             return None
         data = _maybe_redact_artifact_data(
             ArtifactType(artifact.artifact_type),
@@ -1923,6 +1937,39 @@ class ArtifactManager:
             return
 
         context = skyvern_context.current()
+        resolved_workflow_run_id = workflow_run_id or (context.workflow_run_id if context else None)
+        resolved_workflow_run_block_id = workflow_run_block_id or (
+            context.parent_workflow_run_block_id if context else None
+        )
+        resolved_run_id = run_id or (context.run_id if context else None)
+        if not _bundling_enabled():
+            for _, (artifact_type, data) in entries.items():
+                # Callers redact before archiving, but route through the gate anyway (idempotent) so
+                # no archive path can persist an unredacted browser diagnostic.
+                data = _maybe_redact_artifact_data(artifact_type, data, resolved_workflow_run_id)
+                artifact_id = generate_artifact_id()
+                uri = app.STORAGE.build_uri(
+                    organization_id=step.organization_id,
+                    artifact_id=artifact_id,
+                    step=step,
+                    artifact_type=artifact_type,
+                )
+                await self._create_artifact(
+                    aio_task_primary_key=step.task_id,
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    uri=uri,
+                    step_id=step.step_id,
+                    task_id=step.task_id,
+                    workflow_run_id=resolved_workflow_run_id,
+                    workflow_run_block_id=resolved_workflow_run_block_id,
+                    run_id=resolved_run_id,
+                    organization_id=step.organization_id,
+                    file_size=len(data),
+                    data=data,
+                )
+            return
+
         archive_artifact_id = generate_artifact_id()
         archive_uri = app.STORAGE.build_uri(
             organization_id=step.organization_id,
@@ -1939,9 +1986,9 @@ class ArtifactManager:
             organization_id=step.organization_id,
             step_id=step.step_id,
             task_id=step.task_id,
-            workflow_run_id=workflow_run_id or (context.workflow_run_id if context else None),
-            workflow_run_block_id=workflow_run_block_id or (context.parent_workflow_run_block_id if context else None),
-            run_id=run_id or (context.run_id if context else None),
+            workflow_run_id=resolved_workflow_run_id,
+            workflow_run_block_id=resolved_workflow_run_block_id,
+            run_id=resolved_run_id,
             created_at=now,
             modified_at=now,
         )

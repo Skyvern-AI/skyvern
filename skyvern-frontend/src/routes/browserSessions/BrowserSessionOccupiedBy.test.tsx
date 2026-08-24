@@ -14,9 +14,7 @@ afterEach(cleanup);
 
 function renderBadge(runnableId: string) {
   render(
-    <MemoryRouter
-      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
-    >
+    <MemoryRouter>
       <BrowserSessionOccupiedBy runnableId={runnableId} />
     </MemoryRouter>,
   );

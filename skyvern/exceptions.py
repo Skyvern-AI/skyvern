@@ -1,5 +1,8 @@
+import difflib
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.util import find_spec
 from typing import NoReturn
@@ -47,6 +50,7 @@ def _missing_extra_dependency(module_name: str, sentinels: tuple[str, ...]) -> b
 class SkyvernException(Exception):
     def __init__(self, message: str | None = None):
         self.message = message
+        self._user_facing_message: str | None = None
         super().__init__(message)
 
     @property
@@ -59,6 +63,10 @@ class SkyvernException(Exception):
     @property
     def message_is_user_facing(self) -> bool:
         return False
+
+    @property
+    def user_facing_message(self) -> str:
+        return self._user_facing_message or self.message or str(self)
 
 
 class SkyvernPageAnalysisTimeout(SkyvernException):
@@ -172,7 +180,7 @@ def redact_cdp_endpoint_urls(message: str) -> str:
 
 def get_user_facing_exception_message(exception: Exception) -> str:
     if isinstance(exception, SkyvernException):
-        return exception.message or str(exception)
+        return exception.user_facing_message
 
     raw = str(exception)
     if _is_browser_connection_error(raw):
@@ -219,6 +227,19 @@ class RateLimitExceeded(SkyvernHTTPException):
         super().__init__(message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
 
 
+class ConcurrencyLimitExceeded(SkyvernHTTPException):
+    def __init__(self, organization_id: str, operation: str, limit: int):
+        self.organization_id = organization_id
+        self.operation = operation
+        self.limit = limit
+        message = (
+            f"Concurrency limit exceeded for organization {organization_id}. "
+            f"At most {limit} {operation} requests may be in flight at once. "
+            "Retry once an in-flight request finishes."
+        )
+        super().__init__(message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
+
+
 class InvalidOpenAIResponseFormat(SkyvernException):
     def __init__(self, message: str | None = None):
         super().__init__(f"Invalid response format: {message}")
@@ -232,6 +253,16 @@ class PhoneNumberInputMismatch(SkyvernException):
             "Phone input read-back mismatch: "
             f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
         )
+
+
+class PhoneNumberInputBrowserValidityMismatch(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input failed the browser validity check.")
+
+
+class PhoneNumberInputBrowserInteractionFailed(SkyvernException):
+    def __init__(self) -> None:
+        super().__init__("Phone input browser interaction failed.")
 
 
 class CardNumberInputMismatch(SkyvernException):
@@ -395,18 +426,99 @@ class ImaginaryFileUrl(SkyvernException):
         super().__init__(f"File url {file_url} is imaginary.")
 
 
+@dataclass(frozen=True)
+class BrowserStateDiagnostic:
+    reason: str
+    disconnect_observed_at: datetime
+    browser_session_id: str | None = None
+    event: str = "browser_context_disconnected"
+    observation_source: str = "liveness_probe"
+
+    def describe(self, detected_at: datetime) -> str:
+        """Describe the disconnect observation and delay before missing-state detection.
+
+        Playwright gives us an event timestamp when its disconnect event fires. If no event was
+        delivered, the first failed liveness probe is the fallback. The gap is therefore
+        observation-to-detection latency, not the browser's actual outage duration.
+        """
+        observation_gap_seconds = max(0.0, (detected_at - self.disconnect_observed_at).total_seconds())
+        session_str = f" browser_session_id={self.browser_session_id}" if self.browser_session_id else ""
+        return (
+            f" Browser event={self.event} reason={self.reason}{session_str}"
+            f" disconnect_observed_at={self.disconnect_observed_at.astimezone(UTC).isoformat()}"
+            f" detected_at={detected_at.astimezone(UTC).isoformat()}"
+            f" observation_gap_seconds={observation_gap_seconds:.3f} observation_source={self.observation_source}."
+        )
+
+
+def _browser_state_diagnostic_suffix(
+    diagnostic: BrowserStateDiagnostic | None,
+    detected_at: datetime | None,
+    failure_reason: str | None,
+) -> str:
+    if diagnostic is not None and detected_at is not None:
+        suffix = diagnostic.describe(detected_at)
+    elif detected_at is not None:
+        suffix = (
+            f" No browser-context disconnect event was observed; detected_at={detected_at.astimezone(UTC).isoformat()}."
+        )
+    else:
+        suffix = ""
+    if failure_reason:
+        suffix += f" failure_reason={failure_reason}."
+    return suffix
+
+
 class MissingBrowserState(SkyvernException):
-    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        *,
+        diagnostic: BrowserStateDiagnostic | None = None,
+        detected_at: datetime | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
         task_str = f"task_id={task_id}" if task_id else ""
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
-        super().__init__(f"Browser state for {task_str} {workflow_run_str} is missing.")
+        self.diagnostic = diagnostic
+        self.detected_at = detected_at
+        user_facing_message = f"Browser state for {task_str} {workflow_run_str} is missing."
+        super().__init__(
+            f"{user_facing_message}{_browser_state_diagnostic_suffix(diagnostic, detected_at, failure_reason)}"
+        )
+        self._user_facing_message = user_facing_message
 
 
 class MissingBrowserStatePage(SkyvernException):
-    def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None):
+    def __init__(
+        self,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        *,
+        diagnostic: BrowserStateDiagnostic | None = None,
+        detected_at: datetime | None = None,
+        failure_reason: str | None = None,
+    ):
         task_str = f"task_id={task_id}" if task_id else ""
         workflow_run_str = f"workflow_run_id={workflow_run_id}" if workflow_run_id else ""
-        super().__init__(f"Browser state page is missing. {task_str} {workflow_run_str}")
+        self.diagnostic = diagnostic
+        self.detected_at = detected_at
+        user_facing_message = f"Browser state page is missing. {task_str} {workflow_run_str}"
+        super().__init__(
+            f"{user_facing_message}{_browser_state_diagnostic_suffix(diagnostic, detected_at, failure_reason)}"
+        )
+        self._user_facing_message = user_facing_message
+
+
+class BrowserSessionDegraded(SkyvernException):
+    def __init__(self, consecutive_timeouts: int, stuck_operations: str) -> None:
+        self.consecutive_timeouts = consecutive_timeouts
+        self.stuck_operations = stuck_operations
+        super().__init__(
+            f"The browser stopped responding to Skyvern after {consecutive_timeouts} consecutive "
+            f"unanswered operations ({stuck_operations})"
+        )
 
 
 class BrowserProfileNotApplied(SkyvernException):
@@ -503,6 +615,31 @@ class MissingValueForParameter(SkyvernHTTPException):
         )
 
 
+class UnrecognizedWorkflowParameters(SkyvernHTTPException):
+    def __init__(
+        self,
+        unknown_keys: list[str],
+        expected_keys: list[str],
+        unresolved_credential_keys: list[str],
+    ) -> None:
+        unknown = ", ".join(unknown_keys)
+        unresolved = ", ".join(unresolved_credential_keys)
+        expected = ", ".join(expected_keys) or "no parameters"
+        message = (
+            f"The run request sent parameter(s) this workflow does not declare: {unknown}. "
+            f"No credential resolved for {unresolved}, so the run would have started without one. "
+            f"This workflow accepts: {expected}."
+        )
+        hints = [
+            f"'{unknown_key}' -> '{matches[0]}'"
+            for unknown_key in unknown_keys
+            if (matches := difflib.get_close_matches(unknown_key, expected_keys, n=1))
+        ]
+        if hints:
+            message += f" Did you mean {'; '.join(hints)}?"
+        super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
+
+
 class WorkflowRunParameterPersistenceError(SkyvernException):
     def __init__(self, parameter_key: str, workflow_id: str, workflow_run_id: str, reason: str) -> None:
         super().__init__(
@@ -580,16 +717,6 @@ class BackgroundSequentialCredentialUnsupported(SkyvernException):
             f"Workflow run {workflow_run_id} resolves to a sequential credential, but the background executor "
             "has no org-wide serialization gate. The run fails closed before execution rather than using the "
             "credential outside its lane."
-        )
-
-
-class ScheduledSequentialCredentialUnsupported(SkyvernException):
-    def __init__(self, workflow_run_id: str) -> None:
-        super().__init__(
-            f"Scheduled run {workflow_run_id} resolves to a sequential credential, but scheduled credential "
-            "serialization is not yet supported. The run fails closed rather than publishing an ungated row that "
-            "would race on the credential. Every subsequent fire of this schedule fails the same way until scheduled "
-            "parity ships or run_sequentially is cleared on the credential."
         )
 
 
@@ -806,6 +933,14 @@ class EmptyScrapePage(SkyvernException):
         super().__init__("Failed to scrape the page, returned an NONE result")
 
 
+class ElementTreeBuildFailed(SkyvernException):
+    def __init__(self, *, returned: str) -> None:
+        # Says what reached Python, not what the page produced: on the main-world lane a
+        # RemoteObject with no `value` key also arrives as None from a build that succeeded.
+        self.returned = returned
+        super().__init__(f"Element tree build returned {returned}, not [elements, element_tree]")
+
+
 class ScrapingFailed(SkyvernException):
     def __init__(self, *, reason: str | None = None) -> None:
         self.reason = reason
@@ -844,6 +979,16 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
     def __init__(self, max_size: int) -> None:
         self.max_size = max_size
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+
+
+class GoogleDriveFileNotAccessible(SkyvernException):
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(
+            f"Google Drive returned a sign-in or permission page instead of the file content for {url}. "
+            "The file is not publicly accessible. Share it so anyone with the link can view it, "
+            "or use a direct-download link."
+        )
 
 
 class UploadFileMaxSizeExceeded(SkyvernException):
@@ -1056,6 +1201,13 @@ class InvalidElementForTextInput(SkyvernException):
         if is_date_related:
             message += _INVALID_ELEMENT_FOR_TEXT_INPUT_DATE_HINT
         super().__init__(message)
+
+
+class FailedToClearInputField(SkyvernException):
+    def __init__(self, element_id: str, tag_name: str):
+        super().__init__(
+            f"Failed to clear the existing value of the {tag_name} element with id={element_id} before typing."
+        )
 
 
 class ElementIsNotLabel(SkyvernException):
@@ -1365,6 +1517,10 @@ class TaskV2NotFound(SkyvernHTTPException):
 
 
 class NoTOTPVerificationCodeFound(SkyvernHTTPException):
+    # Status-code summary of what totp_verification_url returned, set only when the
+    # endpoint answered every poll without ever honoring the documented response shape.
+    webhook_diagnostics: str | None = None
+
     def __init__(
         self,
         task_id: str | None = None,
@@ -1372,7 +1528,9 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
         workflow_id: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
+        webhook_diagnostics: str | None = None,
     ) -> None:
+        self.webhook_diagnostics = webhook_diagnostics
         msg = "No TOTP verification code found."
         if task_id:
             msg += f" task_id={task_id}"
@@ -1384,6 +1542,8 @@ class NoTOTPVerificationCodeFound(SkyvernHTTPException):
             msg += f" totp_verification_url={totp_verification_url}"
         if totp_identifier:
             msg += f" totp_identifier={totp_identifier}"
+        if webhook_diagnostics:
+            msg += f" {webhook_diagnostics}"
         super().__init__(msg)
 
 
@@ -1466,9 +1626,9 @@ class MissingRoutedVncAddressError(SkyvernException):
 
 
 class BrowserSessionClosed(SkyvernHTTPException):
-    def __init__(self, browser_session_id: str) -> None:
+    def __init__(self, browser_session_id: str, *, reason: str | None = None) -> None:
         super().__init__(
-            f"Browser session {browser_session_id} is closed.",
+            f"Browser session {browser_session_id} {reason or 'is closed'}. Create a new browser session and retry.",
             status_code=HTTPStatus.GONE,
         )
 

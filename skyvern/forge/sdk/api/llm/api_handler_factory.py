@@ -15,7 +15,10 @@ from anthropic import NOT_GIVEN
 from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.router import AllowedFailsPolicy
-from litellm.utils import CustomStreamWrapper, ModelResponse
+
+# supports_tool_choice is not re-exported on the litellm module, whose __getattr__ raises for
+# un-exported names — reading it as litellm.supports_tool_choice would AttributeError.
+from litellm.utils import CustomStreamWrapper, ModelResponse, supports_tool_choice
 from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
@@ -195,6 +198,21 @@ _OPENAI_GPT5_6_MODEL_PREFIX = "gpt-5.6-"
 _OPENAI_GPT5_6_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT5_6_FLEX_LONG_CONTEXT_MULTIPLIER = 0.5
 
+# Kept in `_hidden_params` rather than on the response: `_hidden_params` is excluded from the
+# model dump persisted as the LLM_RESPONSE artifact, so a tier we derived can never be read back
+# as one the provider sent.
+_SERVED_SERVICE_TIER_KEY = "skyvern_served_service_tier"
+_SERVED_SERVICE_TIER_SOURCE_KEY = "skyvern_service_tier_source"
+# litellm selects discounted price keys for these two values only; any other string falls through
+# to standard pricing. Repairing a tier it cannot price would buy nothing and would put Vertex's
+# SERVICE_TIER_FLEX — corrected separately via provider_specific_fields.traffic_type — on this path.
+_PRICEABLE_SERVICE_TIERS = frozenset({"flex", "priority"})
+# Provenance of the tier we report and price against. Absent means no tier was at stake, which
+# is most traffic; keeping these scarce is what lets "unresolved" read as an alarm.
+_SERVICE_TIER_REPORTED = "reported"
+_SERVICE_TIER_INFERRED = "inferred"
+_SERVICE_TIER_UNRESOLVED = "unresolved"
+
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
 # router / non-router / LLMCaller paths with a single filter.
@@ -225,98 +243,6 @@ GEMINI_SAFETY_SETTINGS: list[dict[str, str]] = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
-
-CONTENT_FILTER_RESCUE_LLM_NAME_FLAG = "CONTENT_FILTER_RESCUE_LLM_NAME"
-# PostHog encodes a disabled multivariate flag as `False`; JS-style booleans
-# can also surface as strings.
-_CONTENT_FILTER_RESCUE_CONTROL_VARIANTS = {None, False, "False", "false", "", "control"}
-_content_filter_rescue_handler_cache: dict[str, LLMAPIHandler] = {}
-_content_filter_rescue_logged: set[str] = set()
-
-
-def _content_filter_rescue_log_once(dedup_key: str) -> bool:
-    """True only the first time `dedup_key` is seen; dedups per-misconfiguration warnings."""
-    if dedup_key in _content_filter_rescue_logged:
-        return False
-    _content_filter_rescue_logged.add(dedup_key)
-    return True
-
-
-async def _get_content_filter_rescue_handler(
-    current_llm_key: str, organization_id: str | None
-) -> tuple[str, LLMAPIHandler] | None:
-    """Resolve the CONTENT_FILTER_RESCUE_LLM_NAME multivariate flag to (llm_key, handler).
-
-    Returns None when the flag is unset/control or resolution fails, so the caller
-    keeps the default content-filter fallback behavior (SKY-11766).
-    """
-    ctx = skyvern_context.current()
-    distinct_id = ((ctx.workflow_run_id or ctx.task_id) if ctx else None) or organization_id
-    if not distinct_id:
-        return None
-    try:
-        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-            CONTENT_FILTER_RESCUE_LLM_NAME_FLAG,
-            distinct_id,
-            properties={
-                "organization_id": organization_id or (ctx.organization_id if ctx else None),
-                "workflow_permanent_id": ctx.workflow_permanent_id if ctx else None,
-            },
-        )
-    except Exception:
-        LOG.warning(
-            "Failed to read CONTENT_FILTER_RESCUE_LLM_NAME; keeping default content-filter fallback",
-            llm_key=current_llm_key,
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return None
-
-    if variant in _CONTENT_FILTER_RESCUE_CONTROL_VARIANTS or not isinstance(variant, str):
-        return None
-    # The rescue call resolves this flag again; skipping the blocked key here is
-    # what terminates that recursion.
-    if variant == current_llm_key:
-        if _content_filter_rescue_log_once(f"self:{variant}"):
-            LOG.warning(
-                "CONTENT_FILTER_RESCUE_LLM_NAME matches the blocked llm_key; ignoring",
-                variant=variant,
-            )
-        return None
-
-    # Custom LLMs are org-owned BYO endpoints: this path never validates ownership and
-    # the handler cache outlives registry updates, so they are not valid rescue targets.
-    if is_custom_llm_key(variant):
-        if _content_filter_rescue_log_once(f"custom:{variant}"):
-            LOG.warning(
-                "CONTENT_FILTER_RESCUE_LLM_NAME variant points at a custom LLM; ignoring",
-                variant=variant,
-            )
-        return None
-
-    handler = _content_filter_rescue_handler_cache.get(variant)
-    if handler is None:
-        # get_config synthesizes a config for unknown keys (a typo'd variant would reach
-        # litellm as a model name), so require an explicitly registered llm_key.
-        if not LLMConfigRegistry.is_registered(variant):
-            if _content_filter_rescue_log_once(f"unregistered:{variant}"):
-                LOG.warning(
-                    "CONTENT_FILTER_RESCUE_LLM_NAME variant is not a registered llm_key; ignoring",
-                    variant=variant,
-                )
-            return None
-        try:
-            handler = LLMAPIHandlerFactory.get_llm_api_handler(variant)
-        except Exception:
-            if _content_filter_rescue_log_once(f"init_failed:{variant}"):
-                LOG.warning(
-                    "Failed to initialize handler for CONTENT_FILTER_RESCUE_LLM_NAME variant",
-                    variant=variant,
-                    exc_info=True,
-                )
-            return None
-        _content_filter_rescue_handler_cache[variant] = handler
-    return variant, handler
 
 
 def _set_llm_context_attrs(
@@ -629,16 +555,39 @@ def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) ->
     }
 
 
-def _response_routing_metadata(response: object) -> tuple[str | None, str | None]:
+def _hidden_param(response: object, key: str) -> str | None:
+    hidden_params = getattr(response, "_hidden_params", None)
+    value = hidden_params.get(key) if isinstance(hidden_params, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def _recovered_service_tier(response: object) -> str | None:
+    """The tier recovered from the serving deployment when litellm dropped the provider's."""
+    return _hidden_param(response, _SERVED_SERVICE_TIER_KEY)
+
+
+def _service_tier_with_provenance(response: object) -> tuple[str | None, str | None]:
+    """The tier to report for a call, and where it came from. Recovered values are recorded
+    alongside their provenance, so the two can never be logged apart."""
+    recorded_source = _hidden_param(response, _SERVED_SERVICE_TIER_SOURCE_KEY)
+    if recorded_source is not None:
+        return _recovered_service_tier(response), recorded_source
+    reported = getattr(response, "service_tier", None)
+    return (reported, _SERVICE_TIER_REPORTED) if isinstance(reported, str) else (None, None)
+
+
+def _effective_service_tier(response: object) -> str | None:
+    """What the provider reported, else what we recovered. Never the other way around."""
+    reported = getattr(response, "service_tier", None)
+    return reported if isinstance(reported, str) else _recovered_service_tier(response)
+
+
+def _response_provider(response: object) -> str | None:
     provider = getattr(response, "provider", None)
     if provider is None:
         hidden_params = getattr(response, "_hidden_params", None)
         provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
-    service_tier = getattr(response, "service_tier", None)
-    return (
-        provider if isinstance(provider, str) else None,
-        service_tier if isinstance(service_tier, str) else None,
-    )
+    return provider if isinstance(provider, str) else None
 
 
 def _usage_int_field(value: Any, *field_names: str) -> int | None:
@@ -708,7 +657,7 @@ def _emit_copilot_model_usage_for_response(
     cost: float | None,
 ) -> None:
     try:
-        provider_name, _ = _response_routing_metadata(response)
+        provider_name = _response_provider(response)
         emit_direct_copilot_model_usage(
             _copilot_model_usage_event(
                 response,
@@ -1036,9 +985,9 @@ class LLMAPIHandlerFactory:
         return _normalize(left) == _normalize(right)
 
     @staticmethod
-    def _served_model_group(router: Any, response: Any) -> str | None:
-        """Resolve the litellm deployment group that served a router response, or None
-        when unavailable (direct litellm.acompletion paths, test doubles)."""
+    def _served_deployment(router: Any, response: Any) -> Any | None:
+        """Resolve the litellm deployment that served a router response, or None when
+        unavailable (direct litellm.acompletion paths, test doubles)."""
         hidden_params = getattr(response, "_hidden_params", None)
         model_id = hidden_params.get("model_id") if isinstance(hidden_params, dict) else None
         if not model_id:
@@ -1049,7 +998,7 @@ class LLMAPIHandlerFactory:
         # Never let identity resolution fail a completed request — the outer handler
         # would convert a post-success exception into LLMProviderError.
         try:
-            deployment = get_deployment(model_id=model_id)
+            return get_deployment(model_id=model_id)
         except Exception as e:
             LOG.info(
                 "Failed to resolve serving deployment from model_id",
@@ -1058,7 +1007,89 @@ class LLMAPIHandlerFactory:
                 error=str(e),
             )
             return None
-        return getattr(deployment, "model_name", None)
+
+    @staticmethod
+    def _served_model_group(router: Any, response: Any) -> str | None:
+        """Resolve the litellm deployment group that served a router response, or None
+        when unavailable (direct litellm.acompletion paths, test doubles)."""
+        return getattr(LLMAPIHandlerFactory._served_deployment(router, response), "model_name", None)
+
+    @staticmethod
+    def _deployment_service_tier(deployment: Any) -> str | None:
+        """Service tier configured on a router deployment, lower-cased. litellm keeps it as a
+        pydantic extra on LiteLLM_Params, so it is absent on deployments that declare none.
+        Returned normalised because litellm lower-cases before selecting a price key while our
+        own long-context correction compares exactly, and the two must not disagree."""
+        get = getattr(getattr(deployment, "litellm_params", None), "get", None)
+        if get is None:
+            return None
+        tier = get("service_tier")
+        if not isinstance(tier, str) or tier.lower() not in _PRICEABLE_SERVICE_TIERS:
+            return None
+        return tier.lower()
+
+    @staticmethod
+    def _served_service_tier(router: Any, response: Any) -> tuple[str | None, str | None]:
+        """The tier a router response was served on, paired with where that answer came from.
+
+        What the provider reported always wins — including when it disagrees with the leg we
+        dispatched on, because a downgrade we overwrote would be a real billing event hidden.
+        Only in its absence do we fall back to the tier configured on the deployment that
+        served the call. That fallback identifies the leg rather than the request: flex and
+        standard are separate deployments and a refused flex request 429s onto the fallback
+        one. It assumes the provider never accepts a flex request and quietly serves it at
+        standard, which is measured but not guaranteed — hence the provenance in the return.
+
+        A deployment that declares no priceable tier yields provenance ``None``, not
+        "inferred": no tier was requested, so none was lost and nothing was inferred. Most
+        router traffic is that shape, and labelling it would drown the values that mean
+        something.
+        """
+        reported = getattr(response, "service_tier", None)
+        if isinstance(reported, str):
+            return reported, _SERVICE_TIER_REPORTED
+        deployment = LLMAPIHandlerFactory._served_deployment(router, response)
+        if deployment is None:
+            return None, _SERVICE_TIER_UNRESOLVED
+        tier = LLMAPIHandlerFactory._deployment_service_tier(deployment)
+        return (tier, _SERVICE_TIER_INFERRED) if tier is not None else (None, None)
+
+    @staticmethod
+    def _record_served_service_tier(router: Any, response: Any) -> tuple[str | None, str | None]:
+        """Put back the service tier litellm drops when it bridges a call to /v1/responses.
+
+        OpenAI rejects tools + reasoning_effort on /v1/chat/completions for gpt-5.6, so litellm
+        transparently re-routes through /v1/responses; its response translation
+        (litellm 1.89.1, completion_extras/litellm_responses_transformation/transformation.py,
+        transform_response) copies choices/model/usage/_hidden_params and drops service_tier.
+        completion_cost then misses the *_flex price keys and bills flex traffic at the standard
+        rate — a 2x over-report. Delete this once a litellm release carries the field through.
+
+        Records only what the provider did not report, and records it beside the response rather
+        than on it, so neither the persisted artifact nor a later reader can mistake a value we
+        derived for one the provider sent.
+        """
+        try:
+            tier, source = LLMAPIHandlerFactory._served_service_tier(router, response)
+        except Exception as e:
+            # The outer handler turns any raise here into LLMProviderError, failing a request the
+            # provider has already billed us for.
+            LOG.info("Failed to resolve the served service tier", error=str(e))
+            return None, None
+        if source is None or source == _SERVICE_TIER_REPORTED:
+            return tier, source
+        if source == _SERVICE_TIER_UNRESOLVED:
+            LOG.info(
+                "Router response carried no service tier and no resolvable deployment",
+                sampling=True,
+                model=getattr(response, "model", None),
+            )
+        hidden_params = getattr(response, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            hidden_params[_SERVED_SERVICE_TIER_SOURCE_KEY] = source
+            if tier is not None:
+                hidden_params[_SERVED_SERVICE_TIER_KEY] = tier
+        return tier, source
 
     @staticmethod
     def _extract_token_counts(response: ModelResponse | CustomStreamWrapper) -> tuple[int, int, int, int]:
@@ -1118,14 +1149,23 @@ class LLMAPIHandlerFactory:
         return None
 
     @staticmethod
-    def _completion_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
+    def completion_cost_or_none(response: ModelResponse | CustomStreamWrapper) -> float | None:
         """litellm completion cost, with two known litellm gaps corrected here: the Vertex
         Gemini flex tier, and long-context OpenAI-direct GPT-5.6 flex calls. Both bill at
         the standard rate in litellm and are halved post hoc. Internal cost tracking only
         — never customer-facing.
         """
+        # litellm resolves an explicit service_tier kwarg ahead of the response attribute, so a
+        # tier recovered out of band selects the *_flex price keys without us pricing anything
+        # ourselves. Passed only when recovered, leaving the reported-tier path on litellm's own
+        # resolution rather than routing every call through our short-circuit.
+        recovered_tier = _recovered_service_tier(response)
         try:
-            cost = litellm.completion_cost(completion_response=response)
+            cost = (
+                litellm.completion_cost(completion_response=response, service_tier=recovered_tier)
+                if recovered_tier is not None
+                else litellm.completion_cost(completion_response=response)
+            )
         except Exception as e:
             LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
             return None
@@ -1141,7 +1181,7 @@ class LLMAPIHandlerFactory:
     def _is_openai_direct_gpt5_6_long_context_flex(
         response: ModelResponse | CustomStreamWrapper, hidden_params: object
     ) -> bool:
-        if getattr(response, "service_tier", None) != "flex":
+        if _effective_service_tier(response) != "flex":
             return False
         # litellm_model_name keeps the pre-request model string (unlike response.model,
         # which litellm strips to the bare provider label), so "azure/" still excludes Azure.
@@ -1662,9 +1702,7 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
-            _should_bundle = (
-                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-            )
+            _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
             _bundle_hashed_href_map: bytes | None = None
@@ -1873,6 +1911,7 @@ class LLMAPIHandlerFactory:
                             drop_params=True,
                             **parameters,
                         )
+                        LLMAPIHandlerFactory._record_served_service_tier(router, response)
                     finally:
                         llm_duration_seconds += time.perf_counter() - _llm_call_start
                     return response, request_payload_json
@@ -1890,7 +1929,7 @@ class LLMAPIHandlerFactory:
                                 response,
                                 request_model=direct_model_used,
                                 prompt_name=prompt_name,
-                                cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                                cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
                             )
                             model_used = response.model or direct_model_used
                             # This path invokes the primary deployment directly, so a
@@ -1914,7 +1953,7 @@ class LLMAPIHandlerFactory:
                             response,
                             request_model=main_model_group,
                             prompt_name=prompt_name,
-                            cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                            cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
                         )
                         response_model = response.model or main_model_group
                         model_used = response_model
@@ -1968,11 +2007,12 @@ class LLMAPIHandlerFactory:
                                 drop_params=True,
                                 **fallback_params,
                             )
+                            LLMAPIHandlerFactory._record_served_service_tier(router, response)
                             _emit_copilot_model_usage_for_response(
                                 response,
                                 request_model=fallback_model,
                                 prompt_name=prompt_name,
-                                cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                                cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
                             )
                         finally:
                             llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -1994,73 +2034,9 @@ class LLMAPIHandlerFactory:
                     # recovers it. Gemini's non-configurable safety filters block PII-heavy
                     # prompts that safety_settings=BLOCK_NONE cannot recover, so retrying on
                     # another Gemini tier hits the same block — jump straight to the first
-                    # non-Gemini fallback group, unless CONTENT_FILTER_RESCUE_LLM_NAME names
-                    # a specific rescue llm_key. Fires for any Gemini model that produced the
+                    # non-Gemini fallback group. Fires for any Gemini model that produced the
                     # block, including a standard tier litellm already fell back to (SKY-11766).
                     if is_content_filtered_response(response) and "gemini" in (model_used or "").lower():
-                        rescue_organization_id = organization_id or (
-                            step.organization_id if step else (thought.organization_id if thought else None)
-                        )
-                        rescue = await _get_content_filter_rescue_handler(llm_key, rescue_organization_id)
-                        if rescue is not None:
-                            rescue_llm_key, rescue_handler = rescue
-                            LOG.warning(
-                                "LLM response blocked by content filter on Gemini, retrying with configured rescue LLM",
-                                llm_key=llm_key,
-                                prompt_name=prompt_name,
-                                filtered_model=model_used,
-                                rescue_llm_key=rescue_llm_key,
-                            )
-                            try:
-                                # No parameters= forwarded: the rescue handler derives them from
-                                # its own llm_config (token limits and temperature rules differ).
-                                rescue_result = await rescue_handler(
-                                    prompt=prompt,
-                                    prompt_name=prompt_name,
-                                    step=step,
-                                    task_v2=task_v2,
-                                    thought=thought,
-                                    ai_suggestion=ai_suggestion,
-                                    workflow_run_block_id=workflow_run_block_id,
-                                    screenshots=screenshots,
-                                    organization_id=rescue_organization_id,
-                                    tools=tools,
-                                    use_message_history=use_message_history,
-                                    raw_response=raw_response,
-                                    window_dimension=window_dimension,
-                                    force_dict=force_dict,
-                                    system_prompt=system_prompt,
-                                )
-                            except CancelledError:
-                                raise
-                            except Exception:
-                                # Warn per event so failure rate stays visible, but only
-                                # attach the traceback once per rescue key to avoid spam.
-                                LOG.warning(
-                                    "Content-filter rescue LLM failed; retrying with non-Gemini fallback",
-                                    llm_key=llm_key,
-                                    prompt_name=prompt_name,
-                                    rescue_llm_key=rescue_llm_key,
-                                    exc_info=_content_filter_rescue_log_once(f"rescue_failed:{rescue_llm_key}"),
-                                )
-                            else:
-                                # Pair the blocked response with the already-recorded request so the
-                                # early return doesn't orphan it; the rescue handler persists its own set.
-                                if should_persist_llm_artifacts:
-                                    blocked_response_bytes = _safe_model_dump_json(response).encode("utf-8")
-                                    if _should_bundle:
-                                        _bundle_request = llm_request_json.encode("utf-8")
-                                        _bundle_response = blocked_response_bytes
-                                    else:
-                                        artifacts.append(
-                                            await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                                                data=blocked_response_bytes,
-                                                artifact_type=ArtifactType.LLM_RESPONSE,
-                                                **artifact_targets,
-                                            )
-                                        )
-                                _llm_span.set_attribute("status", "content_filter_rescued")
-                                return rescue_result
                         non_gemini_fallback = next(
                             (group for group in fallback_groups if "gemini" not in group.lower()), None
                         )
@@ -2083,11 +2059,12 @@ class LLMAPIHandlerFactory:
                                     drop_params=True,
                                     **parameters,
                                 )
+                                LLMAPIHandlerFactory._record_served_service_tier(router, response)
                                 _emit_copilot_model_usage_for_response(
                                     response,
                                     request_model=fallback_model,
                                     prompt_name=prompt_name,
-                                    cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                                    cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
                                 )
                             finally:
                                 llm_duration_seconds += time.perf_counter() - _llm_call_start
@@ -2200,7 +2177,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory._completion_cost_or_none(response) or 0.0
+                llm_cost = LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2308,11 +2285,16 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, model_used or main_model_group, response
                 )
-                resolved_provider, service_tier = _response_routing_metadata(response)
+                resolved_provider = _response_provider(response)
+                service_tier, service_tier_source = _service_tier_with_provenance(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
                     model=model_used,
+                    # `model_used` is the router group, identical for the flex and fallback legs;
+                    # without the served deployment the split between them is invisible.
+                    served_model_group=LLMAPIHandlerFactory._served_model_group(router, response),
+                    service_tier_source=service_tier_source,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
                     llm_duration_seconds=llm_duration_seconds,
@@ -2523,9 +2505,7 @@ class LLMAPIHandlerFactory:
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
             )
-            _should_bundle = (
-                step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-            )
+            _should_bundle = step is not None and not is_speculative_step and context is not None
 
             artifacts: list[BulkArtifactCreationRequest | None] = []
             _bundle_hashed_href_map: bytes | None = None
@@ -2720,7 +2700,7 @@ class LLMAPIHandlerFactory:
                         response,
                         request_model=model_name,
                         prompt_name=prompt_name,
-                        cost=LLMAPIHandlerFactory._completion_cost_or_none(response),
+                        cost=LLMAPIHandlerFactory.completion_cost_or_none(response),
                     )
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
@@ -2818,7 +2798,7 @@ class LLMAPIHandlerFactory:
                 completion_token_detail = None
                 cached_token_detail = None
                 # FIXME: volcengine doesn't support litellm cost calculation.
-                llm_cost = LLMAPIHandlerFactory._completion_cost_or_none(response) or 0.0
+                llm_cost = LLMAPIHandlerFactory.completion_cost_or_none(response) or 0.0
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2918,7 +2898,8 @@ class LLMAPIHandlerFactory:
                 image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                     screenshots, actual_model or llm_config.model_name, response
                 )
-                resolved_provider, service_tier = _response_routing_metadata(response)
+                resolved_provider = _response_provider(response)
+                service_tier, service_tier_source = _service_tier_with_provenance(response)
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -2942,6 +2923,9 @@ class LLMAPIHandlerFactory:
                     image_tokens_source=image_source,
                     resolved_provider=resolved_provider,
                     service_tier=service_tier,
+                    # No served deployment on this path, so no tier is ever recovered here; the
+                    # provenance exists so a facet on it does not silently drop non-router traffic.
+                    service_tier_source=service_tier_source,
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
@@ -3187,6 +3171,8 @@ class LLMCaller:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
         self.openai_client = None
+        self._supports_tool_choice: bool | None = None
+        self._warned_unsupported_tool_choice = False
         openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
         self._custom_openrouter = bool(openrouter_model_name and is_custom_llm_key(self.original_llm_key))
         # openrouter/ keys always resolve to LLMConfig, never LLMRouterConfig
@@ -3222,6 +3208,50 @@ class LLMCaller:
 
     def clear_tool_results(self) -> None:
         self.current_tool_results = []
+
+    def supports_tool_choice(self) -> bool:
+        """Whether the resolved model can be sent a ``tool_choice`` parameter.
+
+        Default-deny: an unrecognized model answers False. Router configs answer for their
+        deployments rather than the group name — litellm knows nothing about a router group, so
+        asking about ``model_name`` would deny every router config.
+        """
+        if self._supports_tool_choice is not None:
+            return self._supports_tool_choice
+        self._supports_tool_choice = self._resolve_tool_choice_support()
+        return self._supports_tool_choice
+
+    def _resolve_tool_choice_support(self) -> bool:
+        # Mirrors the branch order in _dispatch_llm_call. These paths build their provider kwargs
+        # from an explicit allowlist with no tool_choice entry, so the parameter cannot reach the
+        # provider however the model is set.
+        if self.openai_client is not None or self._custom_openrouter:
+            return False
+        try:
+            if isinstance(self.llm_config, LLMRouterConfig):
+                groups = {self.llm_config.main_model_group}
+                fallback_group = self.llm_config.fallback_model_group
+                if isinstance(fallback_group, str):
+                    groups.add(fallback_group)
+                elif fallback_group:
+                    groups.update(fallback_group)
+                deployments = [
+                    deployment for deployment in self.llm_config.model_list if deployment.model_name in groups
+                ]
+                if not deployments:
+                    return False
+                return all(
+                    supports_tool_choice(model=str(deployment.litellm_params.get("model") or ""))
+                    for deployment in deployments
+                )
+            # Router configs reach the provider through litellm.Router and never these branches, so
+            # this check has to sit below the router case exactly as it does in dispatch.
+            if any(marker in (self.llm_key or "") for marker in ("ANTHROPIC", "UI_TARS", "YUTORI")):
+                return False
+            return supports_tool_choice(model=self.llm_config.model_name)
+        except Exception:
+            LOG.debug("Failed to resolve tool_choice support", llm_key=self.llm_key, exc_info=True)
+            return False
 
     @traced(name=LLM_REQUEST_SPAN_NAME)
     async def call(
@@ -3264,6 +3294,18 @@ class LLMCaller:
         # Router configs carry per-deployment litellm_params inside the Router, not on the config.
         if not isinstance(self.llm_config, LLMRouterConfig) and self.llm_config.litellm_params:
             active_parameters.update(self.llm_config.litellm_params)
+        if "tool_choice" in active_parameters and not self.supports_tool_choice():
+            # Forwarding it to a provider that rejects it is the one way this parameter breaks a
+            # call rather than merely failing to help, so drop it here instead of at each caller.
+            unsupported_tool_choice = active_parameters.pop("tool_choice")
+            if not self._warned_unsupported_tool_choice:
+                self._warned_unsupported_tool_choice = True
+                LOG.warning(
+                    "Dropping tool_choice the resolved model does not support",
+                    llm_key=self.llm_key,
+                    model=self.llm_config.model_name,
+                    tool_choice=unsupported_tool_choice,
+                )
 
         context = skyvern_context.current()
         secret_values = _current_secret_values_for_redaction()
@@ -3273,9 +3315,7 @@ class LLMCaller:
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
         )
-        _should_bundle = (
-            step is not None and not is_speculative_step and context is not None and context.use_artifact_bundling
-        )
+        _should_bundle = step is not None and not is_speculative_step and context is not None
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
         _bundle_hashed_href_map: bytes | None = None
@@ -3483,6 +3523,11 @@ class LLMCaller:
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
 
+            served_model_group: str | None = None
+            if self._router is not None:
+                served_model_group = LLMAPIHandlerFactory._served_model_group(self._router, response)
+                LLMAPIHandlerFactory._record_served_service_tier(self._router, response)
+
             call_stats = LLMCallStats()
             try:
                 call_stats = await self.get_call_stats(response)
@@ -3546,7 +3591,8 @@ class LLMCaller:
             image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
                 screenshots, actual_model or self.llm_config.model_name, response
             )
-            resolved_provider, service_tier = _response_routing_metadata(response)
+            resolved_provider = _response_provider(response)
+            service_tier, service_tier_source = _service_tier_with_provenance(response)
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -3572,6 +3618,10 @@ class LLMCaller:
                 image_tokens_source=image_source,
                 resolved_provider=resolved_provider,
                 service_tier=service_tier,
+                # `model` above is the router group, identical for the flex and standard legs;
+                # without the served deployment the split between them is invisible.
+                served_model_group=served_model_group,
+                service_tier_source=service_tier_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
@@ -4040,7 +4090,7 @@ class LLMCaller:
                         response_id=getattr(response, "id", None),
                     )
             else:
-                computed_cost = LLMAPIHandlerFactory._completion_cost_or_none(response)
+                computed_cost = LLMAPIHandlerFactory.completion_cost_or_none(response)
                 if computed_cost is not None:
                     llm_cost = computed_cost
                     llm_cost_available = True

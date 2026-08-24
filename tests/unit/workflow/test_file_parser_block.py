@@ -21,6 +21,7 @@ import docx
 import pandas as pd
 import pytest
 
+import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -67,6 +68,26 @@ def _mock_workflow_run_context() -> MagicMock:
     return ctx
 
 
+async def _execute_with_downloaded_file(
+    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> BlockResult:
+    workflow_run_context = _mock_workflow_run_context()
+    monkeypatch.setattr(
+        FileParserBlock,
+        "get_workflow_run_context",
+        lambda _self, _workflow_run_id: workflow_run_context,
+    )
+    monkeypatch.setattr(
+        block_module,
+        "resolve_local_or_download_file",
+        AsyncMock(return_value=str(file_path)),
+    )
+    return await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+    )
+
+
 def _create_docx(
     path: Path,
     paragraphs: list[str] | None = None,
@@ -85,6 +106,9 @@ def _create_docx(
                 table.rows[i].cells[j].text = cell_text
     doc.save(str(path))
     return path
+
+
+_OLE_CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 class TestDetectFileTypeFromUrl:
@@ -135,6 +159,26 @@ class TestDetectFileTypeFromUrl:
         pdf_path.write_bytes(b"%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF")
         assert self._detect("https://example.com/download?id=123", file_path=str(pdf_path)) == FileType.PDF
 
+    def test_no_extension_with_legacy_doc_magic_raises(self, tmp_path: Path) -> None:
+        # OLE CFB header + the Word marker at byte 512: filetype reports application/msword
+        doc_path = tmp_path / "drive_download"
+        doc_path.write_bytes(_OLE_CFB_MAGIC + b"\x00" * 504 + b"\xec\xa5\xc1\x00" + b"\x00" * 60)
+        with pytest.raises(InvalidFileType, match="Legacy .doc format"):
+            self._detect("https://example.com/download?id=123", file_path=str(doc_path))
+
+    def test_no_extension_with_generic_ole_header_raises(self, tmp_path: Path) -> None:
+        # OLE CFB header without a recognizable sector marker: filetype.guess returns None
+        ole_path = tmp_path / "generic_ole"
+        ole_path.write_bytes(_OLE_CFB_MAGIC + b"\x00" * 568)
+        with pytest.raises(InvalidFileType, match="Legacy .doc format"):
+            self._detect("https://example.com/download?id=123", file_path=str(ole_path))
+
+    def test_no_extension_with_legacy_xls_detected_as_excel(self, tmp_path: Path) -> None:
+        # Legacy .xls is also an OLE container but has a dedicated parser, so it must not be rejected
+        xls_path = tmp_path / "legacy_xls"
+        xls_path.write_bytes(_OLE_CFB_MAGIC + b"\x00" * 504 + b"\x09\x08\x10\x00\x00\x06\x05\x00" + b"\x00" * 56)
+        assert self._detect("https://example.com/download?id=123", file_path=str(xls_path)) == FileType.EXCEL
+
 
 class TestValidateFileType:
     """Tests for validate_file_type with DOCX files."""
@@ -158,6 +202,60 @@ class TestValidateFileType:
         block = _make_file_parser_block("https://example.com/empty.docx", FileType.DOCX)
         with pytest.raises(InvalidFileType):
             block.validate_file_type("https://example.com/empty.docx", str(path))
+
+
+@pytest.mark.asyncio
+class TestFileParserBlockAutoDetectExecution:
+    async def test_docx_downloaded_from_extensionless_url_is_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello", "World"])
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == {"value": "Hello\nWorld"}
+
+    async def test_legacy_doc_reports_conversion_guidance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "document.doc"
+        path.write_bytes(b"not a real legacy document")
+        block = _make_file_parser_block("https://example.com/document.doc", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "Legacy .doc format" in result.failure_reason
+        assert "convert the file to .docx" in result.failure_reason
+
+    async def test_unknown_binary_reports_auto_detect_not_csv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.AUTO_DETECT)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
+        assert "File contains binary data" in result.failure_reason
+
+    async def test_legacy_csv_default_unknown_binary_reports_auto_detect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/download?id=123", FileType.CSV)
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        assert "not a valid auto-detect file" in result.failure_reason
+        assert "not a valid csv file" not in result.failure_reason
 
 
 @pytest.mark.asyncio
@@ -404,6 +502,64 @@ class TestExtractWithAiSerialization:
 
             _, kwargs = mock_load.call_args
             assert kwargs["extracted_text_content"] == "Hello\nWorld"
+
+
+@pytest.mark.asyncio
+class TestExtractWithAiTokenBounding:
+    """Oversized extraction input must be bounded before it reaches the LLM (SKY-13641)."""
+
+    @staticmethod
+    def _patch_llm(mp: pytest.MonkeyPatch) -> MagicMock:
+        mock_handler = AsyncMock(return_value={})
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: mock_handler,
+        )
+        mock_load = MagicMock(return_value="prompt")
+        mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+        return mock_load
+
+    async def test_oversized_list_content_truncated_before_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {"type": "object"}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+        records = [{"column": f"value {i}", "filler": "x" * 50} for i in range(500)]
+        raw_dump = json.dumps(records, separators=(",", ":"))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_load = self._patch_llm(mp)
+            await block._extract_with_ai(records, MagicMock())
+
+        _, kwargs = mock_load.call_args
+        content_str = kwargs["extracted_text_content"]
+        assert len(content_str) < len(raw_dump)
+        assert raw_dump.startswith(content_str)
+
+    async def test_oversized_string_content_truncated_before_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        block = _make_file_parser_block("https://example.com/doc.pdf", FileType.PDF)
+        block.json_schema = {"type": "object"}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+        oversized_text = "some repeated file text content " * 2000
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_load = self._patch_llm(mp)
+            await block._extract_with_ai(oversized_text, MagicMock())
+
+        _, kwargs = mock_load.call_args
+        content_str = kwargs["extracted_text_content"]
+        assert len(content_str) < len(oversized_text)
+        assert oversized_text.startswith(content_str)
+
+    async def test_content_within_limit_passes_through_unchanged(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_load = self._patch_llm(mp)
+            await block._extract_with_ai("name\nAlice", MagicMock())
+
+        _, kwargs = mock_load.call_args
+        assert kwargs["extracted_text_content"] == "name\nAlice"
 
 
 @pytest.mark.asyncio

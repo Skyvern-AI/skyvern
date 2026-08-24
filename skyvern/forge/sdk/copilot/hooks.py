@@ -34,7 +34,7 @@ LOG = structlog.get_logger()
 # entry as a short preview. This is a hooks-side concern (what to record),
 # not a registry of the tools themselves.
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
-    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks"}
+    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
 )
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
@@ -57,7 +57,7 @@ def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
 
 
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
-    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
+    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}:
         return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
@@ -89,7 +89,6 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
 
     async def on_agent_start(self, context: AgentHookContext, agent: AgentBase) -> None:
@@ -99,7 +98,6 @@ class CopilotRunHooks(RunHooksBase):
             LOG.warning(
                 "CopilotRunHooks.on_agent_start counting failed",
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
 
     async def on_tool_end(
@@ -165,7 +163,6 @@ class CopilotRunHooks(RunHooksBase):
                 "CopilotRunHooks.on_tool_end recording failed, skipping entry",
                 tool=getattr(tool, "name", None),
                 **_copilot_log_fields(self._ctx),
-                exc_info=True,
             )
             return
 

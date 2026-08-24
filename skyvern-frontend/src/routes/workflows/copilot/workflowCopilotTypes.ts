@@ -11,6 +11,13 @@ export type ProposalDisposition =
   | "review_tested";
 export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
+export interface ConnectedAccountChoice {
+  connection_id: string;
+  name: string;
+  state: string;
+  email_address?: string | null;
+}
+
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
   organization_id: string;
@@ -42,9 +49,13 @@ export interface WorkflowCopilotChatRequest {
   mode?: "ask" | "build" | null;
   code_block?: boolean | null;
   cancel_token?: string;
+  idempotency_key?: string | null;
   target_block_label?: string | null;
-  fix_origin?: boolean;
+  // Ambient fact: the block selected on the studio canvas when the message was
+  // sent — context for "this block" references, never a directive.
+  selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
+  product_action?: "test_end_to_end" | null;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
@@ -61,7 +72,10 @@ export interface WorkflowCopilotChatHistoryMessage {
   created_at: string;
   // Typed turn outcome persisted on assistant rows; optional so the FE
   // tolerates an older backend that does not serve it.
-  turn_outcome?: { response_kind?: string | null } | null;
+  turn_outcome?: {
+    response_kind?: string | null;
+    connected_account_choices?: ConnectedAccountChoice[] | null;
+  } | null;
   narrative_payload?: Record<string, unknown> | null;
 }
 
@@ -106,6 +120,7 @@ export type WorkflowCopilotStreamMessageType =
   | "condensing"
   | "narration"
   | "block_progress"
+  | "run_started"
   | "run_outcome"
   | "turn_start"
   | "design_start"
@@ -212,6 +227,7 @@ export interface WorkflowCopilotToolCallUpdate {
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotToolResultUpdate {
@@ -223,6 +239,7 @@ export interface WorkflowCopilotToolResultUpdate {
   iteration: number;
   tool_call_id: string;
   detail?: string | null;
+  timestamp?: string | null;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -248,6 +265,12 @@ export interface WorkflowCopilotBlockProgressUpdate {
   block_type: string;
   status: string;
   iteration: number;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotRunStartedUpdate {
+  type: "run_started";
+  workflow_run_id: string;
   timestamp: string;
 }
 

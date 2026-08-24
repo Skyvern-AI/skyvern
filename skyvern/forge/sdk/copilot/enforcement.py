@@ -17,14 +17,8 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    CopilotToolBlockerSignal,
-    stash_blocker_signal,
-)
-from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
-    ONE_TIME_CODE_CREDENTIAL_FIELD,
     credential_scout_gap,
     credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
@@ -44,7 +38,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, interactive_challenge_controls
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -52,7 +46,6 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause
-from skyvern.forge.sdk.copilot.credential_resolution import url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -62,8 +55,15 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    MCP_RESULT_PROVENANCE_KEY,
+    MCP_RESULT_PROVENANCE_VALUE,
     extract_final_text,
     parse_final_response,
+)
+from skyvern.forge.sdk.copilot.pending_operation import (
+    install_pending_operation_slot,
+    pending_operation,
+    pending_operation_fields,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
@@ -79,17 +79,10 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     mint_scout_observation_contract,
     scout_observation_bound_paths,
 )
-from skyvern.forge.sdk.copilot.run_outcome import (
-    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-    TERMINAL_CHALLENGE_USER_FACING_REASON,
-    RecordedRunOutcome,
-    run_outcome_display_reason,
-)
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -124,6 +117,7 @@ TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # constant so tests can shrink it instead of paying a full second per deadline.
 MIN_DEADLINE_REMAINING_SECONDS = 1.0
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
+PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
@@ -187,112 +181,6 @@ def _effective_proxy_label(ctx: Any) -> str | None:
     return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
 
 
-def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
-    outcome = getattr(ctx, "last_run_outcome", None)
-    if not isinstance(outcome, RecordedRunOutcome):
-        return None
-    if outcome.reason_code != TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE:
-        return None
-    return outcome
-
-
-def _structured_page_challenge_reason(ctx: Any, evidence: dict[str, Any] | None = None) -> str | None:
-    if evidence is None:
-        evidence = getattr(ctx, "composition_page_evidence", None)
-    if not isinstance(evidence, dict):
-        return None
-    challenge_state = evidence.get("challenge_state")
-    if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
-        # This raw page kind is folded into an internal reason here; halt
-        # metadata sanitizes it through run_outcome_display_reason below.
-        kind = str(challenge_state.get("kind") or "site challenge").replace("_", " ")
-        if challenge_state.get("requires_human_verification") is True:
-            if "verification" in kind.lower() or "captcha" in kind.lower():
-                return f"{kind} requires manual completion"
-            return f"{kind} requires human verification"
-        if challenge_state.get("gates_submit_controls") is True:
-            return f"{kind} gates the submit/search controls"
-    controls = evidence.get("challenge_controls")
-    if isinstance(controls, list) and interactive_challenge_controls(controls):
-        return "interactive challenge controls are visible on the page"
-    return None
-
-
-def _terminal_challenge_halt_signal(
-    ctx: Any,
-    *,
-    evidence_source: str,
-    evidence_reason: str,
-    blocked_tool: str = "update_and_run_blocks",
-    challenge_evidence_source: str | None = None,
-) -> CopilotToolBlockerSignal:
-    workflow_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
-    safe_evidence_reason = (
-        run_outcome_display_reason(evidence_reason) or "Structured challenge evidence reported a terminal blocker."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "Structured challenge evidence confirms this path is blocked: "
-            f"{safe_evidence_reason}. Do NOT retry block-running tools, do NOT try a proxy/location switch "
-            "in this turn, and do NOT claim the workflow is verified end-to-end. Reply with the blocker."
-        ),
-        user_facing_reason=TERMINAL_CHALLENGE_USER_FACING_REASON,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        blocked_tool=blocked_tool,
-        extra={
-            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-            "evidence_source": evidence_source,
-            "challenge_evidence_source": challenge_evidence_source,
-            "evidence_reason": safe_evidence_reason,
-            "workflow_run_id": workflow_run_id if isinstance(workflow_run_id, str) else None,
-        },
-    )
-
-
-def terminal_challenge_blocker_signal_from_page_evidence(
-    ctx: Any,
-    *,
-    blocked_tool: str,
-    evidence_source: str = "page_evidence",
-    evidence: dict[str, Any] | None = None,
-) -> CopilotToolBlockerSignal | None:
-    packet = evidence if evidence is not None else getattr(ctx, "composition_page_evidence", None)
-    page_reason = _structured_page_challenge_reason(ctx, packet)
-    if page_reason is None:
-        return None
-    if isinstance(packet, Mapping) and one_time_code_fill_supersedes_challenge(ctx, packet):
-        LOG.info(
-            "copilot_terminal_challenge_declined_credential_served",
-            blocked_tool=blocked_tool,
-            evidence_source=evidence_source,
-        )
-        return None
-    carrier = composition_challenge_carrier(packet)
-    return _terminal_challenge_halt_signal(
-        ctx,
-        evidence_source=evidence_source,
-        evidence_reason=page_reason,
-        blocked_tool=blocked_tool,
-        challenge_evidence_source=carrier.value if carrier else None,
-    )
-
-
-def _current_page_challenge_requires_stop(evidence: dict[str, Any]) -> bool:
-    challenge_state = evidence.get("challenge_state")
-    if isinstance(challenge_state, dict) and (
-        challenge_state.get("requires_human_verification") is True
-        or challenge_state.get("gates_submit_controls") is True
-    ):
-        return True
-    controls = evidence.get("challenge_controls")
-    return isinstance(controls, list) and bool(interactive_challenge_controls(controls))
-
-
 def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for entry in reversed(getattr(ctx, "flow_evidence", None) or []):
@@ -310,133 +198,6 @@ def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
 
 # Challenge kinds a saved one-time code cannot answer, whoever else is on the page. `unknown` is the
 # DOM detector's verdict for every anti-bot vendor it has no name for, so it belongs here too.
-_CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS = (
-    "captcha",
-    "robot",
-    "turnstile",
-    "cloudflare",
-    "access",
-    "human",
-    "unknown",
-)
-
-
-def _observed_page_key(url: Any) -> str | None:
-    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
-        return None
-    parts = url_parts(url.strip())
-    return parts[1] if parts else None
-
-
-def _one_time_code_fill_targets(ctx: Any) -> set[tuple[str, str]]:
-    """(page key, selector) for every saved one-time code this turn filled.
-
-    Keyed by page as well as selector because an observation packet records only the selector, and
-    the same selector text recurs across sites.
-
-    Carried entries are a prior turn's history, not this turn's acts: the trajectory is seeded with
-    the retained record, and a code entered on an earlier turn cannot supersede a challenge this
-    turn is looking at.
-    """
-    targets: set[tuple[str, str]] = set()
-    for item in getattr(ctx, "scout_trajectory", None) or []:
-        if not isinstance(item, Mapping):
-            continue
-        if item.get("carried") is True:
-            continue
-        if str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        if str(item.get("credential_field") or "").strip() != ONE_TIME_CODE_CREDENTIAL_FIELD:
-            continue
-        page = _observed_page_key(item.get("source_url"))
-        selector = str(item.get("selector") or "").strip()
-        if page and selector:
-            targets.add((page, selector))
-    return targets
-
-
-def _challenge_a_code_cannot_answer(evidence: Mapping[str, Any]) -> bool:
-    """A deny-list on purpose: an unrecognized kind stays answerable rather than halting.
-
-    `challenge_state.kind` is free-form vision output, so an allow-list would fail closed on the
-    misread this ticket exists to fix — the witnessed failure was labelled `other`.
-    """
-    controls = evidence.get("challenge_controls")
-    if isinstance(controls, list) and interactive_challenge_controls(controls):
-        return True
-    challenge_state = evidence.get("challenge_state")
-    kind = str(challenge_state.get("kind") or "").lower() if isinstance(challenge_state, Mapping) else ""
-    return any(term in kind for term in _CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS)
-
-
-def one_time_code_fill_supersedes_challenge(ctx: Any, evidence: Mapping[str, Any]) -> bool:
-    """Whether this turn filled a saved one-time code into the observed page after this challenge
-    was captured.
-
-    Scoped to challenges older than the code so it can never outlive one: a submit reaches the page
-    by routes that mint no observation of their own (an Enter keypress, a block run), so anything
-    observed after the fill is left to halt.
-    """
-    # Nothing is superseded by a packet that reports no challenge, and a caller may hold one whose
-    # stop was decided by the run rather than by this page.
-    if not isinstance(evidence, dict) or _structured_page_challenge_reason(ctx, evidence) is None:
-        return False
-    page = _observed_page_key(evidence.get("current_url") or evidence.get("inspected_url"))
-    if page is None or _challenge_a_code_cannot_answer(evidence):
-        return False
-    targets = _one_time_code_fill_targets(ctx)
-    if not targets:
-        return False
-    challenge_seen = False
-    for entry in getattr(ctx, "flow_evidence", None) or []:
-        if not isinstance(entry, dict):
-            continue
-        packet = entry.get("evidence")
-        if not isinstance(packet, dict):
-            continue
-        # Both writers alias the appended packet into `composition_page_evidence`; a shallow copy
-        # there would silently make this never match, which halts rather than misfires.
-        if packet is evidence:
-            challenge_seen = True
-            continue
-        if not challenge_seen or str(packet.get("interaction_tool") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        selector = str(packet.get("interaction_selector") or "").strip()
-        # An interaction packet carries the post-interaction URL, so it is attributable to the page
-        # it acted on only by the source it recorded.
-        if (page, selector) in targets and _observed_page_key(packet.get("interaction_source_url")) == page:
-            return True
-    return False
-
-
-def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
-    if getattr(ctx, "turn_halt", None) is not None:
-        return
-    outcome = _typed_terminal_challenge_outcome(ctx)
-    if outcome is not None:
-        reason = outcome.display_reason or "Structured evidence reported a terminal site challenge."
-        carrier = composition_challenge_carrier(getattr(ctx, "composition_page_evidence", None))
-        signal = _terminal_challenge_halt_signal(
-            ctx,
-            evidence_source="run_outcome",
-            evidence_reason=reason,
-            challenge_evidence_source=carrier.value if carrier else None,
-        )
-        stash_blocker_signal(ctx, signal)
-        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        return
-    # `last_test_ok is False` is the failed-run sentinel for this backstop.
-    # Free-standing visible challenge hints remain diagnostic until a run/test
-    # also records anti-bot evidence.
-    if getattr(ctx, "last_test_ok", None) is not False:
-        return
-    if not getattr(ctx, "last_test_anti_bot", None):
-        return
-    page_signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-    if page_signal is None:
-        return
-    stash_blocker_signal(ctx, page_signal)
-    stash_turn_halt_from_blocker_signal(ctx, page_signal, source="enforcement")
 
 
 class CopilotTotalTimeoutError(Exception):
@@ -529,6 +290,7 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
         "copilot_turn_deadline_expired",
         elapsed_seconds=round(elapsed_seconds, 3),
         iteration=iteration,
+        **pending_operation_fields(),
     )
 
 
@@ -552,6 +314,27 @@ def _mark_copilot_total_timeout_if_elapsed(ctx: Any, start_time: float, iteratio
     elapsed = _elapsed_run_seconds(ctx, start_time)
     if elapsed >= TOTAL_TIMEOUT_SECONDS:
         _mark_copilot_total_timeout(ctx, elapsed_seconds=elapsed, iteration=iteration)
+
+
+def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
+    """Record a cancellation raised at a model-call boundary, whatever the elapsed budget.
+
+    Synchronous and never raising, so the caller's ``raise`` re-raises the original
+    cancellation neither masked nor delayed.
+    """
+    try:
+        elapsed = _elapsed_run_seconds(ctx, start_time)
+        _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+        ctx.copilot_turn_cancelled_iteration = iteration
+        LOG.warning(
+            "copilot_turn_cancelled",
+            elapsed_seconds=round(elapsed, 3),
+            iteration=iteration,
+            deadline_exceeded=ctx.copilot_total_timeout_exceeded is True,
+            **pending_operation_fields(),
+        )
+    except Exception:
+        LOG.exception("Failed to record a copilot turn cancellation", iteration=iteration)
 
 
 class CopilotNonRetriableNavError(Exception):
@@ -654,24 +437,56 @@ def _same_page(left: str | None, right: str | None) -> bool:
     return left_path == right_path
 
 
-def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
-    """Drain pending_screenshots into a synthetic user message with images.
+def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
+    """Build the synthetic user message for the staged frame without draining it.
 
     Tool results stay text-only because OpenAI rejects images in tool
     messages, so screenshots are delivered as a follow-up user message.
     """
+    # Re-checked here rather than only at enqueue: a retriable failure can swap in a
+    # non-vision fallback model after the frame was staged, so every delivery path needs it.
+    if not getattr(ctx, "supports_vision", False):
+        return None
     pending = getattr(ctx, "pending_screenshots", None)
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
-    pending.clear()
+    provenance_lines: list[str] = []
+    for entry in screenshots:
+        provenance = entry.provenance
+        fields = {
+            "capture_id": entry.capture_id,
+            "source_tool": provenance.source_tool,
+            "captured_url": provenance.captured_url or "unavailable",
+            "dispatch_url": provenance.dispatch_url or "unavailable",
+            "observation_step": provenance.observation_step
+            if provenance.observation_step is not None
+            else "unavailable",
+            "browser_session_id": provenance.browser_session_id or "unavailable",
+            "dispatch_browser_session_id": provenance.dispatch_browser_session_id or "unavailable",
+            "producer_browser_session_id": provenance.producer_browser_session_id or "unavailable",
+            "session_binding": provenance.session_binding.value,
+            "workflow_run_id": provenance.workflow_run_id or "unavailable",
+            "action_relation": provenance.action_relation.value,
+        }
+        rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
+        relation = (
+            "This frame was captured during the named page observation."
+            if provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+            else "This frame records the named source at its stated action relation."
+        )
+        provenance_lines.append(
+            f"Frame provenance: {rendered}. {relation} Its provenance does not claim freshness after later actions."
+        )
+    paired_marker = (
+        PAIRED_OBSERVATION_MARKER
+        if screenshots[0].provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+        else ""
+    )
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": (
-                SCREENSHOT_SENTINEL + "Here is the screenshot from the tool result. "
-                "Analyze it to understand the current browser state."
-            ),
+            "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
     for entry in screenshots:
@@ -683,6 +498,17 @@ def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
             }
         )
     return {"role": "user", "content": content}
+
+
+def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
+    """Build the screenshot message and clear the queue — the end-of-turn drain."""
+    message = pending_screenshot_message(ctx)
+    pending = getattr(ctx, "pending_screenshots", None)
+    if isinstance(pending, list):
+        pending.clear()
+    if hasattr(ctx, "pending_frame_lease"):
+        ctx.pending_frame_lease = None
+    return message
 
 
 def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
@@ -716,8 +542,6 @@ def enforcement_decision(
     raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx, verified=verified)
     return None
 
 
@@ -742,6 +566,22 @@ def is_screenshot_message(item: Any) -> bool:
         if isinstance(text, str) and text.startswith(SCREENSHOT_SENTINEL):
             return True
     return False
+
+
+def is_paired_observation_message(item: Any) -> bool:
+    """Return True only for explicitly marked observation-bound frames."""
+    if _item_field(item, "role") != "user":
+        return False
+    prefix = SCREENSHOT_SENTINEL + PAIRED_OBSERVATION_MARKER
+    content = _item_field(item, "content")
+    if isinstance(content, str):
+        return content.startswith(prefix)
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(_item_field(block, "text"), str) and _item_field(block, "text").startswith(prefix)
+        for block in content
+    )
 
 
 def _is_nudge_message(item: Any) -> bool:
@@ -777,6 +617,10 @@ def _summarize_tool_output(output: str) -> str:
         return _truncated_output_fallback(output)
 
     synopsis: dict[str, Any] = {}
+    # Compaction must not launder untrusted MCP data into unlabelled context. The owned value is
+    # re-stamped rather than copied, so this is not where an attacker-chosen provenance survives.
+    if MCP_RESULT_PROVENANCE_KEY in parsed:
+        synopsis[MCP_RESULT_PROVENANCE_KEY] = MCP_RESULT_PROVENANCE_VALUE
     if "ok" in parsed:
         synopsis["ok"] = parsed["ok"]
     if parsed.get("error"):
@@ -834,12 +678,10 @@ def _replace_item_field(item: Any, name: str, new_value: Any) -> Any:
         dup = copy.copy(item)
         setattr(dup, name, new_value)
         return dup
-    except (AttributeError, TypeError) as exc:
+    except (AttributeError, TypeError):
         LOG.debug(
             "Could not rewrite input-list item field; leaving untouched",
             field=name,
-            item_type=type(item).__name__,
-            error=str(exc),
         )
         return item
 
@@ -987,6 +829,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     if not items:
         return items
 
+    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
     tail: list[Any] = []
     for item in reversed(items[1:]):
         if is_screenshot_message(item):
@@ -1019,7 +862,12 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         retained_tail=[_item_field(item, "type") for item in retained_tail],
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    return [opening, *retained_tail]
+    retained_items = [opening, *retained_tail]
+    screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
+    signal_content = _item_field(screenshot_dropped_signal[0], "content")
+    if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):
+        screenshot_dropped_signal = []
+    return [*retained_items, *screenshot_dropped_signal]
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
@@ -1092,10 +940,11 @@ async def _recover_from_context_overflow(session: Any, current_input: str | list
         stripped_input = current_input
 
     if session is not None:
-        all_items = await session.get_items()
-        pruned = aggressive_prune(all_items)
-        await session.clear_session()
-        await session.add_items(pruned)
+        with pending_operation("session.prune"):
+            all_items = await session.get_items()
+            pruned = aggressive_prune(all_items)
+            await session.clear_session()
+            await session.add_items(pruned)
         return stripped_input, stripped_any
     if isinstance(stripped_input, list):
         return stripped_input, stripped_any
@@ -1178,15 +1027,16 @@ async def _run_streamed_with_deadline(
     """
     elapsed = _elapsed_run_seconds(ctx, start_time)
     remaining = max(MIN_DEADLINE_REMAINING_SECONDS, TOTAL_TIMEOUT_SECONDS - elapsed)
-    result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
-    try:
+    with pending_operation("turn.stream", span=True):
+        result = Runner.run_streamed(agent, input=current_input, context=ctx, session=session, **runner_kwargs)
         try:
-            await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
-        finally:
-            _accumulate_usage(result, ctx)
-    except TimeoutError:
-        _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
-        raise CopilotTotalTimeoutError() from None
+            try:
+                await asyncio.wait_for(streaming_adapter.stream_to_sse(result, tracked_stream, ctx), timeout=remaining)
+            finally:
+                _accumulate_usage(result, ctx)
+        except TimeoutError:
+            _mark_copilot_total_timeout(ctx, elapsed_seconds=_elapsed_run_seconds(ctx, start_time), iteration=iteration)
+            raise CopilotTotalTimeoutError() from None
     return result
 
 
@@ -1708,6 +1558,7 @@ async def run_with_enforcement(
     current_input: str | list = initial_input
     start_time = time.monotonic()
     ctx.copilot_run_start_monotonic = start_time
+    install_pending_operation_slot(ctx)
     iteration = 0
     pending_recovery_nudge: str | None = None
 
@@ -1753,7 +1604,7 @@ async def run_with_enforcement(
                     iteration,
                 )
             except asyncio.CancelledError:
-                _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                _record_copilot_cancellation(ctx, start_time, iteration)
                 raise
             except Exception as e:
                 if not _is_context_window_error(e):
@@ -1763,23 +1614,24 @@ async def run_with_enforcement(
                     # would double-emit frames to the client.
                     LOG.error(
                         "Context window exceeded after partial emission; not retrying",
-                        error=str(e),
                         iteration=iteration,
                         has_session=session is not None,
                     )
                     raise
                 LOG.error(
                     "Context window exceeded, retrying with aggressive prune",
-                    error=str(e),
                     iteration=iteration,
                     has_session=session is not None,
                 )
                 try:
                     current_input, images_stripped = await _recover_from_context_overflow(session, current_input)
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
-                if images_stripped:
+                # Unconditional: the staged frame never reaches current_input, so images_stripped
+                # cannot see it, and the filter would re-append it to the retry we just shrank.
+                frame_dropped = _consume_pending_screenshots(ctx) is not None
+                if images_stripped or frame_dropped:
                     # The agent could otherwise reason about the page from
                     # memory on the next turn; warn it explicitly.
                     pending_recovery_nudge = _nudge(copilot_config, "screenshot_dropped")
@@ -1796,15 +1648,13 @@ async def run_with_enforcement(
                         iteration,
                     )
                 except asyncio.CancelledError:
-                    _mark_copilot_total_timeout_if_elapsed(ctx, start_time, iteration)
+                    _record_copilot_cancellation(ctx, start_time, iteration)
                     raise
-                except Exception as retry_err:
+                except Exception:
                     # Never retry twice; even a second overflow surfaces as a
                     # real failure rather than spinning.
                     LOG.error(
                         "Context window recovery retry failed",
-                        original_error=str(e),
-                        retry_error=str(retry_err),
                         iteration=iteration,
                         has_session=session is not None,
                     )

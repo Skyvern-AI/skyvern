@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.runtime_completion import (
@@ -403,9 +404,10 @@ def test_no_stored_contract_leaves_the_definition_untouched() -> None:
 async def test_finalize_counts_session_scoped_downloads_not_yet_claimed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Session downloads are tagged with the run id during cleanup, after this grade runs."""
+    """The watcher tags a session download with its producing run when it observes the file, so a
+    row can already exist for this run before any claim reaches it."""
     service, run, statuses = _wire_finalize(monkeypatch, contract=_DERIVED_CONTRACT, downloaded=[])
-    monkeypatch.setattr(service, "_session_download_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(service, "_session_download_artifact_ids", AsyncMock(return_value={"a_1"}))
 
     await service._finalize_workflow_run_status(
         workflow_run_id=run.workflow_run_id,
@@ -415,6 +417,56 @@ async def test_finalize_counts_session_scoped_downloads_not_yet_claimed(
     )
 
     assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_an_id_less_registered_file_and_a_session_row_are_counted_separately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without HMAC signing the run read lists the run's own storage prefix, which cannot contain a
+    browser-session download, so the two reads report different files and both count."""
+    contract = {
+        "schema_version": 1,
+        "criteria": [{"id": "declared_download", "kind": "registered_download", "min_count": 2}],
+    }
+    service, run, statuses = _wire_finalize(
+        monkeypatch, contract=contract, downloaded=[FileInfo(url="s3://b/one.pdf", artifact_id=None)]
+    )
+    monkeypatch.setattr(service, "_session_download_artifact_ids", AsyncMock(return_value={"a_1"}))
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+
+    assert statuses == [WorkflowRunStatus.completed]
+
+
+@pytest.mark.asyncio
+async def test_one_file_reported_by_both_download_sources_does_not_satisfy_a_two_file_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session read and the run read overlap on the same run key, so a single stamped download
+    appears in both. Counting it twice would pass a contract the run never met."""
+    contract = {
+        "schema_version": 1,
+        "criteria": [{"id": "declared_download", "kind": "registered_download", "min_count": 2}],
+    }
+    service, run, statuses = _wire_finalize(
+        monkeypatch, contract=contract, downloaded=[FileInfo(url="s3://b/one.pdf", artifact_id="a_1")]
+    )
+    monkeypatch.setattr(service, "_session_download_artifact_ids", AsyncMock(return_value={"a_1"}))
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+
+    assert statuses == [WorkflowRunStatus.terminated]
 
 
 def test_interactive_copilot_routes_do_not_own_completion_contract_lifecycle() -> None:

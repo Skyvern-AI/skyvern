@@ -9,28 +9,20 @@ from typing import Any
 import structlog
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
+    BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 
 LOG = structlog.get_logger()
 
 
 class TurnHaltKind(StrEnum):
-    ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
+    BROWSER_SESSION_LOST = "browser_session_lost"
 
 
 class TurnHaltVerdict(StrEnum):
     BLOCKED = "blocked"
-
-
-_ACTIVE_TERMINAL_CHALLENGE_REASON_CODES = frozenset(
-    {
-        TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        "tool_error_run_output_terminal_blocker",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -52,10 +44,10 @@ class CopilotTurnHalt(Exception):
 def turn_halt_from_blocker_signal(signal: object, *, source: str) -> TurnHalt | None:
     if not isinstance(signal, CopilotToolBlockerSignal) or not signal.renders_final_reply:
         return None
-    if signal.internal_reason_code not in _ACTIVE_TERMINAL_CHALLENGE_REASON_CODES:
+    if signal.internal_reason_code != BROWSER_SESSION_LOST_BLOCKER_REASON_CODE:
         return None
     return TurnHalt(
-        kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE,
+        kind=TurnHaltKind.BROWSER_SESSION_LOST,
         blocker_signal=signal,
         draft_state={"preserves_workflow_draft": signal.preserves_workflow_draft},
         extra={**signal.extra, "source": source},

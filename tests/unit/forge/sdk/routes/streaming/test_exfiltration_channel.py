@@ -18,21 +18,24 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltrationChannel,
     PageConsoleCapture,
 )
+from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannelContext
 
 
-def _make_vnc_channel() -> MagicMock:
+def _make_context() -> MagicMock:
     browser_session = MagicMock()
     browser_session.browser_address = "http://localhost:9222"
     browser_session.persistent_browser_session_id = "pbs_123"
 
-    vnc_channel = MagicMock()
-    vnc_channel.browser_session = browser_session
-    vnc_channel.identity = {
+    context = MagicMock()
+    context.organization_id = "org_123"
+    context.x_api_key = "api-key-123"
+    context.browser_session = browser_session
+    context.identity = {
         "client_id": "client-1",
         "browser_session_id": browser_session.persistent_browser_session_id,
     }
 
-    return vnc_channel
+    return context
 
 
 def _make_event_data() -> dict[str, object]:
@@ -58,12 +61,14 @@ def _make_page(url: str = "https://example.com") -> MagicMock:
     page.add_init_script = AsyncMock()
     page.evaluate = AsyncMock()
     page.expose_binding = AsyncMock()
+    # The page stands in as its own (single) main frame so frame-level draining resolves to page.evaluate.
+    page.frames = [page]
     return page
 
 
 def _make_channel(on_event: MagicMock | None = None) -> tuple[ExfiltrationChannel, MagicMock]:
     event_callback = on_event or MagicMock()
-    return ExfiltrationChannel(on_event=event_callback, vnc_channel=_make_vnc_channel()), event_callback
+    return ExfiltrationChannel(on_event=event_callback, context=_make_context()), event_callback
 
 
 @pytest.fixture(autouse=True)
@@ -217,7 +222,8 @@ class TestExfiltrationChannelEvents:
         page.expose_binding.assert_awaited_once_with(channel.BINDING_NAME, channel._handle_binding_event)
         page.on.assert_called_once()
         assert page.add_init_script.await_count == 2
-        assert page.evaluate.await_count == 2
+        # binding script + exfiltrate script + stale-queue discard
+        assert page.evaluate.await_count == 3
         assert channel._page_console_captures[page].cdp_session is cdp_session
         cdp_session.send.assert_awaited_once_with("Runtime.enable")
         cdp_session.on.assert_called_once()
@@ -405,6 +411,191 @@ class TestExfiltrationChannelEvents:
 
         assert channel._should_emit_console_event(first) is True
         assert channel._should_emit_console_event(distinct) is True
+
+
+def _make_stamped_event_data(seq: int = 0, doc_id: str = "doc-a") -> dict[str, object]:
+    return {**_make_event_data(), "exfilDocId": doc_id, "exfilSeq": seq}
+
+
+def _adopt_page(channel: ExfiltrationChannel, page: MagicMock) -> None:
+    channel._page_console_captures[page] = PageConsoleCapture(console_listener=MagicMock())
+
+
+class TestQueueTransport:
+    """The in-page queue drained via evaluate() carries events when consoleAPICalled/bindingCalled delivery is dropped, deduped by (exfilDocId, exfilSeq)."""
+
+    @pytest.mark.asyncio
+    async def test_drain_emits_queued_events_and_dedups_redelivery(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        first = _make_stamped_event_data(seq=0)
+        second = _make_stamped_event_data(seq=1)
+        page.evaluate = AsyncMock(return_value=[first, second])
+
+        await channel._drain_page_queue(page)
+
+        assert on_event.call_count == 2
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        assert all(event.source == ExfiltratedEventSource.CONSOLE for event in emitted)
+        assert [event.params["exfilSeq"] for event in emitted] == [0, 1]
+
+        # A redelivery of the same stamped events must not produce duplicate steps.
+        await channel._drain_page_queue(page)
+        assert on_event.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_drain_skips_unadopted_page(self) -> None:
+        # An unadopted page may still be owned by a previous channel; draining it would destructively steal that channel's events.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0)])
+
+        await channel._drain_page_queue(page)
+
+        page.evaluate.assert_not_awaited()
+        on_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exfiltrate_discards_stale_queue_before_capturing(self) -> None:
+        # Adopting a page must discard the between-recordings backlog or it replays as phantom steps.
+        channel, _ = _make_channel()
+        page = _make_page()
+        page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await channel.exfiltrate(page)
+
+        evaluated = [call.args[0] for call in page.evaluate.await_args_list]
+        assert channel._DISCARD_QUEUE_JS in evaluated
+        # The discard happens before the exfiltration script (re)install.
+        install_index = next(i for i, expr in enumerate(evaluated) if "exfil_owner" in expr)
+        assert evaluated.index(channel._DISCARD_QUEUE_JS) < install_index
+
+    @pytest.mark.asyncio
+    async def test_console_then_drain_delivery_emits_once(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        event_data = _make_stamped_event_data(seq=7)
+        message = MagicMock()
+        message.args = []
+        message.text = f"[EXFIL] {json.dumps(event_data)}"
+
+        await channel._handle_console_event_async(message, 0)
+        page.evaluate = AsyncMock(return_value=[event_data])
+        await channel._drain_page_queue(page)
+
+        on_event.assert_called_once()
+
+    def test_stamped_identical_rapid_interactions_both_emit(self) -> None:
+        # Distinct interactions can serialize identically except for the sequence stamp; exact dedup must keep both.
+        channel, _ = _make_channel()
+        first = {**_make_stamped_event_data(seq=1), "timestamp": 1000.0}
+        second = {**_make_stamped_event_data(seq=2), "timestamp": 1000.0}
+
+        assert channel._should_emit_console_event(first) is True
+        assert channel._should_emit_console_event(second) is True
+
+    @pytest.mark.asyncio
+    async def test_nav_start_drains_before_emitting_nav_event(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=3)])
+        channel.page = page
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        page.evaluate.assert_awaited_once_with(
+            channel._DRAIN_QUEUE_JS, [channel._drain_token, channel.QUEUE_DRAIN_MAX_ITEMS]
+        )
+        # The drained click must order before the navigation it caused (interpreter sorts by capture_seq).
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        assert [event.event_name for event in emitted] == ["user_interaction", "nav:frame_started_navigating"]
+        assert emitted[0].capture_seq < emitted[1].capture_seq
+
+    @pytest.mark.asyncio
+    async def test_commit_event_orders_after_pending_nav_start(self) -> None:
+        # frame_navigated arriving while the nav-start drain is in flight must still take a higher capture_seq than
+        # the nav-start, or url_change.py sees the commit set last_url first and drops the URL-change step.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        release = asyncio.Event()
+
+        async def slow_drain(expression: object, arg: object) -> list:
+            await release.wait()
+            return [_make_stamped_event_data(seq=0)]
+
+        page.evaluate = AsyncMock(side_effect=slow_drain)
+        channel.page = page
+
+        channel._handle_cdp_event("nav:frame_started_navigating", {"url": "https://example.com/next"})
+        # Commit arrives before the (blocked) nav-start drain resolves.
+        channel._handle_cdp_event("nav:frame_navigated", {"frame": {"url": "https://example.com/next"}})
+        release.set()
+        if channel._pending_event_tasks:
+            await asyncio.gather(*channel._pending_event_tasks)
+
+        emitted = [call.args[0][0] for call in on_event.call_args_list]
+        by_name = {e.event_name: e.capture_seq for e in emitted}
+        assert by_name["user_interaction"] < by_name["nav:frame_started_navigating"]
+        assert by_name["nav:frame_started_navigating"] < by_name["nav:frame_navigated"]
+
+    @pytest.mark.asyncio
+    async def test_drains_child_frames(self) -> None:
+        # Each frame has its own per-document queue; iframe events would otherwise never be collected.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        child = _make_page("https://example.com/iframe")
+        child.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0, doc_id="child-doc")])
+        page.evaluate = AsyncMock(return_value=[_make_stamped_event_data(seq=0, doc_id="main-doc")])
+        page.frames = [page, child]
+
+        await channel._drain_page_queue(page)
+
+        child.evaluate.assert_awaited_once()
+        doc_ids = {call.args[0][0].params["exfilDocId"] for call in on_event.call_args_list}
+        assert doc_ids == {"main-doc", "child-doc"}
+
+    @pytest.mark.asyncio
+    async def test_drained_queue_size_is_bounded(self) -> None:
+        # The drained list is page-controlled input; a hostile page must not push an unbounded batch into the API worker.
+        channel, on_event = _make_channel()
+        page = _make_page()
+        _adopt_page(channel, page)
+        oversized = [_make_stamped_event_data(seq=i) for i in range(channel.QUEUE_DRAIN_MAX_ITEMS + 500)]
+        page.evaluate = AsyncMock(return_value=oversized)
+
+        await channel._drain_page_queue(page)
+
+        assert on_event.call_count == channel.QUEUE_DRAIN_MAX_ITEMS
+
+    @pytest.mark.asyncio
+    async def test_stop_flushes_remaining_queue(self) -> None:
+        channel, on_event = _make_channel()
+        page = _make_page()
+        tail_event = _make_stamped_event_data(seq=9)
+
+        async def evaluate(expression: str, *args: object) -> object:
+            if expression == channel._DRAIN_QUEUE_JS:
+                return [tail_event]
+            return None
+
+        page.evaluate = AsyncMock(side_effect=evaluate)
+        _adopt_page(channel, page)
+        browser_context = MagicMock()
+        browser_context.pages = [page]
+        channel.browser_context = browser_context
+
+        await channel.stop()
+
+        emitted = [call.args[0][0].params for call in on_event.call_args_list]
+        assert tail_event in emitted
 
 
 class TestNavigationReExfiltration:
@@ -600,7 +791,7 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
     """
     import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
 
-    state = SimpleNamespace(start_calls=0, pws=[], browsers=[])
+    state = SimpleNamespace(start_calls=0, pws=[], browsers=[], connections=[])
 
     def _make_pw() -> _FakePw:
         state.start_calls += 1
@@ -614,6 +805,7 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
     async def _fake_connect(pw: object, url: str, headers: dict | None = None, **kwargs: object) -> _FakePwBrowser:
         browser = _FakePwBrowser(fire_disconnect_on_close=fire_disconnect_on_close)
         state.browsers.append(browser)
+        state.connections.append((url, headers))
         return browser
 
     monkeypatch.setattr(cdp_mod, "async_playwright", _fake_async_playwright)
@@ -622,6 +814,38 @@ def _patch_pw_stack(monkeypatch: pytest.MonkeyPatch, *, fire_disconnect_on_close
 
 
 class TestExfiltrationChannelLifecycle:
+    @pytest.mark.asyncio
+    async def test_message_channel_context_connects_like_vnc_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skyvern.forge.sdk.routes.streaming.channels.cdp as cdp_mod
+
+        monkeypatch.setattr(cdp_mod.settings, "ENV", "local")
+        monkeypatch.setenv("LOCAL_CDP_HOST_PORT", "9224")
+        state = _patch_pw_stack(monkeypatch)
+
+        vnc_context = _make_context()
+        backing_message_channel = MagicMock()
+        backing_message_channel.organization_id = vnc_context.organization_id
+        backing_message_channel.browser_session = vnc_context.browser_session
+        backing_message_channel.identity = dict(vnc_context.identity)
+        message_context = MessageChannelContext(
+            message_channel=backing_message_channel,
+            x_api_key=vnc_context.x_api_key,
+        )
+        vnc_channel = ExfiltrationChannel(on_event=lambda _events: None, context=vnc_context)
+        message_channel = ExfiltrationChannel(on_event=lambda _events: None, context=message_context)
+
+        await vnc_channel.connect()
+        await message_channel.connect()
+
+        expected_connection = (
+            "http://localhost:9224",
+            {"x-api-key": "api-key-123", "X-Session-Id": "pbs_123"},
+        )
+        assert state.connections == [expected_connection, expected_connection]
+
+        await vnc_channel.stop()
+        await message_channel.stop()
+
     def test_js_asset_cache_is_keyed_by_file_not_instance(self) -> None:
         from skyvern.forge.sdk.routes.streaming.channels.cdp import _load_js_asset
 
@@ -641,8 +865,10 @@ class TestExfiltrationChannelLifecycle:
     def test_using_js_does_not_pin_channel_instance(self) -> None:
         # A cycle-free vnc stand-in so the channel is reclaimed by refcounting the
         # moment the JS cache stops pinning it (a MagicMock carries internal cycles).
-        vnc_channel = SimpleNamespace(identity={"client_id": "c"}, browser_session=None, x_api_key=None)
-        channel = ExfiltrationChannel(on_event=lambda _events: None, vnc_channel=vnc_channel)  # type: ignore[arg-type]
+        context = SimpleNamespace(
+            identity={"client_id": "c"}, organization_id="org_123", browser_session=None, x_api_key="api-key-123"
+        )
+        channel = ExfiltrationChannel(on_event=lambda _events: None, context=context)  # type: ignore[arg-type]
 
         channel.js("exfiltrate")
         ref = weakref.ref(channel)

@@ -50,13 +50,14 @@ export function RunTab() {
       onFix={
         workflowDeleted
           ? undefined
-          : (seedMessage) => {
+          : (seedMessage, failingLabel) => {
               // One replace-navigation opens the Copilot pane and seeds the message
               // via location.state (Workspace reads it as the copilot's
               // initialMessage), so the pane write can't race a separate
               // state-only navigation.
               openPane("copilot", {
-                state: { copilotMessage: seedMessage, copilotFixOrigin: true },
+                state: { copilotMessage: seedMessage },
+                selectedBlockLabel: failingLabel ?? null,
               });
             }
       }

@@ -239,6 +239,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
+        reuse_browser_session: bool = False,
         mask_secrets: bool = False,
         pin_saved_session_ip: bool = False,
         browser_profile_id: str | None = None,
@@ -260,13 +261,14 @@ class WorkflowsRepository(BaseRepository):
         folder_id: str | None = None,
         created_by: str | None = None,
         edited_by: str | None = None,
+        workflow_id: str | None = None,
     ) -> Workflow:
         async with self.Session() as session:
             # Policy is never taken from the caller's definition: a new version inherits exactly what
             # the previous one stored, so no save path can add, widen or clear an enrollment.
             carried = (
                 await self._policy_of_latest_version(session, workflow_permanent_id, organization_id)
-                if workflow_permanent_id
+                if workflow_permanent_id and version != 1
                 else None
             )
             workflow = WorkflowModel(
@@ -283,6 +285,7 @@ class WorkflowsRepository(BaseRepository):
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
+                reuse_browser_session=reuse_browser_session,
                 mask_secrets=mask_secrets,
                 pin_saved_session_ip=pin_saved_session_ip,
                 browser_profile_id=browser_profile_id,
@@ -305,6 +308,8 @@ class WorkflowsRepository(BaseRepository):
             )
             if workflow_permanent_id:
                 workflow.workflow_permanent_id = workflow_permanent_id
+            if workflow_id:
+                workflow.workflow_id = workflow_id
             if version:
                 workflow.version = version
             session.add(workflow)
@@ -398,8 +403,8 @@ class WorkflowsRepository(BaseRepository):
     @db_operation("is_workflow_copilot_authored")
     async def is_workflow_copilot_authored(self, workflow_permanent_id: str, organization_id: str) -> bool:
         """Any version ever stamped by copilot marks the lineage. The latest row alone is not a
-        durable signal: user saves re-stamp created_by/edited_by, while copilot back-stamps v1 on
-        copilot-born workflows. Deleted versions still count — provenance is historical."""
+        durable signal: user saves re-stamp created_by/edited_by. Deleted versions still count —
+        provenance is historical."""
         copilot_version_exists = (
             select(WorkflowModel.workflow_id)
             .filter_by(workflow_permanent_id=workflow_permanent_id, organization_id=organization_id)
@@ -451,7 +456,9 @@ class WorkflowsRepository(BaseRepository):
             get_workflow_query = get_workflow_query.filter_by(version=version)
         if ignore_version:
             get_workflow_query = get_workflow_query.filter(WorkflowModel.version != ignore_version)
-        get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc())
+        # Result.first() does not emit LIMIT, so without this the query fetches and discards every
+        # version row for the wpid — cost grows with each edit the workflow has ever received.
+        get_workflow_query = get_workflow_query.order_by(WorkflowModel.version.desc()).limit(1)
         async with self.Session() as session:
             if workflow := (await session.scalars(get_workflow_query)).first():
                 is_template = (
@@ -891,6 +898,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        reuse_browser_session: bool | None = None,
         mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
@@ -945,6 +953,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
+                if reuse_browser_session is not None:
+                    workflow.reuse_browser_session = reuse_browser_session
                 if mask_secrets is not None:
                     workflow.mask_secrets = mask_secrets
                 if pin_saved_session_ip is not None:
@@ -1215,6 +1225,7 @@ class WorkflowsRepository(BaseRepository):
         totp_verification_url: str | None | object = _UNSET,
         totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
+        reuse_browser_session: bool | None = None,
         mask_secrets: bool | None = None,
         pin_saved_session_ip: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
@@ -1313,6 +1324,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
+            if reuse_browser_session is not None:
+                workflow.reuse_browser_session = reuse_browser_session
             if mask_secrets is not None:
                 workflow.mask_secrets = mask_secrets
             if pin_saved_session_ip is not None:

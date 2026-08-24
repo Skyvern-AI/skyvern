@@ -28,7 +28,6 @@ import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { filterBlockSearchTargets } from "./blockSearch";
 import { PANE_HEADER_ICON_BUTTON_CLASS, studioPanelId } from "./constants";
 import { ControlTooltip } from "./ControlTooltip";
-import { PaneHeaderDivider } from "./PaneHeaderDivider";
 import { useStudioPaneCompact } from "./StudioShellContext";
 import { ViewToggle } from "./ViewToggle";
 
@@ -49,7 +48,6 @@ export function EditorPaneModeToggle() {
   }
   return (
     <>
-      <PaneHeaderDivider />
       <div
         role="group"
         aria-label="Editor view"

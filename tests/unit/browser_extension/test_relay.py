@@ -43,8 +43,12 @@ class RelayHarness:
     async def on_disconnect(self) -> None:
         self.disconnect_called.set()
 
-    async def on_pairing_complete(self) -> None:
+    async def on_pairing_complete(self) -> dict[str, str]:
         self.pairing_completed.set()
+        return {
+            "approvalNonce": "approval-nonce-sentinel",
+            "requestFingerprint": "1234abcd",
+        }
 
 
 @pytest_asyncio.fixture
@@ -213,7 +217,13 @@ async def test_pair_begin_claim_happy_path_and_pair_page_never_contains_token(
         )
         assert claim.status == 200
         assert claim.headers["Cache-Control"] == "no-store"
-        assert await claim.json() == {"v": 1, "port": relay_harness.server.bound_port, "token": TOKEN}
+        assert await claim.json() == {
+            "v": 1,
+            "port": relay_harness.server.bound_port,
+            "token": TOKEN,
+            "approvalNonce": "approval-nonce-sentinel",
+            "requestFingerprint": "1234abcd",
+        }
         assert relay_harness.pairing_completed.is_set()
 
 
@@ -306,7 +316,7 @@ def test_get_or_create_pairing_nonce_reuses_live_nonce_and_rotates_expired_nonce
 
 
 @pytest.mark.asyncio
-async def test_pair_claim_wrong_nonce_is_forbidden_and_consumes_active_nonce(
+async def test_pair_claim_wrong_nonce_is_forbidden_without_consuming_active_nonce(
     relay_harness: RelayHarness,
 ) -> None:
     nonce = relay_harness.server.create_pairing_nonce()
@@ -320,12 +330,13 @@ async def test_pair_claim_wrong_nonce_is_forbidden_and_consumes_active_nonce(
         assert wrong.status == 403
         assert await wrong.json() == {"error": "invalid_nonce"}
 
-        consumed = await session.post(
+        accepted = await session.post(
             http_url(relay_harness, "/pair/claim"),
             json={"v": 1, "nonce": nonce},
             headers=headers,
         )
-        assert consumed.status == 403
+
+    assert accepted.status == 200
 
 
 @pytest.mark.asyncio
@@ -347,6 +358,53 @@ async def test_pair_claim_nonce_is_single_use(relay_harness: RelayHarness) -> No
         assert first.status == 200
         assert second.status == 403
         assert await second.json() == {"error": "invalid_nonce"}
+
+
+@pytest.mark.asyncio
+async def test_pair_claim_concurrent_requests_consume_nonce_once(relay_harness: RelayHarness) -> None:
+    nonce = relay_harness.server.create_pairing_nonce()
+    headers = interactive_pairing_headers(relay_harness)
+    async with ClientSession() as session:
+        first, second = await asyncio.gather(
+            session.post(http_url(relay_harness, "/pair/claim"), json={"v": 1, "nonce": nonce}, headers=headers),
+            session.post(http_url(relay_harness, "/pair/claim"), json={"v": 1, "nonce": nonce}, headers=headers),
+        )
+
+    assert sorted((first.status, second.status)) == [200, 403]
+
+
+@pytest.mark.asyncio
+async def test_broker_pair_claim_rejects_expired_approval_offer() -> None:
+    async def no_approval_offer() -> None:
+        return None
+
+    server = ExtensionRelayServer(
+        TOKEN,
+        0,
+        AsyncMock(),
+        AsyncMock(),
+        control_pairing_only=True,
+        on_pairing_complete=no_approval_offer,
+    )
+    await server.start()
+    nonce = server.create_pairing_nonce()
+    origin = f"http://127.0.0.1:{server.bound_port}"
+    try:
+        async with ClientSession() as session:
+            response = await session.post(
+                f"{origin}/pair/claim",
+                json={"v": 1, "nonce": nonce},
+                headers={
+                    "Origin": origin,
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+            )
+
+        assert response.status == 409
+        assert await response.json() == {"error": "approval_offer_expired"}
+    finally:
+        await server.stop()
 
 
 @pytest.mark.asyncio
@@ -372,7 +430,7 @@ async def test_pair_claim_expired_nonce_is_forbidden(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [None, [], {"v": "1", "nonce": "present"}, {"v": 1}])
-async def test_pair_claim_bad_payload_is_forbidden_and_consumes_active_nonce(
+async def test_pair_claim_bad_payload_is_forbidden_without_consuming_active_nonce(
     relay_harness: RelayHarness,
     payload: object,
 ) -> None:
@@ -380,7 +438,7 @@ async def test_pair_claim_bad_payload_is_forbidden_and_consumes_active_nonce(
     headers = interactive_pairing_headers(relay_harness)
     async with ClientSession() as session:
         response = await session.post(http_url(relay_harness, "/pair/claim"), json=payload, headers=headers)
-        consumed = await session.post(
+        accepted = await session.post(
             http_url(relay_harness, "/pair/claim"),
             json={"v": 1, "nonce": nonce},
             headers=headers,
@@ -389,8 +447,7 @@ async def test_pair_claim_bad_payload_is_forbidden_and_consumes_active_nonce(
         assert response.status == 403
         assert response.headers["Cache-Control"] == "no-store"
         assert await response.json() == {"error": "invalid_nonce"}
-        assert consumed.status == 403
-        assert await consumed.json() == {"error": "invalid_nonce"}
+        assert accepted.status == 200
 
 
 @pytest.mark.asyncio

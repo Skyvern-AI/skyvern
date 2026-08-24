@@ -4,10 +4,89 @@ from __future__ import annotations
 
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
-from skyvern.cli.mcp_tools.blocks import skyvern_block_schema, skyvern_block_validate
+from skyvern.cli.mcp_tools.blocks import (
+    WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
+    skyvern_block_schema,
+    skyvern_block_validate,
+    skyvern_workflow_knowledge,
+)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_lists_available_topics_without_returning_the_document() -> None:
+    result = await skyvern_workflow_knowledge()
+
+    assert result["ok"] is True
+    assert result["data"]["topics"] == list(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
+    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
+    assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_returns_only_the_requested_authoritative_sections() -> None:
+    result = await skyvern_workflow_knowledge(topics=["workflow_parameters", "error_handling_and_retries"])
+
+    assert result["ok"] is True
+    sections = result["data"]["sections"]
+    assert list(sections) == [
+        "workflow_parameters",
+        "error_handling_and_retries",
+    ]
+    assert all(section["content"] for section in sections.values())
+    assert "complete_workflow_example" not in sections
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_rejects_unknown_topics_with_the_catalog() -> None:
+    result = await skyvern_workflow_knowledge(topics=["does_not_exist"])
+
+    assert result["ok"] is False
+    assert "does_not_exist" in result["error"]["message"]
+    assert "workflow_parameters" in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_rejects_empty_topic_selection() -> None:
+    result = await skyvern_workflow_knowledge(topics=[])
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_INPUT"
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_reports_a_missing_document_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from skyvern.cli.mcp_tools import blocks
+
+    monkeypatch.setattr(blocks, "_KB_PATH", tmp_path / "missing.txt")
+    monkeypatch.setattr(blocks, "_knowledge_topic_cache", None)
+
+    result = await blocks.skyvern_workflow_knowledge()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "SDK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_rejects_an_incomplete_topic_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from skyvern.cli.mcp_tools import blocks
+
+    incomplete = tmp_path / "knowledge.txt"
+    incomplete.write_text("** WORKFLOW PARAMETERS **\nOnly one section")
+    monkeypatch.setattr(blocks, "_KB_PATH", incomplete)
+    monkeypatch.setattr(blocks, "_knowledge_topic_cache", None)
+
+    result = await blocks.skyvern_workflow_knowledge()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "SDK_ERROR"
 
 
 @pytest.mark.asyncio

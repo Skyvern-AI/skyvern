@@ -31,6 +31,8 @@ from skyvern.forge.sdk.artifact.storage.base import (
     BaseStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
+    download_checksums_by_uri,
+    key_is_org_scoped,
     presign_with_sensitive_cap,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
@@ -732,7 +734,17 @@ class S3Storage(BaseStorage):
         """Save files from local download directory to S3."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
+        if not files:
+            return
+        already_saved = (
+            download_checksums_by_uri(
+                await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
+            )
+            if run_id is not None
+            else {}
+        )
         skipped_files: list[str] = []
+        unchanged_file_count = 0
         for file in files:
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
@@ -743,6 +755,11 @@ class S3Storage(BaseStorage):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
+            # Cleanup runs repeatedly over a growing download dir; re-sending bytes that are
+            # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
+            if already_saved.get(uri) == checksum:
+                unchanged_file_count += 1
+                continue
             file_size = _safe_get_file_size(fpath)
             # S3 object metadata only allows ASCII; non-ASCII filenames (CJK,
             # emoji) would otherwise raise ParamValidationError at upload time.
@@ -796,6 +813,14 @@ class S3Storage(BaseStorage):
                         exc_info=True,
                     )
                     skipped_files.append(file)
+        if unchanged_file_count:
+            LOG.info(
+                "Skipped downloaded files already saved with the same checksum",
+                organization_id=organization_id,
+                run_id=run_id,
+                unchanged_file_count=unchanged_file_count,
+                total_file_count=len(files),
+            )
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)
 
@@ -954,6 +979,10 @@ class S3Storage(BaseStorage):
             return None
         return presigned_urls[0], uploaded_s3_uri
 
+    async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
+        self.assert_managed_file_access(uri, organization_id)
+        await self.async_client.delete_file(uri, log_exception=True, raise_on_error=True)
+
     def _build_browser_session_uri(
         self,
         organization_id: str,
@@ -977,6 +1006,7 @@ class S3Storage(BaseStorage):
         remote_path: str,
         date: str | None = None,
         recording_finalized_at: datetime | None = None,
+        producer_run_id: str | None = None,
     ) -> str:
         """Sync a file from local browser session to S3."""
         uri = self._build_browser_session_uri(organization_id, browser_session_id, artifact_type, remote_path, date)
@@ -1059,6 +1089,7 @@ class S3Storage(BaseStorage):
                 filename=os.path.basename(remote_path),
                 checksum=download_checksum,
                 file_size=download_file_size,
+                run_id=None if is_partial else producer_run_id,
             )
         return uri
 
@@ -1125,13 +1156,13 @@ class S3Storage(BaseStorage):
                 f"{settings.ENV}/{organization_id}/",
                 f"{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/",
             )
-            if any(parsed_uri.key.startswith(prefix) for prefix in allowed_prefixes):
+            if key_is_org_scoped(parsed_uri.key, allowed_prefixes):
                 return
 
         # Artifacts bucket: keys use v1/{env}/{org}/
         if parsed_uri.bucket == settings.AWS_S3_BUCKET_ARTIFACTS:
             artifact_prefix = f"{self._PATH_VERSION}/{settings.ENV}/{organization_id}/"
-            if parsed_uri.key.startswith(artifact_prefix):
+            if key_is_org_scoped(parsed_uri.key, (artifact_prefix,)):
                 return
 
         raise PermissionError(f"No permission to access storage URI: {uri}")

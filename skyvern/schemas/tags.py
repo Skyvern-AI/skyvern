@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEYS,
     TAG_DESCRIPTION_MAX_LENGTH,
+    assert_tag_value_not_reserved,
     assert_user_writable_tag_key,
     normalize_optional_tag_key,
     normalize_optional_tag_value,
@@ -47,11 +48,12 @@ class TagInput(BaseModel):
         return normalize_tag_value(v)
 
     @model_validator(mode="after")
-    def _value_avoids_filter_grammar_sigils(self) -> TagInput:
+    def _value_avoids_reserved_forms(self) -> TagInput:
         if self.key is None and ":" in self.value:
             raise ValueError("standalone label values must not contain ':' (use a group, e.g. key:value)")
         if self.key is not None and self.value == "*":
             raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        assert_tag_value_not_reserved(self.value)
         return self
 
 
@@ -275,6 +277,7 @@ class TagValueCreate(BaseModel):
         # Grouped values reserve '*' as the group filter wildcard (mirrors TagInput).
         if value == "*":
             raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        assert_tag_value_not_reserved(value)
         return value
 
     @field_validator("color", mode="before")
@@ -322,6 +325,9 @@ class TagValueRename(BaseModel):
         # Grouped values reserve '*' as the group filter wildcard (mirrors TagInput).
         if self.new_value == "*":
             raise ValueError("grouped tag values must not be exactly '*' (reserved as the group filter wildcard)")
+        # Only the target is reserved-checked: renaming *away from* a pre-existing
+        # colliding value is the remediation path for rows written before this rule.
+        assert_tag_value_not_reserved(self.new_value)
         return self
 
 

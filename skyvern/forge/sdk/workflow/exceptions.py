@@ -105,6 +105,24 @@ class InvalidEmailClientConfiguration(BaseWorkflowException):
         super().__init__(f"Email client configuration is invalid. These parameters are missing or invalid: {problems}")
 
 
+class CustomSMTPConnectionFailed(BaseWorkflowException):
+    def __init__(self, host: str, port: int, reason: str | None = None) -> None:
+        detail = f" ({reason})" if reason else ""
+        super().__init__(
+            f"Could not connect to SMTP server {host}:{port}{detail}. "
+            "Check the SMTP host and port in the Send Email block's Advanced settings."
+        )
+
+
+class CustomSMTPAuthenticationFailed(BaseWorkflowException):
+    def __init__(self, username: str) -> None:
+        super().__init__(
+            f"SMTP authentication failed for '{username}'. "
+            "Check the SMTP username and password in the Send Email block's Advanced settings. "
+            "For Gmail, use an App Password instead of your regular password."
+        )
+
+
 class NoValidEmailRecipient(BaseWorkflowException):
     def __init__(self, recipients: list[str]) -> None:
         super().__init__(f"No valid email recipient found. Recipients: {recipients}")
@@ -174,9 +192,13 @@ class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
         )
 
 
-class InvalidWaitBlockTime(SkyvernException):
-    def __init__(self, max_sec: int) -> None:
-        super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")
+class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, wait_sec: int, max_sec: int) -> None:
+        super().__init__(
+            f"Invalid wait time {wait_sec} for wait block '{block_label}'. "
+            f"It must be a whole number of seconds between 1 and {max_sec}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
 
 
 class FailedToFormatJinjaStyleParameter(SkyvernException):

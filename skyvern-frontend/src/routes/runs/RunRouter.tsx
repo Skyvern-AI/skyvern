@@ -86,7 +86,7 @@ function RunRouter() {
               <Route index element={<Navigate to="overview" replace />} />
               <Route
                 path="blocks"
-                element={<Navigate to="overview" replace />}
+                element={<Navigate to={`/runs/${runId}/overview`} replace />}
               />
               <Route path="overview" element={<WorkflowRunOverview />} />
               <Route path="output" element={<WorkflowRunOutput />} />
@@ -122,7 +122,7 @@ function RunRouter() {
     }
 
     return <Status404 />;
-  }, [runType]);
+  }, [runType, runId]);
 
   if (runId?.startsWith("tsk_v2")) {
     if (isLoading) {

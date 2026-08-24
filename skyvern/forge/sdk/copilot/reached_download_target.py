@@ -291,7 +291,9 @@ def guidance_for(target: ReachedDownloadTarget) -> str:
 
 
 _EXPECT_DOWNLOAD_ATTR = "expect_download"
-_DOWNLOAD_EVENT_CAPTURE_ATTRS: frozenset[str] = frozenset({"wait_for_event", "expect_event"})
+_DOWNLOAD_EVENT_CAPTURE_ATTRS: frozenset[str] = frozenset(
+    {"wait_for_event", "expect_event", "on", "once", "add_listener"}
+)
 _DOWNLOAD_EVENT_NAME = "download"
 _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
 
@@ -344,8 +346,9 @@ def _call_is_expect_download(node: ast.expr) -> bool:
 
 
 def _call_is_download_event_capture(node: ast.expr) -> bool:
-    """True for the event-based download idioms ``page.wait_for_event("download")`` /
-    ``page.expect_event("download")`` (await-unwrapped, first arg the literal ``"download"``).
+    """True for the event-based download idioms -- ``wait_for_event``/``expect_event`` and the
+    listener spellings ``on``/``once``/``add_listener`` -- taking the literal ``"download"`` as their
+    first argument (await-unwrapped).
 
     A hand-rolled event capture registers the same browser download as ``expect_download`` but evades
     the strict ``expect_download`` predicate, so the gate and contract treat it as download intent."""
@@ -387,9 +390,12 @@ def _call_is_download_claim(node: ast.expr) -> bool:
 
 def code_is_download_intent(code: str) -> bool:
     """True when a code block authors a download: it uses the `page.expect_download` context-manager
-    idiom, the event-based `page.wait_for_event("download")` / `page.expect_event("download")` idiom,
-    or the `click_and_claim_download` helper anywhere, or returns/binds a dict literal carrying an
-    execution-layer download registration key."""
+    idiom, any event-based `"download"` capture (`wait_for_event`/`expect_event`/`on`/`once`/
+    `add_listener`), or the `click_and_claim_download` helper anywhere, or returns/binds a dict
+    literal carrying an execution-layer download registration key. It stays deliberately broader
+    than the runner's own policy — the denied `page.expect_download` idiom still counts — because
+    its consumer is the unregistered-download telemetry in workflow/models/block.py, which measures
+    authorship rather than validity."""
     if not code.strip():
         return False
     try:

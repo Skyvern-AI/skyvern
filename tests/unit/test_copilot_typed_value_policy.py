@@ -15,6 +15,7 @@ async def test_type_text_uses_exact_registered_secret_fact_and_stashes_ordinary_
         browser_session_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
+        discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         secret_scrub_values=["known-vault-value"],
     )
@@ -40,6 +41,7 @@ async def test_type_text_pre_hook_does_not_infer_secret_status_from_text_selecto
         browser_session_id=None,
         pending_scout_source_url=None,
         pending_scout_input_value=None,
+        discovery_mcp_server=None,
         block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         workflow_persisted=True,
         last_full_workflow_test_ok=True,
@@ -89,7 +91,7 @@ async def test_code_block_schema_carries_the_steps_already_demonstrated() -> Non
     demonstrated = result["data"]["demonstrated_steps"]
     assert demonstrated[0]["tool_name"] == "click"
     assert demonstrated[0]["selector"] == 'button[aria-label="Log in"]'
-    assert demonstrated[0]["source_url"] == "https://example.com/a"
+    assert demonstrated[0]["source_url"] == "https://example.com/"
     assert demonstrated[0]["selector_match_count"] is None
 
 

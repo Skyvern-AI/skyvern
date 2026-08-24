@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import BlockRunIdentity, CopilotContext
 from skyvern.forge.sdk.copilot.narration import (
     MAX_BLOCK_ACTIVITY_ENTRIES,
     MAX_DESIGN_ACTIVITY_ENTRIES,
@@ -15,8 +15,11 @@ from skyvern.forge.sdk.copilot.narration import (
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
+from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 
 _SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
+
+_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 _CREDENTIAL_PAYLOAD: dict[str, object] = {
     "count": 4,
@@ -60,7 +63,7 @@ def _staged(*labels: str) -> SimpleNamespace:
 
 
 def test_tool_call_activity_shape_and_denylist() -> None:
-    entry = build_tool_call_activity("update_workflow", 3, "abc")
+    entry = build_tool_call_activity("update_workflow", 3, "abc", timestamp=_TS)
     assert entry == {
         "kind": "tool_call",
         "text": "Updating workflow…",
@@ -68,13 +71,14 @@ def test_tool_call_activity_shape_and_denylist() -> None:
         "toolName": "update_workflow",
         "displayLabel": "Updating workflow",
         "id": "tc-abc",
+        "timestamp": _TS.isoformat(),
     }
     assert "success" not in entry
-    assert build_tool_call_activity("get_run_results", 0, "x") is None
+    assert build_tool_call_activity("get_run_results", 0, "x", timestamp=_TS) is None
 
 
 def test_tool_result_activity_shape_falls_back_to_tool_name_and_denylist() -> None:
-    entry = build_tool_result_activity("update_workflow", "Updated 2 blocks", True, 4, "abc")
+    entry = build_tool_result_activity("update_workflow", "Updated 2 blocks", True, 4, "abc", timestamp=_TS)
     assert entry == {
         "kind": "tool_result",
         "text": "Updated 2 blocks",
@@ -83,10 +87,13 @@ def test_tool_result_activity_shape_falls_back_to_tool_name_and_denylist() -> No
         "displayLabel": "Updating workflow",
         "success": True,
         "id": "tr-abc",
+        "timestamp": _TS.isoformat(),
     }
-    assert build_tool_result_activity("update_workflow", "", False, 4, "abc")["text"] == "Updating workflow"
-    assert build_tool_result_activity("get_browser_screenshot", "s", True, 0, "x") is None
-    assert build_tool_result_activity("get_run_results", "s", True, 0, "x") is None
+    assert (
+        build_tool_result_activity("update_workflow", "", False, 4, "abc", timestamp=_TS)["text"] == "Updating workflow"
+    )
+    assert build_tool_result_activity("get_browser_screenshot", "s", True, 0, "x", timestamp=_TS) is None
+    assert build_tool_result_activity("get_run_results", "s", True, 0, "x", timestamp=_TS) is None
 
 
 def test_narration_activity_shape() -> None:
@@ -96,6 +103,7 @@ def test_narration_activity_shape() -> None:
         "text": "Doing the thing",
         "iteration": 5,
         "id": "n-5-2026-01-01T00:00:00+00:00",
+        "timestamp": "2026-01-01T00:00:00+00:00",
     }
     assert "toolName" not in entry
 
@@ -111,7 +119,7 @@ def test_emitted_progress_texts_is_a_fresh_per_state_set() -> None:
 
 def test_record_activity_routes_to_design_when_no_block_running() -> None:
     state = NarratorState()
-    state.record_activity(build_tool_call_activity("update_workflow", 0, "c1"))
+    state.record_activity(build_tool_call_activity("update_workflow", 0, "c1", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c1"]
     assert state.block_activity == {}
 
@@ -119,7 +127,9 @@ def test_record_activity_routes_to_design_when_no_block_running() -> None:
 def test_record_activity_routes_to_running_block() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
-    state.record_activity(build_tool_result_activity("run_blocks_and_collect_debug", "ran", True, 1, "c2"))
+    state.record_activity(
+        build_tool_result_activity("run_blocks_and_collect_debug", "ran", True, 1, "c2", timestamp=_TS)
+    )
     assert [e["id"] for e in state.block_activity["step_1"]] == ["tr-c2"]
     assert state.design_activity == []
 
@@ -127,8 +137,8 @@ def test_record_activity_routes_to_running_block() -> None:
 def test_record_activity_drops_denylisted_entries() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
-    state.record_activity(build_tool_call_activity("get_run_results", 0, "c1"))
-    state.record_activity(build_tool_call_activity("update_workflow", 1, "c2"))
+    state.record_activity(build_tool_call_activity("get_run_results", 0, "c1", timestamp=_TS))
+    state.record_activity(build_tool_call_activity("update_workflow", 1, "c2", timestamp=_TS))
     assert [e["id"] for e in state.block_activity["step_1"]] == ["tc-c2"]
 
 
@@ -136,7 +146,7 @@ def test_record_activity_caps_keep_most_recent() -> None:
     state = NarratorState()
     state.running_block_label = "b"
     for i in range(MAX_BLOCK_ACTIVITY_ENTRIES + 10):
-        state.record_activity(build_tool_call_activity("t", i, f"c{i}"))
+        state.record_activity(build_tool_call_activity("t", i, f"c{i}", timestamp=_TS))
     bucket = state.block_activity["b"]
     assert len(bucket) == MAX_BLOCK_ACTIVITY_ENTRIES
     assert bucket[0]["iteration"] == 10
@@ -154,11 +164,13 @@ def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
     # running_block_label; its result must rejoin the call's bucket so the FE
     # folds the pair instead of stranding the call row "calling…".
     state = NarratorState()
-    state.record_activity(build_tool_call_activity("update_and_run_blocks", 0, "c1"))
+    state.record_activity(build_tool_call_activity("update_and_run_blocks", 0, "c1", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c1"]
 
     state.running_block_label = "step_1"
-    state.record_activity(build_tool_result_activity("update_and_run_blocks", "Workflow updated", True, 1, "c1"))
+    state.record_activity(
+        build_tool_result_activity("update_and_run_blocks", "Workflow updated", True, 1, "c1", timestamp=_TS)
+    )
 
     assert [e["id"] for e in state.design_activity] == ["tc-c1", "tr-c1"]
     assert state.block_activity == {}
@@ -167,11 +179,11 @@ def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
 def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
     # The pin is scoped to run tools; other tools keep live running_block_label routing.
     state = NarratorState()
-    state.record_activity(build_tool_call_activity("evaluate", 0, "c9"))
+    state.record_activity(build_tool_call_activity("evaluate", 0, "c9", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c9"]
 
     state.running_block_label = "step_2"
-    state.record_activity(build_tool_result_activity("evaluate", "Inspecting page", True, 1, "c9"))
+    state.record_activity(build_tool_result_activity("evaluate", "Inspecting page", True, 1, "c9", timestamp=_TS))
 
     assert [e["id"] for e in state.block_activity["step_2"]] == ["tr-c9"]
     assert [e["id"] for e in state.design_activity] == ["tc-c9"]
@@ -195,14 +207,22 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
         build_narration_activity("Planning the build", 0, datetime(2026, 1, 1, tzinfo=timezone.utc))
     ]
     state.block_activity = {
-        "step_1": [build_tool_result_activity("run_blocks_and_collect_debug", "ran step_1", True, 1, "c1")]
+        "step_1": [
+            build_tool_result_activity("run_blocks_and_collect_debug", "ran step_1", True, 1, "c1", timestamp=_TS)
+        ]
     }
     ctx.narrator_state = state
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
 
     assert payload["designActivity"] == [
-        {"kind": "narration", "text": "Planning the build", "iteration": 0, "id": "n-0-2026-01-01T00:00:00+00:00"}
+        {
+            "kind": "narration",
+            "text": "Planning the build",
+            "iteration": 0,
+            "id": "n-0-2026-01-01T00:00:00+00:00",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
     ]
     blocks_by_label = {b["label"]: b for b in payload["blocks"]}
     assert blocks_by_label["step_1"]["activity"] == [
@@ -214,9 +234,26 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
             "displayLabel": "Testing workflow",
             "success": True,
             "id": "tr-c1",
+            "timestamp": _TS.isoformat(),
         }
     ]
     assert blocks_by_label["step_2"]["activity"] == []
+
+
+def test_build_narrative_payload_persists_block_run_identity() -> None:
+    ctx = _ctx()
+    ctx.staged_workflow = _staged("step_1", "drafted_only")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+    ctx.block_state_map = {"step_1": "completed"}
+    ctx.block_run_identity_map = {"step_1": BlockRunIdentity(workflow_run_block_id="wrb_1", iteration=6)}
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message=None, narrative_summary=None)
+
+    blocks_by_label = {b["label"]: b for b in payload["blocks"]}
+    assert blocks_by_label["step_1"]["workflowRunBlockId"] == "wrb_1"
+    assert blocks_by_label["step_1"]["lastSeenIteration"] == 6
+    assert "workflowRunBlockId" not in blocks_by_label["drafted_only"]
+    assert blocks_by_label["drafted_only"]["lastSeenIteration"] == 0
 
 
 def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
@@ -229,6 +266,80 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
 
     assert payload["designActivity"] == []
     assert payload["blocks"][0]["activity"] == []
+
+
+def test_build_narrative_payload_persists_review_projection() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: existing
+      prompt: before
+"""
+    ctx.staged_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: existing
+      prompt: after
+    - block_type: task
+      label: added
+      prompt: new
+"""
+    ctx.staged_workflow = _staged("existing", "added")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+    ctx.executed_block_fingerprints = workflow_block_fingerprints(ctx.staged_workflow_yaml)
+    ctx.executed_block_fingerprints.pop("added")
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert payload["review"] == {
+        "blocks": [
+            {"label": "existing", "blockType": "task", "change": "changed", "neverTested": False},
+            {"label": "added", "blockType": "task", "change": "added", "neverTested": True},
+        ],
+        "duplicateWrites": [],
+    }
+    assert payload["testedBlockFingerprints"] == {"existing": sorted(ctx.executed_block_fingerprints["existing"])}
+
+
+def test_build_narrative_payload_omits_review_when_projection_is_unavailable() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = "::: invalid"
+    ctx.staged_workflow_yaml = "::: invalid"
+    ctx.staged_workflow = _staged("step_1")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert "review" not in payload
+
+
+def test_build_narrative_payload_projects_an_empty_persisted_workflow() -> None:
+    ctx = _ctx()
+    ctx.persisted_workflow_yaml = None
+    ctx.staged_workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: task
+      label: first_draft
+      prompt: new
+"""
+    ctx.staged_workflow = _staged("first_draft")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert payload["review"] == {
+        "blocks": [
+            {"label": "first_draft", "blockType": "task", "change": "added", "neverTested": True},
+        ],
+        "duplicateWrites": [],
+    }
 
 
 def test_surgical_edit_tools_label_the_operation_and_target_block() -> None:
@@ -277,9 +388,13 @@ def test_surgical_edit_tools_never_render_the_working_fallback() -> None:
     }
     for index, tool_name in enumerate(_SURGICAL_EDIT_TOOLS):
         display_label = labels[tool_name]
-        state.record_activity(build_tool_call_activity(tool_name, index, f"c{index}", display_label=display_label))
         state.record_activity(
-            build_tool_result_activity(tool_name, "", True, index, f"c{index}", display_label=display_label)
+            build_tool_call_activity(tool_name, index, f"c{index}", display_label=display_label, timestamp=_TS)
+        )
+        state.record_activity(
+            build_tool_result_activity(
+                tool_name, "", True, index, f"c{index}", display_label=display_label, timestamp=_TS
+            )
         )
 
     rows = state.design_activity
@@ -292,9 +407,9 @@ def test_surgical_edit_tools_never_render_the_working_fallback() -> None:
 
 def _credential_rows(state: NarratorState, parsed: dict[str, object], index: int) -> None:
     summary = format_tool_result_for_user("list_credentials", parsed)  # type: ignore[arg-type]
-    state.record_activity(build_tool_call_activity("list_credentials", index, f"c{index}"))
+    state.record_activity(build_tool_call_activity("list_credentials", index, f"c{index}", timestamp=_TS))
     state.record_activity(
-        build_tool_result_activity("list_credentials", summary, bool(parsed["ok"]), index, f"c{index}")
+        build_tool_result_activity("list_credentials", summary, bool(parsed["ok"]), index, f"c{index}", timestamp=_TS)
     )
 
 
@@ -328,8 +443,10 @@ def test_no_connection_use_line_is_rendered_from_credential_enumeration() -> Non
 
 
 def test_explicit_display_label_overrides_the_static_name_map() -> None:
-    call = build_tool_call_activity("edit_block", 2, "c7", display_label='Editing block "Log in"')
-    result = build_tool_result_activity("edit_block", "", True, 2, "c7", display_label='Editing block "Log in"')
+    call = build_tool_call_activity("edit_block", 2, "c7", display_label='Editing block "Log in"', timestamp=_TS)
+    result = build_tool_result_activity(
+        "edit_block", "", True, 2, "c7", display_label='Editing block "Log in"', timestamp=_TS
+    )
     assert call["displayLabel"] == result["displayLabel"] == 'Editing block "Log in"'
     assert call["text"] == 'Editing block "Log in"…'
     assert result["text"] == 'Editing block "Log in"'
@@ -359,8 +476,12 @@ def test_credential_fill_row_names_the_action_without_leaking_material() -> None
     assert label == "Entering saved credentials"
 
     state = NarratorState()
-    state.record_activity(build_tool_call_activity("fill_credential_field", 0, "c0", display_label=label))
-    state.record_activity(build_tool_result_activity("fill_credential_field", "", True, 0, "c0", display_label=label))
+    state.record_activity(
+        build_tool_call_activity("fill_credential_field", 0, "c0", display_label=label, timestamp=_TS)
+    )
+    state.record_activity(
+        build_tool_result_activity("fill_credential_field", "", True, 0, "c0", display_label=label, timestamp=_TS)
+    )
 
     rows = state.design_activity
     assert len(rows) == 2

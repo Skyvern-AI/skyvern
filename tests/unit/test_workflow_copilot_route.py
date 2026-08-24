@@ -37,9 +37,14 @@ from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.terminal_envelope import (
     INTERRUPTED_TERMINAL_MESSAGE,
     INTERRUPTED_TERMINAL_REASON,
+    InterruptedTurnFacts,
     assemble_terminal_envelope,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
+from skyvern.forge.sdk.db.repositories.workflow_parameters import (
+    _completed_turn_id_for_idempotency_digest,
+    _pending_turn_id_for_idempotency_digest,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_V2_FLAG_KEY,
@@ -51,7 +56,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_chat_history,
     workflow_copilot_chat_post,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotPendingTurn,
     WorkflowCopilotChat,
@@ -102,7 +107,10 @@ def copilot_stream() -> MagicMock:
 
 
 def _make_chat_request(
-    mode: str | None = None, code_block: bool | None = None, keep_pending_proposal: bool = False
+    mode: str | None = None,
+    code_block: bool | None = None,
+    keep_pending_proposal: bool = False,
+    idempotency_key: str | None = None,
 ) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
@@ -114,6 +122,7 @@ def _make_chat_request(
         mode=mode,
         code_block=code_block,
         keep_pending_proposal=keep_pending_proposal,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -476,6 +485,86 @@ async def test_cancel_turn_finalizes_terminal_envelope_to_non_completed_state(
     assert persisted_payload["terminalEnvelope"]["response_kind"] == "stopped"
 
 
+async def _persist_cancel_and_read_row(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    record_as_interrupted: bool,
+) -> tuple[str, dict[str, Any]]:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical", version=7)
+    agent_result = AgentResult(
+        user_response="Cancelled by user.",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        proposal_disposition="auto_applicable",
+        cancelled=True,
+        cancellation_iteration=4,
+        cancellation_last_recorded_phase="persisted_block_run",
+        narrative_payload=_narrative_payload(),
+        terminal_envelope=_terminal_payload(verified=False, workflow_applied=False),
+    )
+    _, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    await workflow_copilot_route._persist_cancel_turn(
+        stream=MagicMock(send=AsyncMock(return_value=True)),
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        user_message="stop",
+        agent_result=agent_result,
+        turn_id="turn-1",
+        record_as_interrupted=record_as_interrupted,
+    )
+
+    written = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
+    return written["content"], written["narrative_payload"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_nobody_asked_for_is_recorded_as_interrupted_with_what_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content, payload = await _persist_cancel_and_read_row(monkeypatch, record_as_interrupted=True)
+
+    assert "interrupted" in content.lower()
+    assert "Cancelled by user." not in content
+    assert not [
+        token
+        for token in ("failed", "navigated", "disconnected", "connection lost", "timed out")
+        if token in content.lower()
+    ]
+    assert "iteration 4" in content
+    assert "wpid-1" in content and "version 7" in content
+    assert "persisted_block_run" in content
+    interruption = payload["terminalEnvelope"]["interruption"]
+    assert interruption["iteration"] == 4
+    assert interruption["workflow_permanent_id"] == "wpid-1"
+    assert interruption["workflow_version"] == 7
+    assert interruption["last_recorded_build_test_phase"] == "persisted_block_run"
+    assert interruption["recorded_at"] is not None
+    assert payload["terminalEnvelope"]["halt_kind"] == INTERRUPTED_TERMINAL_REASON
+    # An interrupted turn halted rather than failed; the FE reads this to keep it
+    # out of failure treatment.
+    assert payload["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_user_stop_is_still_recorded_as_the_users_own_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content, payload = await _persist_cancel_and_read_row(monkeypatch, record_as_interrupted=False)
+
+    assert content == "Cancelled by user."
+    assert payload["terminalEnvelope"].get("interruption") is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flag_enabled", [True, False], ids=["flag-on", "flag-off"])
 async def test_finalise_normal_turn_logs_render_decision(
@@ -626,7 +715,7 @@ async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
         chat=chat,
         organization_id="org-1",
         original_workflow=None,
-        chat_request=_make_chat_request(),
+        chat_request=_make_chat_request(idempotency_key="connected-account:turn-choice:goac_1"),
         agent_result=agent_result,
     )
 
@@ -638,6 +727,11 @@ async def test_finalise_normal_turn_preserves_and_persists_answer_outcome(
     persisted = workflow_params.create_workflow_copilot_chat_message.await_args_list[-1].kwargs
     assert persisted["content"] == answer
     assert persisted["turn_outcome"].response_kind is ResponseKind.ANSWER
+    assert persisted["turn_outcome"].idempotency_digest == workflow_copilot_route._copilot_idempotency_digest(
+        "org-1",
+        "chat-1",
+        "connected-account:turn-choice:goac_1",
+    )
 
 
 @pytest.mark.asyncio
@@ -2297,11 +2391,6 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     workflow_service = SimpleNamespace(update_workflow_definition=AsyncMock())
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "resolve_copilot_created_by_stamp",
-        AsyncMock(return_value="copilot"),
-    )
 
     response = await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
     assert response is captured["sentinel"]
@@ -2667,6 +2756,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         cancelled=False,
         output_policy_diagnostics=None,
         canonical_was_persisted_due_to_param_change=False,
+        executed_block_fingerprints={},
     )
 
     await workflow_copilot_route._persist_proposed_workflow_state(chat, agent_result, restored=False)
@@ -2685,6 +2775,7 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         proposal_disposition="review_untested",
         cancelled=False,
         output_policy_diagnostics=None,
+        executed_block_fingerprints={},
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -2973,6 +3064,61 @@ def _make_pending_turn(turn_id: str, age_seconds: float, **overrides: Any) -> Co
     )
 
 
+def test_pending_turn_idempotency_digest_matches_only_the_exact_product_action() -> None:
+    pending = {
+        "turn-a": _make_pending_turn(
+            "turn-a",
+            1,
+            idempotency_digest="digest-1",
+        ).model_dump(mode="json")
+    }
+
+    assert (
+        _pending_turn_id_for_idempotency_digest(
+            pending,
+            "digest-1",
+        )
+        == "turn-a"
+    )
+    assert _pending_turn_id_for_idempotency_digest(pending, "digest-2") is None
+    assert _pending_turn_id_for_idempotency_digest(pending, None) is None
+
+
+def test_completed_turn_idempotency_digest_closes_the_post_completion_retry_race() -> None:
+    outcomes = [
+        {
+            "copilot_turn_id": "turn-a",
+            "idempotency_digest": "digest-1",
+        }
+    ]
+
+    assert (
+        _completed_turn_id_for_idempotency_digest(
+            outcomes,
+            "digest-1",
+        )
+        == "turn-a"
+    )
+    assert _completed_turn_id_for_idempotency_digest(outcomes, "digest-2") is None
+
+
+def test_completed_turn_idempotency_digest_never_synthesizes_a_turn_id() -> None:
+    outcomes = [{"idempotency_digest": "digest-1"}]
+
+    assert _completed_turn_id_for_idempotency_digest(outcomes, "digest-1") is None
+
+
+def test_copilot_idempotency_digest_never_persists_the_client_value() -> None:
+    client_value = "connected-account:turn-choice:raw-client-value"
+
+    digest = workflow_copilot_route._copilot_idempotency_digest("org-1", "chat-1", client_value)
+
+    assert digest is not None
+    assert client_value not in digest
+    assert digest == workflow_copilot_route._copilot_idempotency_digest("org-1", "chat-1", client_value)
+    assert digest != workflow_copilot_route._copilot_idempotency_digest("org-2", "chat-1", client_value)
+
+
 def _make_persisted_chat(
     pending: list[CopilotPendingTurn], proposed_workflow: dict | None = None
 ) -> WorkflowCopilotChat:
@@ -3001,6 +3147,7 @@ class _FakeCopilotChatStore:
         sender: WorkflowCopilotChatSender,
         content: str,
         turn_outcome: TurnOutcome | None = None,
+        narrative_payload: Any = None,
     ) -> WorkflowCopilotChatMessage:
         message = WorkflowCopilotChatMessage(
             workflow_copilot_chat_message_id=f"wccm-{len(self.messages)}",
@@ -3008,6 +3155,7 @@ class _FakeCopilotChatStore:
             sender=sender,
             content=content,
             turn_outcome=turn_outcome,
+            narrative_payload=narrative_payload,
             created_at=_NOW,
             modified_at=_NOW,
         )
@@ -3043,7 +3191,7 @@ class _FakeCopilotChatStore:
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: Any = None,
     ) -> WorkflowCopilotChatMessage:
-        return self.add_message(sender, content, turn_outcome)
+        return self.add_message(sender, content, turn_outcome, narrative_payload)
 
     async def replace_workflow_copilot_chat_message(
         self,
@@ -3056,7 +3204,13 @@ class _FakeCopilotChatStore:
     ) -> WorkflowCopilotChatMessage | None:
         for index, message in enumerate(self.messages):
             if message.workflow_copilot_chat_message_id == workflow_copilot_chat_message_id:
-                replaced = message.model_copy(update={"content": content, "turn_outcome": turn_outcome})
+                replaced = message.model_copy(
+                    update={
+                        "content": content,
+                        "turn_outcome": turn_outcome,
+                        "narrative_payload": narrative_payload,
+                    }
+                )
                 self.messages[index] = replaced
                 return replaced
         return None
@@ -3146,6 +3300,96 @@ async def test_chat_history_marks_abandoned_turn_interrupted_not_cancelled(
     assert chat.pending_turns == {}
     assert response.chat_history[-1].turn_outcome is not None
     restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_recovered_row_carries_what_is_known_and_never_says_why(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+
+    await _load_history()
+
+    row = store.assistant_messages[0]
+    assert "interrupted" in row.content.lower()
+    assert not [
+        token
+        for token in ("failed", "navigated", "disconnected", "connection lost", "timed out")
+        if token in row.content.lower()
+    ]
+    assert "wpid-1" in row.content
+    payload = row.narrative_payload
+    assert payload is not None
+    interruption = payload["terminalEnvelope"]["interruption"]
+    assert interruption["workflow_permanent_id"] == "wpid-1"
+    assert interruption["recorded_at"] is not None
+    assert interruption["last_recorded_build_test_phase"] is None
+    assert interruption["authored_edits_saved"] is None
+    assert payload["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_a_live_written_interrupted_row_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live cancel exit already answered the turn; a later read must not add a second row."""
+    chat = _make_persisted_chat([_make_pending_turn("turn-a", RECONCILE_ABANDON_AFTER_SECONDS + 60)])
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    store.add_message(WorkflowCopilotChatSender.USER, "build me a scraper")
+    await workflow_copilot_route._persist_interrupted_turn(
+        chat,
+        "turn-a",
+        facts=InterruptedTurnFacts(iteration=2, workflow_permanent_id="wpid-1"),
+    )
+
+    await _load_history()
+
+    assert len(store.assistant_messages) == 1
+    assert chat.pending_turns == {}
+
+
+@pytest.mark.asyncio
+async def test_interrupted_account_selection_preserves_choices_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _make_persisted_chat(
+        [
+            _make_pending_turn(
+                "turn-click",
+                RECONCILE_ABANDON_AFTER_SECONDS + 60,
+                idempotency_digest="digest-click",
+            )
+        ]
+    )
+    store, _ = _install_reconcile_store(monkeypatch, chat)
+    choices = [
+        ConnectedAccountChoice(
+            connection_id="goac_1",
+            name="Google Sheets",
+            state="active",
+            email_address="first@example.test",
+        )
+    ]
+    store.add_message(
+        WorkflowCopilotChatSender.AI,
+        "Which account?",
+        TurnOutcome(
+            response_kind=ResponseKind.CLARIFY,
+            copilot_turn_id="turn-choice",
+            connected_account_choices=choices,
+        ),
+    )
+    store.add_message(WorkflowCopilotChatSender.USER, "goac_1")
+
+    await _load_history()
+
+    recovered = store.assistant_messages[-1].turn_outcome
+    assert recovered is not None
+    assert recovered.response_kind is ResponseKind.RECOVER
+    assert recovered.connected_account_choices == choices
+    assert recovered.idempotency_digest == "digest-click"
 
 
 @pytest.mark.asyncio
@@ -3659,7 +3903,7 @@ async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_co
         auto_accept=False,
     )
     original_workflow = SimpleNamespace(workflow_id="wf-canonical")
-    timeout_copy = "I ran out of time processing your request. Here's what I have so far."
+    timeout_copy = agent_module._TIMEOUT_REPLY_DEFAULT
     envelope = assemble_terminal_envelope(
         response_type="REPLY",
         verified=False,

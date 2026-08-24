@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from skyvern.forge.sdk.workflow.models.validators import (
     RUN_METADATA_MAX_KEY_LENGTH,
@@ -14,6 +15,7 @@ from skyvern.forge.sdk.workflow.models.validators import (
     normalize_tag_description,
     normalize_tag_value,
 )
+from skyvern.schemas.runs import WorkflowRunRequest
 
 
 class TestNormalizeRunMetadataUnchanged:
@@ -36,6 +38,17 @@ class TestNormalizeRunMetadataUnchanged:
 
     def test_all_reserved_namespace_keys_return_none(self) -> None:
         assert normalize_run_metadata({"skyvern.platform": "shop"}) is None
+
+    @pytest.mark.parametrize("value", ["__untagged__", "__other__"])
+    def test_reserved_analytics_values_raise(self, value: str) -> None:
+        # run_metadata becomes run tags, so it reaches the same rollup as the tag endpoints.
+        with pytest.raises(ValueError, match="reserved"):
+            normalize_run_metadata({"cost_center": value})
+
+    def test_reserved_value_under_a_reserved_key_is_filtered_not_raised(self) -> None:
+        # The skyvern.* entry is dropped before the value check, so it can't raise on an
+        # entry that was never going to be written.
+        assert normalize_run_metadata({"skyvern.platform": "__other__", "env": "prod"}) == {"env": "prod"}
 
     def test_over_max_keys_raises(self) -> None:
         too_many = {f"k{i}": "v" for i in range(RUN_METADATA_MAX_KEYS + 1)}
@@ -182,3 +195,14 @@ class TestNormalizeTagDescription:
     def test_over_max_length_raises(self) -> None:
         with pytest.raises(ValueError, match="at most"):
             normalize_tag_description("x" * (TAG_DESCRIPTION_MAX_LENGTH + 1))
+
+
+@pytest.mark.parametrize("value", ["__untagged__", "__other__"])
+def test_run_creation_request_rejects_reserved_run_metadata_value(value: str) -> None:
+    """Entry-point check that the validator is actually wired to the public request model,
+    not merely correct in isolation."""
+    with pytest.raises(ValidationError):
+        WorkflowRunRequest(workflow_id="wpid_x", run_metadata={"cost_center": value})
+
+    ok = WorkflowRunRequest(workflow_id="wpid_x", run_metadata={"cost_center": f"prod{value}eu"})
+    assert ok.run_metadata == {"cost_center": f"prod{value}eu"}

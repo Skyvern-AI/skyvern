@@ -203,6 +203,10 @@ const SETTINGS_LABELS: Array<{
     fields: ["persistBrowserSession"],
     label: "Toggled persist browser session",
   },
+  {
+    fields: ["reuseBrowserSession"],
+    label: "Toggled reuse browser session",
+  },
   { fields: ["pinSavedSessionIp"], label: "Toggled pinned session IP" },
   {
     fields: ["browserProfileId", "browserProfileKey"],

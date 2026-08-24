@@ -1,4 +1,4 @@
-import { Cross2Icon } from "@radix-ui/react-icons";
+import { Pencil1Icon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 
 import { VERB_CYCLE_MS, pickWorkingVerb } from "./workingVerbs";
@@ -21,7 +21,7 @@ export function CopilotWorkingStatus({ queued, onDismissQueued }: Props) {
 
   return (
     <div
-      className="mb-[9px] flex items-center gap-2 pl-[2px]"
+      className="mb-2 flex items-center gap-2 pl-0.5"
       data-testid="copilot-working-status"
     >
       <span
@@ -37,16 +37,18 @@ export function CopilotWorkingStatus({ queued, onDismissQueued }: Props) {
         {queued ? "Message queued" : "Working"}
       </span>
       {queued ? (
-        <div className="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-slate-400/[0.12] py-[3px] pl-[10px] pr-[5px] text-xs text-muted-foreground">
+        <div className="ml-auto flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-slate-400/[0.12] py-0.5 pl-2.5 pr-1 text-xs text-muted-foreground">
           1 message queued
+          {/* A cross here would read as "cancel the queued message"; this
+              returns it to the composer for editing. */}
           <button
             type="button"
             onClick={onDismissQueued}
             title="Edit queued message"
             aria-label="Edit queued message"
-            className="rounded px-[3px] hover:text-accent-foreground"
+            className="rounded px-1 hover:text-accent-foreground"
           >
-            <Cross2Icon className="h-3 w-3" />
+            <Pencil1Icon className="h-3 w-3" />
           </button>
         </div>
       ) : null}

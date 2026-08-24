@@ -21,10 +21,14 @@ class SendEmailBlockYaml(UniversalBaseModel):
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    smtp_host_secret_parameter_key: str
-    smtp_port_secret_parameter_key: str
-    smtp_username_secret_parameter_key: str
-    smtp_password_secret_parameter_key: str
+    smtp_host_secret_parameter_key: typing.Optional[str] = None
+    smtp_port_secret_parameter_key: typing.Optional[str] = None
+    smtp_username_secret_parameter_key: typing.Optional[str] = None
+    smtp_password_secret_parameter_key: typing.Optional[str] = None
+    custom_smtp_host: typing.Optional[str] = None
+    custom_smtp_port: typing.Optional[int] = None
+    custom_smtp_username: typing.Optional[str] = None
+    custom_smtp_password: typing.Optional[str] = None
     sender: str
     recipients: typing.List[str]
     subject: str

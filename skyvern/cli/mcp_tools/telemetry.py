@@ -13,6 +13,8 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 
 from skyvern import analytics
 from skyvern.cli.core.perception_telemetry import MCPPerceptionCounters, perception_counters_scope
+from skyvern.cli.core.result import drop_pending_attach
+from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 
 LOG = structlog.get_logger(__name__)
 
@@ -149,6 +151,8 @@ def _capture_mcp_event(
     response_bytes: int | None = None,
     perception_counters: MCPPerceptionCounters | None = None,
 ) -> None:
+    if current_codeblock_log_redactor() is not None:
+        return
     request = _resolve_http_request()
     organization_id = _resolve_organization_id(request)
     distinct_id, distinct_id_source = _resolve_distinct_id(organization_id)
@@ -254,6 +258,7 @@ class MCPTelemetryMiddleware(Middleware):
     ) -> Any:
         tool_name = getattr(context.message, "name", None)
         start = time.perf_counter()
+        drop_pending_attach()
         with perception_counters_scope() as counters:
             try:
                 result = await call_next(context)

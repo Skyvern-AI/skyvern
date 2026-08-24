@@ -26,6 +26,7 @@ function makeSaveData(
     proxyLocation: ProxyLocation.Residential,
     webhookCallbackUrl: "https://example.test/hook",
     persistBrowserSession: true,
+    reuseBrowserSession: true,
     browserProfileId: "bp_1",
     browserProfileKey: "key_1",
     model: null,
@@ -95,6 +96,7 @@ describe("workflowVersionFromSaveData", () => {
     });
     expect(version.proxy_location).toBe(ProxyLocation.Residential);
     expect(version.persist_browser_session).toBe(true);
+    expect(version.reuse_browser_session).toBe(true);
     expect(version.browser_profile_id).toBe("bp_1");
     expect(version.cache_key).toBe("cache_1");
     expect(version.mask_secrets).toBe(true);

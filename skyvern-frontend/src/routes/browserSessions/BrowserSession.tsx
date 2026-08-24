@@ -322,12 +322,13 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            {isCdpMode && browserSessionId && (
+            {(isCdpMode || vncFailed) && browserSessionId && (
               <BrowserSessionStream
                 browserSessionId={browserSessionId}
                 interactive={true}
                 showControlButtons={true}
                 enableUrlInput={true}
+                forceCdp={vncFailed}
                 onFrameWidthChange={setPreviewWidth}
               />
             )}
@@ -350,7 +351,10 @@ function BrowserSession() {
               pointerEvents: activeTab === "recordings" ? "auto" : "none",
             }}
           >
-            <BrowserSessionVideo />
+            <BrowserSessionVideo
+              browserSession={browserSession}
+              refreshBrowserSession={async () => (await query.refetch()).data}
+            />
           </div>
           <div
             className="absolute left-0 top-0 h-full w-full"

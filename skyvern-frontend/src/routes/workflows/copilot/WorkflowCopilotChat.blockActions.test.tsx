@@ -92,6 +92,16 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
+const { switchStudioRun, releaseStudioRun } = vi.hoisted(() => ({
+  switchStudioRun: vi.fn(),
+  releaseStudioRun: vi.fn(),
+}));
+
+vi.mock("@/routes/workflows/studio/runSwitchNavigation", () => ({
+  useSwitchStudioRun: () => switchStudioRun,
+  useReleaseStudioRun: () => releaseStudioRun,
+}));
+
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -100,6 +110,14 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
+    useNavigate: () => vi.fn(),
+    useLocation: () => ({
+      pathname: "/",
+      search: "",
+      hash: "",
+      state: null,
+      key: "default",
+    }),
   };
 });
 
@@ -144,6 +162,9 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
 }));
 
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useRecordingStore } from "@/store/useRecordingStore";
+
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
@@ -152,18 +173,27 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
   CODE_BLOCK_ACCESS: false,
 };
 
-function chatUi() {
+type ChatProps = { docked?: boolean; portalTarget?: HTMLElement | null };
+
+function chatUi(props: ChatProps = {}) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
       <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
+        <WorkflowCopilotChat {...props} />
       </FeatureFlagValueContext.Provider>
     </FeatureFlagContext.Provider>
   );
 }
 
-async function renderChat() {
-  const view = render(chatUi());
+// A docked chat portals its content, rendering null without a body-attached target.
+function makeDockedProps(): ChatProps {
+  const portalTarget = document.createElement("div");
+  document.body.appendChild(portalTarget);
+  return { docked: true, portalTarget };
+}
+
+async function renderChat(props: ChatProps = {}) {
+  const view = render(chatUi(props));
   await waitFor(() =>
     expect(
       screen.getByPlaceholderText(
@@ -204,7 +234,16 @@ const blockProgressFrame = (
   ...overrides,
 });
 
+const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
+  type: "run_started",
+  workflow_run_id: "wr_1",
+  timestamp: "2026-06-10T00:00:00Z",
+  ...overrides,
+});
+
 beforeEach(() => {
+  switchStudioRun.mockClear();
+  releaseStudioRun.mockClear();
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   mockCopilotUxV1Enabled.mockReset();
@@ -517,5 +556,105 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
+  });
+});
+
+describe("WorkflowCopilotChat — studio run focus", () => {
+  it("focuses the dispatched run from run_started and does not re-navigate on block_progress", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(runStartedFrame());
+    await waitFor(() => expect(switchStudioRun).toHaveBeenCalledTimes(1));
+    expect(switchStudioRun).toHaveBeenCalledWith("wr_1");
+
+    streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
+    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+    expect(switchStudioRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("WorkflowCopilotChat — build follow", () => {
+  const focusBlock = vi.fn();
+
+  beforeEach(() => {
+    focusBlock.mockClear();
+    useWorkflowBlockSearchStore.getState().registerHandle({
+      getTargets: () => [
+        { nodeId: "node_login", label: "login", blockType: "task" },
+      ],
+      focusBlock,
+    });
+    window.history.pushState(null, "", "/?panes=copilot,editor");
+  });
+
+  afterEach(() => {
+    useWorkflowBlockSearchStore.getState().registerHandle(null);
+    window.history.pushState(null, "", "/");
+  });
+
+  it("focuses the canvas on the block a progress frame names", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).toHaveBeenCalledWith("node_login");
+  });
+
+  it("follows a block only once per label", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "completed" }),
+    );
+
+    expect(focusBlock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops following after the user presses outside the copilot pane", async () => {
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    fireEvent.pointerDown(document.body);
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+
+  it("does not follow when the editor pane is closed", async () => {
+    window.history.pushState(null, "", "/?panes=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build it");
+
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({ block_label: "login", status: "running" }),
+    );
+
+    expect(focusBlock).not.toHaveBeenCalled();
+  });
+
+  it("never fights the recording overlay", async () => {
+    useRecordingStore.setState({ isRecording: true });
+    try {
+      await renderChat(makeDockedProps());
+      await submit("build it");
+
+      streamCalls[0]!.onMessage(
+        blockProgressFrame({ block_label: "login", status: "running" }),
+      );
+
+      expect(focusBlock).not.toHaveBeenCalled();
+    } finally {
+      useRecordingStore.setState({ isRecording: false });
+    }
   });
 });

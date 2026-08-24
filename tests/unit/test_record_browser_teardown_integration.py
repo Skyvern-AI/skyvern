@@ -16,6 +16,7 @@ import pytest
 from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge import app
+from skyvern.forge.sdk.routes.streaming.channels.cdp import ChannelContext
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent as StreamingExfiltratedEvent
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource as StreamingExfiltratedEventSource,
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltrationChannel,
 )
+from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannelContext
 from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
 
@@ -49,19 +51,32 @@ def _click_event(*, capture_seq: int, sky_id: str, target_id: str) -> StreamingE
     )
 
 
-def _vnc_channel() -> MagicMock:
-    vnc_channel = MagicMock()
-    vnc_channel.browser_session = MagicMock(
+def _vnc_context() -> MagicMock:
+    context = MagicMock()
+    context.organization_id = ORG_ID
+    context.x_api_key = "api-key-123"
+    context.browser_session = MagicMock(
         browser_address="http://localhost:9222",
         persistent_browser_session_id=PBS_ID,
     )
-    vnc_channel.identity = {"client_id": "client-1", "browser_session_id": PBS_ID}
-    return vnc_channel
+    context.identity = {"client_id": "client-1", "browser_session_id": PBS_ID}
+    return context
 
 
-def _channel_with_closed_page() -> ExfiltrationChannel:
+def _message_context() -> MessageChannelContext:
+    message_channel = MagicMock()
+    message_channel.organization_id = ORG_ID
+    message_channel.browser_session = MagicMock(
+        browser_address="http://localhost:9222",
+        persistent_browser_session_id=PBS_ID,
+    )
+    message_channel.identity = {"organization_id": ORG_ID, "browser_session_id": PBS_ID}
+    return MessageChannelContext(message_channel=message_channel, x_api_key="api-key-123")
+
+
+def _channel_with_closed_page(context: ChannelContext) -> ExfiltrationChannel:
     """An exfiltration channel whose only page's target is already closed."""
-    channel = ExfiltrationChannel(on_event=lambda _messages: None, vnc_channel=_vnc_channel())
+    channel = ExfiltrationChannel(on_event=lambda _messages: None, context=context)
 
     closed_page = MagicMock()
     closed_page.url = "https://example.com"
@@ -77,8 +92,10 @@ def _channel_with_closed_page() -> ExfiltrationChannel:
     return channel
 
 
-@pytest.mark.asyncio
-async def test_end_exfiltration_on_closed_target_preserves_drafts_into_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _assert_closed_target_preserves_drafts(
+    monkeypatch: pytest.MonkeyPatch,
+    context: ChannelContext,
+) -> None:
     async def fake_llm(*args: object, **kwargs: object) -> dict[str, object]:
         return {"block_label": "click_submit", "title": "Click Submit", "prompt": "Click the submit button."}
 
@@ -105,7 +122,7 @@ async def test_end_exfiltration_on_closed_target_preserves_drafts_into_blocks(mo
     assert session.steps, "precondition: the recording accumulated drafts"
 
     # Replay the END_EXFILTRATION handler sequence against a closed browser target.
-    channel = _channel_with_closed_page()
+    channel = _channel_with_closed_page(context)
     await channel.stop()  # message.py:727 — must not raise on a closed target
     drafts = await registry.stop_session(PBS_ID)  # message.py:731 — only reached if stop() didn't crash
 
@@ -113,3 +130,15 @@ async def test_end_exfiltration_on_closed_target_preserves_drafts_into_blocks(mo
     assert drafts, "teardown dropped the recorded drafts"
     blocks = Processor(PBS_ID, ORG_ID, WP_ID).drafts_to_blocks(drafts)
     assert blocks, "surviving drafts did not produce workflow blocks"
+
+
+@pytest.mark.asyncio
+async def test_end_exfiltration_on_closed_target_preserves_drafts_into_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    await _assert_closed_target_preserves_drafts(monkeypatch, _vnc_context())
+
+
+@pytest.mark.asyncio
+async def test_end_exfiltration_without_vnc_on_closed_target_preserves_drafts_into_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _assert_closed_target_preserves_drafts(monkeypatch, _message_context())

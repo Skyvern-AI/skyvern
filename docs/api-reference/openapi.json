@@ -28,10 +28,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -511,22 +509,6 @@
             "description": "Optional folder ID to assign the workflow to"
           },
           {
-            "name": "Idempotency-Key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Idempotency-Key"
-            }
-          },
-          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -543,6 +525,24 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
           }
         ],
         "requestBody": {
@@ -3005,7 +3005,8 @@
         "tags": [
           "agent"
         ],
-        "summary": "Get Runs V2",
+        "summary": "List runs",
+        "description": "List the organization's task and agent runs, newest first, filterable by status, run type, agent, and a free-text search term. Returns a paginated array of run summaries.",
         "operationId": "get_runs_v2_v1_runs_get",
         "parameters": [
           {
@@ -3197,7 +3198,8 @@
         "tags": [
           "Files"
         ],
-        "summary": "Upload File",
+        "summary": "Upload a file",
+        "description": "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its storage URI, a presigned download URL, and the expiry implied by the requested retention period.",
         "operationId": "upload_file_v1_upload_file_post",
         "parameters": [
           {
@@ -3252,6 +3254,61 @@
           }
         },
         "x-fern-sdk-method-name": "upload_file"
+      }
+    },
+    "/v1/files/{file_id}": {
+      "delete": {
+        "tags": [
+          "Files"
+        ],
+        "summary": "Delete File",
+        "description": "Delete a previously uploaded file.\n\nA file that does not exist, was already deleted, or belongs to another organization all\nanswer 404 alike — the endpoint must not tell a caller whether someone else's file id\nexists.",
+        "operationId": "delete_file_v1_files__file_id__delete",
+        "parameters": [
+          {
+            "name": "file_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "File Id"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_file"
       }
     },
     "/v1/browser_profiles": {
@@ -3856,6 +3913,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request"
           },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
@@ -5139,10 +5199,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -5250,10 +5308,8 @@
                   "type": "null"
                 }
               ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
               "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+            }
           },
           {
             "name": "x-user-agent",
@@ -5756,6 +5812,7 @@
           "Schedules"
         ],
         "summary": "List all schedules for the organization",
+        "description": "List every schedule in the organization, across all agents, filterable by active/paused status and a search term matched against agent title or schedule name. Returns a paginated list plus the total count.",
         "operationId": "schedules_list_all",
         "parameters": [
           {
@@ -6558,7 +6615,7 @@
           "Runs"
         ],
         "summary": "Get all runs by agent",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.\n\n### include_child_runs\n\nChild runs — runs this workflow started from inside another workflow run — are **excluded by default**, so the history shows only top-level runs. Pass `include_child_runs=true` to list them as well; every run carries a `parent_workflow_run_id` that is `null` for top-level runs.",
         "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {
@@ -6732,6 +6789,18 @@
             "description": "Filter by run tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only."
           },
           {
+            "name": "include_child_runs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs.",
+              "default": false,
+              "title": "Include Child Runs"
+            },
+            "description": "Include child workflow runs — runs started from inside another workflow run. Excluded by default so the history shows only top-level runs."
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -6785,6 +6854,7 @@
           "Agents"
         ],
         "summary": "Get an agent by id",
+        "description": "Fetch a single agent definition by its permanent id, optionally pinned to a specific version. Returns the agent's blocks, parameters, and metadata.",
         "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
         "parameters": [
           {
@@ -7014,6 +7084,7 @@
           "Schedules"
         ],
         "summary": "Create a schedule for an agent",
+        "description": "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. Returns the stored schedule and its next upcoming run times.",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -7082,6 +7153,7 @@
           "Schedules"
         ],
         "summary": "List schedules for an agent",
+        "description": "List all schedules attached to a single agent. Returns the schedules in creation order.",
         "operationId": "schedules_list",
         "parameters": [
           {
@@ -7142,6 +7214,7 @@
           "Schedules"
         ],
         "summary": "Get an agent schedule by id",
+        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, parameters, enabled state, and next upcoming run times.",
         "operationId": "schedules_get",
         "parameters": [
           {
@@ -7209,6 +7282,7 @@
           "Schedules"
         ],
         "summary": "Update an agent schedule",
+        "description": "Replace a schedule's cron expression, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times.",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -7286,6 +7360,7 @@
           "Schedules"
         ],
         "summary": "Delete an agent schedule",
+        "description": "Permanently delete a schedule so it never triggers again. Returns an acknowledgement flag.",
         "operationId": "schedules_delete",
         "parameters": [
           {
@@ -7355,6 +7430,7 @@
           "Schedules"
         ],
         "summary": "Enable an agent schedule",
+        "description": "Resume a paused schedule so it starts triggering runs again. Returns the updated schedule.",
         "operationId": "schedules_enable",
         "parameters": [
           {
@@ -7424,6 +7500,7 @@
           "Schedules"
         ],
         "summary": "Disable an agent schedule",
+        "description": "Pause a schedule so it stops triggering runs, without deleting it. Returns the updated schedule.",
         "operationId": "schedules_disable",
         "parameters": [
           {
@@ -8571,6 +8648,17 @@
             "title": "Max Retries",
             "default": 0
           },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -8890,6 +8978,7 @@
           "screenshot_action",
           "screenshot_final",
           "screenshot_proxy",
+          "screenshot_pre_submit",
           "llm_prompt",
           "llm_request",
           "llm_response",
@@ -8905,13 +8994,15 @@
           "html",
           "html_scrape",
           "html_action",
+          "html_pre_submit",
           "trace",
           "har",
           "script_file",
           "pdf",
           "step_archive",
           "task_archive",
-          "download"
+          "download",
+          "unknown"
         ],
         "title": "ArtifactType"
       },
@@ -9662,6 +9753,18 @@
       },
       "Body_upload_file_v1_upload_file_post": {
         "properties": {
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days",
+            "description": "Number of days to keep the file before it is deleted automatically. Omit to keep the file until the organization's data retention policy removes it."
+          },
           "file": {
             "type": "string",
             "contentMediaType": "application/octet-stream",
@@ -10313,6 +10416,18 @@
             ],
             "title": "Deleted At",
             "description": "Timestamp when the session was deleted, if applicable"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning",
+            "description": "Advisory message about how the request was adjusted, if it was. Set when a requested timeout above the maximum was capped; null otherwise."
           }
         },
         "type": "object",
@@ -11258,7 +11373,7 @@
               }
             ],
             "title": "Timeout",
-            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be at least 5; values above 240 are capped at 240. Defaults to 60.",
+            "description": "Timeout in minutes for the session. Timeout is applied after the session is started. Must be between 5 and 240. Defaults to 60.",
             "default": 60
           },
           "proxy_location": {
@@ -17635,11 +17750,13 @@
           },
           "timeout_seconds": {
             "type": "integer",
-            "title": "Timeout Seconds"
+            "title": "Timeout Seconds",
+            "default": 7200
           },
           "sender": {
             "type": "string",
-            "title": "Sender"
+            "title": "Sender",
+            "default": "hello@skyvern.com"
           },
           "recipients": {
             "items": {
@@ -17650,21 +17767,19 @@
           },
           "subject": {
             "type": "string",
-            "title": "Subject"
+            "title": "Subject",
+            "default": "Human interaction required for workflow run"
           },
           "body": {
             "type": "string",
-            "title": "Body"
+            "title": "Body",
+            "default": "Your interaction is required for a workflow run!"
           }
         },
         "type": "object",
         "required": [
           "label",
-          "timeout_seconds",
-          "sender",
-          "recipients",
-          "subject",
-          "body"
+          "recipients"
         ],
         "title": "HumanInteractionBlockYAML"
       },
@@ -21447,6 +21562,52 @@
             "type": "array",
             "title": "File Attachments",
             "default": []
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           }
         },
         "type": "object",
@@ -21517,20 +21678,94 @@
             "default": false
           },
           "smtp_host_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Host Secret Parameter Key"
           },
           "smtp_port_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Port Secret Parameter Key"
           },
           "smtp_username_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Username Secret Parameter Key"
           },
           "smtp_password_secret_parameter_key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Smtp Password Secret Parameter Key"
+          },
+          "custom_smtp_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Host"
+          },
+          "custom_smtp_port": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 65535.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Port"
+          },
+          "custom_smtp_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Username"
+          },
+          "custom_smtp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Smtp Password"
           },
           "sender": {
             "type": "string",
@@ -21569,10 +21804,6 @@
         "type": "object",
         "required": [
           "label",
-          "smtp_host_secret_parameter_key",
-          "smtp_port_secret_parameter_key",
-          "smtp_username_secret_parameter_key",
-          "smtp_password_secret_parameter_key",
           "sender",
           "recipients",
           "subject",
@@ -23610,6 +23841,27 @@
               "agent",
               "code"
             ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -23929,6 +24181,27 @@
             "examples": [
               "agent",
               "code"
+            ]
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
             ]
           }
         },
@@ -24462,6 +24735,76 @@
           "prompt"
         ],
         "title": "TaskV2BlockYAML"
+      },
+      "TelInputOutcome": {
+        "properties": {
+          "flag_enabled": {
+            "type": "boolean",
+            "title": "Flag Enabled"
+          },
+          "final_element_id": {
+            "type": "string",
+            "title": "Final Element Id"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/TelInputStrategy"
+          },
+          "expected_digit_count": {
+            "type": "integer",
+            "title": "Expected Digit Count"
+          },
+          "actual_digit_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Digit Count"
+          },
+          "browser_valid": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Browser Valid"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "title": "Attempt Count"
+          },
+          "retargeted": {
+            "type": "boolean",
+            "title": "Retargeted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "flag_enabled",
+          "final_element_id",
+          "strategy",
+          "expected_digit_count",
+          "attempt_count",
+          "retargeted"
+        ],
+        "title": "TelInputOutcome"
+      },
+      "TelInputStrategy": {
+        "type": "string",
+        "enum": [
+          "legacy_sequential",
+          "formatted_sequential",
+          "sequential_national",
+          "atomic_national",
+          "atomic_e164"
+        ],
+        "title": "TelInputStrategy"
       },
       "TextPromptBlock": {
         "properties": {
@@ -25160,6 +25503,31 @@
             "type": "string",
             "title": "Presigned Url",
             "description": "Presigned URL to access the uploaded file"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Id",
+            "description": "Identifier for this upload. Pass it to DELETE /v1/files/{file_id} to delete the file."
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At",
+            "description": "When the file will be deleted, if a retention_days was supplied. Null means the file has no expiry of its own and follows the organization's data retention policy."
           }
         },
         "type": "object",
@@ -26124,6 +26492,10 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "engine": {
+            "$ref": "#/components/schemas/RunEngine",
+            "default": "skyvern-1.0"
+          },
           "complete_criterion": {
             "anyOf": [
               {
@@ -26159,6 +26531,17 @@
               }
             ],
             "title": "Error Code Mapping"
+          },
+          "max_steps_per_run": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps Per Run"
           },
           "parameter_keys": {
             "anyOf": [
@@ -26911,6 +27294,11 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "reuse_browser_session": {
+            "type": "boolean",
+            "title": "Reuse Browser Session",
+            "default": false
+          },
           "mask_secrets": {
             "type": "boolean",
             "title": "Mask Secrets",
@@ -27244,6 +27632,11 @@
             "title": "Persist Browser Session",
             "default": false
           },
+          "reuse_browser_session": {
+            "type": "boolean",
+            "title": "Reuse Browser Session",
+            "default": false
+          },
           "mask_secrets": {
             "anyOf": [
               {
@@ -27254,7 +27647,7 @@
               }
             ],
             "title": "Mask Secrets",
-            "description": "Visually mask secrets as they are typed in the browser, hiding them from screenshots, recordings, and the live view."
+            "description": "Mask secret values across this workflow's runs: hide them while they are typed (screenshots, recordings, live view) and redact them from stored artifacts, network logs, and LLM-bound text."
           },
           "pin_saved_session_ip": {
             "type": "boolean",
@@ -28231,6 +28624,17 @@
               }
             ],
             "title": "Start Fresh Browser"
+          },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session"
           },
           "debug_session_id": {
             "anyOf": [
@@ -29234,6 +29638,18 @@
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
           },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session",
+            "description": "Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account."
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -29366,6 +29782,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",
@@ -29485,6 +29922,18 @@
             "title": "Browser Session Id",
             "description": "ID of a Skyvern browser session to reuse, having it continue from the current screen state"
           },
+          "reuse_browser_session": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reuse Browser Session",
+            "description": "Override whether this run reuses the workflow's managed browser session. Null inherits the workflow setting. Without login credentials, a browser profile key, or a sequential key, reuse is workflow-scoped: every run shares one browser and its signed-in state, so treat the workflow as single-account."
+          },
           "browser_profile_id": {
             "anyOf": [
               {
@@ -29617,6 +30066,27 @@
             ],
             "title": "Run Metadata",
             "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
+          },
+          "file_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 50
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Ids",
+            "description": "\nIds of files uploaded through `POST /v1/upload_file` to attach to this run. Skyvern deletes an attached file as soon as the run finishes, so there is nothing to clean up afterwards. Reference an attached file by its id anywhere a file URL is accepted (for example in `parameters` or in the prompt) and no presigned URL is ever created for it. A file can be attached to one run at a time, and must not already be deleted.\n",
+            "examples": [
+              [
+                "file_123456789"
+              ]
+            ]
           }
         },
         "type": "object",

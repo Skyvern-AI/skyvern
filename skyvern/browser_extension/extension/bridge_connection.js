@@ -13,8 +13,14 @@ const PING_INTERVAL_MS = 20_000;
 const SILENCE_TIMEOUT_MS = 45_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const RECONNECT_MAX_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 29_000;
+const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
 const AUTH_EXT_CONTEXT = "skyvern-ext-v1|";
 const AUTH_SERVER_CONTEXT = "skyvern-srv-v1|";
+
+export function nextReconnectDelay(delayMs) {
+  return Math.min(delayMs * 2, RECONNECT_MAX_MS);
+}
 
 function bytesToBase64Url(bytes) {
   let binary = "";
@@ -77,10 +83,18 @@ async function signHmac(key, message) {
 }
 
 export class BridgeConnection {
-  constructor({ onRequest, onAuthenticated, onReset, onStateChange }) {
+  constructor({
+    onRequest,
+    onAuthenticated,
+    onReset,
+    onEvent = async () => undefined,
+    onStateChange,
+    requestTimeoutMs = REQUEST_TIMEOUT_MS,
+  }) {
     this.onRequest = onRequest;
     this.onAuthenticated = onAuthenticated;
     this.onReset = onReset;
+    this.onEvent = onEvent;
     this.onStateChange = onStateChange;
     this.socket = null;
     this.authenticated = false;
@@ -99,6 +113,8 @@ export class BridgeConnection {
     this.serverNonce = null;
     this.hmacKey = null;
     this.messageQueue = Promise.resolve();
+    this.inflightRequests = new Set();
+    this.requestTimeoutMs = requestTimeoutMs;
 
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === BRIDGE_ALARM_NAME) {
@@ -117,11 +133,17 @@ export class BridgeConnection {
     this.token =
       typeof stored.pairingToken === "string" ? stored.pairingToken : "";
     this.enabled = stored.enabled === true;
-    await chrome.alarms.create(BRIDGE_ALARM_NAME, { periodInMinutes: 1 });
+    await this.ensureReconnectAlarm();
     this.notifyState();
     if (this.enabled && this.token) {
       await this.kick();
     }
+  }
+
+  async ensureReconnectAlarm() {
+    await chrome.alarms.create(BRIDGE_ALARM_NAME, {
+      periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES,
+    });
   }
 
   getStatus() {
@@ -161,6 +183,7 @@ export class BridgeConnection {
         "A pairing token is required.",
       );
     }
+    await this.ensureReconnectAlarm();
     this.enabled = true;
     this.lastError = "";
     this.reconnectDelayMs = 1_000;
@@ -217,19 +240,7 @@ export class BridgeConnection {
     });
     socket.addEventListener("message", (event) => {
       if (generation === this.connectionGeneration) {
-        const handling = this.messageQueue
-          .catch(() => undefined)
-          .then(() => {
-            if (
-              generation !== this.connectionGeneration ||
-              this.socket !== socket
-            ) {
-              return undefined;
-            }
-            return this.handleMessage(event.data);
-          });
-        this.messageQueue = handling;
-        void handling;
+        this.enqueueIncomingMessage(event.data, generation, socket);
       }
     });
     socket.addEventListener("error", () => {
@@ -250,7 +261,27 @@ export class BridgeConnection {
     });
   }
 
-  async handleMessage(rawMessage) {
+  enqueueIncomingMessage(rawMessage, generation, socket) {
+    const handling = this.messageQueue
+      .catch(() => undefined)
+      .then(() => {
+        if (
+          generation !== this.connectionGeneration ||
+          this.socket !== socket
+        ) {
+          return undefined;
+        }
+        return this.handleMessage(rawMessage, generation, socket);
+      });
+    this.messageQueue = handling;
+    void handling;
+  }
+
+  async handleMessage(
+    rawMessage,
+    generation = this.connectionGeneration,
+    socket = this.socket,
+  ) {
     this.lastMessageAt = Date.now();
     let message;
     try {
@@ -285,7 +316,20 @@ export class BridgeConnection {
         return;
       }
       if (message.type === MESSAGE_TYPES.REQUEST) {
-        await this.handleRequest(message);
+        this.startRequest(message, generation, socket);
+        return;
+      }
+      if (message.type === MESSAGE_TYPES.EVENT) {
+        if (
+          typeof message.event !== "string" ||
+          message.params === null ||
+          typeof message.params !== "object" ||
+          Array.isArray(message.params)
+        ) {
+          this.failConnection("The local bridge sent an invalid event.");
+          return;
+        }
+        await this.onEvent(message.event, message.params);
         return;
       }
       if (message.type === MESSAGE_TYPES.EXTENSION_RESET) {
@@ -344,6 +388,16 @@ export class BridgeConnection {
     }
   }
 
+  startRequest(message, generation, socket) {
+    const request = this.handleRequest(message, generation, socket).catch(
+      () => {
+        this.failConnection("The local bridge connection failed.");
+      },
+    );
+    this.inflightRequests.add(request);
+    request.finally(() => this.inflightRequests.delete(request));
+  }
+
   async handleAuthMessage(message) {
     if (
       message.type === MESSAGE_TYPES.AUTH_CHALLENGE &&
@@ -394,6 +448,7 @@ export class BridgeConnection {
       this.authenticated = true;
       this.lastError = "";
       this.reconnectDelayMs = 1_000;
+      await this.ensureReconnectAlarm();
       this.notifyState();
       await this.onAuthenticated();
       return;
@@ -405,30 +460,60 @@ export class BridgeConnection {
     );
   }
 
-  async handleRequest(message) {
+  async handleRequest(message, generation, socket) {
     if (typeof message.id !== "string" || typeof message.op !== "string") {
       this.failConnection("The local bridge sent an invalid request.");
       return;
     }
 
     try {
-      const result = await this.onRequest(message.op, message.args);
-      this.sendRaw({
-        v: PROTOCOL_VERSION,
-        type: MESSAGE_TYPES.RESPONSE,
-        id: message.id,
-        ok: true,
-        result,
-      });
+      let timeoutId;
+      const result = await Promise.race([
+        this.onRequest(message.op, message.args),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(
+            () =>
+              reject(
+                new ProtocolError(
+                  ERROR_CODES.COMMAND_TIMEOUT,
+                  `Extension command timed out: ${message.op}`,
+                ),
+              ),
+            this.requestTimeoutMs,
+          );
+        }),
+      ]).finally(() => clearTimeout(timeoutId));
+      this.sendResponse(
+        {
+          v: PROTOCOL_VERSION,
+          type: MESSAGE_TYPES.RESPONSE,
+          id: message.id,
+          ok: true,
+          result,
+        },
+        generation,
+        socket,
+      );
     } catch (error) {
-      this.sendRaw({
-        v: PROTOCOL_VERSION,
-        type: MESSAGE_TYPES.RESPONSE,
-        id: message.id,
-        ok: false,
-        error: protocolErrorEnvelope(error),
-      });
+      this.sendResponse(
+        {
+          v: PROTOCOL_VERSION,
+          type: MESSAGE_TYPES.RESPONSE,
+          id: message.id,
+          ok: false,
+          error: protocolErrorEnvelope(error),
+        },
+        generation,
+        socket,
+      );
     }
+  }
+
+  sendResponse(message, generation, socket) {
+    if (generation !== this.connectionGeneration || this.socket !== socket) {
+      return false;
+    }
+    return this.sendRaw(message);
   }
 
   sendEvent(event, params) {
@@ -495,10 +580,7 @@ export class BridgeConnection {
       return;
     }
     const delay = this.reconnectDelayMs;
-    this.reconnectDelayMs = Math.min(
-      this.reconnectDelayMs * 2,
-      RECONNECT_MAX_MS,
-    );
+    this.reconnectDelayMs = nextReconnectDelay(this.reconnectDelayMs);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       void this.kick();

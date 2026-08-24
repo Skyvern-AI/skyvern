@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import functools
 import time
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 # Module-level flag: when True, make_result() strips fields that waste AI context
 # tokens (echoed inputs, sdk_equivalent, browser_context, timing, empty collections).
@@ -152,17 +155,65 @@ def make_error(
     }
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+_pending_attach: ContextVar[int | None] = ContextVar("mcp_pending_attach", default=None)
+
+
+def _record_attach(started: float) -> None:
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    _pending_attach.set((_pending_attach.get() or 0) + elapsed_ms)
+
+
+def _take_attach() -> int | None:
+    pending = _pending_attach.get()
+    _pending_attach.set(None)
+    return pending
+
+
+def drop_pending_attach() -> None:
+    """Called at MCP tool dispatch so an attach whose tool never opened a Timer cannot reach the next call."""
+    _pending_attach.set(None)
+
+
+def restore_pending_attach(attach_ms: int | None) -> None:
+    """Hand an attach a finished Timer already claimed to the next Timer of the same tool call."""
+    if attach_ms:
+        _pending_attach.set((_pending_attach.get() or 0) + attach_ms)
+
+
+def count_browser_attach(fn: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+    """Report the browser attach a tool does before opening its Timer as that tool's own attach mark."""
+
+    @functools.wraps(fn)
+    async def counted(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        started = time.perf_counter()
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _record_attach(started)
+
+    return counted
+
+
 class Timer:
     def __init__(self) -> None:
         self._start: float = 0
+        self._attach_ms: int | None = None
         self._marks: dict[str, int] = {}
 
     def __enter__(self) -> Timer:
         self._start = time.perf_counter()
+        self._attach_ms = _take_attach()
         return self
 
     def __exit__(self, *args: Any) -> None:
-        self._marks["total"] = int((time.perf_counter() - self._start) * 1000)
+        elapsed_ms = int((time.perf_counter() - self._start) * 1000)
+        if self._attach_ms is not None:
+            self._marks["attach"] = self._attach_ms
+        self._marks["total"] = elapsed_ms
+        _pending_attach.set(None)
 
     def mark(self, name: str) -> None:
         self._marks[name] = int((time.perf_counter() - self._start) * 1000)

@@ -27,6 +27,7 @@ from skyvern.schemas.workflows import BlockStatus
 def _workflow(browser_profile_key: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         persist_browser_session=True,
+        reuse_browser_session=False,
         pin_saved_session_ip=False,
         browser_profile_key=browser_profile_key,
         workflow_permanent_id="wpid_test",
@@ -38,7 +39,10 @@ def _workflow_run(browser_profile_id: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_run_id="wr_test",
         organization_id="o_test",
+        browser_session_id=None,
         browser_profile_id=browser_profile_id,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         proxy_location=None,
     )
 
@@ -47,12 +51,17 @@ def _execute_workflow() -> SimpleNamespace:
     return SimpleNamespace(
         workflow_id="wf_1",
         persist_browser_session=True,
+        reuse_browser_session=False,
         workflow_permanent_id="wpid_test",
         title="Workflow",
         organization_id="o_test",
         generate_script_on_terminal=False,
         model=None,
-        workflow_definition=SimpleNamespace(parameters=[], finally_block_label=None, blocks=[]),
+        workflow_definition=SimpleNamespace(
+            parameters=[],
+            finally_block_label=None,
+            blocks=[SimpleNamespace(block_type=BlockType.TASK)],
+        ),
     )
 
 
@@ -63,8 +72,11 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         workflow_id="wf_1",
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
+        browser_session_id=None,
         browser_profile_id="bp_managed",
         browser_address=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
         status=status,
         failure_reason=None,
         ignore_inherited_workflow_system_prompt=False,
@@ -798,7 +810,15 @@ async def test_execute_workflow_finalizes_when_pre_status_browser_cleanup_fails(
 
 
 def _patch_session_backed_run(monkeypatch: pytest.MonkeyPatch, svc: WorkflowService) -> AsyncMock:
-    monkeypatch.setattr(service_module.skyvern_context, "ensure_context", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        service_module.skyvern_context,
+        "ensure_context",
+        lambda: SimpleNamespace(
+            browser_session_id=None,
+            browser_session_runnable_id=None,
+            browser_session_runnable_generation_id=None,
+        ),
+    )
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "begin_session", AsyncMock(return_value="lease_1"))
     close_session = AsyncMock()
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "close_session", close_session)

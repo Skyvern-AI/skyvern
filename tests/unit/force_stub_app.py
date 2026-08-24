@@ -1,7 +1,9 @@
 from contextlib import nullcontext
 from unittest.mock import AsyncMock, MagicMock
 
+from skyvern.config import settings
 from skyvern.forge import set_force_app_instance
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
 
 
@@ -16,7 +18,10 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.DATABASE = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER = _LazyNamespace()
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run = MagicMock(return_value=False)
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.secret_redaction_enabled_for_run = MagicMock(return_value=False)
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run = MagicMock(return_value=set())
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts = MagicMock(return_value=set())
     # Sync liveness predicate — _LazyNamespace would auto-mock it as a truthy (never-awaited) AsyncMock,
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
     # into liveness explicitly (non-PBS ownership signal).
@@ -36,10 +41,24 @@ def create_forge_stub_app() -> ForgeApp:
     # the real OSS base no-op so unit tests exercise the legacy in-process path.
     fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
+    base_agent_function = AgentFunction()
+    # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
+    # and break every caller that scans it for close-page phrases.
+    fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
+    fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
+    fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
+        base_agent_function.redact_codeblock_parameter_values
+    )
+    fake_app_module.AGENT_FUNCTION.prepare_codeblock_control_flow_exception = (
+        base_agent_function.prepare_codeblock_control_flow_exception
+    )
     # Copilot worker-dispatch gate — _LazyNamespace would auto-mock this as a truthy AsyncMock
     # and route copilot block runs down the worker-dispatch path. Match the real OSS base
     # default (False) so unit tests exercise the unavailable-worker path.
     fake_app_module.AGENT_FUNCTION.should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
+    # Advisory scanner hook — _LazyNamespace would auto-mock this as an AsyncMock returning a
+    # non-iterable MagicMock, silently exercising the fail-open path instead of the OSS no-op.
+    fake_app_module.AGENT_FUNCTION.scan_code_block_source = AsyncMock(return_value=[])
     # Sync methods — _LazyNamespace would auto-mock these as AsyncMock and break callers that use
     # the return value directly. Match the real OSS defaults.
     fake_app_module.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type = MagicMock(return_value=None)
@@ -88,6 +107,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.EXTRACTION_LLM_API_HANDLER = AsyncMock()
     fake_app_module.CHECK_USER_GOAL_LLM_API_HANDLER = AsyncMock()
     fake_app_module.AUTO_COMPLETION_LLM_API_HANDLER = AsyncMock()
+    fake_app_module.OPENAI_CLIENT = AsyncMock()
+    fake_app_module.OPENAI_CUA_MODEL = settings.OPENAI_CUA_MODEL
     fake_app_module.EXPERIMENTATION_PROVIDER = _LazyNamespace()
     fake_app_module.STORAGE = _LazyNamespace()
     fake_app_module.CACHE = _LazyNamespace()

@@ -262,7 +262,7 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     render(<FileUploadBlockForm blockId="f1" />);
 
     expect(screen.getByText("Google Account")).toBeDefined();
-    expect(screen.getByText("Google Drive Folder ID (Required)")).toBeDefined();
+    expect(screen.getByText("Google Drive Folder ID (Optional)")).toBeDefined();
     expect(
       (screen.getByTestId("google-oauth-selector") as HTMLInputElement).value,
     ).toBe("goac_123");

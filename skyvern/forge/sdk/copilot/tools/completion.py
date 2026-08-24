@@ -91,7 +91,9 @@ _POST_RUN_PAGE_OBSERVATION_LABEL = "post_run_page_observation"
 _REGISTERED_ARTIFACT_OBSERVATION_LABEL = "registered_artifact_observation"
 # Stamp keys the same-run gate reads; they are dropped from the graded payload so the run id
 # and observation flag cannot be traversed as observed page content.
-_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset({"workflow_run_id", "observed_after_workflow_run"})
+_POST_RUN_PAGE_EVIDENCE_STAMP_KEYS = frozenset(
+    {"workflow_run_id", "observed_after_workflow_run", "source_browser_session_id"}
+)
 _AUTHORED_OUTPUT_CONTRACT_CRITERION_ID_PREFIX = "__copilot_authored_output__"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_CRITERION_ID = "__copilot_authored_output_contract_missing"
 _AUTHORED_OUTPUT_CONTRACT_MISSING_PATH = "output.__copilot_missing_authored_output_contract__"

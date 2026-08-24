@@ -257,7 +257,7 @@ describe("StudioPaneToggles run tab label", () => {
 
     await waitFor(() =>
       expect(copyTextMock).toHaveBeenCalledWith(
-        `${window.location.origin}/agents/wpid_abc/studio?wr=wr_556219201027773764`,
+        `${window.location.origin}/runs/wr_556219201027773764`,
       ),
     );
     // The click must not bubble into the popover trigger.
@@ -359,7 +359,6 @@ describe("StudioPaneToggles run selector", () => {
     );
     renderInBrowser("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other", {
       copilotMessage: "Fix run A",
-      copilotFixOrigin: true,
     });
 
     fireEvent.click(tab("Past Runs"));
@@ -397,14 +396,39 @@ describe("StudioPaneToggles run selector", () => {
 });
 
 describe("StudioPaneToggles run-status dot", () => {
-  test("shows a status-colored dot for a finalized run", () => {
+  test("shows a status-colored dot with a status icon for a finalized run", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt();
     const dot = runsTab().querySelector(
-      "span.absolute.-right-0\\.5",
+      "span.absolute.-right-1",
     ) as HTMLElement | null;
     expect(dot).not.toBeNull();
     expect(dot?.className).toContain("bg-badge-success");
+    expect(dot?.querySelector("svg")).not.toBeNull();
+  });
+
+  test("uses a different icon per finalized status (not color-only)", () => {
+    runsQueryMock.mockReturnValue({
+      data: [{ workflow_run_id: "wr_tab", status: Status.Failed }],
+    });
+    const { unmount } = renderAt();
+    const failedIcon = runsTab().querySelector(
+      "span.absolute.-right-1 svg",
+    )?.outerHTML;
+    unmount();
+    cleanup();
+
+    runsQueryMock.mockReturnValue({
+      data: [{ workflow_run_id: "wr_tab", status: Status.Canceled }],
+    });
+    renderAt();
+    const canceledIcon = runsTab().querySelector(
+      "span.absolute.-right-1 svg",
+    )?.outerHTML;
+
+    expect(failedIcon).toBeTruthy();
+    expect(canceledIcon).toBeTruthy();
+    expect(failedIcon).not.toBe(canceledIcon);
   });
 
   test("includes the finalized run status in the run tab accessible name", () => {
@@ -420,7 +444,17 @@ describe("StudioPaneToggles run-status dot", () => {
   test("omits the dot while the run is still in flight", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Running }] });
     renderAt();
-    expect(runsTab().querySelector("span.absolute.-right-0\\.5")).toBeNull();
+    expect(runsTab().querySelector("span.absolute.-right-1")).toBeNull();
+  });
+
+  test("tooltips the run status even with labels expanded (no hidden xl:inline gate)", async () => {
+    runsQueryMock.mockReturnValue({
+      data: [{ workflow_run_id: "wr_tip", status: Status.Failed }],
+    });
+    renderAt();
+    fireEvent.focus(tab(/^View Run: wr_tip/));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toContain("failed");
   });
 });
 
@@ -460,6 +494,27 @@ describe("StudioPaneToggles keyboard navigation", () => {
     ).toEqual([0, -1, -1]);
   });
 
+  // The assertion above only reads three named toggles, so it stayed green
+  // while the copy control sat in the rail as a second, permanently-tabbable
+  // stop. These count what is actually reachable, in the state that has the
+  // most controls.
+  test("every control in the rail is reachable by arrow keys, not by Tab", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_current");
+    const rail = screen.getByRole("navigation", { name: "Studio panes" });
+    const tabbable = Array.from(
+      rail.querySelectorAll<HTMLElement>("button, a[href], [tabindex]"),
+    ).filter((el) => el.tabIndex >= 0);
+    expect(tabbable).toHaveLength(1);
+  });
+
+  test("the rail nests no interactive control inside another", () => {
+    renderAt("/workflows/wpid_abc/studio?wr=wr_current");
+    const rail = screen.getByRole("navigation", { name: "Studio panes" });
+    expect(
+      rail.querySelector("button button, button [tabindex], button [role]"),
+    ).toBeNull();
+  });
+
   test("ArrowRight moves across all four tabs and wraps", () => {
     renderAt();
     tab(/^Copilot/).focus();
@@ -482,6 +537,8 @@ describe("StudioPaneToggles keyboard navigation", () => {
     fireEvent.keyDown(tab("View Run: wr_current"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab("Past Runs"));
     fireEvent.keyDown(tab("Past Runs"), { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tab("Copy run link"));
+    fireEvent.keyDown(tab("Copy run link"), { key: "ArrowRight" });
     expect(document.activeElement).toBe(tab(/^Copilot/));
   });
 

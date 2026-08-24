@@ -24,6 +24,7 @@ class CopilotPendingTurn(BaseModel):
     pre_turn_workflow: dict[str, Any] | None = None
     pre_turn_proposed_workflow: dict[str, Any] | None = None
     keep_pending_proposal: bool = False
+    idempotency_digest: str | None = None
     user_message_id: str | None = None
     recovering_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
@@ -137,6 +138,11 @@ class WorkflowCopilotChatRequest(BaseModel):
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
         ),
     )
+    idempotency_key: str | None = Field(
+        None,
+        max_length=256,
+        description="Stable key for deduplicating a retried product action within this chat.",
+    )
     target_block_label: str | None = Field(
         None,
         description=(
@@ -144,12 +150,11 @@ class WorkflowCopilotChatRequest(BaseModel):
             "other block unchanged. Used by the block-level Generate action."
         ),
     )
-    fix_origin: bool = Field(
-        False,
+    selected_block_label: str | None = Field(
+        None,
         description=(
-            "True when the turn originates from the 'Fix with Copilot' action on a failed run. Carried as "
-            "provenance only: it does not change the turn's routing or tool authority, which come from the "
-            "request policy and the run the turn is grounded in."
+            "Label of the block currently selected on the studio canvas, if any. An ambient fact for "
+            "resolving references like 'this block' — never a directive to act on that block."
         ),
     )
     supports_credential_pause: bool = Field(
@@ -165,6 +170,14 @@ class WorkflowCopilotChatRequest(BaseModel):
         description=(
             "When true, a pending proposed_workflow from an earlier turn survives turns that end without "
             "a new proposal, so the client can keep rendering an actionable review gate."
+        ),
+    )
+    product_action: Literal["test_end_to_end"] | None = Field(
+        None,
+        description=(
+            "Structured product action for this turn, dispatched by the server instead of the agent. "
+            "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
+            "for that run."
         ),
     )
 
@@ -238,6 +251,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CONDENSING = "condensing"
     NARRATION = "narration"
     BLOCK_PROGRESS = "block_progress"
+    RUN_STARTED = "run_started"
     RUN_OUTCOME = "run_outcome"
     TURN_START = "turn_start"
     DESIGN_START = "design_start"
@@ -328,6 +342,10 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
     tool_input: dict = Field(default_factory=dict, description="Sanitized tool input (no secrets)")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
@@ -357,6 +375,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
             "passed or failed; None for non-run tools."
         ),
+    )
+    timestamp: datetime | None = Field(
+        None,
+        description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
     )
 
 
@@ -401,6 +423,14 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class WorkflowCopilotRunStartedUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RUN_STARTED, description="Message type"
+    )
+    workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
 class WorkflowCopilotRunOutcomeUpdate(BaseModel):
     # Current authoring emits one factual terminal record. Legacy persisted
     # frames may still carry the older evaluating/adjudicated shape.
@@ -420,6 +450,18 @@ class WorkflowCopilotRunOutcomeUpdate(BaseModel):
         None, description="Machine-readable cause for a not_demonstrated verdict"
     )
     display_reason: str | None = Field(None, description="Short product-safe reason for user-facing rendering")
+    browser_session_id: str | None = Field(
+        None, description="Browser session that owned this run's recorded execution state"
+    )
+    workflow_permanent_id: str | None = Field(None, description="Workflow whose Copilot turn created this run")
+    turn_id: str | None = Field(None, description="Parent Copilot turn for this child run")
+    workflow_copilot_chat_id: str | None = Field(None, description="Parent Copilot chat for this child run")
+    continuity_source: Literal["workflow_run"] = Field(
+        "workflow_run", description="Distinguishes authoritative run state from pane-stream presentation state"
+    )
+    terminal_disposition: str | None = Field(
+        None, description="Recorded run status or watchdog disposition that ended this run observation"
+    )
     iteration: int = Field(..., description="Agent loop iteration number")
     timestamp: datetime = Field(..., description="Server timestamp")
 

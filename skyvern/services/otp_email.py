@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Protocol
 import httpx
 from google.oauth2.credentials import Credentials
 
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services import google_gmail_service, google_oauth_service, microsoft_oauth_service
 from skyvern.services.email import outlook
 
@@ -76,6 +77,10 @@ class EmailOTPVerificationContext:
     """Whole-poll cache: one EmailOTPSourceContext per source name."""
 
     per_source: dict[str, EmailOTPSourceContext] = field(default_factory=dict)
+    # Types seen but rejected for not matching the caller's expected_otp_type. A rejected
+    # message is never persisted, so this is the only surviving record that a wrong-verb
+    # caller waited out its budget while the other kind of OTP was sitting in the inbox.
+    observed_otp_types: set[OTPType] = field(default_factory=set)
 
     def for_source(self, source_name: str) -> EmailOTPSourceContext:
         return self.per_source.setdefault(source_name, EmailOTPSourceContext())

@@ -1,0 +1,128 @@
+Every Skyvern credential is scoped to **one organization**. There are two ways to authenticate, and both resolve to the same thing: full API access on behalf of that organization.
+
+| Method | Credential | How you send it | Best for |
+| --- | --- | --- | --- |
+| API key | Long-lived organization key | `x-api-key` header | Servers, CI, SDKs, scripts |
+| OAuth 2.0 | Access token from browser sign-in, refreshable | `Authorization: Bearer` header | MCP clients and AI assistants, apps acting for a signed-in user |
+
+## API keys
+
+An API key is an organization-scoped bearer credential. Send it in the `x-api-key` header:
+
+```bash
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "url": "https://example.com", "prompt": "Extract the pricing table" }'
+```
+
+Find and copy your key from **Settings** in the Cloud dashboard, or at [app.skyvern.com/settings](https://app.skyvern.com/settings).
+
+### What an API key can do
+
+The key identifies the organization it belongs to. Authorization is at that granularity and no finer:
+
+- It can call **every** documented endpoint that the organization can reach — create and cancel runs, read run history and artifacts, create and delete workflows, manage browser sessions and profiles, and read and write stored credentials.
+- Usage and cost are metered to that organization.
+- It carries no expiry of its own; it is valid until revoked.
+
+<Warning>
+There are no read-only keys, per-endpoint keys, or per-resource keys today. Any API key grants full organization-level authority, so treat one like a root password: store it in a secrets manager, never commit it, and never ship it to a browser or mobile client.
+</Warning>
+
+### Isolating access
+
+Because scoping is per organization, the organization is the isolation boundary. To separate access:
+
+- Use **separate organizations** for separate blast radii — production versus staging, or one per customer or per team.
+- Rotate keys from **Settings** when someone with access leaves or a key may have leaked. Revoking a key immediately invalidates every client using it, including OAuth tokens issued against it.
+- Put outbound results behind [webhooks](/developers/going-to-production/webhooks) with signature verification rather than handing a key to a third party so it can poll.
+
+
+## OAuth 2.0
+
+Skyvern Cloud is an OAuth 2.0 authorization server, backed by Clerk. It exists so MCP clients and AI assistants can authenticate a human with a browser sign-in instead of asking them to paste a static key into a config file.
+
+Discovery metadata is public:
+
+```bash
+curl https://api.skyvern.com/.well-known/oauth-authorization-server
+curl https://api.skyvern.com/.well-known/oauth-protected-resource
+```
+
+| Property | Value |
+| --- | --- |
+| Issuer | `https://clerk.skyvern.com` |
+| Authorization endpoint | `https://api.skyvern.com/oauth/authorize` |
+| Token endpoint | `https://api.skyvern.com/oauth/token` |
+| Revocation endpoint | `https://clerk.skyvern.com/oauth/token/revoke` |
+| Dynamic client registration | `https://clerk.skyvern.com/oauth/register` |
+| Grant types | `authorization_code`, `refresh_token` |
+| Response types | `code` |
+| PKCE | `S256` required |
+| Protected resource | `https://api.skyvern.com/mcp` |
+| Bearer methods | `header` |
+
+Clients that support MCP OAuth discovery — Claude Code, Claude Desktop, Cursor, Codex CLI, ChatGPT — need no client ID or client secret in their config; they register dynamically and open a browser for sign-in. See the [MCP server setup guide](/developers/getting-started/mcp) for per-client commands.
+
+### Supported scopes
+
+The authorization server advertises these `scopes_supported`:
+
+| Scope | Meaning |
+| --- | --- |
+| `openid` | OpenID Connect sign-in; issue an ID token |
+| `profile` | Basic profile claims (name) |
+| `email` | Email address claim |
+| `public_metadata` | Public user metadata claims |
+| `private_metadata` | Private user metadata claims |
+| `offline_access` | Issue a refresh token so the client can stay connected |
+| `user:org:read` | Read the signed-in user's organization membership |
+
+The protected-resource metadata for the MCP server narrows the advertised set to `profile` and `email`.
+
+<Warning>
+These are **identity scopes, not API permission scopes.** They describe which claims about the signed-in user the token carries. They do not restrict which Skyvern endpoints or tools the token can reach.
+</Warning>
+
+Once the authorization code is exchanged, the resulting access token authorizes as the organization the signed-in user belongs to, with the same organization-wide authority as an API key. Requesting fewer scopes does not produce a more restricted token. Access tokens expire and are refreshable with `offline_access`; a refresh token is single-use and rotated on every exchange, and replaying an old one revokes the whole token family. Revoking the organization's API key also invalidates tokens issued against it.
+
+## MCP server
+
+The hosted Model Context Protocol server is at **`https://api.skyvern.com/mcp`**. It accepts either credential:
+
+- OAuth: `Authorization: Bearer <access_token>`
+- API key: `x-api-key: YOUR_API_KEY`
+
+You can narrow the **tool list** a client sees, either with a scoped URL or a header:
+
+```bash
+# Scoped URL
+https://api.skyvern.com/mcp/x/operate
+
+# Or the default URL plus a header
+X-Skyvern-Scope: operate
+```
+
+Valid values are `operate`, `build`, `browser`, `lean`, and `all`. Omitting the scope is identical to `all`.
+
+<Note>
+Tool scopes are a **usability filter, not an authorization boundary.** They change which tools the server advertises, so a smaller scope means a smaller, sharper tool list for the model — but the request still authenticates with the same organization-wide credential. Do not rely on a narrow scope to prevent a client from taking an action.
+</Note>
+
+## Summary of the scoping model
+
+- **Organization** is the only authorization boundary. Every credential is bound to exactly one, and grants full access within it.
+- **API keys** are org-scoped bearer credentials with no sub-scopes, sent as `x-api-key`.
+- **OAuth scopes** control identity claims about the signed-in user, not API reach.
+- **MCP tool scopes** control the advertised tool catalog, not permissions.
+- To limit what a credential can touch, create a separate organization.
+
+<CardGroup cols={2}>
+  <Card title="API Key" icon="key" href="/cloud/account-settings/api-keys">
+    Find, copy, and rotate your key in the Cloud dashboard
+  </Card>
+  <Card title="MCP Server" icon="plug" href="/developers/getting-started/mcp">
+    Per-client OAuth and API-key setup for the hosted MCP server
+  </Card>
+</CardGroup>

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import mimetypes
 import os
 import re
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
-from urllib.parse import parse_qsl, unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse
 
 import aiohttp
 import filetype
@@ -24,6 +25,7 @@ from skyvern.exceptions import (
     BlockedHost,
     DownloadFileMaxSizeExceeded,
     DownloadFileMaxWaitingTime,
+    GoogleDriveFileNotAccessible,
     HttpException,
     SkyvernHTTPException,
 )
@@ -43,6 +45,8 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     RedirectHopAuthorizer,
     authorize_request_hop_once,
 )
+from skyvern.forge.sdk.db.id import UPLOADED_FILE_PREFIX
+from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
@@ -53,6 +57,33 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 
 LOG = structlog.get_logger()
+
+_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]+$")
+
+
+def is_uploaded_file_id(value: str) -> bool:
+    """Whether a value names a file uploaded through ``POST /v1/upload_file``.
+
+    Distinguishable from a URL by construction: an id carries no scheme, and ``file_`` is not
+    a parsable URL scheme, so this can never shadow a ``file://`` path.
+    """
+    return bool(_UPLOADED_FILE_ID_PATTERN.match(value.strip()))
+
+
+async def resolve_uploaded_file_id(file_id: str, organization_id: str | None) -> str:
+    """Turn a file id into the storage URI holding its bytes.
+
+    The URI comes from the ``uploaded_files`` row rather than from input, and the org scope is
+    part of the lookup, so a caller can only ever name their own organization's files.
+    """
+    if organization_id is None:
+        raise PermissionError(f"No permission to access file: {file_id}")
+    storage_uri = await uploaded_file_service.resolve_file_reference(
+        file_id=file_id.strip(), organization_id=organization_id
+    )
+    if storage_uri is None:
+        raise FileNotFoundError(f"File not found: {file_id}")
+    return storage_uri
 
 
 def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[str, str]) -> tuple[str, str]:
@@ -85,6 +116,57 @@ def extract_google_drive_file_id(url: str) -> str | None:
     if match:
         return match.group(1)
     return None
+
+
+_GOOGLE_DRIVE_DOWNLOAD_HOSTS = ("drive.google.com", "drive.usercontent.google.com")
+_GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES = 1024 * 1024
+_GOOGLE_DRIVE_FORM_RE = re.compile(r'<form[^>]*\baction="([^"]+)"[^>]*>(.*?)</form>', re.IGNORECASE | re.DOTALL)
+_GOOGLE_DRIVE_INPUT_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+
+
+def _is_google_drive_download_url(url: str) -> bool:
+    return (urlparse(url).hostname or "").lower() in _GOOGLE_DRIVE_DOWNLOAD_HOSTS
+
+
+def _extract_google_drive_interstitial_url(body: str) -> str | None:
+    """Continuation URL from Drive's large-file/virus-scan interstitial form, or None when the
+    HTML is a sign-in / permission-denied page carrying no download form."""
+    for form_match in _GOOGLE_DRIVE_FORM_RE.finditer(body):
+        action = html.unescape(form_match.group(1))
+        params: dict[str, str] = {}
+        for input_tag in _GOOGLE_DRIVE_INPUT_RE.findall(form_match.group(2)):
+            name_match = re.search(r'\bname="([^"]*)"', input_tag, re.IGNORECASE)
+            if not name_match:
+                continue
+            value_match = re.search(r'\bvalue="([^"]*)"', input_tag, re.IGNORECASE)
+            params[html.unescape(name_match.group(1))] = html.unescape(value_match.group(1)) if value_match else ""
+        # The confirm token distinguishes the download form from unrelated forms (e.g. sign-in).
+        if "confirm" not in params:
+            continue
+        query = urlencode(params)
+        if not query:
+            return action
+        return f"{action}&{query}" if "?" in action else f"{action}?{query}"
+
+    link_match = re.search(r'href="([^"]*/uc\?[^"]*\bconfirm=[^"]*)"', body, re.IGNORECASE)
+    if link_match:
+        return html.unescape(link_match.group(1))
+    return None
+
+
+def _is_html_content_type(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    return content_type.split(";")[0].strip().lower() == "text/html"
+
+
+async def _read_bounded_response_text(response: aiohttp.ClientResponse, max_bytes: int) -> str:
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(1024):
+        body.extend(chunk)
+        if len(body) >= max_bytes:
+            break
+    return bytes(body).decode("utf-8", errors="replace")
 
 
 def is_valid_mime_type(file_path: str) -> bool:
@@ -254,6 +336,29 @@ async def fetch_file_bytes(
     raise HttpException(400, "[redacted]", "Too many redirects while downloading file")
 
 
+def _resolve_legacy_download_path(candidate_path: str) -> str:
+    """Resolve a legacy file:// path and confirm it is inside the repository downloads directory.
+
+    Containment is checked on the realpath with commonpath, so dot segments, percent-decoded dot
+    segments, symlinks, and sibling directories such as ``downloads-evil`` cannot escape.
+    """
+    allowed_dir = os.path.realpath(os.path.join(REPO_ROOT_DIR, "downloads"))
+    resolved_path = os.path.realpath(candidate_path)
+    try:
+        inside_allowed_dir = os.path.commonpath((allowed_dir, resolved_path)) == allowed_dir
+    except ValueError:
+        inside_allowed_dir = False
+    if not inside_allowed_dir:
+        LOG.warning(
+            "Legacy local file path traversal blocked",
+            candidate_path=candidate_path,
+            resolved_path=resolved_path,
+            allowed_dir=allowed_dir,
+        )
+        raise PermissionError("Local file path is outside the downloads directory")
+    return resolved_path
+
+
 def validate_download_url(url: str, organization_id: str | None = None) -> bool:
     """Validate if a URL is supported for downloading.
 
@@ -269,6 +374,11 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
         True if valid, False otherwise.
     """
     try:
+        # A file id resolves to an org-scoped storage URI at download time, and that URI is
+        # re-checked against the org prefix before any bytes are read.
+        if is_uploaded_file_id(url):
+            return organization_id is not None
+
         parsed_url = urlparse(url)
         scheme = parsed_url.scheme.lower()
 
@@ -292,12 +402,9 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
 
             # Validate the file path is within allowed directories
             try:
-                file_path = parse_uri_to_path(url)
-                allowed_prefix = f"{REPO_ROOT_DIR}/downloads"
-                if not file_path.startswith(allowed_prefix):
-                    return False
+                _resolve_legacy_download_path(parse_uri_to_path(url))
                 return True
-            except ValueError:
+            except (ValueError, PermissionError):
                 return False
 
         # Reject unsupported schemes
@@ -320,6 +427,12 @@ async def download_file(
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
 
+    # Resolved before the try below so a missing or cross-org file id fails loudly instead of
+    # falling through to the HTTP fetch path with an id as the URL.
+    if is_uploaded_file_id(url):
+        url = await resolve_uploaded_file_id(url, organization_id)
+
+    requested_url = url
     try:
         # Check if URL is a Google Drive link
         if "drive.google.com" in url:
@@ -328,6 +441,7 @@ async def download_file(
                 # Convert to direct download URL
                 url = f"https://drive.google.com/uc?export=download&id={file_id}"
                 LOG.info("Converting Google Drive link to direct download", url=url)
+        is_google_drive_download = _is_google_drive_download_url(url)
 
         # Check if URL is a cloud storage URI handled by the configured storage backend.
         parsed = urlparse(url)
@@ -356,10 +470,9 @@ async def download_file(
         # we only support to download local files when the environment is local
         # and the file is in the skyvern downloads directory
         if url.startswith("file://") and settings.ENV == "local":
-            local_path = parse_uri_to_path(url)
-            if local_path.startswith(f"{REPO_ROOT_DIR}/downloads"):
-                LOG.info("Downloading file from local file system", url=url)
-                return local_path
+            local_path = _resolve_legacy_download_path(parse_uri_to_path(url))
+            LOG.info("Downloading file from local file system", url=url)
+            return local_path
 
         resolver = SSRFGuardedResolver()
         current_url = await validate_and_pin_fetch_url(url, resolver)
@@ -383,6 +496,18 @@ async def download_file(
                             return GuardedFileRedirect(location=location)
 
                         _raise_download_response_for_status(response)
+                        if is_google_drive_download and _is_html_content_type(response.headers.get("Content-Type")):
+                            # Drive quirk: uc?export=download answers with an HTML interstitial — a
+                            # virus-scan confirm form for large files, a sign-in page for
+                            # inaccessible ones — so an HTML body is never the requested file.
+                            interstitial_body = await _read_bounded_response_text(
+                                response, _GOOGLE_DRIVE_INTERSTITIAL_MAX_BYTES
+                            )
+                            continuation_url = _extract_google_drive_interstitial_url(interstitial_body)
+                            if continuation_url is None:
+                                raise GoogleDriveFileNotAccessible(url=requested_url)
+                            LOG.info("Following Google Drive download interstitial", url=current_url)
+                            return GuardedFileRedirect(location=continuation_url)
                         if (
                             max_size_mb
                             and response.content_length
@@ -470,6 +595,10 @@ async def download_file(
     except DownloadFileMaxSizeExceeded as e:
         LOG.warning(f"Failed to download file, max size exceeded: {e.max_size}", exc_info=True)
         raise
+    except GoogleDriveFileNotAccessible:
+        # User-actionable sharing problem on the customer's file, not a platform fault.
+        LOG.warning("Google Drive download returned an HTML page instead of file content", url=requested_url)
+        raise
     except PermissionError as e:
         LOG.warning(
             "Rejected storage URI download",
@@ -487,7 +616,9 @@ async def download_file(
         LOG.warning("Failed to download file, blocked host", exc_info=True)
         raise
     except Exception:
-        LOG.exception("Failed to download file")
+        # Dominated by the requested host erroring, which the run record already carries; a genuine
+        # defect in this path therefore surfaces at warning, not error.
+        LOG.warning("Failed to download file", exc_info=True)
         raise
 
 
@@ -597,6 +728,32 @@ def get_download_dir(run_id: str | None) -> str:
     download_dir = os.path.join(settings.DOWNLOAD_PATH, str(run_id))
     os.makedirs(download_dir, exist_ok=True)
     return download_dir
+
+
+RUN_TEMP_NAMESPACE = "runs"
+
+
+def _is_single_path_component(value: str) -> bool:
+    return bool(value) and value not in (".", "..") and Path(value).name == value
+
+
+def get_run_temp_dir(organization_id: str, run_id: str) -> str:
+    """The run's own scratch directory (``TEMP_PATH/runs/<org>/<run>``), created on first use.
+
+    The one sanctioned place for per-run temp files: everything under it is deletable by run
+    identity alone — activity teardown removes the finishing run's directory and the stale sweep
+    reaps aged ones — so a tenant staging here needs no cleanup logic of its own. Both components
+    must be single plain path elements because this path is later fed to rmtree by identity.
+    """
+    if not _is_single_path_component(organization_id) or not _is_single_path_component(run_id):
+        raise ValueError("organization_id and run_id must be single path components")
+    run_dir = os.path.join(settings.TEMP_PATH, RUN_TEMP_NAMESPACE, organization_id, run_id)
+    # makedirs follows symlinked ancestors; a planted link under runs/ would materialize run dirs
+    # outside TEMP_PATH and put them beyond the reapers' reach. Resolve-check before creating.
+    if not Path(run_dir).resolve().is_relative_to(Path(settings.TEMP_PATH).resolve()):
+        raise ValueError("run temp dir resolves outside TEMP_PATH")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 def resolve_run_download_id(context: "SkyvernContext | None", fallback_run_id: str | None = None) -> str | None:

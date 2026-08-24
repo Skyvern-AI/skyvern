@@ -25,6 +25,7 @@ from skyvern.webeye.browser_factory import (
     rebind_download_dir,
     set_download_file_listener,
 )
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 
 
 def _recording_browser() -> tuple[MagicMock, MagicMock]:
@@ -45,6 +46,20 @@ def _recording_context_page() -> tuple[MagicMock, MagicMock, MagicMock]:
     page = MagicMock()
     page.context = context
     return page, context, cdp_session
+
+
+def _workflow_attach_run() -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_block",
+        parent_workflow_run_id=None,
+        workflow_permanent_id="wpid_block",
+        organization_id="org_1",
+        browser_profile_id=None,
+        proxy_location=None,
+        extra_http_headers=None,
+        cdp_connect_headers=None,
+        browser_address=None,
+    )
 
 
 def _assert_scope_rebound(interceptor: MagicMock, run_id: str) -> None:
@@ -193,6 +208,20 @@ async def test_rebind_ignores_context_without_interceptor() -> None:
     await rebind_download_dir(browser, run_id="wr_test")
 
     cdp_session.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rebind_never_detaches_the_session_that_installed_the_binding() -> None:
+    # Chromium scopes setDownloadBehavior to the installing session and reverts the binding when
+    # that session detaches -- a detach after the rebind silently redirects every later download
+    # away from the run's directory, measured on both engines (#15207 review).
+    browser, browser_session = _recording_browser()
+    await rebind_download_dir(browser, run_id="wr_test")
+    browser_session.detach.assert_not_called()
+
+    page, _, page_session = _recording_context_page()
+    await rebind_download_dir(None, run_id="wr_test", page=page)
+    page_session.detach.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -469,20 +498,24 @@ async def test_listener_falls_back_to_kwargs_without_context(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_seam_rebinds_to_run_dir() -> None:
-    """The copilot code-block acquisition site rebinds the adopted CDP downloadPath to the run dir (SKY-11083)."""
+async def test_browser_manager_adoption_rebinds_to_run_dir() -> None:
+    """The persistent-session attach path rebinds the adopted CDP downloadPath to the run dir."""
     browser, cdp_session = _recording_browser()
     browser_state = MagicMock()
     browser_state.browser_context.browser = browser
+    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.get_or_create_page = AsyncMock()
+    manager = RealBrowserManager()
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
+    ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
-
-        result = await Block.get_or_create_browser_state(
-            MagicMock(),
-            workflow_run_id="wr_block",
-            organization_id="org_1",
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        result = await manager.get_or_create_for_workflow_run(
+            _workflow_attach_run(),
             browser_session_id="bs_block",
         )
 
@@ -490,26 +523,27 @@ async def test_block_adoption_seam_rebinds_to_run_dir() -> None:
     _, params = cdp_session.send.await_args.args
     assert params["downloadPath"] == get_download_dir("wr_block")
     assert params["downloadPath"].endswith("/wr_block")
-    mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_skips_rebind_when_session_dir_binding() -> None:
-    """A provider-owned remote binding preserves the provider-selected destination: the block adoption
-    seam must not re-send setDownloadBehavior to a run-scoped dir."""
+async def test_browser_manager_adoption_skips_rebind_when_session_dir_binding() -> None:
+    """A provider-owned remote binding preserves the provider-selected destination."""
     browser, cdp_session = _recording_browser()
     browser_state = MagicMock()
     browser_state.browser_context.browser = browser
     browser_state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.get_or_create_page = AsyncMock()
+    manager = RealBrowserManager()
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
+    ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
-
-        result = await Block.get_or_create_browser_state(
-            MagicMock(),
-            workflow_run_id="wr_block",
-            organization_id="org_1",
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        result = await manager.get_or_create_for_workflow_run(
+            _workflow_attach_run(),
             browser_session_id="bs_block",
         )
 
@@ -518,21 +552,25 @@ async def test_block_adoption_skips_rebind_when_session_dir_binding() -> None:
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_seam_rebinds_via_context_page_without_owning_browser() -> None:
-    """Persistent-context adoption (browser_context.browser is None) rebinds via the working page's CDP session."""
+async def test_browser_manager_adoption_rebinds_via_context_page_without_owning_browser() -> None:
+    """Persistent-context adoption rebinds through its working page when no Browser is exposed."""
     page, context, cdp_session = _recording_context_page()
     browser_state = MagicMock()
+    browser_state.browser_context = context
     browser_state.browser_context.browser = None
-    browser_state.is_connected = MagicMock(return_value=True)
-    browser_state.get_working_page = AsyncMock(return_value=page)
+    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+    browser_state.get_working_page = AsyncMock(side_effect=[page, page])
+    browser_state.get_or_create_page = AsyncMock()
+    manager = RealBrowserManager()
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
+    ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-
-        result = await Block.get_or_create_browser_state(
-            MagicMock(),
-            workflow_run_id="wr_block",
-            organization_id="org_1",
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        result = await manager.get_or_create_for_workflow_run(
+            _workflow_attach_run(),
             browser_session_id="bs_block",
         )
 
@@ -542,20 +580,23 @@ async def test_block_adoption_seam_rebinds_via_context_page_without_owning_brows
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_seam_no_browser_no_page_returns_state() -> None:
-    """No owning Browser and no working page -> nothing to rebind, still return the state (fail-open)."""
+async def test_browser_manager_adoption_no_browser_no_page_returns_state() -> None:
+    """No Browser and no working page leaves nothing to rebind, but attachment stays fail-open."""
     browser_state = MagicMock()
     browser_state.browser_context.browser = None
-    browser_state.is_connected = MagicMock(return_value=True)
+    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
     browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.get_or_create_page = AsyncMock()
+    manager = RealBrowserManager()
 
-    with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
+    ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-
-        result = await Block.get_or_create_browser_state(
-            MagicMock(),
-            workflow_run_id="wr_block",
-            organization_id="org_1",
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        result = await manager.get_or_create_for_workflow_run(
+            _workflow_attach_run(),
             browser_session_id="bs_block",
         )
 
@@ -726,31 +767,32 @@ async def test_block_non_adoption_rebind_fail_open() -> None:
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_seam_fail_open_on_rebind_error() -> None:
-    """A rebind failure is swallowed; the block still receives its browser state (fail-open)."""
+async def test_browser_manager_adoption_rebind_error_is_fail_open() -> None:
+    """A manager-owned rebind failure is swallowed and attachment still returns the browser state."""
     browser_state = MagicMock()
     browser_state.browser_context.browser = MagicMock()
+    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.get_or_create_page = AsyncMock()
+    manager = RealBrowserManager()
 
     with (
-        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
         patch(
-            "skyvern.forge.sdk.workflow.models.block.rebind_download_dir",
+            "skyvern.webeye.real_browser_manager.rebind_download_dir",
             new_callable=AsyncMock,
             side_effect=RuntimeError("cdp down"),
         ),
     ):
         mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
-
-        result = await Block.get_or_create_browser_state(
-            MagicMock(),
-            workflow_run_id="wr_block",
-            organization_id="org_1",
+        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
+        result = await manager.get_or_create_for_workflow_run(
+            _workflow_attach_run(),
             browser_session_id="bs_block",
         )
 
     assert result is browser_state
-    mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run.assert_not_called()
 
 
 def test_resolve_run_download_id_prefers_run_id() -> None:
@@ -770,22 +812,23 @@ def test_resolve_run_download_id_uses_fallback_when_context_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_block_adoption_prefers_context_run_id_over_workflow_run_id() -> None:
-    """SKY-11153 regression: when context.run_id differs from workflow_run_id (e.g. task_v2),
-    the adopted session's download dir must bind to context.run_id — the key FileUploadBlock
-    scans — not the raw workflow_run_id."""
-    browser, cdp_session = _recording_browser()
+async def test_block_adoption_delegates_runnable_identity_to_browser_manager() -> None:
+    """The block passes immutable owner identity to the manager and never attaches directly."""
     browser_state = MagicMock()
-    browser_state.browser_context.browser = browser
-    ctx = SkyvernContext(run_id="run_ctx", workflow_run_id="wr_block")
+    workflow_run = _workflow_attach_run()
+    ctx = SkyvernContext(
+        run_id="run_ctx",
+        workflow_run_id="wr_block",
+        browser_session_runnable_id="wr_root",
+        browser_session_runnable_generation_id="gen_root",
+    )
 
     with (
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=ctx),
     ):
-        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock()
-
+        mock_app.WORKFLOW_SERVICE.get_workflow_run = AsyncMock(return_value=workflow_run)
+        mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock(return_value=browser_state)
         result = await Block.get_or_create_browser_state(
             MagicMock(),
             workflow_run_id="wr_block",
@@ -794,9 +837,53 @@ async def test_block_adoption_prefers_context_run_id_over_workflow_run_id() -> N
         )
 
     assert result is browser_state
-    _, params = cdp_session.send.await_args.args
-    assert params["downloadPath"] == get_download_dir("run_ctx")
-    assert params["downloadPath"].endswith("/run_ctx")
+    mock_app.BROWSER_MANAGER.get_or_create_for_workflow_run.assert_awaited_once_with(
+        workflow_run=workflow_run,
+        url=None,
+        browser_session_id="bs_block",
+        browser_profile_id=None,
+        browser_session_runnable_id="wr_root",
+        browser_session_runnable_generation_id="gen_root",
+    )
+    mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_block_adoption_task_context_delegates_to_task_attach_path() -> None:
+    """A task-owned block uses the task attach path while retaining the context's owner identity."""
+    browser_state = MagicMock()
+    task = MagicMock(task_id="tsk_block")
+    ctx = SkyvernContext(
+        task_id="tsk_block",
+        workflow_run_id="wr_block",
+        browser_session_runnable_id="wr_root",
+        browser_session_runnable_generation_id="gen_root",
+    )
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=ctx),
+    ):
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+        mock_app.BROWSER_MANAGER.get_or_create_for_task = AsyncMock(return_value=browser_state)
+        result = await Block.get_or_create_browser_state(
+            MagicMock(),
+            workflow_run_id="wr_block",
+            organization_id="org_1",
+            browser_session_id="bs_block",
+        )
+
+    assert result is browser_state
+    mock_app.DATABASE.tasks.get_task.assert_awaited_once_with(
+        task_id="tsk_block",
+        organization_id="org_1",
+    )
+    mock_app.BROWSER_MANAGER.get_or_create_for_task.assert_awaited_once_with(
+        task=task,
+        browser_session_id="bs_block",
+    )
+    mock_app.WORKFLOW_SERVICE.get_workflow_run.assert_not_called()
+    mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1248,7 +1335,6 @@ def test_resolve_run_download_id_preserves_task_id_tail() -> None:
 async def test_real_browser_manager_adoption_resolves_context_run_id() -> None:
     """SKY-11153 / COMP-2: the RealBrowserManager adoption seam rebinds the adopted session's
     download dir to context.run_id-first, matching the block seam and FileUploadBlock."""
-    from skyvern.webeye.real_browser_manager import RealBrowserManager
 
     manager = RealBrowserManager.__new__(RealBrowserManager)
     manager.pages = {}

@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import hmac
 import json
+import re
 import secrets
+from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocation, ProxyLocationInput
 
 _LOWER_HEX = set("0123456789abcdef")
+# Nothing in this class can form a scheme, a userinfo or an escape, so matching it proves the
+# value holds no credential. The length bound comes from the set it exists to admit: the longest
+# ProxyLocation value is 15 characters, and the margin covers a typo of one. Wider than that and
+# the class starts admitting token-shaped strings, which is the shape it is meant to exclude.
+_ENUM_SHAPED_RE = re.compile(r"[A-Za-z0-9_-]{1,20}")
+# Keyed per process: an unkeyed digest of a value holding a low-entropy password is an
+# offline verifier, since the surrounding JSON is a known template and candidates can be
+# hashed until one matches. The key never leaves memory, so identifiers correlate within a
+# process's logs and cannot be recomputed from a guess.
+_LOG_DIGEST_KEY = secrets.token_bytes(16)
 
 
 def is_proxy_session_id(value: str) -> bool:
@@ -44,6 +57,70 @@ def redact_proxy_session_id(value: str | None) -> str | None:
     if len(value) <= 5:
         return "***"
     return f"{value[:3]}...{value[-2:]}"
+
+
+def _identify(value: object) -> str:
+    """A keyed identifier for a value that must not be rendered."""
+    return hmac.new(_LOG_DIGEST_KEY, repr(value).encode("utf-8", "replace"), sha256).hexdigest()[:12]
+
+
+def _form_of(value: object) -> str:
+    """The kind of proxy_location this is, from its type and key names only - never its values."""
+    if value is None:
+        return "none"
+    if isinstance(value, dict):
+        return "custom_url" if "url" in value else "geo_dict"
+    if isinstance(value, str):
+        return "json" if value.lstrip()[:1] == "{" else "string"
+    return type(value).__name__
+
+
+class RedactedProxyLogValue(str):
+    """A proxy value already rendered safely for logs and traces."""
+
+
+class ProxyObservabilityField(StrEnum):
+    PROXY_LOCATION = "proxy_location"
+    PROXY_URL = "proxy_url"
+    PROXY_HOST = "proxy_host"
+    GEO_TARGET = "geo_target"
+
+
+def redact_proxy_location(value: object) -> RedactedProxyLogValue:
+    """A proxy_location named for a log line, never rendered into one.
+
+    Only values a type or a closed character class proves cannot hold a credential are printed:
+    the enum, a validated GeoTarget, and an enum-shaped string. Everything else is named and given
+    a keyed identifier, because a mechanism that renders a value first and sanitises it afterwards
+    has an unbounded set of placements and encodings to be defeated by, and sixteen review findings
+    on this helper were sixteen draws from that set.
+
+    The identifier is an HMAC under a key generated once per process and never written down: it
+    correlates two log lines within one process and cannot confirm a guess. Nothing about the
+    value's length or contents is emitted alongside it.
+    """
+    if isinstance(value, ProxyLocation):
+        return RedactedProxyLogValue(value.value)
+    if isinstance(value, GeoTarget):
+        # NOT safe wholesale: city takes 100 characters of free text and subdivision 10, so a
+        # validated GeoTarget can carry a URL. country is pinned to a supported set, so it is the
+        # only field of it that can be shown.
+        return RedactedProxyLogValue(f"geo_target:{value.country}:{_identify(value)}")
+    if isinstance(value, str) and _ENUM_SHAPED_RE.fullmatch(value):
+        return RedactedProxyLogValue(value)
+    return RedactedProxyLogValue(f"{_form_of(value)}:{_identify(value)}")
+
+
+def render_proxy_observability_value(
+    field: ProxyObservabilityField,
+    value: object,
+) -> RedactedProxyLogValue:
+    """Render a value according to its semantic proxy field family."""
+    if field is ProxyObservabilityField.PROXY_LOCATION:
+        return redact_proxy_location(value)
+    if field is ProxyObservabilityField.GEO_TARGET and isinstance(value, GeoTarget):
+        return RedactedProxyLogValue(f"geo_target:{value.country}:{_identify(value)}")
+    return RedactedProxyLogValue(f"{field.value}:{_identify(value)}")
 
 
 def should_generate_proxy_session_id(proxy_location: object | None) -> bool:

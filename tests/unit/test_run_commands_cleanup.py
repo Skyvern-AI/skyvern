@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import shutil
 import threading
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from fastapi import HTTPException
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from skyvern.cli import run_commands
 from skyvern.library import local_browser_profile
@@ -385,6 +394,7 @@ def test_run_mcp_stdin_eof_invokes_original_loop_cleanup(monkeypatch: pytest.Mon
 
 def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
+    from skyvern.cli.mcp_tools.origin_middleware import OriginValidationMiddleware  # noqa: PLC0415
 
     cleanup = AsyncMock()
     register = MagicMock()
@@ -398,7 +408,7 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
 
     run_commands.run_mcp(
         transport="streamable-http",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=9010,
         path="mcp",
         stateless_http=True,
@@ -408,16 +418,110 @@ def test_run_mcp_http_transport_wires_auth_middleware(monkeypatch: pytest.Monkey
     run.assert_awaited_once()
     kwargs = run.call_args.kwargs
     assert kwargs["transport"] == "streamable-http"
-    assert kwargs["host"] == "127.0.0.1"
+    # Wildcard exposure stays reachable, but only when the caller asks for it.
+    assert kwargs["host"] == "0.0.0.0"
     assert kwargs["port"] == 9010
     assert kwargs["path"] == "/mcp"
     assert kwargs["stateless_http"] is True
-    middleware = kwargs["middleware"]
-    assert len(middleware) == 2
-    assert middleware[0].cls is run_commands._ServerCardMiddleware
-    assert middleware[1].cls is MCPAPIKeyMiddleware
+    assert [entry.cls for entry in kwargs["middleware"]] == [
+        run_commands._ServerCardMiddleware,
+        OriginValidationMiddleware,
+        MCPAPIKeyMiddleware,
+    ]
     set_stateless.assert_has_calls([call(True), call(False)])
     cleanup.assert_awaited_once()
+
+
+def test_run_mcp_http_defaults_to_loopback() -> None:
+    assert inspect.signature(run_commands.run_mcp).parameters["host"].default == "127.0.0.1"
+
+
+def _compose_standalone_mcp_http_app(monkeypatch: pytest.MonkeyPatch, inner: Any) -> Any:
+    """Return the standalone MCP ASGI stack exactly as `run_mcp` composes it."""
+    run = AsyncMock()
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", AsyncMock())
+    monkeypatch.setattr(run_commands.atexit, "register", MagicMock())
+    monkeypatch.setattr("skyvern.cli.mcp_tools.mcp.run_async", run)
+
+    run_commands.run_mcp(transport="streamable-http", port=9010, path="mcp")
+
+    app = inner
+    for entry in reversed(run.call_args.kwargs["middleware"]):
+        app = entry.cls(app, *entry.args, **entry.kwargs)
+    return app
+
+
+def test_standalone_mcp_origin_validation_precedes_api_key_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.cli.core import mcp_http_auth  # noqa: PLC0415
+
+    valid_api_key = "STORMBREAKER-valid-key"
+    hostile_api_key = "STORMBREAKER-hostile-key"
+    forged_api_key = "STORMBREAKER-forged-key"
+    auth_db = object()
+    resolved_api_keys: list[str] = []
+    reached_mcp: list[str] = []
+
+    async def resolve_org_from_api_key(api_key: str, db: object, **_: object) -> SimpleNamespace:
+        assert db is auth_db
+        resolved_api_keys.append(api_key)
+        if api_key not in {valid_api_key, hostile_api_key}:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return SimpleNamespace(
+            organization=SimpleNamespace(organization_id="STORMBREAKER-org"),
+            token=SimpleNamespace(token_type=mcp_http_auth.OrganizationAuthTokenType.api),
+        )
+
+    monkeypatch.setattr(mcp_http_auth, "get_auth_db", lambda: auth_db)
+    monkeypatch.setattr(mcp_http_auth, "resolve_org_from_api_key", resolve_org_from_api_key)
+    mcp_http_auth._api_key_validation_cache.clear()
+
+    async def mcp_endpoint(request: Request) -> JSONResponse:
+        reached_mcp.append(request.headers.get("origin", ""))
+        return JSONResponse({"ok": True})
+
+    client = TestClient(
+        _compose_standalone_mcp_http_app(
+            monkeypatch,
+            Starlette(routes=[Route("/mcp", mcp_endpoint, methods=["GET", "POST"])]),
+        )
+    )
+
+    def post(api_key: str, origin: str | None) -> Any:
+        headers = {"x-api-key": api_key}
+        if origin is not None:
+            headers["origin"] = origin
+        return client.post("/mcp", headers=headers)
+
+    # Positive controls: the product still works for the origins it must serve.
+    assert post(valid_api_key, None).status_code == 200
+    assert post(valid_api_key, "http://localhost:5173").status_code == 200
+    assert post(valid_api_key, "https://claude.ai").status_code == 200
+    assert reached_mcp == ["", "http://localhost:5173", "https://claude.ai"]
+    assert resolved_api_keys == [valid_api_key]  # later calls served from the validation cache
+
+    # Hostile origins, including hosts that merely start with an allowed value.
+    for hostile_origin in (
+        "https://STORMBREAKER.attacker.invalid",
+        "https://claude.ai.STORMBREAKER.attacker.invalid",
+        "http://127.0.0.1.STORMBREAKER.attacker.invalid",
+        "http://localhost.STORMBREAKER.attacker.invalid",
+    ):
+        response = post(hostile_api_key, hostile_origin)
+        assert response.status_code == 403, hostile_origin
+        assert response.json() == {"error": "forbidden_origin", "detail": "Origin not allowed"}
+
+    assert hostile_api_key not in resolved_api_keys
+    assert len(reached_mcp) == 3
+
+    # Auth still runs — and still rejects — behind an allowed origin.
+    assert post(forged_api_key, "https://claude.ai").status_code == 401
+    assert forged_api_key in resolved_api_keys
+    assert len(reached_mcp) == 3
+
+    # Server-card discovery stays public, ahead of both gates.
+    card = client.get("/.well-known/mcp/server-card.json", headers={"origin": "https://STORMBREAKER.attacker.invalid"})
+    assert card.status_code == 200
+    assert card.headers["access-control-allow-origin"] == "*"
 
 
 @pytest.mark.asyncio

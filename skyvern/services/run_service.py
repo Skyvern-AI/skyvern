@@ -21,7 +21,13 @@ from skyvern.schemas.runs import (
     TaskRunResponse,
 )
 from skyvern.schemas.webhooks import RunWebhookReplayResponse
-from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
+from skyvern.services import (
+    task_v1_service,
+    task_v2_service,
+    uploaded_file_service,
+    webhook_service,
+    workflow_service,
+)
 
 LOG = structlog.get_logger()
 
@@ -123,6 +129,9 @@ async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_k
     if not task:
         raise TaskNotFound(task_id=task_id)
     task = await app.agent.update_task(task, status=TaskStatus.canceled)
+    # A cancel short-circuits the run's own teardown, so the attachments are deleted here
+    # instead. Same ordering as teardown: bytes gone before the webhook announces the run.
+    await uploaded_file_service.delete_files_attached_to_run(run_id=task_id)
     await app.agent.execute_task_webhook(task=task, api_key=api_key)
 
 
@@ -133,6 +142,9 @@ async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> No
     await task_v2_service.mark_task_v2_as_canceled(
         task_v2_id=task_id, workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id
     )
+    # A task v2's attachments are bound to the workflow run it executes as, not to task_id.
+    if task_v2.workflow_run_id:
+        await uploaded_file_service.delete_files_attached_to_run(run_id=task_v2.workflow_run_id)
 
 
 async def cancel_workflow_run(
@@ -160,6 +172,7 @@ async def cancel_workflow_run(
             continue
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
+    await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
     await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
 
 

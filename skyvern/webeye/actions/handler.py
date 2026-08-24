@@ -2,9 +2,11 @@ import asyncio
 import contextlib
 import copy
 import json
+import math
 import os
 import re
 import shutil
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -12,14 +14,14 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Request, Response, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Request, Response
 from pydantic import BaseModel, field_validator
 
 from skyvern.config import settings
@@ -43,6 +45,7 @@ from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
+    FailedToClearInputField,
     FailedToFetchSecret,
     FailedToTakeScreenshot,
     FailToClick,
@@ -73,7 +76,10 @@ from skyvern.exceptions import (
     NoSuitableAutoCompleteOption,
     NoTOTPSecretFound,
     OptionIndexOutOfBound,
+    PhoneNumberInputBrowserInteractionFailed,
+    PhoneNumberInputBrowserValidityMismatch,
     PhoneNumberInputMismatch,
+    ScreenshotTargetClosed,
     SecretInputMismatch,
     SkyvernException,
     SkyvernHTTPException,
@@ -89,8 +95,8 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     fetch_file_bytes,
     get_download_dir,
+    get_run_temp_dir,
     list_files_in_directory,
-    make_temp_directory,
     resolve_run_download_id,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -131,6 +137,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
@@ -160,16 +167,20 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
-from skyvern.webeye.browser_factory import initialize_download_dir, resolve_artifact_path
+from skyvern.webeye.browser_factory import initialize_download_dir, read_download_failure, resolve_artifact_path
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.cdp_download_interceptor import (
     DOWNLOAD_MIME_TYPES,
     MAX_FILE_SIZE_BYTES,
+    begin_requested_download_for_context,
     download_filename_from_suffix,
     extract_filename,
+    finish_requested_download_for_context,
     is_download_response,
     normalize_download_filename,
+    publish_download_bytes_for_context,
     redacted_exception_origin,
     settle_browser_downloads_for_context,
 )
@@ -193,6 +204,7 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    is_element_detached_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
 )
@@ -207,6 +219,14 @@ from skyvern.webeye.utils.page import (
 )
 
 LOG = structlog.get_logger()
+_DISPATCHER_OWNED_INPUT_EXCEPTIONS = (
+    MissingElement,
+    MultipleElementsFound,
+    LLMProviderError,
+    ImaginarySecretValue,
+    CaptchaSolveError,
+    asyncio.TimeoutError,
+)
 
 
 async def _totp_window_sleep(delay: float) -> None:
@@ -222,6 +242,10 @@ UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the uplo
 DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE = (
     "No file download was observed or credited after this action. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
+)
+DOWNLOAD_ABORTED_FAILURE_MESSAGE = (
+    "The browser started this download but aborted it before any file was saved. "
+    "The download link may have expired; regenerate it before trying the download again."
 )
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
     "The sensitive paste completed, but the clipboard could not be cleared. "
@@ -240,19 +264,19 @@ _COLLAPSE_XP_ASSIGNMENT_MEMO: TTLCache[str, bool] = TTLCache(maxsize=100_000, tt
 
 
 def _is_selected_engine_timeout(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    """A driver-native timeout under THIS run's selected engine; the stock Playwright ``TimeoutError``
-    identity when no engine is pinned (unchanged default)."""
+    """A driver-native timeout under THIS run's selected engine; any installed Playwright-family
+    driver's timeout identity when no engine is pinned."""
     if engine_selection is not None:
         return engine_selection.is_engine_timeout_error(exc)
-    return isinstance(exc, TimeoutError)
+    return is_driver_timeout_error(exc)
 
 
 def _is_selected_engine_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
-    """A driver-native error under THIS run's selected engine; the stock Playwright ``Error`` identity
-    when no engine is pinned (unchanged default)."""
+    """A driver-native error under THIS run's selected engine; any installed Playwright-family
+    driver's error identity when no engine is pinned."""
     if engine_selection is not None:
         return engine_selection.is_engine_error(exc)
-    return isinstance(exc, PlaywrightError)
+    return is_driver_error(exc)
 
 
 class _CollapseGateResult(NamedTuple):
@@ -1511,6 +1535,14 @@ async def _recover_blocked_inline_pdf_download(
         # A URL with no path basename (e.g. ".../?token=...") yields no name; the bytes are a
         # confirmed PDF, so give the persisted file a .pdf extension instead of an extension-less one.
         base_name = "statement.pdf"
+    handled_by_interceptor, intercepted_target = publish_download_bytes_for_context(
+        page.context,
+        data,
+        base_name,
+        "application/pdf",
+    )
+    if handled_by_interceptor:
+        return intercepted_target
     target = _download_target_path(download_dir, base_name)
     try:
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -1951,15 +1983,30 @@ async def check_phone_number_format(
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
-        action=action,
         element_id=skyvern_element.get_id(),
-        recommended_phone_number=check_phone_number_format_response.recommended_phone_number,
+        source_digit_count=len(_phone_digits(value)),
+        recommended_digit_count=len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
+        digit_count_changed=len(_phone_digits(value))
+        != len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
     )
     return check_phone_number_format_response.recommended_phone_number
 
 
 def _phone_digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
+
+
+def _input_target_log_fields(*, is_tel: bool, text: str) -> dict[str, str | int]:
+    if is_tel:
+        return {"target_digit_count": len(_phone_digits(text))}
+    return {"target_value": text}
+
+
+def _browser_error_log_fields(exc: Exception, *, is_tel: bool) -> dict[str, str]:
+    fields = {"error_type": type(exc).__name__}
+    if not is_tel:
+        fields["error_message"] = str(exc)
+    return fields
 
 
 def _phone_readback_digits_match(
@@ -2211,6 +2258,14 @@ async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
     )
 
 
+async def _probe_tel_browser_validity(locator: Locator) -> bool | None:
+    try:
+        result = await locator.evaluate("(element) => element.validity?.valid ?? null")
+    except Exception:
+        return None
+    return result if isinstance(result, bool) else None
+
+
 async def verify_phone_input_digits(
     *,
     tag_name: str,
@@ -2220,7 +2275,7 @@ async def verify_phone_input_digits(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
+) -> int:
     # Compare normalized digits only — never the raw value, which may be a secret.
     actual_value = await get_input_value(tag_name=tag_name, locator=locator, engine_selection=engine_selection)
     expected_digits = _phone_digits(expected_value)
@@ -2245,6 +2300,7 @@ async def verify_phone_input_digits(
         expected_digit_count=len(expected_digits),
         actual_digit_count=len(actual_digits),
     )
+    return len(actual_digits)
 
 
 async def _verify_tel_input_after_fill(
@@ -2256,8 +2312,8 @@ async def _verify_tel_input_after_fill(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
-    await verify_phone_input_digits(
+) -> int:
+    return await verify_phone_input_digits(
         tag_name=tag_name,
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
@@ -2277,7 +2333,15 @@ async def _fill_nanp_tel_with_readback(
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> PhoneNumberInputMismatch | None:
+    outcome: actions.TelInputOutcome | None = None,
+    enforce_browser_validity: bool = False,
+) -> (
+    PhoneNumberInputMismatch
+    | PhoneNumberInputBrowserValidityMismatch
+    | PhoneNumberInputBrowserInteractionFailed
+    | InvalidElementForTextInput
+    | None
+):
     """Fill affirmative NANP digits and verify every attempt.
     Retry atomically with national digits before constraint-safe E.164 for the least invasive recovery.
     """
@@ -2286,14 +2350,25 @@ async def _fill_nanp_tel_with_readback(
         attempts.append(("atomic_e164", e164_fallback))
 
     for attempt_index, (strategy, value) in enumerate(attempts):
-        if strategy == "sequential_national":
-            await skyvern_element.input_sequentially(text=value)
-        else:
-            await skyvern_element.input_clear()
-            await skyvern_element.input_fill(text=value)
+        strategy_enum = actions.TelInputStrategy(strategy)
+        if outcome is not None:
+            outcome.strategy = strategy_enum
+            outcome.attempt_count = attempt_index + 1
 
         try:
-            await _verify_tel_input_after_fill(
+            if strategy == "sequential_national":
+                await skyvern_element.input_sequentially(text=value)
+            else:
+                await skyvern_element.input_clear()
+                await skyvern_element.input_fill(text=value)
+        except InvalidElementForTextInput as exc:
+            return exc
+        except Exception as exc:
+            LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+            return PhoneNumberInputBrowserInteractionFailed()
+
+        try:
+            actual_digit_count = await _verify_tel_input_after_fill(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=national_digits,
@@ -2303,6 +2378,10 @@ async def _fill_nanp_tel_with_readback(
                 engine_selection=engine_selection,
             )
         except PhoneNumberInputMismatch as mismatch:
+            browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if outcome is not None:
+                outcome.actual_digit_count = mismatch.actual_digit_count
+                outcome.browser_valid = browser_valid
             if attempt_index == len(attempts) - 1:
                 return mismatch
             LOG.info(
@@ -2313,8 +2392,30 @@ async def _fill_nanp_tel_with_readback(
                 expected_digit_count=mismatch.expected_digit_count,
                 actual_digit_count=mismatch.actual_digit_count,
             )
-        else:
-            return None
+            continue
+        except InvalidElementForTextInput as exc:
+            return exc
+        except Exception as exc:
+            LOG.warning("Phone input read-back failed", error_type=type(exc).__name__)
+            return PhoneNumberInputBrowserInteractionFailed()
+
+        browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+        if outcome is not None:
+            outcome.actual_digit_count = actual_digit_count
+            outcome.browser_valid = browser_valid
+        if enforce_browser_validity and browser_valid is False:
+            if attempt_index == len(attempts) - 1:
+                return PhoneNumberInputBrowserValidityMismatch()
+            LOG.info(
+                "Phone input failed browser validity; trying next fill strategy",
+                element_id=skyvern_element.get_id(),
+                failed_strategy=strategy,
+                next_strategy=attempts[attempt_index + 1][0],
+                expected_digit_count=len(_phone_digits(national_digits)),
+                actual_digit_count=actual_digit_count,
+            )
+            continue
+        return None
     return None
 
 
@@ -2326,16 +2427,16 @@ async def _log_tel_fallback_fill_digit_counts(
     task_id: str | None,
     step_id: str | None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> None:
+) -> tuple[int, int | None]:
     # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
     # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+    expected_digit_count = len(_phone_digits(expected_value))
     try:
         actual_value = await get_input_value(
             tag_name=tag_name,
             locator=skyvern_element.get_locator(),
             engine_selection=engine_selection,
         )
-        expected_digit_count = len(_phone_digits(expected_value))
         actual_digit_count = len(_phone_digits(actual_value))
         LOG.info(
             "Tel fallback fill digit counts",
@@ -2346,13 +2447,15 @@ async def _log_tel_fallback_fill_digit_counts(
             task_id=task_id,
             step_id=step_id,
         )
-    except Exception:
+        return expected_digit_count, actual_digit_count
+    except Exception as exc:
         LOG.warning(
             "Failed to read back tel fallback fill",
             task_id=task_id,
             step_id=step_id,
-            exc_info=True,
+            error_type=type(exc).__name__,
         )
+        return expected_digit_count, None
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -3801,7 +3904,10 @@ class ActionHandler:
         # admit only frames that appeared in this action's window (see _recover_blocked_inline_pdf_download).
         inline_iframe_srcs_before = await _collect_inline_iframe_src_candidates(page)
 
-        staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
+        # Run-scoped so teardown and the stale sweep reclaim it by run identity (SKY-14159).
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
+        )
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
@@ -3824,6 +3930,7 @@ class ActionHandler:
         # keep their existing single-page download behavior with no popup-download wiring.
         if task.browser_session_id:
             page.on("popup", _register_download_popup)
+        requested_download_token = begin_requested_download_for_context(page.context)
         try:
             await transient_text_observer.start(scan_initial_visible_state=False)
             xhr_capture.enable()
@@ -4249,6 +4356,24 @@ class ActionHandler:
                     )
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
+            elif (
+                captured_download is not None
+                and (aborted_reason := await read_download_failure(captured_download)) is not None
+            ):
+                # The partial file appearing is what credited download_triggered, and the browser
+                # deletes it on abort, so the settle above reads an aborted transfer as a completed
+                # one. Without this the action reports success with no file and the agent retries
+                # the already-consumed link instead of regenerating it.
+                LOG.warning(
+                    "Browser aborted the download after it was credited; no file was saved",
+                    workflow_run_id=task.workflow_run_id,
+                    download_dir=download_dir,
+                    failure=aborted_reason,
+                )
+                results[-1] = ActionFailure(
+                    Exception(f"{DOWNLOAD_ABORTED_FAILURE_MESSAGE} (browser reported: {aborted_reason})"),
+                    download_triggered=True,
+                )
             if xhr_fallback_moved_paths:
                 post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
                 if post_settle_extra_paths:
@@ -4328,6 +4453,12 @@ class ActionHandler:
             except Exception:
                 LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
 
+            download_error = finish_requested_download_for_context(page.context, requested_download_token)
+            if download_error is not None and "results" in locals() and results:
+                results[-1] = ActionFailure(
+                    Exception(download_error["reasoning"]),
+                    download_triggered=download_triggered,
+                )
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
 
@@ -4339,6 +4470,7 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        action.tel_input_outcome = None
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
         LOG.info(
             "Handling action",
@@ -4436,6 +4568,13 @@ class ActionHandler:
             else:
                 LOG.exception("Unhandled exception in action handler", action=action)
                 actions_result.append(ActionFailure(e))
+        except ScreenshotTargetClosed as e:
+            LOG.warning(
+                "Browser target closed while handling action",
+                action=action,
+                exception_message=str(e),
+            )
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
@@ -4454,6 +4593,8 @@ class ActionHandler:
                 if not actions_result:
                     LOG.warning("Action failed to execute, setting status to failed", action=action)
                 action.status = ActionStatus.failed
+
+            _emit_tel_input_outcome(action, actions_result)
 
             if llm_caller and action.tool_call_id:
                 tool_call_result = {
@@ -4585,17 +4726,361 @@ async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
     return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
 
 
+class _GridRowSelection(StrEnum):
+    """Row-selection state of a checkbox's grid context. NOT_GRID_ROW: not a grid row-selection
+    control, so native ``checked`` is the whole truth. SELECTED/UNSELECTED: the closest row's
+    app-controlled selection *positively* read (aria-selected true/false, or a known selected class for
+    SELECTED); it can diverge from the input's native ``checked``. UNMARKED: a well-formed grid
+    row-selection row that exposes no positive selected signal (no aria-selected, no known class) --
+    absence, which is NOT a proof of unselected, so it never suppresses a needed click and is never
+    cell-driven (no readable post-state exists to prove), only handled by the ordinary click. UNREADABLE:
+    the snapshot could not be read (malformed
+    or a bad value), so the caller falls open to an ordinary click rather than trusting native state."""
+
+    NOT_GRID_ROW = "not_grid_row"
+    SELECTED = "selected"
+    UNSELECTED = "unselected"
+    UNMARKED = "unmarked"
+    UNREADABLE = "unreadable"
+
+
+# A selectable ARIA grid tracks row selection as app state on the closest row, independent of a
+# selection checkbox's native `checked`. This is a dumb DOM extractor; every decision lives in the pure
+# `_classify_grid_row_selection`, so classification is unit-tested without a browser and a snapshot that
+# is not the exact shape it promises is UNREADABLE (fail open to an ordinary click). Detection is purely
+# structural and framework-token-free: the checkbox's closest cell must be the row's unique selection
+# cell -- an exact role=gridcell that is the ONLY direct role=gridcell cell in the row. An ordinary
+# boolean data-column checkbox sits among several role=gridcell cells (or in a bare td), so it stays a
+# native checkbox rather than a row-selection control.
+_GRID_ROW_SNAPSHOT_JS = """
+(el, selectedTokens) => {
+  const container = el.closest('[role="grid"], [role="treegrid"]');
+  const row = el.closest('[role="row"], tr');
+  const cell = el.closest('[role="gridcell"], td');
+  const inRow = row !== null && row !== container;
+  const inCell = cell !== null && cell !== container && cell !== row;
+  // The row and cell must belong to the same closest grid as the checkbox, so a nested grid cannot
+  // pair an inner selection cell with an outer row.
+  const sameGridChain = container !== null && inRow && inCell && container.contains(row) && row.contains(cell);
+  const candidateExactGridcell = cell !== null && cell.getAttribute('role') === 'gridcell';
+  const candidateDirectRowChild = cell !== null && inRow && cell.parentElement === row;
+  let gridCellCount = 0;
+  if (inRow) {
+    const children = row.children;
+    for (let i = 0; i < children.length; i++) {
+      if (children[i].getAttribute('role') === 'gridcell') { gridCellCount++; }
+    }
+  }
+  // Whether any OTHER row of this same grid holds a POSITIVE selection (aria-selected="true" or a known
+  // selected class token). A cell click can replace/clear the whole selection, so this proves whether a
+  // recovery could destroy another row's selection; the same positive vocabulary as the per-row read.
+  const tokens = Array.isArray(selectedTokens) ? selectedTokens : [];
+  let otherRowSelected = false;
+  if (container !== null && row !== null) {
+    const rows = container.querySelectorAll('[role="row"], tr');
+    for (let i = 0; i < rows.length && !otherRowSelected; i++) {
+      const r = rows[i];
+      if (r === row) { continue; }
+      if (r.closest('[role="grid"], [role="treegrid"]') !== container) { continue; }
+      const asel = r.getAttribute('aria-selected');
+      if (asel !== null && asel.trim().toLowerCase() === 'true') { otherRowSelected = true; break; }
+      const cls = Array.prototype.slice.call(r.classList).map(function (c) { return c.trim().toLowerCase(); });
+      for (let j = 0; j < tokens.length; j++) {
+        if (cls.indexOf(tokens[j]) !== -1) { otherRowSelected = true; break; }
+      }
+    }
+  }
+  return {
+    inHeader: el.closest('thead, [role="columnheader"]') !== null,
+    hasGrid: container !== null,
+    hasRow: inRow,
+    hasCell: inCell,
+    sameGridChain: sameGridChain,
+    isCheckbox: typeof el.matches === 'function' && el.matches('input[type="checkbox"]'),
+    candidateExactGridcell: candidateExactGridcell,
+    candidateDirectRowChild: candidateDirectRowChild,
+    gridCellCount: gridCellCount,
+    rowAriaSelected: inRow ? row.getAttribute('aria-selected') : null,
+    rowClasses: inRow ? Array.prototype.slice.call(row.classList) : null,
+    otherRowSelected: otherRowSelected,
+  };
+}
+"""
+
+# Atomic recovery-targeting read. Finds one locator-relative point on the selection cell whose ACTUAL
+# hit target (`document.elementFromPoint`) is the cell itself -- not the checkbox, a label, any other
+# descendant (interactive or not), an overlay, an iframe, or null. Candidates are inside the cell's
+# padding box clipped to the viewport and to every clipping ancestor, so a partially-scrolled cell is
+# probed only where it is actually visible. Returns a point relative to the cell padding-box top-left
+# (the Playwright `position` origin) or null when no candidate resolves to the cell (fail closed). A
+# selector allow-list of descendant types is necessarily incomplete; hit-testing is the only proof that
+# a point is clear cell space.
+_SAFE_CELL_POINT_JS = """
+(el) => {
+  const cell = el.closest('[role="gridcell"], td');
+  if (cell === null) { return null; }
+  const rect = cell.getBoundingClientRect();
+  const padLeft = rect.left + cell.clientLeft;
+  const padTop = rect.top + cell.clientTop;
+  let left = Math.max(padLeft, 0);
+  let top = Math.max(padTop, 0);
+  let right = Math.min(padLeft + cell.clientWidth, window.innerWidth);
+  let bottom = Math.min(padTop + cell.clientHeight, window.innerHeight);
+  for (let a = cell.parentElement; a !== null; a = a.parentElement) {
+    const style = window.getComputedStyle(a);
+    if (style.overflowX !== 'visible' || style.overflowY !== 'visible') {
+      const ar = a.getBoundingClientRect();
+      left = Math.max(left, ar.left);
+      top = Math.max(top, ar.top);
+      right = Math.min(right, ar.right);
+      bottom = Math.min(bottom, ar.bottom);
+    }
+  }
+  const w = right - left;
+  const h = bottom - top;
+  if (w <= 0 || h <= 0) { return null; }
+  const fractions = [
+    [0.5, 0.5],
+    [0.85, 0.5], [0.15, 0.5], [0.5, 0.15], [0.5, 0.85],
+    [0.85, 0.15], [0.15, 0.15], [0.85, 0.85], [0.15, 0.85],
+    [0.7, 0.5], [0.3, 0.5], [0.5, 0.7], [0.5, 0.3]
+  ];
+  for (let i = 0; i < fractions.length; i++) {
+    const vx = left + w * fractions[i][0];
+    const vy = top + h * fractions[i][1];
+    if (document.elementFromPoint(vx, vy) === cell) {
+      return { x: vx - padLeft, y: vy - padTop };
+    }
+  }
+  return null;
+}
+"""
+
+_ROW_SELECTION_SETTLE_JS = (
+    "() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(r))))"
+)
+
+# Common selected-row class conventions, consulted only when the row exposes no aria-selected. Exact
+# lowercased-token membership only (never a substring/suffix match).
+_SELECTED_ROW_CLASS_TOKENS = frozenset({"selected", "is-selected", "k-selected"})
+_REQUIRED_SNAPSHOT_BOOL_KEYS = (
+    "inHeader",
+    "hasGrid",
+    "hasRow",
+    "hasCell",
+    "sameGridChain",
+    "isCheckbox",
+    "candidateExactGridcell",
+    "candidateDirectRowChild",
+)
+
+
+def _is_str_list_or_none(value: object) -> bool:
+    return value is None or (isinstance(value, list) and all(isinstance(item, str) for item in value))
+
+
+def _classify_grid_row_selection(snapshot: object) -> _GridRowSelection:
+    """Classify the ``_GRID_ROW_SNAPSHOT_JS`` result. A snapshot that is not the exact shape the
+    extractor promises -- a non-dict, a missing required key, or a wrong field type -- is UNREADABLE and
+    never silently treated as an ordinary checkbox. NOT_GRID_ROW is returned only when a well-formed
+    snapshot positively proves a non-grid-row context: a header cell, not a checkbox inside its own
+    grid -> row -> cell chain, or a row without the unique selection-cell signature (the checkbox's
+    closest cell must be an exact role=gridcell and the ONLY direct role=gridcell cell in the row, so an
+    ordinary data-column checkbox among several gridcells stays a native checkbox). Otherwise the closest
+    row's selection: aria-selected is authoritative when present (exact true/false after normalizing; any
+    other token is UNREADABLE), else an exact selected-row class token is SELECTED; absent both, the row
+    is UNMARKED -- absence of a positive selected signal, which the caller must not read as UNSELECTED."""
+    if not isinstance(snapshot, dict):
+        return _GridRowSelection.UNREADABLE
+    for key in _REQUIRED_SNAPSHOT_BOOL_KEYS:
+        if not isinstance(snapshot.get(key), bool):
+            return _GridRowSelection.UNREADABLE
+    grid_cell_count = snapshot.get("gridCellCount")
+    if not isinstance(grid_cell_count, int) or isinstance(grid_cell_count, bool):
+        return _GridRowSelection.UNREADABLE
+    for key in ("rowClasses", "rowAriaSelected"):
+        if key not in snapshot:
+            return _GridRowSelection.UNREADABLE
+    row_classes = snapshot["rowClasses"]
+    aria_selected = snapshot["rowAriaSelected"]
+    if not _is_str_list_or_none(row_classes):
+        return _GridRowSelection.UNREADABLE
+    if not (aria_selected is None or isinstance(aria_selected, str)):
+        return _GridRowSelection.UNREADABLE
+
+    if snapshot["inHeader"]:
+        return _GridRowSelection.NOT_GRID_ROW
+    if not (snapshot["hasGrid"] and snapshot["hasRow"] and snapshot["hasCell"] and snapshot["isCheckbox"]):
+        return _GridRowSelection.NOT_GRID_ROW
+    if not snapshot["sameGridChain"]:
+        return _GridRowSelection.NOT_GRID_ROW
+    # The unique selection-cell signature: the checkbox's closest cell is an exact role=gridcell and the
+    # only direct role=gridcell cell in the row. Absent it -- a bare td, a nested gridcell, or several
+    # data cells with role=gridcell -- the checkbox is an ordinary data control, not a row-selection one.
+    if not (snapshot["candidateExactGridcell"] and snapshot["candidateDirectRowChild"] and grid_cell_count == 1):
+        return _GridRowSelection.NOT_GRID_ROW
+
+    if aria_selected is not None:
+        token = aria_selected.strip().lower()
+        if token == "true":
+            return _GridRowSelection.SELECTED
+        if token == "false":
+            return _GridRowSelection.UNSELECTED
+        return _GridRowSelection.UNREADABLE
+    if row_classes is not None and not _SELECTED_ROW_CLASS_TOKENS.isdisjoint(
+        cls.strip().lower() for cls in row_classes
+    ):
+        return _GridRowSelection.SELECTED
+    # No aria-selected and no known selected class: absence, not a positive UNSELECTED. Return UNMARKED
+    # so the caller never suppresses a needed click from it and never cell-drives it (no readable
+    # post-state exists to prove) -- it is handled by the ordinary click.
+    return _GridRowSelection.UNMARKED
+
+
+def _grid_other_row_selected(snapshot: object) -> bool:
+    """Whether the snapshot proves that another row of the same grid holds a positive selection. Only a
+    literal ``True`` counts, so a missing/malformed field is treated as 'not proven', matching the
+    fail-open direction of the classifier."""
+    return isinstance(snapshot, dict) and snapshot.get("otherRowSelected") is True
+
+
+class _GridRowRead(NamedTuple):
+    """A single snapshot read of a grid row-selection checkbox: its classified ``state`` and whether any
+    OTHER row of the same grid is positively selected (``other_row_selected``), so a cell recovery can be
+    proven not to clear another row's selection without a second, racy read."""
+
+    state: _GridRowSelection
+    other_row_selected: bool
+
+
+async def _read_grid_row_selection(element: SkyvernElement) -> _GridRowRead:
+    """The checkbox's grid row-selection state plus the grid-wide other-row-selected flag from ONE
+    snapshot read, or UNREADABLE when the snapshot cannot be read -- a failed read falls open to an
+    ordinary click, never to a native-only read that could report a checked-but-unselected row as
+    already selected."""
+    try:
+        snapshot = await element.get_locator().evaluate(_GRID_ROW_SNAPSHOT_JS, sorted(_SELECTED_ROW_CLASS_TOKENS))
+    except Exception:
+        LOG.debug("Grid row-selection snapshot read failed; treating as unreadable", element_id=element.get_id())
+        return _GridRowRead(_GridRowSelection.UNREADABLE, False)
+    return _GridRowRead(_classify_grid_row_selection(snapshot), _grid_other_row_selected(snapshot))
+
+
+def _is_finite_number(value: object) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _coerce_click_position(point: object) -> dict[str, float] | None:
+    """Validate the locator-relative point returned by ``_SAFE_CELL_POINT_JS`` -- a finite {x, y}
+    padding-box offset hit-tested to land on the selection cell -- before it is handed to Playwright, or
+    None when no cell-space point was proven (fail closed)."""
+    if not isinstance(point, dict):
+        return None
+    x = point.get("x")
+    y = point.get("y")
+    if not _is_finite_number(x) or not _is_finite_number(y):
+        return None
+    return {"x": float(x), "y": float(y)}
+
+
+async def _grid_row_reached_state(element: SkyvernElement, desired_state: bool) -> bool:
+    """After a bounded settle so the framework can commit selection, whether the closest row reached the
+    desired selection state. Desired-true requires a POSITIVE SELECTED read. Desired-false (only ever
+    driven from a positively-SELECTED row) requires the positive selected signal to be gone -- UNSELECTED
+    (aria-selected="false") or UNMARKED (the signal removed). A read failure or the opposite state is a
+    failure (fail closed)."""
+    try:
+        await element.get_locator().evaluate(_ROW_SELECTION_SETTLE_JS)
+    except Exception:
+        pass
+    reached = (await _read_grid_row_selection(element)).state
+    if desired_state:
+        return reached is _GridRowSelection.SELECTED
+    return reached is _GridRowSelection.UNSELECTED or reached is _GridRowSelection.UNMARKED
+
+
+async def _drive_grid_row_selection(
+    action: actions.ClickAction, element: SkyvernElement, desired_state: bool
+) -> list[ActionResult] | None:
+    """Drive a grid row-selection checkbox to the desired row-selection state by clicking a proven-clear
+    point on the selection cell (hit-tested via ``document.elementFromPoint``), then re-reading the
+    row's selection after a bounded settle. Entered only from a positively-readable start (an UNSELECTED
+    row to select, a SELECTED row to deselect), so the re-read after the drive can actually prove the
+    result; never entered for an UNMARKED row, whose selection is unreadable in both directions. A native
+    check()/uncheck() flips the input's ``checked`` without entering the framework's row selection (the
+    divergence), so it is never used here. Returns
+    [ActionAbort()] when the row reaches the desired selection, or None to fall through to a single
+    ordinary click when the cell nests an interactive control, no proven cell-space point exists, or the
+    click does not achieve the desired selection. Never loops, force-clicks, or mutates the DOM."""
+    cell_locator = element.get_locator().locator('xpath=ancestor-or-self::*[@role="gridcell" or self::td][1]').first
+    try:
+        if await cell_locator.count() == 0:
+            return None
+        if await SkyvernElement._label_click_forwards_to_descendant(cell_locator, fail_closed=True):
+            LOG.warning(
+                "Grid row-selection cell nests a link/button; continuing the normal click",
+                element_id=element.get_id(),
+            )
+            return None
+        point = _coerce_click_position(await cell_locator.evaluate(_SAFE_CELL_POINT_JS))
+        if point is None:
+            LOG.warning(
+                "No proven cell-space point clear of controls for grid row selection, continuing the normal click",
+                element_id=element.get_id(),
+            )
+            return None
+        await cell_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, position=point)
+    except Exception:
+        LOG.warning(
+            "Grid row-selection click failed, continuing the normal click", element_id=element.get_id(), exc_info=True
+        )
+        return None
+    if await _grid_row_reached_state(element, desired_state):
+        LOG.info("Grid row reached the desired selection state", action=action, desired_state=desired_state)
+        return [ActionAbort()]
+    LOG.warning(
+        "Grid row selection did not reach the desired state, continuing the normal click",
+        element_id=element.get_id(),
+    )
+    return None
+
+
+async def _checkbox_live_state(element: SkyvernElement, grid_state: _GridRowSelection) -> bool | None:
+    """A checkbox's live selected state from an already-read grid classification: the closest row's
+    selection when it is a grid row-selection control (native ``checked`` can diverge from app row
+    selection), else the input's native ``checked``. None -- fall open -- when the row state is
+    unreadable, or is UNMARKED (a well-formed row with no positive selected signal: absence is not a
+    proof of unselected), or the native read fails."""
+    if grid_state is _GridRowSelection.SELECTED:
+        return True
+    if grid_state is _GridRowSelection.UNSELECTED:
+        return False
+    if grid_state is _GridRowSelection.UNREADABLE or grid_state is _GridRowSelection.UNMARKED:
+        return None
+    try:
+        return await element.is_checked()
+    except Exception:
+        LOG.debug(
+            "Failed to read native checkbox state; continuing with an ordinary click", element_id=element.get_id()
+        )
+        return None
+
+
 async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
     """Read one generic, live observable of a control's selected/checked state, or None when no
     boolean observable is readable (unknown control, malformed value, or a detached/unreadable
-    element) so the caller falls open to an ordinary click. Native checkbox/radio inputs report
-    through is_checked(); other controls expose an exact aria-checked/aria-pressed/aria-selected
-    boolean read live. Role only chooses which observable to read and whether a bare aria-selected
-    value is trustworthy; it never implies desired intent."""
+    element) so the caller falls open to an ordinary click. Native radio inputs report through
+    is_checked(); a checkbox reports its grid row's selection when it is a grid row-selection control
+    (native `checked` can diverge from app row selection) and otherwise its native is_checked(); other
+    controls expose an exact aria-checked/aria-pressed/aria-selected boolean read live. Role only
+    chooses which observable to read and whether a bare aria-selected value is trustworthy; it never
+    implies desired intent."""
     try:
         if element.get_tag_name() == "input":
             input_type = (await element.get_attr("type") or "").strip().casefold()
-            if input_type in ("checkbox", "radio"):
+            if input_type == "checkbox":
+                return await _checkbox_live_state(element, (await _read_grid_row_selection(element)).state)
+            if input_type == "radio":
                 return await element.is_checked()
             return None
         for aria_attr in ("aria-checked", "aria-pressed", "aria-selected"):
@@ -4762,6 +5247,98 @@ async def _apply_label_desired_click_state(
     return None
 
 
+async def _apply_checkbox_desired_click_state(
+    action: actions.ClickAction, element: SkyvernElement, desired_state: bool
+) -> list[ActionResult] | None:
+    """Drive a checkbox to an explicit terminal state from a SINGLE grid row-selection snapshot read
+    (state + grid-wide other-row-selected). An ordinary checkbox (NOT_GRID_ROW) is set natively. A grid
+    row-selection checkbox drives app row selection through its selection cell -- a native set flips
+    ``checked`` while the row stays unselected, the divergence this guards against -- so it is recovered
+    on the cell and never check()/uncheck(). Returns [ActionAbort()] only from a positively-proven state,
+    or None to fall through to a single ordinary click. Invariants: absence of a positive selected signal
+    (UNMARKED) never suppresses a needed click; the cell is driven ONLY from a positively-readable start
+    (UNSELECTED to select, SELECTED to deselect) whose result the drive can then read, and only when no
+    OTHER row of the grid holds a readable selection, so a recovery can never clear another row's
+    selection; a drive aborts only after a positively-readable post-state; and an UNMARKED row -- no
+    positive selected signal, DOM-indistinguishable from a foreign-vocabulary selected row -- is never
+    cell-driven, only handled by the single ordinary click."""
+    grid = await _read_grid_row_selection(element)
+    state = grid.state
+
+    if state is _GridRowSelection.NOT_GRID_ROW:
+        native = await _checkbox_live_state(element, state)
+        if native is None:
+            LOG.info("No readable selected state, continuing the normal click", action=action)
+            return None
+        if native == desired_state:
+            LOG.info("Control already in the desired state, suppressing the redundant click", action=action)
+            return [ActionAbort()]
+        LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
+        if await _set_native_checkbox_state(element, should_check=desired_state):
+            return [ActionAbort()]
+        LOG.warning("Failed to set the native control to the desired state, continuing the normal click", action=action)
+        return None
+
+    if state is _GridRowSelection.UNREADABLE:
+        LOG.info("Grid row selection unreadable, continuing the normal click", action=action)
+        return None
+
+    # A grid row-selection checkbox with a well-formed snapshot: SELECTED / UNSELECTED / UNMARKED.
+    positively_selected = state is _GridRowSelection.SELECTED
+    positively_unselected = state is _GridRowSelection.UNSELECTED
+    if positively_selected and desired_state:
+        LOG.info("Row already selected, suppressing the redundant click", action=action)
+        return [ActionAbort()]
+    if positively_unselected and not desired_state:
+        LOG.info("Row already unselected, suppressing the redundant click", action=action)
+        return [ActionAbort()]
+
+    if not desired_state:
+        # Deselect intent. Only a positively-SELECTED row is driven off its selection; an UNMARKED row is
+        # never suppressed from absence, and is only treated as already-unselected when native `checked`
+        # positively agrees the box is off. Otherwise fall open without claiming success.
+        if positively_selected:
+            if grid.other_row_selected:
+                LOG.info("Another row is selected; not driving the cell, continuing the normal click", action=action)
+                return None
+            return await _drive_grid_row_selection(action, element, desired_state)
+        try:
+            native_checked = await element.is_checked()
+        except Exception:
+            native_checked = None
+        if native_checked is False:
+            LOG.info("Unmarked row with the box positively off already matches desired unselected", action=action)
+            return [ActionAbort()]
+        LOG.info("Unmarked row can't be proven unselected, continuing the normal click", action=action)
+        return None
+
+    # Select intent from a row not positively selected. Only a positively-UNSELECTED row is driven through
+    # the selection cell: both its start state and the SELECTED post-state the drive must prove are
+    # readable, and only when no OTHER row holds a readable selection so the recovery can never
+    # replace/clear it. An UNMARKED row exposes no positive selected signal, so neither its start nor a
+    # post-drive selection can be read -- a cell drive there would be an unverifiable state-changing probe
+    # on an ambiguous row (and could clear a selection the gate cannot see). Never drive it: fall open to
+    # the single ordinary click, whose real activation enters the framework's own selection.
+    if positively_unselected:
+        if grid.other_row_selected:
+            LOG.info("Another row is selected; not driving the cell, continuing the normal click", action=action)
+            return None
+        return await _drive_grid_row_selection(action, element, desired_state)
+    LOG.info("Unmarked row can't be proven selected by a cell drive, continuing the normal click", action=action)
+    return None
+
+
+async def _input_type_or_none(element: SkyvernElement) -> str | None:
+    """The casefolded ``type`` of an input, or None when the read raises (a detached/unreadable
+    element). Reading it outside a guard would propagate; the merge base falls open to one ordinary
+    click, so a failed read must too."""
+    try:
+        return (await element.get_attr("type") or "").strip().casefold()
+    except Exception:
+        LOG.debug("Failed to read input type; continuing with an ordinary click", element_id=element.get_id())
+        return None
+
+
 async def _apply_desired_click_state(
     action: actions.ClickAction, element: SkyvernElement, desired_state: bool, dom: DomUtil
 ) -> list[ActionResult] | None:
@@ -4772,6 +5349,8 @@ async def _apply_desired_click_state(
     once to change. Never converts an explicit desired_state=False into a check."""
     if element.get_tag_name() == "label":
         return await _apply_label_desired_click_state(action, element, desired_state, dom)
+    if element.get_tag_name() == "input" and await _input_type_or_none(element) == "checkbox":
+        return await _apply_checkbox_desired_click_state(action, element, desired_state)
     live_state = await _resolve_live_selected_state(element)
     if live_state is None:
         LOG.info("No readable selected state, continuing the normal click", action=action)
@@ -4784,10 +5363,10 @@ async def _apply_desired_click_state(
         )
         return [ActionAbort()]
     if element.get_tag_name() == "input":
-        input_type = (await element.get_attr("type") or "").strip().casefold()
-        if input_type == "radio" and not desired_state:
-            # A radio can't be turned off by clicking it -- only selecting another radio in the
-            # group clears it -- so skip the doomed uncheck() and let a single ordinary click run.
+        # Only a native radio reaches here (checkbox is handled above; a non-toggle input has no
+        # readable state and already fell open), and a radio can't be turned off by clicking it -- only
+        # selecting another radio in the group clears it -- so skip the doomed uncheck() on desired=False.
+        if not desired_state:
             LOG.info("A radio can't be unchecked in place, continuing with a single normal click", action=action)
             return None
         LOG.info("Setting the native control to the desired state", action=action, desired_state=desired_state)
@@ -4973,7 +5552,7 @@ async def handle_click_action(
                     )
                     await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
 
-                if sequential_click_result := await handle_sequential_click_for_dropdown(
+                if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,
                     action_history=results,
                     anchor_element=skyvern_element,
@@ -4988,6 +5567,11 @@ async def handle_click_action(
                     results.append(sequential_click_result)
                     return results
 
+            except NoAvailableOptionFoundForCustomSelection as exc:
+                failure = ActionFailure(exc)
+                failure.skip_remaining_actions = True
+                results.append(failure)
+                return results
             except Exception:
                 LOG.warning(
                     "Failed to do sequential logic for the click action, skipping",
@@ -5049,6 +5633,45 @@ async def _build_after_click_verify_prompt(
     )
 
 
+async def handle_sequential_click_with_submit_bypass(
+    action: actions.ClickAction,
+    action_history: list[ActionResult],
+    anchor_element: SkyvernElement,
+    dom: DomUtil,
+    page: Page,
+    skyvern_frame: SkyvernFrame,
+    scraped_page: ScrapedPage,
+    incremental_scraped: IncrementalScrapePage,
+    task: Task,
+    step: Step,
+) -> ActionResult | None:
+    """Skip only the dropdown-specific post-click full rescrape for exact explicit
+    submit controls; every other click still runs ``handle_sequential_click_for_dropdown``.
+
+    ``anchor_element`` is the final click target after any disabled-wrapper
+    retargeting, so the explicit-submit check is evaluated here and never stale.
+    """
+    if await anchor_element.is_explicit_submit():
+        LOG.info(
+            "Explicit submit click; bypassing the dropdown sequential-click rescrape",
+            element_id=anchor_element.get_id(),
+        )
+        return None
+
+    return await handle_sequential_click_for_dropdown(
+        action=action,
+        action_history=action_history,
+        anchor_element=anchor_element,
+        dom=dom,
+        page=page,
+        skyvern_frame=skyvern_frame,
+        scraped_page=scraped_page,
+        incremental_scraped=incremental_scraped,
+        task=task,
+        step=step,
+    )
+
+
 @traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
@@ -5097,6 +5720,20 @@ async def handle_sequential_click_for_dropdown(
         LOG.info("No new interactable elements found, exiting the sequential click logic")
         return None
 
+    # Settle what the click revealed before spending an LLM call on it. This walk is DOM-only, and
+    # a click that opened no menu returns below either way -- so running the goal check first could
+    # not change that outcome, only the bill. The check itself is unchanged for menus that do open:
+    # exiting the sequential click logic on an achieved goal is the reason it exists (#5599).
+    dropdown_menu_element = await locate_dropdown_menu(
+        current_anchor_element=anchor_element,
+        incremental_scraped=incremental_scraped,
+        step=step,
+        task=task,
+    )
+
+    if dropdown_menu_element is None:
+        return None
+
     action_history_str = ""
     if action_history and len(action_history) > 0:
         result = action_history[-1]
@@ -5122,16 +5759,6 @@ async def handle_sequential_click_for_dropdown(
     verify_result = CompleteVerifyResult.model_validate(response)
     if verify_result.user_goal_achieved:
         LOG.info("User goal achieved, exiting the sequential click logic")
-        return None
-
-    dropdown_menu_element = await locate_dropdown_menu(
-        current_anchor_element=anchor_element,
-        incremental_scraped=incremental_scraped,
-        step=step,
-        task=task,
-    )
-
-    if dropdown_menu_element is None:
         return None
 
     dropdown_select_context = await _get_input_or_select_context(
@@ -5465,6 +6092,38 @@ async def _retarget_wrapper_for_input_text(
     return child_element
 
 
+def _emit_tel_input_outcome(
+    action: actions.Action,
+    results: list[ActionResult],
+    *,
+    exception_type: str | None = None,
+) -> None:
+    outcome = action.tel_input_outcome
+    if outcome is None:
+        return
+
+    try:
+        with contained_effect("emit tel input outcome"):
+            final_result = results[-1] if results else None
+            if isinstance(final_result, ActionSuccess):
+                terminal_result = ActionStatus.completed.value
+            elif isinstance(final_result, ActionAbort):
+                terminal_result = ActionStatus.skipped.value
+            else:
+                terminal_result = ActionStatus.failed.value
+            if exception_type is None and final_result is not None:
+                exception_type = final_result.exception_type
+            LOG.info(
+                "tel_input_outcome",
+                sampling=False,
+                **outcome.model_dump(mode="json"),
+                terminal_result=terminal_result,
+                exception_type=exception_type,
+            )
+    finally:
+        action.tel_input_outcome = None
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -5473,6 +6132,40 @@ async def handle_input_text_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    action.tel_input_outcome = None
+    return await _handle_input_text_action(
+        action=action,
+        page=page,
+        scraped_page=scraped_page,
+        task=task,
+        step=step,
+    )
+
+
+async def handle_input_text_action_direct(
+    action: actions.InputTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    try:
+        results = await handle_input_text_action(action, page, scraped_page, task, step)
+    except Exception as exc:
+        _emit_tel_input_outcome(action, [], exception_type=type(exc).__name__)
+        raise
+    _emit_tel_input_outcome(action, results)
+    return results
+
+
+async def _handle_input_text_action(
+    action: actions.InputTextAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    initial_action_target_id = action.element_id
     if not action.element_id:
         # This is a CUA type action
         text_result = get_actual_value_of_parameter_if_secret_with_task(task, action.text)
@@ -5549,15 +6242,53 @@ async def handle_input_text_action(
     skyvern_frame = await SkyvernFrame.create_instance(skyvern_element.get_frame(), engine_selection=engine_selection)
     incremental_scraped = IncrementalScrapePage(skyvern_frame=skyvern_frame, engine_selection=engine_selection)
     timeout = settings.BROWSER_ACTION_TIMEOUT_MS
-
-    current_text = await get_input_value(
-        skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
-    )
-    if not is_totp_value and current_text == current_text_target:
-        return [ActionSuccess()]
-
-    # before filling text, we need to validate if the element can be filled if it's not one of COMMON_INPUT_TAGS
     tag_name = scraped_page.id_to_element_dict[action.element_id]["tagName"].lower()
+    is_tel = await skyvern_element.get_attr("type") == "tel"
+    candidate_card_digits = _card_number_digits(text)
+    is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
+        skyvern_element
+    )
+    phone_bearing = is_tel and not is_card_number_input
+    tel_fix_enabled: bool | None = None
+    tel_source_text: str | None = None
+    tel_outcome = action.tel_input_outcome
+    if is_tel and not is_card_number_input:
+        tel_source_text = text
+        tel_fix_enabled = await _is_tel_digit_fix_enabled(task)
+        tel_outcome = actions.TelInputOutcome(
+            flag_enabled=tel_fix_enabled,
+            final_element_id=skyvern_element.get_id(),
+            strategy=actions.TelInputStrategy.legacy_sequential,
+            expected_digit_count=len(_phone_digits(tel_source_text)),
+            attempt_count=0,
+            retargeted=skyvern_element.get_id() != initial_action_target_id,
+        )
+        action.tel_input_outcome = tel_outcome
+
+    try:
+        current_text = await get_input_value(
+            skyvern_element.get_tag_name(), skyvern_element.get_locator(), engine_selection=engine_selection
+        )
+    except Exception as exc:
+        if phone_bearing:
+            LOG.warning("Phone input read-back failed", error_type=type(exc).__name__)
+            return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+        raise
+    if not is_totp_value and current_text == current_text_target:
+        if tel_outcome is not None:
+            tel_outcome.actual_digit_count = len(_phone_digits(current_text))
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if tel_outcome.flag_enabled and tel_outcome.browser_valid is False:
+                pattern = await skyvern_element.get_attr("pattern")
+                _, eligible_bare_nanp, _ = _plan_tel_text(
+                    is_tel=True,
+                    is_secret=is_secret_value,
+                    value=tel_source_text or text,
+                    pattern=pattern,
+                )
+                if eligible_bare_nanp:
+                    return [ActionFailure(PhoneNumberInputBrowserValidityMismatch())]
+        return [ActionSuccess()]
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if not await SkyvernElement.wait_until_enabled(skyvern_element):
@@ -5811,41 +6542,16 @@ async def handle_input_text_action(
         )
         return [ActionFailure(InputToReadonlyElement(element_id=skyvern_element.get_id()))]
 
-    is_tel = await skyvern_element.get_attr("type") == "tel"
-    candidate_card_digits = _card_number_digits(text)
-    is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
-        skyvern_element
-    )
     used_bare_nanp = False
     run_phone_format_check = False
-    log_tel_fallback_readback = False
     tel_pattern: str | None = None
     tel_maxlength: str | None = None
     tel_e164_fallback: str | None = None
-    tel_source_text: str | None = None
-    if is_tel and not is_card_number_input and await _is_tel_digit_fix_enabled(task):
-        # SKY-11315 fix, behind FIX_TEL_INPUT_DIGIT_DROP. Flag-off keeps the original behavior below
-        # byte-for-byte. Affirmative-NANP tel is typed as bare national digits (skipping the format-check
-        # LLM) unless the field's pattern requires a mask; secrets are eligible (local strip, no LLM).
-        tel_source_text = text
-        tel_pattern = await skyvern_element.get_attr("pattern")
-        tel_maxlength = await skyvern_element.get_attr("maxlength")
-        tel_e164_fallback = _nanp_e164_fallback(text, pattern=tel_pattern, maxlength=tel_maxlength)
-        text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
-            is_tel=True, is_secret=is_secret_value, value=text, pattern=tel_pattern
-        )
-        log_tel_fallback_readback = run_phone_format_check
-        if used_bare_nanp:
-            LOG.info(
-                "Tel bare-digit fill using national digits",
-                used_bare_nanp=True,
-                expected_digit_count=len(text),
-                element_id=skyvern_element.get_id(),
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-    elif is_tel and not is_card_number_input and not is_secret_value:
+
+    if is_tel and not is_card_number_input and tel_fix_enabled is False and not is_secret_value:
         run_phone_format_check = True
+        if tel_outcome is not None:
+            tel_outcome.strategy = actions.TelInputStrategy.legacy_sequential
     if run_phone_format_check:
         try:
             action.set_has_mini_agent()
@@ -5857,13 +6563,11 @@ async def handle_input_text_action(
                 task=task,
                 step=step,
             )
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "Failed to check the phone number format, using the original text",
-                action=action,
-                exc_info=True,
+                error_type=type(exc).__name__,
             )
-
     await _apply_secret_visual_mask_if_needed(
         skyvern_element,
         workflow_run_id=task.workflow_run_id,
@@ -5876,13 +6580,86 @@ async def handle_input_text_action(
     # we need find a better way to detect the attribute in the future
     class_name: str | None = await skyvern_element.get_attr("class")
     if class_name and "blinking-cursor" in class_name.lower():
+        if tel_outcome is not None and is_tel and tel_outcome.flag_enabled:
+            assert tel_source_text is not None
+            tel_pattern = await skyvern_element.get_attr("pattern")
+            tel_maxlength = await skyvern_element.get_attr("maxlength")
+            tel_e164_fallback = _nanp_e164_fallback(
+                tel_source_text,
+                pattern=tel_pattern,
+                maxlength=tel_maxlength,
+            )
+            text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
+                is_tel=True,
+                is_secret=is_secret_value,
+                value=tel_source_text,
+                pattern=tel_pattern,
+            )
+            if used_bare_nanp:
+                tel_outcome.strategy = actions.TelInputStrategy.sequential_national
+                phone_mismatch = await _fill_nanp_tel_with_readback(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    national_digits=text,
+                    e164_fallback=tel_e164_fallback,
+                    pattern=tel_pattern,
+                    maxlength=tel_maxlength,
+                    engine_selection=engine_selection,
+                    outcome=tel_outcome,
+                    enforce_browser_validity=True,
+                )
+                if phone_mismatch is not None:
+                    if isinstance(phone_mismatch, PhoneNumberInputMismatch):
+                        LOG.warning(
+                            "Phone input read-back mismatch after retry",
+                            element_id=skyvern_element.get_id(),
+                            expected_digit_count=phone_mismatch.expected_digit_count,
+                            actual_digit_count=phone_mismatch.actual_digit_count,
+                        )
+                    return [ActionFailure(phone_mismatch)]
+                return [ActionSuccess()]
+            tel_outcome.strategy = actions.TelInputStrategy.formatted_sequential
+            if run_phone_format_check:
+                try:
+                    action.set_has_mini_agent()
+                    text = await check_phone_number_format(
+                        value=text,
+                        action=action,
+                        skyvern_element=skyvern_element,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to check the phone number format, using the original text",
+                        error_type=type(exc).__name__,
+                    )
         if is_totp_value:
             try:
                 text = generate_totp_value_from_secret(totp_secret)
             except NoTOTPSecretFound as exc:
                 return [ActionFailure(exc)]
             _register_runtime_otp_value_best_effort(task.workflow_run_id, text)
-        await skyvern_element.press_fill(text=text)
+        try:
+            await skyvern_element.press_fill(text=text)
+        except Exception as exc:
+            if phone_bearing:
+                LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+                return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+            raise
+        if tel_outcome is not None and is_tel:
+            expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                expected_value=tel_source_text or text,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                engine_selection=engine_selection,
+            )
+            tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
+            tel_outcome.actual_digit_count = actual_digit_count
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
         return [ActionSuccess()]
 
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
@@ -5899,54 +6676,141 @@ async def handle_input_text_action(
         try:
             await skyvern_element.input_clear()
         except Exception as exc:
+            if phone_bearing:
+                LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+                return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+            # The target already passed supports_text_input() above, so only a failure that names the
+            # live node as incompatible may be reported as one. A timeout or any other driver error
+            # carries no element-type evidence, and claiming otherwise both contradicts itself on a
+            # real field and sends the agent hunting for a date picker via the hint.
+            if isinstance(exc, InvalidElementForTextInput) or (
+                _is_selected_engine_error(exc, engine_selection) and is_incompatible_text_input_error(exc)
+            ):
+                LOG.warning("Live node cannot accept text input while clearing", action=action, exc_info=True)
+                return [
+                    ActionFailure(
+                        InvalidElementForTextInput(
+                            element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                        )
+                    )
+                ]
             if _is_selected_engine_timeout(exc, engine_selection):
-                LOG.info("None input tag clear timeout", action=action)
+                LOG.info("Input field clear timeout", action=action)
             else:
                 LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [
-                ActionFailure(
-                    InvalidElementForTextInput(
-                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
-                    )
-                )
-            ]
+            return [ActionFailure(FailedToClearInputField(element_id=action.element_id, tag_name=tag_name))]
 
-    # wait for blocking element to show up
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
+    retargeted = skyvern_element.get_id() != initial_action_target_id
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
         )
-        if blocking_element and exist:
+        if blocking_element and exist and await blocking_element.is_editable():
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
-            if await blocking_element.is_editable():
-                skyvern_element = blocking_element
-                tag_name = blocking_element.get_tag_name()
-                # The fill/type gate below reads is_tel from the element actually being filled; re-derive it
-                # from the blocker so a retarget to a different type cannot pick the wrong write strategy.
-                is_tel = await skyvern_element.get_attr("type") == "tel"
-                if used_bare_nanp:
-                    # The tel plan read constraints from the original element; re-derive them from
-                    # the element actually being filled.
-                    tel_pattern = await skyvern_element.get_attr("pattern")
-                    tel_maxlength = await skyvern_element.get_attr("maxlength")
-                    tel_e164_fallback = _nanp_e164_fallback(
-                        tel_source_text or "", pattern=tel_pattern, maxlength=tel_maxlength
-                    )
-                await _apply_secret_visual_mask_if_needed(
-                    skyvern_element,
-                    workflow_run_id=task.workflow_run_id,
-                    is_secret_value=is_secret_value,
-                    is_totp_value=is_totp_value,
-                    is_totp_sequence=is_multi_field_totp,
-                )
+            skyvern_element = blocking_element
+            tag_name = blocking_element.get_tag_name().lower()
+            retargeted = True
+            is_tel = await skyvern_element.get_attr("type") == "tel"
+            is_card_number_input = _is_probable_card_number(candidate_card_digits) and await _is_card_number_field(
+                skyvern_element
+            )
+            phone_bearing = is_tel and not is_card_number_input
+            await _apply_secret_visual_mask_if_needed(
+                skyvern_element,
+                workflow_run_id=task.workflow_run_id,
+                is_secret_value=is_secret_value,
+                is_totp_value=is_totp_value,
+                is_totp_sequence=is_multi_field_totp,
+            )
     except Exception:
         LOG.info(
             "Failed to find the blocking element, continue with the original element",
             exc_info=True,
         )
+
+    if is_card_number_input:
+        if tel_outcome is not None:
+            text = tel_source_text or text
+            action.tel_input_outcome = None
+            tel_outcome = None
+            tel_fix_enabled = None
+            tel_source_text = None
+        used_bare_nanp = False
+        run_phone_format_check = False
+        tel_pattern = None
+        tel_maxlength = None
+        tel_e164_fallback = None
+    elif not is_tel:
+        if tel_outcome is not None:
+            text = tel_source_text or text
+            action.tel_input_outcome = None
+            tel_outcome = None
+            tel_fix_enabled = None
+            tel_source_text = None
+        used_bare_nanp = False
+        run_phone_format_check = False
+        tel_pattern = None
+        tel_maxlength = None
+        tel_e164_fallback = None
+    else:
+        if tel_outcome is None:
+            tel_source_text = text
+            tel_fix_enabled = await _is_tel_digit_fix_enabled(task)
+            tel_outcome = actions.TelInputOutcome(
+                flag_enabled=tel_fix_enabled,
+                final_element_id=skyvern_element.get_id(),
+                strategy=actions.TelInputStrategy.legacy_sequential,
+                expected_digit_count=len(_phone_digits(tel_source_text)),
+                attempt_count=0,
+                retargeted=retargeted,
+            )
+            action.tel_input_outcome = tel_outcome
+        else:
+            tel_outcome.final_element_id = skyvern_element.get_id()
+            tel_outcome.retargeted = retargeted
+
+        if tel_fix_enabled:
+            assert tel_source_text is not None
+            tel_pattern = await skyvern_element.get_attr("pattern")
+            tel_maxlength = await skyvern_element.get_attr("maxlength")
+            tel_e164_fallback = _nanp_e164_fallback(tel_source_text, pattern=tel_pattern, maxlength=tel_maxlength)
+            text, used_bare_nanp, run_phone_format_check = _plan_tel_text(
+                is_tel=True,
+                is_secret=is_secret_value,
+                value=tel_source_text,
+                pattern=tel_pattern,
+            )
+            if used_bare_nanp:
+                tel_outcome.strategy = actions.TelInputStrategy.sequential_national
+                LOG.info(
+                    "Tel bare-digit fill using national digits",
+                    used_bare_nanp=True,
+                    expected_digit_count=len(text),
+                    element_id=skyvern_element.get_id(),
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                )
+            else:
+                tel_outcome.strategy = actions.TelInputStrategy.formatted_sequential
+            if run_phone_format_check:
+                try:
+                    action.set_has_mini_agent()
+                    text = await check_phone_number_format(
+                        value=text,
+                        action=action,
+                        skyvern_element=skyvern_element,
+                        scraped_page=scraped_page,
+                        task=task,
+                        step=step,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Failed to check the phone number format, using the original text",
+                        error_type=type(exc).__name__,
+                    )
 
     if is_totp_value:
         LOG.info("Skipping the auto completion logic since it's a TOTP input")
@@ -6127,14 +6991,17 @@ async def handle_input_text_action(
                     pattern=tel_pattern,
                     maxlength=tel_maxlength,
                     engine_selection=engine_selection,
+                    outcome=tel_outcome,
+                    enforce_browser_validity=tel_fix_enabled is True,
                 )
                 if phone_mismatch is not None:
-                    LOG.warning(
-                        "Phone input read-back mismatch after retry",
-                        element_id=skyvern_element.get_id(),
-                        expected_digit_count=phone_mismatch.expected_digit_count,
-                        actual_digit_count=phone_mismatch.actual_digit_count,
-                    )
+                    if isinstance(phone_mismatch, PhoneNumberInputMismatch):
+                        LOG.warning(
+                            "Phone input read-back mismatch after retry",
+                            element_id=skyvern_element.get_id(),
+                            expected_digit_count=phone_mismatch.expected_digit_count,
+                            actual_digit_count=phone_mismatch.actual_digit_count,
+                        )
                     return [ActionFailure(phone_mismatch)]
             elif verify_secret_input:
                 secret_failure = await _fill_secret_with_readback(
@@ -6185,15 +7052,18 @@ async def handle_input_text_action(
                     )
                     if isinstance(truncation_failure, ActionFailure):
                         return [truncation_failure]
-                if log_tel_fallback_readback:
-                    await _log_tel_fallback_fill_digit_counts(
+                if tel_outcome is not None and is_tel and not verify_tel_input_after_fill:
+                    expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
-                        expected_value=text,
+                        expected_value=tel_source_text or text,
                         task_id=task.task_id,
                         step_id=step.step_id,
                         engine_selection=engine_selection,
                     )
+                    tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
+                    tel_outcome.actual_digit_count = actual_digit_count
+                    tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
 
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
@@ -6214,7 +7084,7 @@ async def handle_input_text_action(
                     LOG.info(
                         "Detected target-matching dropdown after search-bar input; attempting custom selection",
                         element_id=skyvern_element.get_id(),
-                        target_value=text,
+                        **_input_target_log_fields(is_tel=phone_bearing, text=text),
                     )
                     action.set_has_mini_agent()
                     select_result = await sequentially_select_from_dropdown(
@@ -6256,7 +7126,7 @@ async def handle_input_text_action(
                     LOG.info(
                         "Detected target-matching option after typing into an invalid combobox; committing selection",
                         element_id=skyvern_element.get_id(),
-                        target_value=text,
+                        **_input_target_log_fields(is_tel=phone_bearing, text=text),
                     )
                     action.set_has_mini_agent()
                     select_result = await sequentially_select_from_dropdown(
@@ -6318,14 +7188,12 @@ async def handle_input_text_action(
                     # These are expected during page navigation/auto-submit, silently continue
                     LOG.debug(
                         "Engine error during incremental element processing (likely page navigation)",
-                        error_type=type(inc_error).__name__,
-                        error_message=error_message,
+                        **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                     )
                 else:
                     LOG.warning(
                         "Unexpected engine error during incremental element processing",
-                        error_type=type(inc_error).__name__,
-                        error_message=str(inc_error),
+                        **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                     )
                     raise inc_error
             elif isinstance(inc_error, PlaywrightError):
@@ -6336,28 +7204,43 @@ async def handle_input_text_action(
                 # instead of falling through to a false ActionSuccess.
                 LOG.warning(
                     "Foreign driver error during incremental element processing under a pinned engine",
-                    error_type=type(inc_error).__name__,
-                    error_message=str(inc_error),
+                    **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                 )
                 raise inc_error
             else:
                 # Handle any other unexpected errors during incremental element processing
                 LOG.warning(
                     "Unexpected error during incremental element processing",
-                    error_type=type(inc_error).__name__,
-                    error_message=str(inc_error),
+                    **_browser_error_log_fields(inc_error, is_tel=phone_bearing),
                 )
         finally:
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
 
         return [ActionSuccess()]
-    except Exception as e:
-        # Handle any other unexpected errors during text input
-
+    except (SkyvernPageAnalysisTimeout, InvalidElementForTextInput):
+        raise
+    except _DISPATCHER_OWNED_INPUT_EXCEPTIONS:
+        raise
+    except Exception as exc:
+        if phone_bearing:
+            LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
+            return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
         LOG.exception("Failed to input the value or finish the auto completion")
-        raise e
+        raise
     finally:
+        if tel_outcome is not None and is_tel and tel_outcome.actual_digit_count is None:
+            try:
+                actual_value = await get_input_value(
+                    tag_name=tag_name,
+                    locator=skyvern_element.get_locator(),
+                    engine_selection=engine_selection,
+                )
+                tel_outcome.actual_digit_count = len(_phone_digits(actual_value))
+            except Exception:
+                pass
+            tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+
         # HACK: force to finish missing auto completion input
         if (
             auto_complete_hacky_flag
@@ -7175,6 +8058,14 @@ async def handle_complete_action(
         verification_result = await app.agent.complete_verify(
             page, scraped_page, task, step, verification_trigger="complete_action_forced"
         )
+    except ScreenshotTargetClosed as e:
+        _span.set_attribute("verification_path", "needs_llm_error")
+        LOG.warning(
+            "Browser target closed while verifying the complete action",
+            workflow_run_id=task.workflow_run_id,
+            exception_message=str(e),
+        )
+        return [ActionFailure(exception=e)]
     except Exception as e:
         _span.set_attribute("verification_path", "needs_llm_error")
         LOG.exception(
@@ -7954,6 +8845,11 @@ async def chain_click(
     # File choosers are impossible to close if you don't expect one. Instead of dealing with it, close it!
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
+    composite_source = skyvern_element
+    composite_target_id = composite_source.get_id()
+    skyvern_element = await dom.resolve_effective_click_target(composite_source)
+    if skyvern_element.get_id() != composite_target_id and await skyvern_element.is_disabled(dynamic=True):
+        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
     locator = skyvern_element.locator
     click_count = _get_click_count(action)
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
@@ -8220,6 +9116,7 @@ async def chain_click(
             coordinate_error: Exception | None = None
             if not skip_coordinate_click:
                 try:
+                    skyvern_element = await dom.resolve_effective_click_target(composite_source)
                     await skyvern_element.coordinate_click(page=page, click_count=click_count)
                 except Exception as e:
                     coordinate_error = e
@@ -8269,6 +9166,7 @@ async def chain_click(
                 locator=locator,
             )
             try:
+                skyvern_element = await dom.resolve_effective_click_target(composite_source)
                 await skyvern_element.click_in_javascript()
             except Exception as e:
                 action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
@@ -8767,7 +9665,18 @@ async def choose_auto_completion_dropdown(
     finally:
         await incremental_scraped.stop_listen_dom_increment()
         if clear_input and await skyvern_element.is_visible():
-            await skyvern_element.input_clear()
+            try:
+                await skyvern_element.input_clear()
+            except Exception:
+                # Best-effort cleanup of the probe text typed above; an exception raised here
+                # (e.g. InvalidElementForTextInput when the live node no longer matches the
+                # scraped tag) would otherwise escape this finally block and clobber whatever
+                # `result`/exception the try/except above already produced, denying the
+                # caller's designed fallback chain (retry -> full-dropdown discovery -> plain fill).
+                LOG.info(
+                    "Failed to clear the auto-completion probe text, but continue",
+                    element_id=skyvern_element.get_id(),
+                )
 
 
 def remove_duplicated_HTML_element(elements: list[dict]) -> list[dict]:
@@ -9374,10 +10283,19 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
     Native ``<select>`` options live on the element's ``options`` field
     (``[{text, value, optionIndex}, ...]``); the scraper skips their child
     ``<option>`` nodes, so this walker must inspect that field directly.
+    Radio/checkbox-based custom selects (e.g. ``role="radiogroup"``) have no
+    ``<option>``/``<li>`` nodes either; they're recognized the same way
+    ``_custom_select_candidates_from_elements`` recognizes them so a
+    radio-group miss doesn't misreport zero observed options.
     """
     queue: deque[dict] = deque(elements)
     seen: set[str] = set()
     out: list[str] = []
+    # Mirrors _custom_select_candidates_from_elements' covered_choice_input_ids: a <label>
+    # wrapping a radio/checkbox is recorded once via its own label text, so the descendant
+    # input(s) it already covers must be skipped when the BFS reaches them directly — otherwise
+    # a labelled radio's raw `value` attribute is recorded again as an unrelated second entry.
+    covered_choice_input_ids: set[str] = set()
 
     def _record(text: str) -> None:
         if text and text not in seen:
@@ -9391,8 +10309,22 @@ def _collect_option_texts(elements: list[dict]) -> list[str]:
         attrs = node.get("attributes") or {}
         role = str(attrs.get("role") or "").lower()
         tag = str(node.get("tagName") or "").lower()
+        input_type = str(attrs.get("type") or "").lower()
+        element_id = str(node.get("id") or "") or None
+        is_choice_input = tag == "input" and input_type in ("checkbox", "radio")
+        # Only compute the descendant walk for <label> nodes (its one consumer below) — calling
+        # it unconditionally for every queued node makes this walker quadratic on large DOMs.
         if role == "option" or tag in ("li", "option"):
             _record(str(node.get("text") or "").strip())
+        elif is_choice_input and element_id in covered_choice_input_ids:
+            pass
+        elif is_choice_input or role in _CUSTOM_SELECT_CHOICE_INPUT_ROLES:
+            _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+        elif tag == "label":
+            choice_input_ids, contains_choice_input = _custom_select_descendant_choice_inputs(node)
+            if contains_choice_input:
+                _record(_select_shadow_label_from_node(node) or _custom_select_choice_value(node) or "")
+                covered_choice_input_ids.update(choice_input_ids)
         for option in node.get("options") or []:
             if not isinstance(option, dict):
                 continue
@@ -9853,7 +10785,63 @@ async def _verify_custom_select_option(
 # input_text_converted is excluded: its anchor is frequently not an <input>, so the reset path that
 # contains an unverified click does not exist for it.
 _EXECUTABLE_CUSTOM_SELECT_ENTRIES = ("select_option", "input_text")
-_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS = (0.15, 0.15)
+# The timer is only a liveness cap for frame-starved/background pages and vendor CDP engines. Double-rAF
+# remains the normal render-driven path; the timer does not claim that rendering has become stable.
+_CUSTOM_SELECT_RENDER_SETTLE_JS = (
+    "() => Promise.race(["
+    "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve('raf')))),"
+    "new Promise((resolve) => setTimeout(() => resolve('liveness_fallback'), 250))"
+    "])"
+)
+
+
+class _CustomSelectRenderSettle(NamedTuple):
+    source: str
+    elapsed_ms: int
+
+
+async def _wait_custom_select_render_settle(element: SkyvernElement) -> _CustomSelectRenderSettle:
+    started_at = time.monotonic()
+    source = await _evaluate_element_scoped(element, _CUSTOM_SELECT_RENDER_SETTLE_JS)
+    return _CustomSelectRenderSettle(
+        source=source if source in {"raf", "liveness_fallback"} else "unknown",
+        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+    )
+
+
+def _custom_select_settle_summary(settles: list[_CustomSelectRenderSettle]) -> tuple[str, int]:
+    source = "liveness_fallback" if any(settle.source == "liveness_fallback" for settle in settles) else "raf"
+    if not settles:
+        source = "not_run"
+    elif any(settle.source == "unknown" for settle in settles):
+        source = "unknown"
+    return source, sum(settle.elapsed_ms for settle in settles)
+
+
+def _log_custom_select_verification_outcome(
+    event: str,
+    *,
+    phase: str,
+    settles: list[_CustomSelectRenderSettle],
+    committed: bool,
+    verification_branch: str,
+    verification_reason: str,
+    recovery_attempted: bool,
+    recovery_succeeded: bool,
+) -> None:
+    render_settle_source, render_settle_elapsed_ms = _custom_select_settle_summary(settles)
+    LOG.info(
+        event,
+        phase=phase,
+        render_settle_source=render_settle_source,
+        render_settle_count=len(settles),
+        render_settle_elapsed_ms=render_settle_elapsed_ms,
+        committed=committed,
+        verification_branch=verification_branch,
+        verification_reason=verification_reason,
+        recovery_attempted=recovery_attempted,
+        recovery_succeeded=recovery_succeeded,
+    )
 
 
 async def _verify_custom_select_option_with_settle(
@@ -9864,16 +10852,14 @@ async def _verify_custom_select_option_with_settle(
     matched_element_id: str,
     matched_label: str | None,
     use_strict_verification: bool,
+    settle_outcomes: list[_CustomSelectRenderSettle] | None = None,
 ) -> tuple[bool, str]:
-    """Retry the read-back a couple of times before giving up.
-
-    Some frameworks commit ``aria-selected``/trigger-text reflection on the next render tick
-    rather than synchronously on click, so an immediate read-back can read stale state. Retries
-    only fire on the failure path; a confirmed read-back returns immediately with no added delay.
-    """
-    for delay_seconds in (0.0, *_CUSTOM_SELECT_VERIFY_SETTLE_RETRY_DELAYS_SECONDS):
-        if delay_seconds:
-            await asyncio.sleep(delay_seconds)
+    """Read back after bounded render turns so framework reconciliation is causally observable."""
+    settle_element = readback_scope_element or matched_element
+    for _ in range(2):
+        settle = await _wait_custom_select_render_settle(settle_element)
+        if settle_outcomes is not None and isinstance(settle, _CustomSelectRenderSettle):
+            settle_outcomes.append(settle)
         verified, branch = await _verify_custom_select_option(
             matched_element=matched_element,
             readback_scope_element=readback_scope_element,
@@ -9965,6 +10951,8 @@ async def _select_deterministic_custom_option(
     select_depth: int = 0,
     on_click_attempted: Callable[[], None] | None = None,
     on_reset_fallback: Callable[[Callable[[CustomSelectFamilyOutcome], None]], None] | None = None,
+    settle_outcomes: list[_CustomSelectRenderSettle] | None = None,
+    post_failed_click_commit_recovery: bool = False,
     engine_selection: BrowserEngineSelection | None = UNSET_SELECTION,
 ) -> tuple[ActionResult, str | None] | None:
     if engine_selection is UNSET_SELECTION:
@@ -10031,7 +11019,7 @@ async def _select_deterministic_custom_option(
         COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
         "collapse-custom-select-fanout",
     )
-    if gate.gate_error:
+    if gate.gate_error and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)
         return None
 
@@ -10056,10 +11044,10 @@ async def _select_deterministic_custom_option(
     option_count = len(option_candidates)
     eligible = not resolution.fallback_to_llm and resolution.matched_index is not None
     match_tier = resolution.matched_tier
-    if not gate.family_enabled:
+    if not gate.family_enabled and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_family_off)
         return None
-    if gate.assigned is False:
+    if gate.assigned is False and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_control)
         return None
     if resolution.fallback_to_llm or resolution.matched_index is None:
@@ -10165,6 +11153,7 @@ async def _select_deterministic_custom_option(
             matched_element_id=element_id,
             matched_label=matched_label,
             use_strict_verification=anchor_is_combobox_input and allow_single_value_scope,
+            settle_outcomes=settle_outcomes,
         )
         if verified:
             emit(CustomSelectFamilyOutcome.success_verified)
@@ -10315,6 +11304,66 @@ def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> Non
         _collect_new_roots(child, new_ids, out)
 
 
+def _custom_select_anchor_ownership(element: dict | None) -> tuple[str, frozenset[str]] | None:
+    if not element:
+        return None
+    attributes = element.get("attributes") or {}
+    role = str(attributes.get("role") or "").lower()
+    owned_ids = frozenset(
+        token
+        for attribute in ("aria-controls", "aria-owns")
+        for token in str(attributes.get(attribute) or "").split()
+        if token
+    )
+    if role != "combobox" or not owned_ids:
+        return None
+    return role, owned_ids
+
+
+def _resolve_owned_custom_select_recovery(
+    *,
+    original_anchor: dict | None,
+    refreshed_page: ScrapedPage,
+) -> tuple[str, list[dict]] | None:
+    ownership = _custom_select_anchor_ownership(original_anchor)
+    if ownership is None:
+        return None
+
+    matching_anchor_ids = _matching_custom_select_anchor_ids(ownership, refreshed_page)
+    if len(matching_anchor_ids) != 1:
+        return None
+
+    owned_ids = ownership[1]
+    matching_roots = [
+        element
+        for element in refreshed_page.elements
+        if str((element.get("attributes") or {}).get("id") or "") in owned_ids
+        and str((element.get("attributes") or {}).get("role") or "").lower() == "listbox"
+        and element.get("id")
+    ]
+    if len(matching_roots) != 1:
+        return None
+
+    owned_subtrees = _extract_new_subtrees(
+        refreshed_page.element_tree_trimmed,
+        {str(matching_roots[0]["id"])},
+    )
+    if len(owned_subtrees) != 1:
+        return None
+    return matching_anchor_ids[0], owned_subtrees
+
+
+def _matching_custom_select_anchor_ids(
+    ownership: tuple[str, frozenset[str]],
+    refreshed_page: ScrapedPage,
+) -> list[str]:
+    return [
+        str(element["id"])
+        for element in refreshed_page.elements
+        if _custom_select_anchor_ownership(element) == ownership and element.get("id")
+    ]
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -10450,6 +11499,17 @@ async def select_from_emerging_elements(
     # string raises ValueError and would mask the OPTION_NOT_AVAILABLE signal.
     raw_action_type: str = (json_response.get("action_type") or "").lower()
     element_id: str | None = json_response.get("id", None)
+    requested_value = options.target_value if _normalize_select_shadow_text(options.target_value) else None
+    if requested_value is None and _normalize_select_shadow_text(value):
+        requested_value = value
+    if requested_value is None and raw_action_type == ActionType.CLICK.value and element_id:
+        clicked_candidates = [
+            candidate
+            for candidate in _custom_select_candidates_from_elements(shadow_candidate_elements)
+            if candidate["element_id"] == element_id and _normalize_select_shadow_text(candidate["label"])
+        ]
+        if len(clicked_candidates) == 1:
+            requested_value = clicked_candidates[0]["label"]
     _log_select_shadow_match(
         prompt_name="custom-select/emerging",
         target_value=options.target_value,
@@ -10519,9 +11579,157 @@ async def select_from_emerging_elements(
         if await selected_element.get_attr("role") == "listbox":
             return ActionFailure(exception=InteractWithDropdownContainer(element_id=element_id))
 
+    original_anchor = scraped_page_after_open.id_to_element_dict.get(current_element_id)
     await selected_element.scroll_into_view()
     await selected_element.click(page=page, engine_selection=engine_selection)
-    return ActionSuccess()
+    readback_scope_element = await _resolve_custom_select_readback_scope_element(
+        get_readback_scope_element=get_readback_scope_element,
+        target_value=options.target_value or "",
+        matched_element_id=element_id,
+        matched_label=requested_value,
+    )
+    anchor_is_combobox_input = await _anchor_is_combobox_input(readback_scope_element)
+    initial_settles: list[_CustomSelectRenderSettle] = []
+    verification_branch = "none"
+    try:
+        verified, verification_branch = await _verify_custom_select_option_with_settle(
+            matched_element=selected_element,
+            readback_scope_element=readback_scope_element,
+            anchor_is_combobox_input=anchor_is_combobox_input,
+            matched_element_id=element_id,
+            matched_label=requested_value,
+            use_strict_verification=True,
+            settle_outcomes=initial_settles,
+        )
+        # The settle preceding each read-back inside _verify_custom_select_option_with_settle already
+        # spans the render turn on which frameworks reconcile, so a next-render reset lands as a
+        # non-committed read-back there and routes to recovery without a second confirming round.
+    except Exception:
+        LOG.info(
+            "Custom-select primary commit verification exception",
+            phase="initial_click",
+            exc_info=True,
+        )
+        _log_custom_select_verification_outcome(
+            "Custom-select commit verification outcome",
+            phase="initial_click",
+            settles=initial_settles,
+            committed=False,
+            verification_branch="none",
+            verification_reason="verification_error",
+            recovery_attempted=False,
+            recovery_succeeded=False,
+        )
+        return _terminal_custom_select_failure(
+            target_value=options.target_value or requested_value or "",
+            matched_label=requested_value,
+        )[0]
+    _log_custom_select_verification_outcome(
+        "Custom-select commit verification outcome",
+        phase="initial_click",
+        settles=initial_settles,
+        committed=verified,
+        verification_branch=verification_branch,
+        verification_reason="verified" if verified else "not_committed",
+        recovery_attempted=not verified,
+        recovery_succeeded=False,
+    )
+    if verified:
+        return ActionSuccess()
+
+    recovery_settles: list[_CustomSelectRenderSettle] = []
+    recovery_reason = "not_committed"
+    try:
+        refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
+        refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        ownership = _custom_select_anchor_ownership(original_anchor)
+        if ownership is None:
+            raise ValueError("Custom-select recovery ownership is missing")
+        matching_anchor_ids = _matching_custom_select_anchor_ids(ownership, refreshed_page)
+        if len(matching_anchor_ids) != 1:
+            raise ValueError("Custom-select recovery anchor is missing or ambiguous")
+        recovered_anchor_id = matching_anchor_ids[0]
+        recovered_anchor = await refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id)
+        if await recovered_anchor.get_locator().get_attribute("aria-expanded") != "true":
+            await recovered_anchor.click(page=page, engine_selection=engine_selection)
+            refreshed_page = await scraped_page_after_open.generate_scraped_page_without_screenshots()
+            refreshed_dom = DomUtil(scraped_page=refreshed_page, page=page, engine_selection=engine_selection)
+        owned_recovery = _resolve_owned_custom_select_recovery(
+            original_anchor=original_anchor,
+            refreshed_page=refreshed_page,
+        )
+        if owned_recovery is None:
+            raise ValueError("Custom-select recovery ownership is missing or ambiguous")
+        recovered_anchor_id, refreshed_option_elements = owned_recovery
+        recovery_result = await _select_deterministic_custom_option(
+            execute=True,
+            target_value=requested_value,
+            get_option_candidates=lambda: _custom_select_candidates_from_elements(refreshed_option_elements),
+            field_context=options.model_dump(),
+            page=page,
+            get_skyvern_element=refreshed_dom.get_skyvern_element_by_id,
+            get_readback_scope_element=lambda: refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id),
+            task=task,
+            step=step,
+            entry_action_type=entry_action_type,
+            selection_group_id=selection_group_id,
+            select_depth=1,
+            settle_outcomes=recovery_settles,
+            post_failed_click_commit_recovery=True,
+            engine_selection=engine_selection,
+        )
+    except Exception:
+        LOG.info(
+            "Custom-select deterministic recovery exception",
+            phase="recovery",
+            exc_info=True,
+        )
+        recovery_reason = "recovery_error"
+        recovery_result = None
+
+    recovery_committed = False
+    recovery_branch = "none"
+    if recovery_result is not None and isinstance(recovery_result[0], ActionSuccess):
+        try:
+            recovered_label = requested_value if requested_value is not None else recovery_result[1]
+            expected_label = _normalize_select_shadow_text(recovered_label)
+            recovered_scope = await refreshed_dom.get_skyvern_element_by_id(recovered_anchor_id)
+            recovery_settle = await _wait_custom_select_render_settle(recovered_scope)
+            if isinstance(recovery_settle, _CustomSelectRenderSettle):
+                recovery_settles.append(recovery_settle)
+            recovery_committed, recovery_branch = await _custom_select_scope_confirms_committed(
+                readback_scope_element=recovered_scope,
+                anchor_is_combobox_input=await _anchor_is_combobox_input(recovered_scope),
+                matched_element_id=element_id,
+                matched_label=recovered_label,
+                expected_label=expected_label,
+                allow_aria_selected_option_tokens=False,
+                allow_single_value_scope=True,
+            )
+        except Exception:
+            LOG.info(
+                "Custom-select recovery commit verification exception",
+                phase="recovery",
+                exc_info=True,
+            )
+            recovery_reason = "verification_error"
+            recovery_committed = False
+    _log_custom_select_verification_outcome(
+        "Custom-select recovery outcome",
+        phase="recovery",
+        settles=recovery_settles,
+        committed=recovery_committed,
+        verification_branch=recovery_branch,
+        verification_reason="verified" if recovery_committed else recovery_reason,
+        recovery_attempted=True,
+        recovery_succeeded=recovery_committed,
+    )
+    if recovery_committed and recovery_result is not None:
+        return recovery_result[0]
+    return _terminal_custom_select_failure(
+        target_value=requested_value or "",
+        matched_label=requested_value,
+    )[0]
 
 
 @traced(name="skyvern.agent.dropdown.select")
@@ -11136,7 +12344,21 @@ async def scroll_down_to_load_all_options(
         LOG.info("element handle is None, using focus to move the cursor", element_id=scrollable_element.get_id())
         await scrollable_element.get_locator().focus(timeout=timeout)
     else:
-        await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        try:
+            await dropdown_menu_element_handle.scroll_into_view_if_needed(timeout=timeout)
+        except Exception as exc:
+            if not _is_selected_engine_timeout(exc, skyvern_frame.engine_selection) and not is_element_detached_error(
+                exc
+            ):
+                raise
+            # A detached handle can't be reused below either, so null it out to take the
+            # existing None-handle fallback path for the rest of this function.
+            LOG.info(
+                "Dropdown-menu element detached mid-scroll, falling back to focus",
+                element_id=scrollable_element.get_id(),
+            )
+            await scrollable_element.get_locator().focus(timeout=timeout)
+            dropdown_menu_element_handle = None
 
     await scrollable_element.move_mouse_to_safe(page=page)
 
