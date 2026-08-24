@@ -43,8 +43,16 @@ def _structlog_config_capture_can_see(monkeypatch: pytest.MonkeyPatch) -> None:
         cache_logger_on_first_use=False,
     )
     from skyvern.cli import run_commands
+    from skyvern.library import local_browser_profile
 
-    monkeypatch.setattr(run_commands.LOG, "_logger", None, raising=False)
+    for log_proxy in (run_commands.LOG, local_browser_profile.LOG):
+        monkeypatch.setattr(log_proxy, "_logger", None, raising=False)
+        # Strip instance attrs shadowing the proxy's lazy dispatch: a stashed `bind`
+        # closure, or a bound method frozen onto the proxy by another test's
+        # monkeypatch undo (e.g. setattr(LOG, "warning", ...)). Either keeps routing
+        # through a logger built under an earlier config, bypassing capture_logs.
+        for attr in [a for a in vars(log_proxy) if not a.startswith("_")]:
+            monkeypatch.delattr(log_proxy, attr)
     yield
     structlog.configure(**saved)
 
@@ -91,6 +99,15 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
     fake_telemetry = types.ModuleType("skyvern.cli.mcp_tools.telemetry")
     fake_telemetry.configure_mcp_telemetry_runtime = lambda **_kwargs: None
 
+    fake_instructions = types.ModuleType("skyvern.cli.mcp_tools.instructions")
+    fake_instructions.instructions_for_scope = lambda _scope: ""
+
+    fake_origin_middleware = types.ModuleType("skyvern.cli.mcp_tools.origin_middleware")
+    fake_origin_middleware.OriginValidationMiddleware = object
+
+    fake_scopes = types.ModuleType("skyvern.cli.mcp_tools.scopes")
+    fake_scopes.apply_scope = lambda _mcp, _scope: None
+
     fake_mcp_tools = types.ModuleType("skyvern.cli.mcp_tools")
 
     class FakeMCP:
@@ -118,6 +135,9 @@ def _patch_minimal_run_mcp_dependencies(monkeypatch, events: list[str], run_mcp_
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.session_manager", fake_session_manager)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools", fake_mcp_tools)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.telemetry", fake_telemetry)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.instructions", fake_instructions)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.origin_middleware", fake_origin_middleware)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.scopes", fake_scopes)
     return run_commands
 
 
@@ -376,6 +396,15 @@ def test_run_mcp_prepares_cloud_env_before_starting_mcp(tmp_path, monkeypatch) -
     monkeypatch.setitem(sys.modules, "skyvern.cli.core.session_manager", fake_session_manager)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools", fake_mcp_tools)
     monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.telemetry", fake_telemetry)
+    fake_instructions = types.ModuleType("skyvern.cli.mcp_tools.instructions")
+    fake_instructions.instructions_for_scope = lambda _scope: ""
+    fake_origin_middleware = types.ModuleType("skyvern.cli.mcp_tools.origin_middleware")
+    fake_origin_middleware.OriginValidationMiddleware = object
+    fake_scopes = types.ModuleType("skyvern.cli.mcp_tools.scopes")
+    fake_scopes.apply_scope = lambda _mcp, _scope: None
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.instructions", fake_instructions)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.origin_middleware", fake_origin_middleware)
+    monkeypatch.setitem(sys.modules, "skyvern.cli.mcp_tools.scopes", fake_scopes)
 
     run_commands.run_mcp()
 
@@ -1056,7 +1085,7 @@ def test_quickstart_docker_compose_bypasses_server_extra_guard(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_start_services_without_frontend_runtime_starts_backend_only(monkeypatch) -> None:
-    import skyvern.cli.utils as utils
+    from skyvern.cli import utils
 
     commands = []
 
