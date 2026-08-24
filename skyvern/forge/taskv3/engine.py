@@ -32,6 +32,8 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
+    CompletionBlocker,
+    CompletionProbe,
     LoopOutcome,
     SubmitWatch,
     ToolSpec,
@@ -82,6 +84,14 @@ Rules:
 - A page message rejecting your submission and inviting you to try again is not an instruction to loop: retry at most once, and if the outcome is unchanged, finish honestly naming the rejection as the reason.
 - When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
+
+DOWNLOAD_COMPLETION_GUIDANCE = """
+
+This task completes automatically once a file download finishes -- trigger the download and let it land; do not call finish(status=completed) yourself. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
+
+DOWNLOAD_REQUIRED_GUIDANCE = """
+
+This task cannot finish as completed until a file download has finished. Trigger the download and let it land, then call finish(status=completed) with the extracted output. If the download cannot be triggered, call finish with status=failed or status=terminated and say why."""
 
 
 def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int]:
@@ -175,6 +185,9 @@ async def run_task_v3_agent_loop(
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
+    completion_probe: CompletionProbe | None = None,
+    completion_blocker: CompletionBlocker | None = None,
+    staged_downloads: set[str] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -203,6 +216,13 @@ async def run_task_v3_agent_loop(
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
     submit_watch = SubmitWatch()
+    if staged_downloads is None:
+        staged_downloads = set()
+    # A page-free run has no tool that could trigger a download, so a blocker would refuse every
+    # completed verdict forever.
+    if page_free:
+        completion_probe = None
+        completion_blocker = None
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         max_settle_deferrals=max_settle_deferrals,
@@ -211,9 +231,17 @@ async def run_task_v3_agent_loop(
         should_cancel=should_cancel,
         deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
         activity=activity,
+        completion_blocker=completion_blocker,
+        staged_downloads=staged_downloads,
     )
     tools = browser_tools + (extra_tools or []) + [finish_tool]
     base_system_prompt = PAGE_FREE_SYSTEM_PROMPT if page_free else SYSTEM_PROMPT
+    # Keyed on which hooks are present, not completion_probe alone: an extraction blocker-only
+    # case needs the model told it ends the run itself; a wait-only probe has nothing to explain.
+    if completion_blocker is not None and completion_probe is not None:
+        extra_system_guidance = extra_system_guidance + DOWNLOAD_COMPLETION_GUIDANCE
+    elif completion_blocker is not None and completion_probe is None:
+        extra_system_guidance = extra_system_guidance + DOWNLOAD_REQUIRED_GUIDANCE
     outcome = await run_agent_tool_loop(
         llm_caller=llm_caller,
         system_prompt=base_system_prompt + extra_system_guidance,
@@ -234,6 +262,8 @@ async def run_task_v3_agent_loop(
         max_call_retries=DEFAULT_MAX_CALL_RETRIES,
         activity=activity,
         submit_watch=None if page_free else submit_watch,
+        completion_probe=completion_probe,
+        staged_downloads=staged_downloads,
     )
     LOG.info(
         "taskv3 engine loop finished",
