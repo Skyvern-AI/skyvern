@@ -817,3 +817,70 @@ export type {
   UnexecutedBlockReason,
   UnexecutedDefinedBlock,
 };
+
+export function buildBlockOrderIndex(
+  items: Array<WorkflowRunTimelineItem>,
+): ReadonlyMap<string, number> {
+  const blocks: Array<{
+    id: string;
+    createdAt: number;
+    sequence: number;
+  }> = [];
+
+  function walk(timelineItems: Array<WorkflowRunTimelineItem>) {
+    for (const item of timelineItems) {
+      if (isBlockItem(item)) {
+        const createdAt = new Date(item.created_at).getTime();
+        blocks.push({
+          id: item.block.workflow_run_block_id,
+          createdAt: Number.isNaN(createdAt)
+            ? Number.MAX_SAFE_INTEGER
+            : createdAt,
+          sequence: blocks.length,
+        });
+      }
+      if (item.children.length > 0) {
+        walk(item.children);
+      }
+    }
+  }
+
+  walk(items);
+  blocks.sort(
+    (left, right) =>
+      left.createdAt - right.createdAt || left.sequence - right.sequence,
+  );
+
+  return new Map(blocks.map((block, index) => [block.id, index + 1]));
+}
+
+export type TimelineSearchTarget = {
+  block: WorkflowRunBlock;
+  label: string;
+  order: number | null;
+};
+
+// Top-level rows only: flattenTimelineChronologically hoists conditional
+// branches here; loop/task_v2 children stay out so a looped label doesn't
+// repeat once per iteration.
+export function collectTimelineSearchTargets(
+  items: Array<WorkflowRunTimelineItem>,
+  blockOrder: ReadonlyMap<string, number>,
+): Array<TimelineSearchTarget> {
+  const targets: Array<TimelineSearchTarget> = [];
+  for (const item of items) {
+    if (!isBlockItem(item)) {
+      continue;
+    }
+    const label = item.block.label;
+    if (!label || label.trim() === "") {
+      continue;
+    }
+    targets.push({
+      block: item.block,
+      label,
+      order: blockOrder.get(item.block.workflow_run_block_id) ?? null,
+    });
+  }
+  return targets;
+}

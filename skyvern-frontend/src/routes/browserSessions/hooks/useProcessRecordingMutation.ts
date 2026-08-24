@@ -36,6 +36,12 @@ const useProcessRecordingMutation = ({
   const recordingStore = useRecordingStore();
   const workflowPermanentId = useWorkflowPermanentId();
   const mutationStartedAtRef = useRef<number | null>(null);
+  const recordingStatsRef = useRef<{
+    transport: "cdp" | "vnc";
+    durationMs: number;
+    eventCount: number;
+    optimisticStepCount: number;
+  } | null>(null);
   // Per-user opt-in preview; not enrolled reads as false (agent blocks).
   const codeFirst =
     useFeatureFlagEnabled(RECORD_BROWSER_CODE_FIRST_FLAG) ?? false;
@@ -67,7 +73,14 @@ const useProcessRecordingMutation = ({
 
       mutationStartedAtRef.current = Date.now();
 
-      const eventCount = recordingStore.getEventCount();
+      const currentRecording = useRecordingStore.getState();
+      const eventCount = currentRecording.getEventCount();
+      recordingStatsRef.current = {
+        transport: currentRecording.recordingTransport,
+        durationMs: Math.round(currentRecording.getSecondsRecording() * 1000),
+        eventCount,
+        optimisticStepCount: currentRecording.optimisticSteps.length,
+      };
       const hasDraftSteps = (draftSteps?.length ?? 0) > 0;
 
       if (eventCount === 0 && !hasDraftSteps) {
@@ -119,6 +132,22 @@ const useProcessRecordingMutation = ({
 
       markRecordBrowserProcessed(blocks?.length ?? 0);
 
+      const completedRecording = recordingStatsRef.current;
+      recordingStatsRef.current = null;
+      const currentRecording = useRecordingStore.getState();
+      captureRecordBrowser("record_browser.finished", {
+        transport:
+          completedRecording?.transport ?? currentRecording.recordingTransport,
+        duration_ms:
+          completedRecording?.durationMs ??
+          Math.round(currentRecording.getSecondsRecording() * 1000),
+        event_count:
+          completedRecording?.eventCount ?? currentRecording.getEventCount(),
+        optimistic_step_count:
+          completedRecording?.optimisticStepCount ??
+          currentRecording.optimisticSteps.length,
+      });
+
       captureRecordBrowser("record_browser.processed", {
         block_count: blocks?.length ?? 0,
         parameter_count: parameters?.length ?? 0,
@@ -156,6 +185,7 @@ const useProcessRecordingMutation = ({
           ? Date.now() - mutationStartedAtRef.current
           : 0;
       mutationStartedAtRef.current = null;
+      recordingStatsRef.current = null;
 
       if (error instanceof Error && error.message === FAIL_QUIET_NO_EVENTS) {
         recordingStore.reset();

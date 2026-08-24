@@ -191,34 +191,13 @@ def _code_only_browser_unavailable_types() -> list[str]:
     )
 
 
-def _code_only_browser_pending_details(settled_block_types: frozenset[str] | None = None) -> list[str]:
-    settled = settled_block_types or frozenset()
+def _code_only_browser_pending_details() -> list[str]:
     return [
         _render_block_policy_detail(block_type, policy)
         for block_type, policy in sorted(_COPILOT_BLOCK_TYPE_POLICIES.items())
         if policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
         and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
-        and block_type not in settled
     ]
-
-
-def _extract_existing_code_only_pending_block_types(prior_workflow_yaml: str | None) -> frozenset[str]:
-    blocks = _parse_workflow_blocks(prior_workflow_yaml)
-    if not blocks:
-        return frozenset()
-
-    existing_types: set[str] = set()
-    for _label, block_type in _collect_banned_block_items(blocks, _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES):
-        normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
-        policy = _COPILOT_BLOCK_TYPE_POLICIES.get(normalized)
-        if (
-            policy is not None
-            and policy.scope == CopilotBlockPolicyScope.CODE_ONLY_BROWSER
-            and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
-        ):
-            existing_types.add(normalized)
-
-    return frozenset(existing_types)
 
 
 def _code_only_browser_unavailable_summary() -> str:
@@ -237,53 +216,21 @@ def _code_only_browser_validation_guidance() -> str:
     )
 
 
-def _login_is_settled(settled_block_types: frozenset[str] | None) -> bool:
-    return bool(settled_block_types) and "login" in (settled_block_types or frozenset())
-
-
-def _code_only_browser_schema_guidance(settled_block_types: frozenset[str] | None = None) -> list[str]:
-    guidance = [
+def _code_only_browser_schema_guidance() -> list[str]:
+    return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
         _code_only_browser_unavailable_summary(),
         "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
         _code_only_browser_validation_guidance(),
         "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
         "Wait for the value the block returns, not for a URL or a navigation. A page reaches its final URL while it is still rendering, so a URL check passes before the value exists and a navigation wait fails on a page that has already arrived.",
-        "The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
+        "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, use await <key>.otp() for authenticator, email, or SMS one-time codes, and use await <key>.magic_link(page) when the scouted page offers an emailed sign-in link; that broker navigates the page without exposing the sign-in link to authored code. Never put literal secret values in code; scout credential fields with fill_credential_field.",
+        "The Code runtime provides await solve_captcha(page) for a platform-managed verification challenge observed while scouting; this is an available capability, not a required step for every login.",
     ]
-    if not _login_is_settled(settled_block_types):
-        guidance.append(
-            "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username and <key>.password, use await <key>.otp() for authenticator, email, or SMS one-time codes, and use await <key>.magic_link(page) when the scouted page offers an emailed sign-in link; that broker navigates the page without exposing the sign-in link to authored code. Never put literal secret values in code; scout credential fields with fill_credential_field."
-        )
-    return guidance
 
 
-def _code_only_browser_credential_login_rules(settled_block_types: frozenset[str] | None = None) -> str:
-    """Expose credential accessors without prescribing login control flow."""
-    return """- A `credential_id` workflow parameter resolves to a credential object with
-  `<key>.username`, `<key>.password`, `await <key>.otp()` for one-time codes, and
-  `await <key>.magic_link(page)` for an emailed sign-in link without exposing the sign-in link to authored code;
-  scout fields with
-  `fill_credential_field`, never embed literal secrets.
-- The Code runtime provides `solve_captcha(page)` for a platform-managed verification challenge observed while
-  scouting; this is an available capability, not a required login step.\n"""
-
-
-def _code_only_browser_block_status_section(settled_block_types: frozenset[str] | None = None) -> str:
-    sections = []
-    details = _code_only_browser_pending_details(settled_block_types)
-    if details:
-        rendered = "\n".join(f"- {detail}" for detail in details)
-        sections.append(f"Code-native capabilities still pending plumbing:\n{rendered}")
-    if settled_block_types:
-        settled = ", ".join(f"`{block_type}`" for block_type in sorted(settled_block_types))
-        sections.append(f"Already saved in this workflow, inherited as-is and not pending conversion: {settled}.")
-    return "\n\n".join(sections)
-
-
-def _code_only_browser_authoring_prompt(settled_block_types: frozenset[str] | None = None) -> str:
-    pending = _code_only_browser_block_status_section(settled_block_types)
-    credential_login_rules = _code_only_browser_credential_login_rules(settled_block_types)
+def _code_only_browser_authoring_prompt() -> str:
+    pending = "\n".join(f"- {detail}" for detail in _code_only_browser_pending_details())
     return f"""
 ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
@@ -291,28 +238,30 @@ ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
 Rules:
 - Browser/page/session durable steps must be focused `code` blocks.
+- In code-only browser mode, before authoring the first `code` block this turn,
+  call `get_block_schema` with `block_type: code` and follow its returned field
+  names and nesting exactly; do not guess the YAML shape from memory.
 - Allowed non-browser helper blocks remain available: `conditional`, `for_loop`,
   `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file
   parsers, and triggers.
 - {_code_only_browser_validation_guidance()}
 
+Code-native capabilities still pending plumbing:
 {pending}
 
 Runtime facts:
 - `code` is async Python with a Playwright `page` object and workflow parameters by key.
 - The runtime pre-injects its helper namespaces; do not write `import` statements and do
   not access dunder (`__name__`) names or attributes.
-- Valid Python identifier parameter keys are local variables; normalize before page inputs.
-- Use deterministic, bounded Playwright calls: `goto`, `click`, `fill`, `press`,
-  `wait_for_load_state`, `locator`, `get_by_role`, and locator text/count APIs.
+- Valid Python identifier parameter keys are local variables; normalize values before page inputs.
+- Use deterministic, bounded Playwright calls and selectors observed while scouting.
 - For browser reads, prefer visible anchors, locator text, block outputs, and
   MCP/scout evidence gathered before authoring.
-{credential_login_rules}- Return JSON-safe structured data plus visible evidence text for records, totals,
+- Return JSON-safe structured data plus visible evidence text for records, totals,
   confirmations, and identifiers.
 - For an extraction-intent `code` block, derive a typed `extraction_schema` (named
   fields with types) from the goal and the scouted page, carry it as
-  `extraction_schema` on `code_artifact_metadata`, conform the block's `return` to it,
-  and name the fields you chose when you deliver so the user can adjust them.
+  `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.
 - Use YAML block scalars (`code: |`) and pass complete workflow YAML to update tools.
 """.strip()
 

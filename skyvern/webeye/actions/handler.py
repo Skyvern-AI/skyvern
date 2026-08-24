@@ -45,6 +45,7 @@ from skyvern.exceptions import (
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
+    FailedToClearInputField,
     FailedToFetchSecret,
     FailedToTakeScreenshot,
     FailToClick,
@@ -6678,17 +6679,26 @@ async def _handle_input_text_action(
             if phone_bearing:
                 LOG.warning("Phone input browser interaction failed", error_type=type(exc).__name__)
                 return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
+            # The target already passed supports_text_input() above, so only a failure that names the
+            # live node as incompatible may be reported as one. A timeout or any other driver error
+            # carries no element-type evidence, and claiming otherwise both contradicts itself on a
+            # real field and sends the agent hunting for a date picker via the hint.
+            if isinstance(exc, InvalidElementForTextInput) or (
+                _is_selected_engine_error(exc, engine_selection) and is_incompatible_text_input_error(exc)
+            ):
+                LOG.warning("Live node cannot accept text input while clearing", action=action, exc_info=True)
+                return [
+                    ActionFailure(
+                        InvalidElementForTextInput(
+                            element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
+                        )
+                    )
+                ]
             if _is_selected_engine_timeout(exc, engine_selection):
-                LOG.info("None input tag clear timeout", action=action)
+                LOG.info("Input field clear timeout", action=action)
             else:
                 LOG.warning("Failed to clear the input field", action=action, exc_info=True)
-            return [
-                ActionFailure(
-                    InvalidElementForTextInput(
-                        element_id=action.element_id, tag_name=tag_name, is_date_related=is_date_related
-                    )
-                )
-            ]
+            return [ActionFailure(FailedToClearInputField(element_id=action.element_id, tag_name=tag_name))]
 
     await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
     retargeted = skyvern_element.get_id() != initial_action_target_id

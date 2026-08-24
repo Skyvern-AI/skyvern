@@ -97,6 +97,18 @@ const railHighlightStyle = {
   paddingLeft: `${RAIL_CONTENT_PADDING_PX}px`,
 };
 
+// How long a revealed row keeps moving while an ancestor's Collapsible height
+// animates open (animate-collapsible-down-fade, 0.22s in tailwind.config.js).
+// Scrolling before it settles aims at where the row started, not where it lands.
+const COLLAPSIBLE_SETTLE_MS = 250;
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
 function IndentRails({ depth }: { depth: number }) {
   // Render guide rails only for nested rows. Top-level rows should start with
   // content, not a phantom outer timeline rail.
@@ -1074,6 +1086,7 @@ function WorkflowRunTimelineBlockItem({
       !hasRenderableNestedChildren,
   );
   const userToggledRef = useRef(false);
+  const rowRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     userToggledRef.current = false;
@@ -1101,6 +1114,48 @@ function WorkflowRunTimelineBlockItem({
     isLoopWithSelectedIteration,
   ]);
 
+  // A selection landing inside this block outranks an earlier collapse: that
+  // collapse was a choice about the previous selection, not this one, and a
+  // selection nobody can see is worse than a container reopening. Keyed on the
+  // selection's id, not the containment boolean — the boolean doesn't change
+  // when the selection moves between two children of the same collapsed
+  // container, and the activeItem object is rebuilt by every timeline poll.
+  const activeKey = isWorkflowRunBlock(activeItem)
+    ? activeItem.workflow_run_block_id
+    : isAction(activeItem)
+      ? activeItem.action_id
+      : isObserverThought(activeItem)
+        ? activeItem.thought_id
+        : activeItem;
+  useEffect(() => {
+    if (hasActiveDescendant || isLoopWithSelectedIteration) {
+      userToggledRef.current = false;
+      setExpanded(true);
+    }
+  }, [activeKey, hasActiveDescendant, isLoopWithSelectedIteration]);
+
+  // Follow the selection with the viewport, wherever it came from — the editor
+  // canvas, a deep link, the search jump, or the block detail. "nearest" makes
+  // this a no-op for a row that is already on screen, so clicking a visible row
+  // never moves the list under the pointer.
+  useEffect(() => {
+    if (!isActiveBlock) {
+      return;
+    }
+    // An ancestor revealing this row animates its height (see
+    // animate-collapsible-down-fade, 0.22s in tailwind.config.js), so the row
+    // is still travelling when this effect runs; scrolling now would aim at
+    // where it started. ponytail: one settle beats wiring animationend up
+    // through every container.
+    const id = window.setTimeout(() => {
+      rowRef.current?.scrollIntoView({
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+        block: "nearest",
+      });
+    }, COLLAPSIBLE_SETTLE_MS);
+    return () => window.clearTimeout(id);
+  }, [isActiveBlock]);
+
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
   // Loop inline counter (e.g. 3/8).
@@ -1114,7 +1169,7 @@ function WorkflowRunTimelineBlockItem({
 
   return (
     <div className="min-w-0">
-      <div className="flex min-h-[28px] items-stretch text-xs">
+      <div ref={rowRef} className="flex min-h-[28px] items-stretch text-xs">
         <IndentRails depth={depth} />
         <div
           className={cn(
@@ -1528,5 +1583,5 @@ function LoopIterationRow({
   );
 }
 
-export { WorkflowRunTimelineBlockItem };
+export { StatusDot, WorkflowRunTimelineBlockItem };
 export type { SkippedBranchGroup };

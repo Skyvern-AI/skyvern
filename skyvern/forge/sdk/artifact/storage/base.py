@@ -95,6 +95,16 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
     return infos
 
 
+def download_checksums_by_uri(artifacts: list[Artifact]) -> dict[str, str]:
+    """URI -> SHA-256 for DOWNLOAD rows that carry one.
+
+    A row is only written after its bytes land in storage, so a file whose checksum
+    matches its row is already saved and the save loop can skip re-uploading it
+    (SKY-14752). Rows without a checksum are omitted: they cannot vouch for content.
+    """
+    return {artifact.uri: artifact.checksum for artifact in artifacts if artifact.uri and artifact.checksum}
+
+
 async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list[FileInfo]:
     """Backward-compat alias for DOWNLOAD-typed callers.
 
@@ -113,6 +123,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.BROWSER_CONSOLE_LOG: "log",
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "png",
     ArtifactType.SCREENSHOT_FINAL: "png",
     ArtifactType.SKYVERN_LOG: "log",
     ArtifactType.SKYVERN_LOG_RAW: "json",
@@ -128,6 +139,7 @@ FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "txt",
     ArtifactType.HTML_SCRAPE: "html",
     ArtifactType.HTML_ACTION: "html",
+    ArtifactType.HTML_PRE_SUBMIT: "html",
     ArtifactType.TRACE: "zip",
     ArtifactType.HAR: "har",
     ArtifactType.HASHED_HREF_MAP: "json",

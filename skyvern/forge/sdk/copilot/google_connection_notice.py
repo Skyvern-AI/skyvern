@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from typing import Literal
@@ -7,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
+from skyvern.config import settings
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock
@@ -37,6 +39,8 @@ class GoogleConnectionNotice(BaseModel):
 
 
 GoogleSheetConnectionBinding = tuple[str, str]
+
+_CAPTURE_SEQ = itertools.count(1)
 
 
 def google_sheet_connection_bindings(workflow: Workflow | None) -> tuple[GoogleSheetConnectionBinding, ...]:
@@ -104,16 +108,21 @@ def retain_notices_after_lookup_failure(
 def write_google_connection_notice_capture(
     *,
     output_root: str,
+    turn_id: str,
     turn_start_workflow: Workflow | None,
     final_workflow: Workflow,
     accepted_workflow_yaml: str,
     visible_credentials: list[GoogleOAuthCredentialBase],
     observed_notices: list[GoogleConnectionNotice],
 ) -> None:
-    target = Path(output_root).expanduser() / "capture-0001.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    """The capture carries the org's visible connection names, so it stays behind a local ENV."""
+    if settings.ENV != "local":
+        return
+    root = Path(output_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
     payload = {
-        "contractVersion": 1,
+        "contractVersion": 2,
+        "turnId": turn_id,
         "turnStartWorkflow": turn_start_workflow.model_dump(mode="json") if turn_start_workflow else None,
         "finalWorkflow": final_workflow.model_dump(mode="json"),
         "acceptedWorkflowYaml": accepted_workflow_yaml,
@@ -133,6 +142,12 @@ def write_google_connection_notice_capture(
         ],
         "observedNotices": [notice.to_payload() for notice in observed_notices],
     }
+    # The counter restarts with the process, so a later run would otherwise overwrite the
+    # captures of an earlier one in the same directory.
+    target = root / f"capture-{next(_CAPTURE_SEQ):04d}.json"
+    while target.exists():
+        target = root / f"capture-{next(_CAPTURE_SEQ):04d}.json"
     with target.open("x", encoding="utf-8") as capture_file:
         json.dump(payload, capture_file, indent=2)
         capture_file.write("\n")
+    target.chmod(0o600)

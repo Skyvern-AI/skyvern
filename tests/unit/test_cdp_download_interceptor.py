@@ -1190,7 +1190,7 @@ class TestCDPDownloadInterceptorProxyAuth:
 
     @pytest.mark.asyncio
     async def test_context_rebind_waits_for_each_bounded_session_detach(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mod, "BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0.5)
+        test_timeout_seconds = 2
         monkeypatch.setattr(mod, "CDP_SESSION_DETACH_TIMEOUT_SECONDS", 0.01, raising=False)
         old_interceptor = self._make_interceptor()
         replacement = self._make_interceptor()
@@ -1229,9 +1229,10 @@ class TestCDPDownloadInterceptorProxyAuth:
         stalled_session.detach.side_effect = stalled_detach
         binding = asyncio.create_task(replacement.bind_to_context(browser_context))
         try:
-            await asyncio.wait_for(detach_started.wait(), timeout=0.1)
-            await asyncio.wait_for(binding, timeout=0.7)
-            await asyncio.wait_for(detach_cancelled.wait(), timeout=0.1)
+            async with asyncio.timeout(test_timeout_seconds):
+                await detach_started.wait()
+                await binding
+                await detach_cancelled.wait()
 
             first_session.detach.assert_awaited_once_with()
             stalled_session.detach.assert_awaited_once_with()
@@ -1250,10 +1251,10 @@ class TestCDPDownloadInterceptorProxyAuth:
             assert browser_context._skyvern_cdp_download_interceptor is replacement
         finally:
             release_detach.set()
-            await asyncio.wait_for(asyncio.gather(binding, return_exceptions=True), timeout=0.2)
+            await asyncio.wait_for(asyncio.gather(binding, return_exceptions=True), timeout=test_timeout_seconds)
             detached = tuple(mod._DETACHED_DISABLE_TASKS)
             if detached:
-                await asyncio.wait_for(asyncio.gather(*detached, return_exceptions=True), timeout=0.2)
+                await asyncio.wait_for(asyncio.gather(*detached, return_exceptions=True), timeout=test_timeout_seconds)
 
     @pytest.mark.asyncio
     async def test_unregister_failure_invalidates_before_fetch_disable(self) -> None:

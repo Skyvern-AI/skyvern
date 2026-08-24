@@ -45,6 +45,8 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     RedirectHopAuthorizer,
     authorize_request_hop_once,
 )
+from skyvern.forge.sdk.db.id import UPLOADED_FILE_PREFIX
+from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
     SAFE_REDIRECT_STATUS_CODES,
@@ -55,6 +57,33 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 
 LOG = structlog.get_logger()
+
+_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]+$")
+
+
+def is_uploaded_file_id(value: str) -> bool:
+    """Whether a value names a file uploaded through ``POST /v1/upload_file``.
+
+    Distinguishable from a URL by construction: an id carries no scheme, and ``file_`` is not
+    a parsable URL scheme, so this can never shadow a ``file://`` path.
+    """
+    return bool(_UPLOADED_FILE_ID_PATTERN.match(value.strip()))
+
+
+async def resolve_uploaded_file_id(file_id: str, organization_id: str | None) -> str:
+    """Turn a file id into the storage URI holding its bytes.
+
+    The URI comes from the ``uploaded_files`` row rather than from input, and the org scope is
+    part of the lookup, so a caller can only ever name their own organization's files.
+    """
+    if organization_id is None:
+        raise PermissionError(f"No permission to access file: {file_id}")
+    storage_uri = await uploaded_file_service.resolve_file_reference(
+        file_id=file_id.strip(), organization_id=organization_id
+    )
+    if storage_uri is None:
+        raise FileNotFoundError(f"File not found: {file_id}")
+    return storage_uri
 
 
 def get_file_name_and_suffix_from_headers(headers: CIMultiDictProxy[str] | dict[str, str]) -> tuple[str, str]:
@@ -345,6 +374,11 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
         True if valid, False otherwise.
     """
     try:
+        # A file id resolves to an org-scoped storage URI at download time, and that URI is
+        # re-checked against the org prefix before any bytes are read.
+        if is_uploaded_file_id(url):
+            return organization_id is not None
+
         parsed_url = urlparse(url)
         scheme = parsed_url.scheme.lower()
 
@@ -392,6 +426,11 @@ async def download_file(
 ) -> str:
     if not url or not url.strip():
         raise ValueError("Download URL is empty — no file download was triggered by the browser")
+
+    # Resolved before the try below so a missing or cross-org file id fails loudly instead of
+    # falling through to the HTTP fetch path with an id as the URL.
+    if is_uploaded_file_id(url):
+        url = await resolve_uploaded_file_id(url, organization_id)
 
     requested_url = url
     try:

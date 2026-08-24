@@ -775,8 +775,10 @@ async def test_pairing_approval_clears_flow_but_preserves_operator_rate_limit() 
 
 
 @pytest.mark.asyncio
-async def test_each_client_requires_its_own_one_click_approval() -> None:
+async def test_pairing_grant_approves_connected_clients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server._broker_auth_token = "extension-secret"
     relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
     first = BrokerClient(19777, _ignore_event, auto_spawn=False)
@@ -810,13 +812,12 @@ async def test_each_client_requires_its_own_one_click_approval() -> None:
         )
 
         assert (await first.broker_status())["approved"] is True
-        assert (await second.broker_status())["approved"] is False
+        assert await second.wait_connected(1.0) is True
+        assert (await second.broker_status())["approved"] is True
         first_response = await first.request("tabs.create", {"url": "about:blank"})
         assert first_response["op"] == "tabs.create"
-        assert first_response["args"] == {"url": "about:blank"}
-        with pytest.raises(BrowserExtensionBrokerError) as error_info:
-            await second.request("tabs.create", {"url": "about:blank"})
-        assert error_info.value.code == "APPROVAL_REQUIRED"
+        second_response = await second.request("tabs.create", {"url": "about:blank"})
+        assert second_response["op"] == "tabs.create"
         assert relay.sent_events[-2:] == [
             (
                 "pairing.approved_ack",

@@ -1517,3 +1517,21 @@ async def test_register_tag_value_reuses_soft_deleted_pair(repo: TagsRepository)
 
     assert row is not None
     assert [(v.value, v.color) for v in await repo.list_tag_values(ORG_ID)] == [("prod", "green")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["__untagged__", "__other__"])
+async def test_apply_system_run_tag_changes_rejects_reserved_analytics_values(repo: TagsRepository, value: str) -> None:
+    """System-written run tags reach the same analytics rollup as customer ones, so the
+    reserved bucket markers are refused here too."""
+    await _seed_workflow_run(repo, WRID)
+
+    with pytest.raises(ValueError):
+        await repo.apply_system_run_tag_changes(
+            workflow_run_id=WRID,
+            organization_id=ORG_ID,
+            sets={"skyvern.bucket": value},
+            caller_id="system:foundation",
+        )
+
+    assert await repo.get_active_tag_events_for_run(WRID, ORG_ID) == []

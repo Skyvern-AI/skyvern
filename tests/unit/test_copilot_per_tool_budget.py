@@ -28,7 +28,6 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _per_tool_budget_failure_category,
     _watchdog_user_facing_summary,
 )
-from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 from tests.unit.conftest import make_copilot_context as _fresh_context
 
 _BUDGET_RUN_ID = "wr_1234567890"
@@ -242,7 +241,7 @@ def test_record_run_blocks_keeps_prose_blocker_message_out_of_terminal_challenge
     assert ctx.last_run_outcome is None or ctx.last_run_outcome.reason_code != "terminal_challenge_blocker"
 
 
-def test_record_run_blocks_treats_typed_anti_bot_flag_as_terminal_challenge() -> None:
+def test_record_run_blocks_keeps_typed_anti_bot_flag_as_model_observation() -> None:
     ctx = _fresh_context()
     ctx.workflow_yaml = "workflow_definition: {blocks: []}"
     result = _prose_blocker_run_result()
@@ -260,11 +259,11 @@ def test_record_run_blocks_treats_typed_anti_bot_flag_as_terminal_challenge() ->
     assert categories[1]["evidence_source"] == "artifact"
     assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.turn_halt is None
 
 
-def test_record_run_blocks_treats_structured_browser_access_blocker_as_terminal_challenge() -> None:
+def test_record_run_blocks_keeps_structured_browser_access_blocker_as_model_observation() -> None:
     ctx = _fresh_context()
     ctx.workflow_yaml = "workflow_definition: {blocks: []}"
     result = {
@@ -300,9 +299,8 @@ def test_record_run_blocks_treats_structured_browser_access_blocker_as_terminal_
     assert result["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
     assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.turn_halt is None
 
 
 def test_record_run_blocks_prefers_nested_port_blocker_over_status_shell() -> None:
@@ -338,9 +336,8 @@ def test_record_run_blocks_prefers_nested_port_blocker_over_status_shell() -> No
     assert ctx.last_test_ok is False
     assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert "Requested port" in ctx.turn_halt.extra["evidence_reason"]
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.turn_halt is None
 
 
 def test_record_run_blocks_keyword_only_top_category_is_not_latched() -> None:
@@ -436,8 +433,5 @@ def test_record_run_blocks_combines_status_blocked_with_page_challenge_evidence(
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_failure_category_top == "ANTI_BOT_DETECTION"
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "terminal_challenge_blocker"
-    assert ctx.turn_halt is not None
-    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
-    assert "challenge-gated disabled submit/search control: Search" in ctx.turn_halt.extra["evidence_reason"]
-    assert "Run output reported" in ctx.turn_halt.extra["evidence_reason"]
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
+    assert ctx.turn_halt is None

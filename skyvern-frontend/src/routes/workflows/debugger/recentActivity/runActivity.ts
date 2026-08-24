@@ -43,7 +43,9 @@ export const STATUS_PILL_TONE: Record<RunStatusKind, string> = {
   neutral: "bg-slate-500/15 text-tertiary-foreground",
 };
 
-export function getRunDurationLabel(run: DebugSessionRun): string | null {
+export function getRunDurationLabel(
+  run: Pick<DebugSessionRun, "created_at" | "started_at" | "finished_at">,
+): string | null {
   const begin = run.started_at
     ? toDate(run.started_at, null)
     : run.created_at

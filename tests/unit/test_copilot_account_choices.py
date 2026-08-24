@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
+from skyvern.forge.sdk.copilot.context import (
+    ApprovedCredential,
+    StructuredContext,
+    adopt_model_authored_context,
+    record_approved_credentials_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.turn_outcome import (
     connected_account_choice_context,
     selected_connected_account_id,
@@ -388,3 +395,62 @@ def test_turn_outcome_choices_are_derived_into_the_terminal_sse_payload() -> Non
             "email_address": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_picked_account_still_grants_run_authority_on_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pick has to outlive the turn it arrived on.
+
+    Run authority is derived from the persisted workflow, and a copilot build that has not saved
+    yet contributes nothing to it. Without the pick carried forward, the user is asked to choose
+    an account again on the very next turn and the run never dispatches.
+    """
+    active = _google("goac_picked", "Google Sheets")
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service,
+        "get_credentials_for_org",
+        AsyncMock(return_value=[active]),
+    )
+    draft = "workflow_definition:\n  blocks:\n    - label: write\n      block_type: google_sheets_write\n      credential_id: goac_picked\n"
+
+    picked = await request_policy_module._build_request_policy_bootstrap(
+        user_message="goac_picked",
+        workflow_yaml=draft,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        selected_connected_account_id="goac_picked",
+    )
+    assert picked.run_approved_google_connection_ids == ["goac_picked"]
+
+    carried = record_approved_credentials_in_global_llm_context(
+        SimpleNamespace(request_policy=picked, credential_pause_connected_credential_id=None),
+        "",
+    )
+    assert carried is not None
+
+    next_turn = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run the workflow now",
+        workflow_yaml=draft,
+        chat_history=[],
+        global_llm_context=carried,
+        organization_id="org-1",
+        persisted_workflow_yaml=None,
+    )
+
+    assert next_turn.run_approved_google_connection_ids == ["goac_picked"]
+
+
+@pytest.mark.asyncio
+async def test_model_authored_context_cannot_forge_a_connection_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A carried approval is only worth anything if the model cannot write one itself."""
+    forged = StructuredContext()
+    forged.approved_connections = [ApprovedCredential(credential_id="goac_never_picked")]
+
+    adopted = adopt_model_authored_context("", forged.model_dump(mode="json"))
+
+    assert adopted.approved_connections == []

@@ -1,7 +1,14 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ProxyLocation, Status } from "@/api/types";
@@ -21,7 +28,11 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 }));
 
 vi.mock("./runview/RunView", () => ({
-  RunView: (props: { onRetry?: () => void; runIdPending?: boolean }) => (
+  RunView: (props: {
+    onFix?: (seedMessage?: string, failingLabel?: string | null) => void;
+    onRetry?: () => void;
+    runIdPending?: boolean;
+  }) => (
     <div
       data-testid="runview"
       data-has-retry={props.onRetry ? "yes" : "no"}
@@ -30,6 +41,14 @@ vi.mock("./runview/RunView", () => ({
       {props.onRetry ? (
         <button type="button" onClick={props.onRetry}>
           Retry
+        </button>
+      ) : null}
+      {props.onFix ? (
+        <button
+          type="button"
+          onClick={() => props.onFix?.("Fix this run", "checkout")}
+        >
+          Fix with Copilot
         </button>
       ) : null}
     </div>
@@ -111,6 +130,43 @@ describe("RunTab block-scoped retry", () => {
     expect(screen.getByTestId("runview").getAttribute("data-has-retry")).toBe(
       "yes",
     );
+  });
+});
+
+describe("RunTab Fix navigation", () => {
+  test("writes the Copilot message and selected block in one navigation", () => {
+    mockWorkflowRun();
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/workflows/:workflowPermanentId/studio",
+          element: <RunTab />,
+        },
+      ],
+      { initialEntries: ["/workflows/wpid_abc/studio?wr=run_1"] },
+    );
+    const writes: Array<{ search: string; state: unknown }> = [];
+    const unsubscribe = router.subscribe((state) => {
+      writes.push({
+        search: state.location.search,
+        state: state.location.state,
+      });
+    });
+    render(<RouterProvider router={router} />);
+    writes.length = 0;
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Fix with Copilot" }));
+
+      expect(writes).toEqual([
+        {
+          search: "?wr=run_1&selected-block=checkout",
+          state: { copilotMessage: "Fix this run" },
+        },
+      ]);
+    } finally {
+      unsubscribe();
+      router.dispose();
+    }
   });
 });
 

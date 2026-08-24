@@ -144,7 +144,7 @@ describe("NavigationEditor engine options", () => {
       screen
         .getByTestId("engine-selector")
         .getAttribute("data-available-engines"),
-    ).toBe("skyvern-1.0,openai-cua,anthropic-cua");
+    ).toBe("skyvern-1.0,skyvern-3.0,openai-cua,anthropic-cua");
   });
 
   test("keeps V2 available when editing an existing V2 block", () => {
@@ -156,7 +156,7 @@ describe("NavigationEditor engine options", () => {
       screen
         .getByTestId("engine-selector")
         .getAttribute("data-available-engines"),
-    ).toBe("skyvern-1.0,skyvern-2.0,openai-cua,anthropic-cua");
+    ).toBe("skyvern-1.0,skyvern-2.0,skyvern-3.0,openai-cua,anthropic-cua");
   });
 
   test("keeps V2 available after a remount when a legacy V2 block has switched to V1", () => {
@@ -167,6 +167,6 @@ describe("NavigationEditor engine options", () => {
       screen
         .getByTestId("engine-selector")
         .getAttribute("data-available-engines"),
-    ).toBe("skyvern-1.0,skyvern-2.0,openai-cua,anthropic-cua");
+    ).toBe("skyvern-1.0,skyvern-2.0,skyvern-3.0,openai-cua,anthropic-cua");
   });
 });

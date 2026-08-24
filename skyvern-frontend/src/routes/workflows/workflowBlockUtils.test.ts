@@ -109,6 +109,49 @@ describe("visitWorkflowBlocks", () => {
 
     expect(visited).toEqual(["top", "loop", "nested"]);
   });
+
+  it("follows next_block_label chains so conditional branches precede their merge block", () => {
+    // Editor-serialized order: the top-level chain (conditional → merge) is
+    // emitted first and branch children are appended after it.
+    const branch = (id: string, next_block_label: string) => ({
+      id,
+      criteria: null,
+      next_block_label,
+      description: null,
+      is_default: false,
+    });
+    const blocks = [
+      {
+        ...codeBlock("check", []),
+        block_type: "conditional",
+        next_block_label: "end",
+        branch_conditions: [branch("b1", "if_1"), branch("b2", "else_1")],
+      },
+      { ...codeBlock("end", []), next_block_label: null },
+      { ...codeBlock("if_1", []), next_block_label: "loop" },
+      {
+        ...forLoop("loop", [codeBlock("inside", [])]),
+        next_block_label: "if_2",
+      },
+      { ...codeBlock("if_2", []), next_block_label: "end" },
+      { ...codeBlock("else_1", []), next_block_label: "end" },
+    ] as unknown as Array<WorkflowBlock>;
+    const visited: Array<string> = [];
+
+    visitWorkflowBlocks(blocks, (block) => {
+      visited.push(block.label);
+    });
+
+    expect(visited).toEqual([
+      "check",
+      "if_1",
+      "loop",
+      "inside",
+      "if_2",
+      "else_1",
+      "end",
+    ]);
+  });
 });
 
 describe("getCodeStepPlainText", () => {

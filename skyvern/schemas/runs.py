@@ -42,6 +42,7 @@ from skyvern.schemas.docs.doc_strings import (
     MAX_STEPS_DOC_STRING,
     MODEL_CONFIG,
     PROXY_LOCATION_DOC_STRING,
+    RUN_FILE_IDS_DOC_STRING,
     TASK_ENGINE_DOC_STRING,
     TASK_PROMPT_DOC_STRING,
     TASK_URL_DOC_STRING,
@@ -69,6 +70,7 @@ from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import WebhookUrl, validate_browser_host, validate_url
 
 MAX_SEARCH_FETCH_LIMIT = 1000
+MAX_RUN_ATTACHED_FILES = 50
 _BROWSER_ADDRESS_ADAPTER = TypeAdapter(AnyHttpUrl | WebsocketUrl)
 BROWSER_ADDRESS_SERVER_ASSIGNED_CONTEXT_KEY = "browser_address_is_server_assigned"
 
@@ -223,6 +225,12 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="Whether to run the task with agent or code. Null means use the default.",
         examples=["agent", "code"],
+    )
+    file_ids: list[str] | None = Field(
+        default=None,
+        max_length=MAX_RUN_ATTACHED_FILES,
+        description=RUN_FILE_IDS_DOC_STRING,
+        examples=[["file_123456789"]],
     )
 
     @field_validator("run_with", mode="before")
@@ -396,6 +404,12 @@ class WorkflowRunRequest(BaseModel):
     run_metadata: dict[str, str] | None = Field(
         default=None,
         description="String key/value metadata to attach to this workflow run for analytics tag filtering.",
+    )
+    file_ids: list[str] | None = Field(
+        default=None,
+        max_length=MAX_RUN_ATTACHED_FILES,
+        description=RUN_FILE_IDS_DOC_STRING,
+        examples=[["file_123456789"]],
     )
 
     @field_validator("run_with", mode="before")

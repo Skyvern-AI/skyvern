@@ -251,6 +251,9 @@ class StructuredContext(BaseModel):
     fields_filled: list[FieldFilled] = Field(default_factory=list)
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
     approved_credentials: list[ApprovedCredential] = Field(default_factory=list)
+    # Google connections the user picked from the account card. Separate from approved_credentials
+    # because connections never enter resolved_credentials, which is ADR 0002's password-fill plane.
+    approved_connections: list[ApprovedCredential] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
     page_inspection_calls_made: int = 0
@@ -557,11 +560,21 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     resolved_credentials, never discovered_credentials, so ADR-0002's run/draft split
     holds by construction. A credential a live login page vouched for is left out: its
     evidence is that page, which a later turn has not seen, so it must be re-earned there.
+
+    Google connections are recorded on the same terms but from the account the user picked,
+    since connections never enter resolved_credentials. Without this the pick authorizes only
+    the turn it arrived on, and a workflow that has not yet persisted re-asks every turn.
     """
     policy = ctx.request_policy
-    if policy is None or not policy.resolved_credentials:
+    if policy is None or not (policy.resolved_credentials or policy.selected_connected_account_id):
         return raw_context
     sc = StructuredContext.from_json_str(raw_context)
+    if policy.selected_connected_account_id is not None and policy.selected_connected_account_id not in {
+        record.credential_id for record in sc.approved_connections
+    }:
+        sc.approved_connections.append(ApprovedCredential(credential_id=policy.selected_connected_account_id))
+        if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
+            sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
     existing_ids = {record.credential_id for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
         # A credential the user picked from the card is durable approval even though the resume
@@ -585,7 +598,8 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     Approval is recorded only from server-resolved credentials; an entry the model
     supplied would be promoted into `resolved_credentials` on the next turn and clear
     the unapproved-credential gate for a credential the user never named. Membership
-    of the org is not evidence the user named it.
+    of the org is not evidence the user named it. `approved_connections` is server-owned
+    for the same reason: a model-authored entry would grant its own draft a run.
 
     `carried_trajectory` is the record of what the browser was observed doing, so an
     entry the model wrote would enter the factual record as an observation nothing made.
@@ -603,6 +617,7 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     elif isinstance(model_raw, str):
         structured = StructuredContext.from_json_str(model_raw)
     structured.approved_credentials = list(trusted.approved_credentials)
+    structured.approved_connections = list(trusted.approved_connections)
     structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
     return structured
 
@@ -684,6 +699,7 @@ class CopilotContext(AgentContext):
     """
 
     workflow_copilot_chat_id: str | None = None
+    eval_capture_case_id: str | None = None
 
     # Enforcement state
     navigate_called: bool = False
@@ -703,6 +719,7 @@ class CopilotContext(AgentContext):
     copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     target_block_label: str | None = None
+    selected_block_label: str | None = None
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
@@ -725,7 +742,6 @@ class CopilotContext(AgentContext):
     google_connection_turn_start_workflow_yaml: str | None = field(init=False, default=None)
     google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
-    google_connection_notice_capture_written: bool = False
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -875,18 +891,12 @@ class CopilotContext(AgentContext):
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
 
-    # Block types the workflow already carried when the turn opened. Tools reassign
-    # ``workflow_yaml`` mid-turn, so this must never be recomputed from it.
-    code_only_settled_block_types: frozenset[str] = field(init=False, default=frozenset())
-
     def __post_init__(self) -> None:
         parent_post_init = getattr(super(), "__post_init__", None)
         if callable(parent_post_init):
             parent_post_init()
         from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-        from skyvern.forge.sdk.copilot.tools.banned_blocks import _extract_existing_code_only_pending_block_types
 
-        self.code_only_settled_block_types = _extract_existing_code_only_pending_block_types(self.workflow_yaml)
         self.google_connection_turn_start_workflow_yaml = self.workflow_yaml
 
         if isinstance(self.last_run_outcome, RecordedRunOutcome):

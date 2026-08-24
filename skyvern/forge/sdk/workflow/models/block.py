@@ -1321,6 +1321,11 @@ class BaseTaskBlock(Block):
     include_action_history_in_verification: bool = False
     download_timeout: float | None = None  # minutes
     include_extracted_text: bool = True
+    _data_extraction_goal_is_prerendered: bool = PrivateAttr(default=False)
+
+    def mark_data_extraction_goal_prerendered(self) -> None:
+        self._data_extraction_goal_is_prerendered = True
+
     # Blocks built at runtime for internal machinery (loop-value and branch-condition extraction)
     # are not part of the workflow definition, so the run-level engine A/B never saw them and must
     # not reroute them. Private so an internal experiment toggle stays out of the published block
@@ -1402,7 +1407,7 @@ class BaseTaskBlock(Block):
                 self.navigation_goal, workflow_run_context
             )
 
-        if self.data_extraction_goal:
+        if self.data_extraction_goal and not self._data_extraction_goal_is_prerendered:
             self.data_extraction_goal = self.format_block_parameter_template_from_workflow_run_context(
                 self.data_extraction_goal, workflow_run_context
             )
@@ -13088,6 +13093,27 @@ class PrintPageBlock(Block):
         )
 
 
+# A `{` opening a Jinja delimiter ({{, {%, {#) and a `}` closing one (}}, %}, #}). Splitting on
+# single characters (instead of replacing two-character delimiters) guarantees runs like `{{{`
+# cannot re-form a delimiter after substitution.
+_JINJA_DELIMITER_OPENER_RE = re.compile(r"\{(?=[{%#])")
+_JINJA_DELIMITER_CLOSER_RE = re.compile(r"(?<=[}%#])\}")
+
+
+def _neutralize_jinja_delimiters(value: Any) -> Any:
+    """Space out Jinja delimiters in strings (`{{` -> `{ {`) so stored raw expressions stay
+    readable for the LLM but can never execute in a downstream template render (SKY-14080)."""
+    if isinstance(value, str):
+        return _JINJA_DELIMITER_CLOSER_RE.sub(" }", _JINJA_DELIMITER_OPENER_RE.sub("{ ", value))
+    if isinstance(value, dict):
+        # Keys are left as-is: neutralization is not injective, so rewriting keys can collapse two
+        # distinct keys into one and silently drop a value.
+        return {key: _neutralize_jinja_delimiters(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_neutralize_jinja_delimiters(item) for item in value]
+    return value
+
+
 class BranchEvaluationContext:
     """Collection of runtime data that BranchCriteria evaluators can consume."""
 
@@ -13160,7 +13186,9 @@ class BranchEvaluationContext:
         # Mask any real secret values that may have leaked into values
         snapshot = ctx.mask_secrets_in_data(snapshot)
 
-        return snapshot
+        # Stored block outputs can carry raw `{{...}}` expressions; a live delimiter here would
+        # inject into any later Jinja render of a prompt that embeds this snapshot.
+        return _neutralize_jinja_delimiters(snapshot)
 
     def _declared_parameter_keys(self) -> list[str]:
         ctx = self.workflow_run_context
@@ -14020,6 +14048,9 @@ async def _evaluate_prompt_branch_conditions_batch(
             data_schema=data_schema,
             output_parameter=output_param,
         )
+        # The goal was fully rendered above; a second Jinja pass would resolve any `{{...}}` text
+        # inlined from stored block outputs against the synthetic block's scope and fail (SKY-14080).
+        extraction_block.mark_data_extraction_goal_prerendered()
         extraction_block._exclude_from_engine_ab = True
 
         LOG.info(
@@ -14203,7 +14234,10 @@ class ConditionalBlock(Block):
         )
 
         matched_branch = None
-        failure_reason: str | None = None
+        # A branch whose evaluation raised is treated as non-matching rather than as a stop signal,
+        # so an unevaluated later branch can still win. The first error is kept for reporting.
+        prompt_batch_error: str | None = None
+        first_evaluation_error: str | None = None
 
         # Track all branch evaluations for UI display
         branch_evaluations_list: list[dict] = []
@@ -14238,9 +14272,9 @@ class ConditionalBlock(Block):
                     for branch, rendered in zip(natural_language_branches, prompt_rendered_expressions, strict=False)
                 }
             except BranchEvaluationContextTooLargeError as exc:
-                failure_reason = get_user_facing_exception_message(exc)
+                prompt_batch_error = get_user_facing_exception_message(exc)
             except Exception as exc:
-                failure_reason = f"Failed to evaluate natural language branches: {str(exc)}"
+                prompt_batch_error = f"Failed to evaluate natural language branches: {str(exc)}"
                 LOG.error(
                     "Failed to evaluate natural language branches",
                     block_label=self.label,
@@ -14269,16 +14303,18 @@ class ConditionalBlock(Block):
                 continue
 
             if branch.criteria.criteria_type == "prompt":
-                if failure_reason:
-                    branch_eval["error"] = failure_reason
+                if prompt_batch_error:
+                    branch_eval["error"] = prompt_batch_error
                     branch_evaluations_list.append(branch_eval)
-                    break
+                    if first_evaluation_error is None:
+                        first_evaluation_error = prompt_batch_error
+                    continue
                 prompt_result = prompt_results_by_id.get(branch.id)
                 rendered_expr = prompt_rendered_by_id.get(branch.id)
                 branch_eval["rendered_expression"] = rendered_expr
                 if prompt_result is None:
-                    failure_reason = "Missing result for natural language branch evaluation"
-                    branch_eval["error"] = failure_reason
+                    missing_result_error = "Missing result for natural language branch evaluation"
+                    branch_eval["error"] = missing_result_error
                     LOG.error(
                         "Missing prompt evaluation result",
                         block_label=self.label,
@@ -14286,7 +14322,9 @@ class ConditionalBlock(Block):
                         branch_id=branch.id,
                     )
                     branch_evaluations_list.append(branch_eval)
-                    break
+                    if first_evaluation_error is None:
+                        first_evaluation_error = missing_result_error
+                    continue
                 branch_eval["result"] = prompt_result
                 branch_evaluations_list.append(branch_eval)
                 if prompt_result:
@@ -14328,7 +14366,8 @@ class ConditionalBlock(Block):
                     )
                     break
             except Exception as exc:
-                failure_reason = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
+                if first_evaluation_error is None:
+                    first_evaluation_error = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
                 branch_eval["error"] = str(exc)
                 branch_eval["result"] = None
                 branch_evaluations_list.append(branch_eval)
@@ -14339,16 +14378,33 @@ class ConditionalBlock(Block):
                     error=str(exc),
                     exc_info=True,
                 )
-                break
+                continue
 
-        if matched_branch is None and failure_reason is None:
+        failure_reason: str | None = None
+        evaluation_error: str | None = None
+
+        if matched_branch is None:
             matched_branch = self.get_default_branch()
-            # Update is_matched for default branch in evaluations
-            if matched_branch:
+            if matched_branch is not None:
                 for eval_entry in branch_evaluations_list:
                     if eval_entry["branch_id"] == matched_branch.id:
                         eval_entry["is_matched"] = True
                         break
+            elif first_evaluation_error is not None:
+                failure_reason = first_evaluation_error
+
+        if matched_branch is not None and first_evaluation_error is not None:
+            # Routed despite a branch that could not be evaluated: the taken branch may not be the
+            # one the author's ordering intended, so surface the error alongside the route.
+            evaluation_error = first_evaluation_error
+            LOG.warning(
+                "Conditional block routed despite a failed branch evaluation",
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                evaluation_error=evaluation_error,
+                next_block_label=matched_branch.next_block_label,
+                took_default_branch=matched_branch.is_default,
+            )
 
         matched_index = self.ordered_branches.index(matched_branch) if matched_branch in self.ordered_branches else None
         next_block_label = matched_branch.next_block_label if matched_branch else None
@@ -14397,6 +14453,8 @@ class ConditionalBlock(Block):
                 else prompt_extraction_goal
             ),
         }
+        if evaluation_error is not None:
+            branch_metadata["evaluation_error"] = evaluation_error
 
         status = BlockStatus.completed
         success = True
@@ -15017,6 +15075,9 @@ def run_is_eligible_for_v3_ab(blocks: list[BlockTypeVar], *, is_script_run: bool
             return False
         if not _task_block_supports_v3(block):
             return False
+        # A/B rerouting never admits a run with a verification-URL block (a block explicitly pinned to
+        # v3 is honored as requested); bare tasks with a verification URL are rerouted. Block-run
+        # code/budget dynamics are unmeasured (SKY-14816).
         if block.totp_verification_url:
             return False
         reroutable_blocks += 1

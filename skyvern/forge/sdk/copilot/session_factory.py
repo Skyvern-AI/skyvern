@@ -33,10 +33,16 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_output,
     aggressive_prune,
     estimate_tokens,
+    is_paired_observation_message,
     is_screenshot_message,
     is_synthetic_user_message,
     log_recent_tool_output_truncation,
     pending_screenshot_message,
+)
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    PendingFrameLease,
+    ScreenshotActionRelation,
+    model_input_fingerprint,
 )
 
 LOG = structlog.get_logger()
@@ -123,12 +129,21 @@ def copilot_session_input_callback(
     # The newest frame must survive the merge: with every injected message classified
     # synthetic, the whole post-goal history is middle, and blanket-replacing would
     # blind the agent to the frame it just captured once it rotates into history.
-    middle_screenshots = [i for i, item in enumerate(pruned_middle) if _screenshot_with_image(item)]
+    trailing_items = list(recent) + list(new_items)
+    stale_paired_screenshots = {
+        i
+        for i, item in enumerate(pruned_middle)
+        if is_paired_observation_message(item)
+        and any(not is_synthetic_user_message(following) for following in list(pruned_middle[i + 1 :]) + trailing_items)
+    }
+    middle_screenshots = [
+        i for i, item in enumerate(pruned_middle) if _screenshot_with_image(item) and i not in stale_paired_screenshots
+    ]
     has_newer_screenshot = any(_screenshot_with_image(item) for item in list(recent) + list(new_items))
     keep_screenshot = middle_screenshots[-1] if middle_screenshots and not has_newer_screenshot else None
     pruned_middle = [
         {"role": "user", "content": SCREENSHOT_PLACEHOLDER}
-        if is_screenshot_message(item) and i != keep_screenshot
+        if is_screenshot_message(item) and (i != keep_screenshot or i in stale_paired_screenshots)
         else item
         for i, item in enumerate(pruned_middle)
     ]
@@ -158,9 +173,36 @@ def _run_context(data: CallModelData[Any]) -> Any:
 
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
     items = list(data.model_data.input)
+    ctx = _run_context(data)
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
-    screenshot_msg = pending_screenshot_message(_run_context(data))
+    screenshot_msg = pending_screenshot_message(ctx)
+    pending = getattr(ctx, "pending_screenshots", None)
+    entry = pending[0] if isinstance(pending, list) and pending else None
+    if (
+        screenshot_msg is not None
+        and entry is not None
+        and entry.provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+    ):
+        fingerprint = model_input_fingerprint(items)
+        lease = getattr(ctx, "pending_frame_lease", None)
+        if isinstance(lease, PendingFrameLease) and lease.capture_event_id == entry.capture_event_id:
+            if lease.input_fingerprint != fingerprint:
+                if isinstance(pending, list):
+                    pending.clear()
+                ctx.pending_frame_lease = None
+                screenshot_msg = None
+                LOG.info(
+                    "copilot_frame_lease_invalidated",
+                    capture_id=entry.capture_id,
+                    input_fingerprint=fingerprint[:12],
+                )
+        else:
+            ctx.pending_frame_lease = PendingFrameLease(
+                capture_event_id=entry.capture_event_id,
+                capture_id=entry.capture_id,
+                input_fingerprint=fingerprint,
+            )
     if screenshot_msg is not None:
         LOG.info(
             "Injecting screenshot user message",
@@ -212,6 +254,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
         target = Path(dump_dir)
         target.mkdir(parents=True, exist_ok=True)
         payload = {
+            "capture_case_id": getattr(ctx, "eval_capture_case_id", None),
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,

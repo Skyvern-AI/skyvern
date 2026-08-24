@@ -19,6 +19,8 @@ interface UseCdpInputOptions {
   interactive: boolean;
   viewportWidth: number;
   viewportHeight: number;
+  onClipboardPaste?: (text: string) => void;
+  onClipboardCopy?: () => void;
 }
 
 interface UseCdpInputReturn {
@@ -56,6 +58,8 @@ export function useCdpInput({
   interactive,
   viewportWidth,
   viewportHeight,
+  onClipboardPaste,
+  onClipboardCopy,
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
@@ -73,6 +77,19 @@ export function useCdpInput({
   const inputReconnectAttemptsRef = useRef(0);
   const inputStoppedRef = useRef(false);
   const inputEventCountRef = useRef(0);
+  const wheelAccumulatorRef = useRef<{
+    deltaX: number;
+    deltaY: number;
+    x: number;
+    y: number;
+    modifiers: number;
+  } | null>(null);
+  const wheelAnimationFrameRef = useRef<number | null>(null);
+  const interceptedClipboardKeysRef = useRef(new Set<string>());
+  const onClipboardPasteRef = useRef(onClipboardPaste);
+  const onClipboardCopyRef = useRef(onClipboardCopy);
+  onClipboardPasteRef.current = onClipboardPaste;
+  onClipboardCopyRef.current = onClipboardCopy;
 
   useEffect(() => {
     if (!interactive || !inputWsUrl) return;
@@ -213,6 +230,29 @@ export function useCdpInput({
     const el = containerRef.current;
     if (!el) return;
 
+    const flushWheelEvents = () => {
+      wheelAnimationFrameRef.current = null;
+      const event = wheelAccumulatorRef.current;
+      wheelAccumulatorRef.current = null;
+      const ws = inputSocketRef.current;
+      if (
+        event &&
+        (event.deltaX !== 0 || event.deltaY !== 0) &&
+        ws?.readyState === WebSocket.OPEN
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: "wheelEvent",
+            x: event.x,
+            y: event.y,
+            deltaX: Math.round(event.deltaX),
+            deltaY: Math.round(event.deltaY),
+            modifiers: event.modifiers,
+          }),
+        );
+      }
+    };
+
     const handler = (e: WheelEvent) => {
       e.preventDefault();
       const ws = inputSocketRef.current;
@@ -231,20 +271,29 @@ export function useCdpInput({
       );
       if (!coords) return;
 
-      ws.send(
-        JSON.stringify({
-          type: "wheelEvent",
-          x: coords.x,
-          y: coords.y,
-          deltaX: Math.round(e.deltaX),
-          deltaY: Math.round(e.deltaY),
-          modifiers: getModifiers(e),
-        }),
-      );
+      const accumulated = wheelAccumulatorRef.current;
+      wheelAccumulatorRef.current = {
+        deltaX: (accumulated?.deltaX ?? 0) + e.deltaX,
+        deltaY: (accumulated?.deltaY ?? 0) + e.deltaY,
+        x: coords.x,
+        y: coords.y,
+        modifiers: getModifiers(e),
+      };
+      if (accumulated === null) {
+        wheelAnimationFrameRef.current =
+          requestAnimationFrame(flushWheelEvents);
+      }
     };
 
     el.addEventListener("wheel", handler, { passive: false });
-    return () => el.removeEventListener("wheel", handler);
+    return () => {
+      el.removeEventListener("wheel", handler);
+      if (wheelAnimationFrameRef.current !== null) {
+        cancelAnimationFrame(wheelAnimationFrameRef.current);
+        wheelAnimationFrameRef.current = null;
+      }
+      wheelAccumulatorRef.current = null;
+    };
   }, [interactive, userIsControlling, viewportWidth, viewportHeight]);
 
   const sendInputEvent = useCallback((payload: Record<string, unknown>) => {
@@ -346,6 +395,27 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
+      const clipboardModifier = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+      if (clipboardModifier && key === "v" && onClipboardPasteRef.current) {
+        interceptedClipboardKeysRef.current.add(e.code);
+        if (!navigator.clipboard) {
+          console.warn("Clipboard API not available.");
+          return;
+        }
+        navigator.clipboard
+          .readText()
+          .then((text) => onClipboardPasteRef.current?.(text))
+          .catch((error) => {
+            console.error("Failed to read clipboard contents:", error);
+          });
+        return;
+      }
+      if (clipboardModifier && key === "c" && onClipboardCopyRef.current) {
+        interceptedClipboardKeysRef.current.add(e.code);
+        onClipboardCopyRef.current();
+        return;
+      }
       const isPrintable = e.key.length === 1;
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
       const payload: Record<string, unknown> = {
@@ -368,6 +438,9 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
+      if (interceptedClipboardKeysRef.current.delete(e.code)) {
+        return;
+      }
       const windowsVirtualKeyCode = virtualKeyCodeFor(e);
       const payload: Record<string, unknown> = {
         type: "keyEvent",

@@ -36,7 +36,6 @@ import { cn } from "@/util/utils";
 import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
 import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
-import { PaneHeaderDivider } from "../PaneHeaderDivider";
 import { runOutcomeFromStatus } from "../runProjections";
 import { studioPanelId } from "../constants";
 import { useStudioPaneCompact } from "../StudioShellContext";
@@ -108,7 +107,6 @@ export function RunPaneViewToggles() {
 
   return (
     <>
-      <PaneHeaderDivider />
       <div
         role="group"
         aria-label="Run view"
@@ -144,10 +142,10 @@ export function RunPaneViewToggles() {
                   aria-label="More views"
                   aria-pressed={view === "code"}
                   className={cn(
-                    "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
+                    "inline-flex h-7 items-center gap-1.5 rounded-md px-1.5 text-xs font-medium",
                     "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
                     view === "code"
-                      ? "bg-accent text-foreground"
+                      ? "bg-foreground text-background"
                       : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
                   )}
                 >
@@ -173,7 +171,7 @@ export function RunPaneViewToggles() {
           <DropdownMenuContent align="start" sideOffset={6} className="min-w-0">
             <DropdownMenuItem
               onSelect={() => setView("code")}
-              className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-[11px] font-medium text-muted-foreground focus:text-foreground"
+              className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-xs font-medium text-muted-foreground focus:text-foreground"
             >
               <CodeIcon className="h-3 w-3" />
               Code
@@ -187,8 +185,10 @@ export function RunPaneViewToggles() {
               <button
                 type="button"
                 onClick={focusBrowserPane}
-                aria-label="Live"
-                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                // Names the handoff, not the state: the Browser pane's Live
+                // *view* toggle already answers to "Live".
+                aria-label="Watch live in the Browser pane"
+                className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
                 {compact ? null : "Live"}
@@ -241,8 +241,8 @@ export function RunPaneActions() {
             type="button"
             aria-label="API & Webhooks"
             className={cn(
-              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md text-[11px] font-medium",
-              compact ? "w-7 justify-center px-0" : "px-2",
+              "inline-flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md text-xs font-medium",
+              compact ? "w-7 justify-center px-0" : "px-1.5",
               "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
               "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
             )}

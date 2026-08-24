@@ -19,7 +19,12 @@ from playwright._impl._errors import Error as PlaywrightError
 from playwright.async_api import ElementHandle, Frame, Locator, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
-from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed, SkyvernPageAnalysisTimeout
+from skyvern.exceptions import (
+    ElementTreeBuildFailed,
+    FailedToTakeScreenshot,
+    ScreenshotTargetClosed,
+    SkyvernPageAnalysisTimeout,
+)
 from skyvern.forge.sdk.browser_action_preflight import policy_observation_enabled, record_observed_tabs
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -30,6 +35,7 @@ from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_health import BrowserOperation
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
+from skyvern.webeye.navigation import redact_url_secrets
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
@@ -210,6 +216,27 @@ _JS_TOP_LEVEL_DECL_RE = re.compile(
 )
 
 
+def _as_element_tree_pair(result: Any) -> tuple[list[dict], list[dict]] | None:
+    """The ``[elements, element_tree]`` pair a domUtils tree builder returns, or None if it didn't.
+
+    Every builder in domUtils.js returns two lists or throws, so anything else means the JS that ran
+    was not the injected bundle -- the execution context was replaced without an error reaching us,
+    or the export was shadowed. Unpacking it blindly turns that into a bare TypeError at the
+    assignment, which names neither the frame nor what came back. Both entries have to be lists:
+    ``pop_destination_facts`` treats a non-list as empty, so a pair like ``[None, None]`` would
+    otherwise reach callers as a successful build of a page with no elements.
+    """
+    if isinstance(result, (list, tuple)) and len(result) == 2 and all(isinstance(part, list) for part in result):
+        return result[0], result[1]
+    return None
+
+
+def _describe_non_pair(result: Any) -> str:
+    if isinstance(result, (list, tuple)):
+        return f"{type(result).__name__} of {len(result)}: {[type(item).__name__ for item in result[:2]]}"
+    return type(result).__name__
+
+
 def _wrap_js_in_isolated_scope(script: str) -> str:
     # page.evaluate runs string scripts through a sloppy indirect eval, which hoists
     # top-level declarations into the page's global scope and throws
@@ -372,6 +399,32 @@ class ScreenshotMode(StrEnum):
     DETAILED = "detailed"
 
 
+async def _restore_invalid_viewport_before_screenshot(page: Page) -> None:
+    viewport = page.viewport_size
+    if not isinstance(viewport, dict):
+        return
+
+    width = viewport.get("width")
+    height = viewport.get("height")
+    if not (isinstance(width, int) and isinstance(height, int)) or (width > 0 and height > 0):
+        return
+
+    settings = SettingsManager.get_settings()
+    restored_viewport = {
+        "width": width if width > 0 else settings.BROWSER_WIDTH,
+        "height": height if height > 0 else settings.BROWSER_HEIGHT,
+    }
+    if restored_viewport["width"] <= 0 or restored_viewport["height"] <= 0:
+        return
+
+    LOG.warning(
+        "Restoring invalid page viewport before screenshot",
+        viewport=viewport,
+        restored_viewport=restored_viewport,
+    )
+    await page.set_viewport_size(restored_viewport)
+
+
 async def _page_screenshot_helper(
     page: Page,
     file_path: str | None = None,
@@ -379,6 +432,7 @@ async def _page_screenshot_helper(
     timeout: float = SettingsManager.get_settings().BROWSER_SCREENSHOT_TIMEOUT_MS,
     engine_selection: BrowserEngineSelection | None = None,
 ) -> bytes:
+    await _restore_invalid_viewport_before_screenshot(page)
     if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
         try:
             await SkyvernFrame.hide_cursor_overlay(page)
@@ -1117,6 +1171,7 @@ class SkyvernFrame:
         engine_selection: BrowserEngineSelection | None = None,
         *,
         force_cdp: bool = False,
+        deadline: float | None = None,
     ) -> Any:
         async def evaluate_expression() -> Any:
             return await _dispatch_evaluate(frame, expression, arg, force_cdp=force_cdp)
@@ -1127,6 +1182,7 @@ class SkyvernFrame:
             evaluate_expression=evaluate_expression,
             timeout_ms=timeout_ms,
             engine_selection=engine_selection,
+            **({"deadline": deadline} if deadline is not None else {}),
         )
 
     @staticmethod
@@ -1136,9 +1192,12 @@ class SkyvernFrame:
         evaluate_expression: Callable[[], Awaitable[Any]],
         timeout_ms: float,
         engine_selection: BrowserEngineSelection | None = None,
+        deadline: float | None = None,
     ) -> Any:
+        loop = asyncio.get_running_loop()
+        deadline = deadline if deadline is not None else loop.time() + timeout_ms / 1000
         try:
-            async with asyncio.timeout(timeout_ms / 1000):
+            async with asyncio.timeout_at(deadline):
                 result = await evaluate_expression()
         except asyncio.TimeoutError as error:
             skyvern_context.record_browser_timeout(BrowserOperation.EVALUATE)
@@ -1159,6 +1218,7 @@ class SkyvernFrame:
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
                 engine_selection=engine_selection,
+                deadline=deadline,
             )
         except Exception as e:
             # A driver-native error from THIS run's engine (stock Playwright when no engine is
@@ -1176,6 +1236,7 @@ class SkyvernFrame:
                 timeout_ms=timeout_ms,
                 initial_error=error_msg,
                 engine_selection=engine_selection,
+                deadline=deadline,
             )
         skyvern_context.record_browser_success()
         return result
@@ -1188,6 +1249,7 @@ class SkyvernFrame:
         timeout_ms: float,
         initial_error: str,
         engine_selection: BrowserEngineSelection | None = None,
+        deadline: float | None = None,
     ) -> Any:
         # Multi-hop SSO/OIDC flows (especially response_mode=form_post) can destroy
         # the JS execution context several times in a row as the page auto-submits
@@ -1196,7 +1258,8 @@ class SkyvernFrame:
         # deadline so retries can't compound into many multiples of timeout_ms.
         per_attempt_seconds = timeout_ms / 1000
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + per_attempt_seconds * _NAVIGATION_RECOVERY_MAX_ATTEMPTS
+        if deadline is None:
+            deadline = loop.time() + per_attempt_seconds * _NAVIGATION_RECOVERY_MAX_ATTEMPTS
 
         def _remaining_seconds() -> float:
             return max(0.0, deadline - loop.time())
@@ -1881,7 +1944,12 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, engine_selection=self.engine_selection, expression=js_script)
 
-    async def _set_enriched_element_tree_flag(self) -> None:
+    async def _set_enriched_element_tree_flag(
+        self,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         context = skyvern_context.current()
         enriched_enabled = bool(context and context.enriched_tree_enabled())
         await self.evaluate(
@@ -1889,6 +1957,8 @@ class SkyvernFrame:
             engine_selection=self.engine_selection,
             expression="([enabled]) => { window.GlobalEnableEnrichedElementTree = enabled; }",
             arg=[enriched_enabled],
+            timeout_ms=timeout_ms,
+            deadline=deadline,
         )
 
     @traced(name="skyvern.browser.element_tree_from_body")
@@ -1900,7 +1970,6 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict], dict[str, dict]]:
         must_included_tags = must_included_tags or []
-        await self._set_enriched_element_tree_flag()
         # Capture is flag-gated so a disabled-mode build does no destination-fact work on any page
         # that has not interposed on the builder global; a page that has can still force the flag,
         # and the per-build budget in domUtils is what bounds that. The strip below stays
@@ -1908,13 +1977,50 @@ class SkyvernFrame:
         # cost.
         capture_destination_facts = policy_observation_enabled()
         js_script = "async ([frame_name, frame_index, must_included_tags, capture_destination_facts]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags, capture_destination_facts)"
-        elements, element_tree = await self.evaluate(
-            frame=self.frame,
-            engine_selection=self.engine_selection,
-            expression=js_script,
-            timeout_ms=timeout_ms,
-            arg=[frame_name, frame_index, must_included_tags, capture_destination_facts],
-        )
+
+        # One monotonic budget across the flag write, both build attempts and the re-injection
+        # between them -- as _evaluate_with_navigation_recovery does -- so the retry cannot double
+        # what a stuck frame costs. A step that starts with nothing left times out immediately,
+        # which is the SkyvernPageAnalysisTimeout the un-retried build already raised.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_ms / 1000
+
+        def remaining_ms() -> float:
+            return max(0.0, (deadline - loop.time()) * 1000)
+
+        async def build() -> Any:
+            await self._set_enriched_element_tree_flag(timeout_ms=remaining_ms(), deadline=deadline)
+            return await self.evaluate(
+                frame=self.frame,
+                engine_selection=self.engine_selection,
+                expression=js_script,
+                timeout_ms=remaining_ms(),
+                arg=[frame_name, frame_index, must_included_tags, capture_destination_facts],
+                deadline=deadline,
+            )
+
+        tree = _as_element_tree_pair(await build())
+        if tree is None:
+            # Callers scraping an iframe swallow a raise here and drop the whole frame from the tree,
+            # so spend one re-injection before giving up: a silent non-pair is the same lost JS world
+            # the raised-ReferenceError path already recovers from, minus an error to key on.
+            LOG.warning(
+                "Element tree builder returned no tree, re-injecting domUtils.js and retrying",
+                url=redact_url_secrets(self.frame.url),
+            )
+            await self.evaluate(
+                frame=self.frame,
+                engine_selection=self.engine_selection,
+                expression=JS_FUNCTION_DEFS,
+                timeout_ms=remaining_ms(),
+                deadline=deadline,
+            )
+            retried = await build()
+            tree = _as_element_tree_pair(retried)
+            if tree is None:
+                raise ElementTreeBuildFailed(returned=_describe_non_pair(retried))
+
+        elements, element_tree = tree
         destinations = pop_destination_facts(elements)
         destinations.update(pop_destination_facts(element_tree))
         return elements, element_tree, destinations
@@ -1927,13 +2033,22 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
-        elements, element_tree = await self.evaluate(
+        result = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
             expression=js_script,
             timeout_ms=timeout_ms,
             arg=[wait_until_finished],
         )
+        # No re-injection retry here, unlike build_tree_from_body: that one rebuilds from the live
+        # DOM so a fresh JS world still answers correctly, while this one reports mutations an
+        # earlier startGlobalIncrementalObserver accumulated, and a world that lost them answers
+        # [[], []] -- "nothing appeared" -- rather than raising. A world that still has them
+        # re-answers identically, so the retry buys nothing either way.
+        tree = _as_element_tree_pair(result)
+        if tree is None:
+            raise ElementTreeBuildFailed(returned=_describe_non_pair(result))
+        elements, element_tree = tree
         pop_destination_facts(elements)
         pop_destination_facts(element_tree)
         return elements, element_tree
@@ -1948,13 +2063,17 @@ class SkyvernFrame:
     ) -> tuple[list[dict], list[dict]]:
         await self._set_enriched_element_tree_flag()
         js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
-        elements, element_tree = await self.evaluate(
+        result = await self.evaluate(
             frame=self.frame,
             engine_selection=self.engine_selection,
             expression=js_script,
             timeout_ms=timeout_ms,
             arg=[starter, frame, full_tree],
         )
+        tree = _as_element_tree_pair(result)
+        if tree is None:
+            raise ElementTreeBuildFailed(returned=_describe_non_pair(result))
+        elements, element_tree = tree
         pop_destination_facts(elements)
         pop_destination_facts(element_tree)
         return elements, element_tree

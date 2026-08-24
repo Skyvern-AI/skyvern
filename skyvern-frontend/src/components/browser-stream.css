@@ -21,6 +21,10 @@
   cursor: not-allowed;
 }
 
+.browser-stream .overlay.can-take-control {
+  cursor: pointer;
+}
+
 .browser-stream.user-is-controlling .overlay {
   pointer-events: none;
   cursor: unset;

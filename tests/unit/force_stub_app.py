@@ -42,6 +42,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.should_use_codeblock_runner = AsyncMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
+    # and break every caller that scans it for close-page phrases.
+    fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values

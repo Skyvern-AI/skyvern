@@ -16,30 +16,27 @@ from skyvern.forge.sdk.copilot.tools import (
     update_workflow_tool,
 )
 
-_AGENT_TEMPLATE_DEFAULTS = dict(
-    workflow_knowledge_base="test kb",
-    current_datetime="2026-01-01T00:00:00Z",
-    tool_usage_guide="",
-    security_rules="",
-)
+_AGENT_TEMPLATE_DEFAULTS = {
+    "workflow_knowledge_base": "test kb",
+    "current_datetime": "2026-01-01T00:00:00Z",
+    "tool_usage_guide": "",
+    "security_rules": "",
+}
 
 
 def _render_agent_prompt() -> str:
     return prompt_engine.load_prompt("workflow-copilot-agent", **_AGENT_TEMPLATE_DEFAULTS)
 
 
-def test_agent_prompt_frames_inspection_as_build_time_context_not_workflow_shape_policy() -> None:
+def test_agent_prompt_keeps_page_evidence_in_the_build_and_repair_loop() -> None:
     rendered = _render_agent_prompt()
 
-    assert "PAGE EVIDENCE POLICY" in rendered
-    assert "gather ground-truth evidence in ANY phase of building" in rendered
-    assert "exploring, composing, editing, and repairing after a failed block run" in rendered
-    assert "not adding defensive verification blocks for every website shape" in rendered
-    assert "Do not invent website-specific paths, query parameters, form fields" in rendered
-    assert (
-        "Add `validation` blocks only when the reusable workflow's task actually includes a durable check" in rendered
-    )
-    assert "before each action" in rendered
+    assert "Driving a browser — navigating, inspecting, or extracting on request" in rendered
+    assert "inspect the resulting page and run evidence before deciding what to change" in rendered
+    assert "preserve known-good blocks" in rendered
+    assert "retry unchanged only when fresh evidence shows the action did not land" in rendered
+    assert "A page challenge (CAPTCHA, anti-bot wall) is an observation, not a verdict" in rendered
+    assert "PAGE EVIDENCE POLICY" not in rendered
     assert "GOTO_URL STATE SHORTCUT POLICY" not in rendered
     assert "Before extraction on stateful search/result tasks" not in rendered
 
@@ -73,7 +70,8 @@ def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> Non
 def test_agent_prompt_directs_past_redundant_output_schema_confirmation() -> None:
     rendered = _render_agent_prompt()
 
-    assert "instead of asking the user to confirm output fields or schema" in rendered
+    assert "Everything else you decide: choose the sensible default, act on it" in rendered
+    assert "If your question states what you would do, you are not blocked" in rendered
 
 
 def test_block_observation_ref_rejects_negative_steps() -> None:

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ChevronDownIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -12,8 +13,8 @@ import { ControlTooltip } from "./ControlTooltip";
 import { PastRunsList } from "./PastRunsList";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
 import {
-  DELETED_WORKFLOW_BLOCKED_PANES,
   STUDIO_PANE_IDS,
+  WORKFLOW_AUTHORING_PANES,
   type StudioPaneId,
 } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
@@ -54,7 +55,7 @@ export function StudioStageLauncher() {
             const { icon: Icon } = STUDIO_PANE_META[id];
             const label = railLabel(id);
             const blockedByDeletion =
-              workflowDeleted && DELETED_WORKFLOW_BLOCKED_PANES.includes(id);
+              workflowDeleted && WORKFLOW_AUTHORING_PANES.includes(id);
             const tile = (
               <Button
                 key={id}
@@ -67,6 +68,14 @@ export function StudioStageLauncher() {
               >
                 <Icon className="size-4" aria-hidden />
                 {label}
+                {/* Three tiles open a pane; this one opens a menu. Without the
+                    chevron all four look like the same kind of control. */}
+                {id === "overview" ? (
+                  <ChevronDownIcon
+                    className="size-3.5 opacity-60"
+                    aria-hidden
+                  />
+                ) : null}
                 {/* The tooltip isn't exposed on a disabled control in browse
                     mode; keep the reason readable there. */}
                 {blockedByDeletion ? (

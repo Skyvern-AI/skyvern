@@ -67,7 +67,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     ScoutedSelectorCandidate,
     resolve_browser_state_for_context,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import stage_screenshot_from_artifact
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    screenshot_result_facts,
+    stage_screenshot_from_artifact,
+)
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -519,7 +524,12 @@ async def _capture_element_fingerprint(
 
 
 async def _capture_post_interaction_screenshot(
-    ctx: AgentContext, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    captured_url: str | None,
+    observation_step: int | None = None,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
 ) -> bool:
     """Attach a look at the page after a state-changing action, reporting whether a frame staged.
     Reading the DOM answers "what is on the page" but not "did that work" -- a filled password reads
@@ -533,16 +543,40 @@ async def _capture_post_interaction_screenshot(
     server = getattr(ctx, "discovery_mcp_server", None)
     if server is None:
         return False
+    capture_started_at = time.monotonic()
+    capture_session_id = ctx.browser_session_id
+    screenshot_arguments = {"session_id": capture_session_id} if capture_session_id else {}
     try:
         result = await asyncio.wait_for(
-            server.call_internal_tool("skyvern_screenshot", {}),
+            server.call_internal_tool("skyvern_screenshot", screenshot_arguments),
             timeout=timeout_seconds,
         )
     except Exception:
         return False
     if not isinstance(result, dict) or not result.get("ok"):
         return False
-    return stage_screenshot_from_artifact(ctx, result)
+    producer_url, producer_session_id, session_binding = screenshot_result_facts(
+        result,
+        dispatch_url=captured_url,
+        dispatch_browser_session_id=capture_session_id,
+    )
+    return stage_screenshot_from_artifact(
+        ctx,
+        result,
+        provenance=ScreenshotProvenance(
+            source_tool=source_tool,
+            captured_url=producer_url,
+            observation_step=observation_step,
+            browser_session_id=producer_session_id,
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
+            dispatch_url=captured_url,
+            dispatch_browser_session_id=capture_session_id,
+            producer_browser_session_id=producer_session_id,
+            session_binding=session_binding,
+        ),
+        captured_at=capture_started_at,
+    )
 
 
 async def _capture_enclosing_form_submits(

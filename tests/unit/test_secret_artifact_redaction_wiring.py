@@ -6,7 +6,7 @@ import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import MODEL_HIDDEN_PLACEHOLDER, SkyvernContext
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow import service as workflow_service_module
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
@@ -280,6 +280,42 @@ async def test_runtime_secret_values_for_artifacts_respects_global_switch(monkey
     monkeypatch.setattr(context_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
     assert skyvern_context.current() is None
     assert WorkflowContextManager().runtime_secret_values_for_artifacts() == set()
+
+
+def test_hide_from_model_returns_same_object_when_nothing_matches() -> None:
+    context = SkyvernContext()
+    text = "nothing sensitive here"
+    assert context.hide_from_model(text) is text
+
+
+def test_hide_from_model_replaces_longest_registered_value_first() -> None:
+    # A shorter registered value that is a substring of a longer one (the bare token
+    # inside the full magic-link URL) must not fragment the longer replacement.
+    context = SkyvernContext()
+    context.register_secret_value("token=abc123", hide_from_model=True)
+    context.register_secret_value("abc123", hide_from_model=True)
+    assert context.hide_from_model("url has token=abc123 in it") == f"url has {MODEL_HIDDEN_PLACEHOLDER} in it"
+
+
+def test_register_secret_value_hide_from_model_populates_both_sets() -> None:
+    context = SkyvernContext()
+    context.register_secret_value("https://example.test/magic?token=abc", hide_from_model=True)
+    context.register_secret_value("123456")
+    assert context.runtime_secret_values == {"https://example.test/magic?token=abc", "123456"}
+    assert context.model_hidden_values == {"https://example.test/magic?token=abc"}
+
+
+def test_model_hidden_values_is_per_task_not_process_global() -> None:
+    first = SkyvernContext()
+    first.register_secret_value("https://example.test/magic?token=abc", hide_from_model=True)
+    skyvern_context.set(first)
+    try:
+        assert skyvern_context.current() is first
+    finally:
+        skyvern_context.reset()
+
+    assert skyvern_context.current() is None
+    assert SkyvernContext().model_hidden_values == set()
 
 
 def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(monkeypatch: pytest.MonkeyPatch) -> None:

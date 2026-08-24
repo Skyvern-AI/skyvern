@@ -24,7 +24,6 @@ from structlog.testing import capture_logs
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import one_time_code_fill_supersedes_challenge
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_module
@@ -1024,39 +1023,7 @@ class TestCredentialFillInCallSubmit:
 
         await tools_module._fill_credential_field_impl(_ctx(), "#totpCode", "cred_123", "totp", "#verifyButton")
 
-        # enforcement.one_time_code_fill_supersedes_challenge only matches a packet naming this
-        # tool. Without the fill's own observation the challenge it just answered still halts.
         assert observed == [("fill_credential_field", "#totpCode"), ("click", "#verifyButton")]
-
-    @pytest.mark.asyncio
-    async def test_the_recorded_fill_lets_the_code_supersede_an_earlier_challenge(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        page = _FakePage()
-        _wire_impl(monkeypatch, page, secret_value="123456")
-        monkeypatch.setattr(
-            credential_fill_module,
-            "_register_scout_interaction_observation",
-            scouting_module._register_scout_interaction_observation,
-        )
-        challenge = {
-            "inspected_url": _FIXTURE_LOGIN_URL,
-            "current_url": _FIXTURE_LOGIN_URL,
-            "challenge_state": {"detected": True, "kind": "two factor code", "gates_submit_controls": True},
-        }
-        ctx = _ctx(flow_evidence=[{"evidence": challenge, "step": 0, "reached_via": "interaction"}])
-
-        await tools_module._fill_credential_field_impl(ctx, "#totpCode", "cred_123", "totp", "#verifyButton")
-
-        # The real predicate over the real packets: the join is on selector and source URL, so a
-        # drift in either would leave a tool-name-only assertion green while the turn still halts.
-        assert one_time_code_fill_supersedes_challenge(ctx, challenge) is True
-        ctx.flow_evidence = [
-            entry
-            for entry in ctx.flow_evidence
-            if (entry["evidence"].get("interaction_tool") or "") != "fill_credential_field"
-        ]
-        assert one_time_code_fill_supersedes_challenge(ctx, challenge) is False
 
     @pytest.mark.asyncio
     async def test_an_unreadable_match_count_still_submits(self, monkeypatch: pytest.MonkeyPatch) -> None:

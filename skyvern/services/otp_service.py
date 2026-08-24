@@ -576,22 +576,50 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     return try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
 
 
-async def resolve_otp_value(task: "Task", expected_otp_type: OTPType | None = None) -> OTPValue | None:
+def has_otp_source(task: "Task", expected_otp_type: OTPType | None = None) -> bool:
+    """Return True when resolve_otp_value would consult at least one source for this task.
+
+    Mirrors resolve_otp_value's waterfall (payload of the expected type -> credential TOTP ->
+    webhook/email/DB poll) without resolving a code, so callers can decide whether to offer code
+    handling at all.
+    """
+    payload_otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+    if payload_otp_value is not None and (
+        expected_otp_type is None or payload_otp_value.get_otp_type() == expected_otp_type
+    ):
+        return True
+    # A credential-TOTP candidate can only ever yield a TOTP code, so it's a source only when the
+    # caller isn't expecting some other OTP type (e.g. a magic link).
+    if expected_otp_type in (None, OTPType.TOTP) and has_credential_totp_candidate(task.workflow_run_id):
+        return True
+    return bool((task.totp_verification_url or task.totp_identifier) and task.organization_id)
+
+
+async def resolve_otp_value(
+    task: "Task",
+    expected_otp_type: OTPType | None = None,
+    max_wait_seconds: float | None = None,
+    poll_started_at: datetime | None = None,
+) -> OTPValue | None:
     """Resolve the OTP value to use for a verification step.
 
-    Priority is payload -> credential-backed TOTP -> webhook polling. The
-    workflow-run metadata lookup needed by polling is performed lazily so
-    payload/credential resolutions do not touch the database. Polling raises
+    Priority is payload -> credential-backed TOTP -> webhook polling; a payload
+    value of another type than ``expected_otp_type`` is skipped rather than
+    returned, so the later sources are still consulted. The workflow-run
+    metadata lookup needed by polling is performed lazily so payload/credential
+    resolutions do not touch the database. Polling raises
     NoTOTPVerificationCodeFound or FailedToGetTOTPVerificationCode on timeout;
     those propagate so callers can build the right terminate action. Returns
     None when no source is configured.
     """
     otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-    if otp_value:
+    if otp_value and (expected_otp_type is None or otp_value.get_otp_type() == expected_otp_type):
         return otp_value
 
     otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-    if otp_value:
+    # A credential TOTP can only ever be a TOTP, so it's a match only when the caller isn't
+    # expecting some other OTP type (e.g. a magic link) -- mirrors has_otp_source's gate.
+    if otp_value and expected_otp_type in (None, OTPType.TOTP):
         return otp_value
 
     if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
@@ -617,6 +645,8 @@ async def resolve_otp_value(task: "Task", expected_otp_type: OTPType | None = No
             totp_identifier=task.totp_identifier,
             created_after=run_started_at,
             expected_otp_type=expected_otp_type,
+            max_wait_seconds=max_wait_seconds,
+            poll_started_at=poll_started_at,
         )
 
     return None
@@ -635,16 +665,24 @@ async def poll_otp_value(
     email_context: EmailOTPVerificationContext | None = None,
     raw_context: RawOTPVerificationContext | None = None,
     webhook_context: WebhookOTPVerificationContext | None = None,
+    max_wait_seconds: float | None = None,
+    poll_started_at: datetime | None = None,
 ) -> OTPValue | None:
     """Poll until an OTP of ``expected_otp_type`` arrives or the wall-clock budget expires.
 
-    A caller that cancels this early (``asyncio.wait_for``) can pass its own contexts and then
-    read ``observed_otp_types`` off them to report which kind of OTP did arrive.
+    ``max_wait_seconds`` shortens the budget below VERIFICATION_CODE_POLLING_TIMEOUT_MINS so a caller
+    can poll in bounded slices and still receive the timeout diagnostics, instead of cancelling this
+    coroutine mid-request; such a caller passes the first slice's start as ``poll_started_at`` so the
+    email lower bound does not advance past a message that landed between slices. A caller that
+    cancels this early (``asyncio.wait_for``) can pass its own contexts and then read
+    ``observed_otp_types`` off them to report which kind of OTP did arrive.
     """
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
+    if max_wait_seconds is not None:
+        timeout = min(timeout, timedelta(seconds=max_wait_seconds))
     start_datetime = datetime.utcnow()
     timeout_datetime = start_datetime + timeout
-    email_created_after = created_after or start_datetime
+    email_created_after = created_after or poll_started_at or start_datetime
     db_created_after = created_after
     LOG.info(
         "Polling otp value",
@@ -658,9 +696,12 @@ async def poll_otp_value(
     email_otp_context = email_context if email_context is not None else EmailOTPVerificationContext()
     raw_otp_context = raw_context if raw_context is not None else RawOTPVerificationContext()
     webhook_otp_context = webhook_context if webhook_context is not None else WebhookOTPVerificationContext()
+    sleep_seconds = min(10.0, timeout.total_seconds())
     while True:
-        await asyncio.sleep(10)
-        if datetime.utcnow() > timeout_datetime:
+        await asyncio.sleep(sleep_seconds)
+        now = datetime.utcnow()
+        sleep_seconds = min(10.0, max(0.0, (timeout_datetime - now).total_seconds()))
+        if now >= timeout_datetime:
             if consecutive_failures > 0 and last_error_reason is not None:
                 LOG.warning(
                     "Polling otp value timed out while webhook was still failing",

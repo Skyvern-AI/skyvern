@@ -268,6 +268,15 @@ class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
 
+async def _assert_files_attachable(file_ids: list[str] | None, organization_id: str) -> None:
+    if not file_ids:
+        return
+    try:
+        await uploaded_file_service.assert_files_attachable(file_ids=file_ids, organization_id=organization_id)
+    except uploaded_file_service.FileNotAttachable as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
 ################# /v1 Endpoints #################
 @base_router.post(
     "/run/tasks",
@@ -306,6 +315,7 @@ async def run_task(
     analytics.capture("skyvern-oss-run-task", data={"url": run_request.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=run_request.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+    await _assert_files_attachable(run_request.file_ids, current_org.organization_id)
 
     skyvern_ctx = skyvern_context.current()
     # Per-request distinct_id makes the TTLCache effectively single-use here; that's the
@@ -413,6 +423,7 @@ async def run_task(
                 x_api_key=x_api_key,
                 request=request,
                 background_tasks=background_tasks,
+                file_ids=run_request.file_ids,
             )
         except task_v1_service.InvalidTaskV1ModelError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -464,6 +475,7 @@ async def run_task(
                 browser_session_id=run_request.browser_session_id,
                 start_fresh_browser=run_request.start_fresh_browser,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
+                file_ids=run_request.file_ids,
             ),
         )
     if run_request.engine == RunEngine.skyvern_v2:
@@ -509,6 +521,15 @@ async def run_task(
                     span.set_attribute("task_v2_id", task_v2.observer_cruise_id)
                 if task_v2.workflow_run_id:
                     span.set_attribute("workflow_run_id", task_v2.workflow_run_id)
+        # A task v2 executes as a workflow run, and it is the workflow run's teardown that
+        # deletes attachments, so bind to that id rather than the task v2 id this endpoint
+        # returns as run_id. Done before dispatch so the run cannot finish before it is bound.
+        if task_v2.workflow_run_id:
+            await uploaded_file_service.attach_files_to_run(
+                file_ids=run_request.file_ids or [],
+                organization_id=current_org.organization_id,
+                run_id=task_v2.workflow_run_id,
+            )
         await AsyncExecutorFactory.get_executor().execute_task_v2(
             request=request,
             background_tasks=background_tasks,
@@ -553,6 +574,7 @@ async def run_task(
                 data_extraction_schema=task_v2.extracted_information_schema,
                 publish_workflow=run_request.publish_workflow,
                 max_screenshot_scrolls=run_request.max_screenshot_scrolls,
+                file_ids=run_request.file_ids,
             ),
         )
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
@@ -633,6 +655,7 @@ async def run_workflow(
         current_org, browser_session_id=workflow_run_request.browser_session_id
     )
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+    await _assert_files_attachable(workflow_run_request.file_ids, current_org.organization_id)
     workflow_id = workflow_run_request.workflow_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
@@ -656,6 +679,11 @@ async def run_workflow(
         )
     except MissingBrowserAddressError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    await uploaded_file_service.attach_files_to_run(
+        file_ids=workflow_run_request.file_ids or [],
+        organization_id=current_org.organization_id,
+        run_id=workflow_run.workflow_run_id,
+    )
     background_tasks.add_task(
         app.AGENT_FUNCTION.on_run_created,
         organization_id=current_org.organization_id,
@@ -2942,6 +2970,7 @@ async def get_artifact(
 _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.HTML_SCRAPE: "text/html; charset=utf-8",
     ArtifactType.HTML_ACTION: "text/html; charset=utf-8",
+    ArtifactType.HTML_PRE_SUBMIT: "text/html; charset=utf-8",
     ArtifactType.LLM_PROMPT: "text/plain; charset=utf-8",
     ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT: "text/plain; charset=utf-8",
     ArtifactType.BROWSER_CONSOLE_LOG: "text/plain; charset=utf-8",
@@ -2949,6 +2978,7 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "image/png",
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
+    ArtifactType.SCREENSHOT_PRE_SUBMIT: "image/png",
     ArtifactType.RECORDING: "video/webm",
     ArtifactType.AUDIO: "audio/webm",
     ArtifactType.SESSION_REPLAY: "video/mp4",
@@ -4233,6 +4263,11 @@ async def _parse_and_gate_tag_filter_terms(
     "/runs",
     tags=["agent"],
     response_model=list[TaskRunListItem],
+    summary="List runs",
+    description=(
+        "List the organization's task and agent runs, newest first, filterable by status, run type, agent, "
+        "and a free-text search term. Returns a paginated array of run summaries."
+    ),
     openapi_extra={
         "x-hidden": True,
         "x-fern-sdk-method-name": "get_runs_v2",
@@ -5192,6 +5227,10 @@ async def get_workflow_templates() -> list[Workflow]:
     response_model=Workflow,
     tags=["Agents"],
     summary="Get an agent by id",
+    description=(
+        "Fetch a single agent definition by its permanent id, optionally pinned to a specific version. "
+        "Returns the agent's blocks, parameters, and metadata."
+    ),
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow",
     },
@@ -5619,6 +5658,11 @@ async def get_api_keys(
 @base_router.post(
     "/upload_file",
     tags=["Files"],
+    summary="Upload a file",
+    description=(
+        "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its "
+        "storage URI, a presigned download URL, and the expiry implied by the requested retention period."
+    ),
     openapi_extra={
         "x-fern-sdk-method-name": "upload_file",
     },

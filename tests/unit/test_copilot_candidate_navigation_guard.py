@@ -531,6 +531,7 @@ async def test_real_adapter_internal_call_drains_candidate_network_before_return
     server = _server()
     server._context_provider = lambda: SimpleNamespace(
         browser_session_id="session",
+        browser_session_continuity_generation=0,
         organization_id="org",
         turn_origin=mcp_adapter.TurnOrigin.interactive,
     )

@@ -669,6 +669,7 @@ def _timed_out_ctx(*, workflow_yaml: str | None, last_test_ok: bool | None) -> M
     ctx.test_after_update_done = last_test_ok is not None
     ctx.last_update_block_count = None
     ctx.has_staged_proposal = True
+    ctx.request_policy.selected_connected_account_id = None
     return ctx
 
 

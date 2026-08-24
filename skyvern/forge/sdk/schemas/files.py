@@ -33,6 +33,7 @@ class UploadedFile(BaseModel):
     filename: str
     size_bytes: int | None = None
     expires_at: datetime | None = None
+    run_id: str | None = None
     deleted_at: datetime | None = None
     created_at: datetime
     modified_at: datetime

@@ -11,14 +11,12 @@ from unittest.mock import MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import runtime_authoring_repair
 from skyvern.forge.sdk.copilot.agent import _code_authoring_repair_context_prompt
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_outcome import recorded_outcome_from_run_blocks_result
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_KIND_KEY,
-    ChallengeEvidenceSource,
     ChallengeKind,
-    composition_challenge_carrier,
 )
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
@@ -34,16 +32,9 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     RepairNextAction,
     build_diagnosis_repair_contract,
 )
-from skyvern.forge.sdk.copilot.enforcement import (
-    latest_diagnosis_contract_satisfies_goal,
-    terminal_challenge_blocker_signal_from_page_evidence,
-)
+from skyvern.forge.sdk.copilot.enforcement import latest_diagnosis_contract_satisfies_goal
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
-    DEVICE_APPROVAL_BLOCKER_REASON_CODE,
-    TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-    TERMINAL_CHALLENGE_USER_FACING_REASON,
     RecordedRunOutcome,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -2113,40 +2104,6 @@ def test_contract_trace_exposes_stable_root_cause_identity() -> None:
     }
 
 
-def test_diagnosis_tool_error_preserves_terminal_challenge_blocker_category() -> None:
-    from skyvern.forge.sdk.copilot.tools.run_execution import _diagnosis_repair_tool_error
-
-    ctx = _ctx()
-    ctx.blocker_signal = CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text="terminal challenge",
-        user_facing_reason="The page is gated by a site verification challenge.",
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
-        blocked_tool="update_and_run_blocks",
-        extra={
-            "run_outcome_reason_code": TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
-            "evidence_source": "page_evidence",
-            "challenge_evidence_source": "challenge_state",
-            "evidence_reason": "human verification requires human verification",
-        },
-    )
-
-    payload = json.loads(_diagnosis_repair_tool_error(ctx, "update_and_run_blocks", "terminal challenge"))
-
-    assert payload["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
-    assert payload["data"]["failure_categories"][0]["evidence_source"] == "challenge_state"
-    assert ctx.latest_diagnosis_repair_contract is not None
-    assert (
-        ctx.latest_diagnosis_repair_contract.diagnosis_result.suspected_failure_type
-        == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
-    )
-    assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP
-
-
 def _failed_run_result(run_id: str = "wr_failed") -> dict[str, object]:
     return {
         "ok": False,
@@ -2951,7 +2908,7 @@ def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> Non
     assert contract.diagnosis_input.failed_block_labels == ["append_visitors_to_sheet"]
 
 
-def _device_wall_page_evidence(challenge_kind: str | None, *, run_id: str = "wr_device_wall") -> dict[str, object]:
+def _challenge_wall_page_evidence(challenge_kind: str | None, *, run_id: str = "wr_device_wall") -> dict[str, object]:
     challenge_state: dict[str, object] = {
         "detected": True,
         "kind": "2-step verification",
@@ -2996,7 +2953,7 @@ def test_fresh_session_run_envelope_carries_typed_session_facts() -> None:
         data,
         used_fresh_run_session=True,
         run_ok=False,
-        page_evidence=_device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value),
+        page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
 
     assert data["used_fresh_run_session"] is True
@@ -3024,108 +2981,95 @@ def test_passing_fresh_session_run_did_not_stall_on_the_challenge() -> None:
         data,
         used_fresh_run_session=True,
         run_ok=True,
-        page_evidence=_device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value),
+        page_evidence=_challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value),
     )
 
     assert data["challenge_stalled_fresh_session"] is False
 
 
-def test_device_approval_wall_is_not_labelled_a_site_verification_challenge() -> None:
+def test_a_challenge_wall_remains_an_observation_for_the_model() -> None:
     ctx = _ctx()
-    page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value)
     ctx.composition_page_evidence = page_evidence
     run_result = _fresh_session_run_result(page_evidence)
 
     run_execution_module._record_run_blocks_result(ctx, run_result)
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
-    assert signal.extra["run_outcome_reason_code"] == "device_approval_challenge_blocker"
-    assert signal.extra["challenge_kind"] == ChallengeKind.DEVICE_APPROVAL.value
-    assert signal.user_facing_reason != TERMINAL_CHALLENGE_USER_FACING_REASON
-    assert "device-approval" in signal.user_facing_reason
-    assert "fresh browser session" in signal.user_facing_reason
-    assert "re-use an already-approved browser session" in signal.user_facing_reason
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == "device_approval_challenge_blocker"
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
     assert ctx.latest_recorded_build_test_outcome is not None
-    assert ctx.latest_recorded_build_test_outcome.reason_code == "device_approval_challenge_blocker"
-    assert ctx.latest_recorded_build_test_outcome.verdict == "not_authoritative"
+    assert ctx.latest_recorded_build_test_outcome.reason_code == "runtime_block_failure"
+    assert ctx.latest_recorded_build_test_outcome.verdict == "repairable_failure"
 
 
 @pytest.mark.parametrize("used_fresh_run_session", [False, None])
-def test_device_approval_reply_names_a_fresh_session_only_when_the_run_reported_one(
+def test_a_challenge_reply_names_a_fresh_session_only_when_the_run_reported_one(
     used_fresh_run_session: bool | None,
 ) -> None:
     ctx = _ctx()
-    page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
+    page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value)
     ctx.composition_page_evidence = page_evidence
 
     run_execution_module._record_run_blocks_result(
         ctx, _fresh_session_run_result(page_evidence, used_fresh_run_session)
     )
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
-    assert "device-approval" in signal.user_facing_reason
-    assert "fresh browser session" not in signal.user_facing_reason
-    assert "re-use an already-approved browser session" in signal.user_facing_reason
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
 
 
 @pytest.mark.parametrize(
     ("challenge_kind", "used_fresh_run_session"),
-    [(ChallengeKind.CAPTCHA.value, True), (ChallengeKind.HUMAN_VERIFICATION.value, True), (None, None)],
+    [(ChallengeKind.CAPTCHA.value, True), (None, None)],
 )
 def test_a_wall_the_classifier_did_not_name_keeps_the_site_verification_label(
     challenge_kind: str | None,
     used_fresh_run_session: bool | None,
 ) -> None:
-    """A run that stopped at a wall reports the recorded facts on its payload, but the reply only
-    names a device-approval step when the classifier typed one; anything else keeps today's wording."""
+    """A run that stopped at a wall reports the recorded facts on its payload; the reply keeps
+    today's wording whether or not the classifier typed the wall."""
     ctx = _ctx()
-    page_evidence = _device_wall_page_evidence(challenge_kind)
+    page_evidence = _challenge_wall_page_evidence(challenge_kind)
     ctx.composition_page_evidence = page_evidence
 
     run_execution_module._record_run_blocks_result(
         ctx, _fresh_session_run_result(page_evidence, used_fresh_run_session, stalled_pre_auth=True)
     )
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
 
 
 @pytest.mark.parametrize("challenge_kind", [ChallengeKind.CAPTCHA.value, "moon_phase", None])
 def test_unclassified_and_captcha_walls_keep_the_site_verification_label(challenge_kind: str | None) -> None:
     ctx = _ctx()
-    page_evidence = _device_wall_page_evidence(challenge_kind)
+    page_evidence = _challenge_wall_page_evidence(challenge_kind)
     ctx.composition_page_evidence = page_evidence
 
     run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(page_evidence))
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.last_run_outcome is not None
-    assert ctx.last_run_outcome.reason_code == TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
 
 
-def test_a_device_wall_seen_on_another_run_cannot_name_this_one() -> None:
+def test_a_challenge_wall_seen_on_another_run_cannot_name_this_one() -> None:
     ctx = _ctx()
-    ctx.composition_page_evidence = _device_wall_page_evidence(
-        ChallengeKind.DEVICE_APPROVAL.value, run_id="wr_earlier_run"
-    )
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_earlier_run")
 
     run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(None))
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.reason_code == "blocker_reported"
 
 
 def test_a_run_that_never_started_does_not_count_as_a_run_of_this_turn() -> None:
@@ -3139,72 +3083,25 @@ def test_a_run_that_never_started_does_not_count_as_a_run_of_this_turn() -> None
     run_execution_module._record_run_blocks_result(ctx, preflight_failure)
     assert ctx.block_run_calls_this_turn == 0
 
-    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_device_wall_page_evidence(None)))
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_challenge_wall_page_evidence(None)))
 
-    signal = ctx.blocker_signal
-    assert isinstance(signal, CopilotToolBlockerSignal)
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
     assert ctx.block_run_calls_this_turn == 1
-    assert "stopped instead of retrying the same path" in signal.user_facing_reason
 
 
-def test_stopped_claim_is_dropped_once_the_turn_has_run_more_than_once() -> None:
+def test_repeated_challenge_runs_remain_model_owned() -> None:
     ctx = _ctx()
-    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_device_wall_page_evidence(None)))
-    first_signal = ctx.blocker_signal
-    assert isinstance(first_signal, CopilotToolBlockerSignal)
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_challenge_wall_page_evidence(None)))
     assert ctx.block_run_calls_this_turn == 1
-    assert "stopped instead of retrying the same path" in first_signal.user_facing_reason
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
 
-    second_signal = run_execution_module._terminal_challenge_blocker_signal(
-        run_execution_module.TerminalChallengeEvidence(
-            source="failure_category",
-            reason="Run reported ANTI_BOT_DETECTION",
-            challenge_evidence_source="challenge_state",
-        ),
-        tool_name="update_and_run_blocks",
-        runs_this_turn=2,
-    )
+    run_execution_module._record_run_blocks_result(ctx, _fresh_session_run_result(_challenge_wall_page_evidence(None)))
 
-    assert "stopped instead of retrying the same path" not in second_signal.user_facing_reason
-    assert "not verified end-to-end" in second_signal.user_facing_reason
-
-
-def test_enforcement_page_evidence_signal_uses_the_same_discriminant() -> None:
-    ctx = _ctx()
-    ctx.composition_page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
-    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
-
-    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-
-    assert signal is not None
-    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
-    assert signal.user_facing_reason != TERMINAL_CHALLENGE_USER_FACING_REASON
-
-
-def test_enforcement_page_evidence_signal_never_asserts_a_fresh_session() -> None:
-    ctx = _ctx()
-    ctx.composition_page_evidence = _device_wall_page_evidence(ChallengeKind.DEVICE_APPROVAL.value)
-    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
-
-    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-
-    assert signal is not None
-    assert signal.internal_reason_code == DEVICE_APPROVAL_BLOCKER_REASON_CODE
-    assert "fresh browser session" not in signal.user_facing_reason
-
-
-def test_enforcement_signal_will_not_name_a_device_wall_from_another_run() -> None:
-    ctx = _ctx()
-    ctx.composition_page_evidence = _device_wall_page_evidence(
-        ChallengeKind.DEVICE_APPROVAL.value, run_id="wr_earlier_run"
-    )
-    ctx.last_run_blocks_workflow_run_id = "wr_device_wall"
-
-    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
-    assert signal.user_facing_reason == TERMINAL_CHALLENGE_USER_FACING_REASON
+    assert ctx.block_run_calls_this_turn == 2
+    assert ctx.blocker_signal is None
+    assert ctx.turn_halt is None
 
 
 _SATISFIABLE_TOTP_PAGE_HTML = (
@@ -3282,41 +3179,6 @@ def _post_run_totp_page_evidence(visual_summary: dict[str, Any]) -> dict[str, An
         "observed_after_workflow_run": True,
         "source_tool": "inspect_page_for_composition",
     }
-
-
-def test_runtime_authoring_repair_survives_a_vision_only_challenge_over_a_satisfiable_form() -> None:
-    ctx = _ctx()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.composition_page_evidence = _post_run_totp_page_evidence(_TOTP_VISION_CHALLENGE_SUMMARY)
-    result = _failed_run_blocks_result()
-
-    run_execution_module._record_run_blocks_result(ctx, result)
-    repair_context = finalize_runtime_authoring_repair_context_from_page_observation(ctx)
-
-    assert composition_challenge_carrier(ctx.composition_page_evidence) is None
-    assert terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks") is None
-    assert repair_context is not None
-    assert repair_context.block_label == "login_and_read_visitors"
-    assert ctx.last_code_authoring_repair_context is not None
-    assert any("Authenticator token" in summary for summary in repair_context.page_form_summaries)
-    statement_lines = result["data"]["action_trace_summary"]
-    assert any("code_line=27" in line and "wait_for_selector" in line for line in statement_lines)
-    assert any("credential.otp()" in line for line in statement_lines)
-
-
-def test_vision_challenge_without_a_blocked_submit_claim_still_terminalizes_over_a_form() -> None:
-    ctx = _ctx()
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    ctx.composition_page_evidence = _post_run_totp_page_evidence(_TOTP_VISION_OCCLUSION_ONLY_SUMMARY)
-
-    run_execution_module._record_run_blocks_result(ctx, _failed_run_blocks_result())
-
-    carrier = composition_challenge_carrier(ctx.composition_page_evidence)
-    signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-
-    assert carrier is ChallengeEvidenceSource.VISION
-    assert signal is not None
-    assert signal.internal_reason_code == TERMINAL_CHALLENGE_BLOCKER_REASON_CODE
 
 
 _NAMED_CONTROL_OVERLAY_HTML = (Path(__file__).parent / "data" / "click_overlay_named_dismiss.html").read_text()
@@ -3591,8 +3453,8 @@ async def test_obstruction_only_packet_survives_the_automatic_post_run_capture(
 
     async def _read(
         _ctx_arg: CopilotContext, *, run_session_id: str, current_url: str
-    ) -> tuple[dict[str, Any], str, None]:
-        return packet, run_session_id, None
+    ) -> tuple[dict[str, Any], str, None, None]:
+        return packet, run_session_id, None, None
 
     monkeypatch.setattr(run_execution_module, "_read_run_session_page_evidence", _read)
 
@@ -3664,3 +3526,153 @@ def test_a_long_control_text_never_costs_the_prompt_the_dismiss_selector() -> No
     ]
     assert obstruction_lines
     assert control_selector in obstruction_lines[0]
+
+
+_CHALLENGE_PAGE_URL = "https://sso.example.test/challenge"
+
+
+def _precedence_ctx(monkeypatch: pytest.MonkeyPatch) -> CopilotContext:
+    """A run whose page evidence shows a captcha this deployment can clear."""
+    ctx = _ctx()
+    _with_solver(ctx, True)
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_mixed")
+    return ctx
+
+
+def _with_solver(ctx: CopilotContext, available: bool, *, url: str = _CHALLENGE_PAGE_URL) -> None:
+    """Set the answer the run path resolves once, and the page it was resolved against."""
+    ctx.captcha_solver_available = available
+    ctx.captcha_solver_available_for_url = url
+
+
+def test_a_clearable_captcha_alone_yields_the_repair_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _precedence_ctx(monkeypatch)
+    data = {
+        "workflow_run_id": "wr_mixed",
+        "failure_categories": [
+            {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0}
+        ],
+    }
+
+    assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is False
+
+
+def test_a_clearable_captcha_is_released_without_a_post_run_packet() -> None:
+    """Only one authoring policy mints a run-matched post-run packet, and the stop this releases fires
+    on every policy. A release that needed the packet would be unreachable exactly where the stop
+    still fires, so an unstamped observation has to be enough."""
+    ctx = _ctx()
+    _with_solver(ctx, True)
+    ctx.composition_page_evidence = {
+        "current_url": "https://sso.example.test/challenge",
+        "challenge_state": {"detected": True, CHALLENGE_KIND_KEY: ChallengeKind.CAPTCHA.value},
+    }
+
+    assert runtime_authoring_repair.run_challenge_is_runtime_clearable(ctx, "wr_standard_policy") is True
+
+
+def test_a_clearable_captcha_leaves_the_repair_path_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The halt is only one of the routes that stops the turn: diagnosis must not route to STOP
+    either, or the turn ends anyway with no blocker, no halt and no repair context."""
+    ctx = _ctx()
+    _with_solver(ctx, True)
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_captcha")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_captcha",
+                "overall_status": "failed",
+                "failure_reason": "blocked by a verification challenge",
+                "failure_categories": [
+                    {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0}
+                ],
+            },
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action != RepairNextAction.STOP
+
+
+def test_an_answer_resolved_for_another_page_does_not_release_this_one() -> None:
+    """The gate behind the cached answer is a domain denylist, so an answer obtained against an
+    allowed page must not authorise a later one that may not be."""
+    ctx = _ctx()
+    _with_solver(ctx, True, url="https://allowed.example.test/login")
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_other")
+
+    assert runtime_authoring_repair.run_challenge_is_runtime_clearable(ctx, "wr_other") is False
+
+
+def test_an_unclearable_challenge_still_routes_diagnosis_to_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _ctx()
+    _with_solver(ctx, False)
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_captcha")
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_captcha",
+                "overall_status": "failed",
+                "failure_reason": "blocked by a verification challenge",
+                "failure_categories": [
+                    {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0}
+                ],
+            },
+        },
+        ctx=ctx,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+
+
+def test_an_unreachable_sandbox_still_stops_even_beside_a_clearable_captcha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-run page inspection runs whatever failed, so a solvable captcha routinely shares a run
+    with an unrelated stop condition. No edit to the block can reach a sandbox that is not there."""
+    ctx = _precedence_ctx(monkeypatch)
+    data = {
+        "workflow_run_id": "wr_mixed",
+        "failure_categories": [
+            {"category": "UNRECOVERABLE_TOOL_ERROR", "evidence_source": "challenge_state", "confidence_float": 1.0},
+            {"category": "ANTI_BOT_DETECTION", "evidence_source": "challenge_state", "confidence_float": 1.0},
+        ],
+    }
+
+    assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is True
+
+
+def test_an_unresolved_solver_question_keeps_the_wall() -> None:
+    """A path that never resolved the capability must not read as clearable: an unanswered question
+    is the deployment whose solver is switched off, not the one whose solver works."""
+    ctx = _ctx()
+    ctx.composition_page_evidence = _challenge_wall_page_evidence(ChallengeKind.CAPTCHA.value, run_id="wr_captcha")
+    assert ctx.captcha_solver_available is None
+
+    assert runtime_authoring_repair.run_challenge_is_runtime_clearable(ctx, "wr_captcha") is False
+
+
+def test_an_unstamped_packet_still_keeps_the_wall_without_a_solver() -> None:
+    ctx = _ctx()
+    _with_solver(ctx, False)
+    ctx.composition_page_evidence = {
+        "current_url": "https://sso.example.test/challenge",
+        "challenge_state": {"detected": True, CHALLENGE_KIND_KEY: ChallengeKind.CAPTCHA.value},
+    }
+
+    assert runtime_authoring_repair.run_challenge_is_runtime_clearable(ctx, "wr_standard_policy") is False
+
+
+def test_unbound_credentials_still_ask_even_beside_a_clearable_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = _precedence_ctx(monkeypatch)
+    data = {"workflow_run_id": "wr_mixed", "skip_reason": "workflow_credential_inputs_unbound"}
+
+    assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is True

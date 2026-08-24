@@ -316,6 +316,11 @@ class Settings(BaseSettings):
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
     # still means "no expiry of its own", governed by the org's data-retention policy.
     MAX_UPLOADED_FILE_RETENTION_DAYS: int = Field(default=365, gt=0)
+    # Backstop expiry given to a file attached to a run, so a run that never reaches its
+    # terminal handler (cancelled worker, lost node) still cannot strand the bytes. Must stay
+    # comfortably above WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES plus queue time, since deleting
+    # a file mid-run would fail the run that is using it.
+    RUN_ATTACHED_FILE_BACKSTOP_HOURS: int = Field(default=24, gt=0)
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
@@ -484,6 +489,9 @@ class Settings(BaseSettings):
     # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
     # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
     TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
+    # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
+    # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
+    TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False

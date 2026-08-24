@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -65,6 +65,71 @@ class UploadedFilesRepository(BaseRepository):
             result = await session.execute(stmt)
             uploaded_file = result.scalar_one_or_none()
             return UploadedFile.model_validate(uploaded_file) if uploaded_file else None
+
+    @db_operation("attach_uploaded_files_to_run")
+    async def attach_uploaded_files_to_run(
+        self,
+        file_ids: list[str],
+        organization_id: str,
+        run_id: str,
+        expires_at: datetime,
+    ) -> list[UploadedFile]:
+        """Bind live files to a run and give them a backstop expiry, returning the rows bound.
+
+        ``expires_at`` is only ever moved earlier. A caller who asked for a shorter
+        ``retention_days`` at upload time already has a deletion promise, and attaching to a
+        run must not extend the life of their data past it.
+
+        A file already attached to a different run is left alone and omitted from the result,
+        so the caller can reject the request rather than silently move an attachment (and with
+        it, the deletion trigger) off the run that is still using it.
+        """
+        now = naive_utc_now()
+        async with self.Session() as session:
+            result = await session.execute(
+                update(UploadedFileModel)
+                .where(UploadedFileModel.file_id.in_(file_ids))
+                .where(UploadedFileModel.organization_id == organization_id)
+                .where(UploadedFileModel.deleted_at.is_(None))
+                .where(
+                    UploadedFileModel.run_id.is_(None) | (UploadedFileModel.run_id == run_id),
+                )
+                .values(
+                    run_id=run_id,
+                    expires_at=func.least(
+                        func.coalesce(UploadedFileModel.expires_at, to_naive_utc(expires_at)),
+                        to_naive_utc(expires_at),
+                    ),
+                    modified_at=now,
+                )
+                .returning(UploadedFileModel)
+            )
+            attached = [UploadedFile.model_validate(row) for row in result.scalars().all()]
+            await session.commit()
+            return attached
+
+    @db_operation("get_uploaded_files_by_ids")
+    async def get_uploaded_files_by_ids(self, file_ids: list[str], organization_id: str) -> list[UploadedFile]:
+        async with self.Session() as session:
+            stmt = (
+                select(UploadedFileModel)
+                .where(UploadedFileModel.file_id.in_(file_ids))
+                .where(UploadedFileModel.organization_id == organization_id)
+                .where(UploadedFileModel.deleted_at.is_(None))
+            )
+            result = await session.execute(stmt)
+            return [UploadedFile.model_validate(row) for row in result.scalars().all()]
+
+    @db_operation("get_uploaded_files_for_run")
+    async def get_uploaded_files_for_run(self, run_id: str) -> list[UploadedFile]:
+        async with self.Session() as session:
+            stmt = (
+                select(UploadedFileModel)
+                .where(UploadedFileModel.run_id == run_id)
+                .where(UploadedFileModel.deleted_at.is_(None))
+            )
+            result = await session.execute(stmt)
+            return [UploadedFile.model_validate(row) for row in result.scalars().all()]
 
     @db_operation("claim_uploaded_file_for_deletion")
     async def claim_uploaded_file_for_deletion(self, file_id: str, organization_id: str) -> UploadedFile | None:

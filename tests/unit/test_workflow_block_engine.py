@@ -145,13 +145,13 @@ async def test_explicit_block_engine_is_never_overridden_by_treatment_arm(scoped
     assert v2_block.resolve_engine("wr_pinned") == RunEngine.skyvern_v2
 
 
-def test_pinned_non_default_engine_block_disqualifies_the_run() -> None:
+@pytest.mark.parametrize("pinned_engine", [RunEngine.openai_cua, RunEngine.skyvern_v3])
+def test_pinned_non_default_engine_block_disqualifies_the_run(pinned_engine: RunEngine) -> None:
     eligible = _make_block(TaskBlock, label="ok")
     # Pinned as-authored in both arms, but that leaves control mixed-engine, so it
-    # disqualifies the whole run rather than being skipped.
-    pinned = _make_block(
-        NavigationBlock, label="pinned", navigation_goal="Apply to the job", engine=RunEngine.openai_cua
-    )
+    # disqualifies the whole run rather than being skipped. A v3 pin is the user opting
+    # in explicitly, not a treatment exposure.
+    pinned = _make_block(NavigationBlock, label="pinned", navigation_goal="Apply to the job", engine=pinned_engine)
 
     assert run_is_eligible_for_v3_ab([eligible, pinned], is_script_run=False) is False
 

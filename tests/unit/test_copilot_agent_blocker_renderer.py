@@ -31,7 +31,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyVerdict,
 )
 from skyvern.forge.sdk.copilot.request_policy import LivePageResolutionRecord, RequestPolicy
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODE, RecordedRunOutcome
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.turn_halt import TurnHalt, TurnHaltKind
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
@@ -440,13 +440,13 @@ def test_turn_halt_exit_renders_terminal_reason_when_terminal_blocker_held() -> 
     ctx = _ctx()
     terminal = _signal(
         kind="tool_error",
-        user_facing="The site's verification challenge blocked the run.",
+        user_facing="The browser session was lost before the run finished.",
         recovery_hint="report_blocker_to_user",
-        internal_reason_code="tool_error_terminal_challenge_blocker",
+        internal_reason_code="tool_error_browser_session_lost",
         blocked_tool="update_and_run_blocks",
     )
     ctx.blocker_signal = terminal
-    halt = TurnHalt(kind=TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE, blocker_signal=terminal)
+    halt = TurnHalt(kind=TurnHaltKind.BROWSER_SESSION_LOST, blocker_signal=terminal)
 
     result = _build_turn_halt_exit_result(ctx, global_llm_context=None, halt=halt)
 
@@ -505,7 +505,7 @@ def test_verified_outcome_does_not_suppress_voluntary_terminal_challenge() -> No
         kind="tool_error",
         user_facing=challenge_text,
         recovery_hint="stop",
-        internal_reason_code=TERMINAL_CHALLENGE_BLOCKER_REASON_CODE,
+        internal_reason_code="tool_error_terminal_challenge_blocker",
         blocked_tool="update_and_run_blocks",
     )
 

@@ -244,12 +244,26 @@ async def _get_block_schema_post_hook(
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
             data["code_only_note"] = _code_only_browser_unavailable_summary()
-            settled_block_types = ctx.code_only_settled_block_types if isinstance(ctx, CopilotContext) else frozenset()
-            data["code_only_guidance"] = _code_only_browser_schema_guidance(settled_block_types)
+            data["code_only_guidance"] = _code_only_browser_schema_guidance()
             data["download_claim_helper_contract"] = download_claim_helper_contract()
             demonstrated = _demonstrated_step_facts(ctx)
             if demonstrated:
                 data["demonstrated_steps"] = demonstrated
+    return result
+
+
+async def _get_workflow_knowledge_post_hook(
+    result: dict[str, Any],
+    raw: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any]:
+    data = result.get("data")
+    if isinstance(data, dict) and _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        data["active_policy_note"] = (
+            "This knowledge describes workflow concepts across all block types. Under the active code-only browser "
+            "policy, author browser work with code blocks only; get_block_schema is authoritative for what the active "
+            "policy permits."
+        )
     return result
 
 
@@ -548,14 +562,22 @@ async def _navigate_post_hook(
             result_url=result["url"],
         )
         await _bind_login_credential_for_observed_url(ctx, result["url"], result)
-        staged = await _capture_post_interaction_screenshot(ctx)
+        staged = await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=result["url"],
+        )
         attached = " A screenshot is attached." if staged else ""
         result["next_step"] = (
             f"Page loaded.{attached} Use evaluate or inspect_page_for_composition when you need the "
             "page's structure or selectors before responding."
         )
     else:
-        await _capture_post_interaction_screenshot(ctx)
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="navigate_browser",
+            captured_url=source_url,
+        )
     return result
 
 
@@ -619,6 +641,8 @@ async def _click_post_hook(
     ctx.last_scout_act_observe_outcome = None
     ctx.last_scout_act_observe_packet = None
     page_evidence: dict[str, Any] | None = None
+    captured_url: str | None = None
+    observation_step: int | None = None
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
     pending_role_name = ctx.pending_scout_role_name
@@ -692,6 +716,7 @@ async def _click_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        captured_url = url or None
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
             # A download this click produced is proof the affordance works, so it outranks the
             # href-shape prediction — and is the only source that sees a command-URL download.
@@ -709,7 +734,12 @@ async def _click_post_hook(
     # The round-trip is skipped only when the evidence positively names the obstruction a frame
     # would have shown; evidence that merely parsed is not a substitute for looking at the page.
     if ctx.last_scout_act_observe_outcome != "attached" or not _page_evidence_names_obstruction(page_evidence):
-        await _capture_post_interaction_screenshot(ctx)
+        await _capture_post_interaction_screenshot(
+            ctx,
+            source_tool="click",
+            captured_url=captured_url or source_url,
+            observation_step=observation_step,
+        )
     return result
 
 
@@ -1413,6 +1443,7 @@ async def _press_key_post_hook(
 
 def get_skyvern_mcp_alias_map() -> dict[str, str]:
     return {
+        "get_workflow_knowledge": "skyvern_workflow_knowledge",
         "get_block_schema": "skyvern_block_schema",
         "validate_block": "skyvern_block_validate",
         "navigate_browser": "skyvern_navigate",
@@ -1433,6 +1464,14 @@ _EVALUATE_BASE_DESCRIPTION = (
     "values. JavaScript run here can also change the page, but only click, type_text, select_option "
     "and press_key record a scouted interaction, so a change made through this tool leaves nothing to "
     "author from -- act with those tools and read with this one."
+)
+_WORKFLOW_KNOWLEDGE_DESCRIPTION = (
+    "Read authoritative Skyvern workflow concepts and authoring guidance. Use this before answering "
+    "questions about workflow structure, parameters, execution, authoring patterns, or block selection. "
+    "Common topic IDs are workflow_parameters, parameter_templating, workflow_execution_flow, "
+    "choosing_a_block, common_patterns, and best_practices; omit topics to list every available ID. "
+    "Request only the relevant sections. For exact fields of a specific block type, use "
+    "get_block_schema instead."
 )
 # Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
 # target only once its page is reached. The model reaches that page with navigate/click and
@@ -1472,6 +1511,11 @@ def _build_skyvern_mcp_overlays(
     block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
 ) -> dict[str, SchemaOverlay]:
     return {
+        "get_workflow_knowledge": SchemaOverlay(
+            description=_WORKFLOW_KNOWLEDGE_DESCRIPTION,
+            description_suffix=_block_schema_banned_types_note(block_authoring_policy),
+            post_hook=_get_workflow_knowledge_post_hook,
+        ),
         "get_block_schema": SchemaOverlay(
             description_suffix=_block_schema_banned_types_note(block_authoring_policy),
             pre_hook=_get_block_schema_pre_hook,
@@ -1551,8 +1595,8 @@ def _build_skyvern_mcp_overlays(
                 "Optionally clear the field first. Use this for form filling. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
                 "codes, private keys, or other raw credentials/secrets received in "
-                "chat — stop and follow the CREDENTIAL HANDLING refusal rule in the "
-                "system prompt instead."
+                "chat. Ask the user to store the value as a saved credential and "
+                "reply with its name; do not type or submit the raw value."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "delay", "intent"}),
             forced_args={"selector_mode": "direct"},

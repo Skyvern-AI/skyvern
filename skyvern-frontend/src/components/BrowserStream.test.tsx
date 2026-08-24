@@ -569,6 +569,26 @@ describe("BrowserStream", () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
   });
 
+  it("takes control on a click anywhere on the read-only picture, not just the button", async () => {
+    const { container } = renderBrowserStream();
+    await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream")!;
+    expect(stream.classList.contains("user-is-controlling")).toBe(false);
+
+    fireEvent.click(screen.getByTestId("browser-stream-overlay"));
+
+    expect(stream.classList.contains("user-is-controlling")).toBe(true);
+    expect(
+      screen
+        .getByTestId("browser-stream-overlay")
+        .classList.contains("can-take-control"),
+    ).toBe(false);
+  });
+
   it("notifies activity after a VNC framebuffer update completes", async () => {
     const onActivity = vi.fn();
 

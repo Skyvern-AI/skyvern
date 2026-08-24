@@ -1700,6 +1700,10 @@ class AgentFunction:
         """Compute the user-facing ``total_cost`` for a workflow run. OSS returns None."""
         return None
 
+    async def captcha_solving_available(self, organization_id: str | None, url: str | None) -> bool:
+        """Whether a captcha on this page could be solved without a person."""
+        return False
+
     async def auto_solve_captchas(self, page: Page) -> bool:
         """Proactively detect and solve captchas on the current page.
         Returns True if a captcha was detected and solved.

@@ -1408,3 +1408,49 @@ class TestS3SaveDownloadedFiles:
             await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
 
         assert raised.value.skipped_files == ["a.pdf"]
+
+    async def test_repeat_save_only_uploads_new_and_changed_files(
+        self, s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A run's second cleanup must cost only its new files, not the whole download dir (SKY-14752)."""
+        import skyvern.forge.sdk.artifact.storage.s3 as s3_module
+
+        self._seed_run_dir(tmp_path, monkeypatch)
+        run_dir = tmp_path / "downloads" / "wr_partial"
+        uploaded: list[str] = []
+        rows: dict[str, Artifact] = {}
+
+        async def _upload(*, uri: str, file_path: str, **kwargs: object) -> None:
+            uploaded.append(uri.rsplit("/", 1)[-1])
+
+        async def _create_row(*, uri: str, checksum: str | None = None, **kwargs: object) -> str:
+            artifact = (rows.get(uri) or _share_artifact(ArtifactType.DOWNLOAD, uri)).model_copy(
+                update={"checksum": checksum}
+            )
+            rows[uri] = artifact
+            return artifact.artifact_id
+
+        async def _list_rows(**kwargs: object) -> list[Artifact]:
+            return list(rows.values())
+
+        monkeypatch.setattr(s3_storage.async_client, "upload_file_from_path", _upload)
+        monkeypatch.setattr(
+            s3_module,
+            "app",
+            SimpleNamespace(
+                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=_create_row),
+                DATABASE=SimpleNamespace(artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows)),
+            ),
+        )
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+        assert sorted(uploaded) == ["a.pdf", "b.pdf"]
+
+        uploaded.clear()
+        (run_dir / "b.pdf").write_bytes(b"second, edited")
+        (run_dir / "c.pdf").write_bytes(b"third")
+
+        await s3_storage.save_downloaded_files(organization_id=TEST_ORGANIZATION_ID, run_id="wr_partial")
+
+        assert sorted(uploaded) == ["b.pdf", "c.pdf"]
+        assert len(rows) == 3

@@ -303,13 +303,18 @@ class TestCopilotContext:
         assert ctx.last_frontier_start_label is None
 
 
-def _policy_ctx(resolved: list[SimpleNamespace], credential_input_kind: str = "credential_name") -> SimpleNamespace:
+def _policy_ctx(
+    resolved: list[SimpleNamespace],
+    credential_input_kind: str = "credential_name",
+    selected_connected_account_id: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         credential_pause_connected_credential_id=None,
         request_policy=SimpleNamespace(
             resolved_credentials=resolved,
             credential_input_kind=credential_input_kind,
             live_page_admitted_urls={},
+            selected_connected_account_id=selected_connected_account_id,
         ),
     )
 

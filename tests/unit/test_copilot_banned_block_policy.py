@@ -20,15 +20,12 @@ from __future__ import annotations
 
 import json
 import textwrap
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.agent import _render_code_only_browser_authoring_prompt
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import (
     _COPILOT_BANNED_BLOCK_TYPES,
@@ -45,7 +42,6 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     CopilotBlockPolicyStatus,
     _code_only_browser_authoring_prompt,
     _code_only_browser_schema_guidance,
-    _extract_existing_code_only_pending_block_types,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
 from skyvern.schemas.runs import ProxyLocation
@@ -255,22 +251,13 @@ def test_code_only_authoring_prompt_does_not_recommend_blocked_page_evaluate() -
     assert "MCP/scout evidence" in prompt
 
 
-def test_code_only_authoring_prompt_exposes_credential_capability_without_prescribing_login_control_flow() -> None:
+def test_code_only_authoring_prompt_defers_runtime_helpers_to_code_schema() -> None:
     prompt = _code_only_browser_authoring_prompt()
 
-    assert "<key>.username" in prompt
-    assert "<key>.password" in prompt
-    assert "await <key>.otp()" in prompt
-    assert "await <key>.magic_link(page)" in prompt
-    assert "without exposing the sign-in link to authored code" in prompt
-    assert "solve_captcha(page)" in prompt
     assert "Credentialed login code must be idempotent" not in prompt
-    assert ".or_(" not in prompt
     assert "timeout=90000" not in prompt
     assert "await solve_captcha(page)" not in prompt
-    assert "After challenge handling" not in prompt
-    assert "resolves at the moment it is awaited" not in prompt
-    assert "Transient disappearance of the OTP field" not in prompt
+    assert "<key>.username" not in prompt
 
 
 def test_code_only_schema_guidance_exposes_credential_runtime_without_otp_procedure() -> None:
@@ -767,157 +754,6 @@ async def test_code_only_update_workflow_rejects_new_browser_block_with_policy_t
     mock_span.assert_called_once_with("_update_workflow", [("login_step", "login")])
 
 
-def _copilot_ctx(workflow_yaml: str) -> CopilotContext:
-    return CopilotContext(
-        organization_id="org_test",
-        workflow_id="w_test",
-        workflow_permanent_id="wpid_test",
-        workflow_yaml=workflow_yaml,
-        browser_session_id=None,
-        stream=SimpleNamespace(),  # type: ignore[arg-type]
-        workflow_copilot_chat_id="wcc_test",
-        request_policy=RequestPolicy(),
-    )
-
-
-def test_settled_gating_is_a_no_op_for_a_new_workflow() -> None:
-    # The contract is that an empty settled set withholds nothing, so the three ways of asking
-    # for "no settled blocks" render identically. Asserting the prompt's exact prose instead
-    # would fail on any unrelated edit to it, which is not what this change owns.
-    absent = _code_only_browser_authoring_prompt()
-    empty = _code_only_browser_authoring_prompt(frozenset())
-    unrelated = _code_only_browser_authoring_prompt(frozenset({"file_upload"}))
-
-    assert absent == empty
-    assert "Already saved in this workflow" not in absent
-    for capability in ("<key>.username", "<key>.password", "await <key>.otp()", "await <key>.magic_link(page)"):
-        assert capability in absent
-        assert capability in unrelated
-    for removed_procedure in (
-        "Credentialed login code must be idempotent",
-        "wait for either the observed one-time-code field",
-        "timeout=90000",
-    ):
-        assert removed_procedure not in absent
-        assert removed_procedure not in unrelated
-
-
-def test_code_only_authoring_prompt_for_new_workflow_keeps_every_pending_type() -> None:
-    prompt = _code_only_browser_authoring_prompt(frozenset())
-
-    assert "credential-typed code" in prompt
-    assert "download registration" in prompt
-    assert "file materialization" in prompt
-    assert "Already saved in this workflow" not in prompt
-
-
-def test_code_only_authoring_prompt_drops_conversion_guidance_for_settled_login() -> None:
-    settled = _extract_existing_code_only_pending_block_types(_yaml({"block_type": "login", "label": "login_step"}))
-
-    prompt = _code_only_browser_authoring_prompt(settled)
-
-    assert "credential-typed code" not in prompt
-    assert "credential_id workflow parameter" not in prompt
-    assert "download registration" in prompt
-    assert "file materialization" in prompt
-
-
-def test_code_only_authoring_prompt_marks_settled_login_as_inherited() -> None:
-    settled = _extract_existing_code_only_pending_block_types(_yaml({"block_type": "login", "label": "login_step"}))
-
-    prompt = _code_only_browser_authoring_prompt(settled)
-
-    assert "Already saved in this workflow, inherited as-is and not pending conversion: `login`." in prompt
-
-
-def test_code_only_authoring_prompt_drops_conversion_guidance_for_settled_file_download() -> None:
-    settled = _extract_existing_code_only_pending_block_types(
-        _yaml({"block_type": "file_download", "label": "download_step"})
-    )
-
-    prompt = _code_only_browser_authoring_prompt(settled)
-
-    assert "download registration" not in prompt
-    assert "credential-typed code" in prompt
-    assert "file materialization" in prompt
-
-
-def test_code_only_authoring_prompt_suppresses_pending_header_when_all_types_settled() -> None:
-    settled = _extract_existing_code_only_pending_block_types(
-        _yaml(
-            {"block_type": "login", "label": "login_step"},
-            {"block_type": "file_download", "label": "download_step"},
-            {"block_type": "file_upload", "label": "upload_step"},
-        )
-    )
-
-    prompt = _code_only_browser_authoring_prompt(settled)
-
-    assert "still pending plumbing" not in prompt
-    assert "credential-typed code" not in prompt
-    assert "download registration" not in prompt
-    assert "file materialization" not in prompt
-    assert (
-        "Already saved in this workflow, inherited as-is and not pending conversion: "
-        "`file_download`, `file_upload`, `login`." in prompt
-    )
-
-
-def test_settled_block_types_snapshot_ignores_mid_turn_workflow_writes() -> None:
-    ctx = _copilot_ctx("")
-    assert ctx.code_only_settled_block_types == frozenset()
-
-    ctx.workflow_yaml = _yaml({"block_type": "login", "label": "login_step"})
-
-    prompt = _render_code_only_browser_authoring_prompt(ctx)
-
-    assert ctx.code_only_settled_block_types == frozenset()
-    assert "credential-typed code" in prompt
-    assert "Already saved in this workflow" not in prompt
-
-
-def test_settled_block_types_snapshot_reads_the_turn_start_workflow() -> None:
-    ctx = _copilot_ctx(_yaml({"block_type": "login", "label": "login_step"}))
-
-    prompt = _render_code_only_browser_authoring_prompt(ctx)
-
-    assert ctx.code_only_settled_block_types == frozenset({"login"})
-    assert "credential-typed code" not in prompt
-    assert "Already saved in this workflow, inherited as-is and not pending conversion: `login`." in prompt
-
-
-def test_extract_existing_block_types_from_empty_workflow() -> None:
-    assert _extract_existing_code_only_pending_block_types(None) == frozenset()
-    assert _extract_existing_code_only_pending_block_types("") == frozenset()
-
-
-def test_extract_existing_block_types_from_malformed_yaml() -> None:
-    assert _extract_existing_code_only_pending_block_types("not valid yaml: {{{") == frozenset()
-
-
-def test_extract_existing_block_types_identifies_pending_block_types() -> None:
-    prior_yaml = _yaml(
-        {"block_type": "login", "label": "login_step"},
-        {"block_type": "file_download", "label": "download_step"},
-        {"block_type": "file_upload", "label": "upload_step"},
-    )
-
-    assert _extract_existing_code_only_pending_block_types(prior_yaml) == frozenset(
-        {"login", "file_download", "file_upload"}
-    )
-
-
-def test_extract_existing_block_types_ignores_blocks_outside_the_pending_set() -> None:
-    prior_yaml = _yaml(
-        {"block_type": "login", "label": "login_step"},
-        {"block_type": "navigation", "label": "nav_step"},
-        {"block_type": "code", "label": "code_step"},
-        {"block_type": "task", "label": "task_step"},
-    )
-
-    assert _extract_existing_code_only_pending_block_types(prior_yaml) == frozenset({"login"})
-
-
 # ---------- Cross-layer sync guard ----------
 
 
@@ -950,51 +786,6 @@ def test_schema_guidance_does_not_prescribe_login_waits_or_branches() -> None:
         assert "timeout=90000" not in text
         assert "login_form" not in text
         assert "authenticated_anchor" not in text
-
-
-def test_schema_guidance_drops_credential_binding_when_login_is_settled() -> None:
-    from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_schema_guidance
-
-    new_workflow = " ".join(_code_only_browser_schema_guidance(frozenset()))
-    settled = " ".join(_code_only_browser_schema_guidance(frozenset({"login"})))
-
-    assert "workflow_parameter_type credential_id" in new_workflow
-    assert "workflow_parameter_type credential_id" not in settled
-    assert "bind the credential as a workflow parameter" not in settled
-    assert "Use one focused code block per durable browser goal" in settled
-
-
-def test_authoring_prompt_drops_login_procedure_when_login_is_settled() -> None:
-    settled = _code_only_browser_authoring_prompt(frozenset({"login"}))
-
-    # Step-by-step login authoring is steering; it is what drove the model to rewrite a
-    # settled block, so it is withheld.
-    assert "Credentialed login code must be idempotent" not in settled
-    assert "wait for either the observed one-time-code field" not in settled
-    assert "Return JSON-safe structured data" in settled
-
-
-def test_authoring_prompt_keeps_runtime_facts_when_login_is_settled() -> None:
-    settled = _code_only_browser_authoring_prompt(frozenset({"login"}))
-
-    # The credential object is a runtime capability. A mandatory challenge/login sequence is not.
-    assert "`credential_id` workflow parameter resolves to a credential object" in settled
-    assert "await solve_captcha(page)" not in settled
-
-
-def test_authoring_prompt_exposes_credential_capabilities_without_a_login_procedure() -> None:
-    for settled_types in (frozenset(), frozenset({"file_download"})):
-        rendered = _code_only_browser_authoring_prompt(settled_types)
-        assert "<key>.username" in rendered
-        assert "<key>.password" in rendered
-        assert "await <key>.otp()" in rendered
-        assert "await <key>.magic_link(page)" in rendered
-        assert "Credentialed login code must be idempotent" not in rendered
-        assert "await solve_captcha(page)" not in rendered
-
-
-def test_settled_login_does_not_change_new_workflow_rendering() -> None:
-    assert _code_only_browser_authoring_prompt(frozenset()) == _code_only_browser_authoring_prompt(None)
 
 
 @pytest.mark.asyncio

@@ -81,6 +81,8 @@ def _redirect_response(*urls: str) -> _FakeResponse:
         pytest.param("net::ERR_CERT_AUTHORITY_INVALID", id="cert-authority-invalid"),
         pytest.param("net::ERR_CERT_DATE_INVALID", id="cert-date-invalid"),
         pytest.param("net::ERR_SSL_PROTOCOL_ERROR", id="ssl-protocol-error"),
+        pytest.param("net::ERR_SOCKS_CONNECTION_FAILED", id="socks-connection-failed"),
+        pytest.param("net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE", id="socks-host-unreachable"),
     ],
 )
 @pytest.mark.asyncio

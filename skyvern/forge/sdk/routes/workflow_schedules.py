@@ -191,6 +191,10 @@ async def _set_schedule_enabled(
     tags=["Schedules"],
     operation_id="schedules_list_all",
     summary="List all schedules for the organization",
+    description=(
+        "List every schedule in the organization, across all agents, filterable by active/paused status and "
+        "a search term matched against agent title or schedule name. Returns a paginated list plus the total count."
+    ),
 )
 async def list_organization_schedules(
     page: int = Query(default=1, ge=1),
@@ -231,6 +235,10 @@ async def list_organization_schedules(
     tags=["Schedules"],
     operation_id="schedules_create",
     summary="Create a schedule for an agent",
+    description=(
+        "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. "
+        "Returns the stored schedule and its next upcoming run times."
+    ),
 )
 async def create_workflow_schedule(
     workflow_permanent_id: str,
@@ -370,6 +378,7 @@ async def create_workflow_schedule(
     tags=["Schedules"],
     operation_id="schedules_list",
     summary="List schedules for an agent",
+    description="List all schedules attached to a single agent. Returns the schedules in creation order.",
 )
 async def list_workflow_schedules(
     workflow_permanent_id: str,
@@ -391,6 +400,10 @@ async def list_workflow_schedules(
     tags=["Schedules"],
     operation_id="schedules_get",
     summary="Get an agent schedule by id",
+    description=(
+        "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, "
+        "parameters, enabled state, and next upcoming run times."
+    ),
 )
 async def get_workflow_schedule(
     workflow_permanent_id: str,
@@ -418,6 +431,10 @@ async def get_workflow_schedule(
     tags=["Schedules"],
     operation_id="schedules_update",
     summary="Update an agent schedule",
+    description=(
+        "Replace a schedule's cron expression, timezone, run parameters, and enabled state. "
+        "Returns the updated schedule and its next upcoming run times."
+    ),
 )
 async def update_workflow_schedule(
     workflow_permanent_id: str,
@@ -562,6 +579,7 @@ async def update_workflow_schedule(
     tags=["Schedules"],
     operation_id="schedules_enable",
     summary="Enable an agent schedule",
+    description="Resume a paused schedule so it starts triggering runs again. Returns the updated schedule.",
 )
 async def enable_workflow_schedule(
     workflow_permanent_id: str,
@@ -587,6 +605,7 @@ async def enable_workflow_schedule(
     tags=["Schedules"],
     operation_id="schedules_disable",
     summary="Disable an agent schedule",
+    description="Pause a schedule so it stops triggering runs, without deleting it. Returns the updated schedule.",
 )
 async def disable_workflow_schedule(
     workflow_permanent_id: str,
@@ -611,6 +630,7 @@ async def disable_workflow_schedule(
     tags=["Schedules"],
     operation_id="schedules_delete",
     summary="Delete an agent schedule",
+    description="Permanently delete a schedule so it never triggers again. Returns an acknowledgement flag.",
 )
 async def delete_workflow_schedule_route(
     workflow_permanent_id: str,

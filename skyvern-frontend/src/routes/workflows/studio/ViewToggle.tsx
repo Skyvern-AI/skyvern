@@ -41,11 +41,11 @@ export function ViewToggle({
       aria-label={ariaLabel ?? label}
       aria-pressed={active}
       className={cn(
-        "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium",
+        "inline-flex h-7 items-center gap-1.5 rounded-md px-1.5 text-xs font-medium",
         "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
         "disabled:pointer-events-none disabled:opacity-40",
         active
-          ? "bg-accent text-foreground"
+          ? "bg-foreground text-background"
           : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
       )}
     >

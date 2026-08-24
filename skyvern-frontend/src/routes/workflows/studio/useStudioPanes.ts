@@ -15,6 +15,7 @@ import {
   resolveOpenPanes,
   searchWithPanes,
   searchWithRunReference,
+  toReadableSearch,
   togglePane as togglePaneIn,
   withCopilotSelection,
   withPaneClosed,
@@ -22,6 +23,7 @@ import {
   type CopilotPaneSelection,
   type StudioPaneId,
 } from "./panes";
+import { SELECTED_BLOCK_SEARCH_PARAM } from "../editor/hooks/useSelectedBlockUrlSync";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
@@ -31,7 +33,26 @@ type ApplyPanesOptions = Pick<NavigateOptions, "state"> & {
   // layout class (edit/run). System writes leave this unset so they never
   // overwrite a user's last-chosen arrangement.
   learn?: boolean;
+  // Written in the SAME navigation as the pane change. null clears the value;
+  // undefined leaves it untouched.
+  selectedBlockLabel?: string | null;
 };
+
+function withSelectedBlockLabel(
+  search: string,
+  selectedBlockLabel: string | null | undefined,
+): string {
+  if (selectedBlockLabel === undefined) {
+    return search;
+  }
+  const params = new URLSearchParams(search);
+  if (selectedBlockLabel === null) {
+    params.delete(SELECTED_BLOCK_SEARCH_PARAM);
+  } else {
+    params.set(SELECTED_BLOCK_SEARCH_PARAM, selectedBlockLabel);
+  }
+  return toReadableSearch(params);
+}
 
 type PaneWriteKind = "normal" | "copilot-only" | "exact" | "reorder";
 
@@ -236,11 +257,17 @@ export function useStudioPanes() {
         });
       }
       if (!nonCopilotChanged && writeKind !== "normal") {
-        if (options !== undefined && "state" in options) {
+        if (
+          options !== undefined &&
+          ("state" in options || options.selectedBlockLabel !== undefined)
+        ) {
           navigate(
             {
               pathname: location.pathname,
-              search,
+              search: withSelectedBlockLabel(
+                search,
+                options.selectedBlockLabel,
+              ),
               hash: location.hash,
             },
             { replace: true, state: options.state },
@@ -259,7 +286,10 @@ export function useStudioPanes() {
       navigate(
         {
           pathname: location.pathname,
-          search: searchWithPanes(search, urlNext),
+          search: withSelectedBlockLabel(
+            searchWithPanes(search, urlNext),
+            options?.selectedBlockLabel,
+          ),
           hash: location.hash,
         },
         {

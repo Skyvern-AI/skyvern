@@ -17,14 +17,8 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import streaming_adapter
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    CopilotToolBlockerSignal,
-    stash_blocker_signal,
-)
-from skyvern.forge.sdk.copilot.challenge_evidence import composition_challenge_carrier
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     CREDENTIAL_FILL_TOOL_NAME,
-    ONE_TIME_CODE_CREDENTIAL_FIELD,
     credential_scout_gap,
     credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
@@ -44,7 +38,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
 )
 from skyvern.forge.sdk.copilot.completion_criteria_store import requested_output_paths
 from skyvern.forge.sdk.copilot.completion_verification import only_structural_requested_output_abstentions
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, interactive_challenge_controls
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -52,7 +46,6 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause
-from skyvern.forge.sdk.copilot.credential_resolution import url_parts
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
@@ -86,17 +79,10 @@ from skyvern.forge.sdk.copilot.result_evidence import (
     mint_scout_observation_contract,
     scout_observation_bound_paths,
 )
-from skyvern.forge.sdk.copilot.run_outcome import (
-    TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODES,
-    RecordedRunOutcome,
-    run_outcome_display_reason,
-    terminal_challenge_disposition,
-)
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
 )
-from skyvern.forge.sdk.copilot.runtime_authoring_repair import same_run_typed_challenge_kind
-from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
+from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotActionRelation, ScreenshotEntry
 from skyvern.forge.sdk.copilot.terminal_predicates import (
     artifact_health_blocked,
     outcome_criteria_evaluated,
@@ -131,6 +117,7 @@ TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 # constant so tests can shrink it instead of paying a full second per deadline.
 MIN_DEADLINE_REMAINING_SECONDS = 1.0
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
+PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
 TOKEN_BUDGET = DEFAULT_TOKEN_BUDGET
@@ -194,117 +181,6 @@ def _effective_proxy_label(ctx: Any) -> str | None:
     return _normalized_proxy_label(getattr(workflow, "proxy_location", None))
 
 
-def _typed_terminal_challenge_outcome(ctx: Any) -> RecordedRunOutcome | None:
-    outcome = getattr(ctx, "last_run_outcome", None)
-    if not isinstance(outcome, RecordedRunOutcome):
-        return None
-    if outcome.reason_code not in TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODES:
-        return None
-    return outcome
-
-
-def _structured_page_challenge_reason(ctx: Any, evidence: dict[str, Any] | None = None) -> str | None:
-    if evidence is None:
-        evidence = getattr(ctx, "composition_page_evidence", None)
-    if not isinstance(evidence, dict):
-        return None
-    challenge_state = evidence.get("challenge_state")
-    if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
-        # This raw page kind is folded into an internal reason here; halt
-        # metadata sanitizes it through run_outcome_display_reason below.
-        kind = str(challenge_state.get("kind") or "site challenge").replace("_", " ")
-        if challenge_state.get("requires_human_verification") is True:
-            if "verification" in kind.lower() or "captcha" in kind.lower():
-                return f"{kind} requires manual completion"
-            return f"{kind} requires human verification"
-        if challenge_state.get("gates_submit_controls") is True:
-            return f"{kind} gates the submit/search controls"
-    controls = evidence.get("challenge_controls")
-    if isinstance(controls, list) and interactive_challenge_controls(controls):
-        return "interactive challenge controls are visible on the page"
-    return None
-
-
-def _terminal_challenge_halt_signal(
-    ctx: AgentContext,
-    *,
-    evidence_source: str,
-    evidence_reason: str,
-    blocked_tool: str = "update_and_run_blocks",
-    challenge_evidence_source: str | None = None,
-) -> CopilotToolBlockerSignal:
-    workflow_run_id = ctx.last_run_blocks_workflow_run_id
-    safe_evidence_reason = (
-        run_outcome_display_reason(evidence_reason) or "Structured challenge evidence reported a terminal blocker."
-    )
-    disposition = terminal_challenge_disposition(
-        challenge_kind=same_run_typed_challenge_kind(ctx.composition_page_evidence, workflow_run_id),
-        runs_this_turn=ctx.block_run_calls_this_turn,
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=(
-            "Structured challenge evidence confirms this path is blocked: "
-            f"{safe_evidence_reason}. Do NOT retry block-running tools, do NOT try a proxy/location switch "
-            "in this turn, and do NOT claim the workflow is verified end-to-end. Reply with the blocker."
-        ),
-        user_facing_reason=disposition.user_facing_reason,
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code=disposition.internal_reason_code,
-        blocked_tool=blocked_tool,
-        extra={
-            "run_outcome_reason_code": disposition.run_outcome_reason_code,
-            "challenge_kind": disposition.challenge_kind.value if disposition.challenge_kind else None,
-            "evidence_source": evidence_source,
-            "challenge_evidence_source": challenge_evidence_source,
-            "evidence_reason": safe_evidence_reason,
-            "workflow_run_id": workflow_run_id,
-        },
-    )
-
-
-def terminal_challenge_blocker_signal_from_page_evidence(
-    ctx: Any,
-    *,
-    blocked_tool: str,
-    evidence_source: str = "page_evidence",
-    evidence: dict[str, Any] | None = None,
-) -> CopilotToolBlockerSignal | None:
-    packet = evidence if evidence is not None else getattr(ctx, "composition_page_evidence", None)
-    page_reason = _structured_page_challenge_reason(ctx, packet)
-    if page_reason is None:
-        return None
-    if isinstance(packet, Mapping) and one_time_code_fill_supersedes_challenge(ctx, packet):
-        LOG.info(
-            "copilot_terminal_challenge_declined_credential_served",
-            blocked_tool=blocked_tool,
-            evidence_source=evidence_source,
-        )
-        return None
-    carrier = composition_challenge_carrier(packet)
-    return _terminal_challenge_halt_signal(
-        ctx,
-        evidence_source=evidence_source,
-        evidence_reason=page_reason,
-        blocked_tool=blocked_tool,
-        challenge_evidence_source=carrier.value if carrier else None,
-    )
-
-
-def _current_page_challenge_requires_stop(evidence: dict[str, Any]) -> bool:
-    challenge_state = evidence.get("challenge_state")
-    if isinstance(challenge_state, dict) and (
-        challenge_state.get("requires_human_verification") is True
-        or challenge_state.get("gates_submit_controls") is True
-    ):
-        return True
-    controls = evidence.get("challenge_controls")
-    return isinstance(controls, list) and bool(interactive_challenge_controls(controls))
-
-
 def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for entry in reversed(getattr(ctx, "flow_evidence", None) or []):
@@ -322,133 +198,6 @@ def _current_page_evidence_candidates(ctx: Any) -> list[dict[str, Any]]:
 
 # Challenge kinds a saved one-time code cannot answer, whoever else is on the page. `unknown` is the
 # DOM detector's verdict for every anti-bot vendor it has no name for, so it belongs here too.
-_CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS = (
-    "captcha",
-    "robot",
-    "turnstile",
-    "cloudflare",
-    "access",
-    "human",
-    "unknown",
-)
-
-
-def _observed_page_key(url: Any) -> str | None:
-    if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
-        return None
-    parts = url_parts(url.strip())
-    return parts[1] if parts else None
-
-
-def _one_time_code_fill_targets(ctx: Any) -> set[tuple[str, str]]:
-    """(page key, selector) for every saved one-time code this turn filled.
-
-    Keyed by page as well as selector because an observation packet records only the selector, and
-    the same selector text recurs across sites.
-
-    Carried entries are a prior turn's history, not this turn's acts: the trajectory is seeded with
-    the retained record, and a code entered on an earlier turn cannot supersede a challenge this
-    turn is looking at.
-    """
-    targets: set[tuple[str, str]] = set()
-    for item in getattr(ctx, "scout_trajectory", None) or []:
-        if not isinstance(item, Mapping):
-            continue
-        if item.get("carried") is True:
-            continue
-        if str(item.get("tool_name") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        if str(item.get("credential_field") or "").strip() != ONE_TIME_CODE_CREDENTIAL_FIELD:
-            continue
-        page = _observed_page_key(item.get("source_url"))
-        selector = str(item.get("selector") or "").strip()
-        if page and selector:
-            targets.add((page, selector))
-    return targets
-
-
-def _challenge_a_code_cannot_answer(evidence: Mapping[str, Any]) -> bool:
-    """A deny-list on purpose: an unrecognized kind stays answerable rather than halting.
-
-    `challenge_state.kind` is free-form vision output, so an allow-list would fail closed on the
-    misread this ticket exists to fix — the witnessed failure was labelled `other`.
-    """
-    controls = evidence.get("challenge_controls")
-    if isinstance(controls, list) and interactive_challenge_controls(controls):
-        return True
-    challenge_state = evidence.get("challenge_state")
-    kind = str(challenge_state.get("kind") or "").lower() if isinstance(challenge_state, Mapping) else ""
-    return any(term in kind for term in _CODE_UNSATISFIABLE_CHALLENGE_KIND_TERMS)
-
-
-def one_time_code_fill_supersedes_challenge(ctx: Any, evidence: Mapping[str, Any]) -> bool:
-    """Whether this turn filled a saved one-time code into the observed page after this challenge
-    was captured.
-
-    Scoped to challenges older than the code so it can never outlive one: a submit reaches the page
-    by routes that mint no observation of their own (an Enter keypress, a block run), so anything
-    observed after the fill is left to halt.
-    """
-    # Nothing is superseded by a packet that reports no challenge, and a caller may hold one whose
-    # stop was decided by the run rather than by this page.
-    if not isinstance(evidence, dict) or _structured_page_challenge_reason(ctx, evidence) is None:
-        return False
-    page = _observed_page_key(evidence.get("current_url") or evidence.get("inspected_url"))
-    if page is None or _challenge_a_code_cannot_answer(evidence):
-        return False
-    targets = _one_time_code_fill_targets(ctx)
-    if not targets:
-        return False
-    challenge_seen = False
-    for entry in getattr(ctx, "flow_evidence", None) or []:
-        if not isinstance(entry, dict):
-            continue
-        packet = entry.get("evidence")
-        if not isinstance(packet, dict):
-            continue
-        # Both writers alias the appended packet into `composition_page_evidence`; a shallow copy
-        # there would silently make this never match, which halts rather than misfires.
-        if packet is evidence:
-            challenge_seen = True
-            continue
-        if not challenge_seen or str(packet.get("interaction_tool") or "").strip() != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        selector = str(packet.get("interaction_selector") or "").strip()
-        # An interaction packet carries the post-interaction URL, so it is attributable to the page
-        # it acted on only by the source it recorded.
-        if (page, selector) in targets and _observed_page_key(packet.get("interaction_source_url")) == page:
-            return True
-    return False
-
-
-def _maybe_stash_terminal_challenge_halt(ctx: Any) -> None:
-    if getattr(ctx, "turn_halt", None) is not None:
-        return
-    outcome = _typed_terminal_challenge_outcome(ctx)
-    if outcome is not None:
-        reason = outcome.display_reason or "Structured evidence reported a terminal site challenge."
-        carrier = composition_challenge_carrier(getattr(ctx, "composition_page_evidence", None))
-        signal = _terminal_challenge_halt_signal(
-            ctx,
-            evidence_source="run_outcome",
-            evidence_reason=reason,
-            challenge_evidence_source=carrier.value if carrier else None,
-        )
-        stash_blocker_signal(ctx, signal)
-        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
-        return
-    # `last_test_ok is False` is the failed-run sentinel for this backstop.
-    # Free-standing visible challenge hints remain diagnostic until a run/test
-    # also records anti-bot evidence.
-    if getattr(ctx, "last_test_ok", None) is not False:
-        return
-    if not getattr(ctx, "last_test_anti_bot", None):
-        return
-    page_signal = terminal_challenge_blocker_signal_from_page_evidence(ctx, blocked_tool="update_and_run_blocks")
-    if page_signal is None:
-        return
-    stash_blocker_signal(ctx, page_signal)
-    stash_turn_halt_from_blocker_signal(ctx, page_signal, source="enforcement")
 
 
 class CopilotTotalTimeoutError(Exception):
@@ -702,13 +451,42 @@ def pending_screenshot_message(ctx: Any) -> dict[str, Any] | None:
     if not isinstance(pending, list) or not pending:
         return None
     screenshots: list[ScreenshotEntry] = list(pending)
+    provenance_lines: list[str] = []
+    for entry in screenshots:
+        provenance = entry.provenance
+        fields = {
+            "capture_id": entry.capture_id,
+            "source_tool": provenance.source_tool,
+            "captured_url": provenance.captured_url or "unavailable",
+            "dispatch_url": provenance.dispatch_url or "unavailable",
+            "observation_step": provenance.observation_step
+            if provenance.observation_step is not None
+            else "unavailable",
+            "browser_session_id": provenance.browser_session_id or "unavailable",
+            "dispatch_browser_session_id": provenance.dispatch_browser_session_id or "unavailable",
+            "producer_browser_session_id": provenance.producer_browser_session_id or "unavailable",
+            "session_binding": provenance.session_binding.value,
+            "workflow_run_id": provenance.workflow_run_id or "unavailable",
+            "action_relation": provenance.action_relation.value,
+        }
+        rendered = "; ".join(f"{key}={value}" for key, value in fields.items())
+        relation = (
+            "This frame was captured during the named page observation."
+            if provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+            else "This frame records the named source at its stated action relation."
+        )
+        provenance_lines.append(
+            f"Frame provenance: {rendered}. {relation} Its provenance does not claim freshness after later actions."
+        )
+    paired_marker = (
+        PAIRED_OBSERVATION_MARKER
+        if screenshots[0].provenance.action_relation is ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+        else ""
+    )
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": (
-                SCREENSHOT_SENTINEL + "Here is the most recent screenshot captured this turn. "
-                "It shows the page as of that capture and may predate later actions."
-            ),
+            "text": SCREENSHOT_SENTINEL + paired_marker + "\n".join(provenance_lines),
         },
     ]
     for entry in screenshots:
@@ -728,6 +506,8 @@ def _consume_pending_screenshots(ctx: Any) -> dict[str, Any] | None:
     pending = getattr(ctx, "pending_screenshots", None)
     if isinstance(pending, list):
         pending.clear()
+    if hasattr(ctx, "pending_frame_lease"):
+        ctx.pending_frame_lease = None
     return message
 
 
@@ -762,8 +542,6 @@ def enforcement_decision(
     raise_if_turn_halt(ctx, verified=verified)
     _raise_if_unrecoverable_contract_stop(ctx)
 
-    _maybe_stash_terminal_challenge_halt(ctx)
-    raise_if_turn_halt(ctx, verified=verified)
     return None
 
 
@@ -788,6 +566,22 @@ def is_screenshot_message(item: Any) -> bool:
         if isinstance(text, str) and text.startswith(SCREENSHOT_SENTINEL):
             return True
     return False
+
+
+def is_paired_observation_message(item: Any) -> bool:
+    """Return True only for explicitly marked observation-bound frames."""
+    if _item_field(item, "role") != "user":
+        return False
+    prefix = SCREENSHOT_SENTINEL + PAIRED_OBSERVATION_MARKER
+    content = _item_field(item, "content")
+    if isinstance(content, str):
+        return content.startswith(prefix)
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(_item_field(block, "text"), str) and _item_field(block, "text").startswith(prefix)
+        for block in content
+    )
 
 
 def _is_nudge_message(item: Any) -> bool:

@@ -1,8 +1,4 @@
-import {
-  DownloadIcon,
-  ExclamationTriangleIcon,
-  FileIcon,
-} from "@radix-ui/react-icons";
+import { DownloadIcon, FileIcon } from "@radix-ui/react-icons";
 
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
@@ -63,99 +59,71 @@ function getErrorMessage(error: RunOutputError): string | null {
   ]);
 }
 
-function uniqueNonEmpty(
-  values: Array<string | null | undefined>,
-): Array<string> {
+type RunErrorRow = { code: string | null; message: string | null };
+
+// One row per distinct (code, message); a code-only entry stays a row so a
+// failure with no prose still shows its code.
+function getErrorRows(errors: RunOutputError[]): RunErrorRow[] {
   const seen = new Set<string>();
-  const result: Array<string> = [];
-  for (const value of values) {
-    const trimmed = value?.trim();
-    if (!trimmed || seen.has(trimmed)) {
+  const rows: RunErrorRow[] = [];
+  for (const error of errors) {
+    const code = getErrorCode(error);
+    const message = getErrorMessage(error);
+    if (!code && !message) {
       continue;
     }
-    seen.add(trimmed);
-    result.push(trimmed);
+    const key = `${code ?? ""}\u0000${message ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    rows.push({ code, message });
   }
-  return result;
-}
-
-function getVisibleErrorCodes(errors: RunOutputError[]): string[] {
-  return uniqueNonEmpty(errors.map(getErrorCode));
-}
-
-function getVisibleErrors(errors: RunOutputError[]): RunOutputError[] {
-  return errors.filter((error) => getErrorMessage(error) !== null);
+  return rows;
 }
 
 function hasRenderableErrors(errors: RunOutputError[]): boolean {
-  return (
-    getVisibleErrorCodes(errors).length > 0 ||
-    getVisibleErrors(errors).length > 0
-  );
+  return getErrorRows(errors).length > 0;
 }
 
-function RunErrorsPanel({ errors }: { errors: RunOutputError[] }) {
-  const visibleErrorCodes = getVisibleErrorCodes(errors);
-  const visibleErrors = getVisibleErrors(errors);
-
-  if (visibleErrorCodes.length === 0 && visibleErrors.length === 0) {
+/**
+ * The run's errors as a field among the Outputs fields — same label grammar
+ * as "Extracted information" and "Run outputs", one row per error, the code
+ * once. The Timeline view's failure alert is where the failure gets a card
+ * and its actions; this view is the data.
+ */
+function RunErrorsField({ errors }: { errors: RunOutputError[] }) {
+  const rows = getErrorRows(errors);
+  if (rows.length === 0) {
     return null;
   }
-
   return (
-    <div className="rounded-md border border-destructive/35 bg-destructive/10 p-3">
-      <div className="flex items-start gap-2">
-        <ExclamationTriangleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-        <div className="min-w-0 flex-1 space-y-3">
-          <div>
-            <div className="text-xs font-semibold text-foreground">
-              Run errors
-            </div>
-            <div className="mt-0.5 text-xs text-muted-foreground">
-              Errors and failure codes from this run
-            </div>
-          </div>
-          {visibleErrorCodes.length > 0 ? (
-            <div className="flex flex-wrap gap-1.5">
-              {visibleErrorCodes.map((code) => (
-                <span
-                  key={code}
-                  className="rounded border border-destructive/30 bg-destructive/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-destructive"
-                >
-                  {code}
-                </span>
-              ))}
-            </div>
-          ) : null}
-          {visibleErrors.length > 0 ? (
-            <div className="space-y-2">
-              {visibleErrors.map((error, index) => {
-                const code = getErrorCode(error);
-                const message = getErrorMessage(error);
-                return (
-                  <div
-                    key={`${code ?? "error"}-${index}`}
-                    className="rounded-md border border-destructive/20 bg-slate-elevation2 px-3 py-2 text-sm text-foreground"
-                  >
-                    <div className="flex min-w-0 items-start gap-2">
-                      {code ? (
-                        <span className="mt-0.5 shrink-0 rounded bg-destructive/15 px-1.5 py-0.5 font-mono text-[11px] text-destructive">
-                          {code}
-                        </span>
-                      ) : null}
-                      {message ? (
-                        <span className="min-w-0 whitespace-pre-wrap break-words">
-                          {message}
-                        </span>
-                      ) : null}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
-        </div>
-      </div>
+    <div className="flex flex-col gap-2">
+      <span className="text-xs font-medium text-muted-foreground">
+        Errors
+        <span className="ml-1.5 tabular-nums text-muted-foreground/70">
+          {rows.length}
+        </span>
+      </span>
+      <ul className="divide-y divide-border/50">
+        {rows.map((row, index) => (
+          <li
+            key={`${row.code ?? "error"}-${index}`}
+            className="flex items-start gap-3 py-1.5 text-sm text-foreground"
+          >
+            {row.code ? (
+              <code className="shrink-0 font-mono text-[11px] leading-5 text-destructive">
+                {row.code}
+              </code>
+            ) : null}
+            {row.message ? (
+              <span className="min-w-0 whitespace-pre-wrap break-words">
+                {row.message}
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -194,7 +162,7 @@ export function RunOutputsSection({
 
   return (
     <div className="flex flex-col gap-5">
-      <RunErrorsPanel errors={errors} />
+      <RunErrorsField errors={errors} />
       {webhookFailureReason ? (
         <div className="flex flex-col gap-2">
           <span className="text-xs font-medium text-muted-foreground">

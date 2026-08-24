@@ -12,7 +12,7 @@ import { ActionsApiResponse, getReadableActionType } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
-import { useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   ReloadIcon,
@@ -20,6 +20,7 @@ import {
   ChevronDownIcon,
   CheckIcon,
   ArrowUpIcon,
+  Pencil1Icon,
 } from "@radix-ui/react-icons";
 import { createPortal } from "react-dom";
 import { stringify as convertToYAML } from "yaml";
@@ -27,7 +28,6 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
-import { usePasteSkillHintStore } from "@/store/usePasteSkillHintStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
@@ -64,6 +64,8 @@ import {
   WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { WorkflowCopilotHistory } from "./WorkflowCopilotHistory";
+import { SelectedBlockChip } from "./SelectedBlockChip";
+import { readSelectedBlockLabel } from "./selectedBlockLabel";
 import { selectAutoBoundReceiptIndexes } from "./autoBoundReceiptIndexes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
@@ -118,6 +120,16 @@ import {
   useReleaseStudioRun,
   useSwitchStudioRun,
 } from "@/routes/workflows/studio/runSwitchNavigation";
+import { searchWithSystemBlockFocus } from "@/routes/workflows/editor/hooks/useSelectedBlockUrlSync";
+import { studioPanelId } from "@/routes/workflows/studio/constants";
+import {
+  liveLocationState,
+  liveSearch,
+} from "@/routes/workflows/studio/liveSearch";
+import { resolveOpenPanes } from "@/routes/workflows/studio/panes";
+import { useRecordingStore } from "@/store/useRecordingStore";
+import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
@@ -806,7 +818,6 @@ export function WorkflowCopilotChat({
   );
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
   const [inputValue, setInputValue] = useState("");
-  const dismissPasteSkillHint = usePasteSkillHintStore((s) => s.dismiss);
   const [isLoading, setIsLoading] = useState(false);
   // A stop is a round trip to the backend; without this the control stays
   // live-looking and users press it repeatedly.
@@ -931,6 +942,11 @@ export function WorkflowCopilotChat({
   // The run this turn pointed the studio's Browser pane at, so the focus is
   // written once per run and released only if we still own it.
   const focusedTurnRunId = useRef<string | null>(null);
+  // Build-follow: while a docked turn streams, the canvas follows the block the
+  // copilot is working on. Any pointer press outside the copilot pane hands
+  // control back to the user for the rest of the turn (log-tail semantics).
+  const buildFollowEngaged = useRef(false);
+  const lastFollowedLabelRef = useRef<string | null>(null);
   // Focusing the turn's run is the copilot acting for the user, not a
   // navigation they asked for, so it must not add a Back step.
   const switchStudioRun = useSwitchStudioRun({
@@ -984,6 +1000,8 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId: routeWorkflowRunId } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const workflowPermanentId = useWorkflowPermanentId();
   // The studio focuses a run via ?wr= (not a path param), so the route param is
   // empty there; an explicit prop grounds the chat in that run and wins.
@@ -1121,6 +1139,74 @@ export function WorkflowCopilotChat({
       releaseStudioRun(focused);
     },
     [releaseStudioRun],
+  );
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      if (!buildFollowEngaged.current) return;
+      const target = event.target;
+      if (
+        !(target instanceof Element) ||
+        !target.closest(`#${studioPanelId("copilot")}`)
+      ) {
+        buildFollowEngaged.current = false;
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => window.removeEventListener("pointerdown", onPointerDown, true);
+  }, []);
+  const followBuildLabel = useCallback(
+    (label: string | null) => {
+      if (!docked || !label) return;
+      const handle = useWorkflowBlockSearchStore.getState().handle;
+      if (!handle) return;
+      // Follow is a courtesy, so every guard errs toward not moving: the user
+      // disengaged (touched the studio), recording mode owns the panes, or the
+      // frame repeats the block already followed. resolveTimelineBlockJumpNodeId
+      // adds the editor-open and unique-canvas-match rules.
+      if (
+        !buildFollowEngaged.current ||
+        useRecordingStore.getState().isRecording ||
+        label === lastFollowedLabelRef.current
+      ) {
+        return;
+      }
+      const nodeId = resolveTimelineBlockJumpNodeId({
+        editorOpen: resolveOpenPanes(window.location.search).includes("editor"),
+        targets: handle.getTargets(),
+        label,
+      });
+      if (nodeId === null) return;
+      lastFollowedLabelRef.current = label;
+      // Mark the selection before it exists: focusBlock selects on the canvas
+      // and useSelectedBlockUrlSync mirrors that into ?selected-block=, merging
+      // against the live URL — the marker has to already be there, or the run
+      // pin reads the follow as a block the user picked.
+      navigate(
+        {
+          pathname: location.pathname,
+          search: searchWithSystemBlockFocus(
+            liveSearch(location.search),
+            label,
+          ),
+          hash: location.hash,
+        },
+        // Same preservation useStudioPanes applies: a follow must not drop the
+        // studio's location state (the copilot seed message rides in it).
+        {
+          replace: true,
+          state: liveLocationState(location.search, location.state),
+        },
+      );
+      handle.focusBlock(nodeId);
+    },
+    [
+      docked,
+      navigate,
+      location.pathname,
+      location.search,
+      location.hash,
+      location.state,
+    ],
   );
   const respondToCredentialPause = useCallback(
     async (
@@ -2135,6 +2221,8 @@ export function WorkflowCopilotChat({
 
       const cancelToken = crypto.randomUUID();
       pendingCancelToken.current = cancelToken;
+      buildFollowEngaged.current = true;
+      lastFollowedLabelRef.current = null;
 
       pendingMessageId.current = userMessageId;
       if (!options.queuedMessageId) {
@@ -2489,6 +2577,7 @@ export function WorkflowCopilotChat({
             idempotency_key: options.idempotencyKey ?? null,
             target_block_label: targetBlockLabel,
             product_action: endToEndAction ? "test_end_to_end" : null,
+            selected_block_label: readSelectedBlockLabel(),
             keep_pending_proposal:
               copilotUxV1Enabled && Boolean(pendingProposalTurnId),
             // Only opt in behind the flag; flag-off omits the field entirely so
@@ -2511,6 +2600,7 @@ export function WorkflowCopilotChat({
                 focusTurnRun(payload.workflow_run_id);
                 return false;
               case "block_progress":
+                followBuildLabel(payload.block_label);
                 applyStoredNarrativeEvent(payload);
                 // Earliest frame carrying the run id on a new backend — start
                 // the live poll here so rows appear mid-execution.
@@ -2582,6 +2672,11 @@ export function WorkflowCopilotChat({
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {
+                // The draft frame summarizes the whole draft; the newest block
+                // is the one being worked on.
+                followBuildLabel(
+                  payload.block_labels[payload.block_labels.length - 1] ?? null,
+                );
                 // Render the staged workflow on the canvas mid-turn. Only
                 // mark the turn as having staged content if applyWorkflowUpdate
                 // succeeds — a swallowed update would otherwise trigger a
@@ -2665,6 +2760,7 @@ export function WorkflowCopilotChat({
         // stream) would otherwise leave a live poll running past the run.
         stopAllRecordedActionsPolls();
         releaseTurnRun();
+        buildFollowEngaged.current = false;
       }
     },
     [
@@ -2680,6 +2776,7 @@ export function WorkflowCopilotChat({
       fetchRecordedActions,
       finalizeRecordedActionsPoll,
       focusTurnRun,
+      followBuildLabel,
       getSaveData,
       inputValue,
       isSpeechListening,
@@ -3377,6 +3474,13 @@ export function WorkflowCopilotChat({
                   Example: "Build an agent to find the top post on hackernews
                   today"
                 </p>
+                {/* The only in-product pointer to this: the newer composer
+                    placeholder dropped the "or paste recorded steps" clause, so
+                    without it here the affordance is undiscoverable. */}
+                <p className="mt-2 text-muted-foreground">
+                  Already recorded this with another agent? Copy that workflow's
+                  prompt text and paste it here.
+                </p>
               </div>
             ) : null}
             <ConvoAggregatePill
@@ -3906,7 +4010,10 @@ export function WorkflowCopilotChat({
         copilotV2Enabled &&
         queuedPrompt &&
         (queuedPrompt.reason === "working" || queuedBubbleOrphaned) ? (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-border bg-slate-elevation2 px-2.5 py-1.5 text-xs text-muted-foreground">
+          // Same state as the working row's queued pill, which a user on this
+          // flag path also sees — so it takes the same tinted-pill grammar
+          // rather than a bordered box, and the same edit glyph.
+          <div className="mb-2 flex items-center gap-2 rounded-full bg-slate-400/[0.12] py-0.5 pl-2.5 pr-1 text-xs text-muted-foreground">
             <ReloadIcon className="h-3 w-3 shrink-0 animate-spin" />
             <span className="shrink-0 font-medium text-foreground">Queued</span>
             <span className="flex-1 truncate">{queuedPromptWaitingStatus}</span>
@@ -3915,9 +4022,9 @@ export function WorkflowCopilotChat({
               onClick={restoreQueuedPromptToComposer}
               title="Edit queued message"
               aria-label="Edit queued message"
-              className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              className="shrink-0 rounded px-1 text-muted-foreground hover:text-accent-foreground"
             >
-              <Cross2Icon className="h-3 w-3" />
+              <Pencil1Icon className="h-3 w-3" />
             </button>
           </div>
         ) : null}
@@ -3929,6 +4036,7 @@ export function WorkflowCopilotChat({
             {inputStatusText}
           </div>
         ) : null}
+        <SelectedBlockChip />
         <div
           className={
             copilotUxV1Enabled && copilotV2Enabled
@@ -3960,7 +4068,6 @@ export function WorkflowCopilotChat({
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
-            onPaste={() => dismissPasteSkillHint()}
             onKeyDown={handleKeyPress}
             rows={1}
             className={

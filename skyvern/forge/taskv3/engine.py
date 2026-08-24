@@ -33,6 +33,7 @@ from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     ActivityRecency,
     LoopOutcome,
+    SubmitWatch,
     ToolSpec,
     make_finish_tool,
     run_agent_tool_loop,
@@ -79,6 +80,7 @@ How to work:
 Rules:
 - Fill fields from the task's data and satisfy required fields rather than failing over a missing value: prefer the provided values, and for an ordinary required field with no exact value, enter the most reasonable value you can. Do not invent sensitive or identifying values (government IDs, financial details, or legal/eligibility attestations); if one of those is required and not provided, stop and report it rather than guessing. Leave optional fields blank when you have no basis to fill them.
 - A page message rejecting your submission and inviting you to try again is not an instruction to loop: retry at most once, and if the outcome is unchanged, finish honestly naming the rejection as the reason.
+- When a submit is refused, find the page's own message in `observe`: a `text:` line that reads as a rejection or validation message, or a field marked `*invalid`. Fix the named field if the task's data allows; otherwise finish and quote that message as the reason. A captcha widget that is merely present on the page is not evidence that it blocked the submission.
 - Do not submit forms or take irreversible actions unless the goal explicitly instructs it."""
 
 
@@ -163,6 +165,7 @@ async def run_task_v3_agent_loop(
     step: Any = None,
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: Callable[[list[tuple[str, dict[str, Any], bool]]], Awaitable[None]] | None = None,
+    on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
     extra_tools: list[ToolSpec] | None = None,
     extra_system_guidance: str = "",
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
@@ -171,6 +174,7 @@ async def run_task_v3_agent_loop(
     page_free: bool = False,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     max_settle_deferrals: int = DEFAULT_MAX_SETTLE_DEFERRALS,
+    pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> LoopOutcome:
     """Run one Task V3 task to completion against `page`, returning the loop outcome.
 
@@ -198,9 +202,12 @@ async def run_task_v3_agent_loop(
     # recovery — live with the dispatcher); the finish gate owns the settle wait, bounded by this
     # run's deadline and cancellation so probing cannot overrun either. Page-free runs never probe.
     activity = ActivityRecency()
+    submit_watch = SubmitWatch()
     finish_tool = make_finish_tool(
         page_fingerprint=None if page_free else page_fingerprint,
         max_settle_deferrals=max_settle_deferrals,
+        pending_marker=None if page_free else pending_marker,
+        submit_watch=None if page_free else submit_watch,
         should_cancel=should_cancel,
         deadline_at=time.monotonic() + deadline_seconds if deadline_seconds is not None else None,
         activity=activity,
@@ -220,11 +227,13 @@ async def run_task_v3_agent_loop(
         call_kwargs=_build_call_kwargs(step, llm_caller),
         should_cancel=should_cancel,
         on_action_round=on_action_round,
+        on_pre_action=on_pre_action,
         max_tokens=max_tokens,
         deadline_seconds=deadline_seconds,
         retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
         max_call_retries=DEFAULT_MAX_CALL_RETRIES,
         activity=activity,
+        submit_watch=None if page_free else submit_watch,
     )
     LOG.info(
         "taskv3 engine loop finished",

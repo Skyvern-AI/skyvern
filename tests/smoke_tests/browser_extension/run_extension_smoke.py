@@ -371,25 +371,12 @@ async def _run_mcp_phase(
                 session_result = await call_tool("skyvern_browser_session_create")
             else:
                 previous_count = _pairing_url_count(pairing_url_capture)
-                session_task = asyncio.create_task(call_tool("skyvern_browser_session_create"))
-                try:
-                    await _approve_next_pairing(context, pairing_url_capture, previous_count)
-                except BaseException:
-                    if not session_task.done():
-                        session_task.cancel()
-                    try:
-                        incomplete_result = await session_task
-                    except BaseException:
-                        pass
-                    else:
-                        session_created = incomplete_result.get("ok") is True
-                    raise
-                session_result = await session_task
+                session_result = await call_tool("skyvern_browser_session_create")
+                if _pairing_url_count(pairing_url_capture) != previous_count:
+                    raise AssertionError("workstation grant unexpectedly opened a pairing URL")
             if session_result.get("ok") is not True:
                 raise AssertionError(f"session create failed: {_tool_error(session_result)}")
             session_created = True
-            if not legacy_mode:
-                _assert_one_pairing_url(pairing_url_capture, previous_count)
             assert pairing_token not in repr(session_result)
             assert CDP_URL_PATTERN.search(repr(session_result)) is None
 

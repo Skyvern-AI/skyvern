@@ -469,7 +469,7 @@ def test_composition_parse_html_adds_challenge_state_for_anti_bot_dom() -> None:
     assert page_evidence_needs_visual_fallback(parsed) is True
     assert "verify you are human" in parsed["anti_bot_indicators"]
     assert parsed["challenge_state"]["detected"] is True
-    assert parsed["challenge_state"]["kind"] == "human_verification"
+    assert parsed["challenge_state"]["kind"] == "captcha"
     assert parsed["challenge_state"]["source"] == "dom_html"
     assert parsed["challenge_state"]["gates_submit_controls"] is False
     assert parsed["challenge_state"]["gated_submit_controls"] == []
@@ -2195,6 +2195,40 @@ def test_structured_parses_forms_labels_options_and_submit() -> None:
     assert has_bounded_page_schema(parsed) is True
 
 
+def test_structured_select_reports_total_count_when_capture_omits_options() -> None:
+    payload = _structured_form_payload()
+    select = payload["forms"][0]["fields"][1]
+    select["option_count"] = 42
+    select["options_omitted"] = True
+
+    parsed = parse_composition_structured(
+        payload,
+        inspected_url="https://example.com/lookup",
+        current_url="https://example.com/lookup",
+    )
+
+    assert parsed is not None
+    parsed_select = parsed["forms"][0]["fields"][1]
+    assert parsed_select["option_count"] == 42
+    assert parsed_select["options_omitted"] is True
+    assert len(parsed_select["options"]) == 2
+
+
+def test_html_select_reports_total_count_when_parser_caps_options() -> None:
+    options = "".join(f'<option value="{index}">Option {index}</option>' for index in range(35))
+
+    parsed = parse_composition_html(
+        f'<html><body><form><select id="region">{options}</select></form></body></html>',
+        inspected_url="https://example.com/lookup",
+        current_url="https://example.com/lookup",
+    )
+
+    parsed_select = parsed["forms"][0]["fields"][0]
+    assert parsed_select["option_count"] == 35
+    assert parsed_select["options_omitted"] is True
+    assert len(parsed_select["options"]) == 30
+
+
 def test_structured_preserves_observed_form_control_visibility_and_disabled_state() -> None:
     payload = _structured_form_payload()
     payload["forms"][0]["fields"][0]["visible"] = True
@@ -3760,12 +3794,16 @@ async def test_capture_reports_structured_failure_without_calling_get_html() -> 
     )
 
     assert evidence is None
-    assert error == "structured page evidence failed: evaluate returned an error"
+    assert (
+        error
+        == "skyvern_evaluate returned an error while capturing structured page evidence: structured extract failed"
+    )
+    assert "structured page evidence failed: evaluate returned an error" not in error
     assert server.calls.count("skyvern_get_html") == 0
 
 
 @pytest.mark.asyncio
-async def test_capture_does_not_reflect_structured_exception_text_to_copilot() -> None:
+async def test_capture_redacts_raw_secrets_from_reflected_structured_exception_text() -> None:
     server = _RecordingCompositionServer(
         structured_json=None,
         structured_exception=RuntimeError("https://example.com/callback?token=raw-secret"),
@@ -3777,8 +3815,9 @@ async def test_capture_does_not_reflect_structured_exception_text_to_copilot() -
     )
 
     assert evidence is None
-    assert error == "skyvern_evaluate failed while capturing structured page evidence"
+    assert error.startswith("skyvern_evaluate raised while capturing structured page evidence: ")
     assert "raw-secret" not in error
+    assert "[REDACTED_SECRET]" in error
 
 
 @pytest.mark.asyncio
@@ -3916,11 +3955,13 @@ async def test_navigation_failure_uses_structured_evidence_when_bounded() -> Non
     server = _RecordingCompositionServer(structured_json=json.dumps(_structured_form_payload()))
     ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
 
-    evidence = await tools_module._composition_evidence_after_navigation_failure(
+    capture = await tools_module._composition_evidence_after_navigation_failure(
         ctx, inspected_url="https://example.com/lookup", navigation_error="boom"
     )
 
-    assert evidence is not None
+    assert capture is not None
+    evidence, frame = capture
+    assert frame is None
     assert evidence["forms"]
     assert server.calls.count("skyvern_get_html") == 0
     assert any("navigation_error_before_html_capture" in warning for warning in evidence["inspection_warnings"])
@@ -3933,8 +3974,8 @@ async def test_navigation_failure_uses_visual_fallback_after_structured_failure_
     server = _RecordingCompositionServer(structured_json=None, html=_HTML_FORM_PAGE)
     ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
 
-    async def attach_visual(_ctx: Any, evidence: dict[str, Any]) -> dict[str, Any]:
-        return {**evidence, "screenshot_used": True, "visual_evidence_summary": "A login form is visible."}
+    async def attach_visual(_ctx: Any, evidence: dict[str, Any]) -> tuple[dict[str, Any], None]:
+        return {**evidence, "screenshot_used": True, "visual_evidence_summary": "A login form is visible."}, None
 
     monkeypatch.setattr(
         tools_module.composition_capture,
@@ -3942,13 +3983,15 @@ async def test_navigation_failure_uses_visual_fallback_after_structured_failure_
         attach_visual,
     )
 
-    evidence = await tools_module._composition_evidence_after_navigation_failure(
+    capture = await tools_module._composition_evidence_after_navigation_failure(
         ctx,
         inspected_url="https://example.com/login",
         navigation_error="https://example.com/callback?token=raw-secret",
     )
 
-    assert evidence is not None
+    assert capture is not None
+    evidence, frame = capture
+    assert frame is None
     assert evidence["screenshot_used"] is True
     assert evidence["visual_evidence_summary"] == "A login form is visible."
     assert "raw-secret" not in json.dumps(evidence)
@@ -4710,9 +4753,11 @@ def test_the_page_side_capture_keeps_a_label_that_sits_outside_the_value_row() -
 @pytest.mark.parametrize(
     ("classifier_kind", "expected"),
     [
-        ("device_approval", "device_approval"),
-        ("Device_Approval", "device_approval"),
         ("captcha", "captcha"),
+        ("CAPTCHA", "captcha"),
+        ("access_denied", "access_denied"),
+        ("device_approval", None),
+        ("human_verification", None),
         ("a shape nobody enumerated", None),
         ("", None),
     ],
@@ -4729,7 +4774,7 @@ def test_merge_visual_composition_evidence_stamps_only_closed_enum_challenge_kin
     merged = merge_visual_composition_evidence(
         parsed,
         visual_summary={
-            "summary": "The sign-in is waiting for approval on another device.",
+            "summary": "A verification widget sits over the sign-in form.",
             "challenge_detected": True,
             "challenge_kind": classifier_kind,
             "challenge_location": "Centered on the page.",
@@ -4906,6 +4951,17 @@ _SATISFIABLE_TOTP_HTML = (
     "<input id='token' name='token' type='text' placeholder='123456' />"
     "<button type='submit' class='btn--login'>Login</button></form></body></html>"
 )
+_EMPTY_CODE_DISABLED_SUBMIT_HTML = (
+    "<html><head><title>Enter Code</title></head><body>"
+    "<p>Enter the code provided by your authenticator app.</p>"
+    "<form><label for='token'>Code</label>"
+    "<input id='token' name='token' type='text' />"
+    "<button type='submit' disabled>Next</button></form></body></html>"
+)
+_EMPTY_CODE_BEHIND_A_CHALLENGE_CDN_HTML = _EMPTY_CODE_DISABLED_SUBMIT_HTML.replace(
+    "</head>",
+    "<script src='https://cdn.example/challenge-platform/api.js'></script></head>",
+)
 _CAPTCHA_HTML = (
     "<html><head><title>Security Verification</title></head><body>"
     "<form><input id='lastName' name='lastName' type='text' />"
@@ -4917,10 +4973,10 @@ _ACCESS_DENIED_HTML = (
     "<html><head><title>Access Denied</title></head><body>"
     "<h1>Access denied</h1><p>You do not have permission to view this page.</p></body></html>"
 )
-_DEVICE_APPROVAL_HTML = (
-    "<html><head><title>Approve this sign-in</title></head><body>"
-    "<p>Open your authenticator app and approve this sign-in to complete verification.</p>"
-    "<form><button type='submit'>Resend request</button></form></body></html>"
+_NO_ENTRY_FIELD_HTML = (
+    "<html><head><title>Verification required</title></head><body>"
+    "<p>Complete the verification challenge to continue.</p>"
+    "<form><button type='submit'>Retry</button></form></body></html>"
 )
 _CANCEL_ONLY_HTML = (
     "<html><head><title>Verification required</title></head><body>"
@@ -4998,9 +5054,19 @@ def _merged_from_html(html: str, **evidence_overrides: Any) -> dict[str, Any]:
             ),
             False,
         ),
+        ("empty_code_field_disables_its_own_submit", _merged_from_html(_EMPTY_CODE_DISABLED_SUBMIT_HTML), False),
+        # Known boundary, reachable only when the classifier is also wrong. In production a code
+        # screen is reported as no challenge at all and never gets here. If the classifier does call
+        # one a challenge, page structure cannot separate it from a challenge the CDN is genuinely
+        # gating, so the vendor markup wins and the page keeps the label the repair brake reads.
+        (
+            "empty_code_field_on_a_site_behind_a_challenge_cdn",
+            _merged_from_html(_EMPTY_CODE_BEHIND_A_CHALLENGE_CDN_HTML),
+            True,
+        ),
         ("captcha_with_rendered_control", _merged_from_html(_CAPTCHA_HTML), True),
         ("access_denied_no_form", _merged_from_html(_ACCESS_DENIED_HTML), True),
-        ("device_approval_no_entry_field", _merged_from_html(_DEVICE_APPROVAL_HTML), True),
+        ("wall_with_no_entry_field", _merged_from_html(_NO_ENTRY_FIELD_HTML), True),
         ("cancel_and_reset_controls_only", _merged_from_html(_CANCEL_ONLY_HTML), True),
         (
             "visual_obstruction_over_enabled_form",

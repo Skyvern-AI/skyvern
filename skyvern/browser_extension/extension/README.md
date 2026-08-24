@@ -44,11 +44,14 @@ matching owner-only legacy and broker credentials. `skyvern browser extension-br
 explicit idempotent enable/start command, but normal setup does not require it.
 
 The broker keeps the extension-facing port reserved after an MCP process exits, and multiple MCP agents share one
-daemon concurrently. Each agent receives browser access only after its own **Approve pairing** click. Approval expires
-when that agent disconnects. Each approved agent leases its own tabs, popups follow their opener, and user-shared tabs
-go to the first agent that claims them. A disconnected extension gets a short reconnect window before session creation
-opens the one-click pairing page for you. Use `skyvern browser extension-broker-status` to inspect sanitized state and
-`skyvern browser extension-broker-stop` to drain the daemon and release the configured port.
+daemon concurrently. A successful pairing creates one persisted workstation approval shared by all MCP agents. Revoke
+it with `skyvern browser extension-revoke-workstation`; add `--all` to clear live interactive approvals as the full
+kill switch. Interactive approval is bound to a continuously connected agent: it survives overlap socket replacement
+(needed for MV3 and network reconnects) but dies on a true disconnect. Each approved agent leases its own tabs, popups
+follow their opener, and user-shared tabs go to the first agent that claims them. A disconnected extension gets a
+short reconnect window before session creation opens the one-click pairing page for you. Use
+`skyvern browser extension-broker-status` to inspect sanitized state and `skyvern browser extension-broker-stop` to
+drain the daemon and release the configured port.
 
 The extension records broker-created root tabs and popups in Chrome session storage until those tabs close. This lets
 the broker close one of its tabs after an external debugger detach removes it from extension scope. The extension still

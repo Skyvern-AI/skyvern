@@ -2,6 +2,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from skyvern.forge.sdk.copilot import google_connection_notice as notice_module
 from skyvern.forge.sdk.copilot.google_connection_notice import (
     GoogleConnectionNotice,
     collect_google_connection_notices,
@@ -173,21 +176,30 @@ def test_active_connection_without_sheets_scope_is_unusable() -> None:
     ]
 
 
-def test_capture_writes_one_token_free_packet_at_the_contract_path(tmp_path: Path) -> None:
-    final = _workflow(_write("write", "goac_error"))
-    credential = _credential("goac_error", "error", "Needs reconnect", scopes_granted=[])
-
+def _capture(tmp_path: Path, turn_id: str, *blocks: object, credentials: list[GoogleOAuthCredentialBase]) -> None:
     write_google_connection_notice_capture(
         output_root=str(tmp_path),
+        turn_id=turn_id,
         turn_start_workflow=_workflow(),
-        final_workflow=final,
+        final_workflow=_workflow(*blocks),
         accepted_workflow_yaml="workflow_definition:\n  blocks: []\n",
-        visible_credentials=[credential],
+        visible_credentials=credentials,
         observed_notices=[],
     )
 
-    payload = json.loads((tmp_path / "capture-0001.json").read_text())
-    assert payload["contractVersion"] == 1
+
+def _captures(tmp_path: Path) -> list[dict[str, object]]:
+    return [json.loads(path.read_text()) for path in sorted(tmp_path.glob("capture-*.json"))]
+
+
+def test_capture_writes_one_token_free_packet_at_the_contract_path(tmp_path: Path) -> None:
+    credential = _credential("goac_error", "error", "Needs reconnect", scopes_granted=[])
+
+    _capture(tmp_path, "turn_1", _write("write", "goac_error"), credentials=[credential])
+
+    payload = _captures(tmp_path)[0]
+    assert payload["contractVersion"] == 2
+    assert payload["turnId"] == "turn_1"
     assert payload["visibleCredentials"] == [
         {
             "id": "goac_error",
@@ -201,3 +213,23 @@ def test_capture_writes_one_token_free_packet_at_the_contract_path(tmp_path: Pat
             "modified_at": credential.modified_at.isoformat(),
         }
     ]
+
+
+def test_capture_records_every_binding_once_per_accepted_update(tmp_path: Path) -> None:
+    active = _credential("goac_active", "active")
+
+    _capture(tmp_path, "turn_1", _write("count", "goac_active"), credentials=[active])
+    _capture(tmp_path, "turn_1", _write("count", "goac_active"), _write("append", "goac_active"), credentials=[active])
+
+    payloads = _captures(tmp_path)
+    assert [payload["observedNotices"] for payload in payloads] == [[], []]
+    assert [len(payload["finalWorkflow"]["workflow_definition"]["blocks"]) for payload in payloads] == [1, 2]
+    assert all(path.stat().st_mode & 0o077 == 0 for path in tmp_path.glob("capture-*.json"))
+
+
+def test_capture_is_withheld_outside_a_local_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(notice_module.settings, "ENV", "production")
+
+    _capture(tmp_path, "turn_1", _write("append", "goac_active"), credentials=[_credential("goac_active", "active")])
+
+    assert _captures(tmp_path) == []

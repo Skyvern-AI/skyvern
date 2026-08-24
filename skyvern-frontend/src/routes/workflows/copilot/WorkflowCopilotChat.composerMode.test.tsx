@@ -17,6 +17,7 @@ type StreamBody = {
   message: string;
   mode: string | null;
   code_block: boolean | null;
+  selected_block_label: string | null;
 };
 type StreamCall = {
   body: StreamBody;
@@ -315,5 +316,28 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
 
     expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(null);
+  });
+});
+
+describe("WorkflowCopilotChat — canvas selection context", () => {
+  afterEach(() => {
+    window.history.pushState(null, "", "/");
+  });
+
+  it("sends the canvas selection as selected_block_label", async () => {
+    window.history.pushState(null, "", "/?selected-block=login");
+    await renderChat({ copilotV2: true });
+    await submit("why is this block failing?");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.selected_block_label).toBe("login");
+  });
+
+  it("sends null without a selection", async () => {
+    await renderChat({ copilotV2: true });
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.selected_block_label).toBe(null);
   });
 });

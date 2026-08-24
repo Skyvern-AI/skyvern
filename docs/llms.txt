@@ -49,6 +49,11 @@
 - [Error Handling](https://skyvern.com/docs/developers/going-to-production/error-handling.md): Detect, classify, and recover from task failures; retry strategies, cancel runs, and webhook error payloads
 - [Reliability Tips](https://skyvern.com/docs/developers/going-to-production/reliability-tips.md): Write robust prompts, handle edge cases, and build resilient automations that work across website changes
 
+## API Access
+
+- [Authentication & Permissions](https://skyvern.com/docs/developers/api/authentication-and-permissions.md): How API access is scoped; organization-scoped API keys sent as x-api-key, OAuth 2.0 browser sign-in and its supported scopes, the hosted MCP server at https://api.skyvern.com/mcp, and what each credential can reach
+- [Versioning & Deprecation](https://skyvern.com/docs/developers/api/versioning-and-deprecation.md): REST API versioning scheme (URL path /v1/), what counts as a backward-compatible change, and the deprecation policy; 6 months minimum notice, Deprecation and Sunset response headers per RFC 9745 and RFC 8594, and changelog announcements
+
 ## Debugging
 
 - [Using Artifacts](https://skyvern.com/docs/developers/debugging/using-artifacts.md): Access recordings, screenshots, action logs, and network data for every run

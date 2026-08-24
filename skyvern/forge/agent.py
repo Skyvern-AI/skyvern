@@ -153,6 +153,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     _task_block_supports_v3,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
@@ -160,7 +161,7 @@ from skyvern.forge.validation_evidence_router import (
 )
 from skyvern.schemas.runs import CUA_ENGINES, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services import run_service, service_utils
+from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.services.otp_service import (
@@ -174,6 +175,7 @@ from skyvern.services.webhook_delivery import (
     deliver_webhook_with_retries,
     describe_delivery_error,
 )
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
     PROMPT_HARD_CEILING_TOKENS,
@@ -1223,6 +1225,7 @@ class ForgeAgent:
             taskv3_runaway_backstops,
         )
         from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS
+        from skyvern.forge.taskv3.tools import pending_marker
 
         # Workflow-block tasks re-resolve the live working page on every tool call, so a click that
         # opens a new tab/popup is followed (mirrors the step engine's get_working_page re-fetch).
@@ -1482,6 +1485,25 @@ class ForgeAgent:
                 # scroll/wait) keep the current index so they never inflate the workflow-run count.
                 v3_round_index += 1
 
+        pre_submit_ring: PreSubmitCaptureRing | None = None
+        if not page_free_validation and is_run_sampled(
+            task.workflow_run_id or task.task_id, settings.TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE
+        ):
+            # Shot on the page the DOM came from, so the pair is one frame; browser_state's own
+            # screenshot path may recover a lost page or hide the cursor overlay, and a capture must
+            # never touch the page.
+            pre_submit_ring = PreSubmitCaptureRing(_fingerprint_page, pre_submit_screenshot)
+
+        async def _persist_pre_submit_frames() -> None:
+            if pre_submit_ring is None:
+                return
+
+            async def _write(kind: str, data: bytes) -> str:
+                artifact_type = ArtifactType.HTML_PRE_SUBMIT if kind == "html" else ArtifactType.SCREENSHOT_PRE_SUBMIT
+                return await app.ARTIFACT_MANAGER.create_artifact(step=step, artifact_type=artifact_type, data=data)
+
+            await pre_submit_ring.persist(_write)
+
         # Disambiguates multi-credential TOTP the way v1's action handler does (handler.py
         # get_actual_value_of_parameter_if_secret), but resolved once per block instead of per keystroke:
         # only an unambiguous single login credential is worth pinning for the whole loop.
@@ -1511,6 +1533,16 @@ class ForgeAgent:
             )
             return await peek.evaluate(probe_js)
 
+        # Whether the control the run CLICKED is still in flight. Scoped to that one control on
+        # purpose: "is anything on this page busy?" strands a finished run on an unrelated upload
+        # widget or a stale modal the app left in the DOM. Narrow for the same reason -- every
+        # widening is a way to hold a run that succeeded.
+        async def _pending_marker(selector: str) -> str | None:
+            peek = await _fingerprint_page()
+            if peek is None:
+                return None
+            return await pending_marker(peek, selector)
+
         resolve_typed_text = None
         if task_block is not None:
             # Local import: handler.py transitively imports this module (agent registration), so a
@@ -1526,7 +1558,9 @@ class ForgeAgent:
         try:
             # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
             # must see the pinned key, or a multi-credential context hides get_verification_code.
-            auth_tools, auth_guidance = build_auth_tools(task)
+            # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
+            # structurally never touches the live DOM must not be offered it.
+            auth_tools, auth_guidance = build_auth_tools(task, None if page_free_validation else _page_provider)
             # Offered on any page-aware run (a captcha can appear mid-run, so there is no build-time
             # source to gate on); solving routes through the AGENT_FUNCTION seam (OSS no-op, cloud solves).
             # Withheld in page-free mode: like browser_tools, a page-operating tool must not be offered
@@ -1542,6 +1576,11 @@ class ForgeAgent:
                 resolve_typed_text=resolve_typed_text,
                 page_free=page_free_validation,
                 page_fingerprint=_page_fingerprint,
+                # Unfenced across both populations, unlike the settle probe above: that fence exists
+                # to keep a RENDERING wait off the bare arm, and this asks a different question. The
+                # bare arm is where the measured specimen lives (SKY-14701 is what inheriting a fence
+                # whose reason does not apply looks like).
+                pending_marker=_pending_marker,
                 # The 2026-08-18 scoping decision kept the completed-side settle probe off the
                 # bare-task arm. Fenced by its own deferral budget so it does not also disable
                 # the failure-evidence gate that shares the sampler (SKY-14598).
@@ -1558,6 +1597,7 @@ class ForgeAgent:
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
+                on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
                 extra_tools=auth_tools + captcha_tools,
                 extra_system_guidance="\n\n".join(
                     part for part in (auth_guidance, captcha_guidance, task.workflow_system_prompt) if part
@@ -1566,6 +1606,11 @@ class ForgeAgent:
         finally:
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
+            # Frames are already in memory, so a loop that raised or ran out of budget still
+            # persists what it captured; bounded so the unwind of a cancelled run is not held up.
+            with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
+                async with asyncio.timeout(30):
+                    await _persist_pre_submit_frames()
         LOG.info(
             "Task V3 loop finished",
             task_id=task.task_id,
@@ -1940,9 +1985,6 @@ class ForgeAgent:
             if (
                 engine == RunEngine.skyvern_v3
                 and task_block_supports_v3
-                # v3 now resolves TOTP via get_verification_code; only a totp_verification_url task
-                # (needs step-engine webhook delivery) stays excluded on that axis.
-                and not task.totp_verification_url
                 and not await task_v3_disabled(task.workflow_run_id or task.task_id, task.organization_id)
             ):
                 try:
@@ -6137,6 +6179,11 @@ class ForgeAgent:
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
+
+        # Before the webhook, so a caller acting on the run's completion already sees the
+        # attached files gone. Tasks belonging to a workflow run returned above; their
+        # attachments hang off the workflow run and are deleted by its own cleanup.
+        await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
 
         if need_call_webhook:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:

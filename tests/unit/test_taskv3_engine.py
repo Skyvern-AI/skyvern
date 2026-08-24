@@ -387,3 +387,62 @@ async def test_engine_wires_failure_evidence_gate() -> None:
     )
     assert outcome.status == "failed"
     assert outcome.reason == "still blocked, re-verified"
+
+
+@pytest.mark.asyncio
+async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate needs BOTH halves to reach their destinations and to share one record: the loop writes
+    # the clicked control into the watch, the finish tool reads it. Wire either half to a different
+    # object, or arm them for a page-free run (which has no page to ask) and disarm them for an
+    # ordinary one, and nothing else in the suite would notice.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome, SubmitWatch
+
+    finish_args: list[tuple[Any, Any]] = []
+    loop_watches: list[Any] = []
+    real_make = engine_mod.make_finish_tool
+    real_loop = engine_mod.run_agent_tool_loop
+
+    def capturing_make(*args: Any, **kwargs: Any) -> Any:
+        finish_args.append((kwargs.get("pending_marker"), kwargs.get("submit_watch")))
+        return real_make(*args, **kwargs)
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_watches.append(kwargs.get("submit_watch"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+
+    async def provider() -> Any:
+        return object()
+
+    async def pending_marker(selector: str) -> str | None:
+        return "the submit control still reads 'Submitting…'"
+
+    script = [[("finish", {"status": "completed", "reason": "done"})]]
+    await run_task_v3_agent_loop(
+        page_provider=provider,
+        llm_caller=_ScriptedCaller(script),
+        goal="apply",
+        pending_marker=pending_marker,
+        max_action_steps=2,
+        max_turns=4,
+    )
+    await run_task_v3_agent_loop(
+        page_provider=provider,
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]]),
+        goal="assess",
+        page_free=True,
+        pending_marker=pending_marker,
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert [marker for marker, _watch in finish_args] == [pending_marker, None], finish_args
+    watches = [watch for _marker, watch in finish_args]
+    assert isinstance(watches[0], SubmitWatch), watches
+    assert watches[1] is None, watches
+    assert loop_watches[0] is watches[0], (loop_watches, watches)
+    assert loop_watches[1] is None, loop_watches

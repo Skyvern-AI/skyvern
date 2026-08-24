@@ -14,7 +14,6 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opentelemetry import trace as otel_trace
@@ -212,22 +211,17 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
-WORKFLOW_KNOWLEDGE_BASE_PATH = (
-    Path(__file__).resolve().parents[2] / "prompts" / "skyvern" / "workflow_knowledge_base.txt"
-)
-
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
 _EMPTY_REVIEW_BASELINE_YAML = "workflow_definition:\n  parameters: []\n  blocks: []\n"
 
 _CONNECTED_ACCOUNT_CHOICE_REFERENCE = TypeAdapter(ConnectedAccountChoiceReference)
 
 
-def _render_code_only_browser_authoring_prompt(ctx: CopilotContext | None = None) -> str:
+def _render_code_only_browser_authoring_prompt() -> str:
     from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_authoring_prompt
 
-    settled_block_types = ctx.code_only_settled_block_types if isinstance(ctx, CopilotContext) else frozenset()
     return (
-        _code_only_browser_authoring_prompt(settled_block_types)
+        _code_only_browser_authoring_prompt()
         + "\n\nWhen a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page\n"
         "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
         "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
@@ -632,20 +626,16 @@ def _build_system_prompt(
     tool_usage_guide: str,
     config: CopilotConfig | None = None,
     security_rules: str | None = None,
-    answer_only: bool = False,
 ) -> str:
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
-    workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
     current_datetime = datetime.now(timezone.utc).isoformat()
     datetime_boundary = "__SKYVERN_COPILOT_DYNAMIC_DATETIME_BOUNDARY__"
     prompt_with_boundary = prompt_engine.load_prompt(
         template=template,
-        workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=datetime_boundary,
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
-        answer_only=answer_only,
     )
     prompt_with_boundary = f"{_MCP_RESULT_SECURITY_BOUNDARY}\n\n{prompt_with_boundary}"
     stable_prefix, boundary, dynamic_suffix = prompt_with_boundary.partition(datetime_boundary)
@@ -1153,7 +1143,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + todo_list_prompt(ctx)
         )
         if config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-            dynamic_context = f"{dynamic_context}\n\n{_render_code_only_browser_authoring_prompt(ctx)}"
+            dynamic_context = f"{dynamic_context}\n\n{_render_code_only_browser_authoring_prompt()}"
         if isinstance(base_system_prompt, CacheableSystemInstructions):
             return CacheableSystemInstructions(
                 base_system_prompt.stable_prefix,
@@ -1291,13 +1281,6 @@ def _build_tool_usage_guide(tool_names_and_descriptions: list[tuple[str, str]]) 
 
 
 _FinalActionDataValue = str | int | float | bool | None
-
-
-def _is_explicit_false(value: Any) -> bool:
-    # LLMs occasionally serialise JSON booleans as strings; coerce the common spellings.
-    if value is False:
-        return True
-    return isinstance(value, str) and value.strip().lower() in {"false", "no", "0"}
 
 
 def _normalize_failure_reason(failure_reason: str | None) -> str:
@@ -3271,13 +3254,10 @@ async def _translate_to_agent_result(
     if not blocker_active and resp_type != "ASK_QUESTION" and not salvaged_reply:
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    # The model's reply is the claim; a template must not overwrite it, and the model's own
-    # goal_reached admission is never vetoed by a promoted claim tier.
-    agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
     last_workflow = None
     last_workflow_yaml = None
     unvalidated = False
-    if verified_workflow is not None and not agent_admits_incomplete and not blocker_active:
+    if verified_workflow is not None and not blocker_active:
         last_workflow, last_workflow_yaml = verified_workflow, verified_yaml
     elif salvaged_reply:
         last_workflow, last_workflow_yaml = ctx.last_good_workflow, ctx.last_good_workflow_yaml
@@ -4064,6 +4044,7 @@ async def run_copilot_agent(
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
     persisted_workflow_yaml: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
+    eval_capture_case_id: str | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -4107,6 +4088,7 @@ async def run_copilot_agent(
                     persist_canonical_user_message=persist_canonical_user_message,
                     persisted_workflow_yaml=persisted_workflow_yaml,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
+                    eval_capture_case_id=eval_capture_case_id,
                 )
                 return result
             except Exception as exc:
@@ -4189,6 +4171,7 @@ async def _run_copilot_turn_impl(
     persist_canonical_user_message: Callable[[str], Awaitable[None]] | None = None,
     persisted_workflow_yaml: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
+    eval_capture_case_id: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     # Protect historical rows created before canonical safe-turn persistence existed. A semantic
@@ -4252,6 +4235,7 @@ async def _run_copilot_turn_impl(
         api_key=api_key,
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        eval_capture_case_id=eval_capture_case_id,
         turn_id=turn_id,
         turn_index=turn_index,
         prior_block_count=prior_block_count,
@@ -4260,6 +4244,7 @@ async def _run_copilot_turn_impl(
         block_authoring_policy=copilot_config.block_authoring_policy,
         copilot_config=copilot_config,
         target_block_label=getattr(chat_request, "target_block_label", None),
+        selected_block_label=getattr(chat_request, "selected_block_label", None),
         client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
         executed_block_fingerprints={
             label: set(fingerprints) for label, fingerprints in (prior_executed_block_fingerprints or {}).items()
@@ -4466,6 +4451,16 @@ async def _run_copilot_turn_impl(
             "Preserve every other block's code, goal, steps, and configuration exactly as-is.\n\n"
             f"{safe_global_llm_context}"
         )
+    elif ctx.selected_block_label:
+        # An ambient fact, not a directive: the model decides whether the message refers to this
+        # block. Skipped under target_block_label, whose turn is already pinned to one block.
+        safe_selected_block_label = re.sub(r"\s+", " ", ctx.selected_block_label).replace('"', "").strip()[:200]
+        if safe_selected_block_label:
+            scoped_global_llm_context = (
+                f"{scoped_global_llm_context}\n\nCANVAS SELECTION FACT:\n"
+                f'The user currently has the block labeled "{safe_selected_block_label}" selected on the '
+                "studio canvas. If their message refers to a block without naming one, it is likely this one."
+            ).strip()
 
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,

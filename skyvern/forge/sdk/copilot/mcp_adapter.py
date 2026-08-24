@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
@@ -19,6 +19,7 @@ from agents.agent import AgentBase
 from agents.mcp.server import MCPServer
 from agents.run_context import RunContextWrapper
 from fastmcp import Client
+from fastmcp.client.client import CallToolResult as FastMCPCallToolResult
 from mcp import Tool as MCPTool
 from mcp.types import (
     CallToolResult,
@@ -52,7 +53,11 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
     retire_browser_session_id,
 )
-from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ScreenshotActionRelation,
+    ScreenshotProvenance,
+    enqueue_screenshot_from_result,
+)
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.utils.contained_effects import contained_effect
@@ -63,6 +68,276 @@ if TYPE_CHECKING:
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
+
+_SHARED_BROWSER_OUTCOME_TOOLS = frozenset({"skyvern_evaluate", "skyvern_screenshot"})
+_BrowserCallErrorKind = Literal["tool", "protocol"]
+_BrowserSessionLossDisposition = Literal["reestablished", "failed"]
+
+
+@dataclass(frozen=True)
+class _BrowserCallOutcome:
+    """Immutable browser facts captured before either Copilot adapter shapes them.
+
+    The payload is copied structurally at the protocol boundary and for each
+    projection. Immutable leaves (including screenshot base64 strings) are shared,
+    so adapter isolation does not duplicate the largest response body.
+    """
+
+    raw_tool_name: str
+    source_browser_session_id: str | None
+    source_browser_session_generation: int
+    dispatched: bool
+    ok: bool
+    error_kind: _BrowserCallErrorKind | None
+    error_code: str | None
+    screenshot_present: bool
+    screenshot_reference: str | None
+    response_truncated: bool
+    payload_omitted: bool
+    session_loss_disposition: _BrowserSessionLossDisposition | None = None
+    replacement_browser_session_id: str | None = None
+    completion_browser_session_id: str | None = None
+    completion_browser_session_generation: int | None = None
+    evidence_drain_complete: bool | None = None
+    cancelled: bool = False
+    protocol_error_detail: str | None = None
+    _raw_result_payload: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def raw_result(self) -> dict[str, Any]:
+        return deepcopy(self._raw_result_payload)
+
+    def with_raw_result(self, raw_result: dict[str, Any]) -> _BrowserCallOutcome:
+        return replace(self, _raw_result_payload=_copy_browser_result(raw_result))
+
+
+@dataclass(frozen=True)
+class _InternalBrowserCallResult:
+    result: dict[str, Any]
+    outcome: _BrowserCallOutcome
+
+
+@dataclass(frozen=True)
+class _InternalToolCallResult:
+    result: dict[str, Any]
+    browser_outcome: _BrowserCallOutcome | None = None
+
+
+def _copy_browser_result(raw_result: dict[str, Any]) -> dict[str, Any]:
+    # deepcopy copies mutable containers but returns immutable strings unchanged.
+    # Inline screenshot bytes therefore have one string allocation in custody.
+    return deepcopy(raw_result)
+
+
+def _browser_error_code(raw_result: dict[str, Any]) -> str | None:
+    error = raw_result.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) and code else None
+
+
+def _screenshot_reference(raw_tool_name: str, raw_result: dict[str, Any]) -> tuple[bool, str | None]:
+    if raw_tool_name != "skyvern_screenshot":
+        return False, None
+    data = raw_result.get("data")
+    reference = data.get("path") if isinstance(data, dict) else None
+    inline_present = isinstance(data, dict) and any(
+        isinstance(data.get(key), str) and bool(data[key]) for key in ("data", "screenshot_base64", "image_base64")
+    )
+    artifacts = raw_result.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or artifact.get("kind") != "screenshot":
+                continue
+            artifact_path = artifact.get("path")
+            if isinstance(artifact_path, str) and artifact_path:
+                reference = artifact_path
+                break
+    safe_reference = reference if isinstance(reference, str) and reference else None
+    return inline_present or safe_reference is not None, safe_reference
+
+
+def _browser_call_outcome_from_mapping(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    dispatched: bool = True,
+    raw_result: dict[str, Any],
+    error_kind: _BrowserCallErrorKind | None = None,
+    protocol_error_detail: str | None = None,
+) -> _BrowserCallOutcome:
+    ok = raw_result.get("ok", raw_result.get("error") is None) is True and error_kind is None
+    normalized_error_kind = error_kind or ("tool" if not ok else None)
+    screenshot_present, screenshot_reference = _screenshot_reference(raw_tool_name, raw_result)
+    response_truncated = raw_result.get("_truncated") is True
+    return _BrowserCallOutcome(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        dispatched=dispatched,
+        ok=ok,
+        error_kind=normalized_error_kind,
+        error_code=_browser_error_code(raw_result),
+        screenshot_present=screenshot_present,
+        screenshot_reference=screenshot_reference,
+        response_truncated=response_truncated,
+        payload_omitted=response_truncated,
+        protocol_error_detail=protocol_error_detail,
+        _raw_result_payload=_copy_browser_result(raw_result),
+    )
+
+
+def _normalize_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    raw_result: FastMCPCallToolResult,
+) -> _BrowserCallOutcome:
+    raw_mcp = dict(raw_result.structured_content or {})
+    if raw_result.is_error:
+        raw_mcp["ok"] = False
+        if not raw_result.structured_content and raw_result.content:
+            text_parts = [content.text for content in raw_result.content if isinstance(content, TextContent)]
+            raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+        else:
+            raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+    return _browser_call_outcome_from_mapping(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        raw_result=raw_mcp,
+        error_kind="tool" if raw_result.is_error else None,
+    )
+
+
+def _browser_protocol_exception_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int = 0,
+    dispatched: bool = True,
+    exception: BaseException,
+) -> _BrowserCallOutcome:
+    try:
+        detail = str(exception)
+    except BaseException:  # noqa: BLE001 - exception text is an untrusted protocol boundary
+        detail = ""
+    return _browser_call_outcome_from_mapping(
+        raw_tool_name=raw_tool_name,
+        source_browser_session_id=source_browser_session_id,
+        source_browser_session_generation=source_browser_session_generation,
+        dispatched=dispatched,
+        raw_result={},
+        error_kind="protocol",
+        protocol_error_detail=detail,
+    )
+
+
+def _not_dispatched_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int,
+    raw_result: dict[str, Any],
+    ctx: AgentContext,
+    session_loss_disposition: _BrowserSessionLossDisposition | None = None,
+) -> _BrowserCallOutcome:
+    return replace(
+        _browser_call_outcome_from_mapping(
+            raw_tool_name=raw_tool_name,
+            source_browser_session_id=source_browser_session_id,
+            source_browser_session_generation=source_browser_session_generation,
+            dispatched=False,
+            raw_result=raw_result,
+            error_kind="protocol",
+        ),
+        session_loss_disposition=session_loss_disposition,
+        replacement_browser_session_id=(
+            ctx.browser_session_id if session_loss_disposition == "reestablished" else None
+        ),
+        completion_browser_session_id=ctx.browser_session_id,
+        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+    )
+
+
+def _cancelled_browser_call_outcome(
+    *,
+    raw_tool_name: str,
+    source_browser_session_id: str | None,
+    source_browser_session_generation: int,
+    dispatch_started: bool,
+    ctx: AgentContext,
+) -> _BrowserCallOutcome:
+    return replace(
+        _browser_call_outcome_from_mapping(
+            raw_tool_name=raw_tool_name,
+            source_browser_session_id=source_browser_session_id,
+            source_browser_session_generation=source_browser_session_generation,
+            dispatched=dispatch_started,
+            raw_result={},
+            error_kind="protocol",
+        ),
+        cancelled=True,
+        completion_browser_session_id=ctx.browser_session_id,
+        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+    )
+
+
+def _record_browser_call_outcome(
+    ctx: AgentContext,
+    outcome: _BrowserCallOutcome,
+    *,
+    call_path: Literal["model", "internal"],
+) -> None:
+    with contained_effect("record browser call outcome", tool_name=outcome.raw_tool_name):
+        LOG.info(
+            "copilot_browser_call_outcome",
+            tool_name=outcome.raw_tool_name,
+            call_path=call_path,
+            dispatched=outcome.dispatched,
+            ok=outcome.ok,
+            error_kind=outcome.error_kind,
+            error_code=outcome.error_code,
+            cancelled=outcome.cancelled,
+            source_browser_session_id=outcome.source_browser_session_id,
+            source_browser_session_generation=outcome.source_browser_session_generation,
+            replacement_browser_session_id=outcome.replacement_browser_session_id,
+            completion_browser_session_id=outcome.completion_browser_session_id,
+            completion_browser_session_generation=outcome.completion_browser_session_generation,
+            evidence_drain_complete=outcome.evidence_drain_complete,
+            response_truncated=outcome.response_truncated,
+            payload_omitted=outcome.payload_omitted,
+            **_copilot_log_fields(cast("CopilotContext", ctx)),
+        )
+
+
+def _scrub_browser_call_outcome(ctx: AgentContext, outcome: _BrowserCallOutcome) -> _BrowserCallOutcome:
+    scrubbed = outcome.with_raw_result(_scrub_tool_result(ctx, outcome.raw_result()))
+    if outcome.protocol_error_detail is None:
+        return scrubbed
+    detail_result = _scrub_tool_result(ctx, {"ok": False, "error": outcome.protocol_error_detail})
+    detail = detail_result.get("error")
+    return replace(scrubbed, protocol_error_detail=detail if isinstance(detail, str) else "")
+
+
+def _project_browser_call_outcome(
+    outcome: _BrowserCallOutcome,
+    *,
+    display_tool_name: str,
+) -> dict[str, Any]:
+    if outcome.protocol_error_detail is not None:
+        detail = outcome.protocol_error_detail
+        error = f"{display_tool_name} failed: {detail}" if detail else f"{display_tool_name} failed"
+        result: dict[str, Any] = {"ok": False, "error": error}
+    else:
+        raw_result = outcome.raw_result()
+        result = mcp_to_copilot(raw_result) if raw_result else {}
+    if outcome.session_loss_disposition is not None:
+        result = _browser_session_loss_result(result, disposition=outcome.session_loss_disposition)
+    return result
+
 
 _POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
     "flow_evidence",
@@ -620,8 +895,8 @@ async def _prepare_browser_session_for_dispatch(
     tool_name: str,
     call_path: Literal["model", "internal"],
     observed_generation: int,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Verify the current session and surface any replacement before action dispatch."""
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
+    """Verify the current session and return any error, continuity result, and fresh disposition."""
     async with _context_browser_session_recovery_lock(ctx):
         if getattr(ctx, "browser_session_continuity_generation", 0) != observed_generation:
             disposition: Literal["reestablished", "failed"] = (
@@ -629,17 +904,17 @@ async def _prepare_browser_session_for_dispatch(
                 if getattr(ctx, "browser_session_continuity_disposition", None) == "reestablished"
                 else "failed"
             )
-            return None, _browser_session_loss_result({}, disposition=disposition)
+            return None, _browser_session_loss_result({}, disposition=disposition), disposition
 
         prior_session_id = ctx.browser_session_id
         if not prior_session_id:
-            return await ensure_browser_session(ctx), None
+            return await ensure_browser_session(ctx), None, None
 
         async with _browser_session_continuity_lock(ctx.organization_id, prior_session_id):
             recorded = await _get_continuity_outcome(ctx.organization_id, prior_session_id)
             if recorded is not None:
                 _apply_continuity_outcome(ctx, recorded, tool_name=tool_name, call_path=call_path)
-                return None, _browser_session_loss_result({}, disposition=recorded.disposition)
+                return None, _browser_session_loss_result({}, disposition=recorded.disposition), recorded.disposition
 
             # No preflight verdict here: the attach below is the oracle, and an indeterminate probe
             # is not evidence of loss.
@@ -648,7 +923,7 @@ async def _prepare_browser_session_for_dispatch(
                 getattr(ctx, "turn_origin", TurnOrigin.interactive) == TurnOrigin.runtime_self_heal
                 or ctx.browser_session_id == prior_session_id
             ):
-                return None, None
+                return None, None, None
 
             _emit_continuity_event(
                 ctx,
@@ -679,7 +954,7 @@ async def _prepare_browser_session_for_dispatch(
                 replacement_session_id=outcome.replacement_session_id,
                 disposition=outcome.disposition,
             )
-            return None, _browser_session_loss_result({}, disposition=outcome.disposition)
+            return None, _browser_session_loss_result({}, disposition=outcome.disposition), outcome.disposition
 
 
 def _requested_output_path_choices(schema: dict[str, Any], paths: list[str]) -> dict[str, Any]:
@@ -1016,7 +1291,11 @@ class SkyvernOverlayMCPServer(MCPServer):
         arguments = {k: v for k, v in arguments.items() if k not in _INTERNAL_TOOL_ARG_KEYS}
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
-        observed_continuity_generation = getattr(copilot_ctx, "browser_session_continuity_generation", 0)
+        observed_continuity_generation = copilot_ctx.browser_session_continuity_generation
+        attempt_browser_session_id = getattr(copilot_ctx, "browser_session_id", None)
+        mcp_name = self._alias_map.get(tool_name, tool_name)
+        uses_shared_browser_outcome = mcp_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        dispatch_started = False
 
         policy = copilot_ctx.request_policy
         if overlay.requires_browser and isinstance(policy, RequestPolicy) and policy.raw_secret_detected:
@@ -1024,26 +1303,61 @@ class SkyvernOverlayMCPServer(MCPServer):
                 "ok": False,
                 "error": "A raw-secret draft cannot use browser tools. Save only the redacted draft.",
             }
-            result = _scrub_tool_result(copilot_ctx, result)
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=copilot_ctx,
+                )
+                outcome = _scrub_browser_call_outcome(copilot_ctx, outcome)
+                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+            else:
+                result = _scrub_tool_result(copilot_ctx, result)
             LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result)
 
         if overlay.pre_hook:
-            hook_result = await overlay.pre_hook(arguments, copilot_ctx)
+            try:
+                hook_result = await overlay.pre_hook(arguments, copilot_ctx)
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatch_started=False,
+                        ctx=copilot_ctx,
+                    )
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                raise
             if hook_result is not None:
-                hook_result = _scrub_tool_result(copilot_ctx, hook_result)
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=hook_result,
+                        ctx=copilot_ctx,
+                    )
+                    outcome = _scrub_browser_call_outcome(copilot_ctx, outcome)
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                    hook_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    hook_result = _scrub_tool_result(copilot_ctx, hook_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, hook_result)
                 return _copilot_to_call_tool_result(hook_result)
 
         phases = _PhaseClock()
-        mcp_name = self._alias_map.get(tool_name, tool_name)
         mcp_args = _transform_args(arguments, overlay)
 
         if overlay.requires_browser:
             phases.enter("session_prepare")
             try:
-                err, continuity_result = await _prepare_browser_session_for_dispatch(
+                err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
                     copilot_ctx,
                     tool_name=tool_name,
                     call_path="model",
@@ -1051,22 +1365,66 @@ class SkyvernOverlayMCPServer(MCPServer):
                 )
             except asyncio.CancelledError:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatch_started=False,
+                        ctx=copilot_ctx,
+                    )
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 raise
-            except Exception:
+            except Exception as exc:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
+                if uses_shared_browser_outcome:
+                    outcome = _browser_protocol_exception_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        dispatched=False,
+                        exception=exc,
+                    )
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
                 raise
             if err:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
-                err = _scrub_tool_result(copilot_ctx, err)
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=err,
+                        ctx=copilot_ctx,
+                    )
+                    outcome = _scrub_browser_call_outcome(copilot_ctx, outcome)
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                    err = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    err = _scrub_tool_result(copilot_ctx, err)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
                 return _copilot_to_call_tool_result(err)
             if continuity_result is not None:
                 _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
-                continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
+                if uses_shared_browser_outcome:
+                    outcome = _not_dispatched_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=attempt_browser_session_id,
+                        source_browser_session_generation=observed_continuity_generation,
+                        raw_result=continuity_result,
+                        ctx=copilot_ctx,
+                        session_loss_disposition=continuity_disposition,
+                    )
+                    outcome = _scrub_browser_call_outcome(copilot_ctx, outcome)
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                    continuity_result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
+                else:
+                    continuity_result = _scrub_tool_result(copilot_ctx, continuity_result)
                 record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, continuity_result)
                 return _copilot_to_call_tool_result(continuity_result)
             mcp_args["session_id"] = copilot_ctx.browser_session_id
         call_browser_session_id = copilot_ctx.browser_session_id if overlay.requires_browser else None
+        call_browser_session_generation = copilot_ctx.browser_session_continuity_generation
 
         try:
             # wait_for(timeout=None) is a plain await, so only overlays that declare a ceiling get
@@ -1076,6 +1434,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 phases.enter("context_enter")
                 async with mcp_browser_context(copilot_ctx):
                     phases.enter("dispatch")
+                    dispatch_started = True
                     try:
                         raw_result = await asyncio.wait_for(
                             self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
@@ -1087,6 +1446,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     phases.enter("context_exit")
             else:
                 phases.enter("dispatch")
+                dispatch_started = True
                 raw_result = await asyncio.wait_for(
                     self._client.call_tool(mcp_name, mcp_args, raise_on_error=False),
                     timeout=overlay.timeout,
@@ -1103,66 +1463,196 @@ class SkyvernOverlayMCPServer(MCPServer):
                     "Whether it took effect is unknown; read the page before trying it again."
                 ),
             }
-            err = _scrub_tool_result(copilot_ctx, err)
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result=err,
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    completion_browser_session_id=copilot_ctx.browser_session_id,
+                    completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(copilot_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = _scrub_tool_result(copilot_ctx, err)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
         except CopilotBrowserSessionUnavailable as exc:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "session_error")
-            disposition = await _handle_browser_session_loss(
-                copilot_ctx,
-                tool_name=tool_name,
-                call_path="model",
-                lost_session_id=exc.session_id,
-            )
-            err = _scrub_tool_result(
-                copilot_ctx,
-                _browser_session_loss_result({}, disposition=disposition),
-            )
+            try:
+                disposition = await _handle_browser_session_loss(
+                    copilot_ctx,
+                    tool_name=tool_name,
+                    call_path="model",
+                    lost_session_id=exc.session_id,
+                )
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_name,
+                        source_browser_session_id=call_browser_session_id,
+                        source_browser_session_generation=call_browser_session_generation,
+                        dispatch_started=dispatch_started,
+                        ctx=copilot_ctx,
+                    )
+                    _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                raise
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result={},
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    session_loss_disposition=disposition,
+                    replacement_browser_session_id=(
+                        copilot_ctx.browser_session_id if disposition == "reestablished" else None
+                    ),
+                    completion_browser_session_id=copilot_ctx.browser_session_id,
+                    completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(copilot_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = _scrub_tool_result(
+                    copilot_ctx,
+                    _browser_session_loss_result({}, disposition=disposition),
+                )
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
         except asyncio.CancelledError:
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "cancelled")
+            if uses_shared_browser_outcome:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatch_started=dispatch_started,
+                    ctx=copilot_ctx,
+                )
+                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
             raise
         except Exception as exc:
             LOG.warning("MCP tool call failed", tool=tool_name)
             _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, {}, "model", "error")
-            err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    exception=exc,
+                )
+                outcome = replace(
+                    outcome,
+                    completion_browser_session_id=copilot_ctx.browser_session_id,
+                    completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
+                err = _project_browser_call_outcome(
+                    _scrub_browser_call_outcome(copilot_ctx, outcome),
+                    display_tool_name=tool_name,
+                )
+            else:
+                err = _scrub_tool_exception(copilot_ctx, tool_name, exc)
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
-        # Copy fastmcp's structured_content so mutations below stay local to
-        # this call — the client may reuse or cache the response object.
-        raw_mcp = dict(raw_result.structured_content or {})
-        if raw_result.is_error:
-            raw_mcp["ok"] = False
-            if not raw_result.structured_content and raw_result.content:
-                text_parts = [c.text for c in raw_result.content if hasattr(c, "text")]
-                raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
-            else:
-                raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
-        failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
+        browser_outcome: _BrowserCallOutcome | None = None
+        if uses_shared_browser_outcome:
+            browser_outcome = _normalize_browser_call_outcome(
+                raw_tool_name=mcp_name,
+                source_browser_session_id=call_browser_session_id,
+                source_browser_session_generation=call_browser_session_generation,
+                raw_result=raw_result,
+            )
+            raw_mcp = browser_outcome.raw_result()
+            failed = not browser_outcome.ok
+        else:
+            # Copy fastmcp's structured_content so mutations below stay local to
+            # this call — the client may reuse or cache the response object.
+            raw_mcp = dict(raw_result.structured_content or {})
+            if raw_result.is_error:
+                raw_mcp["ok"] = False
+                if not raw_result.structured_content and raw_result.content:
+                    text_parts = [c.text for c in raw_result.content if hasattr(c, "text")]
+                    raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+                else:
+                    raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+            failed = raw_result.is_error or raw_mcp.get("ok", True) is not True
         phases.settle()
         _log_mcp_timing(copilot_ctx, tool_name, mcp_name, phases, raw_mcp, "model", "error" if failed else "ok")
         # Scrub before the post hook so evidence the hooks record from raw_mcp
         # (flow evidence, scout observations) is scrubbed too.
         raw_mcp = _scrub_tool_result(copilot_ctx, raw_mcp)
-        copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
         session_lost = False
+        error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(raw_mcp)
         if (
             overlay.requires_browser
             and copilot_ctx.turn_origin != TurnOrigin.runtime_self_heal
             and isinstance(call_browser_session_id, str)
             and call_browser_session_id
-            and copilot_result.get("error_code") == _SESSION_EXPIRED_ERROR_CODE
+            and error_code == _SESSION_EXPIRED_ERROR_CODE
         ):
             session_lost = True
-            disposition = await _handle_browser_session_loss(
-                copilot_ctx,
-                tool_name=tool_name,
-                call_path="model",
-                lost_session_id=call_browser_session_id,
+            try:
+                disposition = await _handle_browser_session_loss(
+                    copilot_ctx,
+                    tool_name=tool_name,
+                    call_path="model",
+                    lost_session_id=call_browser_session_id,
+                )
+            except asyncio.CancelledError:
+                if browser_outcome is not None:
+                    cancelled_outcome = replace(
+                        browser_outcome,
+                        cancelled=True,
+                        ok=False,
+                        error_kind="protocol",
+                        completion_browser_session_id=copilot_ctx.browser_session_id,
+                        completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
+                    )
+                    _record_browser_call_outcome(copilot_ctx, cancelled_outcome, call_path="model")
+                raise
+            if browser_outcome is not None:
+                browser_outcome = replace(
+                    browser_outcome.with_raw_result(raw_mcp),
+                    session_loss_disposition=disposition,
+                    replacement_browser_session_id=(
+                        copilot_ctx.browser_session_id if disposition == "reestablished" else None
+                    ),
+                )
+            else:
+                copilot_result = _browser_session_loss_result(mcp_to_copilot(raw_mcp), disposition=disposition)
+
+        if browser_outcome is not None:
+            if browser_outcome.session_loss_disposition is None:
+                browser_outcome = browser_outcome.with_raw_result(raw_mcp)
+            browser_outcome = replace(
+                browser_outcome,
+                completion_browser_session_id=copilot_ctx.browser_session_id,
+                completion_browser_session_generation=copilot_ctx.browser_session_continuity_generation,
             )
-            copilot_result = _browser_session_loss_result(copilot_result, disposition=disposition)
+            _record_browser_call_outcome(copilot_ctx, browser_outcome, call_path="model")
+            copilot_result = _project_browser_call_outcome(browser_outcome, display_tool_name=tool_name)
+        elif not session_lost:
+            copilot_result = mcp_to_copilot(raw_mcp) if raw_mcp else {}
 
         if overlay.post_hook and not session_lost:
             base_copilot_result = deepcopy(copilot_result)
@@ -1177,7 +1667,27 @@ class SkyvernOverlayMCPServer(MCPServer):
 
         copilot_result = _scrub_tool_result(copilot_ctx, copilot_result)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
-        enqueue_screenshot_from_result(copilot_ctx, copilot_result)
+        screenshot_data = copilot_result.get("data")
+        screenshot_data = screenshot_data if isinstance(screenshot_data, dict) else {}
+        captured_url = screenshot_data.get("url") or screenshot_data.get("current_url")
+        observation_step = copilot_result.get("observation_step")
+        if observation_step is None:
+            observation_step = screenshot_data.get("observation_step")
+        workflow_run_id = copilot_result.get("workflow_run_id") or screenshot_data.get("workflow_run_id")
+        enqueue_screenshot_from_result(
+            copilot_ctx,
+            copilot_result,
+            provenance=ScreenshotProvenance(
+                source_tool=tool_name,
+                captured_url=captured_url if isinstance(captured_url, str) and captured_url else None,
+                observation_step=observation_step
+                if isinstance(observation_step, int) and not isinstance(observation_step, bool)
+                else None,
+                browser_session_id=call_browser_session_id,
+                workflow_run_id=workflow_run_id if isinstance(workflow_run_id, str) and workflow_run_id else None,
+                action_relation=ScreenshotActionRelation.TOOL_RESULT,
+            ),
+        )
         return _copilot_to_call_tool_result(copilot_result)
 
     async def call_internal_tool(
@@ -1187,7 +1697,7 @@ class SkyvernOverlayMCPServer(MCPServer):
     ) -> dict[str, Any]:
         propagated_error: BaseException
         try:
-            return await self._call_internal_tool(mcp_tool_name, mcp_args)
+            return (await self._call_internal_tool(mcp_tool_name, mcp_args)).result
         except BaseException as exc:
             if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
                 LOG.warning("Internal MCP tool dispatch failed")
@@ -1196,11 +1706,31 @@ class SkyvernOverlayMCPServer(MCPServer):
             del self, mcp_tool_name, mcp_args, exc
         raise propagated_error from None
 
+    async def call_internal_browser_tool(
+        self,
+        mcp_tool_name: Literal["skyvern_evaluate", "skyvern_screenshot"],
+        mcp_args: dict[str, Any],
+    ) -> _InternalBrowserCallResult:
+        """Typed sibling for native consumers that need browser-call provenance."""
+        propagated_error: BaseException
+        try:
+            call = await self._call_internal_tool(mcp_tool_name, mcp_args)
+            if call.browser_outcome is None:
+                raise RuntimeError(f"Missing browser-call outcome for {mcp_tool_name}")
+            return _InternalBrowserCallResult(result=call.result, outcome=call.browser_outcome)
+        except BaseException as exc:
+            if not app.AGENT_FUNCTION.prepare_codeblock_control_flow_exception(exc):
+                LOG.warning("Internal MCP browser tool dispatch failed")
+                raise
+            propagated_error = exc.with_traceback(None)
+            del self, mcp_tool_name, mcp_args, exc
+        raise propagated_error from None
+
     async def _call_internal_tool(
         self,
         mcp_tool_name: str,
         mcp_args: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> _InternalToolCallResult:
         """Raw FastMCP call for internal copilot subsystems (discovery walker).
 
         Bypasses overlay hooks, loop detection, and screenshot recording —
@@ -1214,13 +1744,34 @@ class SkyvernOverlayMCPServer(MCPServer):
         phases = _PhaseClock()
         copilot_name = self._reverse_alias.get(mcp_tool_name, mcp_tool_name)
         ctx = self._context_provider()
-        observed_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0)
+        requested_session_id = mcp_args.get("session_id")
+        if not isinstance(requested_session_id, str) or not requested_session_id:
+            requested_session_id = None
+        observed_continuity_generation = ctx.browser_session_continuity_generation
+        attempt_browser_session_id = requested_session_id or ctx.browser_session_id
+        uses_shared_browser_outcome = mcp_tool_name in _SHARED_BROWSER_OUTCOME_TOOLS
+        dispatch_started = False
         if not self._client:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "not_connected")
-            return _scrub_tool_result(ctx, {"ok": False, "error": "MCP client not connected"})
+            result = {"ok": False, "error": "MCP client not connected"}
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=result,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=_scrub_tool_result(ctx, result))
         phases.enter("session_prepare")
         try:
-            err, continuity_result = await _prepare_browser_session_for_dispatch(
+            err, continuity_result, continuity_disposition = await _prepare_browser_session_for_dispatch(
                 ctx,
                 tool_name=copilot_name,
                 call_path="internal",
@@ -1228,24 +1779,84 @@ class SkyvernOverlayMCPServer(MCPServer):
             )
         except asyncio.CancelledError:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
+            if uses_shared_browser_outcome:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    dispatch_started=False,
+                    ctx=ctx,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
-        except Exception:
+        except Exception as exc:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    dispatched=False,
+                    exception=exc,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
         if err:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
-            return _scrub_tool_result(ctx, err)
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=err,
+                    ctx=ctx,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=_scrub_tool_result(ctx, err))
         if continuity_result is not None:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
-            return _scrub_tool_result(ctx, continuity_result)
-        merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
-        call_browser_session_id = ctx.browser_session_id
+            if uses_shared_browser_outcome:
+                outcome = _not_dispatched_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=attempt_browser_session_id,
+                    source_browser_session_generation=observed_continuity_generation,
+                    raw_result=continuity_result,
+                    ctx=ctx,
+                    session_loss_disposition=continuity_disposition,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=_scrub_tool_result(ctx, continuity_result))
+        # An explicit session is a dispatch lease chosen before session preparation awaits. Do not
+        # relabel that call with mutable ambient context if another concurrent tool replaces it.
+        call_browser_session_id = requested_session_id or ctx.browser_session_id
+        merged_args = {**mcp_args, "session_id": call_browser_session_id}
+        call_browser_session_generation = ctx.browser_session_continuity_generation
+        browser_outcome: _BrowserCallOutcome | None = None
+        post_dispatch_status: Literal["ok", "error", "session_error"] = "ok"
         try:
             phases.enter("context_enter")
             async with mcp_browser_context(ctx):
                 phases.enter("dispatch")
+                dispatch_started = True
                 try:
                     raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+                    if uses_shared_browser_outcome:
+                        browser_outcome = _normalize_browser_call_outcome(
+                            raw_tool_name=mcp_tool_name,
+                            source_browser_session_id=call_browser_session_id,
+                            source_browser_session_generation=call_browser_session_generation,
+                            raw_result=raw,
+                        )
                 except BaseException:
                     phases.unwind()
                     raise
@@ -1257,52 +1868,191 @@ class SkyvernOverlayMCPServer(MCPServer):
                 try:
                     await asyncio.sleep(0)
                     await self._drain_evidence_candidate_response_tasks()
-                except BaseException:
+                except asyncio.CancelledError:
                     phases.record_drain(drain_started, failed=True)
+                    if browser_outcome is not None:
+                        browser_outcome = replace(
+                            browser_outcome,
+                            evidence_drain_complete=False,
+                            cancelled=True,
+                            completion_browser_session_id=ctx.browser_session_id,
+                            completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                        )
+                        _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
                     raise
-                phases.record_drain(drain_started, failed=False)
+                except CopilotBrowserSessionUnavailable:
+                    phases.record_drain(drain_started, failed=True)
+                    if browser_outcome is None:
+                        raise
+                    post_dispatch_status = "session_error"
+                    if browser_outcome is not None:
+                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
+                    LOG.warning("Internal MCP evidence drain lost its browser session", tool=mcp_tool_name)
+                except Exception:
+                    phases.record_drain(drain_started, failed=True)
+                    if browser_outcome is None:
+                        raise
+                    post_dispatch_status = "error"
+                    if browser_outcome is not None:
+                        browser_outcome = replace(browser_outcome, evidence_drain_complete=False)
+                    LOG.warning("Internal MCP evidence drain failed", tool=mcp_tool_name)
+                else:
+                    phases.record_drain(drain_started, failed=False)
+                    if browser_outcome is not None:
+                        browser_outcome = replace(browser_outcome, evidence_drain_complete=True)
         except asyncio.CancelledError:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "cancelled")
+            if uses_shared_browser_outcome and browser_outcome is None:
+                outcome = _cancelled_browser_call_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatch_started=dispatch_started,
+                    ctx=ctx,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
             raise
         except CopilotBrowserSessionUnavailable as exc:
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "session_error")
-            disposition = await _handle_browser_session_loss(
-                ctx,
-                tool_name=copilot_name,
-                call_path="internal",
-                lost_session_id=exc.session_id,
+            try:
+                disposition = await _handle_browser_session_loss(
+                    ctx,
+                    tool_name=copilot_name,
+                    call_path="internal",
+                    lost_session_id=exc.session_id,
+                )
+            except asyncio.CancelledError:
+                if uses_shared_browser_outcome:
+                    outcome = _cancelled_browser_call_outcome(
+                        raw_tool_name=mcp_tool_name,
+                        source_browser_session_id=call_browser_session_id,
+                        source_browser_session_generation=call_browser_session_generation,
+                        dispatch_started=dispatch_started,
+                        ctx=ctx,
+                    )
+                    _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                raise
+            if uses_shared_browser_outcome:
+                outcome = _browser_call_outcome_from_mapping(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    raw_result={},
+                    error_kind="protocol",
+                )
+                outcome = replace(
+                    outcome,
+                    session_loss_disposition=disposition,
+                    replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
+                    completion_browser_session_id=ctx.browser_session_id,
+                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                )
+                outcome = _scrub_browser_call_outcome(ctx, outcome)
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(
+                result=_scrub_tool_result(ctx, _browser_session_loss_result({}, disposition=disposition))
             )
-            return _scrub_tool_result(ctx, _browser_session_loss_result({}, disposition=disposition))
         except Exception as exc:
             LOG.warning("Internal MCP tool call failed", tool=mcp_tool_name)
             _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, {}, "internal", "error")
-            return _scrub_tool_exception(ctx, mcp_tool_name, exc)
-        raw_mcp = dict(raw.structured_content or {})
-        if raw.is_error:
-            raw_mcp["ok"] = False
-            if not raw.structured_content and raw.content:
-                text_parts = [c.text for c in raw.content if hasattr(c, "text")]
-                raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
-            else:
-                raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
-        failed = raw.is_error or raw_mcp.get("ok", True) is not True
-        phases.settle()
-        _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", "error" if failed else "ok")
+            if uses_shared_browser_outcome:
+                outcome = _browser_protocol_exception_outcome(
+                    raw_tool_name=mcp_tool_name,
+                    source_browser_session_id=call_browser_session_id,
+                    source_browser_session_generation=call_browser_session_generation,
+                    dispatched=dispatch_started,
+                    exception=exc,
+                )
+                outcome = replace(
+                    _scrub_browser_call_outcome(ctx, outcome),
+                    completion_browser_session_id=ctx.browser_session_id,
+                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(ctx, outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=outcome,
+                )
+            return _InternalToolCallResult(result=_scrub_tool_exception(ctx, mcp_tool_name, exc))
+        if browser_outcome is not None:
+            raw_mcp = browser_outcome.raw_result()
+            failed = not browser_outcome.ok
+        else:
+            raw_mcp = dict(raw.structured_content or {})
+            if raw.is_error:
+                raw_mcp["ok"] = False
+                if not raw.structured_content and raw.content:
+                    text_parts = [c.text for c in raw.content if hasattr(c, "text")]
+                    raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+                else:
+                    raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+            failed = raw.is_error or raw_mcp.get("ok", True) is not True
+        if post_dispatch_status == "ok":
+            phases.settle()
+        call_status = "error" if failed else post_dispatch_status
+        _log_mcp_timing(ctx, copilot_name, mcp_tool_name, phases, raw_mcp, "internal", call_status)
         scrubbed = _scrub_tool_result(ctx, raw_mcp)
-        result = mcp_to_copilot(scrubbed) if scrubbed else {}
+        error_code = browser_outcome.error_code if browser_outcome is not None else _browser_error_code(scrubbed)
         if (
             ctx.turn_origin != TurnOrigin.runtime_self_heal
             and call_browser_session_id is not None
-            and result.get("error_code") == _SESSION_EXPIRED_ERROR_CODE
+            and error_code == _SESSION_EXPIRED_ERROR_CODE
         ):
-            disposition = await _handle_browser_session_loss(
-                ctx,
-                tool_name=copilot_name,
-                call_path="internal",
-                lost_session_id=call_browser_session_id,
+            try:
+                disposition = await _handle_browser_session_loss(
+                    ctx,
+                    tool_name=copilot_name,
+                    call_path="internal",
+                    lost_session_id=call_browser_session_id,
+                )
+            except asyncio.CancelledError:
+                if browser_outcome is not None:
+                    cancelled_outcome = replace(
+                        browser_outcome,
+                        cancelled=True,
+                        ok=False,
+                        error_kind="protocol",
+                        completion_browser_session_id=ctx.browser_session_id,
+                        completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                    )
+                    _record_browser_call_outcome(ctx, cancelled_outcome, call_path="internal")
+                raise
+            if browser_outcome is not None:
+                browser_outcome = replace(
+                    browser_outcome.with_raw_result(scrubbed),
+                    session_loss_disposition=disposition,
+                    replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
+                )
+                browser_outcome = replace(
+                    browser_outcome,
+                    completion_browser_session_id=ctx.browser_session_id,
+                    completion_browser_session_generation=ctx.browser_session_continuity_generation,
+                )
+                _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
+                return _InternalToolCallResult(
+                    result=_project_browser_call_outcome(browser_outcome, display_tool_name=mcp_tool_name),
+                    browser_outcome=browser_outcome,
+                )
+            return _InternalToolCallResult(
+                result=_browser_session_loss_result(mcp_to_copilot(scrubbed), disposition=disposition)
             )
-            return _browser_session_loss_result(result, disposition=disposition)
-        return result
+        if browser_outcome is not None:
+            browser_outcome = replace(
+                browser_outcome.with_raw_result(scrubbed),
+                completion_browser_session_id=ctx.browser_session_id,
+                completion_browser_session_generation=ctx.browser_session_continuity_generation,
+            )
+            _record_browser_call_outcome(ctx, browser_outcome, call_path="internal")
+            return _InternalToolCallResult(
+                result=_project_browser_call_outcome(browser_outcome, display_tool_name=mcp_tool_name),
+                browser_outcome=browser_outcome,
+            )
+        return _InternalToolCallResult(result=mcp_to_copilot(scrubbed) if scrubbed else {})
 
     async def list_prompts(self) -> ListPromptsResult:
         return ListPromptsResult(prompts=[])

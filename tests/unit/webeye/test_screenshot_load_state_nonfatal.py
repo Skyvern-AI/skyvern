@@ -13,6 +13,7 @@ from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import Page
 
 from skyvern.exceptions import FailedToTakeScreenshot, ScreenshotTargetClosed
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.webeye import browser_driver_errors
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_errors import BrowserAutomationError, BrowserTargetClosedError
@@ -70,6 +71,52 @@ def _stock_selection() -> BrowserEngineSelection:
 
 
 class TestScreenshotLoadStateNonFatal:
+    @pytest.mark.asyncio
+    async def test_zero_height_viewport_is_restored_before_screenshot(self) -> None:
+        page = _make_page(b"image-bytes")
+        page.viewport_size = {"width": 800, "height": 0}
+        page.set_viewport_size = AsyncMock()
+
+        result = await _current_viewpoint_screenshot_helper(page)
+
+        assert result == b"image-bytes"
+        page.set_viewport_size.assert_awaited_once_with(
+            {"width": 800, "height": SettingsManager.get_settings().BROWSER_HEIGHT}
+        )
+        page.screenshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_viewport_mode_is_not_mutated(self) -> None:
+        page = _make_page(b"image-bytes")
+        page.viewport_size = None
+        page.set_viewport_size = AsyncMock()
+
+        assert await _current_viewpoint_screenshot_helper(page) == b"image-bytes"
+
+        page.set_viewport_size.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_valid_viewport_is_not_mutated(self) -> None:
+        page = _make_page(b"image-bytes")
+        page.set_viewport_size = AsyncMock()
+
+        assert await _current_viewpoint_screenshot_helper(page) == b"image-bytes"
+
+        page.set_viewport_size.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_viewport_restore_failure_remains_a_screenshot_failure(self) -> None:
+        page = _make_page(b"image-bytes")
+        page.viewport_size = {"width": 800, "height": 0}
+        restore_error = PlaywrightError("viewport restore failed")
+        page.set_viewport_size = AsyncMock(side_effect=restore_error)
+
+        with pytest.raises(FailedToTakeScreenshot) as exc_info:
+            await _current_viewpoint_screenshot_helper(page)
+
+        assert exc_info.value.__cause__ is restore_error
+        page.screenshot.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_load_state_timeout_does_not_block_screenshot(self) -> None:
         page = _make_page(b"image-bytes")

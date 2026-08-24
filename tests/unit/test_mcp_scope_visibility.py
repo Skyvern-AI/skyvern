@@ -182,11 +182,11 @@ async def test_every_real_scope_is_non_empty_strict_subset(scoped_mcp: FastMCP) 
 # on ONE tool of many — the tag survives elsewhere, the subset stays strict, and the scope
 # silently loses a tool. Only an external oracle catches that, so these numbers are a ratchet:
 # adding or re-tagging a tool must be a conscious edit here, reviewed alongside the scope map.
-RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 29, "build": 60, "browser": 54, "lean": 33}
+RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 29, "build": 61, "browser": 54, "lean": 33}
 
 # Same ratchet for the unfiltered (`all`) surface. Kept in one place because duplicated copies
 # drift: a registration that bumps only its own copy leaves the others to fail in CI.
-TOTAL_TOOL_COUNT: int = 115
+TOTAL_TOOL_COUNT: int = 116
 
 
 @pytest.mark.asyncio

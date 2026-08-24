@@ -59,6 +59,10 @@ SENSITIVE_ARTIFACT_TYPES: frozenset[ArtifactType] = frozenset(
         ArtifactType.SCREENSHOT_ACTION,
         ArtifactType.SCREENSHOT_FINAL,
         ArtifactType.SCREENSHOT_PROXY,
+        ArtifactType.SCREENSHOT_PRE_SUBMIT,
+        ArtifactType.HTML_PRE_SUBMIT,
+        # A row this image cannot classify gets the short TTL, not the default one.
+        ArtifactType.UNKNOWN,
     }
 )
 

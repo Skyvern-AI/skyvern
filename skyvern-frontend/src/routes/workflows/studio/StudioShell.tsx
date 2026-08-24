@@ -39,7 +39,11 @@ import { RunTab } from "./RunTab";
 import { RunPaneActions, RunPaneViewToggles } from "./runview/RunPaneHeader";
 import { StudioBrowserStream } from "./StudioBrowserStream";
 import { StudioCoachMark } from "./StudioCoachMark";
-import { studioPanelId, studioTabId } from "./constants";
+import {
+  PANE_HEADER_ICON_BUTTON_CLASS,
+  studioPanelId,
+  studioTabId,
+} from "./constants";
 import {
   clampResizeDelta,
   movePaneBy,
@@ -99,8 +103,10 @@ function RunPaneLabel({
 }) {
   return (
     <span className="group/runlabel inline-flex min-w-0 items-center text-xs font-medium text-foreground">
+      {/* Must not wrap: the header is a fixed h-11 row, so a second line of
+          "Run: wr_…" overflows it and squeezes the control cluster. */}
       <span
-        className="inline group-focus-within/runlabel:hidden group-hover/runlabel:hidden"
+        className="inline-block min-w-0 truncate group-focus-within/runlabel:hidden group-hover/runlabel:hidden"
         title={dragHint}
       >
         {label}
@@ -219,7 +225,7 @@ export function StudioPane({
       aria-label={accessibleLabel}
       style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
-        "relative min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-slate-elevation1",
+        "relative min-h-0 flex-col overflow-hidden rounded-lg border-2 border-border bg-slate-elevation1",
         open
           ? "flex duration-200 motion-safe:animate-in motion-safe:fade-in"
           : "hidden",
@@ -271,7 +277,7 @@ export function StudioPane({
           event.preventDefault();
           reorder.onMove(event.key === "ArrowLeft" ? -1 : 1);
         }}
-        className="flex h-9 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing"
+        className="flex h-11 shrink-0 cursor-grab select-none items-center gap-2 border-b border-border px-2 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring active:cursor-grabbing"
       >
         {/* The drag hint lives on the grip (icon + label) only, so the header's
             buttons keep their own tooltips instead of inheriting this one. */}
@@ -299,7 +305,14 @@ export function StudioPane({
         <StudioPaneCompactContext.Provider value={compact}>
           {headerExtras}
           <span className="min-w-0 flex-1" />
-          {headerActions}
+          {headerActions ? (
+            <div
+              data-pane-header-actions
+              className="flex shrink-0 items-center gap-0.5"
+            >
+              {headerActions}
+            </div>
+          ) : null}
         </StudioPaneCompactContext.Provider>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -307,7 +320,7 @@ export function StudioPane({
               type="button"
               onClick={onClose}
               aria-label={`Close ${accessibleLabel} pane`}
-              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              className={PANE_HEADER_ICON_BUTTON_CLASS}
             >
               <Cross2Icon className="size-3.5" />
             </button>

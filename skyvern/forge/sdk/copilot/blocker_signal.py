@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
-from skyvern.forge.sdk.copilot.run_outcome import TERMINAL_CHALLENGE_BLOCKER_REASON_CODES
-
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import BlockRunIdentity
 
@@ -248,13 +246,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
 SCHEMA_INCOMPATIBILITY_REASON_CODE = "schema_incompatibility"
 # A held blocker whose reason code is in this set must win both the rendered reply and the typed
 # halt kind over a later non-terminal trip (e.g. the code-authoring churn backstop).
-GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset(
-    {
-        *TERMINAL_CHALLENGE_BLOCKER_REASON_CODES,
-        BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
-        "tool_error_run_output_terminal_blocker",
-    }
-)
+GENUINELY_TERMINAL_BLOCKER_REASON_CODES: frozenset[str] = frozenset({BROWSER_SESSION_LOST_BLOCKER_REASON_CODE})
 
 
 def blocker_signal_is_genuinely_terminal(signal: CopilotToolBlockerSignal | None) -> bool:
