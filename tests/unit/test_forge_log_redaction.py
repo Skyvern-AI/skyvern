@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import subprocess
 import sys
 import textwrap
@@ -11,13 +12,20 @@ import pytest
 import structlog
 from pydantic import BaseModel
 
+from skyvern.config import settings
+from skyvern.forge import log_redaction
 from skyvern.forge.log_redaction import (
+    REDACTED,
+    is_proxy_observability_key,
     redact_bearer_tokens_in_text,
+    redact_proxy_observability_value,
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import (
     compact_action_objects,
     redact_bearer_tokens,
@@ -25,9 +33,112 @@ from skyvern.forge.sdk.forge_log import (
     redact_sensitive_event_fields,
     setup_logger,
 )
+from skyvern.schemas.proxy_pinning import ProxyObservabilityField, RedactedProxyLogValue, redact_proxy_location
+from skyvern.schemas.runs import GeoTarget
 
 _FAKE_CREDENTIAL = "fake-pa55w0rd-7x9"
 _REDACTED = "****"
+_SYNTHETIC_PROXY_CREDENTIAL = "synthetic-proxy-secret"
+_SYNTHETIC_PROXY_HOST = "internalproxy"
+_SYNTHETIC_PROXY_URL = f"http://user:{_SYNTHETIC_PROXY_CREDENTIAL}@{_SYNTHETIC_PROXY_HOST}:8080"
+
+
+def _nested_mapping(value: object, depth: int = 22) -> object:
+    for _ in range(depth):
+        value = {"child": value}
+    return value
+
+
+def _emit_native_json_log(
+    capsys: pytest.CaptureFixture[str],
+    context: SkyvernContext,
+    **event_fields: object,
+) -> str:
+    root = logging.getLogger()
+    saved_config = structlog.get_config()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    try:
+        setup_logger()
+        with skyvern_context.scoped(context):
+            structlog.get_logger("skyvern.test.proxy_redaction").warning("synthetic proxy event", **event_fields)
+        return capsys.readouterr().err
+    finally:
+        structlog.configure(**saved_config)
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def test_proxy_observability_key_classifier_matches_values_not_metadata() -> None:
+    for key in (
+        "proxy_location",
+        "profile_proxy_location",
+        "input_proxy_location",
+        "effective_proxy_location",
+        "proxy_url",
+        "proxy_host",
+        "geo_target",
+    ):
+        assert is_proxy_observability_key(key)
+
+    for key in ("proxy_location_type", "input_proxy_location_present", "proxy_session_id", 200):
+        assert not is_proxy_observability_key(key)
+
+
+def test_proxy_observability_renderer_preserves_marked_values() -> None:
+    rendered = redact_proxy_location({"url": "http://user:synthetic-secret@token.proxy.example:8080"})
+
+    assert redact_proxy_observability_value("proxy_location", rendered) is rendered
+
+
+def test_proxy_observability_renderer_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_renderer(field: ProxyObservabilityField, value: object) -> RedactedProxyLogValue:
+        assert field is ProxyObservabilityField.PROXY_LOCATION
+        del value
+        raise RuntimeError("synthetic renderer failure")
+
+    monkeypatch.setattr(log_redaction, "_proxy_observability_renderer", fail_renderer)
+
+    rendered = redact_proxy_observability_value(
+        "proxy_location", "http://user:synthetic-secret@token.proxy.example:8080"
+    )
+
+    assert rendered == REDACTED
+    assert isinstance(rendered, RedactedProxyLogValue)
+
+
+def test_proxy_observability_renderer_rejects_unmarked_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unsafe_renderer(field: ProxyObservabilityField, value: object) -> str:
+        del field
+        del value
+        return "http://user:synthetic-secret@token.proxy.example:8080"
+
+    monkeypatch.setattr(log_redaction, "_proxy_observability_renderer", unsafe_renderer)
+
+    rendered = redact_proxy_observability_value("proxy_location", "proxy_location")
+
+    assert rendered == REDACTED
+    assert isinstance(rendered, RedactedProxyLogValue)
+
+
+def test_proxy_field_families_render_by_semantics() -> None:
+    out = redact_sensitive_event_fields(
+        None,
+        "warning",
+        {
+            "proxy_location": "RESIDENTIAL",
+            "proxy_host": _SYNTHETIC_PROXY_HOST,
+            "proxy_url": _SYNTHETIC_PROXY_URL,
+            "geo_target": GeoTarget(country="US", subdivision="CA", city="Chicago"),
+        },
+    )  # type: ignore[arg-type]
+
+    assert out["proxy_location"] == "RESIDENTIAL"
+    assert re.fullmatch(r"proxy_host:[0-9a-f]{12}", out["proxy_host"])
+    assert re.fullmatch(r"proxy_url:[0-9a-f]{12}", out["proxy_url"])
+    assert re.fullmatch(r"geo_target:US:[0-9a-f]{12}", out["geo_target"])
+    assert _SYNTHETIC_PROXY_CREDENTIAL not in json.dumps(out)
+    assert _SYNTHETIC_PROXY_HOST not in json.dumps(out)
 
 
 @pytest.fixture(autouse=True)
@@ -216,6 +327,77 @@ def test_leaves_plain_string_values_untouched() -> None:
     assert out == event
 
 
+def test_proxy_values_are_redacted_at_the_structlog_boundary() -> None:
+    custom_proxy = {"url": "http://user:synthetic-secret@token.proxy.example:8080"}
+    event = {
+        "event": "synthetic proxy event",
+        "proxy_location": custom_proxy,
+        "profile_proxy_location": custom_proxy,
+        "proxy_host": "token.proxy.example",
+        "proxy_location_type": "dict",
+        "input_proxy_location_present": True,
+        "payload": {"effective_proxy_location": custom_proxy},
+    }
+
+    out = redact_sensitive_event_fields(None, "warning", event)  # type: ignore[arg-type]
+    dumped = json.dumps(out)
+
+    assert "synthetic-secret" not in dumped
+    assert "token.proxy.example" not in dumped
+    assert re.fullmatch(r"custom_url:[0-9a-f]{12}", out["proxy_location"])
+    assert out["profile_proxy_location"] == out["proxy_location"]
+    assert re.fullmatch(r"proxy_host:[0-9a-f]{12}", out["proxy_host"])
+    assert out["payload"]["effective_proxy_location"] == out["proxy_location"]
+    assert out["proxy_location_type"] == "dict"
+    assert out["input_proxy_location_present"] is True
+
+
+def test_proxy_boundary_does_not_render_a_marked_value_twice() -> None:
+    rendered = redact_proxy_location({"url": "http://user:synthetic-secret@token.proxy.example:8080"})
+
+    out = redact_sensitive_event_fields(None, "info", {"proxy_location": rendered})  # type: ignore[arg-type]
+
+    assert out["proxy_location"] is rendered
+
+
+def test_native_pipeline_redacts_proxy_output_and_context_log(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(settings, "JSON_LOGGING", True)
+    context = SkyvernContext()
+
+    rendered = _emit_native_json_log(
+        capsys,
+        context,
+        proxy_host=_SYNTHETIC_PROXY_HOST,
+        proxy_url=_SYNTHETIC_PROXY_URL,
+    )
+    persisted = json.dumps(context.log)
+
+    for output in (rendered, persisted):
+        assert _SYNTHETIC_PROXY_CREDENTIAL not in output
+        assert _SYNTHETIC_PROXY_HOST not in output
+    assert re.fullmatch(r"proxy_host:[0-9a-f]{12}", context.log[0]["proxy_host"])
+
+
+def test_native_pipeline_fails_closed_beyond_the_depth_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(settings, "JSON_LOGGING", True)
+    context = SkyvernContext()
+    payload = _nested_mapping({"proxy_url": _SYNTHETIC_PROXY_URL})
+
+    rendered = _emit_native_json_log(capsys, context, payload=payload)
+    persisted = json.dumps(context.log)
+
+    for output in (rendered, persisted):
+        assert _SYNTHETIC_PROXY_CREDENTIAL not in output
+        assert _SYNTHETIC_PROXY_HOST not in output
+    assert REDACTED in persisted
+
+
 def test_webhook_failure_event_is_fully_redacted_through_processors() -> None:
     # Composed in the exact order setup_logger installs them: redact_bearer_tokens
     # first (top-level strings only), then redact_sensitive_event_fields (recurses
@@ -324,6 +506,14 @@ class _FakeTaskModel(BaseModel):
     extra_http_headers: dict[str, str] | None = None
 
 
+class _UndumpableProxyModel(BaseModel):
+    proxy_url: str
+
+    def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
+        del args, kwargs
+        raise RuntimeError("synthetic model_dump failure")
+
+
 def test_masks_sensitive_fields_inside_a_model_kwarg() -> None:
     """A model kwarg is rendered in full by the formatter, so it has to be redacted too."""
     event = {"event": "x", "task": _FakeTaskModel(task_id="tsk_1", extra_http_headers={"X-Auth": "test-token-123"})}
@@ -331,6 +521,21 @@ def test_masks_sensitive_fields_inside_a_model_kwarg() -> None:
     assert "test-token-123" not in json.dumps(out, default=str)
     assert out["task"]["extra_http_headers"] == _REDACTED
     assert out["task"]["task_id"] == "tsk_1"
+
+
+def test_model_dump_failure_fails_closed() -> None:
+    model = _UndumpableProxyModel(proxy_url=_SYNTHETIC_PROXY_URL)
+
+    assert redact_sensitive_fields(model) == REDACTED
+
+
+def test_depth_cap_redacts_remaining_containers_and_json_shaped_strings() -> None:
+    raw = {"proxy_url": _SYNTHETIC_PROXY_URL}
+
+    assert redact_sensitive_fields(raw, 21) == REDACTED
+    assert redact_sensitive_fields([raw], 21) == REDACTED
+    assert redact_sensitive_fields(json.dumps(raw), 21) == REDACTED
+    assert redact_sensitive_fields("ordinary text", 21) == "ordinary text"
 
 
 def test_masks_sensitive_fields_inside_tuple_and_set_kwargs() -> None:

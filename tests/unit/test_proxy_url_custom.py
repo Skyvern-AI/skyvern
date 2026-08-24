@@ -12,7 +12,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
 from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileRequest
 from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
-from skyvern.schemas.proxy_pinning import redact_proxy_location
+from skyvern.schemas.proxy_pinning import RedactedProxyLogValue, redact_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_url_query
 
@@ -181,6 +181,14 @@ def test_redact_proxy_location_never_renders_a_credentialed_value(value: object)
     rendered = redact_proxy_location(value)
     assert CREDENTIAL not in rendered
     assert _NAMED_ONLY_RE.fullmatch(rendered), rendered
+
+
+def test_redact_proxy_location_returns_a_safe_log_value() -> None:
+    rendered = redact_proxy_location({"url": "http://user:synthetic-secret@token.proxy.example:8080"})
+
+    assert isinstance(rendered, RedactedProxyLogValue)
+    assert "synthetic-secret" not in rendered
+    assert "token.proxy.example" not in rendered
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
@@ -28,13 +30,13 @@ def _render(record: logging.LogRecord) -> str:
     return formatter.format(record)
 
 
-def _render_json(record: logging.LogRecord, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+def _render_json(record: logging.LogRecord, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Render through the JSON branch — the one production and staging run."""
     monkeypatch.setattr(settings, "JSON_LOGGING", True)
     return json.loads(_render(record))
 
 
-def _foreign_record(**extra: str) -> logging.LogRecord:
+def _foreign_record(**extra: object) -> logging.LogRecord:
     """A stdlib record shaped like `LOG.warning(msg, extra={...})` produces."""
     record = logging.LogRecord(
         name="codeblock.codeblock_grpc",
@@ -94,6 +96,20 @@ def test_json_foreign_record_keeps_its_message_alongside_extra_fields(monkeypatc
     assert payload["unavailable_cause"] == "grpc_unavailable"
     assert payload["runner_target"] == "127.0.0.1:7819"
     assert payload["grpc_status"] == "UNAVAILABLE"
+
+
+def test_json_foreign_record_redacts_proxy_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _render_json(
+        _foreign_record(
+            proxy_location={"url": "http://user:synthetic-secret@token.proxy.example:8080"},
+        ),
+        monkeypatch,
+    )
+    rendered = json.dumps(payload)
+
+    assert "synthetic-secret" not in rendered
+    assert "token.proxy.example" not in rendered
+    assert re.fullmatch(r"custom_url:[0-9a-f]{12}", payload["proxy_location"])
 
 
 def test_json_foreign_record_carries_organization_id_from_context(monkeypatch: pytest.MonkeyPatch) -> None:
