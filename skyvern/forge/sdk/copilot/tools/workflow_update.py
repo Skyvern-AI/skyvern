@@ -3454,39 +3454,6 @@ def _extraction_schema_incompatibility(
     )
 
 
-_EXPECT_DOWNLOAD_ATTR = "expect_download"
-
-
-def _call_is_expect_download(node: ast.expr) -> bool:
-    if isinstance(node, ast.Await):
-        return _call_is_expect_download(node.value)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        return node.func.attr == _EXPECT_DOWNLOAD_ATTR
-    return False
-
-
-def _code_registers_download(code: str) -> bool:
-    """Either terminal that actually fires a registered download: the ``expect_download`` idiom or
-    the worker-owned download claim."""
-    return _code_uses_expect_download(code) or code_uses_download_claim(code)
-
-
-def _code_uses_expect_download(code: str) -> bool:
-    """True only for the registering form: `expect_download()` called as the context
-    expression of an `async with`/`with`. A bare `page.expect_download` attribute or an
-    uncaptured call fires no download, so it does not count."""
-    try:
-        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
-    except SyntaxError:
-        return False
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.AsyncWith, ast.With)):
-            for item in node.items:
-                if _call_is_expect_download(item.context_expr):
-                    return True
-    return False
-
-
 _DOWNLOAD_DESCRIPTOR_LEAK_KEY_SET = frozenset({"downloaded_file_path", "download_url"})
 
 
@@ -3562,12 +3529,12 @@ def _artifact_declares_registration_keys(artifact: Mapping[str, Any]) -> bool:
 
 def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
     """Disjoint from extraction-intent (`goal_value_paths` on non-registration keys):
-    a block is download-intent when it carries the expect_download idiom, self-asserts a
-    registration key in a top-level dict, or declares a registration key as a goal path."""
+    a block is download-intent when it claims a download, self-asserts a registration key in a
+    top-level dict, or declares a registration key as a goal path."""
     if not code.strip():
         return False
     return (
-        _code_registers_download(code)
+        code_uses_download_claim(code)
         or _code_returns_registration_keys(code)
         or _artifact_declares_registration_keys(artifact)
     )
