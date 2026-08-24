@@ -31,9 +31,27 @@ from skyvern.webeye.driver_connection import close_driver_connection_on_transpor
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
-    from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession
 
 LOG = structlog.get_logger()
+
+
+class ChannelContext(t.Protocol):
+    """The connection identity a CdpChannel dials with. Members are read-only
+    properties so implementations may delegate to live channel state (a
+    session's browser_address can rotate mid-connection)."""
+
+    @property
+    def organization_id(self) -> str: ...
+
+    @property
+    def x_api_key(self) -> str: ...
+
+    @property
+    def browser_session(self) -> AddressablePersistentBrowserSession | None: ...
+
+    @property
+    def identity(self) -> dict[str, t.Any]: ...
 
 
 @functools.lru_cache(maxsize=None)
@@ -54,10 +72,7 @@ def _load_js_asset(file_name: str) -> str:
 
 
 class CdpChannel:
-    """
-    CdpChannel. Relies on a VncChannel - without one, a CdpChannel has no
-    r'aison d'etre.
-    """
+    """A CDP channel backed by browser session context."""
 
     def __new__(cls, *_: t.Iterable[t.Any], **__: t.Mapping[str, t.Any]) -> t.Self:  # noqa: N805
         if cls is CdpChannel:
@@ -65,8 +80,8 @@ class CdpChannel:
 
         return super().__new__(cls)
 
-    def __init__(self, *, vnc_channel: VncChannel) -> None:
-        self.vnc_channel = vnc_channel
+    def __init__(self, *, context: ChannelContext) -> None:
+        self.context = context
         # --
         self.browser: Browser | None = None
         self.browser_context: BrowserContext | None = None
@@ -84,7 +99,7 @@ class CdpChannel:
 
     @property
     def identity(self) -> t.Dict[str, t.Any]:
-        base = self.vnc_channel.identity
+        base = self.context.identity
 
         # This mapping is splatted into every log line this channel writes, and the url it holds
         # is the session's own address — which carries the session token.
@@ -107,8 +122,8 @@ class CdpChannel:
 
         if cdp_url:
             url = cdp_url
-        elif self.vnc_channel.browser_session and self.vnc_channel.browser_session.browser_address:
-            url = self.vnc_channel.browser_session.browser_address
+        elif self.context.browser_session and self.context.browser_session.browser_address:
+            url = self.context.browser_session.browser_address
         else:
             url = settings.BROWSER_REMOTE_DEBUGGING_URL
 
@@ -126,11 +141,11 @@ class CdpChannel:
         self.pw = pw
 
         headers: dict[str, str] | None = None
-        if self.vnc_channel.x_api_key:
-            headers = {"x-api-key": self.vnc_channel.x_api_key}
-        if self.vnc_channel.browser_session and is_local_pbs_cdp_url(url):
+        if self.context.x_api_key:
+            headers = {"x-api-key": self.context.x_api_key}
+        if self.context.browser_session and is_local_pbs_cdp_url(url):
             headers = headers or {}
-            headers["X-Session-Id"] = self.vnc_channel.browser_session.persistent_browser_session_id
+            headers["X-Session-Id"] = self.context.browser_session.persistent_browser_session_id
 
         def on_close() -> None:
             if self._closing:
@@ -171,10 +186,10 @@ class CdpChannel:
         return self
 
     async def apply_download_behavior(self, browser: Browser) -> t.Self:
-        org_id = self.vnc_channel.organization_id
+        org_id = self.context.organization_id
 
         browser_session_id = (
-            self.vnc_channel.browser_session.persistent_browser_session_id if self.vnc_channel.browser_session else None
+            self.context.browser_session.persistent_browser_session_id if self.context.browser_session else None
         )
 
         download_path = f"/app/downloads/{org_id}/{browser_session_id}" if browser_session_id else "/app/downloads/"

@@ -23,8 +23,7 @@ import weakref
 import structlog
 from playwright.async_api import CDPSession, ConsoleMessage, Frame, Page
 
-from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
-from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
+from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel, ChannelContext
 
 LOG = structlog.get_logger()
 
@@ -98,7 +97,7 @@ class ExfiltrationChannel(CdpChannel):
     _rearm_in_flight_pages: t.ClassVar[weakref.WeakKeyDictionary[Page, bool]] = weakref.WeakKeyDictionary()
     _rearm_pending_full_nav_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
 
-    def __init__(self, *, on_event: OnExfiltrationEvent, vnc_channel: VncChannel) -> None:
+    def __init__(self, *, on_event: OnExfiltrationEvent, context: ChannelContext) -> None:
         self.cdp_session: CDPSession | None = None
         self.on_event = on_event
         self._page_console_captures: weakref.WeakKeyDictionary[Page, PageConsoleCapture] = weakref.WeakKeyDictionary()
@@ -115,7 +114,7 @@ class ExfiltrationChannel(CdpChannel):
         self._capture_seq = 0
         self._drain_token = uuid.uuid4().hex
 
-        super().__init__(vnc_channel=vnc_channel)
+        super().__init__(context=context)
 
     def _next_capture_seq(self) -> int:
         seq = self._capture_seq
