@@ -124,6 +124,8 @@
             "group": "Account & Settings",
             "pages": [
               "cloud/account-settings/api-keys",
+              "cloud/account-settings/authentication-and-permissions",
+              "cloud/account-settings/api-versioning-and-deprecation",
               "cloud/account-settings/billing-usage",
               "cloud/account-settings/organization-settings",
               "cloud/account-settings/profile-settings"
@@ -193,6 +195,13 @@
               "developers/going-to-production/proxy-geolocation",
               "developers/going-to-production/error-handling",
               "developers/going-to-production/reliability-tips"
+            ]
+          },
+          {
+            "group": "API Access",
+            "pages": [
+              "developers/api/authentication-and-permissions",
+              "developers/api/versioning-and-deprecation"
             ]
           },
           {

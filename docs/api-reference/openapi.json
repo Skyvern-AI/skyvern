@@ -3005,7 +3005,8 @@
         "tags": [
           "agent"
         ],
-        "summary": "Get Runs V2",
+        "summary": "List runs",
+        "description": "List the organization's task and agent runs, newest first, filterable by status, run type, agent, and a free-text search term. Returns a paginated array of run summaries.",
         "operationId": "get_runs_v2_v1_runs_get",
         "parameters": [
           {
@@ -3197,7 +3198,8 @@
         "tags": [
           "Files"
         ],
-        "summary": "Upload File",
+        "summary": "Upload a file",
+        "description": "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its storage URI, a presigned download URL, and the expiry implied by the requested retention period.",
         "operationId": "upload_file_v1_upload_file_post",
         "parameters": [
           {
@@ -5810,6 +5812,7 @@
           "Schedules"
         ],
         "summary": "List all schedules for the organization",
+        "description": "List every schedule in the organization, across all agents, filterable by active/paused status and a search term matched against agent title or schedule name. Returns a paginated list plus the total count.",
         "operationId": "schedules_list_all",
         "parameters": [
           {
@@ -6851,6 +6854,7 @@
           "Agents"
         ],
         "summary": "Get an agent by id",
+        "description": "Fetch a single agent definition by its permanent id, optionally pinned to a specific version. Returns the agent's blocks, parameters, and metadata.",
         "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
         "parameters": [
           {
@@ -7080,6 +7084,7 @@
           "Schedules"
         ],
         "summary": "Create a schedule for an agent",
+        "description": "Create a cron schedule that runs the given agent automatically with a fixed set of parameters. Returns the stored schedule and its next upcoming run times.",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -7148,6 +7153,7 @@
           "Schedules"
         ],
         "summary": "List schedules for an agent",
+        "description": "List all schedules attached to a single agent. Returns the schedules in creation order.",
         "operationId": "schedules_list",
         "parameters": [
           {
@@ -7208,6 +7214,7 @@
           "Schedules"
         ],
         "summary": "Get an agent schedule by id",
+        "description": "Fetch one schedule belonging to an agent. Returns the schedule's cron expression, timezone, parameters, enabled state, and next upcoming run times.",
         "operationId": "schedules_get",
         "parameters": [
           {
@@ -7275,6 +7282,7 @@
           "Schedules"
         ],
         "summary": "Update an agent schedule",
+        "description": "Replace a schedule's cron expression, timezone, run parameters, and enabled state. Returns the updated schedule and its next upcoming run times.",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -7352,6 +7360,7 @@
           "Schedules"
         ],
         "summary": "Delete an agent schedule",
+        "description": "Permanently delete a schedule so it never triggers again. Returns an acknowledgement flag.",
         "operationId": "schedules_delete",
         "parameters": [
           {
@@ -7421,6 +7430,7 @@
           "Schedules"
         ],
         "summary": "Enable an agent schedule",
+        "description": "Resume a paused schedule so it starts triggering runs again. Returns the updated schedule.",
         "operationId": "schedules_enable",
         "parameters": [
           {
@@ -7490,6 +7500,7 @@
           "Schedules"
         ],
         "summary": "Disable an agent schedule",
+        "description": "Pause a schedule so it stops triggering runs, without deleting it. Returns the updated schedule.",
         "operationId": "schedules_disable",
         "parameters": [
           {

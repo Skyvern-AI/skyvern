@@ -1,0 +1,95 @@
+Skyvern's REST API is versioned in the URL path. The current and only supported version is **v1**, served from `https://api.skyvern.com/v1/`.
+
+```bash
+curl -X POST "https://api.skyvern.com/v1/run/tasks" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "url": "https://example.com", "prompt": "Extract the pricing table" }'
+```
+
+## How versioning works
+
+The major version appears once, as the first path segment. It never appears in a header, query parameter, or `Accept` media type.
+
+| Change type | How it ships |
+| --- | --- |
+| Backward-compatible change | Released into `v1` with no new version and no client action required |
+| Breaking change | Released under a new path prefix (`/v2/`), with `v1` kept alive through the deprecation window below |
+
+Skyvern does not use date-based or header-negotiated versions. If your client pins `https://api.skyvern.com/v1`, no deployment we make will change the shape of a response you already depend on.
+
+## What counts as backward compatible
+
+Treat the following as expected within `v1`, and make sure your client tolerates them:
+
+- New endpoints and new HTTP methods on existing paths
+- New optional request parameters and request body fields
+- New fields in response bodies
+- New values in existing enums (for example, a new run status or failure reason)
+- New or reworded human-readable `detail` strings on error responses
+- Changes to the ordering of JSON object keys or of items in an unordered collection
+
+The practical rule: **ignore unknown fields rather than failing on them**, and treat an unrecognized enum value as "something newer than my client" instead of an error.
+
+## What we will not do inside v1
+
+These are breaking changes. They only ship in a new major version, never into `v1`:
+
+- Removing or renaming an endpoint, a request field, or a response field
+- Changing the type or format of an existing field
+- Making an optional parameter required, or adding a new required parameter
+- Removing a value from an enum
+- Changing the HTTP status code or error code for an existing failure mode
+- Changing the authentication a route requires
+
+## Stability guarantees by surface
+
+| Surface | Stability |
+| --- | --- |
+| `https://api.skyvern.com/v1/*` | Stable and covered by this policy. Described by the [OpenAPI specification](/api-reference/openapi.json) |
+| `/api/v1/*`, `/api/v2/*` | Legacy compatibility paths. Excluded from the OpenAPI specification and from this policy. Do not build new integrations on them; use `/v1/` |
+| Official SDKs (Python, TypeScript) | Semantic versioning, generated from the same OpenAPI specification. A major SDK bump can accompany an API major version |
+| MCP server (`https://api.skyvern.com/mcp`) | Tool names and arguments follow the same compatibility rules as `v1` endpoints |
+| Undocumented endpoints and fields | Anything absent from the OpenAPI specification and these docs is internal and may change without notice |
+
+## Deprecation and sunset policy
+
+When we do deprecate part of the API, this is what you can count on:
+
+- **At least 6 months notice.** That is the minimum time between the deprecation announcement and the sunset date on which the endpoint stops serving traffic. Removing an entire major version gets at least 12 months.
+- **A changelog announcement** on the [Skyvern changelog](/changelog), naming the affected endpoints, the replacement, and the sunset date.
+- **Machine-readable response headers** on every response from a deprecated endpoint, following [RFC 9745](https://www.rfc-editor.org/rfc/rfc9745.html) (`Deprecation`) and [RFC 8594](https://www.rfc-editor.org/rfc/rfc8594.html) (`Sunset`).
+- **`deprecated: true` in the OpenAPI specification** for the affected operation, parameter, or schema field, so generated clients and API tooling surface the warning automatically.
+- **No silent removals.** An endpoint that has not been announced, header-flagged, and given its full notice window will not be turned off.
+
+A response from a deprecated endpoint looks like this:
+
+```http
+HTTP/1.1 200 OK
+Deprecation: @1767225600
+Sunset: Wed, 01 Jul 2026 00:00:00 GMT
+Link: <https://skyvern.com/docs/changelog>; rel="deprecation"; type="text/html"
+```
+
+`Deprecation` carries the moment the endpoint became deprecated, `Sunset` the moment it stops responding, and the `Link` header points at the announcement explaining the migration.
+
+<Note>
+No `/v1` endpoint is deprecated today, so these headers are not present on any current response. The two deprecations in flight are field-level and documented in place: the `title` query parameter on `GET /v1/agents` (use `search_key`) and `publish_workflow` on task creation.
+</Note>
+
+## Building a client that survives changes
+
+- Pin the version prefix (`/v1/`), not a specific SDK patch release.
+- Parse responses leniently: ignore unknown fields, default unknown enum values to a safe branch.
+- Log any response carrying a `Deprecation` or `Sunset` header, and alert on it — that header is the earliest programmatic signal you will get.
+- Watch the [changelog](/changelog) for announcements, and diff the [OpenAPI specification](/api-reference/openapi.json) in CI if you generate your own client.
+
+## Where changes are announced
+
+| Channel | What it carries |
+| --- | --- |
+| [Changelog](/changelog) | Weekly entries: new features, improvements, fixes, and every deprecation announcement |
+| [OpenAPI specification](/api-reference/openapi.json) | The authoritative machine-readable contract, including `deprecated` flags |
+| `Deprecation` / `Sunset` headers | Per-request signal on any deprecated endpoint |
+
+Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
