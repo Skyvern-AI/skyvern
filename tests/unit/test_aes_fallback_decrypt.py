@@ -7,6 +7,18 @@ PRIMARY_SALT = "primary_salt_value_xxxxxxxxxxxxxxx"
 PRIMARY_IV = "primary_iv_xxxxxxxxx"
 PRIOR_SALT = "prior_salt_value_xxxxxxxxxxxxxxxxx"
 PRIOR_IV = "prior_iv_value_xxxxx"
+LEGACY_PRIMARY_CIPHERTEXT = "rvmea7ou1gzyata3OwKEQg=="
+
+
+@pytest.mark.asyncio
+async def test_decrypts_ciphertext_created_with_legacy_primary_normalization() -> None:
+    aes = AES(
+        secret_key=SECRET,
+        salt=PRIMARY_SALT,
+        iv=PRIMARY_IV,
+        fallback_decrypt_keys=[(PRIMARY_SALT, PRIMARY_IV)],
+    )
+    assert await aes.decrypt(LEGACY_PRIMARY_CIPHERTEXT) == "legacy primary"
 
 
 @pytest.mark.asyncio
