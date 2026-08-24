@@ -3,7 +3,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.forge.sdk.schemas.credentials import CreditCardBillingAddress, CreditCardCredential
+from skyvern.forge.sdk.schemas.credentials import (
+    CreditCardBillingAddress,
+    CreditCardCredential,
+    PasswordCredential,
+)
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 
@@ -34,13 +38,17 @@ def _context(*, mask_secrets: bool = True) -> WorkflowRunContext:
     )
 
 
-async def _register(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowRunContext, dict[str, Any]]:
+async def _register(
+    monkeypatch: pytest.MonkeyPatch,
+    credential: Any = _CARD,
+    parameter_key: str = "card",
+) -> tuple[WorkflowRunContext, dict[str, Any]]:
     context = _context()
-    parameter = MagicMock(key="card")
+    parameter = MagicMock(key=parameter_key)
 
     db_credential = MagicMock(vault_type=None, totp_identifier=None)
     vault = MagicMock()
-    vault.get_credential_item = AsyncMock(return_value=MagicMock(credential=_CARD))
+    vault.get_credential_item = AsyncMock(return_value=MagicMock(credential=credential))
 
     app = MagicMock()
     app.DATABASE.credentials.get_credential = AsyncMock(return_value=db_credential)
@@ -56,7 +64,7 @@ async def _register(monkeypatch: pytest.MonkeyPatch) -> tuple[WorkflowRunContext
         parameter=parameter,
         organization=MagicMock(organization_id="o_test"),
     )
-    return context, context.values["card"]
+    return context, context.values[parameter_key]
 
 
 @pytest.mark.asyncio
@@ -145,3 +153,35 @@ def test_mask_secrets_in_data_masks_even_when_global_flag_disabled(
     context.secrets["password"] = "secret-value"
 
     assert context.mask_secrets_in_data({"password": "secret-value"}) == {"password": "*****"}
+
+
+@pytest.mark.asyncio
+async def test_password_less_credential_still_exposes_a_password_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A login with no password must still register `password`, as the empty string.
+
+    Blocks (code blocks especially) dereference `.password` directly, so dropping the key for a
+    falsy value turns a valid password-less credential into a namespace lookup failure.
+    """
+    credential = PasswordCredential(username="user@example.com", password="")
+
+    context, values = await _register(monkeypatch, credential=credential, parameter_key="login")
+
+    assert values["password"] == ""
+    assert str(values["username"]).startswith(RANDOM_SECRET_ID_PREFIX)
+    # The empty password is not a secret to mask, so it must not enter the secrets map.
+    assert "" not in context.secrets
+
+
+@pytest.mark.asyncio
+async def test_password_less_credential_resolves_real_password_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The template entry for the real password resolves to "" rather than a placeholder id."""
+    credential = PasswordCredential(username="user@example.com", password="")
+
+    context, _ = await _register(monkeypatch, credential=credential, parameter_key="login")
+    entries = context.credential_template_entries(["login"], resolve_credential_dicts=True)
+
+    assert entries["login_real_password"] == ""
+    assert entries["login_real_username"] == "user@example.com"
+    assert entries["login"]["password"] == ""

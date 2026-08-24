@@ -9430,6 +9430,7 @@ class WorkflowService:
         failure_reason: str | None = None,
         run_with: str | None = None,
         failure_category: list[dict] | None = None,
+        finalized_by: str | None = None,
         run_minutes_recorded_through: datetime | None = None,
     ) -> WorkflowRun | None:
         """:meth:`_update_workflow_run_status` for writers that must lose a race against the
@@ -9446,6 +9447,7 @@ class WorkflowService:
         await self._after_workflow_run_status_write(
             workflow_run,
             status,
+            finalized_by=finalized_by,
             run_minutes_recorded_through=run_minutes_recorded_through,
         )
         return workflow_run
@@ -9456,6 +9458,7 @@ class WorkflowService:
         failure_reason: str | None = None,
         run_with: str | None = None,
         failure_category: list[dict] | None = None,
+        finalized_by: str | None = None,
     ) -> WorkflowRun | None:
         workflow_run = await app.DATABASE.workflow_runs.finish_preexisting_timed_out_workflow_run(
             workflow_run_id=workflow_run_id,
@@ -9467,7 +9470,9 @@ class WorkflowService:
             return None
         # Bulk stuck-run cleanup writes only the status. Complete that deferred
         # terminal transition exactly once, when ``finished_at`` is still null.
-        await self._after_workflow_run_status_write(workflow_run, WorkflowRunStatus.timed_out)
+        await self._after_workflow_run_status_write(
+            workflow_run, WorkflowRunStatus.timed_out, finalized_by=finalized_by
+        )
         return workflow_run
 
     async def _after_workflow_run_status_write(
@@ -9475,6 +9480,7 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         status: WorkflowRunStatus,
         emit_run_minutes: bool = True,
+        finalized_by: str | None = None,
         run_minutes_recorded_through: datetime | None = None,
     ) -> None:
         workflow_run_id = workflow_run.workflow_run_id
@@ -9524,6 +9530,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                     excluded_reason=None if workflow_run.started_at else "never_started",
+                    finalized_by=finalized_by,
                 )
             await self._apply_completion_run_tags_best_effort(workflow_run)
             self._schedule_workflow_run_terminal_hooks(
@@ -10067,6 +10074,7 @@ class WorkflowService:
         failure_reason: str | None = None,
         run_with: str | None = None,
         fallback_workflow_run: WorkflowRun | None = None,
+        finalized_by: str | None = None,
     ) -> WorkflowRun:
         LOG.info(
             f"Marking workflow run {workflow_run_id} as timed out",
@@ -10093,6 +10101,7 @@ class WorkflowService:
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
+            finalized_by=finalized_by,
         )
         if updated_workflow_run is None:
             # The CAS lost to a terminal writer, so only a fresh row can identify
@@ -10108,6 +10117,7 @@ class WorkflowService:
                 failure_reason=failure_reason,
                 run_with=run_with,
                 failure_category=failure_category,
+                finalized_by=finalized_by,
             )
             if enriched_workflow_run is not None:
                 updated_workflow_run = enriched_workflow_run

@@ -1112,7 +1112,8 @@ export type CreateCredentialRequest = {
 
 export type PasswordCredential = {
   username: string;
-  password: string;
+  /** Omit on an overwrite to keep the stored password; "" blanks it. */
+  password?: string;
   totp: string | null;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;

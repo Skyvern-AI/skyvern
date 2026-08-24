@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { COPILOT_WORKING_VERBS, pickWorkingVerb } from "./workingVerbs";
+import {
+  COPILOT_WORKING_VERBS,
+  pickWorkingVerb,
+  VERB_CYCLE_MS,
+} from "./workingVerbs";
+
+it("cycles working verbs every six seconds", () => {
+  expect(VERB_CYCLE_MS).toBe(6000);
+});
 
 describe("pickWorkingVerb", () => {
   it("never repeats the verb it just showed", () => {

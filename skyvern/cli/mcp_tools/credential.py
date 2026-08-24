@@ -308,7 +308,10 @@ async def skyvern_credential_create(
         Field(description="Type of credential: 'password', 'credit_card', or 'secret'"),
     ] = "password",
     username: Annotated[str | None, Field(description="Username or email (required for password type)")] = None,
-    password: Annotated[str | None, Field(description="Password (required for password type)")] = None,
+    password: Annotated[
+        str | None,
+        Field(description="Password (optional for password type; omit or leave empty for logins without a password)"),
+    ] = None,
     totp: Annotated[str | None, Field(description="TOTP secret for 2FA (e.g., 'JBSWY3DPEHPK3PXP')")] = None,
     card_number: Annotated[str | None, Field(description="Full card number (for credit_card type)")] = None,
     card_cvv: Annotated[str | None, Field(description="Card CVV (for credit_card type)")] = None,
@@ -338,17 +341,17 @@ async def skyvern_credential_create(
     # Build credential payload per type
     credential_data: dict[str, Any]
     if credential_type == "password":
-        if not username or not password:
+        if not username:
             return make_result(
                 "skyvern_credential_create",
                 ok=False,
                 error=make_error(
                     ErrorCode.INVALID_INPUT,
-                    "username and password are required for credential_type='password'",
-                    "Provide both username and password",
+                    "username is required for credential_type='password'",
+                    "Provide a username; password may be empty for logins without a password",
                 ),
             )
-        credential_data = {"username": username, "password": password}
+        credential_data = {"username": username, "password": password or ""}
         if totp:
             credential_data["totp"] = totp
     elif credential_type == "credit_card":

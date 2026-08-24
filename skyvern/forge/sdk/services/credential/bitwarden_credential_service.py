@@ -60,7 +60,7 @@ class BitwardenCredentialVaultService(CredentialVaultService):
 
         credential_data = data.credential
         if data.credential_type == CredentialType.PASSWORD and isinstance(credential_data, PasswordCredential):
-            credential_data = await self._preserve_omitted_password_metadata(
+            credential_data = await self._preserve_omitted_password_fields(
                 credential=credential,
                 updated_credential=credential_data,
             )

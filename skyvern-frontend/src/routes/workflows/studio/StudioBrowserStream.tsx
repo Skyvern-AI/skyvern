@@ -84,8 +84,9 @@ export function StudioBrowserStream() {
         enableUrlInput={true}
         isRecording={isRecording}
         // While recording, the Copilot pane hosts the live-drafts panel, whose
-        // header already shows the timer + step count — the REC pill would
-        // duplicate it. Closing that pane brings the pill back as the indicator.
+        // header already shows the timer + step count — an on-stream REC pill
+        // would duplicate it. Closing that pane brings the pill back on either
+        // transport (VNC renders it in BrowserStream, CDP in StreamPresenter).
         hideRecordingIndicator={panes.includes("copilot")}
         onUrlChange={handleUrlChange}
         onActivity={handleActivity}

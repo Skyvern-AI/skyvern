@@ -887,6 +887,7 @@ class AgentFunction:
         workflow_run_id: str | None = None,
         organization_id: str | None = None,
         excluded_reason: str | None = None,
+        finalized_by: str | None = None,
     ) -> None:
         """Cloud overrides this to emit run-duration telemetry; the OSS default is a no-op.
 
@@ -894,6 +895,8 @@ class AgentFunction:
         workflow run that backs a task_v2) without the caller paying for the lookup.
         excluded_reason marks a run whose duration must not count as compute (e.g.
         it never started); the override records it as an exclusion, not as minutes.
+        finalized_by names the writer when it is not the run's own finalizer, so the
+        override can bound a duration that measures the row's age rather than compute.
         """
         return None
 

@@ -4,6 +4,7 @@ from typing import Any, Awaitable, Callable
 
 import structlog
 
+from skyvern.exceptions import CredentialVaultShapeMismatchError
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
@@ -189,19 +190,39 @@ class CredentialVaultService(ABC):
 
         return updated_credential.model_copy(update=preserved_fields)
 
-    async def _preserve_omitted_password_metadata(
+    async def _preserve_omitted_password_fields(
         self,
         credential: Credential,
         updated_credential: PasswordCredential,
     ) -> PasswordCredential:
-        if "metadata" in updated_credential.model_fields_set:
+        """Restore fields the overwrite request omitted.
+
+        `password` defaults to "" so a login with no password can be stored, which makes an omitted
+        password indistinguishable from an explicitly blanked one by value alone. Only an explicitly
+        set password may overwrite the stored one.
+        """
+        updated_fields = updated_credential.model_fields_set
+        if {"metadata", "password"}.issubset(updated_fields):
             return updated_credential
 
         existing_item = await self.get_credential_item(credential)
         if not isinstance(existing_item.credential, PasswordCredential):
+            # Callers only reach this helper for CredentialType.PASSWORD, so a non-password item
+            # means the row and the vault disagree. There is nothing password-shaped to restore
+            # from, so continuing would write the defaulted "" over the stored secret.
+            if "password" not in updated_fields:
+                raise CredentialVaultShapeMismatchError(
+                    credential_id=credential.credential_id,
+                    stored_credential_type=type(existing_item.credential).__name__,
+                )
             return updated_credential
 
-        return updated_credential.model_copy(update={"metadata": existing_item.credential.metadata})
+        preserved_fields: dict[str, object] = {}
+        for field_name in ("metadata", "password"):
+            if field_name not in updated_fields:
+                preserved_fields[field_name] = getattr(existing_item.credential, field_name)
+
+        return updated_credential.model_copy(update=preserved_fields)
 
     @staticmethod
     def _preserve_omitted_billing_address_fields(
