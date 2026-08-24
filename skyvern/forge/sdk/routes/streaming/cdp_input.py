@@ -70,6 +70,8 @@ _MAX_URL_LEN = 2083
 ACTIVE_PAGE_INPUT_REFRESH_INTERVAL = 0.5
 _NAVIGATION_RESET_TIMEOUT_MS = 5_000
 _TARGET_CLOSED_ERROR_TYPES = frozenset({"TargetClosedError", "CdpTargetClosedError"})
+_PIPELINED_INPUT_KINDS = frozenset({"mouseEvent", "wheelEvent", "keyEvent"})
+_MAX_IN_FLIGHT_INPUT_DISPATCHES = 32
 
 
 def _input_kind_label(kind: object) -> str:
@@ -304,6 +306,28 @@ _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
 }
 
 
+def _validate_cdp_dispatch(
+    kind: str,
+    msg: dict,
+    log_id_key: str,
+    log_id_value: str,
+) -> tuple[str, dict] | None:
+    entry = _EVENT_DISPATCH_MAP.get(kind)
+    if entry is None:
+        return None
+    validator, cdp_method = entry
+    validated = validator(msg)
+    if validated is not None:
+        return cdp_method, validated
+    LOG.warning(
+        "CDP input: validation failed",
+        **{log_id_key: log_id_value},
+        kind=kind,
+        raw_event_type=msg.get("eventType"),
+    )
+    return None
+
+
 async def _reset_page_after_navigation_failure(
     page: object,
     log_id_key: str,
@@ -443,20 +467,11 @@ async def _dispatch_event(
         await _dispatch_history_event(cdp_session, kind, log_id_key, log_id_value, websocket)
         return
 
-    entry = _EVENT_DISPATCH_MAP.get(kind)
-    if entry is None:
+    dispatch = _validate_cdp_dispatch(kind, msg, log_id_key, log_id_value)
+    if dispatch is None:
         return
-    validator, cdp_method = entry
-    validated = validator(msg)
-    if validated:
-        await cdp_session.send(cdp_method, validated)
-    else:
-        LOG.warning(
-            "CDP input: validation failed",
-            **{log_id_key: log_id_value},
-            kind=kind,
-            raw_event_type=msg.get("eventType"),
-        )
+    cdp_method, validated = dispatch
+    await cdp_session.send(cdp_method, validated)
 
 
 async def _run_input_loop(
@@ -468,74 +483,144 @@ async def _run_input_loop(
 ) -> None:
     dropped_log_count = 0
     no_active_page_log_count = 0
-    while True:
-        try:
-            raw = await websocket.receive_text()
-        except WebSocketDisconnect:
-            break
-        received_at = time.monotonic()
+    dispatch_semaphore = asyncio.Semaphore(_MAX_IN_FLIGHT_INPUT_DISPATCHES)
+    dispatch_tasks: set[asyncio.Task[None]] = set()
+    dispatch_failure_close_started = False
 
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            LOG.warning("CDP input: malformed JSON", **{log_id_key: log_id_value})
-            continue
-
-        kind = msg.get("kind") or msg.get("type")
-
-        if kind == "take-control":
-            channel.interactor = "user"
-            LOG.info("CDP input: take-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
-            continue
-        if kind == "cede-control":
-            channel.interactor = "agent"
-            LOG.info("CDP input: cede-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
-            continue
-
-        if channel.interactor != "user":
-            if dropped_log_count < 5:
-                LOG.info(
-                    "CDP input: event dropped",
-                    interactor=channel.interactor,
-                    **{log_id_key: log_id_value},
-                    kind=kind,
-                )
-                dropped_log_count += 1
-            continue
-
-        try:
-            cdp_session = await input_session.get_session()
-        except Exception:
-            LOG.warning(
-                "CDP input: failed to resolve active page; closing input channel",
-                **{log_id_key: log_id_value},
-                kind=kind,
-                exc_info=True,
-            )
-            await websocket.close(code=4411, reason="active_page_resolution_failed")
-            break
-
-        if cdp_session is None:
-            if no_active_page_log_count < 5:
-                LOG.info("CDP input: no active page; event skipped", **{log_id_key: log_id_value}, kind=kind)
-                no_active_page_log_count += 1
-            continue
-
+    async def dispatch_pipelined_event(
+        cdp_session: CDPSession,
+        kind: str,
+        cdp_method: str,
+        validated: dict,
+        received_at: float,
+    ) -> None:
+        nonlocal dispatch_failure_close_started
         attributes = {"event_kind": _input_kind_label(kind)}
         dispatch_started = time.monotonic()
         _input_wait_seconds.record(dispatch_started - received_at, attributes)
         try:
-            await _dispatch_event(cdp_session, input_session.page, kind, msg, log_id_key, log_id_value, websocket)
-        except Exception:
+            try:
+                await cdp_session.send(cdp_method, validated)
+            finally:
+                _input_dispatch_seconds.record(time.monotonic() - dispatch_started, attributes)
+        except Exception as error:
+            if _is_navigation_target_loss(error):
+                LOG.debug(
+                    "CDP input: dropped event for detached pipelined session",
+                    **{log_id_key: log_id_value},
+                    kind=kind,
+                    error_type=type(error).__name__,
+                )
+                return
             LOG.warning(
                 "CDP input: failed to dispatch event; closing input channel",
                 **{log_id_key: log_id_value},
                 kind=kind,
                 exc_info=True,
             )
-            await websocket.close(code=4411, reason="dispatch_failed")
-            break
-        _input_dispatch_seconds.record(time.monotonic() - dispatch_started, attributes)
+            if not dispatch_failure_close_started:
+                dispatch_failure_close_started = True
+                await _close_ws_safely(websocket, code=4411, reason="dispatch_failed")
+        finally:
+            dispatch_semaphore.release()
+
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            received_at = time.monotonic()
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                LOG.warning("CDP input: malformed JSON", **{log_id_key: log_id_value})
+                continue
+
+            kind = msg.get("kind") or msg.get("type")
+
+            if kind == "take-control":
+                channel.interactor = "user"
+                LOG.info("CDP input: take-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
+                continue
+            if kind == "cede-control":
+                channel.interactor = "agent"
+                LOG.info("CDP input: cede-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
+                continue
+
+            if channel.interactor != "user":
+                if dropped_log_count < 5:
+                    LOG.info(
+                        "CDP input: event dropped",
+                        interactor=channel.interactor,
+                        **{log_id_key: log_id_value},
+                        kind=kind,
+                    )
+                    dropped_log_count += 1
+                continue
+
+            try:
+                cdp_session = await input_session.get_session()
+            except Exception:
+                LOG.warning(
+                    "CDP input: failed to resolve active page; closing input channel",
+                    **{log_id_key: log_id_value},
+                    kind=kind,
+                    exc_info=True,
+                )
+                await websocket.close(code=4411, reason="active_page_resolution_failed")
+                break
+
+            if cdp_session is None:
+                if no_active_page_log_count < 5:
+                    LOG.info("CDP input: no active page; event skipped", **{log_id_key: log_id_value}, kind=kind)
+                    no_active_page_log_count += 1
+                continue
+
+            if kind in _PIPELINED_INPUT_KINDS:
+                dispatch = _validate_cdp_dispatch(kind, msg, log_id_key, log_id_value)
+                if dispatch is None:
+                    continue
+                cdp_method, validated = dispatch
+                await dispatch_semaphore.acquire()
+                if dispatch_failure_close_started:
+                    dispatch_semaphore.release()
+                    break
+                task = asyncio.create_task(
+                    dispatch_pipelined_event(cdp_session, kind, cdp_method, validated, received_at)
+                )
+                dispatch_tasks.add(task)
+                task.add_done_callback(dispatch_tasks.discard)
+                # CDPSession.send writes to one transport before awaiting a response, preserving receive order here.
+                await asyncio.sleep(0)
+                if dispatch_failure_close_started:
+                    break
+                continue
+
+            attributes = {"event_kind": _input_kind_label(kind)}
+            dispatch_started = time.monotonic()
+            _input_wait_seconds.record(dispatch_started - received_at, attributes)
+            try:
+                await _dispatch_event(cdp_session, input_session.page, kind, msg, log_id_key, log_id_value, websocket)
+            except Exception:
+                LOG.warning(
+                    "CDP input: failed to dispatch event; closing input channel",
+                    **{log_id_key: log_id_value},
+                    kind=kind,
+                    exc_info=True,
+                )
+                if not dispatch_failure_close_started:
+                    dispatch_failure_close_started = True
+                    await websocket.close(code=4411, reason="dispatch_failed")
+                break
+            _input_dispatch_seconds.record(time.monotonic() - dispatch_started, attributes)
+    finally:
+        pending_tasks = tuple(dispatch_tasks)
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 @legacy_base_router.websocket("/stream/cdp_input/workflow_run/{workflow_run_id}")

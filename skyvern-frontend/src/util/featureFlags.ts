@@ -37,3 +37,6 @@ export const CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY";
 
 // Opt-in preview (0% base): recordings synthesize code blocks instead of agent blocks.
 export const RECORD_BROWSER_CODE_FIRST_FLAG = "record_browser_code_first";
+
+// Opt-in (0% base): recording keeps the CDP stream instead of swapping to VNC.
+export const RECORD_BROWSER_CDP_TRANSPORT_FLAG = "record_browser_cdp_transport";

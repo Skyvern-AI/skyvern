@@ -202,7 +202,7 @@ class TestExecutionChannelHelpers:
         page = MagicMock()
         page.url = "https://example.com/current"
 
-        channel = ExecutionChannel(vnc_channel=vnc_channel)
+        channel = ExecutionChannel(context=vnc_channel)
         channel.url = "ws://cdp.example/devtools/browser/123"
         channel.page = page
 
@@ -237,7 +237,7 @@ class TestExecutionChannelHelpers:
     )
     async def test_navigate_refuses_internal_destination(self, url: str) -> None:
         """The live-session navigate control renders the response, so an internal host must fail closed."""
-        channel = ExecutionChannel(vnc_channel=MagicMock(identity={"client_id": "abc"}))
+        channel = ExecutionChannel(context=MagicMock(identity={"client_id": "abc"}))
         channel.page = MagicMock()
         channel.page.goto = AsyncMock()
 
@@ -250,7 +250,7 @@ class TestExecutionChannelHelpers:
     async def test_navigate_uses_the_validated_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         validate = MagicMock(return_value="https://example.test/validated")
         monkeypatch.setattr(execution_module, "validate_fetch_url", validate)
-        channel = ExecutionChannel(vnc_channel=MagicMock(identity={"client_id": "abc"}))
+        channel = ExecutionChannel(context=MagicMock(identity={"client_id": "abc"}))
         channel.page = MagicMock()
         channel.page.goto = AsyncMock()
 
@@ -294,7 +294,7 @@ class TestExecutionChannelHelpers:
         page.go_forward = AsyncMock()
         page.context.new_cdp_session = AsyncMock()
 
-        channel = ExecutionChannel(vnc_channel=vnc_channel)
+        channel = ExecutionChannel(context=vnc_channel)
         channel.page = page
 
         with patch(

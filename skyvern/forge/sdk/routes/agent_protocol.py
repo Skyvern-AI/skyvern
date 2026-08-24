@@ -4263,6 +4263,11 @@ async def _parse_and_gate_tag_filter_terms(
     "/runs",
     tags=["agent"],
     response_model=list[TaskRunListItem],
+    summary="List runs",
+    description=(
+        "List the organization's task and agent runs, newest first, filterable by status, run type, agent, "
+        "and a free-text search term. Returns a paginated array of run summaries."
+    ),
     openapi_extra={
         "x-hidden": True,
         "x-fern-sdk-method-name": "get_runs_v2",
@@ -5222,6 +5227,10 @@ async def get_workflow_templates() -> list[Workflow]:
     response_model=Workflow,
     tags=["Agents"],
     summary="Get an agent by id",
+    description=(
+        "Fetch a single agent definition by its permanent id, optionally pinned to a specific version. "
+        "Returns the agent's blocks, parameters, and metadata."
+    ),
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow",
     },
@@ -5649,6 +5658,11 @@ async def get_api_keys(
 @base_router.post(
     "/upload_file",
     tags=["Files"],
+    summary="Upload a file",
+    description=(
+        "Upload a file to Skyvern storage so runs can reference it as an input. Returns the file id, its "
+        "storage URI, a presigned download URL, and the expiry implied by the requested retention period."
+    ),
     openapi_extra={
         "x-fern-sdk-method-name": "upload_file",
     },
