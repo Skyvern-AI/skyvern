@@ -40,8 +40,8 @@ export function StudioBrowserStream() {
   }, [browserSessionId, reset]);
 
   // Recording is session-scoped: clear it when the studio's browser session ends
-  // or changes. The transport stream no longer resets on unmount (it remounts
-  // across CDP<->VNC swaps without the session ending), so this owns that.
+  // or changes. The stream component can remount while the session persists and
+  // doesn't reset recording state itself, so this owns that.
   useEffect(() => {
     return () => resetRecording();
   }, [browserSessionId, resetRecording]);
