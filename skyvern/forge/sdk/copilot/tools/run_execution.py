@@ -63,7 +63,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_html
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, PageObstruction
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
     build_diagnosis_repair_contract,
@@ -3700,6 +3700,26 @@ def _packet_string_list(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
 
 
+def _packet_page_obstructions(value: Any, omission_notices: list[str]) -> list[PageObstruction]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        omission_notices.append("failure.page_state.obstructions omitted: repair-context value was malformed.")
+        return []
+    obstructions: list[PageObstruction] = []
+    malformed = 0
+    for item in value:
+        try:
+            obstructions.append(PageObstruction.model_validate(item))
+        except ValueError:
+            malformed += 1
+    if malformed:
+        omission_notices.append(
+            f"failure.page_state.obstructions omitted: {malformed} malformed repair-context item(s)."
+        )
+    return obstructions
+
+
 def _packet_workflow_readback(copilot_ctx: CopilotContext) -> tuple[str | None, str]:
     accepted = copilot_ctx.last_workflow_yaml
     if isinstance(accepted, str) and accepted.strip():
@@ -3723,6 +3743,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
     if isinstance(repair_context, Mapping) and repair_run_id != run_id:
         omission_notices.append("failure.page_state omitted repair-context fields belonging to another or unknown run.")
     repair = repair_context if isinstance(repair_context, Mapping) and repair_run_id == run_id else {}
+    omission_notices.extend(_packet_string_list(repair.get("page_obstruction_omission_notices")))
     current_url = _packet_string(repair.get("current_url")) or _packet_string(data.get("current_url"))
     title = _packet_string(repair.get("current_title")) or _packet_string(data.get("page_title"))
     page_state = BuildTestPacketPageState(
@@ -3736,6 +3757,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
         action_summaries=_packet_string_list(repair.get("page_action_summaries")),
         challenge_summaries=_packet_string_list(repair.get("page_challenge_summaries")),
         obstruction_summaries=_packet_string_list(repair.get("page_obstruction_summaries")),
+        obstructions=_packet_page_obstructions(repair.get("page_obstructions"), omission_notices),
     )
     return (
         page_state
@@ -3750,6 +3772,7 @@ def _packet_page_state(data: Mapping[str, Any], omission_notices: list[str]) -> 
                 page_state.action_summaries,
                 page_state.challenge_summaries,
                 page_state.obstruction_summaries,
+                page_state.obstructions,
             )
         )
         else None

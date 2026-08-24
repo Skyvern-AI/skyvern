@@ -199,6 +199,49 @@ _RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
 OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
 
 
+class PageObstructionSelectorCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    selector: str
+    source: str
+
+
+class PageObstructionIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tag: str
+    role: str
+    label_context: str
+
+
+class PageObstructionControl(BaseModel):
+    """A producer-bounded control plus scalar capture extensions not known to this consumer."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    __pydantic_extra__: dict[str, str | bool | int | float] = Field(init=False)
+    tag: str | None = None
+    text: str | None = None
+    aria_label: str | None = None
+    title: str | None = None
+    selector: str | None = None
+    type: str | None = None
+    selector_candidates: list[PageObstructionSelectorCandidate] = Field(default_factory=list)
+    identity: PageObstructionIdentity | None = None
+
+
+class PageObstruction(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str | None = None
+    source: str | None = None
+    selector: str | None = None
+    text: str | None = None
+    visual_location: str | None = None
+    underlying_page_blocked: bool | None = None
+    visible_controls: list[PageObstructionControl] = Field(default_factory=list)
+
+
 class CodeAuthoringRepairContext(BaseModel):
     block_label: str
     reason_code: str
@@ -233,6 +276,8 @@ class CodeAuthoringRepairContext(BaseModel):
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
     page_obstruction_summaries: list[str] = Field(default_factory=list)
+    page_obstructions: list[PageObstruction] = Field(default_factory=list)
+    page_obstruction_omission_notices: list[str] = Field(default_factory=list)
     required_block_structure: str = ""
     spine_stage_count: int | None = None
     spine_split_blockers: list[str] = Field(default_factory=list)
