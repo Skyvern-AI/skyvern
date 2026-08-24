@@ -4,16 +4,21 @@ A "channel", as used within the streaming mechanism of our remote browsers,
 is a WebSocket fit to some particular purpose.
 
 There is/are:
-  - a "VNC" channel that transmits NoVNC's RFB protocol data
+  - a "VNC" channel that transmits NoVNC's RFB protocol data (legacy viewers)
   - a "Message" channel that transmits JSON between the frontend app and
     the api server
   - "CDP" channels that send messages to a remote browser using CDP protocol
     data
     - an "Execution" channel (one-off executions)
-    - a soon-to-be "Exfiltration" channel (user event streaming)
+    - an "Exfiltration" channel (Record Browser user-event capture)
 
 In all cases, these are just WebSockets. They have been bucketed into "named channels"
 to aid understanding.
+
+Record Browser captures actions over CDP: the frontend renders screencast frames
+from the browser-session stream, user events arrive via the Exfiltration channel,
+and the Message channel carries recording commands and interpretation updates.
+The VNC channel and its Message pairing below apply to legacy VNC viewers.
 
 These channels are described at the top of their respective files.
 
@@ -54,7 +59,7 @@ the `skyvern/forge/sdk/routes/streaming` directory. It looks correct.
 │                                                             │
 │  CDP Channels (created on-demand):                          │
 │  - ExecutionChannel: JS evaluation (paste, get selected)    │
-│  - ExfiltrationChannel: (future) user event streaming       │
+│  - ExfiltrationChannel: Record Browser user-event capture   │
 │                                                             │
 └────┬─────────────────────────────────────────────────────┬──┘
      │                                                     │
@@ -71,9 +76,11 @@ the `skyvern/forge/sdk/routes/streaming` directory. It looks correct.
 
 ### Channel Pairing & Sticky Sessions
 
-**Critical Design Constraint**: The VNC and Message channels for a given frontend
-instance MUST connect to the same API server instance because they coordinate
-via in-memory registries keyed by `client_id`.
+**Critical Design Constraint** (legacy VNC viewers): The VNC and Message channels
+for a given frontend instance MUST connect to the same API server instance because
+they coordinate via in-memory registries keyed by `client_id`. The CDP Record
+Browser path opens only the Message channel here — the Exfiltration channel is
+owned by that Message channel, so there is no cross-socket pairing to break.
 
 ```
 Frontend Instance (client_id="abc123")
