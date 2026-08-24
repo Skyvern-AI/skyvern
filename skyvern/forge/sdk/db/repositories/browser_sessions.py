@@ -945,6 +945,8 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         completed_at: datetime | None = None,
         started_at: datetime | None = None,
+        browser_address: str | None = None,
+        upstream_cdp_url: str | None = None,
         generate_browser_profile: bool | None = None,
         browser_profile_loaded: bool | None = None,
     ) -> PersistentBrowserSession:
@@ -973,12 +975,20 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.download_run_id = None
             if started_at:
                 persistent_browser_session.started_at = to_naive_utc(started_at)
+            if browser_address is not None:
+                persistent_browser_session.browser_address = browser_address
+            if upstream_cdp_url is not None:
+                persistent_browser_session.upstream_cdp_url = upstream_cdp_url
             if generate_browser_profile is not None:
                 persistent_browser_session.generate_browser_profile = generate_browser_profile
             if browser_profile_loaded is not None:
                 persistent_browser_session.browser_profile_loaded = browser_profile_loaded
 
-            await session.commit()
+            try:
+                await session.commit()
+            except StatementError as exc:
+                exc.hide_parameters = True
+                raise
             await session.refresh(persistent_browser_session)
             return PersistentBrowserSession.model_validate(persistent_browser_session)
 

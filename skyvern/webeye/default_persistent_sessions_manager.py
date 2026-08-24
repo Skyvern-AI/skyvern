@@ -17,6 +17,7 @@ from skyvern.exceptions import BrowserSessionClosed, BrowserSessionNotRenewable,
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.polls import wait_on_persistent_browser_address
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -30,7 +31,7 @@ from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_sessio
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.cdp_ports import _release_cdp_port
+from skyvern.webeye.cdp_ports import _allocate_cdp_port, _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import PBS_TASK_RUNNABLE_TYPE, PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.session_cookies import persist_session_cookies
@@ -39,6 +40,45 @@ LOG = structlog.get_logger()
 
 # Grace margin past a session's timeout before reaping, so a reap can't race an in-flight renewal.
 REAP_GRACE_SECONDS = 120
+
+
+async def _probe_local_cdp_address(cdp_port: int) -> str | None:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", cdp_port), timeout=1)
+        writer.close()
+        await writer.wait_closed()
+    except ConnectionRefusedError:
+        LOG.info("Local browser did not open requested CDP port", cdp_port=cdp_port)
+        return None
+    except Exception:
+        LOG.warning("Failed to connect to local browser CDP port", cdp_port=cdp_port, exc_info=True)
+        return None
+
+    try:
+        # Chrome can take a beat to expose the debugging endpoint after the first page opens.
+        version = await aiohttp_get_json(
+            f"http://127.0.0.1:{cdp_port}/json/version",
+            retry=2,
+            retry_timeout=0.25,
+            timeout=1,
+        )
+        browser_address = version.get("webSocketDebuggerUrl")
+        if isinstance(browser_address, str) and browser_address:
+            return browser_address
+    except Exception:
+        LOG.warning("Failed to probe local browser CDP address", cdp_port=cdp_port, exc_info=True)
+        return None
+
+    LOG.warning("Local browser CDP response did not include a websocket address", cdp_port=cdp_port)
+    return None
+
+
+async def _discard_browser_state(browser_state: BrowserState, cdp_port: int | None) -> None:
+    try:
+        await browser_state.close()
+    finally:
+        if cdp_port is not None:
+            _release_cdp_port(cdp_port)
 
 
 @dataclass
@@ -148,7 +188,14 @@ async def renew_session(database: AgentDB, session_id: str, organization_id: str
 
 
 async def update_status(
-    db: AgentDB, session_id: str, organization_id: str, status: str
+    db: AgentDB,
+    session_id: str,
+    organization_id: str,
+    status: str,
+    *,
+    started_at: datetime | None = None,
+    browser_address: str | None = None,
+    upstream_cdp_url: str | None = None,
 ) -> PersistentBrowserSession | None:
     persistent_browser_session = await db.browser_sessions.get_persistent_browser_session(session_id, organization_id)
 
@@ -184,6 +231,9 @@ async def update_status(
         status=status,
         organization_id=organization_id,
         completed_at=completed_at,
+        started_at=started_at,
+        browser_address=browser_address,
+        upstream_cdp_url=upstream_cdp_url,
     )
 
     return persistent_browser_session
@@ -448,6 +498,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput | None = None,
         url: str | None = None,
     ) -> None:
+        cdp_port: int | None = None
+        browser_state: BrowserState | None = None
         try:
             session = await self.get_session(session_id, organization_id)
             if session is None or is_final_status(session.status) or session.completed_at is not None:
@@ -459,6 +511,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
             launch_proxy_location = session.proxy_location if session.proxy_location is not None else proxy_location
             extra_http_headers = app.AGENT_FUNCTION.build_proxy_session_extra_http_headers(session.proxy_session_id)
+            if settings.BROWSER_TYPE != "cdp-connect":
+                cdp_port = _allocate_cdp_port()
 
             browser_state = await cast(RealBrowserManager, app.BROWSER_MANAGER)._create_browser_state(
                 proxy_location=launch_proxy_location,
@@ -466,6 +520,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
                 browser_profile_id=session.browser_profile_id,
+                cdp_port=cdp_port,
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",
@@ -473,6 +528,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
             )
+            browser_address = await _probe_local_cdp_address(cdp_port) if cdp_port is not None else None
 
             session = await self.get_session(session_id, organization_id)
             if session is None or is_final_status(session.status) or session.completed_at is not None:
@@ -480,7 +536,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     "Session closed during browser launch, discarding browser",
                     browser_session_id=session_id,
                 )
-                await browser_state.close()
+                discarded_cdp_port = cdp_port
+                cdp_port = None
+                await _discard_browser_state(browser_state, discarded_cdp_port)
                 return
 
             if session_id in self._browser_sessions:
@@ -488,31 +546,51 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                     "Session already has browser state, discarding duplicate",
                     browser_session_id=session_id,
                 )
-                await browser_state.close()
+                discarded_cdp_port = cdp_port
+                cdp_port = None
+                await _discard_browser_state(browser_state, discarded_cdp_port)
                 return
 
             self._browser_sessions[session_id] = BrowserSession(
                 browser_state=browser_state,
                 organization_id=organization_id,
+                cdp_port=cdp_port,
             )
+            cdp_port = None
 
-            result = await self.update_status(session_id, organization_id, PersistentBrowserSessionStatus.running)
-            if result is None:
-                self._browser_sessions.pop(session_id, None)
-                await browser_state.close()
-                return
-            # Set started_at so renewal knows the browser is live
-            await self.database.browser_sessions.update_persistent_browser_session(
+            result = await self.update_status(
                 session_id,
-                organization_id=organization_id,
+                organization_id,
+                PersistentBrowserSessionStatus.running,
                 started_at=datetime.now(timezone.utc),
+                browser_address=browser_address,
+                upstream_cdp_url=browser_address,
             )
+            if result is None:
+                discarded_session = self._browser_sessions.pop(session_id, None)
+                await _discard_browser_state(
+                    browser_state,
+                    discarded_session.cdp_port if discarded_session is not None else None,
+                )
+                return
             LOG.info(
                 "Browser launched for standalone session",
                 browser_session_id=session_id,
                 organization_id=organization_id,
             )
         except Exception:
+            if cdp_port is not None:
+                if browser_state is not None:
+                    try:
+                        await browser_state.close()
+                    except Exception:
+                        LOG.warning(
+                            "Failed to close browser after standalone launch failure",
+                            browser_session_id=session_id,
+                            organization_id=organization_id,
+                            exc_info=True,
+                        )
+                _release_cdp_port(cdp_port)
             LOG.exception(
                 "Failed to launch browser for standalone session",
                 browser_session_id=session_id,
@@ -561,9 +639,24 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             raise
 
     async def update_status(
-        self, session_id: str, organization_id: str, status: str
+        self,
+        session_id: str,
+        organization_id: str,
+        status: str,
+        *,
+        started_at: datetime | None = None,
+        browser_address: str | None = None,
+        upstream_cdp_url: str | None = None,
     ) -> PersistentBrowserSession | None:
-        return await update_status(self.database, session_id, organization_id, status)
+        return await update_status(
+            self.database,
+            session_id,
+            organization_id,
+            status,
+            started_at=started_at,
+            browser_address=browser_address,
+            upstream_cdp_url=upstream_cdp_url,
+        )
 
     async def release_browser_session(
         self,
