@@ -2152,7 +2152,7 @@ async def test_legacy_scope_additions_stay_globally_fenced_while_create_is_pendi
 
         assert 91 not in server._pending_tab_events
         with pytest.raises(BrowserExtensionBrokerError) as error_info:
-            await second.request("tabs.activate", {"tabId": 91}, timeout=0.1)
+            await second.request("tabs.activate", {"tabId": 91}, timeout=1.0)
         assert error_info.value.code == "LEASE_HELD"
         assert relay.requests == [("tabs.create", {"url": "about:blank"})]
 

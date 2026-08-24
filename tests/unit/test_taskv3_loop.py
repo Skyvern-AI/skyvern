@@ -3422,3 +3422,238 @@ def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> No
         '<a data-tv3="t9">y</a><b data-tv3="t8'
     )
     assert _canonical_perception_content('tail closed data-tv3="t5"') == 'tail closed data-tv3="*"'
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
+    # A billable action's own result can carry the download-completion signal; the probe ends the
+    # run right there, no finish tool call needed, and the rest of the batch never dispatches.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading"
+
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+    script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
+    recorded_rounds: list[list[tuple[str, dict[str, Any], bool]]] = []
+
+    async def on_action_round(round_actions: list[tuple[str, dict[str, Any], bool]]) -> None:
+        recorded_rounds.append(round_actions)
+
+    outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "a file finished downloading"
+    assert len(clicks) == 1  # the second batched click never ran
+    assert outcome.tool_calls == 1
+    # The click that produced the download must be billed and persisted, not lost because the
+    # probe fired before the recording step that appends it.
+    assert outcome.billable_actions == ["click"]
+    assert recorded_rounds == [[("click", {"selector": "#a"}, True)]]
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_ignores_staged_download_unless_download_notice_too() -> None:
+    # file_upload stages an http(s) source file into the same downloads dir and marks it via
+    # staged_download; that must not read as the run's own landed download.
+    probe_calls = 0
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        nonlocal probe_calls
+        probe_calls += 1
+        return "a file finished downloading"
+
+    async def staged_only_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf"})
+
+    staged_only_tool = ToolSpec(
+        name="file_upload",
+        description="file_upload",
+        parameters={"type": "object", "properties": {}},
+        handler=staged_only_handler,
+        billable=True,
+    )
+    outcome, _ = await _run(
+        [[("file_upload", {})], [("finish", {"status": "completed", "reason": "done"})]],
+        [staged_only_tool, make_finish_tool()],
+        completion_probe=probe,
+    )
+    assert outcome.status == "completed"
+    assert outcome.reason == "done"  # not the probe's reason -- it was never consulted
+    assert probe_calls == 0
+
+    async def staged_and_landed_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf", "download_notice": True})
+
+    staged_and_landed_tool = ToolSpec(
+        name="file_upload",
+        description="file_upload",
+        parameters={"type": "object", "properties": {}},
+        handler=staged_and_landed_handler,
+        billable=True,
+    )
+    outcome2, _ = await _run(
+        [[("file_upload", {})]],
+        [staged_and_landed_tool, make_finish_tool()],
+        completion_probe=probe,
+    )
+    assert outcome2.status == "completed"
+    assert outcome2.reason == "a file finished downloading"
+    assert probe_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_gated_on_billable_or_download_notice() -> None:
+    probe_calls = 0
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        nonlocal probe_calls
+        probe_calls += 1
+        return None
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("observed")
+
+    observe_tool = ToolSpec(
+        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe_handler
+    )
+
+    async def check_download_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("download seen", data={"download_notice": True})
+
+    download_tool = ToolSpec(
+        name="check_download",
+        description="check_download",
+        parameters={"type": "object", "properties": {}},
+        handler=check_download_handler,
+    )
+
+    script = [
+        [("observe", {})],  # non-billable, no download_notice -> probe not consulted
+        [("check_download", {})],  # non-billable but download_notice -> probe consulted
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, [observe_tool, download_tool, make_finish_tool()], completion_probe=probe)
+
+    assert outcome.status == "completed"
+    assert probe_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_probe_exception_is_logged_and_treated_as_none() -> None:
+    async def probe(_staged: frozenset[str]) -> str | None:
+        raise RuntimeError("boom")
+
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    tools = [_billable_tool("click", clicks), make_finish_tool()]
+    script = [[("click", {"selector": "#a"})], [("finish", {"status": "completed", "reason": "done normally"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, completion_probe=probe)
+
+    assert outcome.status == "completed"
+    assert outcome.reason == "done normally"
+    assert any(log["log_level"] == "warning" for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_completion_blocker_gates_completed_status_only() -> None:
+    # completed: blocked once, then allowed once the blocker clears.
+    responses = iter(["wait: the download has not started yet", None])
+
+    async def blocker(_staged: frozenset[str]) -> str | None:
+        return next(responses)
+
+    tools = [make_finish_tool(completion_blocker=blocker)]
+    script = [
+        [("finish", {"status": "completed", "reason": "first attempt"})],
+        [("finish", {"status": "completed", "reason": "second attempt"})],
+    ]
+    outcome, caller = await _run(script, tools)
+    assert outcome.status == "completed"
+    assert outcome.reason == "second attempt"
+    assert caller.calls == 2  # the first finish was rejected, forcing a second turn
+
+    # failed: the blocker is never consulted, even though it would block if asked.
+    async def always_blocks(_staged: frozenset[str]) -> str | None:
+        return "should never be read"
+
+    tools2 = [make_finish_tool(completion_blocker=always_blocks)]
+    outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
+    assert outcome2.status == "failed"
+    assert outcome2.reason == "blocked reason"
+
+
+@pytest.mark.asyncio
+async def test_completion_blocker_exception_fails_closed() -> None:
+    # A transient storage error checking for a landed download is evidence of nothing -- it must
+    # not let a download-gated task complete with no file. finish(failed) is unaffected.
+    calls = 0
+
+    async def blocker(_staged: frozenset[str]) -> str | None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("boom")
+
+    tools = [make_finish_tool(completion_blocker=blocker)]
+    script = [
+        [("finish", {"status": "completed", "reason": "first attempt"})],
+        [("finish", {"status": "failed", "reason": "give up"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools)
+
+    assert outcome.status == "failed"
+    assert outcome.reason == "give up"
+    assert caller.calls == 2  # the completed attempt was rejected, forcing a second turn
+    assert calls == 1  # a failed verdict never consults the blocker
+    assert any(log["log_level"] == "warning" for log in logs)
+    rejected_tool_messages = [
+        m for m in outcome.messages if m.get("role") == "tool" and "Could not verify" in m.get("content", "")
+    ]
+    assert len(rejected_tool_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
+    # file_upload's staged http(s) source fetch must not be treated as a landed download by any
+    # LATER probe/blocker call this run -- not just skipped for the tool call that staged it.
+    staged_downloads: set[str] = set()
+    probe_seen: list[frozenset[str]] = []
+    blocker_seen: list[frozenset[str]] = []
+
+    async def probe(staged: frozenset[str]) -> str | None:
+        probe_seen.append(staged)
+        return None
+
+    async def blocker(staged: frozenset[str]) -> str | None:
+        blocker_seen.append(staged)
+        return None
+
+    async def stage_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("uploaded", data={"staged_download": "in.pdf"})
+
+    stage_tool = ToolSpec(
+        name="file_upload",
+        description="file_upload",
+        parameters={"type": "object", "properties": {}},
+        handler=stage_handler,
+        billable=True,
+    )
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        stage_tool,
+        _billable_tool("click", click_calls),
+        make_finish_tool(completion_blocker=blocker, staged_downloads=staged_downloads),
+    ]
+    script = [
+        [("file_upload", {})],
+        [("click", {"selector": "#a"})],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome, _ = await _run(script, tools, completion_probe=probe, staged_downloads=staged_downloads)
+
+    assert outcome.status == "completed"
+    # The staging call itself never consults the probe (no download_notice); the next billable
+    # call's probe already carries the name it staged.
+    assert probe_seen == [frozenset({"in.pdf"})]
+    assert blocker_seen == [frozenset({"in.pdf"})]

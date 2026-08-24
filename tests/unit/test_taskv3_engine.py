@@ -446,3 +446,147 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     assert watches[1] is None, watches
     assert loop_watches[0] is watches[0], (loop_watches, watches)
     assert loop_watches[1] is None, loop_watches
+
+
+@pytest.mark.asyncio
+async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    # completion_probe must reach the loop and completion_blocker must reach the finish tool, and
+    # the download-completion guidance is appended to the system prompt only when a probe is given.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+    finish_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(*args, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading"
+
+    async def blocker(_staged: frozenset[str]) -> str | None:
+        return None
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="download the file",
+        completion_probe=probe,
+        completion_blocker=blocker,
+    )
+    assert loop_kwargs["completion_probe"] is probe
+    assert finish_kwargs["completion_blocker"] is blocker
+    assert DOWNLOAD_COMPLETION_GUIDANCE in loop_kwargs["system_prompt"]
+    # One staged_downloads set is shared between the loop and the finish tool -- a name staged via
+    # a billable tool call must be visible to the SAME finish-tool blocker, not a divergent copy.
+    assert loop_kwargs["staged_downloads"] is finish_kwargs["staged_downloads"]
+    assert isinstance(loop_kwargs["staged_downloads"], set)
+
+    loop_kwargs.clear()
+    finish_kwargs.clear()
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="download the file"
+    )
+    assert loop_kwargs["completion_probe"] is None
+    assert finish_kwargs["completion_blocker"] is None
+    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_engine_guidance_keyed_on_which_hooks_are_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    # blocker-only (extraction tasks: the probe would end the loop before the model returns
+    # extracted_output) gets the DOWNLOAD_REQUIRED variant naming finish(completed) as the model's
+    # own job; probe-only (download_timeout alone, wait-only) has no completion semantics at all,
+    # so it gets neither guidance string.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+
+    async def blocker(_staged: frozenset[str]) -> str | None:
+        return None
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="download the file",
+        completion_blocker=blocker,
+    )
+    assert DOWNLOAD_REQUIRED_GUIDANCE in loop_kwargs["system_prompt"]
+    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
+
+    loop_kwargs.clear()
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return None
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="download the file",
+        completion_probe=probe,
+    )
+    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
+    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No browser tools exist to trigger a download, so a blocker would refuse finish(completed)
+    # forever; page-free runs get neither hook nor the download guidance.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    loop_kwargs: dict[str, Any] = {}
+    finish_kwargs: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> LoopOutcome:
+        loop_kwargs.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    real_make_finish_tool = engine_mod.make_finish_tool
+
+    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
+        finish_kwargs.update(kwargs)
+        return real_make_finish_tool(*args, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
+    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+
+    async def probe(_staged: frozenset[str]) -> str | None:
+        return "a file finished downloading"
+
+    async def blocker(_staged: frozenset[str]) -> str | None:
+        return "no download yet"
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="validate the record",
+        page_free=True,
+        completion_probe=probe,
+        completion_blocker=blocker,
+    )
+    assert loop_kwargs["completion_probe"] is None
+    assert finish_kwargs["completion_blocker"] is None
+    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
+    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
