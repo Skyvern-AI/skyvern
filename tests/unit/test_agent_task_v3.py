@@ -2316,6 +2316,29 @@ async def test_execute_task_v3_router_selected_data_only_validation_goes_page_fr
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The finish gate the loop receives must be the same VerificationState the auth tools mutate;
+    # a fresh or detached state would let a refused source false-complete despite the blocker.
+    seen_states: list[Any] = []
+
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
+        seen_states.append(state)
+        return [], ""
+
+    monkeypatch.setattr("skyvern.forge.taskv3.auth_tools.build_auth_tools", capturing_build)
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, data_extraction_goal=None, extracted_information_schema=None
+    )
+    blocker = loop_mock.await_args.kwargs["verification_blocker"]
+    assert blocker is not None
+    assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
+    assert await blocker() is None
+    seen_states[0].source_failed = True
+    assert await blocker() is not None
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2325,7 +2348,7 @@ async def test_execute_task_v3_pins_credential_before_building_auth_tools(
     seen_keys: list[str | None] = []
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
         ctx = skyvern_context.current()
         seen_keys.append(ctx.active_credential_parameter_key if ctx else None)
         seen_providers.append(page_provider)
@@ -2354,7 +2377,7 @@ async def test_execute_task_v3_withholds_the_page_provider_from_auth_tools_when_
     # navigate; a page-aware run must be, or the sign-in-link tool is silently never offered.
     seen_providers: list[Any] = []
 
-    def capturing_build(task: Any, page_provider: Any = None) -> tuple[list[Any], str]:
+    def capturing_build(task: Any, page_provider: Any = None, state: Any = None) -> tuple[list[Any], str]:
         seen_providers.append(page_provider)
         return [], ""
 

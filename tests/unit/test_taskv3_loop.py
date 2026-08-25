@@ -228,6 +228,23 @@ async def test_terminal_finish_with_failed_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verification_blocker_refuses_completed_but_not_failed() -> None:
+    async def _blocked() -> str | None:
+        return "verification never delivered a code"
+
+    tools = [make_finish_tool(verification_blocker=_blocked)]
+    script = [
+        [("finish", {"status": "completed", "reason": "done"})],
+        [("finish", {"status": "failed", "reason": "verification never delivered a code"})],
+    ]
+    outcome, _ = await _run(script, tools)
+
+    tool_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert any("verification never delivered a code" in m["content"] for m in tool_messages)
+    assert outcome.status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_tools_are_forwarded_in_openai_shape() -> None:
     tools = [make_finish_tool()]
     script = [[("finish", {"status": "completed", "reason": "ok"})]]

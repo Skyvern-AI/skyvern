@@ -184,6 +184,7 @@ def _tool_output_event(call_id: str, ok: bool = True, block_count: int = 2) -> R
 def _new_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
         design_start_emitted=False,
     )
@@ -244,6 +245,7 @@ async def test_goal_satisfied_flush_entry_shares_the_clock_read_of_its_sse_updat
         goal_satisfied_tool_output={"ok": True, "data": {"block_count": 1}},
         last_artifact_health_blocker_reason=None,
         completion_verification_result=None,
+        pending_code_write_diffs={},
     )
 
     await flush_goal_satisfied_tool_result(stream, ctx)  # type: ignore[arg-type]
@@ -287,6 +289,7 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
 
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -322,6 +325,7 @@ async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
     stream.send = _send
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -363,6 +367,7 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
 
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -373,13 +378,12 @@ async def test_stream_to_sse_propagates_cancelled_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_to_sse_suppresses_narration_on_an_iteration_with_typed_activity(
+async def test_stream_to_sse_tags_narration_to_the_iteration_carrying_typed_activity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end: a completed update_workflow round-trip registers a
-    workflow_updated transition and the narrator handler is available, but the
-    iteration already carries typed TOOL_CALL / TOOL_RESULT rows, so no
-    NARRATION frame is emitted or persisted for it.
+    workflow_updated transition, and the narration it produces is emitted and
+    persisted against the same iteration as that round-trip's typed rows.
     """
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
@@ -452,13 +456,16 @@ async def test_stream_to_sse_suppresses_narration_on_an_iteration_with_typed_act
     await stream_to_sse(result, stream, ctx)
 
     narration_payloads = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.NARRATION]
-    assert narration_payloads == []
-    assert [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"] == []
-    # The typed rows the operator sees instead.
+    assert [p.iteration for p in narration_payloads] == [0]
+    narration_entries = [e for e in ctx.narrator_state.design_activity if e["kind"] == "narration"]
+    assert [e["iteration"] for e in narration_entries] == [0]
     tool_types = [getattr(p, "type", None) for p in sent]
     assert WorkflowCopilotStreamMessageType.TOOL_CALL in tool_types
     assert WorkflowCopilotStreamMessageType.TOOL_RESULT in tool_types
-    assert ctx.narrator_state.iterations_with_tool_activity == {0}
+    typed_iterations = {
+        e["iteration"] for e in ctx.narrator_state.design_activity if e["kind"] in ("tool_call", "tool_result")
+    }
+    assert typed_iterations == {0}
 
 
 @pytest.mark.asyncio
@@ -508,6 +515,7 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
         latest_tool_blocker_signal=signal,
         tool_blocker_signals=[signal],
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -558,6 +566,7 @@ async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_e
     stream.send = AsyncMock(return_value=True)
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -605,6 +614,7 @@ async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None
 
     ctx = SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -800,6 +810,167 @@ def test_tool_result_workflow_run_id_only_for_block_running_tools() -> None:
     assert _tool_result_workflow_run_id("update_and_run_blocks", {"data": {"workflow_run_id": 42}}) is None
 
 
+@pytest.mark.asyncio
+async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() -> None:
+    diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        _tool_output_event("c1"),
+        _tool_called_event("c2", "inspect_page_for_composition"),
+        _tool_output_event("c2"),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={"c1": diffs},
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.code_diffs for p in tool_results] == [diffs, None]
+    assert ctx.pending_code_write_diffs == {}
+
+    write_row = [row for row in ctx.narrator_state.design_activity if row["id"] == "tr-c1"]
+    assert write_row[0]["codeDiffs"] == diffs
+    assert all("codeDiffs" not in row for row in ctx.narrator_state.design_activity if row["id"] != "tr-c1")
+
+
+@pytest.mark.asyncio
+async def test_two_writes_resolving_out_of_order_each_keep_their_own_diff() -> None:
+    """Parallel tool calls are the provider default and results are not ordered by call. Draining
+    by arrival handed the first result both writes' diffs, so a patch rendered — and persisted —
+    against a write that did not produce it."""
+    first = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n+first"}]
+    second = [{"label": "parse_step", "added": 9, "removed": 0, "patch": "@@\n+second"}]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        _tool_called_event("c2", "add_block", '{"label": "parse_step"}'),
+        # c2 answers first: the stash must not hand c2 the diff c1 produced.
+        _tool_output_event("c2"),
+        _tool_output_event("c1"),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={"c1": first, "c2": second},
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity if row["id"].startswith("tr-")}
+    assert rows["tr-c1"]["codeDiffs"] == first
+    assert rows["tr-c2"]["codeDiffs"] == second
+    assert ctx.pending_code_write_diffs == {}
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_failed_does_not_display_a_sibling_write_diff() -> None:
+    """The failed row is the one a user inspects to see what went wrong; showing it a concurrent
+    write's patch is worse than showing none."""
+    healthy = [{"label": "download_step", "added": 4, "removed": 0, "patch": "@@\n+ok"}]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        _tool_called_event("c2", "add_block", '{"label": "broken_step"}'),
+        _tool_output_event("c2"),
+        _tool_output_event("c1"),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    # c2 stashed nothing: its write raised before a diff could be built.
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={"c1": healthy},
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity if row["id"].startswith("tr-")}
+    assert "codeDiffs" not in rows["tr-c2"]
+    assert rows["tr-c1"]["codeDiffs"] == healthy
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_result_arriving_first_does_not_cost_the_write_its_counts() -> None:
+    """Parallel tool calls are the provider default, so the write's own result is not
+    guaranteed to drain first. Consuming the stash on the foreign result would leave the
+    write row with no counts at all, which the narrative-stream contract forbids."""
+    diffs = [{"label": "download_step", "added": 3, "removed": 1, "patch": "@@\n-old\n+new"}]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        _tool_called_event("c2", "inspect_page_for_composition"),
+        _tool_output_event("c2"),
+        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        _tool_output_event("c1"),
+    )
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(
+        last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={"c1": diffs},
+        completion_verification_result=None,
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert [p.code_diffs for p in tool_results] == [None, diffs]
+    assert ctx.pending_code_write_diffs == {}
+
+    write_row = [row for row in ctx.narrator_state.design_activity if row["id"] == "tr-c1"]
+    assert write_row[0]["codeDiffs"] == diffs
+    foreign_row = [row for row in ctx.narrator_state.design_activity if row["id"] == "tr-c2"]
+    assert "codeDiffs" not in foreign_row[0]
+
+
 class TestFlushGoalSatisfiedToolResult:
     @staticmethod
     def _ctx(**overrides: Any) -> SimpleNamespace:
@@ -811,6 +982,7 @@ class TestFlushGoalSatisfiedToolResult:
             ),
             goal_satisfied_tool_name="update_and_run_blocks",
             goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
+            pending_code_write_diffs={},
             narrator_state=None,
         )
         defaults.update(overrides)
@@ -847,6 +1019,37 @@ class TestFlushGoalSatisfiedToolResult:
         assert ctx.in_flight_stream_tool_call is None
         assert ctx.goal_satisfied_tool_output is None
         assert ctx.goal_satisfied_tool_name is None
+
+    @pytest.mark.asyncio
+    async def test_flush_seam_drains_the_stashed_write_diff(self) -> None:
+        diffs = [{"label": "download_step", "added": 2, "removed": 0}]
+        sent: list[Any] = []
+        ctx = self._ctx(pending_code_write_diffs={"c9": diffs})
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent[0].code_diffs == diffs
+        assert ctx.pending_code_write_diffs == {}
+
+    @pytest.mark.asyncio
+    async def test_flush_seam_withholds_a_write_diff_from_a_non_write_tool(self) -> None:
+        sent: list[Any] = []
+        diffs = [{"label": "download_step", "added": 2, "removed": 0}]
+        ctx = self._ctx(
+            in_flight_stream_tool_call=InFlightStreamToolCall(
+                call_id="c9", tool_name="run_blocks_and_collect_debug", iteration=3
+            ),
+            goal_satisfied_tool_name="run_blocks_and_collect_debug",
+            pending_code_write_diffs={"c1": diffs},
+        )
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent[0].code_diffs is None
+        # This seam is a terminal exit, so withheld and discarded look the same to the user;
+        # the assertion pins the drain rule itself, which the mid-turn seam does depend on.
+        # The write's own entry is still keyed under c1 — a foreign call cannot consume it.
+        assert ctx.pending_code_write_diffs == {"c1": diffs}
 
     @pytest.mark.asyncio
     async def test_noops_when_no_call_is_pending(self) -> None:
@@ -1144,7 +1347,9 @@ async def _capture_tool_result(tool_name: str, parsed_output: dict[str, Any]) ->
     await stream_to_sse(
         result,
         stream,
-        SimpleNamespace(last_artifact_health_blocker_reason=None, completion_verification_result=None),
+        SimpleNamespace(
+            last_artifact_health_blocker_reason=None, pending_code_write_diffs={}, completion_verification_result=None
+        ),
     )
 
     tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
@@ -1488,6 +1693,7 @@ async def test_codegen_progress_is_disconnected_bounded_when_client_gone(
 def _label_probe_ctx() -> SimpleNamespace:
     return SimpleNamespace(
         last_artifact_health_blocker_reason=None,
+        pending_code_write_diffs={},
         completion_verification_result=None,
     )
 
@@ -1553,20 +1759,17 @@ async def test_non_dict_tool_arguments_degrade_to_the_generic_label_and_keep_dra
 
 
 @pytest.mark.asyncio
-async def test_typed_activity_suppression_set_is_cleared_on_each_stream_pass() -> None:
+async def test_banked_transition_loses_its_iteration_tag_on_each_stream_pass() -> None:
     ctx = _label_probe_ctx()
     await _drive(_tool_round_trip("edit_block", '{"label": "Log in"}', json.dumps({"ok": True, "data": {}})), ctx)
-    assert ctx.narrator_state.iterations_with_tool_activity == {0}
 
-    # A transition banked in pass 1 must survive pass 2, and its iteration tag
-    # must reset — pass 2's iteration numbers restart, so a stale tag could let
-    # a same-numbered armed iteration consume pass 1's pending narration.
+    # Pass 2's iteration numbers restart at 0, so a tag carried over would pair
+    # pass 1's banked prose to an unrelated pass 2 step.
     ctx.narrator_state.record_transition(TransitionKind.WORKFLOW_UPDATED)
     assert ctx.narrator_state.pending_transition_iteration is not None
 
     await _drive([], ctx)
 
-    assert ctx.narrator_state.iterations_with_tool_activity == set()
     assert ctx.narrator_state.pending_transition is TransitionKind.WORKFLOW_UPDATED
     assert ctx.narrator_state.pending_transition_iteration is None
 
@@ -1589,6 +1792,7 @@ async def test_goal_satisfied_flush_reuses_the_pending_calls_label() -> None:
         ),
         goal_satisfied_tool_name="edit_block",
         goal_satisfied_tool_output={"ok": True, "data": {}},
+        pending_code_write_diffs={},
         narrator_state=narrator_state,
     )
 

@@ -235,10 +235,10 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
     assert ctx.pending_code_authoring_runtime_repair_context is None
     assert ctx.last_code_authoring_repair_context is not None
     assert ctx.last_code_authoring_repair_context.current_origin == "https://example.test"
-    assert ctx.last_code_authoring_repair_context.page_result_summaries == ["#results No matching records"]
+    assert ctx.last_code_authoring_repair_context.page_result_summaries == ["No matching records"]
     assert "runtime_failure_class:" not in prompt
     assert 'runtime_failure_reason: Timeout waiting for locator("#results")' in prompt
-    assert "page_results: #results No matching records" in prompt
+    assert "page_results: No matching records" in prompt
     assert "case=secret" not in ctx.last_code_authoring_repair_context.model_dump_json()
 
 
@@ -494,8 +494,9 @@ async def test_a_declared_read_holding_no_single_value_leaves_its_output_unread(
         "tool": "inspect_page_for_composition",
         "argument": "requested_output_reads",
         "page_reference": "current_page",
+        "requested_output_paths": ["output.visitors"],
         "citation_fields": ["output_path", "value_text", "label"],
-        "effect": "browser verifies the cited rendered value and returns selector candidates with cardinality",
+        "effect": "browser verifies the cited rendered value and returns selector candidates",
     }
     assert gathered["data"]["requested_outputs_still_unread"] == ["output.sessions", "output.visitors"]
 

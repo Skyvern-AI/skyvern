@@ -7,6 +7,7 @@ safety checks may reject a submission, and registered live credential values rem
 
 from __future__ import annotations
 
+import asyncio
 import json
 import textwrap
 from types import SimpleNamespace
@@ -104,6 +105,58 @@ def _stub_successful_update(monkeypatch: pytest.MonkeyPatch, persisted: list[str
 
     monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The originating call id must reach the stash as a parameter, not via shared context.
+
+    The stash runs after the workflow is persisted, so when the id was read back off a field on
+    ``CopilotContext`` a sibling authoring call could overwrite it in the awaits between — and the
+    patch stashed under the wrong call, putting one write's code on another write's row. This
+    drives two real ``_update_workflow`` calls whose persists interleave.
+    """
+    gate = asyncio.Event()
+    first_entered = asyncio.Event()
+
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        label = "alpha" if "alpha" in str(kwargs["workflow_yaml"]) else "beta"
+        if label == "alpha":
+            # Suspend the first write mid-persist so the second runs to completion inside it.
+            first_entered.set()
+            await gate.wait()
+        return SimpleNamespace(
+            workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label)]),
+            proxy_location=None,
+            webhook_callback_url=None,
+        )
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+
+    ctx = _ctx()
+
+    async def write(call_id: str, label: str, code: str) -> None:
+        await _update_workflow(
+            {"workflow_yaml": _code_yaml(code, label=label), "code_artifact_metadata": []},
+            ctx,
+            allow_missing_credentials=True,
+            originating_call_id=call_id,
+        )
+
+    alpha = asyncio.create_task(write("c1", "alpha", 'return {"output": {"a": 1}}'))
+    await first_entered.wait()
+    await write("c2", "beta", 'return {"output": {"b": 2}}')
+    gate.set()
+    await alpha
+
+    assert [d["label"] for d in ctx.pending_code_write_diffs["c1"]] == ["alpha"]
+    assert [d["label"] for d in ctx.pending_code_write_diffs["c2"]] == ["beta"]
 
 
 @pytest.mark.asyncio

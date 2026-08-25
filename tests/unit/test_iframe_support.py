@@ -108,7 +108,6 @@ class TestMCPFrameTools:
     @pytest.mark.asyncio
     async def test_tab_switch_clears_working_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Switching tabs must clear _working_frame to prevent stale cross-tab frame references."""
-        import skyvern.cli.core.session_manager as sm_mod
         from skyvern.cli.core.session_manager import SessionState
         from skyvern.cli.mcp_tools import tabs as mcp_tabs
 
@@ -117,7 +116,6 @@ class TestMCPFrameTools:
         fake_ctx = MagicMock()
         fake_ctx.mode = "local"
         monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(fake_page, fake_ctx)))
-        monkeypatch.setattr(sm_mod, "is_stateless_http_mode", lambda: False)
 
         target_page = MagicMock()
         target_page.is_closed = MagicMock(return_value=False)
@@ -125,7 +123,7 @@ class TestMCPFrameTools:
         target_page.title = AsyncMock(return_value="Other Tab")
         target_page.bring_to_front = AsyncMock()
 
-        state = SessionState()
+        state = SessionState(tab_state_persists=True)
         state.browser = MagicMock()
         state.browser._browser_context.pages = [fake_page, target_page]
         state._working_frame = MagicMock()  # stale frame from previous tab

@@ -59,6 +59,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotPendingTurn,
+    WorkflowCopilotBrowserAblationResponseUpdate,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
@@ -217,6 +218,52 @@ async def test_finalise_normal_turn_finalizes_terminal_envelope_without_auto_acc
     assert persisted_payload["terminalEnvelope"]["workflow_applied"] is False
     assert persisted_payload["terminalEnvelope"]["next_state"] == "proposal_pending"
     assert persisted_payload["terminalEnvelope"]["response_kind"] == "update"
+
+
+@pytest.mark.asyncio
+async def test_finalise_normal_turn_emits_selected_only_browser_ablation_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = SimpleNamespace(
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(workflow_id="wf-canonical")
+    metadata = {
+        "eval_mode": "browser_ablation",
+        "browser_session_id": "pbs-1",
+        "prompt_sha256": "a" * 64,
+        "tool_surface_sha256": "b" * 64,
+        "input_tokens": 12,
+        "output_tokens": 4,
+        "tool_activity": [{"tool_name": "navigate_browser", "success": True}],
+        "screenshot_frames": [{"capture_id": "frame-1", "image_b64": "encoded"}],
+    }
+    agent_result = AgentResult(
+        user_response="done",
+        updated_workflow=None,
+        global_llm_context=None,
+        response_type="REPLY",
+        browser_ablation_metadata=metadata,
+    )
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    stream = MagicMock(send=AsyncMock(return_value=True))
+
+    await workflow_copilot_route._finalise_normal_turn(
+        stream=stream,
+        chat=chat,
+        organization_id="org-1",
+        original_workflow=original_workflow,
+        chat_request=_make_chat_request(),
+        agent_result=agent_result,
+    )
+
+    response_frame = stream.send.await_args.args[0]
+    assert isinstance(response_frame, WorkflowCopilotBrowserAblationResponseUpdate)
+    for key, value in metadata.items():
+        assert getattr(response_frame, key) == value
 
 
 @pytest.mark.asyncio
@@ -1289,6 +1336,63 @@ async def test_request_mode_absent_follows_flag(
 
 
 @pytest.mark.asyncio
+async def test_browser_ablation_selector_is_rejected_while_disabled(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_selector_forces_v2_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    new_copilot = AsyncMock(return_value=object())
+    monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
+
+    response = await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert response is new_copilot.return_value
+    assert new_copilot.await_args.kwargs["eval_mode"].value == "browser_ablation"
+
+
+@pytest.mark.asyncio
+async def test_browser_ablation_selector_is_rejected_for_a_non_eval_organization(
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+) -> None:
+    anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-eval"])
+    new_copilot = AsyncMock(return_value=object())
+    monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert exc_info.value.status_code == 403
+    new_copilot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_eval_selector_is_rejected(anon_request: MagicMock, organization: SimpleNamespace) -> None:
+    anon_request.headers = {"x-copilot-eval-mode": "unknown"}
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
+
+    assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("auto_accept", "workflow_was_persisted", "has_valid_proposal", "expect_restore"),
     [
@@ -1341,6 +1445,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=False,
+        resolved_model=None,
         proposal_disposition="auto_applicable",
         turn_outcome=None,
     )
@@ -1491,6 +1596,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1570,6 +1676,7 @@ async def test_v2_route_never_persists_unscreened_user_message(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1626,6 +1733,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1696,6 +1804,7 @@ async def test_pre_agent_config_error_uses_default_turn_index_during_recovery(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1756,6 +1865,7 @@ async def test_route_error_after_restore_keeps_bypassed_proposal_when_keep_pendi
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1828,6 +1938,7 @@ async def test_route_error_honors_real_agent_explicit_clear_despite_keep_pending
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=True,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -1903,6 +2014,7 @@ async def test_route_error_after_staged_commit_clears_stale_proposal_despite_kee
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         has_staged_proposal=True,
         proposal_disposition="auto_applicable",
         unvalidated=False,
@@ -1965,6 +2077,7 @@ async def test_finalise_normal_turn_clears_stale_proposal_when_rollback_itself_f
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        resolved_model=None,
         turn_outcome=None,
     )
     restore_mock, _ = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -2029,6 +2142,7 @@ async def test_route_error_recovery_clears_stale_proposal_when_its_own_rollback_
         workflow_yaml=None,
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -2104,6 +2218,7 @@ async def test_route_error_before_write_keeps_older_proposal_despite_attempted_f
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         has_staged_proposal=False,
         proposal_disposition="review_untested",
         unvalidated=False,
@@ -2174,6 +2289,7 @@ async def test_route_error_after_real_fresh_write_clears_it_even_with_no_prior_p
         workflow_yaml="title: fresh draft\n",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         has_staged_proposal=False,
         proposal_disposition="review_untested",
         turn_outcome=None,
@@ -2289,6 +2405,7 @@ async def test_proposed_workflow_cleared_on_restore(
         workflow_yaml=None,
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=clear_proposed_flag,
+        resolved_model=None,
         proposal_disposition="auto_applicable",
         turn_outcome=None,
     )
@@ -2381,6 +2498,7 @@ async def test_verified_code_only_fix_stays_pending_without_auto_accept(
         workflow_yaml="title: Applied",
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         proposal_disposition="auto_applicable",
         apply_without_review=True,
         has_staged_proposal=True,
@@ -2448,6 +2566,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         response_type="ASK_QUESTION",
         unvalidated=False,
         output_policy_diagnostics={
@@ -2519,6 +2638,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(
         workflow_yaml="title: WIP",
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
+        resolved_model=None,
         proposal_disposition="review_untested",
         total_tokens=42,
         response_type="REPLY",
@@ -2752,6 +2872,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         updated_workflow=SimpleNamespace(title="built", model_dump=lambda mode: {"title": "built"}),
         workflow_yaml="title: built\n",
         clear_proposed_workflow=False,
+        resolved_model=None,
         proposal_disposition="review_tested",
         cancelled=False,
         output_policy_diagnostics=None,
@@ -2772,6 +2893,7 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
     fields: dict[str, object] = dict(
         updated_workflow=None,
         clear_proposed_workflow=False,
+        resolved_model=None,
         proposal_disposition="review_untested",
         cancelled=False,
         output_policy_diagnostics=None,
@@ -3802,6 +3924,7 @@ async def test_marker_survives_a_finalizer_that_raises_with_no_assistant_row(
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        resolved_model=None,
         unvalidated=False,
         turn_outcome=None,
     )
@@ -3950,3 +4073,32 @@ async def test_finalise_normal_turn_persists_deadline_cause_and_keeps_timeout_co
     assert persisted_payload["terminalEnvelope"]["terminal_cause"] == "deadline_expired"
     assert persisted_payload["terminalMessage"] == timeout_copy
     assert persisted_payload["narrativeSummary"] == timeout_copy
+
+
+def test_a_server_side_http_error_is_named_so_the_benchmark_excludes_it() -> None:
+    # _parse_llm_response raises 500 when the model returns unusable JSON. Without a failure kind
+    # the eval reads that frame as the agent's own answer and scores an outage as a product miss.
+    assert (
+        workflow_copilot_route._http_exception_failure_kind(
+            HTTPException(status_code=500, detail="Invalid response from LLM")
+        )
+        == "server"
+    )
+    assert (
+        workflow_copilot_route._http_exception_failure_kind(
+            HTTPException(status_code=503, detail="upstream unavailable")
+        )
+        == "server"
+    )
+
+
+def test_a_client_side_http_error_stays_the_products_own_answer() -> None:
+    # A refusal the caller should see is a real miss, and naming it infrastructure would drop it
+    # out of the scored denominator.
+    assert (
+        workflow_copilot_route._http_exception_failure_kind(HTTPException(status_code=400, detail="bad request"))
+        is None
+    )
+    assert (
+        workflow_copilot_route._http_exception_failure_kind(HTTPException(status_code=403, detail="forbidden")) is None
+    )
